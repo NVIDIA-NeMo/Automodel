@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
-from unittest.mock import MagicMock, Mock, patch
+from contextlib import ExitStack
+from unittest.mock import patch
 
 import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.models.common import BackendConfig
+
 
 @pytest.fixture
 def device():
@@ -132,14 +132,23 @@ class TestBlock:
         x = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
         freqs_cis = torch.randn(batch_size, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
 
-        with patch.object(block.self_attn.attn_module, "__call__") as mock_attn, \
-             patch.object(block.mlp, "forward") as mock_mlp:
+        with (
+            patch.object(block.self_attn.attn_module, "__call__") as mock_attn,
+            patch.object(block.mlp, "forward") as mock_mlp,
+        ):
             # Mock attention output
             mock_attn.return_value = torch.randn(
-                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device
+                batch_size,
+                gpt_config.num_attention_heads,
+                seq_len,
+                gpt_config.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
             # Mock MLP output (return just tensor, not tuple)
-            mock_mlp.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            mock_mlp.return_value = torch.randn(
+                batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
 
             output = block(x, freqs_cis=freqs_cis)
 
@@ -158,14 +167,23 @@ class TestBlock:
         attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
         attention_mask[:, -2:] = 0  # Mask last 2 tokens
 
-        with patch.object(block.self_attn.attn_module, "__call__") as mock_attn, \
-             patch.object(block.mlp, "forward") as mock_mlp:
+        with (
+            patch.object(block.self_attn.attn_module, "__call__") as mock_attn,
+            patch.object(block.mlp, "forward") as mock_mlp,
+        ):
             mock_attn.return_value = torch.randn(
-                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device
+                batch_size,
+                gpt_config.num_attention_heads,
+                seq_len,
+                gpt_config.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
-            mock_mlp.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            mock_mlp.return_value = torch.randn(
+                batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
 
-            output = block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
+            block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
             # Verify that MLP received the correct padding mask
             mock_mlp.assert_called_once()
@@ -181,11 +199,25 @@ class TestBlock:
         """Test _mlp method with regular MLP."""
         # Create a config that would result in regular MLP
         moe_config = MoEConfig(
-            dim=128, inter_dim=256, moe_inter_dim=256, n_routed_experts=0, n_shared_experts=1, n_activated_experts=1,
-            n_expert_groups=1, n_limited_groups=1, train_gate=True, gate_bias_update_factor=0,
-            score_func="softmax", route_scale=1.0, aux_loss_coeff=0.01, norm_topk_prob=False,
-            expert_bias=True, router_bias=True, expert_activation="quick_geglu",
-            activation_alpha=1.702, activation_limit=7.0,
+            dim=128,
+            inter_dim=256,
+            moe_inter_dim=256,
+            n_routed_experts=0,
+            n_shared_experts=1,
+            n_activated_experts=1,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0,
+            score_func="softmax",
+            route_scale=1.0,
+            aux_loss_coeff=0.01,
+            norm_topk_prob=False,
+            expert_bias=True,
+            router_bias=True,
+            expert_activation="quick_geglu",
+            activation_alpha=1.702,
+            activation_limit=7.0,
         )
 
         block = Block(0, gpt_config, moe_config, backend_config)
@@ -204,11 +236,12 @@ class TestBlock:
         """Test Block weight initialization."""
         block = Block(0, gpt_config, moe_config, backend_config)
 
-        with patch.object(block.input_layernorm, "reset_parameters") as mock_input_norm, \
-             patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post_norm, \
-             patch.object(block.self_attn, "init_weights") as mock_attn_init, \
-             patch.object(block.mlp, "init_weights") as mock_mlp_init:
-
+        with (
+            patch.object(block.input_layernorm, "reset_parameters") as mock_input_norm,
+            patch.object(block.post_attention_layernorm, "reset_parameters") as mock_post_norm,
+            patch.object(block.self_attn, "init_weights") as mock_attn_init,
+            patch.object(block.mlp, "init_weights") as mock_mlp_init,
+        ):
             block.init_weights(device)
 
             mock_input_norm.assert_called_once()
@@ -274,7 +307,9 @@ class TestGptOssModel:
             # Mock each layer's forward pass
             for layer in model.layers.values():
                 with patch.object(layer, "forward") as mock_layer:
-                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+                    mock_layer.return_value = torch.randn(
+                        batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+                    )
 
             output = model(input_ids)
 
@@ -295,7 +330,9 @@ class TestGptOssModel:
 
             for layer in model.layers.values():
                 with patch.object(layer, "forward") as mock_layer:
-                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+                    mock_layer.return_value = torch.randn(
+                        batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+                    )
 
             output = model(input_ids, position_ids=position_ids)
 
@@ -316,7 +353,9 @@ class TestGptOssModel:
 
             for layer in model.layers.values():
                 with patch.object(layer, "forward") as mock_layer:
-                    mock_layer.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+                    mock_layer.return_value = torch.randn(
+                        batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+                    )
 
             output = model(input_ids, padding_mask=padding_mask)
 
@@ -330,7 +369,7 @@ class TestGptOssModel:
 
         with patch.object(model.norm, "reset_parameters") as mock_norm:
             for layer in model.layers.values():
-                with patch.object(layer, "init_weights") as mock_layer_init:
+                with patch.object(layer, "init_weights"):
                     pass
 
             model.init_weights(device)
@@ -348,11 +387,13 @@ class TestGptOssForCausalLM:
 
     def test_from_config_with_string(self, gpt_config, backend_config):
         """Test from_config class method with string path."""
-        with patch("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = gpt_config
 
             with pytest.raises(AttributeError):
-                model = GptOssForCausalLM.from_config("test-model", backend=backend_config)
+                GptOssForCausalLM.from_config("test-model", backend=backend_config)
 
     def test_from_config_with_config_object(self, gpt_config, backend_config):
         """Test from_config class method with config object."""
@@ -388,7 +429,9 @@ class TestGptOssForCausalLM:
         input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
 
         with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            mock_model.return_value = torch.randn(
+                batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
 
             output = model(input_ids)
 
@@ -414,7 +457,9 @@ class TestGptOssForCausalLM:
 
         with patch.object(model.model, "forward") as mock_model:
             # After squeeze_input_for_thd, input is 1D [T], so backbone returns [T, H]
-            mock_model.return_value = torch.randn(total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            mock_model.return_value = torch.randn(
+                total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
 
             output = model(
                 input_ids,
@@ -442,7 +487,9 @@ class TestGptOssForCausalLM:
         input_ids = torch.randint(0, gpt_config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
 
         with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            mock_model.return_value = torch.randn(
+                batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
 
             output = model(input_ids)
 
@@ -499,7 +546,9 @@ class TestGptOssForCausalLM:
         attention_mask = torch.ones(batch_size, seq_len, device=device)
 
         with patch.object(model.model, "forward") as mock_model:
-            mock_model.return_value = torch.randn(batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device)
+            mock_model.return_value = torch.randn(
+                batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
+            )
 
             model(input_ids, attention_mask=attention_mask, custom_kwarg="test")
 
@@ -512,10 +561,14 @@ class TestGptOssForCausalLM:
 
     def test_from_pretrained_classmethod(self, gpt_config, backend_config):
         """Ensure classmethod from_pretrained builds config then delegates to from_config."""
-        with patch("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained") as mock_from_pretrained:
+        with patch(
+            "transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig.from_pretrained"
+        ) as mock_from_pretrained:
             mock_from_pretrained.return_value = gpt_config
 
-            with patch.object(GptOssForCausalLM, "from_config", wraps=GptOssForCausalLM.from_config) as mock_from_config:
+            with patch.object(
+                GptOssForCausalLM, "from_config", wraps=GptOssForCausalLM.from_config
+            ) as mock_from_config:
                 model = GptOssForCausalLM.from_pretrained("some/model")
                 assert isinstance(model, GptOssForCausalLM)
                 mock_from_pretrained.assert_called_once_with("some/model")
@@ -543,10 +596,13 @@ class TestGptOssAttentionTHD:
         with patch.object(attn.attn_module, "__call__") as mock_attn:
             # THD attention returns [T, num_heads, head_dim]
             mock_attn.return_value = torch.randn(
-                total_tokens, gpt_config.num_attention_heads, gpt_config.head_dim,
-                dtype=torch.bfloat16, device=device,
+                total_tokens,
+                gpt_config.num_attention_heads,
+                gpt_config.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
-            output = attn(x, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
+            attn(x, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
 
             # Verify attention was called — the input should have been squeezed
             mock_attn.assert_called_once()
@@ -566,10 +622,13 @@ class TestGptOssAttentionTHD:
 
         with patch.object(attn.attn_module, "__call__") as mock_attn:
             mock_attn.return_value = torch.randn(
-                total_tokens, gpt_config.num_attention_heads, gpt_config.head_dim,
-                dtype=torch.bfloat16, device=device,
+                total_tokens,
+                gpt_config.num_attention_heads,
+                gpt_config.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
-            output = attn(x, freqs_cis=freqs_cis)
+            attn(x, freqs_cis=freqs_cis)
             mock_attn.assert_called_once()
             call_kwargs = mock_attn.call_args[1]
             assert call_kwargs.get("qkv_format") == "thd"
@@ -587,7 +646,11 @@ class TestRopeUtilsTHD:
         position_ids = torch.arange(seq_len, device=device)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=True, cp_size=1,
+            model.rotary_emb,
+            position_ids,
+            qkv_format="thd",
+            for_fused_rope=True,
+            cp_size=1,
         )
         # Should produce valid freqs_cis without errors
         assert result.ndim >= 2
@@ -601,7 +664,11 @@ class TestRopeUtilsTHD:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=True, cp_size=1,
+            model.rotary_emb,
+            position_ids,
+            qkv_format="thd",
+            for_fused_rope=True,
+            cp_size=1,
         )
         assert result.ndim >= 2
 
@@ -614,7 +681,11 @@ class TestRopeUtilsTHD:
         position_ids = torch.arange(seq_len, device=device)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=False, cp_size=1,
+            model.rotary_emb,
+            position_ids,
+            qkv_format="thd",
+            for_fused_rope=False,
+            cp_size=1,
         )
         assert result.ndim >= 2
 
@@ -627,7 +698,11 @@ class TestRopeUtilsTHD:
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb, position_ids, qkv_format="thd", for_fused_rope=False, cp_size=1,
+            model.rotary_emb,
+            position_ids,
+            qkv_format="thd",
+            for_fused_rope=False,
+            cp_size=1,
         )
         # Should be valid without double-unsqueezing to [1, 1, T]
         assert result.ndim >= 2
@@ -647,15 +722,19 @@ class TestGptOssModelTHD:
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq") as mock_rope:
             mock_rope.return_value = (1.0, torch.randn(16, dtype=torch.bfloat16, device=device))
 
-            for layer in model.layers.values():
-                with patch.object(layer, "forward") as mock_layer:
+            with ExitStack() as stack:
+                for layer in model.layers.values():
+                    mock_layer = stack.enter_context(patch.object(layer, "forward"))
                     mock_layer.return_value = torch.randn(
-                        total_tokens, gpt_config.hidden_size, dtype=torch.bfloat16, device=device,
+                        total_tokens,
+                        gpt_config.hidden_size,
+                        dtype=torch.bfloat16,
+                        device=device,
                     )
 
-            output = model(input_ids, qkv_format="thd")
-            # Should not crash — 1D input_ids handled correctly
-            assert output.shape == (total_tokens, gpt_config.hidden_size)
+                output = model(input_ids, qkv_format="thd")
+                # Should not crash — 1D input_ids handled correctly
+                assert output.shape == (total_tokens, gpt_config.hidden_size)
 
     def test_2d_input_ids_generates_2d_position_ids(self, gpt_config, backend_config, device):
         """Standard 2D [B, S] input should still generate 2D position_ids."""
@@ -667,14 +746,19 @@ class TestGptOssModelTHD:
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq") as mock_rope:
             mock_rope.return_value = (1.0, torch.randn(16, dtype=torch.bfloat16, device=device))
 
-            for layer in model.layers.values():
-                with patch.object(layer, "forward") as mock_layer:
+            with ExitStack() as stack:
+                for layer in model.layers.values():
+                    mock_layer = stack.enter_context(patch.object(layer, "forward"))
                     mock_layer.return_value = torch.randn(
-                        batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device,
+                        batch_size,
+                        seq_len,
+                        gpt_config.hidden_size,
+                        dtype=torch.bfloat16,
+                        device=device,
                     )
 
-            output = model(input_ids)
-            assert output.shape == (batch_size, seq_len, gpt_config.hidden_size)
+                output = model(input_ids)
+                assert output.shape == (batch_size, seq_len, gpt_config.hidden_size)
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
