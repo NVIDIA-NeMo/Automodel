@@ -33,6 +33,7 @@ from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSSt
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -160,11 +161,15 @@ class GptOssModel(nn.Module):
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         if position_ids is None:
-            position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
-            )
+            if input_ids.ndim == 1:
+                position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
+            else:
+                position_ids = (
+                    torch.arange(0, input_ids.shape[1], device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(input_ids.shape[0], -1)
+                )
 
-        # Compute cos/sin from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
         freqs_cis = position_ids_to_freqs_cis(
             self.rotary_emb,
             position_ids,
@@ -264,6 +269,12 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, attn_kwargs
+            )
+            attention_mask = None
+
         hidden = self.model(
             input_ids,
             position_ids=position_ids,
@@ -272,6 +283,8 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = self.lm_head(hidden) if self.lm_head else hidden
+        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            logits = logits.unsqueeze(0)
         return logits
 
     @torch.no_grad()
