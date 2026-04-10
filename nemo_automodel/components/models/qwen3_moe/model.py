@@ -97,7 +97,9 @@ class Block(nn.Module):
 
 
 class Qwen3MoeModel(nn.Module):
-    def __init__(self, config: Qwen3MoeConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self, config: Qwen3MoeConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, moe_overrides=None
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -105,7 +107,7 @@ class Qwen3MoeModel(nn.Module):
         # Map HF Qwen3 MoE config -> our MoE wrapper
         # Qwen config fields from example config:
         # - hidden_size, intermediate_size, moe_intermediate_size, num_experts, num_experts_per_tok, norm_topk_prob
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
@@ -125,6 +127,9 @@ class Qwen3MoeModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=True,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -236,7 +241,8 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3MoeStateDictAdapter(

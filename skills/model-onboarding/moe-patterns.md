@@ -69,6 +69,11 @@ def _build_moe_config(config) -> MoEConfig:
     )
 ```
 
+All MoE models support `moe_overrides` — a dict that merges into the default `MoEConfig` construction:
+```python
+model = NeMoAutoModelForCausalLM.from_pretrained("model", moe_overrides={"gate_bias_update_factor": 1e-4})
+```
+
 ### MoEConfig fields
 
 | Field | Type | Description |

@@ -86,7 +86,7 @@ class MiniMaxM2Model(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        gate_bias_update_factor: float = 1e-3,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
@@ -97,7 +97,7 @@ class MiniMaxM2Model(nn.Module):
         score_func = getattr(config, "scoring_func", "sigmoid")
         score_func = "softmax" if str(score_func).lower() == "softmax" else "sigmoid"
 
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.intermediate_size,
@@ -107,7 +107,7 @@ class MiniMaxM2Model(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=gate_bias_update_factor,
+            gate_bias_update_factor=1e-3,
             score_func=score_func,
             route_scale=1.0,
             aux_loss_coeff=0,
@@ -119,6 +119,9 @@ class MiniMaxM2Model(nn.Module):
             force_e_score_correction_bias=True,
             dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -249,11 +252,12 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
+        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiniMaxM2Model(
             config,
             backend=self.backend,
             moe_config=moe_config,
-            gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 1e-3),
+            moe_overrides=moe_overrides,
         )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:

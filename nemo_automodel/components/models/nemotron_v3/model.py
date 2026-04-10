@@ -47,7 +47,7 @@ class NemotronV3Model(nn.Module):
         backend: BackendConfig | None = None,
         *,
         moe_config: MoEConfig | None = None,
-        gate_bias_update_factor: float = 0.0,
+        moe_overrides: dict | None = None,
     ):
         """Initialize NemotronV3Model.
 
@@ -55,19 +55,19 @@ class NemotronV3Model(nn.Module):
             config: NemotronH config with model parameters
             backend: Backend configuration for MoE and other components
             moe_config: MoE configuration (optional, will create default if None)
-            gate_bias_update_factor: Scaling factor for MoE gate bias updates
+            moe_overrides: Optional dict of overrides to apply to the default MoE config
         """
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             n_routed_experts=config.n_routed_experts,
             n_shared_experts=1,  # NemotronV3 has 1 shared expert
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=gate_bias_update_factor,
+            gate_bias_update_factor=0.0,
             aux_loss_coeff=0.0,  # No aux loss for NemotronV3
             score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
             route_scale=config.routed_scaling_factor,
@@ -85,6 +85,9 @@ class NemotronV3Model(nn.Module):
             force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
             moe_latent_size=getattr(config, "moe_latent_size", None),
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # Embeddings
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -262,10 +265,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self.backend = backend or BackendConfig()
 
         # Base model
+        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = NemotronV3Model(
             config,
             backend=self.backend,
-            gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 0.0),
+            moe_overrides=moe_overrides,
         )
         self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
 

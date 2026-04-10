@@ -100,13 +100,13 @@ class GlmMoeDsaModel(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        gate_bias_update_factor: float = 1e-3,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
 
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
@@ -116,7 +116,7 @@ class GlmMoeDsaModel(nn.Module):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=gate_bias_update_factor,
+            gate_bias_update_factor=1e-3,
             score_func="sigmoid",
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0.0,
@@ -126,6 +126,9 @@ class GlmMoeDsaModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=False,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -234,11 +237,12 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
+        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GlmMoeDsaModel(
             config,
             backend=self.backend,
             moe_config=moe_config,
-            gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 1e-3),
+            moe_overrides=moe_overrides,
         )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:

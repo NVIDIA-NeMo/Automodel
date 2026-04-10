@@ -43,7 +43,14 @@ class Qwen3OmniMoeThinkerTextModel(
 ):  # corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
 
-    def __init__(self, config: Qwen3OmniMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTextConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides=None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -51,7 +58,7 @@ class Qwen3OmniMoeThinkerTextModel(
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
@@ -71,6 +78,9 @@ class Qwen3OmniMoeThinkerTextModel(
             expert_activation="swiglu",
             softmax_before_topk=True,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -215,7 +225,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.backend = backend
 
         text_config = base_config.text_config if hasattr(base_config, "text_config") else base_config
-        self.model = Qwen3OmniMoeThinkerTextModel(text_config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Qwen3OmniMoeThinkerTextModel(
+            text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
+        )
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )

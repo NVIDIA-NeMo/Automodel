@@ -157,9 +157,9 @@ class Mistral4Block(Block):
         self.self_attn = Mistral4MLA(config, backend)
 
 
-def _build_moe_config(config, gate_bias_update_factor: float = 1e-3) -> MoEConfig:
+def _build_moe_config(config, moe_overrides: dict | None = None) -> MoEConfig:
     """Build MoEConfig from a Mistral4 text config."""
-    return MoEConfig(
+    moe_defaults = dict(
         dim=config.hidden_size,
         inter_dim=config.intermediate_size,
         moe_inter_dim=config.moe_intermediate_size,
@@ -169,12 +169,15 @@ def _build_moe_config(config, gate_bias_update_factor: float = 1e-3) -> MoEConfi
         n_expert_groups=config.n_group,
         n_limited_groups=config.topk_group,
         train_gate=True,
-        gate_bias_update_factor=gate_bias_update_factor,
+        gate_bias_update_factor=1e-3,
         score_func="softmax_with_bias",
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
         norm_topk_prob=config.norm_topk_prob,
     )
+    if moe_overrides:
+        moe_defaults.update(moe_overrides)
+    return MoEConfig(**moe_defaults)
 
 
 class Mistral4Model(nn.Module):
@@ -184,12 +187,12 @@ class Mistral4Model(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        gate_bias_update_factor: float = 1e-3,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
-        self.moe_config = moe_config or _build_moe_config(config, gate_bias_update_factor=gate_bias_update_factor)
+        self.moe_config = moe_config or _build_moe_config(config, moe_overrides=moe_overrides)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
         )
@@ -325,11 +328,12 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         config = getattr(config, "text_config", config)
         self.config = config
         self.backend = backend or BackendConfig()
+        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Mistral4Model(
             config,
             backend=self.backend,
             moe_config=moe_config,
-            gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 1e-3),
+            moe_overrides=moe_overrides,
         )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
@@ -448,14 +452,14 @@ if _HF_MISTRAL3_AVAILABLE:
             backend: BackendConfig,
             *,
             moe_config: MoEConfig | None = None,
-            gate_bias_update_factor: float = 1e-3,
+            moe_overrides: dict | None = None,
         ):
             super().__init__()
             self.model = Mistral4Model(
                 config,
                 backend,
                 moe_config=moe_config,
-                gate_bias_update_factor=gate_bias_update_factor,
+                moe_overrides=moe_overrides,
             )
             self.moe_config = self.model.moe_config
             # lm_head lives inside language_model (like KimiVLLanguageModelBackend)
@@ -674,11 +678,12 @@ if _HF_MISTRAL3_AVAILABLE:
             # Build components: vision tower from HF, projector from HF, text from our backend
             vision_tower = AutoModel.from_config(config.vision_config)
             multi_modal_projector = Mistral3MultiModalProjector(config)
+            moe_overrides = kwargs.pop("moe_overrides", None)
             language_model = Mistral4TextModelBackend(
                 text_config,
                 backend=backend,
                 moe_config=moe_config,
-                gate_bias_update_factor=kwargs.pop("gate_bias_update_factor", 1e-3),
+                moe_overrides=moe_overrides,
             )
 
             self.model = Mistral3Model(
