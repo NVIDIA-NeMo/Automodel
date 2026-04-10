@@ -195,9 +195,7 @@ def position_ids_to_freqs_cis(
             # shape[0] is T for 1D [T] or batch for 2D [B, T].
             # For THD with PP schedule, position_ids may be [1, T] — use shape[-1].
             seq_len = position_ids.shape[-1] if position_ids.ndim >= 2 else position_ids.shape[0]
-            position_ids = torch.arange(
-                seq_len * cp_size, device=position_ids.device, dtype=torch.int32
-            ).unsqueeze(0)
+            position_ids = torch.arange(seq_len * cp_size, device=position_ids.device, dtype=torch.int32).unsqueeze(0)
         else:
             if position_ids.ndim == 1:
                 position_ids = position_ids.unsqueeze(0)
