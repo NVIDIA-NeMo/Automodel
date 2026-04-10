@@ -259,14 +259,24 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 if _use_hf_native_grad_ckpt:
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
                 else:
-                    for layer in layers:
+                    for i, layer in enumerate(layers):
                         if hasattr(layer, "mlp"):
-                            layer.mlp = checkpoint_wrapper(layer.mlp)
+                            layers[i].mlp = checkpoint_wrapper(layers[i].mlp)
                         # Skip self_attn checkpointing for KV-shared models:
                         # recomputation would double-write to the DynamicCache,
                         # corrupting K/V entries that shared layers depend on.
                         if hasattr(layer, "self_attn") and not _has_kv_sharing:
-                            layer.self_attn = checkpoint_wrapper(layer.self_attn)
+                            layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+                        if hasattr(layer, "input_layernorm"):
+                            layers[i].input_layernorm = checkpoint_wrapper(
+                                layers[i].input_layernorm  # type: ignore
+                            )
+
+                        if hasattr(layer, "post_attention_layernorm"):
+                            layers[i].post_attention_layernorm = checkpoint_wrapper(
+                                layers[i].post_attention_layernorm  # type: ignore
+                            )
 
         # Set up mixed precision policy
         if not mp_policy:
