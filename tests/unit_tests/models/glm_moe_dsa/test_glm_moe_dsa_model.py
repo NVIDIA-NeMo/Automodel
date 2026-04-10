@@ -103,7 +103,7 @@ def _make_moe_config(cfg: GlmMoeDsaConfig) -> MoEConfig:
         n_expert_groups=cfg.n_group,
         n_limited_groups=cfg.topk_group,
         train_gate=True,
-        gate_bias_update_factor=0.001,
+        gate_bias_update_factor=1e-5,
         score_func="sigmoid",
         route_scale=cfg.routed_scaling_factor,
         aux_loss_coeff=0.0,

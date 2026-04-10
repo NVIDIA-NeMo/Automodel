@@ -134,7 +134,7 @@ class DeepseekV3Model(nn.Module):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-5,
             score_func="sigmoid",
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,

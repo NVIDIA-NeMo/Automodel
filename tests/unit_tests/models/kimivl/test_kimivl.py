@@ -512,7 +512,7 @@ class TestKimiVLStateDictAdapter:
             n_expert_groups=2,
             n_limited_groups=2,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-5,
             aux_loss_coeff=0.0,
             score_func="sigmoid",
             route_scale=1.0,
