@@ -581,10 +581,10 @@ class TestGptOssAttentionTHD:
     """Test THD format handling in GptOssAttention."""
 
     def test_3d_input_with_cu_seqlens_detected_as_thd(self, gpt_config, backend_config, device):
-        """PP schedule produces [1, T, H] with cu_seqlens — attention must squeeze to [T, H]."""
+        """PP schedule produces [1, T, H] with cu_seqlens — attention must squeeze and not crash."""
         from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 
-        attn = GptOssAttention(gpt_config, layer_idx=0, backend=backend_config).to(device)
+        attn = GptOssAttention(gpt_config, backend=backend_config).to(device)
         total_tokens = 16
         hidden = gpt_config.hidden_size
 
@@ -593,8 +593,7 @@ class TestGptOssAttentionTHD:
         freqs_cis = torch.randn(1, total_tokens, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
         cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
 
-        with patch.object(attn.attn_module, "__call__") as mock_attn:
-            # THD attention returns [T, num_heads, head_dim]
+        with patch.object(attn, "attn_func") as mock_attn:
             mock_attn.return_value = torch.randn(
                 total_tokens,
                 gpt_config.num_attention_heads,
@@ -602,25 +601,26 @@ class TestGptOssAttentionTHD:
                 dtype=torch.bfloat16,
                 device=device,
             )
-            attn(x, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
+            output = attn(x, freqs_cis=freqs_cis, cu_seqlens=cu_seqlens)
 
-            # Verify attention was called — the input should have been squeezed
+            # Forward should succeed and attn_func should be called
             mock_attn.assert_called_once()
-            call_kwargs = mock_attn.call_args[1]
-            assert call_kwargs.get("qkv_format") == "thd"
+            # Output should be 2D [T, hidden] (THD flattened)
+            assert output.ndim == 2
+            assert output.shape[0] == total_tokens
 
     def test_2d_input_detected_as_thd(self, gpt_config, backend_config, device):
         """Native THD format: 2D [T, H] input should be detected without cu_seqlens."""
         from nemo_automodel.components.models.gpt_oss.layers import GptOssAttention
 
-        attn = GptOssAttention(gpt_config, layer_idx=0, backend=backend_config).to(device)
+        attn = GptOssAttention(gpt_config, backend=backend_config).to(device)
         total_tokens = 16
         hidden = gpt_config.hidden_size
 
         x = torch.randn(total_tokens, hidden, dtype=torch.bfloat16, device=device)
         freqs_cis = torch.randn(1, total_tokens, gpt_config.head_dim, dtype=torch.bfloat16, device=device)
 
-        with patch.object(attn.attn_module, "__call__") as mock_attn:
+        with patch.object(attn, "attn_func") as mock_attn:
             mock_attn.return_value = torch.randn(
                 total_tokens,
                 gpt_config.num_attention_heads,
@@ -628,25 +628,43 @@ class TestGptOssAttentionTHD:
                 dtype=torch.bfloat16,
                 device=device,
             )
-            attn(x, freqs_cis=freqs_cis)
+            output = attn(x, freqs_cis=freqs_cis)
             mock_attn.assert_called_once()
-            call_kwargs = mock_attn.call_args[1]
-            assert call_kwargs.get("qkv_format") == "thd"
+            # Output should be 2D [T, hidden] (THD flattened)
+            assert output.ndim == 2
+            assert output.shape[0] == total_tokens
 
 
 class TestRopeUtilsTHD:
     """Test position_ids_to_freqs_cis THD handling."""
 
+    @staticmethod
+    def _make_rotary_emb(gpt_config, device):
+        from nemo_automodel.components.models.common import get_rope_config
+        from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding
+
+        rope_theta, rope_scaling, _ = get_rope_config(gpt_config)
+        return RotaryEmbedding(
+            head_dim=gpt_config.head_dim,
+            base=rope_theta,
+            dtype=torch.float32,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
+            device=device,
+        )
+
     def test_thd_1d_position_ids_fused_rope(self, gpt_config, backend_config, device):
         """1D position_ids [T] with fused_rope should use shape[0] for seq_len."""
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
-        model = GptOssModel(gpt_config, backend_config).to(device)
+        rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
         position_ids = torch.arange(seq_len, device=device)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb,
+            rotary_emb,
             position_ids,
             qkv_format="thd",
             for_fused_rope=True,
@@ -659,12 +677,12 @@ class TestRopeUtilsTHD:
         """2D position_ids [1, T] from PP schedule should use shape[-1] for seq_len."""
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
-        model = GptOssModel(gpt_config, backend_config).to(device)
+        rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb,
+            rotary_emb,
             position_ids,
             qkv_format="thd",
             for_fused_rope=True,
@@ -676,12 +694,12 @@ class TestRopeUtilsTHD:
         """1D position_ids [T] without fused_rope should unsqueeze to [1, T]."""
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
-        model = GptOssModel(gpt_config, backend_config).to(device)
+        rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
         position_ids = torch.arange(seq_len, device=device)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb,
+            rotary_emb,
             position_ids,
             qkv_format="thd",
             for_fused_rope=False,
@@ -693,12 +711,12 @@ class TestRopeUtilsTHD:
         """2D position_ids [1, T] without fused_rope should NOT be double-unsqueezed."""
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
-        model = GptOssModel(gpt_config, backend_config).to(device)
+        rotary_emb = self._make_rotary_emb(gpt_config, device)
         seq_len = 16
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
         result = position_ids_to_freqs_cis(
-            model.rotary_emb,
+            rotary_emb,
             position_ids,
             qkv_format="thd",
             for_fused_rope=False,
