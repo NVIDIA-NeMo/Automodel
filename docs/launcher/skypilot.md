@@ -106,7 +106,7 @@ model:
 
 ## Cloud Examples
 
-### AWS - On-demand A10G
+### AWS — On-Demand A10G
 
 ```yaml
 skypilot:
@@ -118,7 +118,7 @@ skypilot:
   hf_token: ${HF_TOKEN}
 ```
 
-### GCP - Spot V100, 8 GPUs (single node)
+### GCP — Spot V100, 8 GPUs (Single Node)
 
 ```yaml
 skypilot:
@@ -130,7 +130,7 @@ skypilot:
   hf_token: ${HF_TOKEN}
 ```
 
-### Multi-node distributed training (2 x 8 x A100)
+### Multi-Node Distributed Training (2 x 8 x A100)
 
 ```yaml
 skypilot:
@@ -142,7 +142,7 @@ skypilot:
   hf_token: ${HF_TOKEN}
 ```
 
-For multi-node jobs the launcher automatically adds the SkyPilot rendezvous environment variables (`$SKYPILOT_NODE_RANK`, `$SKYPILOT_NUM_NODES`, `$SKYPILOT_NODE_IPS`) to the `torchrun` command.
+For multi-node jobs, the launcher automatically adds the SkyPilot rendezvous environment variables (`$SKYPILOT_NODE_RANK`, `$SKYPILOT_NUM_NODES`, `$SKYPILOT_NODE_IPS`) to the `torchrun` command.
 
 ## Monitor and Manage Jobs
 
@@ -176,7 +176,7 @@ automodel config_with_skypilot.yaml \
   --model.pretrained_model_name_or_path meta-llama/Llama-3.2-3B
 ```
 
-## Kubernetes users
+## Kubernetes Users
 
 If you want to run on a Kubernetes cluster, use `cloud: kubernetes` and follow the dedicated [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md). That guide includes:
 
