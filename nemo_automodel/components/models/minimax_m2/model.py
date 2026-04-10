@@ -80,7 +80,9 @@ class Block(nn.Module):
 
 
 class MiniMaxM2Model(nn.Module):
-    def __init__(self, config: Any, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self, config: Any, backend: BackendConfig, *, moe_config: MoEConfig | None = None, **kwargs
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -100,7 +102,7 @@ class MiniMaxM2Model(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=getattr(config, "gate_bias_update_factor", 1e-5),
+            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 1e-5),
             score_func=score_func,
             route_scale=1.0,
             aux_loss_coeff=0,
@@ -242,7 +244,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = MiniMaxM2Model(config, backend=self.backend, moe_config=moe_config)
+        self.model = MiniMaxM2Model(config, backend=self.backend, moe_config=moe_config, **kwargs)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM2StateDictAdapter(
