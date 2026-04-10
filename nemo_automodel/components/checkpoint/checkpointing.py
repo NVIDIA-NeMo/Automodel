@@ -1027,16 +1027,26 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
 
 def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
     """
-    Recompute non-persistent RoPE ``inv_freq`` buffers for Nemotron-NAS models.
+    Recompute non-persistent RoPE ``inv_freq`` buffers.
+
+    Non-persistent buffers are not saved in checkpoints, so after meta-device
+    materialization they contain uninitialized CUDA memory.  When
+    ``initialize_weights()`` is skipped (e.g. for Gemma3 to avoid DTensor
+    issues), these buffers must be recomputed explicitly.
+
+    Handles two RoPE patterns:
+    - Standard: single ``inv_freq`` buffer with ``rope_init_fn`` + ``rope_kwargs``
+      (e.g. Nemotron-NAS).
+    - Per-layer-type: ``{layer_type}_inv_freq`` buffers with per-type init
+      via ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
+      In transformers v5.5, Gemma3RotaryEmbedding registers per-layer-type inv_freq buffers as non-persistent.
+
     Args:
         model: Model to reinitialize RoPE buffers for.
         device: Device to create the new buffers on.
     """
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type not in ("nemotron-nas",):
-        return
-
     for name, module in model.named_modules():
+        # Pattern 1: standard RoPE with rope_init_fn + rope_kwargs (Nemotron-NAS)
         if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
             try:
                 inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
@@ -1046,6 +1056,35 @@ def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
                 logging.debug(f"Reinitialized RoPE inv_freq for {name} on device {device}")
             except Exception as e:
                 logging.warning(f"Failed to reinitialize RoPE inv_freq for {name}: {e}")
+
+        # Pattern 2: per-layer-type RoPE (Gemma3RotaryEmbedding and similar)
+        elif hasattr(module, "layer_types") and hasattr(module, "rope_type") and hasattr(module, "config"):
+            rope_config = getattr(module, "config", None)
+            rope_parameters = getattr(rope_config, "rope_parameters", None)
+            if rope_parameters is None:
+                continue
+            for layer_type in getattr(module, "layer_types", []):
+                inv_freq_attr = f"{layer_type}_inv_freq"
+                if not hasattr(module, inv_freq_attr):
+                    continue
+                try:
+                    rope_init_fn = getattr(module, "compute_default_rope_parameters", None)
+                    if rope_init_fn is None:
+                        continue
+                    rope_type = module.rope_type.get(layer_type, "default")
+                    if rope_type != "default":
+                        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+                        rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+                    curr_inv_freq, curr_attention_scaling = rope_init_fn(rope_config, device, layer_type=layer_type)
+                    setattr(module, inv_freq_attr, curr_inv_freq)
+                    orig_attr = f"{layer_type}_original_inv_freq"
+                    if hasattr(module, orig_attr):
+                        setattr(module, orig_attr, curr_inv_freq.clone())
+                    setattr(module, f"{layer_type}_attention_scaling", curr_attention_scaling)
+                    logging.debug(f"Reinitialized RoPE {inv_freq_attr} for {name} on device {device}")
+                except Exception as e:
+                    logging.warning(f"Failed to reinitialize RoPE {inv_freq_attr} for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:

@@ -16,9 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
-pytest.importorskip("transformers.models.gemma4", reason="Gemma4 not available in this transformers version")
-
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
