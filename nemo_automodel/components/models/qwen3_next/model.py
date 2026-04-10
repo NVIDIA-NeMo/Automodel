@@ -74,14 +74,46 @@ class Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         if self.layer_type == "linear_attention":
+            # Qwen3NextGatedDeltaNet expects [B, S, H]; handle THD (2-D) input.
+            is_thd = x.dim() == 2
+            hidden = self.input_layernorm(x)
+            if is_thd:
+                hidden = hidden.unsqueeze(0)
+
+            # Derive seq_idx from cu_seqlens so causal_conv1d respects
+            # packed-sequence boundaries (same derivation as NemotronV3 Mamba).
+            seq_idx = None
+            cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if cu_seqlens is not None:
+                total_len = hidden.shape[1]
+                positions = torch.arange(total_len, device=hidden.device)
+                seq_idx = torch.searchsorted(cu_seqlens[1:], positions, side="right").unsqueeze(0).to(torch.int32)
+
+            # The upstream HF forward hard-codes seq_idx=None in its
+            # causal_conv1d_fn call.  Temporarily replace the callable so the
+            # derived seq_idx is forwarded to the kernel instead.
+            _orig_conv1d_fn = getattr(self.linear_attn, "causal_conv1d_fn", None)
+            _patched = False
+            if seq_idx is not None and _orig_conv1d_fn is not None:
+                _si = seq_idx  # capture for closure
+
+                def _conv1d_with_seq_idx(*args, **kwargs):
+                    kwargs["seq_idx"] = _si
+                    return _orig_conv1d_fn(*args, **kwargs)
+
+                self.linear_attn.causal_conv1d_fn = _conv1d_with_seq_idx
+                _patched = True
+
             attn_out = self.linear_attn(
-                hidden_states=self.input_layernorm(x),
+                hidden_states=hidden,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                qkv_format=attn_kwargs.get("qkv_format"),
-                cu_seqlens=attn_kwargs.get("cu_seqlens"),
-                seq_index=attn_kwargs.get("seq_index"),
             )
+
+            if _patched:
+                self.linear_attn.causal_conv1d_fn = _orig_conv1d_fn
+
+            if is_thd:
+                attn_out = attn_out.squeeze(0)
         elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
                 x=self.input_layernorm(x),
