@@ -1,5 +1,5 @@
 # Supervised Fine-Tuning (SFT) configuration for NeMo AutoModel.
-# To run: automodel tutorials/sft-peft/sft_config.yaml --nproc-per-node 2
+# To run: automodel tutorials/sft-peft/sft_config.yaml
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -21,14 +21,14 @@ validation_dataset:
 
 step_scheduler:
   global_batch_size: 8
-  local_batch_size: 4
+  local_batch_size: 8
   val_every_steps: 10
   num_epochs: 1
   max_steps: 100
 
 distributed:
   strategy: fsdp2
-  tp_size: 2
+  tp_size: 1
   dp_size: none
   cp_size: 1
 

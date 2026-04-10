@@ -1,5 +1,5 @@
 # Domain Adaptive Pre-Training (DAPT) configuration for NeMo AutoModel.
-# To run: automodel tutorials/dapt/dapt_config.yaml --nproc-per-node 8
+# To run: automodel tutorials/dapt/dapt_config.yaml --nproc-per-node 2
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -55,7 +55,7 @@ distributed:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 10
 
 optimizer:
   _target_: torch.optim.AdamW
