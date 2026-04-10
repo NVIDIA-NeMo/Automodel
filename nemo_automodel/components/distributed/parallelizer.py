@@ -185,13 +185,19 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
-            # Disable KV caching during training to ensure deterministic
-            # shapes between forward and checkpoint recomputation.
-            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                try:
-                    model.config.use_cache = False
-                except Exception:
-                    pass
+            # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
+            # earlier layers to later layers through the DynamicCache.  Disabling
+            # the cache breaks this architectural dependency, so we must keep
+            # use_cache=True for those models.
+            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
+            _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
+
+            if not _has_kv_sharing:
+                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                    try:
+                        model.config.use_cache = False
+                    except Exception:
+                        pass
 
             # For HF-native models in transformers >= 5.3.0, GradientCheckpointingLayer.__call__
             # applies torch.utils.checkpoint at full-layer granularity when gradient_checkpointing=True.
@@ -219,7 +225,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 for i, layer in enumerate(layers):
                     if hasattr(layer, "mlp"):
                         layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                    if hasattr(layer, "self_attn"):
+                    # Skip self_attn checkpointing for KV-shared models:
+                    # recomputation would double-write to the DynamicCache,
+                    # corrupting K/V entries that shared layers depend on.
+                    if hasattr(layer, "self_attn") and not _has_kv_sharing:
                         layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
 
                     if hasattr(layer, "input_layernorm"):
@@ -350,6 +359,69 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             offload_policy=offload_policy,
             reshard_after_forward=False,
         )
+
+
+class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
+    """Parallelization strategy for Qwen3.5 dense models with mixed-dtype GatedDeltaNet.
+
+    Qwen3.5 has linear_attn layers with float32 params (A_log, norm) alongside
+    bfloat16 params. Overrides the FSDP sharding step to use fully_shard_by_dtype
+    per layer, and sets the CP mesh on CPAwareGatedDeltaNet modules.
+    """
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        # Patch HF GatedDeltaNet for FSDP mixed-dtype support (and CP if enabled)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
+        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
+        cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
+        patch_hf_model(model, cp_enabled=cp_enabled)
+
+        # Delegate TP, AC, mixed precision to the default strategy, but
+        # override the FSDP sharding to use fully_shard_by_dtype.
+        # Temporarily swap the global — safe because model init is single-threaded
+        # (one model is parallelized at a time). Not safe under concurrent calls.
+        original_fn = globals().get("apply_fsdp2_sharding_recursively")
+        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
+
+        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None):
+            if isinstance(module, nn.ModuleList):
+                for layer_id, child in enumerate(module):
+                    if isinstance(child, nn.ModuleList):
+                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                    else:
+                        _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
+                        parallelizer_utils.fully_shard_by_dtype(
+                            child,
+                            mesh,
+                            mp_policy,
+                            offload_policy,
+                        )
+            else:
+                for _, sub in module.named_children():
+                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+
+        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
+        try:
+            result = super().parallelize(
+                model,
+                device_mesh,
+                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+                **kwargs,
+            )
+        finally:
+            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+
+        # Set CP mesh on CPAwareGatedDeltaNet modules
+        if cp_enabled:
+            from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+
+            cp_mesh = device_mesh[cp_mesh_name]
+            for _, mod in model.named_modules():
+                if isinstance(mod, CPAwareGatedDeltaNet):
+                    mod._cp_mesh = cp_mesh
+
+        return result
 
 
 class WanParallelizationStrategy(ParallelizationStrategy):
@@ -497,6 +569,8 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
+    "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
 }
