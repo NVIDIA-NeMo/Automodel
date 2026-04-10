@@ -64,7 +64,7 @@ class NemotronV3Model(nn.Module):
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
-            train_gate=False,  # Router weights are trained but not using bias updates
+            train_gate=True,
             gate_bias_update_factor=0.0,
             aux_loss_coeff=0.0,  # No aux loss for NemotronV3
             score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
