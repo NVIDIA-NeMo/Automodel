@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -95,10 +94,7 @@ def test_get_repo_root_editable_checkout_appends_pythonpath(tmp_path, monkeypatc
 def test_get_repo_root_not_checkout(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = _get_repo_root()
-    expected = Path(__file__).parents[3] / "nemo_automodel" / "components" / "launcher"
-    assert result == Path(
-        nemo_automodel.components.launcher.interactive.__file__
-    ).parents[3]
+    assert result == Path(nemo_automodel.components.launcher.interactive.__file__).parents[3]
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +105,7 @@ def test_interactive_launcher_returns_1_when_torch_missing(monkeypatch, tmp_path
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("recipe:\n  _target_: some.Recipe\n")
 
-    import nemo_automodel.components.launcher.interactive as mod
-
-    original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+    original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
     def fake_import(name, *args, **kwargs):
         if name == "torch.distributed.run":
@@ -139,9 +133,7 @@ def _make_torch_distributed_mock(world_size=1, run_return=0):
     mock_module.determine_local_world_size.return_value = world_size
     mock_module.run.return_value = run_return
     mock_parser = mock.MagicMock()
-    mock_args = SimpleNamespace(
-        training_script="", training_script_args=[], nproc_per_node=0
-    )
+    mock_args = SimpleNamespace(training_script="", training_script_args=[], nproc_per_node=0)
     mock_parser.parse_known_args.return_value = (mock_args, [])
     mock_module.get_args_parser.return_value = mock_parser
     return mock_module, mock_args
@@ -270,10 +262,11 @@ def test_interactive_launcher_multi_device_with_extra_args(tmp_path):
 # InteractiveLauncher.launch – torchrun worker detection (in-process path)
 # ---------------------------------------------------------------------------
 def test_interactive_launcher_torchrun_worker_runs_in_process(tmp_path, monkeypatch):
-    """When LOCAL_RANK is set (i.e. already inside torchrun), run in-process."""
+    """When LOCAL_RANK and TORCHELASTIC_RUN_ID are set (i.e. already inside torchrun), run in-process."""
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("")
     monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "test-run-123")
 
     mock_recipe_instance = mock.MagicMock()
     mock_recipe_instance.run_train_validation_loop.return_value = 0
@@ -306,6 +299,7 @@ def test_interactive_launcher_torchrun_worker_ignores_nproc(tmp_path, monkeypatc
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("")
     monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "test-run-456")
 
     mock_recipe_instance = mock.MagicMock()
     mock_recipe_instance.run_train_validation_loop.return_value = 0
@@ -331,14 +325,78 @@ def test_interactive_launcher_torchrun_worker_ignores_nproc(tmp_path, monkeypatc
     mock_dist.run.assert_not_called()
 
 
+def test_interactive_launcher_local_rank_without_torchelastic_launches_torchrun(tmp_path, monkeypatch):
+    """When LOCAL_RANK is set but TORCHELASTIC_RUN_ID is not (e.g. SLURM),
+    the CLI should NOT treat this as a torchrun worker and should launch torchrun."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
+
+    mock_dist, mock_args = _make_torch_distributed_mock(world_size=8, run_return=0)
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive._get_repo_root",
+            return_value=Path("/opt/Automodel"),
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        rc = launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=8,
+        )
+    assert rc == 0
+    mock_dist.run.assert_called_once()
+    assert mock_args.nproc_per_node == 8
+
+
+def test_interactive_launcher_multi_device_explicit_nproc(tmp_path):
+    """Explicit --nproc-per-node 8 with 8 GPUs should launch torchrun with 8 workers."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+
+    mock_dist, mock_args = _make_torch_distributed_mock(world_size=8, run_return=0)
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive._get_repo_root",
+            return_value=Path("/opt/Automodel"),
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        rc = launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=8,
+        )
+    assert rc == 0
+    mock_dist.run.assert_called_once()
+    assert mock_args.nproc_per_node == 8
+
+
 def test_is_torchrun_worker_false(monkeypatch):
     monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
     assert InteractiveLauncher._is_torchrun_worker() is False
 
 
 def test_is_torchrun_worker_true(monkeypatch):
     monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "test-run-789")
     assert InteractiveLauncher._is_torchrun_worker() is True
+
+
+def test_is_torchrun_worker_false_local_rank_only(monkeypatch):
+    """LOCAL_RANK alone (e.g. set by SLURM) should NOT be detected as torchrun."""
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
+    assert InteractiveLauncher._is_torchrun_worker() is False
 
 
 import nemo_automodel.components.launcher.interactive
