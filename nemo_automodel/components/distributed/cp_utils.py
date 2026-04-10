@@ -149,7 +149,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     _original_sdpa = F_module.scaled_dot_product_attention
 
     @torch._dynamo.disable
-    def _cp_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs):
+    def _cp_sdpa(
+        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
+    ):
         # Re-wrap local Q/K/V as DTensors so DTensor SDPA dispatch fires the CP allgather.
         # Seq dim is 2: [B, nH, S/cp_size, D].
         if not isinstance(query, DTensor):
@@ -157,9 +159,14 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
             value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
         out = _original_sdpa(
-            query, key, value,
-            attn_mask=attn_mask, dropout_p=dropout_p,
-            is_causal=is_causal, scale=scale, enable_gqa=enable_gqa,
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
             **kwargs,
         )
         # Unwrap back to local tensor for the compiled O-proj + MLP region.
