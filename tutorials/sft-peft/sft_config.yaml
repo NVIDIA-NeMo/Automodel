@@ -1,5 +1,6 @@
 # Supervised Fine-Tuning (SFT) configuration for NeMo AutoModel.
-# To run: automodel tutorials/llm/sft-peft/sft_config.yaml --nproc-per-node 2
+# To run: automodel tutorials/sft-peft/sft_config.yaml --nproc-per-node 2
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -28,7 +29,7 @@ step_scheduler:
 distributed:
   strategy: fsdp2
   tp_size: 2
-  dp_size: null
+  dp_size: none
   cp_size: 1
 
 optimizer:
@@ -69,15 +70,14 @@ dist_env:
   timeout_minutes: 1
 
 rng:
-  _target_: StatefulRNG
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
 
 packed_sequence:
   packed_sequence_size: 0
 
-# Optional: enable Weights & Biases logging.
+# Uncomment and configure for W&B logging
 # wandb:
-#   enabled: true
 #   project: nemo-sft
 #   name: llama-3.2-1b-sft-squad

@@ -1,5 +1,6 @@
 # Domain Adaptive Pre-Training (DAPT) configuration for NeMo AutoModel.
-# To run: automodel tutorials/llm/dapt/dapt_config.yaml --nproc-per-node 8
+# To run: automodel tutorials/dapt/dapt_config.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -9,24 +10,20 @@ model:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  data_path:
-    - 1.0
-    - /path/to/preprocessed_data/domain_data_text_document  # REPLACE THIS with your bin/idx prefix
-  splits_string: "99,1,0"
-  splits_to_build: "train"
+  paths: /path/to/preprocessed_data/domain_data_text_document  # REPLACE THIS with your bin/idx prefix
   seq_length: 4096
+  split: "99,1,0"
+  splits_to_build: "train"
   tokenizer:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  data_path:
-    - 1.0
-    - /path/to/preprocessed_data/domain_data_text_document  # REPLACE THIS with your bin/idx prefix
-  splits_string: "99,1,0"
-  splits_to_build: "validation"
+  paths: /path/to/preprocessed_data/domain_data_text_document  # REPLACE THIS with your bin/idx prefix
   seq_length: 4096
+  split: "99,1,0"
+  splits_to_build: "validation"
   num_val_samples: 512
   tokenizer:
     _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
@@ -52,7 +49,7 @@ step_scheduler:
 
 distributed:
   strategy: fsdp2
-  dp_size: null
+  dp_size: none
   tp_size: 1
   cp_size: 1
 
@@ -81,7 +78,7 @@ checkpoint:
   save_consolidated: true
 
 rng:
-  _target_: StatefulRNG
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
 

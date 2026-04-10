@@ -1,5 +1,5 @@
 # Parameter-Efficient Fine-Tuning (PEFT / LoRA) configuration for NeMo AutoModel.
-# To run: automodel tutorials/llm/sft-peft/peft_config.yaml
+# To run: automodel tutorials/sft-peft/peft_config.yaml
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -35,7 +35,7 @@ step_scheduler:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  dp_size: null
+  dp_size: none
   cp_size: 1
 
 optimizer:
@@ -76,15 +76,14 @@ dist_env:
   timeout_minutes: 1
 
 rng:
-  _target_: StatefulRNG
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1111
   ranked: true
 
 packed_sequence:
   packed_sequence_size: 0
 
-# Optional: enable Weights & Biases logging.
+# Uncomment and configure for W&B logging
 # wandb:
-#   enabled: true
 #   project: nemo-peft
 #   name: llama-3.2-1b-lora-squad
