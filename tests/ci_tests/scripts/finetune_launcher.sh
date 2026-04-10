@@ -42,7 +42,7 @@ else
 fi
 
 # Customizer contract test dataset overrides
-if [[ "${CONFIG_PATH}" == *customizer/* ]]; then
+if [[ "${CONFIG_PATH}" == *customizer_* ]]; then
   CUSTOMIZER_DATA="${NEMO_CI_PATH}/datasets/customizer/sample-datasets"
   if [[ "${CONFIG_PATH}" == *chat* ]]; then
     CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/train.jsonl \
