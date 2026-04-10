@@ -74,6 +74,31 @@ All MoE models support `moe_overrides` — a dict that merges into the default `
 model = NeMoAutoModelForCausalLM.from_pretrained("model", moe_overrides={"gate_bias_update_factor": 1e-4})
 ```
 
+### Model MoE defaults
+
+| Model | `score_func` | `aux_loss_coeff` | `gate_bias_update_factor` | `e_score_correction_bias` |
+|-------|-------------|-----------------|--------------------------|--------------------------|
+| DeepSeek V3 | sigmoid | 0 | 1e-3 | yes |
+| DeepSeek V3.2 | sigmoid | 0 | 1e-3 | yes |
+| GLM4 MoE | sigmoid | 0.0 | 1e-3 | yes |
+| GLM4 MoE Lite | sigmoid | 0.0 | 1e-3 | yes |
+| GLM MoE DSA | sigmoid | 0.0 | 1e-3 | yes |
+| Mistral4 | softmax_with_bias | 0 | 1e-3 | yes |
+| MiniMax-M2 | sigmoid | 0 | 1e-3 | yes |
+| NemotronV3 | sigmoid | 0.0 | 0.0 | yes |
+| Qwen3 MoE | softmax | from config (0.0) | 0.0 | no |
+| Qwen3.5 MoE | softmax | from config (0.001) | 0.0 | no |
+| Qwen3 Next | softmax | from config | 0.0 | no |
+| Qwen3 Omni MoE | softmax | from config (0.0) | 0.0 | no |
+| Qwen3 VL MoE | softmax | from config (0.0) | 0.0 | no |
+| Gemma4 MoE | softmax | 0.0 | 0.0 | no |
+| GPT-OSS | softmax | from config | 0 | no |
+| Step3.5 | config-dependent | 0.0 | 0.0 | no |
+
+Models with `e_score_correction_bias=yes` use gate bias updates for load balancing.
+Models with `e_score_correction_bias=no` may use auxiliary loss (`aux_loss_coeff`) instead.
+All defaults are overridable via `moe_overrides`.
+
 ### MoEConfig fields
 
 | Field | Type | Description |
