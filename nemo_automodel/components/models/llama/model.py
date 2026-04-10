@@ -411,7 +411,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     ):
         super().__init__(config)
         self.config = config
-        self.backend = BackendConfig(**backend) if isinstance(backend, dict) else (backend or BackendConfig())
+        self.backend = backend or BackendConfig()
         self.model = LlamaModel(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

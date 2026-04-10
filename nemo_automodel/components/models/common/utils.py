@@ -260,12 +260,6 @@ class Float32RMSNorm(nn.Module):
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x):
-        # TP>1: input is a DTensor; torch.compile fails to propagate sharding through
-        # aten._to_copy with symbolic shapes, so use the dynamo-disabled path.
-        from torch.distributed.tensor import DTensor
-
-        if isinstance(x, DTensor):
-            return _float32_rms_norm_fwd_no_compile(x, self.weight, self.eps)
         return _float32_rms_norm_fwd(x, self.weight, self.eps)
 
 
@@ -405,9 +399,6 @@ def _make_lazy_te_patcher():
 
 
 _patch_te_modules = _make_lazy_te_patcher()
-
-# Cached dynamo-disabled wrapper for Float32RMSNorm under TP (DTensor inputs).
-_float32_rms_norm_fwd_no_compile = torch._dynamo.disable(_float32_rms_norm_fwd)
 
 
 def get_rope_config(config) -> tuple[float, dict, float]:
