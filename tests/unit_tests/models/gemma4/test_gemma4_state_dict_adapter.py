@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma4MoEStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -293,11 +294,13 @@ class TestRoundTrip:
         nemo_sd = adapter.from_hf(hf_sd)
         hf_sd_rt = adapter.to_hf(nemo_sd)
 
-        for key in ["model.language_model.layers.0.experts.gate_up_proj",
-                     "model.language_model.layers.0.experts.down_proj",
-                     "model.language_model.layers.0.router.per_expert_scale",
-                     "model.language_model.layers.0.router.proj.weight",
-                     "model.language_model.layers.0.router.scale"]:
+        for key in [
+            "model.language_model.layers.0.experts.gate_up_proj",
+            "model.language_model.layers.0.experts.down_proj",
+            "model.language_model.layers.0.router.per_expert_scale",
+            "model.language_model.layers.0.router.proj.weight",
+            "model.language_model.layers.0.router.scale",
+        ]:
             assert key in hf_sd_rt, f"Missing key after round-trip: {key}"
             assert hf_sd[key].shape == hf_sd_rt[key].shape, f"Shape mismatch for {key}"
 

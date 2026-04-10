@@ -599,7 +599,7 @@ class Checkpointer:
                 key_mapping=key_mapping,
             )
 
-        _reinit_rope_buffers(model, device)
+        _reinit_non_persistent_buffers(model, device)
 
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
@@ -1025,24 +1025,26 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
 
-def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
+def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> None:
     """
-    Recompute non-persistent RoPE ``inv_freq`` buffers.
+    Recompute non-persistent buffers that are not saved in checkpoints.
 
-    Non-persistent buffers are not saved in checkpoints, so after meta-device
-    materialization they contain uninitialized CUDA memory.  When
-    ``initialize_weights()`` is skipped (e.g. for Gemma3 to avoid DTensor
-    issues), these buffers must be recomputed explicitly.
+    After meta-device materialization, non-persistent buffers contain
+    uninitialized CUDA memory.  When ``initialize_weights()`` is skipped
+    (e.g. for Gemma3 to avoid DTensor issues), these buffers must be
+    recomputed explicitly.
 
-    Handles two RoPE patterns:
-    - Standard: single ``inv_freq`` buffer with ``rope_init_fn`` + ``rope_kwargs``
-      (e.g. Nemotron-NAS).
-    - Per-layer-type: ``{layer_type}_inv_freq`` buffers with per-type init
-      via ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
-      In transformers v5.5, Gemma3RotaryEmbedding registers per-layer-type inv_freq buffers as non-persistent.
+    Handles three patterns:
+
+    1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` +
+       ``rope_kwargs`` (e.g. Nemotron-NAS).
+    2. **Per-layer-type RoPE** — ``{layer_type}_inv_freq`` buffers via
+       ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
+    3. **Scaled embedding** — ``embed_scale`` buffer on ``ScaledWordEmbedding``
+       modules (Gemma family), recomputed from ``scalar_embed_scale``.
 
     Args:
-        model: Model to reinitialize RoPE buffers for.
+        model: Model to reinitialize non-persistent buffers for.
         device: Device to create the new buffers on.
     """
     for name, module in model.named_modules():
@@ -1085,6 +1087,14 @@ def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
                     logging.debug(f"Reinitialized RoPE {inv_freq_attr} for {name} on device {device}")
                 except Exception as e:
                     logging.warning(f"Failed to reinitialize RoPE {inv_freq_attr} for {name}: {e}")
+
+        # Pattern 3: ScaledWordEmbedding embed_scale (Gemma family)
+        if hasattr(module, "scalar_embed_scale") and "embed_scale" in getattr(module, "_buffers", {}):
+            try:
+                module.embed_scale = torch.tensor(module.scalar_embed_scale, device=device)
+                logging.debug(f"Reinitialized embed_scale={module.scalar_embed_scale} for {name} on device {device}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize embed_scale for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:

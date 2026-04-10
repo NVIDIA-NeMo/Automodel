@@ -148,7 +148,7 @@ class TestGemma4Gate:
 
     def test_root_size_value(self, text_config):
         gate = Gemma4Gate(text_config)
-        expected = text_config.hidden_size ** -0.5
+        expected = text_config.hidden_size**-0.5
         torch.testing.assert_close(gate.root_size, torch.tensor(expected))
 
     def test_scale_initialized_to_ones(self, text_config):
@@ -361,8 +361,11 @@ class TestGemma4ForConditionalGeneration:
 
     def test_state_dict_adapter_created_when_enabled(self, gemma4_config):
         backend = BackendConfig(
-            linear="torch", attn="sdpa", rms_norm="torch",
-            experts="torch", dispatcher="torch",
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
             enable_hf_state_dict_adapter=True,
         )
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend)
@@ -378,8 +381,11 @@ class TestGemma4ForConditionalGeneration:
         model = Gemma4ForConditionalGeneration(
             cfg,
             backend=BackendConfig(
-                linear="torch", attn="sdpa", rms_norm="torch",
-                experts="torch", dispatcher="torch",
+                linear="torch",
+                attn="sdpa",
+                rms_norm="torch",
+                experts="torch",
+                dispatcher="torch",
                 enable_hf_state_dict_adapter=False,
             ),
             text_config=override,
@@ -468,6 +474,7 @@ class TestGemma4ForConditionalGeneration:
                 def tracker(buf_dev):
                     init_calls.append(buf_dev)
                     return orig(buf_dev)
+
                 return tracker
 
             layer.moe.init_weights = make_tracker(original_init)
@@ -494,8 +501,11 @@ class TestGemma4ForConditionalGenerationClassmethods:
     def test_from_pretrained_classmethod(self):
         cfg = _make_gemma4_config()
         backend = BackendConfig(
-            linear="torch", attn="sdpa", rms_norm="torch",
-            experts="torch", dispatcher="torch",
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
             enable_hf_state_dict_adapter=False,
         )
 
@@ -505,11 +515,13 @@ class TestGemma4ForConditionalGenerationClassmethods:
             mock_from_pretrained.return_value = cfg
 
             with patch.object(
-                Gemma4ForConditionalGeneration, "from_config",
+                Gemma4ForConditionalGeneration,
+                "from_config",
                 wraps=Gemma4ForConditionalGeneration.from_config,
             ) as mock_from_config:
                 model = Gemma4ForConditionalGeneration.from_pretrained(
-                    "gemma4/model", backend=backend,
+                    "gemma4/model",
+                    backend=backend,
                 )
                 assert isinstance(model, Gemma4ForConditionalGeneration)
                 mock_from_pretrained.assert_called_once_with("gemma4/model")
