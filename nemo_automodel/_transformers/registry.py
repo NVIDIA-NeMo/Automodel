@@ -36,6 +36,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
         ),
         (
+            "DeciLMForCausalLM",
+            ("nemo_automodel.components.models.decilm.model", "DeciLMForCausalLM"),
+        ),
+        (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
