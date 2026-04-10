@@ -70,6 +70,7 @@ def _load_openai_messages(
     split: Optional[str] = None,
     name: Optional[str] = None,
     shuffle_seed: Optional[int] = None,
+    skip_invalid_samples: bool = False,
 ):
     """Load OpenAI chat messages datasets from HF or local JSON/JSONL files.
 
@@ -88,6 +89,8 @@ def _load_openai_messages(
         name: Dataset configuration/subset name
         shuffle_seed: Random seed for shuffling HF datasets before slicing.
             Set to ``None`` to disable shuffling.
+        skip_invalid_samples: If ``True``, skip malformed JSONL lines for local
+            files instead of failing fast.
     """
     if isinstance(path_or_dataset_id, str) and _is_hf_repo_id(path_or_dataset_id):
         base_split, sl = _parse_split_slice(split)
@@ -151,11 +154,23 @@ def _load_openai_messages(
             raise FileNotFoundError(f"File not found: {fp}")
         text = p.read_text(encoding="utf-8")
         if p.suffix.lower() in {".jsonl", ".ndjson"}:
+            skipped_lines = 0
             for line in text.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    if not skip_invalid_samples:
+                        raise
+                    skipped_lines += 1
+            if skipped_lines:
+                logging.getLogger(__name__).warning(
+                    "Skipped %d malformed JSONL line(s) from %s (skip_invalid_samples=True)",
+                    skipped_lines,
+                    fp,
+                )
         else:
             obj = json.loads(text)
             if isinstance(obj, list):
@@ -276,7 +291,27 @@ class ChatDataset(Dataset):
         shuffle_seed: Optional[int] = None,
         mask_reasoning_content: bool = False,
         unshifted: bool = False,
+        skip_invalid_samples: bool = False,
     ) -> None:
+        """Load OpenAI-format chat rows and tokenize via the chat template.
+
+        Args:
+            path_or_dataset_id: Hugging Face dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory.
+            tokenizer: Tokenizer with chat template support (required).
+            split: Dataset split or slice (e.g. ``train``, ``train[1024:]``).
+            name: Optional Hub subset / config name.
+            seq_length: Maximum sequence length for padding and truncation in formatting.
+            padding: Padding mode for ``format_chat_template``.
+            truncation: Truncation mode for ``format_chat_template``.
+            start_of_turn_token: Optional token marking assistant turns for answer-only loss.
+            chat_template: Optional Jinja template string overriding ``tokenizer.chat_template``.
+            shuffle_seed: If set, shuffles Hub/Parquet data before applying a split slice.
+            mask_reasoning_content: If ``True``, exclude rendered reasoning traces from the loss mask.
+            unshifted: Passed through to ``format_chat_template``.
+            skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
+                include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
+                load; those still raise when a sample is accessed.
+        """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
 
@@ -294,8 +329,15 @@ class ChatDataset(Dataset):
         self.start_of_turn_token = start_of_turn_token
         self.mask_reasoning_content = mask_reasoning_content
         self.unshifted = unshifted
+        self.skip_invalid_samples = skip_invalid_samples
 
-        self.dataset = _load_openai_messages(path_or_dataset_id, split=split, name=name, shuffle_seed=shuffle_seed)
+        self.dataset = _load_openai_messages(
+            path_or_dataset_id,
+            split=split,
+            name=name,
+            shuffle_seed=shuffle_seed,
+            skip_invalid_samples=skip_invalid_samples,
+        )
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)

@@ -59,6 +59,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
+    freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
 )
@@ -455,6 +456,10 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config)
 
+    # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
+    # so the optimizer never tracks them and checkpoint save/resume stay consistent.
+    freeze_unused_kv_sharing_params(model)
+
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         loss_fn = MaskedCrossEntropy()
@@ -540,10 +545,14 @@ def apply_model_infrastructure(
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     if mesh.cp_size > 1 and not _uses_te_attention(model):
-        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+        from nemo_automodel.components.distributed.cp_utils import (
+            attach_context_parallel_hooks,
+            attach_linear_attn_position_hooks,
+        )
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
+            attach_linear_attn_position_hooks(mp)
 
     return model

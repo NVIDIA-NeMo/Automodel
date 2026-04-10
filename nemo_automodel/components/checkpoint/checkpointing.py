@@ -141,6 +141,7 @@ class CheckpointingConfig:
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
+    best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
 
     def __post_init__(self):
         """
@@ -266,7 +267,11 @@ class Checkpointer:
 
         # Convert to HF format if using custom model implementations
         state_dict = _maybe_adapt_state_dict_to_hf(
-            model_state.model[0], state_dict, quantization=False, device_mesh=self.moe_mesh
+            model_state.model[0],
+            state_dict,
+            quantization=False,
+            device_mesh=self.moe_mesh,
+            v4_compatible=self.config.v4_compatible,
         )
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)

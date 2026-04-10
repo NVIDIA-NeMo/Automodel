@@ -56,6 +56,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.dllm.strategy import get_dllm_strategy
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -84,6 +85,12 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         self.dllm_mode = dllm_cfg.get("mode", "mdlm")
         self.dllm_strategy = get_dllm_strategy(self.dllm_mode)
+        if self.dllm_strategy.normalization_mode not in ("supervised", "noise"):
+            raise ValueError(
+                f"Invalid normalization_mode {self.dllm_strategy.normalization_mode!r} "
+                f"from strategy {type(self.dllm_strategy).__name__}. "
+                f"Must be 'supervised' or 'noise'."
+            )
 
         self.dllm_eps = float(dllm_cfg.get("eps", 1e-3))
         self.dllm_block_size = dllm_cfg.get("block_size", None)
@@ -118,7 +125,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         logger.info(
             f"dLLM SFT setup: mode={self.dllm_mode}, mask_token_id={self.mask_token_id}, "
             f"eps={self.dllm_eps}, block_size={self.dllm_block_size}, "
-            f"half_life_ratio={self.dllm_half_life_ratio}"
+            f"half_life_ratio={self.dllm_half_life_ratio}, "
+            f"normalization_mode={self.dllm_strategy.normalization_mode}"
         )
 
         # --- Wrap dataloader collate to produce unshifted format ---
@@ -156,12 +164,16 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         if max_seq_len is not None:
             max_seq_len = int(max_seq_len)
 
+        dllm_cfg = self.cfg.get("dllm", {})
+        supervise_padding = bool(dllm_cfg.get("supervise_padding", False))
+
         collator = DLLMCollator(
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             block_size=self.dllm_pad_block_size,
             pad_seq_len_divisible=self.dllm_pad_seq_len_divisible,
             max_seq_len=max_seq_len,
+            supervise_padding=supervise_padding,
         )
 
         self.dataloader.collate_fn = collator
@@ -244,6 +256,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         )
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+            batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
             del out
@@ -275,6 +288,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         # Pre-corrupt all microbatches so we can count noise tokens globally
         # before any forward pass.
         num_noise_tokens = 0  # diffusion loss denominator (corrupted positions)
+        num_supervised_tokens = 0  # total supervised tokens (all loss_mask==1 positions)
 
         for batch in batches:
             noisy_input_ids, noise_mask, p_mask = self._apply_corruption(batch["input_ids"], batch["loss_mask"])
@@ -283,8 +297,16 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             batch["_p_mask"] = p_mask
             batch["_clean_input_ids"] = batch["input_ids"].clone()
             num_noise_tokens += noise_mask.sum().item()
+            num_supervised_tokens += batch["loss_mask"].sum().item()
 
         num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens, dtype=torch.long)).item()
+        num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens, dtype=torch.long)).item()
+
+        # Select denominator based on strategy (MDLM -> supervised, future models may use noise)
+        if self.dllm_strategy.normalization_mode == "noise":
+            num_diffusion_tokens = num_noise_tokens
+        else:
+            num_diffusion_tokens = num_supervised_tokens
 
         loss_buffer = []
 
@@ -303,7 +325,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 i,
                 batch,
                 loss_buffer=loss_buffer,
-                num_diffusion_tokens=num_noise_tokens,
+                num_diffusion_tokens=num_diffusion_tokens,
                 num_batches=num_batches,
             )
 
@@ -320,7 +342,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_noise_tokens,
+            num_label_tokens=num_diffusion_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
@@ -394,6 +416,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 "Train/tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
                 "Train/mfu": mfu,
                 "Train/tokens_per_step": num_tokens_in_batch,
+                "Train/supervised_tokens": num_supervised_tokens,
                 "Train/mode": self.dllm_mode,
             },
         )
@@ -411,7 +434,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 mp.eval()
 
             total_weighted_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            total_noise_tokens = 0
+            total_norm_tokens = 0
+            use_noise = self.dllm_strategy.normalization_mode == "noise"
 
             for batch in val_dataloader:
                 # Pre-corrupt this val batch (same as training path)
@@ -425,27 +449,29 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
                 # Count tokens for this batch (all-reduce across DP for this batch)
                 num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()
+                num_supervised = self._dp_allreduce(torch.tensor(loss_mask.sum().item(), dtype=torch.long)).item()
+                num_norm = num_noise if use_noise else num_supervised
 
                 loss_buffer = []
                 self._forward_backward_step(
                     0,
                     batch,
                     loss_buffer=loss_buffer,
-                    num_diffusion_tokens=num_noise,
+                    num_diffusion_tokens=num_norm,
                     num_batches=1,
                     is_train=False,
                 )
 
-                # Accumulate: per-token-avg loss * noise_count
+                # Accumulate: per-token-avg loss * norm_count
                 batch_loss = torch.sum(torch.stack(loss_buffer)).item()
                 batch_loss = self._dp_allreduce(
                     torch.tensor(batch_loss, dtype=torch.float32, device=self.dist_env.device),
                     include_cp=True,
                 ).item()
-                total_weighted_loss += batch_loss * num_noise
-                total_noise_tokens += num_noise
+                total_weighted_loss += batch_loss * num_norm
+                total_norm_tokens += num_norm
 
-        val_loss = total_weighted_loss / max(total_noise_tokens, 1e-8)
+        val_loss = total_weighted_loss / max(total_norm_tokens, 1e-8)
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
         # Clear dLLM loss buffer from validation
@@ -457,7 +483,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             metrics={
                 "val_loss": val_loss,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_noise_tokens,
+                "num_label_tokens": total_norm_tokens,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
             },
         )

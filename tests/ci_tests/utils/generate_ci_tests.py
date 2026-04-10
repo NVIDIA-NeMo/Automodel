@@ -109,20 +109,11 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         }
     }
 
-    # Configure test script (finetune or benchmark) and set template
-    test_script = ""
+    # Configure test template
     if 'benchmark' in config.stem:
-        test_script = "benchmark"
-        job['extends'] = f'.llm_{test_script}_test'
+        job['extends'] = '.llm_benchmark_test'
     else:
-        test_script = "finetune"
         job['extends'] = f'.{test_folder}_test'
-
-    # Configure test stage based on test script
-    if 'peft' in config.stem:
-        job['stage'] = f'{test_script}_peft'
-    else:
-        job['stage'] = f'{test_script}_sft'
 
     # Apply resource overrides (time, nodes, etc.) from the recipe's top-level ci: section
     recipe_path = f"{automodel_dir}/{config}"
@@ -135,6 +126,7 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         'nodes': 'TEST_NODE_COUNT',
         'node_multiplier': 'NODE_MULTIPLIER',
         'local_batch_size': 'LOCAL_BATCH_SIZE',
+        'recipe_owner': 'RECIPE_OWNER',
     }
     for ci_key, ci_var in ci_key_map.items():
         if ci_key in ci_config:
@@ -146,6 +138,17 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
             else:
                 job['variables'][ci_var] = value
 
+    has_robustness = bool(ci_config.get('checkpoint_robustness'))
+    job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
+
+    # Configure test stage based on recipe type and robustness config
+    if 'benchmark' in config.stem:
+        job['stage'] = 'benchmark'
+    elif 'peft' in config.stem:
+        job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
+    else:
+        job['stage'] = 'sft_ckpt_robustness' if has_robustness else 'sft'
+
     # Check if config has known issue
     known_issue_config_list = config_override.get('known_issue') or []
     if config.stem in known_issue_config_list:
@@ -156,7 +159,20 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         slurm_time = job['variables'].get('TIME', '00:10:00')
         job['variables']['TIME'] = DQ(slurm_time_multiplier(slurm_time, 2))
 
-    return job
+    # Generate vLLM deploy job if recipe opts in
+    vllm_job = None
+    if ci_config.get('vllm_deploy'):
+        vllm_stage = 'peft_vllm_deploy' if 'peft' in config.stem else 'sft_vllm_deploy'
+        vllm_job = {
+            'extends': '.vllm_deploy_test',
+            'stage': vllm_stage,
+            'variables': {
+                'CONFIG_PATH': f'{config}',
+                'TEST_LEVEL': f'{scope}',
+            }
+        }
+
+    return job, vllm_job
 
 
 def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
@@ -198,7 +214,10 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         if model_name in exempt_models_list or config_name in exempt_configs_list:
             continue
 
-        pipeline[f'{config_name}'] = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        job, vllm_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        pipeline[f'{config_name}'] = job
+        if vllm_job:
+            pipeline[f'{config_name}_vllm_deploy'] = vllm_job
 
     return pipeline
 

@@ -93,4 +93,8 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  min_lr: 1.0e-6 
+  min_lr: 1.0e-6
+
+ci:
+  recipe_owner: ZhiyuLi-Nvidia
+  time: "00:30:00"

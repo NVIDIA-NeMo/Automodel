@@ -100,4 +100,14 @@ optimizer:
   eps: 1e-8
 
 ci:
-  nodes: 2
+  recipe_owner: adil-a
+  time: "00:15:00"
+  nodes: 1
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    tokenizer_name: Qwen/Qwen3-30B-A3B
+    trust_remote_code: true
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500

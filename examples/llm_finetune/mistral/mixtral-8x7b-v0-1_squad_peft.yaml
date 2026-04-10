@@ -104,4 +104,5 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  recipe_owner: HuiyingLi
   nodes: 2
