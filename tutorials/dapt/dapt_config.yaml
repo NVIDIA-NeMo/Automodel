@@ -1,0 +1,92 @@
+# Domain Adaptive Pre-Training (DAPT) configuration for NeMo AutoModel.
+# To run: automodel tutorials/llm/dapt/dapt_config.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  data_path:
+    - 1.0
+    - /path/to/preprocessed_data/domain_data_text_document  # REPLACE THIS with your bin/idx prefix
+  splits_string: "99,1,0"
+  splits_to_build: "train"
+  seq_length: 4096
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  data_path:
+    - 1.0
+    - /path/to/preprocessed_data/domain_data_text_document  # REPLACE THIS with your bin/idx prefix
+  splits_string: "99,1,0"
+  splits_to_build: "validation"
+  seq_length: 4096
+  num_val_samples: 512
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 4
+  num_epochs: 1
+  max_steps: 1000
+  ckpt_every_steps: 200
+  val_every_steps: 100
+
+distributed:
+  strategy: fsdp2
+  dp_size: null
+  tp_size: 1
+  cp_size: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 50
+  min_lr: 2e-6
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
+rng:
+  _target_: StatefulRNG
+  seed: 1111
+  ranked: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+packed_sequence:
+  packed_sequence_size: 4096
