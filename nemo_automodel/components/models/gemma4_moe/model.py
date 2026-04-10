@@ -248,7 +248,6 @@ class Gemma4MoETextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
-        **kwargs,
     ):
         super().__init__()
         self.backend = backend
@@ -267,7 +266,7 @@ class Gemma4MoETextModelBackend(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 0.0),
+            gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
             aux_loss_coeff=0.0,
@@ -458,7 +457,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             text_config,
             backend=self.backend,
             moe_config=moe_config,
-            **kwargs,
         )
 
         # Expose moe_config for the MoE parallelizer assertion

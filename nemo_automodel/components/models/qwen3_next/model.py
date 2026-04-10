@@ -119,7 +119,7 @@ class Block(nn.Module):
 
 
 class Qwen3NextModel(nn.Module):
-    def __init__(self, config: Qwen3NextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, **kwargs):
+    def __init__(self, config: Qwen3NextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -135,7 +135,7 @@ class Qwen3NextModel(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 0.0),
+            gate_bias_update_factor=0.0,
             score_func="softmax",  # Qwen3Next uses softmax topk routing
             route_scale=1.0,
             aux_loss_coeff=config.router_aux_loss_coef,
@@ -259,7 +259,7 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, **kwargs)
+        self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3NextStateDictAdapter(

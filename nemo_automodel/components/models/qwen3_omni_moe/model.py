@@ -43,7 +43,7 @@ class Qwen3OmniMoeThinkerTextModel(
 ):  # corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
 
-    def __init__(self, config: Qwen3OmniMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, **kwargs):
+    def __init__(self, config: Qwen3OmniMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -61,7 +61,7 @@ class Qwen3OmniMoeThinkerTextModel(
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
-            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 0.0),
+            gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
             aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
@@ -215,7 +215,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.backend = backend
 
         text_config = base_config.text_config if hasattr(base_config, "text_config") else base_config
-        self.model = Qwen3OmniMoeThinkerTextModel(text_config, backend=self.backend, moe_config=moe_config, **kwargs)
+        self.model = Qwen3OmniMoeThinkerTextModel(text_config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )

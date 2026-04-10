@@ -171,7 +171,7 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
 class Qwen3VLMoeTextModelBackend(nn.Module):
     """Qwen3-VL text decoder rebuilt on top of the Qwen3-MoE block implementation."""
 
-    def __init__(self, config: Qwen3VLMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None, **kwargs):
+    def __init__(self, config: Qwen3VLMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
         super().__init__()
         self.backend = backend
         self.config = config
@@ -189,7 +189,7 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
-            gate_bias_update_factor=kwargs.get("gate_bias_update_factor", 0.0),
+            gate_bias_update_factor=0.0,
             score_func="softmax",
             route_scale=1.0,
             aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
@@ -352,7 +352,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
         self.model.__class__ = Qwen3VLMoeModel
 
         text_config = config.text_config if hasattr(config, "text_config") else config
-        self.model.language_model = Qwen3VLMoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config, **kwargs)
+        self.model.language_model = Qwen3VLMoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )
