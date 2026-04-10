@@ -14,13 +14,6 @@
 
 """Common/shared components for model implementations."""
 
-from nemo_automodel.components.models.common.combined_projection import (
-    CombinedGateUpMLP,
-    CombinedQKVAttentionMixin,
-)
-from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
-    CombinedProjectionStateDictAdapter,
-)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     HAVE_DEEP_EP,
@@ -32,10 +25,6 @@ from nemo_automodel.components.models.common.utils import (
 )
 
 __all__ = [
-    # Combined projection
-    "CombinedQKVAttentionMixin",
-    "CombinedGateUpMLP",
-    "CombinedProjectionStateDictAdapter",
     # HF checkpointing mixin
     "HFCheckpointingMixin",
     # Backend utilities
