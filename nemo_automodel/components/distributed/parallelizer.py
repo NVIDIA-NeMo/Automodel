@@ -47,6 +47,8 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.distributed.mesh_utils import get_submesh
+
 
 def _is_transformers_v5_or_higher() -> bool:
     """Check if transformers version is 5.x or higher."""
@@ -90,6 +92,7 @@ from nemo_automodel.components.distributed.parallel_styles import translate_to_l
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
+logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
 try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
@@ -148,7 +151,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Extract layers from the model for parallelization
         layers = _extract_model_layers(model)
@@ -182,13 +185,19 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # Apply activation checkpointing to linear layers if requested
         if activation_checkpointing:
-            # Disable KV caching during training to ensure deterministic
-            # shapes between forward and checkpoint recomputation.
-            if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                try:
-                    model.config.use_cache = False
-                except Exception:
-                    pass
+            # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
+            # earlier layers to later layers through the DynamicCache.  Disabling
+            # the cache breaks this architectural dependency, so we must keep
+            # use_cache=True for those models.
+            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
+            _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
+
+            if not _has_kv_sharing:
+                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+                    try:
+                        model.config.use_cache = False
+                    except Exception:
+                        pass
 
             # For HF-native models in transformers >= 5.3.0, GradientCheckpointingLayer.__call__
             # applies torch.utils.checkpoint at full-layer granularity when gradient_checkpointing=True.
@@ -216,7 +225,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 for i, layer in enumerate(layers):
                     if hasattr(layer, "mlp"):
                         layers[i].mlp = checkpoint_wrapper(layer.mlp)
-                    if hasattr(layer, "self_attn"):
+                    # Skip self_attn checkpointing for KV-shared models:
+                    # recomputation would double-write to the DynamicCache,
+                    # corrupting K/V entries that shared layers depend on.
+                    if hasattr(layer, "self_attn") and not _has_kv_sharing:
                         layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
 
                     if hasattr(layer, "input_layernorm"):
@@ -331,7 +343,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                     layers[i] = checkpoint_wrapper(layers[i])
 
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
@@ -347,6 +359,69 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
             offload_policy=offload_policy,
             reshard_after_forward=False,
         )
+
+
+class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
+    """Parallelization strategy for Qwen3.5 dense models with mixed-dtype GatedDeltaNet.
+
+    Qwen3.5 has linear_attn layers with float32 params (A_log, norm) alongside
+    bfloat16 params. Overrides the FSDP sharding step to use fully_shard_by_dtype
+    per layer, and sets the CP mesh on CPAwareGatedDeltaNet modules.
+    """
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        # Patch HF GatedDeltaNet for FSDP mixed-dtype support (and CP if enabled)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
+        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
+        cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
+        patch_hf_model(model, cp_enabled=cp_enabled)
+
+        # Delegate TP, AC, mixed precision to the default strategy, but
+        # override the FSDP sharding to use fully_shard_by_dtype.
+        # Temporarily swap the global — safe because model init is single-threaded
+        # (one model is parallelized at a time). Not safe under concurrent calls.
+        original_fn = globals().get("apply_fsdp2_sharding_recursively")
+        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
+
+        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None):
+            if isinstance(module, nn.ModuleList):
+                for layer_id, child in enumerate(module):
+                    if isinstance(child, nn.ModuleList):
+                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                    else:
+                        _pre_shard_combined_projections(child, mesh, mp_policy, offload_policy)
+                        parallelizer_utils.fully_shard_by_dtype(
+                            child,
+                            mesh,
+                            mp_policy,
+                            offload_policy,
+                        )
+            else:
+                for _, sub in module.named_children():
+                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+
+        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
+        try:
+            result = super().parallelize(
+                model,
+                device_mesh,
+                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+                **kwargs,
+            )
+        finally:
+            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+
+        # Set CP mesh on CPAwareGatedDeltaNet modules
+        if cp_enabled:
+            from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+
+            cp_mesh = device_mesh[cp_mesh_name]
+            for _, mod in model.named_modules():
+                if isinstance(mod, CPAwareGatedDeltaNet):
+                    mod._cp_mesh = cp_mesh
+
+        return result
 
 
 class WanParallelizationStrategy(ParallelizationStrategy):
@@ -372,7 +447,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
         # Not using custom tp_shard_plan; apply Wan-specific plan
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Apply TP only when TP group size > 1
         if tp_mesh.size() > 1:
@@ -462,7 +537,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         tp_mesh_name: str = "tp",
     ) -> nn.Module:
         dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = device_mesh[dp_mesh_dim_names]
+        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
 
         # Mixed precision default like Default strategy
         if not mp_policy:
@@ -494,6 +569,8 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
+    "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
 }
@@ -1123,7 +1200,9 @@ def _get_parallel_plan(
 
     if isinstance(tp_shard_plan, dict):
         model_parallel_plan = tp_shard_plan
-        logger.info(f"Using parallel plan (dictionary). {tp_shard_plan}")
+        col_w = max(55, max(map(len, tp_shard_plan.keys()), default=0))
+        plan_lines = "\n".join(f"  {k:<{col_w}} {v}" for k, v in tp_shard_plan.items())
+        logger.info(f"Using parallel plan (dictionary):\n{plan_lines}")
     elif tp_shard_plan == LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME:
         model_arch = None
         if hasattr(model, "config") and hasattr(model.config, "architectures") and model.config.architectures:
