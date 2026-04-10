@@ -203,3 +203,27 @@ class TestMiniMaxM2ForCausalLM:
             logits = model(input_ids)
 
         assert logits.shape == (2, 6, config.vocab_size)
+
+
+class TestMoeOverrides:
+    """Tests for the moe_overrides dict pattern."""
+
+    def test_moe_overrides_applied(self, config, backend):
+        """moe_overrides should merge into the default MoEConfig."""
+        model = MiniMaxM2Model(config, backend, moe_overrides={"gate_bias_update_factor": 0.5})
+        assert model.moe_config.gate_bias_update_factor == 0.5
+
+    def test_moe_overrides_preserves_defaults(self, config, backend):
+        """Unspecified fields should keep their defaults."""
+        model = MiniMaxM2Model(config, backend, moe_overrides={"gate_bias_update_factor": 0.5})
+        assert model.moe_config.aux_loss_coeff == 0
+
+    def test_moe_config_and_moe_overrides_raises(self, config, backend, moe_config):
+        """Passing both moe_config and moe_overrides should raise ValueError."""
+        with pytest.raises(ValueError, match="Cannot pass both"):
+            MiniMaxM2Model(config, backend, moe_config=moe_config, moe_overrides={"gate_bias_update_factor": 0.5})
+
+    def test_moe_overrides_via_causal_lm(self, config, backend):
+        """moe_overrides should flow from ForCausalLM to inner model."""
+        model = MiniMaxM2ForCausalLM(config, backend=backend, moe_overrides={"gate_bias_update_factor": 0.5})
+        assert model.model.moe_config.gate_bias_update_factor == 0.5
