@@ -41,6 +41,12 @@ model:
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   trust_remote_code: true
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 distributed:
   strategy: fsdp2
   dp_size: none
