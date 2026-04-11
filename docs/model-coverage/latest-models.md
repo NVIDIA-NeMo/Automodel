@@ -6,6 +6,7 @@ See the [Model Coverage Overview](overview.md) for release summaries, and the [L
 
 | Date | Model | HF Model ID | Modality | Recipe | Try on Brev |
 |------|-------|-------------|----------|--------|------|
+| 2026-04-11 | LLaVA-OneVision-1.5 (4B / 8B) | [`lmms-lab/LLaVA-OneVision-1.5-4B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct) | VLM | [llava_ov_1_5_4b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml) | 🚧 |
 | 2026-04-07 | GLM-5.1 | [`zai-org/GLM-5.1`](https://huggingface.co/zai-org/GLM-5.1) | LLM | [glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) | 🚧 |
 | 2026-04-02 | Gemma 4 | [`google/gemma-4-4b-it`](https://huggingface.co/google/gemma-4-4b-it) | VLM | [gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) | 🚧 |
 | 2026-03-16 | Mistral Small 4 | [`mistralai/Mistral-Small-4-119B-2603`](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) | VLM | [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) | 🚧 |
