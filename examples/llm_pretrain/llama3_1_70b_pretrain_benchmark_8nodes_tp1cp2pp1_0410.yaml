@@ -31,7 +31,7 @@ model:
   attn_implementation: sdpa  # required for cp>1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: torch_fp32
+    rms_norm: te
 
 checkpoint:
   enabled: False
@@ -69,7 +69,7 @@ distributed:
   enable_fsdp2_prefetch: True
   fsdp2_backward_prefetch_depth: 2
   fsdp2_forward_prefetch_depth: 1
-  enable_compile: True
+  enable_compile: False
   defer_fsdp_grad_sync: False   # Must be False with GA>1: True → delayed resharding → OOM
   mp_policy:
     param_dtype: bfloat16
