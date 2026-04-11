@@ -512,7 +512,15 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             encoder_outputs = BaseModelOutput(*encoder_outputs)
 
         encoder_hidden_states = encoder_outputs[0]
-        encoder_attention_mask = None
+        # Build an all-ones encoder attention mask so that the decoder's
+        # cross-attention layers receive a properly shaped mask.  Transformers
+        # >= 5.5 SDPA attention requires an explicit mask; passing ``None``
+        # causes shape mismatches in ``scaled_dot_product_attention``.
+        encoder_attention_mask = torch.ones(
+            encoder_hidden_states.shape[:2],
+            dtype=torch.long,
+            device=encoder_hidden_states.device,
+        )
 
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
             decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
