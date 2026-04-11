@@ -16,8 +16,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
     _init_model,
