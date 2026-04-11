@@ -203,8 +203,8 @@ def test_pretokenized_wrapper_truncate_mm_token_type_ids():
     wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
 
     sample = wrapper[0]
-    if "mm_token_type_ids" in sample:
-        assert sample["mm_token_type_ids"].shape[0] <= ml
+    assert "mm_token_type_ids" in sample, "mm_token_type_ids missing from output"
+    assert sample["mm_token_type_ids"].shape[0] <= ml
 
 
 # ---------- pad_collate_fn with mm_token_type_ids ----------------------------
