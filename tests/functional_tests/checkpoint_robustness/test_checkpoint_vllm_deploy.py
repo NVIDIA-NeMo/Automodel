@@ -46,8 +46,12 @@ PROMPTS = [
 
 def _extract_custom_args(argv):
     custom_keys = {
-        "--deploy_model_path", "--tokenizer", "--max_new_tokens",
-        "--adapter_path", "--config_path", "--deploy_mode",
+        "--deploy_model_path",
+        "--tokenizer",
+        "--max_new_tokens",
+        "--adapter_path",
+        "--config_path",
+        "--deploy_mode",
     }
     boolean_keys = {"--vllm_smoke_test", "--trust_remote_code"}
     custom = {}
@@ -174,7 +178,18 @@ def test_vllm_greedy_matches_hf():
         return
 
     # Default mode: compare vLLM (model_impl="transformers") against HF token-for-token.
+    # Backward-compat shim: trust_remote_code models (e.g. DeciLM used by
+    # Nemotron-Super-49B) import NEED_SETUP_CACHE_CLASSES_MAPPING, removed in
+    # transformers >= 4.57.  See nemo_automodel/_transformers/auto_model.py.
+    import transformers.generation.utils as _gen_utils
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    try:
+        from transformers.generation.utils import NEED_SETUP_CACHE_CLASSES_MAPPING  # noqa: F401
+    except ImportError:
+        from transformers.cache_utils import StaticCache
+
+        _gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING = {"static": StaticCache}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

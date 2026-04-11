@@ -211,8 +211,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         except ImportError as e:
             # trust_remote_code models (e.g. DeciLM / Nemotron-Super-49B)
             # may import NEED_SETUP_CACHE_CLASSES_MAPPING which was removed
-            # in transformers >= 4.57.  Apply the shim and retry.
-            if "NEED_SETUP_CACHE_CLASSES_MAPPING" in str(e):
+            # in transformers >= 4.57.  Apply the shim and retry once.
+            if "NEED_SETUP_CACHE_CLASSES_MAPPING" in str(e) and not hasattr(
+                _gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"
+            ):
                 logger.warning(
                     "Remote code model imports removed symbol (%s). Injecting backward-compat shim and retrying.",
                     e,
