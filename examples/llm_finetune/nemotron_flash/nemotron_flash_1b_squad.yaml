@@ -48,6 +48,12 @@ model:
     attn_implementation_new: flash_attention_2
     _attn_implementation: flash_attention_2
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 distributed:
   strategy: fsdp2
   dp_size: none
