@@ -16,10 +16,14 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
+    _init_model,
     get_hf_config,
 )
+from nemo_automodel.components.models.common.utils import BackendConfig
 
 
 class TestConsumeConfigOverridesNestedDict:
@@ -59,6 +63,67 @@ class TestConsumeConfigOverridesNestedDict:
 
         assert config.some_field == {"key": "val"}
         assert "some_field" not in kwargs
+
+
+class TestBackendDictCoercion:
+    """CLI overrides like --model.backend.attn sdpa produce a plain dict; _init_model should coerce it to BackendConfig."""
+
+    def _make_config(self):
+        config = MagicMock()
+        config.architectures = ["SomeModel"]
+        config.torch_dtype = "bfloat16"
+        config.name_or_path = "fake/model"
+        return config
+
+    def _run_init_model(self, mock_resolve_cls, **extra_kwargs):
+        """Helper to call _init_model with a fake model class and capture kwargs."""
+        captured_kwargs = {}
+
+        def fake_model_cls(config, **kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        mock_resolve_cls.return_value = fake_model_cls
+
+        _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config=self._make_config(),
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            **extra_kwargs,
+        )
+        return captured_kwargs
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_dict_backend_coerced_to_backend_config(self, mock_resolve_cls, _mock_download):
+        """A plain dict backend kwarg should become a BackendConfig with defaults filled in."""
+        captured = self._run_init_model(mock_resolve_cls, backend={"attn": "sdpa"})
+
+        assert isinstance(captured["backend"], BackendConfig)
+        assert captured["backend"].attn == "sdpa"
+        assert captured["backend"].rms_norm == "torch_fp32"
+        assert captured["backend"].linear == "torch"
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_backend_config_object_passed_through(self, mock_resolve_cls, _mock_download):
+        """A proper BackendConfig should be passed through unchanged."""
+        original_backend = BackendConfig(attn="te", linear="te")
+        captured = self._run_init_model(mock_resolve_cls, backend=original_backend)
+
+        assert captured["backend"] is original_backend
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_no_backend_kwarg_unchanged(self, mock_resolve_cls, _mock_download):
+        """When no backend is provided, kwargs should not gain one."""
+        captured = self._run_init_model(mock_resolve_cls)
+
+        assert "backend" not in captured
 
 
 class TestGetHfConfigNestedKwargs:
