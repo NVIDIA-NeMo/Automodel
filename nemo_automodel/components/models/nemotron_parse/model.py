@@ -323,7 +323,6 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     encoder_hidden_states,
                     encoder_attention_mask,
                     None,  # past_key_values
-                    output_attentions,
                     False,  # use_cache
                 )
             else:
@@ -333,15 +332,18 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     past_key_values=None,
-                    output_attentions=output_attentions,
                     use_cache=False,
                 )
-            hidden_states = layer_outputs[0]
+            # transformers >= 5.5: MBartDecoderLayer returns a tensor directly
+            if isinstance(layer_outputs, torch.Tensor):
+                hidden_states = layer_outputs
+            else:
+                hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-                if encoder_hidden_states is not None:
-                    all_cross_attentions += (layer_outputs[2],)
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+                    if encoder_hidden_states is not None:
+                        all_cross_attentions += (layer_outputs[2],)
 
         hidden_states = self.layer_norm(hidden_states)
 
