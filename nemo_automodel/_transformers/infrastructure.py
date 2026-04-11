@@ -59,6 +59,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
+    freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
 )
@@ -421,6 +422,7 @@ def apply_model_infrastructure(
         autopipeline=autopipeline,
         tp_size=mesh.tp_size,
         ep_size=mesh.ep_size,
+        dp_shard_size=mesh.dp_shard_size,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         load_base_model=load_base_model,
         peft_config=peft_config,
@@ -455,6 +457,10 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config)
 
+    # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
+    # so the optimizer never tracks them and checkpoint save/resume stay consistent.
+    freeze_unused_kv_sharing_params(model)
+
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         loss_fn = MaskedCrossEntropy()
@@ -467,8 +473,12 @@ def apply_model_infrastructure(
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
-        if compile_config is not None:
+        if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
+        if isinstance(model_wrapper, FSDP2Manager):
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                model_wrapper.maybe_compile(mp)
         if isinstance(model_wrapper, DDPManager):
             setattr(model.module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
@@ -540,10 +550,20 @@ def apply_model_infrastructure(
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     if mesh.cp_size > 1 and not _uses_te_attention(model):
-        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+        from nemo_automodel.components.distributed.cp_utils import (
+            attach_context_parallel_hooks,
+            attach_cp_sdpa_hooks,
+            attach_linear_attn_position_hooks,
+        )
+
+        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
+            attach_linear_attn_position_hooks(mp)
+            if is_compile_enabled:
+                attach_cp_sdpa_hooks(mp, cp_mesh)
 
     return model

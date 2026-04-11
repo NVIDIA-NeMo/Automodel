@@ -88,8 +88,22 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
+ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
+  recipe_owner: adil-a
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 7e-2
+    hf_device_map_auto: true
+    experts_implementation: grouped_mm
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
+
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

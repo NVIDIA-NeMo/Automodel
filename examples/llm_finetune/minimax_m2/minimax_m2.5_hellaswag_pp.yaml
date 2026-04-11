@@ -116,4 +116,6 @@ optimizer:
   weight_decay: 0
 
 ci:
+  recipe_owner: hemildesai
+  time: "00:20:00"
   nodes: 8
