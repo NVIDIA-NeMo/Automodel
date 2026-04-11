@@ -163,7 +163,6 @@ RMSNorm is negligible (<0.5% of kernel time). Not a performance concern.
 | AG–GEMM overlap | Megatron slight advantage | 67.6% vs 62.0%; Megatron's `--overlap-param-gather` more aggressive than `fsdp2_backward_prefetch_depth=2` |
 | Gradient dtype | Fair | Both FP32 RS |
 | Model architecture | Fair | Same TP/CP/PP/DP, MBS, GBS, seqlen |
-| Manual GC | Megatron advantage | Reduces step-time jitter; Automodel had one 38s outlier step |
 | Cross-entropy fusion | Megatron minor advantage | `--cross-entropy-loss-fusion te` |
 
 **Overall MFU gap**: 41.7% (Megatron) vs 37.2% (Automodel) = **4.5pp / ~12% relative**
@@ -177,8 +176,7 @@ Primary driver: cuDNN attention (~2pp). Secondary: overlap quality and NCCL sett
 1. **Enable cuDNN SDPA** — largest single lever (~2pp MFU). Switch from FA2 (`flash_fwd_kernel`) to cuDNN WGMMA kernel by enabling `torch.backends.cuda.enable_cudnn_sdp(True)` in the attention backend.
 2. **Tune FSDP2 prefetch depth** — increase `fsdp2_forward_prefetch_depth` to reduce exposed AG time (currently 38% AG exposed vs Megatron's 32%; tuning depth or bucket size may close this).
 3. **Match NCCL env vars** — test with Megatron's `NCCL_P2P_NET_CHUNKSIZE` and `NCCL_IB_SL` settings to understand their impact on RS bandwidth (currently FSDP2 is faster without them).
-4. **Manual GC** — add explicit GC control to prevent outlier steps (~38s outlier observed).
-5. **Cross-entropy fusion** — add TE fused cross-entropy loss (`--cross-entropy-loss-fusion te` equivalent) to reduce activation memory and fuse the softmax+loss kernel.
+4. **Cross-entropy fusion** — add TE fused cross-entropy loss (`--cross-entropy-loss-fusion te` equivalent) to reduce activation memory and fuse the softmax+loss kernel.
 
 ---
 
