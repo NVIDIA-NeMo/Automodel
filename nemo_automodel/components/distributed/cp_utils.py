@@ -307,7 +307,7 @@ def make_cp_batch_and_ctx(
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
         cp_no_restore_buffers=cp_no_restore_buffers,
-        cp_rotate_method="allgather",  # TODO: expose through cfg
+        cp_rotate_method="alltoall",  # TODO: expose through cfg
     )
     # TODO(@akoumparouli): surface these in the future.
     enable_loss_parallel: bool = False
