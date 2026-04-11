@@ -642,6 +642,10 @@ class TestValidateHfModelForPipelineSupport:
             output = forward_fn(mock_model, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
             assert isinstance(output, BaseModelOutputWithPast)
+            assert "inputs_embeds" in mock_create_causal.call_args.kwargs
+            assert "input_embeds" not in mock_create_causal.call_args.kwargs
+            assert "inputs_embeds" in mock_create_sliding.call_args.kwargs
+            assert "input_embeds" not in mock_create_sliding.call_args.kwargs
 
     def test_attentions_not_collected(self):
         """Attentions are not collected in the new inner forward."""

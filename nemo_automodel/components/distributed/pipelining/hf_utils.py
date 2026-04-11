@@ -121,11 +121,11 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             if not isinstance((causal_mask_mapping := attention_mask), dict):
                 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-                # Note: input_embeds is only used for shape and dtype, not values
+                # Note: inputs_embeds is only used for shape and dtype, not values
                 # We could use a dummy tensor here, but inputs_embeds is already available
                 mask_kwargs = {
                     "config": self.config,
-                    "input_embeds": inputs_embeds,
+                    "inputs_embeds": inputs_embeds,
                     "attention_mask": attention_mask,
                     "cache_position": cache_position,
                     "past_key_values": None,  # Training-only: no KV cache
