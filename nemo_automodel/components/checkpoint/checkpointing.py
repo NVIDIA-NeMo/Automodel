@@ -485,9 +485,15 @@ class Checkpointer:
             device: Target device for materialized parameters.
             peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
         """
-        to_empty_parameters_only(model, device=device)
+        # Only materialize parameters that are actually on the meta device.
+        # When the caller sets is_meta_device=True but the model was already
+        # constructed on a real device (e.g. ContextManagers was patched to
+        # a no-op), calling to_empty_parameters_only would replace valid
+        # weights with uninitialized CUDA memory.
+        has_meta_params = any(p.device.type == "meta" for p in model.parameters())
+        if has_meta_params:
+            to_empty_parameters_only(model, device=device)
 
-        # to_empty_parameters_only only materializes parameters, not buffers.
         # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
         # to *device* with uninitialized storage so that the subsequent
         # initialize_weights() call can overwrite them with proper values
@@ -1029,12 +1035,12 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> No
     """
     Recompute non-persistent buffers that are not saved in checkpoints.
 
-    After meta-device materialization, non-persistent buffers contain
-    uninitialized CUDA memory.  When ``initialize_weights()`` is skipped
-    (e.g. for Gemma3 to avoid DTensor issues), these buffers must be
-    recomputed explicitly.
+    Non-persistent buffers are not saved in checkpoints, so after meta-device
+    materialization they contain uninitialized CUDA memory.  When
+    ``initialize_weights()`` is skipped (e.g. for Gemma3 to avoid DTensor
+    issues), these buffers must be recomputed explicitly.
 
-    Handles three patterns:
+    Handles four patterns:
 
     1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` +
        ``rope_kwargs`` (e.g. Nemotron-NAS).
@@ -1042,6 +1048,8 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> No
        ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
     3. **Scaled embedding** — ``embed_scale`` buffer on ``ScaledWordEmbedding``
        modules (Gemma family), recomputed from ``scalar_embed_scale``.
+    4. **Vision position IDs** — ``position_ids`` buffer on vision embedding
+       modules (SigLIP), recomputed from ``num_positions``.
 
     Args:
         model: Model to reinitialize non-persistent buffers for.
@@ -1095,6 +1103,14 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> No
                 logging.debug(f"Reinitialized embed_scale={module.scalar_embed_scale} for {name} on device {device}")
             except Exception as e:
                 logging.warning(f"Failed to reinitialize embed_scale for {name}: {e}")
+
+        # Pattern 4: Vision embedding position_ids (SigLIP and similar)
+        if hasattr(module, "num_positions") and "position_ids" in getattr(module, "_buffers", {}):
+            try:
+                module.position_ids = torch.arange(module.num_positions, device=device).expand((1, -1))
+                logging.debug(f"Reinitialized position_ids (num_positions={module.num_positions}) for {name}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize position_ids for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:

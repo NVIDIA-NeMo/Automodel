@@ -273,6 +273,31 @@ class TestReinitRopeBuffers:
         # embed_scale should remain NaN because there's no scalar_embed_scale to recover from
         assert torch.isnan(emb.embed_scale)
 
+    def test_position_ids_reinitialized_from_num_positions(self):
+        """Vision embedding position_ids buffer is recomputed from num_positions."""
+        model = torch.nn.Module()
+        vis_emb = torch.nn.Module()
+        vis_emb.num_positions = 16
+        vis_emb.register_buffer("position_ids", torch.full((1, 16), 999999, dtype=torch.long), persistent=False)
+        model.vision_embeddings = vis_emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+
+        expected = torch.arange(16).expand((1, -1))
+        assert torch.equal(vis_emb.position_ids, expected)
+
+    def test_position_ids_without_num_positions_is_skipped(self):
+        """Modules with position_ids but no num_positions are not touched."""
+        model = torch.nn.Module()
+        vis_emb = torch.nn.Module()
+        garbage = torch.full((1, 16), 999999, dtype=torch.long)
+        vis_emb.register_buffer("position_ids", garbage.clone(), persistent=False)
+        model.vision_embeddings = vis_emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+
+        assert torch.equal(vis_emb.position_ids, garbage)
+
 
 # =============================================================================
 # Tests for _is_custom_model
