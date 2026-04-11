@@ -72,8 +72,11 @@ if TYPE_CHECKING:
     from nemo_automodel.components.utils.compile_utils import CompileConfig
 
 #  Re-exports from sibling modules (backward compatibility)
-# Backward-compat shim for trust_remote_code models (e.g. DeciLM)
-# that import NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
+# Backward-compat shim for trust_remote_code models (e.g. DeciLM used by
+# nvidia/Llama-3_3-Nemotron-Super-49B-v1_5) that import
+# NEED_SETUP_CACHE_CLASSES_MAPPING from transformers.generation.utils.
+# Removed in transformers >= 4.57.  Can be dropped once the upstream
+# HuggingFace DeciLM modeling code removes this import.
 import transformers.generation.utils as _gen_utils  # noqa: E402
 
 from nemo_automodel._transformers.infrastructure import (
@@ -98,7 +101,9 @@ from nemo_automodel._transformers.model_init import (
     resolve_sdpa_method,
 )
 
-if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
+try:
+    from transformers.generation.utils import NEED_SETUP_CACHE_CLASSES_MAPPING  # noqa: F401
+except ImportError:
     from transformers.cache_utils import StaticCache
 
     _gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING = {"static": StaticCache}
@@ -203,6 +208,21 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             cls.__name__ = name[4:]
         try:
             model = super().from_pretrained(*args, **kwargs)
+        except ImportError as e:
+            # trust_remote_code models (e.g. DeciLM / Nemotron-Super-49B)
+            # may import NEED_SETUP_CACHE_CLASSES_MAPPING which was removed
+            # in transformers >= 4.57.  Apply the shim and retry.
+            if "NEED_SETUP_CACHE_CLASSES_MAPPING" in str(e):
+                logger.warning(
+                    "Remote code model imports removed symbol (%s). Injecting backward-compat shim and retrying.",
+                    e,
+                )
+                from transformers.cache_utils import StaticCache
+
+                _gen_utils.NEED_SETUP_CACHE_CLASSES_MAPPING = {"static": StaticCache}
+                model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
         except (AttributeError, TypeError) as e:
             if "all_tied_weights_keys" in str(e) or (isinstance(e, TypeError) and "tie_weights" in str(e)):
                 logger.warning(
