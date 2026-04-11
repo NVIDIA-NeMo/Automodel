@@ -187,10 +187,11 @@ def _mock_extract_media(conversations):
 
 
 def _mock_build_labels(input_ids, conversations, processor):
-    # Mark last half of tokens as label tokens (not -100).
+    # Mark last three-quarters of tokens as label tokens (not -100)
+    # so that labels survive truncation to ml=32 from seq=64.
     seq = input_ids.shape[1]
     labels = torch.full_like(input_ids, -100)
-    labels[:, seq // 2:] = input_ids[:, seq // 2:]
+    labels[:, seq // 4:] = input_ids[:, seq // 4:]
     return labels
 
 
