@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from PIL import Image
@@ -135,7 +137,7 @@ def test_determinism_with_seed():
 
 
 class _StubProcessor:
-    """Minimal processor stub that returns deterministic tokenized output."""
+    """Minimal processor stub for pad_collate_fn tests (not PreTokenizedDatasetWrapper)."""
 
     class _tokenizer:
         pad_token_id = 0
@@ -158,9 +160,8 @@ class _StubProcessor:
         seq_len = 64
         input_ids = torch.arange(1, seq_len + 1, dtype=torch.long).unsqueeze(0)
         attention_mask = torch.ones(1, seq_len, dtype=torch.long)
-        # Simulate mm_token_type_ids as 1D (some processors emit this shape)
         mm_token_type_ids = torch.zeros(seq_len, dtype=torch.long)
-        mm_token_type_ids[:10] = 1  # first 10 tokens are "image" type
+        mm_token_type_ids[:10] = 1
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -168,15 +169,69 @@ class _StubProcessor:
         }
 
 
-def test_pretokenized_wrapper_truncate_shapes():
-    """PreTokenizedDatasetWrapper with truncate=True produces exact max_length output."""
+# Shared mock helpers for PreTokenizedDatasetWrapper tests.
+_DS_MODULE = "nemo_automodel.components.datasets.vlm.datasets"
+_SEQ_LEN = 64
+
+
+def _mock_preload_media(example, processor, **kwargs):
+    return example
+
+
+def _mock_conversation_has_media(conversation):
+    return True
+
+
+def _mock_extract_media(conversations):
+    return [Image.new("RGB", (4, 4))], []
+
+
+def _mock_build_labels(input_ids, conversations, processor):
+    # Mark last half of tokens as label tokens (not -100).
+    seq = input_ids.shape[1]
+    labels = torch.full_like(input_ids, -100)
+    labels[:, seq // 2:] = input_ids[:, seq // 2:]
+    return labels
+
+
+def _make_wrapper(ml):
+    """Build a PreTokenizedDatasetWrapper with mocked internals."""
     from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
     raw_ds = build_mock_vlm_dataset(num_samples=3, seed=0)
-    ml = 32
-    wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
+    proc = _StubProcessor()
+    return PreTokenizedDatasetWrapper(raw_ds, proc, max_length=ml, truncate=True)
 
-    sample = wrapper[0]
+
+def _patched_getitem(wrapper, idx):
+    """Call wrapper[idx] with internal helpers mocked out."""
+    with (
+        patch(f"{_DS_MODULE}._preload_media", side_effect=_mock_preload_media),
+        patch(
+            f"{_DS_MODULE}._build_video_metadata",
+            return_value=None,
+        ),
+        patch(
+            "nemo_automodel.components.datasets.vlm.fake_image._conversation_has_media",
+            side_effect=_mock_conversation_has_media,
+        ),
+        patch(
+            "nemo_automodel.components.datasets.vlm.collate_fns._extract_media_from_conversations",
+            side_effect=_mock_extract_media,
+        ),
+        patch(
+            "nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template",
+            side_effect=_mock_build_labels,
+        ),
+    ):
+        return wrapper[idx]
+
+
+def test_pretokenized_wrapper_truncate_shapes():
+    """PreTokenizedDatasetWrapper with truncate=True produces exact max_length output."""
+    ml = 32
+    wrapper = _make_wrapper(ml)
+    sample = _patched_getitem(wrapper, 0)
     assert sample["input_ids"].shape == (ml,)
     assert sample["attention_mask"].shape == (ml,)
     assert sample["labels"].shape == (ml,)
@@ -184,25 +239,17 @@ def test_pretokenized_wrapper_truncate_shapes():
 
 def test_pretokenized_wrapper_truncate_labels_not_all_ignored():
     """After truncation, labels should contain some non-(-100) values."""
-    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
-
-    raw_ds = build_mock_vlm_dataset(num_samples=3, seed=0)
     ml = 32
-    wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
-
-    sample = wrapper[0]
+    wrapper = _make_wrapper(ml)
+    sample = _patched_getitem(wrapper, 0)
     assert (sample["labels"] != -100).any(), "Labels are all -100 after truncation"
 
 
 def test_pretokenized_wrapper_truncate_mm_token_type_ids():
     """mm_token_type_ids (1D) should be truncated to max_length."""
-    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
-
-    raw_ds = build_mock_vlm_dataset(num_samples=3, seed=0)
     ml = 32
-    wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
-
-    sample = wrapper[0]
+    wrapper = _make_wrapper(ml)
+    sample = _patched_getitem(wrapper, 0)
     assert "mm_token_type_ids" in sample, "mm_token_type_ids missing from output"
     assert sample["mm_token_type_ids"].shape[0] <= ml
 
