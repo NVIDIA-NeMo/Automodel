@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+import torch
 from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.mock import build_mock_vlm_dataset
@@ -128,3 +129,131 @@ def test_determinism_with_seed():
         for item1, item2 in zip(s1["conversation"][0]["content"], s2["conversation"][0]["content"]):
             if item1["type"] == "image":
                 assert list(item1["image"].tobytes()) == list(item2["image"].tobytes())
+
+
+# ---------- PreTokenizedDatasetWrapper truncation ----------------------------
+
+
+class _StubProcessor:
+    """Minimal processor stub that returns deterministic tokenized output."""
+
+    class _tokenizer:
+        pad_token_id = 0
+        eos_token = "</s>"
+
+        @staticmethod
+        def convert_tokens_to_ids(token):
+            return None
+
+        @staticmethod
+        def decode(token):
+            return str(token.item() if isinstance(token, torch.Tensor) else token)
+
+    tokenizer = _tokenizer()
+
+    def apply_chat_template(self, conversations, *, tokenize=False, **kwargs):
+        return "stub template text"
+
+    def __call__(self, *, text, images=None, videos=None, return_tensors="pt", **kwargs):
+        seq_len = 64
+        input_ids = torch.arange(1, seq_len + 1, dtype=torch.long).unsqueeze(0)
+        attention_mask = torch.ones(1, seq_len, dtype=torch.long)
+        # Simulate mm_token_type_ids as 1D (some processors emit this shape)
+        mm_token_type_ids = torch.zeros(seq_len, dtype=torch.long)
+        mm_token_type_ids[:10] = 1  # first 10 tokens are "image" type
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+
+
+def test_pretokenized_wrapper_truncate_shapes():
+    """PreTokenizedDatasetWrapper with truncate=True produces exact max_length output."""
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+    raw_ds = build_mock_vlm_dataset(num_samples=3, seed=0)
+    ml = 32
+    wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
+
+    sample = wrapper[0]
+    assert sample["input_ids"].shape == (ml,)
+    assert sample["attention_mask"].shape == (ml,)
+    assert sample["labels"].shape == (ml,)
+
+
+def test_pretokenized_wrapper_truncate_labels_not_all_ignored():
+    """After truncation, labels should contain some non-(-100) values."""
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+    raw_ds = build_mock_vlm_dataset(num_samples=3, seed=0)
+    ml = 32
+    wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
+
+    sample = wrapper[0]
+    assert (sample["labels"] != -100).any(), "Labels are all -100 after truncation"
+
+
+def test_pretokenized_wrapper_truncate_mm_token_type_ids():
+    """mm_token_type_ids (1D) should be truncated to max_length."""
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+    raw_ds = build_mock_vlm_dataset(num_samples=3, seed=0)
+    ml = 32
+    wrapper = PreTokenizedDatasetWrapper(raw_ds, _StubProcessor(), max_length=ml, truncate=True)
+
+    sample = wrapper[0]
+    if "mm_token_type_ids" in sample:
+        assert sample["mm_token_type_ids"].shape[0] <= ml
+
+
+# ---------- pad_collate_fn with mm_token_type_ids ----------------------------
+
+
+def test_pad_collate_fn_mm_token_type_ids():
+    """pad_collate_fn pads mm_token_type_ids and trims it with autoregressive shift."""
+    from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+
+    seq_a, seq_b = 10, 8
+    examples = [
+        {
+            "input_ids": torch.arange(seq_a, dtype=torch.long),
+            "attention_mask": torch.ones(seq_a, dtype=torch.long),
+            "labels": torch.arange(seq_a, dtype=torch.long),
+            "mm_token_type_ids": torch.ones(seq_a, dtype=torch.long),
+        },
+        {
+            "input_ids": torch.arange(seq_b, dtype=torch.long),
+            "attention_mask": torch.ones(seq_b, dtype=torch.long),
+            "labels": torch.arange(seq_b, dtype=torch.long),
+            "mm_token_type_ids": torch.zeros(seq_b, dtype=torch.long),
+        },
+    ]
+
+    batch = pad_collate_fn(examples, _StubProcessor())
+
+    assert "mm_token_type_ids" in batch
+    # After autoregressive shift, seq dim is (pad_to - 1)
+    expected_seq = max(seq_a, seq_b) - 1
+    assert batch["mm_token_type_ids"].shape == (2, expected_seq)
+    assert batch["input_ids"].shape == (2, expected_seq)
+
+
+def test_pad_collate_fn_mm_token_type_ids_2d():
+    """pad_collate_fn handles mm_token_type_ids as 2D (1, seq_len) tensor."""
+    from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+
+    seq = 10
+    examples = [
+        {
+            "input_ids": torch.arange(seq, dtype=torch.long),
+            "attention_mask": torch.ones(seq, dtype=torch.long),
+            "labels": torch.arange(seq, dtype=torch.long),
+            "mm_token_type_ids": torch.ones(1, seq, dtype=torch.long),  # 2D
+        },
+    ]
+
+    batch = pad_collate_fn(examples, _StubProcessor())
+
+    assert "mm_token_type_ids" in batch
+    assert batch["mm_token_type_ids"].shape == (1, seq - 1)
