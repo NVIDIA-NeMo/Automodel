@@ -34,6 +34,8 @@ if [ "$TEST_LEVEL" = "convergence" ]; then
          --wandb.entity Nemo-automodel \
          --wandb.name ${TEST_NAME} \
          --wandb.dir /tmp/wandb/"
+elif [ "$TEST_LEVEL" = "perf" ]; then
+  CONFIG="${CONFIG}"
 else
   CONFIG="${CONFIG} \
         --step_scheduler.ckpt_every_steps 100 \
