@@ -306,6 +306,37 @@ def _chunk_vlm_media(
     return pixel_values_chunks, image_grid_chunks
 
 
+def _patch_mistral_common_compat():
+    """Apply compatibility patches for older ``mistral_common`` versions.
+
+    ``transformers >= 5.5`` imports ``ReasoningEffort`` from
+    ``mistral_common.protocol.instruct.request``, but older releases of
+    ``mistral_common`` do not expose that symbol.  When this import fails
+    it causes ``AutoProcessor.from_pretrained`` (and any direct
+    ``Processor.__init__``) to raise an ``ImportError`` because
+    transformers' lazy-loading walks all tokenizer modules.
+
+    This shim adds a minimal ``ReasoningEffort`` stub to the module so
+    that the import succeeds without requiring a ``mistral_common``
+    upgrade.
+    """
+    try:
+        import mistral_common.protocol.instruct.request as _mcr
+
+        if not hasattr(_mcr, "ReasoningEffort"):
+            import enum
+
+            class ReasoningEffort(str, enum.Enum):
+                low = "low"
+                medium = "medium"
+                high = "high"
+
+            _mcr.ReasoningEffort = ReasoningEffort
+            logging.debug("Patched ReasoningEffort into mistral_common for transformers compat.")
+    except ImportError:
+        pass
+
+
 def _build_processor_from_components(pretrained_model_name_or_path, **kwargs):
     """Attempt to construct a processor by loading individual components.
 
@@ -399,6 +430,10 @@ def build_dataloader(
             "num_replicas": dp_mesh.size(),
             "rank": dp_mesh.get_local_rank(),
         }
+
+    # Ensure mistral_common compatibility shim is applied before any
+    # processor loading that may trigger transformers' lazy module walk.
+    _patch_mistral_common_compat()
 
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
