@@ -87,6 +87,15 @@ FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
 echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
 echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
 
+# Collect benchmark artifact for performance tests
+if [ "$TEST_LEVEL" = "perf" ]; then
+  echo "[benchmark] Collecting benchmark artifact..."
+  python3 /opt/Automodel/tests/ci_tests/scripts/collect_benchmark_artifact.py \
+    --config /opt/Automodel/${CONFIG_PATH} \
+    --log $PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out \
+    --output $PIPELINE_DIR/$TEST_NAME/benchmark_results.json || true
+fi
+
 if [[ "$FINETUNE_EXIT_CODE" -ne 0 ]]; then
   echo "[finetune] Failed with exit code ${FINETUNE_EXIT_CODE}, skipping robustness test"
   exit $FINETUNE_EXIT_CODE
