@@ -1,4 +1,4 @@
-# Quantization-Aware Training (QAT) in NeMo Automodel
+# Quantization-Aware Training (QAT)
 
 NeMo Automodel supports Quantization-Aware Training (QAT) for Supervised Fine-Tuning (SFT) using [TorchAO](https://github.com/pytorch/ao). QAT simulates quantization effects during the training process, allowing models to adapt to lower precision representations while learning. This approach produces quantized models that maintain significantly higher accuracy compared to applying quantization after training is complete.
 

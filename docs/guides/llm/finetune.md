@@ -1,4 +1,4 @@
-# Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel
+# Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT)
 
 ## Introduction
 

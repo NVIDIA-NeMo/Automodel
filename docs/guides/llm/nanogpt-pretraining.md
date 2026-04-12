@@ -1,4 +1,4 @@
-# LLM Pre-Training with NeMo AutoModel
+# LLM Pre-Training
 
 This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
 

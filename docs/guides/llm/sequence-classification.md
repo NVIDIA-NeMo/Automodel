@@ -1,4 +1,4 @@
-# Sequence Classification (SFT/PEFT) with NeMo AutoModel
+# Sequence Classification (SFT/PEFT)
 
 ## Introduction
 

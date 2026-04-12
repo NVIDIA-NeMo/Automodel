@@ -1,4 +1,4 @@
-# Function Calling with NeMo AutoModel using FunctionGemma
+# Function Calling with FunctionGemma
 
 This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270M function-calling model, with NeMo AutoModel on the xLAM function-calling dataset.
 

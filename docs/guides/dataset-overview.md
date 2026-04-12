@@ -1,4 +1,4 @@
-# Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo AutoModel
+# Dataset Overview: LLM, VLM, and Retrieval Datasets
 
 This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
