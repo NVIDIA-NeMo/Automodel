@@ -947,16 +947,13 @@ class TestNemotronV3MambaCacheGPU:
 
     @skip_if_no_mamba
     def test_hybrid_model_generate_with_inputs_embeds_matches_manual_decode(self, config, backend):
-        """generate(inputs_embeds=...) should match generate(input_ids=...).
+        """Cached generate(inputs_embeds=...) should match full-recompute decoding.
 
-        Note: the reference uses generate(input_ids=...) (cached path) rather
-        than a manual use_cache=False loop because the Mamba mixer uses
-        different CUDA kernels for the cached vs uncached paths
-        (causal_conv1d + selective_state_update vs
-        mamba_split_conv1d_scan_combined).  These are mathematically
-        equivalent but not bit-identical in bf16, so comparing cached
-        generate against uncached manual decode would fail spuriously.
+        Flash-attention is disabled so that both the cached inference path
+        (direct F.scaled_dot_product_attention) and the uncached training path
+        (backend attn_func) use the deterministic math SDPA kernel.
         """
+        from torch.nn.attention import SDPBackend, sdpa_kernel
         from transformers import PretrainedConfig
 
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
@@ -974,25 +971,26 @@ class TestNemotronV3MambaCacheGPU:
         inputs_embeds = model.model.embed_tokens(input_ids).to(torch.bfloat16)
         attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device="cuda")
 
-        output_embeds = model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+        with sdpa_kernel(SDPBackend.MATH):
+            output_cached = model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
 
-        output_ids = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+            generated = input_ids.clone()
+            with torch.no_grad():
+                for _ in range(max_new_tokens):
+                    out = model(generated, use_cache=False)
+                    next_token = out.logits[:, -1:, :].argmax(dim=-1)
+                    generated = torch.cat([generated, next_token], dim=1)
+                    if next_token.item() == hf_config.eos_token_id:
+                        break
 
-        # generate(input_ids=...) returns prompt + new tokens;
-        # generate(inputs_embeds=...) returns only new tokens.
-        expected_new_tokens = output_ids[:, prompt_len:]
-        min_len = min(output_embeds.shape[1], expected_new_tokens.shape[1])
-        assert torch.equal(output_embeds[:, :min_len], expected_new_tokens[:, :min_len])
+        expected_new_tokens = generated[:, prompt_len:]
+        min_len = min(output_cached.shape[1], expected_new_tokens.shape[1])
+        assert torch.equal(output_cached[:, :min_len], expected_new_tokens[:, :min_len])
 
     @skip_if_no_mamba
     def test_hybrid_mamba_cache_deterministic(self, config, backend):
