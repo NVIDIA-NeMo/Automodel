@@ -100,11 +100,13 @@ class TestBackendDictCoercion:
     def test_dict_backend_coerced_to_backend_config(self, mock_resolve_cls, _mock_download):
         """A plain dict backend kwarg should become a BackendConfig with defaults filled in."""
         captured = self._run_init_model(mock_resolve_cls, backend={"attn": "sdpa"})
+        defaults = BackendConfig()
 
         assert isinstance(captured["backend"], BackendConfig)
         assert captured["backend"].attn == "sdpa"
-        assert captured["backend"].rms_norm == "torch_fp32"
-        assert captured["backend"].linear == "torch"
+        # Unspecified fields should get their environment-dependent defaults
+        assert captured["backend"].rms_norm == defaults.rms_norm
+        assert captured["backend"].linear == defaults.linear
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
