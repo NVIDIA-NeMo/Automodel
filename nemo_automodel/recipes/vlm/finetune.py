@@ -28,7 +28,7 @@ from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoProcessor
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
@@ -306,6 +306,60 @@ def _chunk_vlm_media(
     return pixel_values_chunks, image_grid_chunks
 
 
+def _build_processor_from_components(pretrained_model_name_or_path, **kwargs):
+    """Attempt to construct a processor by loading individual components.
+
+    When ``AutoProcessor.from_pretrained`` fails (e.g. because the local
+    model directory lacks a ``preprocessor_config.json``), this helper tries
+    to assemble the processor from:
+
+      1. An ``AutoConfig`` loaded from the model path.
+      2. The ``PROCESSOR_MAPPING`` to determine the correct processor class.
+      3. The ``IMAGE_PROCESSOR_MAPPING`` to instantiate the image processor
+         with default parameters.
+      4. ``AutoTokenizer`` to load the tokenizer.
+
+    Returns ``None`` if any of these steps fail.
+    """
+    try:
+        from transformers import IMAGE_PROCESSOR_MAPPING, PROCESSOR_MAPPING
+
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        config_type = type(config)
+
+        if config_type not in PROCESSOR_MAPPING:
+            logging.warning("No PROCESSOR_MAPPING entry for %s; processor will be None.", config_type.__name__)
+            return None
+
+        processor_cls = PROCESSOR_MAPPING[config_type]
+
+        # Resolve the image processor class from the mapping.
+        if config_type in IMAGE_PROCESSOR_MAPPING:
+            ip_mapping = IMAGE_PROCESSOR_MAPPING[config_type]
+            if isinstance(ip_mapping, tuple):
+                # Tuple of (slow_class, fast_class) -- prefer the fast variant.
+                ip_cls = ip_mapping[-1] if len(ip_mapping) > 1 else ip_mapping[0]
+            elif isinstance(ip_mapping, dict):
+                # Prefer torchvision backend, fall back to first available.
+                ip_cls = ip_mapping.get("torchvision", next(iter(ip_mapping.values())))
+            else:
+                ip_cls = ip_mapping
+            image_processor = ip_cls()
+        else:
+            logging.warning(
+                "No IMAGE_PROCESSOR_MAPPING for %s; cannot build processor from components.", config_type.__name__
+            )
+            return None
+
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        processor = processor_cls(image_processor=image_processor, tokenizer=tokenizer)
+        logging.info("Successfully constructed processor from components: %s", type(processor).__name__)
+        return processor
+    except Exception as fallback_err:
+        logging.warning("Fallback processor construction also failed: %s", fallback_err)
+        return None
+
+
 def build_dataloader(
     cfg_ds,
     cfg_dl,
@@ -366,9 +420,13 @@ def build_dataloader(
                 try:
                     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
                 except Exception as e:
-                    # Some models do not provide an AutoProcessor
-                    processor = None
-                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+                    logging.warning(f"AutoProcessor.from_pretrained failed for {pretrained_model_name_or_path} ({e}). ")
+                    # Fallback: construct the processor from individual components
+                    # (image processor + tokenizer) using the model config to resolve
+                    # the correct processor class.  This covers local model directories
+                    # that lack a preprocessor_config.json, which became required in
+                    # transformers >= 5.5 for multi-modal processors.
+                    processor = _build_processor_from_components(pretrained_model_name_or_path, **processor_kwargs)
 
             chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
             # Update chat_template if chat_template is given

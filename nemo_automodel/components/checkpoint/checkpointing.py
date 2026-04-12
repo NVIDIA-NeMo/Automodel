@@ -422,6 +422,16 @@ class Checkpointer:
             if key_mapping and state_dict_from_disk:
                 state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
 
+            # Transformers' WeightRenaming patterns do not include the
+            # base_model_prefix (e.g. "model.") that HF's own loading code
+            # prepends automatically.  After applying key_mapping we may end up
+            # with keys like "language_model.X" or "vision_tower.X" while the
+            # actual model parameters live under "model.language_model.X" or
+            # "model.vision_tower.X".  Detect this mismatch and prepend the
+            # prefix so set_model_state_dict can find the correct parameters.
+            if state_dict_from_disk:
+                state_dict_from_disk = _apply_base_model_prefix(model_state.model[0], state_dict_from_disk)
+
             total_bytes = sum(
                 t.nelement() * t.element_size() for t in state_dict_from_disk.values() if isinstance(t, torch.Tensor)
             )
@@ -1150,6 +1160,71 @@ def _apply_key_mapping(
     )
 
     return {_get_key_renaming_mapping(k, key_mapping): v for k, v in state_dict.items()}
+
+
+def _apply_base_model_prefix(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Prepend the HF ``base_model_prefix`` to state-dict keys when needed.
+
+    Transformers' ``WeightRenaming`` patterns (returned by
+    ``get_checkpoint_conversion_mapping``) transform checkpoint keys to the
+    *inner* model namespace but do **not** include the ``base_model_prefix``
+    wrapper (e.g. ``"model."``).  HF's own ``from_pretrained`` adds this
+    prefix transparently, but NeMo's checkpoint loading path uses the
+    patterns directly.
+
+    This function detects the mismatch by comparing state-dict keys against
+    the model's parameter / buffer names and prepending the prefix where it
+    resolves an otherwise-missing key.
+
+    Keys that already match a model parameter or buffer are left untouched,
+    so the function is safe to call unconditionally.
+
+    Args:
+        model: The model whose parameters define the expected FQNs.
+        state_dict: State dict (already key-mapped) that may need prefixing.
+
+    Returns:
+        A new dict with corrected keys.
+    """
+    prefix = getattr(model, "base_model_prefix", "")
+    if not prefix:
+        return state_dict
+
+    prefix_dot = f"{prefix}."
+
+    # Build a set of all model FQNs (parameters + buffers) for fast lookup.
+    model_keys = set()
+    for name, _ in model.named_parameters():
+        model_keys.add(name)
+    for name, _ in model.named_buffers():
+        model_keys.add(name)
+
+    # If no state-dict key is missing we can skip the rewrite entirely.
+    sd_keys = set(state_dict.keys())
+    all_present = sd_keys <= model_keys
+    if all_present:
+        return state_dict
+
+    # Check whether prepending the prefix would resolve missing keys.
+    needs_prefix = False
+    for k in sd_keys:
+        if k not in model_keys and f"{prefix_dot}{k}" in model_keys:
+            needs_prefix = True
+            break
+
+    if not needs_prefix:
+        return state_dict
+
+    result = {}
+    for k, v in state_dict.items():
+        if k not in model_keys and f"{prefix_dot}{k}" in model_keys:
+            result[f"{prefix_dot}{k}"] = v
+        else:
+            result[k] = v
+    return result
 
 
 def _load_full_state_dict_into_model(
