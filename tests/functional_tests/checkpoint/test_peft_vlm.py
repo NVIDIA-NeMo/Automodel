@@ -843,6 +843,41 @@ def test_hf_peft_checkpoint():
     else:
         print("WEIGHT COMPARISON: All parameters and buffers match exactly.", flush=True)
 
+    # --- Diagnostic: dump non-persistent buffers of both models before forward pass ---
+    for label, mdl in [("SOURCE", source_model), ("RESTORED", restored_model)]:
+        np_names = set()
+        for mod_name, module in mdl.named_modules():
+            for buf_name in getattr(module, "_non_persistent_buffers_set", set()):
+                fqn = f"{mod_name}.{buf_name}" if mod_name else buf_name
+                np_names.add(fqn)
+        print(f"\n  {label} non-persistent buffers ({len(np_names)}):", flush=True)
+        for bname, buf in mdl.named_buffers():
+            if bname not in np_names:
+                continue
+            if buf.is_meta:
+                print(f"    {bname}: STILL_META", flush=True)
+            elif buf.is_floating_point():
+                has_nan = torch.isnan(buf).any().item()
+                norm = buf.float().norm().item()
+                print(
+                    f"    {bname}: shape={list(buf.shape)} dtype={buf.dtype} "
+                    f"norm={norm:.6f} nan={has_nan} sample={buf.flatten()[:3].tolist()}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"    {bname}: shape={list(buf.shape)} dtype={buf.dtype} "
+                    f"sample={buf.flatten()[:5].tolist()}",
+                    flush=True,
+                )
+
+    # --- Diagnostic: check tie_word_embeddings and model config ---
+    model_cfg = getattr(restored_model, "config", None)
+    text_cfg = getattr(model_cfg, "text_config", model_cfg)
+    tie_we = getattr(text_cfg, "tie_word_embeddings", "MISSING")
+    print(f"\n  MODEL CONFIG: tie_word_embeddings={tie_we}", flush=True)
+    print(f"  MODEL CONFIG: architectures={getattr(model_cfg, 'architectures', 'MISSING')}", flush=True)
+
     source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), (
