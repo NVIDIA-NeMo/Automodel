@@ -370,7 +370,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             _meta_err_msgs = (
                 "Cannot copy out of meta tensor",
                 "cannot be called on meta tensors",
-                "aten::equal",
+                "aten::equal: attempted to run this operator with Meta tensors",
             )
             if any(msg in str(e) for msg in _meta_err_msgs) and is_meta_device:
                 logger.warning(
