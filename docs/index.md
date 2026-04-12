@@ -82,9 +82,9 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 | 2026-03-11 | LLM | [Nemotron Super v3](https://github.com/NVIDIA-NeMo/Automodel/discussions/976) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag.yaml)) |
 | 2026-03-03 | Diffusion | FLUX.1-dev ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml)) |
 
-## I Want To...
+## Recipes & Guides
 
-Fine-tuning adapts a pre-trained model to your specific data and task. Choose full fine-tuning for maximum accuracy when you have the GPU budget, or LoRA/QLoRA for memory-efficient training that updates less than 1% of parameters.
+Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
 
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
