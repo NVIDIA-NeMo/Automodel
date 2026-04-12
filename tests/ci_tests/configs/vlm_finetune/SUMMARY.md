@@ -8,7 +8,7 @@ The nightly scope uses only the recipes listed in [nightly_recipes.yml](nightly_
 ## SFT
 
 | Recipe | Time | Nodes |
-|---|---|---|
+|---|:---:|:---:|
 | gemma3_vl_4b_cord_v2 | 00:10:00 | 1 |
 | gemma3n_vl_4b_medpix | 00:30:00 | 1 |
 | internvl_3_5_4b | 00:10:00 | 1 |
@@ -25,6 +25,6 @@ The nightly scope uses only the recipes listed in [nightly_recipes.yml](nightly_
 ## PEFT
 
 | Recipe | Time | Nodes |
-|---|---|---|
+|---|:---:|:---:|
 | gemma3_vl_4b_cord_v2_peft | 00:10:00 | 1 |
 | gemma3n_vl_4b_medpix_peft | 00:10:00 | 1 |
