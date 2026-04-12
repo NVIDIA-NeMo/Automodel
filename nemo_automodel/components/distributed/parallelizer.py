@@ -1443,6 +1443,8 @@ def megatron_fsdp_strategy_parallelize(
     # TP sharding.
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
+        if _attention_is_head_sharded(tp_shard_plan):
+            _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
     # Import MegatronFSDP unit modules specified by the user.
     megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
