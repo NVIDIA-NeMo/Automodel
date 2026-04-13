@@ -119,7 +119,10 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
 COPY scripts/setup_uccl_ep.sh /opt/setup_uccl_ep.sh
 ARG INSTALL_UCCL_EP=False
 RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
-    bash /opt/setup_uccl_ep.sh --no-efa && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends libibverbs-dev librdmacm-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    bash /opt/setup_uccl_ep.sh --no-efa --skip-apt && \
     rm -f /opt/setup_uccl_ep.sh; \
     fi
 
