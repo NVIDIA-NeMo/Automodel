@@ -1383,6 +1383,7 @@ def nemotron_omni_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: Optional[int] = None,
+    max_video_frames: int = 8,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for NemotronOmni (NemotronH_Nano_VL_V2) model.
 
@@ -1393,42 +1394,47 @@ def nemotron_omni_collate_fn(
     The processor (NemotronNanoVLV2Processor) handles:
     - Image preprocessing (dynamic tiling, normalization)
     - Token expansion (<image> -> <img> + N*<image> + </img>)
+    - Video preprocessing (each frame gets 1 tile, max_num_tiles=1)
+    - Token expansion (<video> -> per-frame descriptions with timestamps)
     - Tokenization
 
     This collate function:
-    1. Extracts conversations and images from examples
-    2. Applies chat template and processes through the processor
-    3. Builds image_flags tensor (1 for real images, 0 for padding in batch)
-    4. Creates labels masking non-assistant tokens with -100
+    1. Extracts conversations and images/videos from examples
+    2. Pre-loads video frames from file paths using _read_video_frames
+    3. Applies chat template and processes through the processor
+    4. Builds image_flags tensor (1 for real images, 0 for padding in batch)
+    5. Creates labels masking non-assistant tokens with -100
 
     Args:
         examples: List of dataset examples with 'conversation' key
         processor: NemotronNanoVLV2Processor instance
         max_length: Optional max sequence length for truncation
+        max_video_frames: Maximum number of frames to sample per video (default 8)
 
     Returns:
-        Dict with input_ids, attention_mask, pixel_values, image_flags, labels
+        Dict with input_ids, attention_mask, pixel_values, image_flags, labels,
+        and optionally pixel_values_videos for video inputs.
     """
+    from nemo_automodel.components.datasets.vlm.utils import _read_video_frames
+
     conversations = _ensure_rgb([example["conversation"] for example in examples])
     tokenizer = getattr(processor, "tokenizer", processor)
     image_token = getattr(processor, "image_token", "<image>")
+    video_token = getattr(processor, "video_token", "<video>")
 
-    # Collect images and build text prompts
+    # Collect images, videos, and build text prompts
     all_images: List[Any] = []
+    all_videos: List[Any] = []  # list of (frames_list, metadata) per sample
     texts: List[str] = []
 
     for conversation in conversations:
-        # Extract images and convert multimodal content to text with <image> tokens.
-        # The NemotronOmni chat template does not natively handle {'type': 'image'}
-        # content items, so we replace them with the <image> text token and collect
-        # the PIL images separately for the processor.
+        # Extract images/videos and convert multimodal content to text tokens.
         conv_images = []
+        conv_videos = []
         text_conversation = []
         for message in conversation:
             content = message.get("content")
             if isinstance(content, list):
-                # Multimodal message: flatten image items to <image> token and
-                # concatenate text items.
                 text_parts = []
                 for item in content:
                     if isinstance(item, dict):
@@ -1437,6 +1443,41 @@ def nemotron_omni_collate_fn(
                             if img is not None:
                                 conv_images.append(img)
                                 text_parts.append(image_token)
+                        elif item.get("type") == "video":
+                            vid = item.get("video")
+                            if vid is not None:
+                                # Video can be a path (str) or already-loaded frames (list)
+                                if isinstance(vid, str):
+                                    # Use uniform sampling to limit frames
+                                    import decord
+                                    decord.bridge.set_bridge("native")
+                                    vr = decord.VideoReader(vid)
+                                    total = len(vr)
+                                    n_frames = min(max_video_frames, total)
+                                    # Ensure even number for temporal_patch_size=2
+                                    if n_frames % 2 != 0:
+                                        n_frames = max(2, n_frames - 1)
+                                    frame_idx = torch.linspace(0, total - 1, n_frames).round().long().tolist()
+                                    frames, fps, indices = _read_video_frames(
+                                        vid, processor=processor,
+                                        frame_indices=frame_idx,
+                                        return_metadata=True,
+                                    )
+                                elif isinstance(vid, list):
+                                    frames = vid
+                                    fps = item.get("_video_fps")
+                                    indices = item.get("_frame_indices")
+                                else:
+                                    frames = vid
+                                    fps = None
+                                    indices = None
+                                conv_videos.append((frames, fps, indices))
+                                # Use one <image> token per video frame. The model's
+                                # forward replaces <image> (token 18) with vision
+                                # embeddings; <video> is NOT a special token in this
+                                # tokenizer and gets split into sub-tokens.
+                                for _ in frames:
+                                    text_parts.append(image_token)
                         elif item.get("type") == "text":
                             text_parts.append(item.get("text", ""))
                 text_conversation.append({
@@ -1447,27 +1488,43 @@ def nemotron_omni_collate_fn(
                 text_conversation.append(message)
 
         all_images.append(conv_images)
+        all_videos.append(conv_videos)
 
-        # Apply chat template to get text with <image> tokens
+        # Apply chat template to get text with <image>/<video> tokens
         text = tokenizer.apply_chat_template(text_conversation, tokenize=False)
         texts.append(text)
 
-    # Process each sample individually to handle variable image counts.
-    # Track per-sample pixel_values so we can trim after truncation.
+    # Process each sample individually to handle variable image/video counts.
     all_input_ids = []
     all_attention_masks = []
     sample_pixel_values: Dict[int, torch.Tensor] = {}  # sample_idx -> pixel_values
 
-    for i, (text, images) in enumerate(zip(texts, all_images)):
+    for i, (text, images, videos) in enumerate(zip(texts, all_images, all_videos)):
         processor_kwargs = {
             "text": text,
             "return_tensors": "pt",
             "padding": False,
         }
-        if images:
-            processor_kwargs["images"] = images
+
+        # Combine images and video frames — video frames are passed as
+        # single-tile images (max_num_tiles=1) so the processor generates
+        # proper <image> (token 18) placeholders for each frame.
+        combined_images = list(images)
+        if videos:
+            for frames, fps, indices in videos:
+                combined_images.extend(frames)
+
+        if combined_images:
+            orig_max_tiles = processor.image_processor.max_num_tiles
+            if videos and not images:
+                processor.image_processor.max_num_tiles = 1
+            processor_kwargs["images"] = combined_images
 
         batch_i = processor(**processor_kwargs)
+
+        if videos and not images:
+            processor.image_processor.max_num_tiles = orig_max_tiles
+
         all_input_ids.append(batch_i["input_ids"][0])
         all_attention_masks.append(batch_i["attention_mask"][0])
 

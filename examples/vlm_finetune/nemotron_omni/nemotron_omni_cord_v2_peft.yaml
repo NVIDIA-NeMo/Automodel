@@ -1,8 +1,8 @@
-# NemotronOmni fine-tuning on CORD-V2 (receipt OCR) dataset
+# NemotronOmni LoRA fine-tuning on CORD-V2 (receipt OCR) dataset
 #
 # Run:
 #   cd automodel-omni
-#   automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml --nproc-per-node 8
+#   PYTHONPATH=$(pwd):$PYTHONPATH automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
@@ -37,6 +37,20 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision_model*"
+    - "*audio*"
+    - "*sound*"
+    - "*lm_head*"
+    - "*mlp1*"
+  dim: 64
+  alpha: 128
+  use_triton: true
+
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/nemotron-3-nano-omni-ea1_v2.0
@@ -44,7 +58,7 @@ processor:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/logs/cordv2_v2_lr1e4_ckpts/
+  checkpoint_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/logs/cordv2_v2_lora_r64_ckpts/
   model_save_format: safetensors
   save_consolidated: true
 
@@ -90,13 +104,13 @@ validation_dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
     max_length: 4096
 
-# wandb:
-#   entity: <your_entity_name>
-#   project: <your_project_name>
-#   name: <your_run_name>
+wandb:
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nemotron_omni_cordv2_v2_lora_400steps
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1e-4
+  lr: 1e-3
   weight_decay: 0.01
   betas: [0.9, 0.95]
