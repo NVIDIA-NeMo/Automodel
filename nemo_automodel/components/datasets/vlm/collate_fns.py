@@ -1073,6 +1073,7 @@ def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: Optional[int] = None,
+    drop_overlong: bool = False,
     _post_tokenize_hook=None,
 ) -> Dict[str, torch.Tensor]:
     """Default collate function for multimodal VLM datasets.
@@ -1089,8 +1090,8 @@ def default_collate_fn(
 
     conversations = _ensure_rgb([example["conversation"] for example in examples])
 
-    # Drop overlong samples before processing
-    if max_length is not None:
+    # Optionally drop overlong samples before processing
+    if max_length is not None and drop_overlong:
         conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
         examples = [examples[i] for i in kept]
 
@@ -1104,7 +1105,8 @@ def default_collate_fn(
     if max_length is not None:
         processor_kwargs["max_length"] = max_length
         processor_kwargs["padding"] = "max_length"
-        processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+        if drop_overlong:
+            processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
     batch = processor.apply_chat_template(conversations, **processor_kwargs)
 
     if _post_tokenize_hook is not None:
