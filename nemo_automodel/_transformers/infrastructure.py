@@ -514,14 +514,8 @@ def apply_model_infrastructure(
         for mp in model_parts:
             checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
 
-    # Load the checkpoint if needed.
-    # This runs when the checkpoint wasn't loaded pre-shard (e.g. PEFT, TP, PP).
-    # It also covers the meta-device retry path where is_meta_device flipped to
-    # False: HF from_pretrained may silently fail to load old-format checkpoint
-    # keys (e.g. gemma3 after transformers restructured its module hierarchy),
-    # leaving parameters uninitialized. Loading here with our key-mapping
-    # fallback ensures weights are always populated.
-    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded
+    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
     if should_load_checkpoint:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
