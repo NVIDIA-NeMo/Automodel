@@ -72,30 +72,35 @@ class TestPatchHfModel:
 
         patch_hf_model(fake_model, cp_enabled=False)
 
-        # A_log (float32) should be moved out of _parameters into __dict__
+        # A_log (float32) should be moved out of _parameters
         assert "A_log" not in la._parameters
+        # Accessed via __getattr__ → _fp32_params
         assert la.A_log.dtype == torch.float32
         # dt_bias (bfloat16) stays as a regular parameter
         assert "dt_bias" in la._parameters
         # _fp32_params submodule holds the moved param
         assert hasattr(la, "_fp32_params")
         assert la._fp32_params.A_log.dtype == torch.float32
-        # __dict__ reference and holder share the same tensor
+        # __getattr__ resolves to the same tensor in _fp32_params
         assert la.A_log is la._fp32_params.A_log
 
-    def test_no_class_swap_when_cp_disabled(self, fake_model, monkeypatch):
-        """With cp_enabled=False, class should not change to CPAwareGatedDeltaNet."""
+    def test_class_always_swapped_for_fsdp(self, fake_model, monkeypatch):
+        """Class is always swapped to CPAwareGatedDeltaNet for FSDP fp32 unshard support."""
         self._stub_qwen3_5_modules(monkeypatch)
 
         cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
 
-        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+            CPAwareGatedDeltaNet,
+            patch_hf_model,
+        )
 
         la = fake_model.layers[0].linear_attn
         patch_hf_model(fake_model, cp_enabled=False)
-        assert type(la) is _FakeGatedDeltaNet
+        assert type(la) is CPAwareGatedDeltaNet
+        assert la._cp_mesh is None
 
     def test_class_swap_when_cp_enabled(self, fake_model, monkeypatch):
         """With cp_enabled=True, class is swapped to CPAwareGatedDeltaNet."""
@@ -115,19 +120,25 @@ class TestPatchHfModel:
         assert type(la) is CPAwareGatedDeltaNet
         assert la._cp_mesh is None
 
-    def test_dict_access_preserves_tensor_identity(self, fake_model):
-        """__dict__ reference and _fp32_params hold the same tensor."""
+    def test_getattr_resolves_after_param_replacement(self, fake_model, monkeypatch):
+        """__getattr__ resolves to _fp32_params even after the underlying tensor is replaced."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
         la = fake_model.layers[0].linear_attn
-        original_A_log = la.A_log
+        patch_hf_model(fake_model, cp_enabled=False)
 
-        holder = nn.Module()
-        setattr(holder, "A_log", la.A_log)
-        del la._parameters["A_log"]
-        la.__dict__["A_log"] = original_A_log
-        la.add_module("_fp32_params", holder)
+        # Simulate FSDP replacing the parameter in _fp32_params
+        new_tensor = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        la._fp32_params._parameters["A_log"] = new_tensor
 
-        assert la.A_log is la._fp32_params.A_log
-        assert id(la.A_log) == id(original_A_log)
+        # __getattr__ should resolve to the NEW tensor, not the old one
+        assert la.A_log is new_tensor
 
 
 class TestAttachLinearAttnPositionHooks:
