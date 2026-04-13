@@ -44,6 +44,11 @@ from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_rms_norm_module,
@@ -53,6 +58,7 @@ from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_fused,
+    rotate_half,
 )
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
@@ -77,11 +83,16 @@ class LlamaAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.rope_fusion = getattr(backend, "rope_fusion", False)
+
+        self.backend = backend or BackendConfig()
+        self.rope_fusion = self.backend.rope_fusion
+        self._use_te_attn = self.backend.attn == "te"
 
         # Separate projections -- same layout as HuggingFace default Llama
         self.q_proj = nn.Linear(
@@ -97,6 +108,16 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+
+        if self._use_te_attn:
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl="te",
+                num_attention_heads=self.num_heads,
+                num_qk_channels=self.head_dim,
+                num_v_channels=self.head_dim,
+                softmax_scale=self.scaling,
+                num_gqa_groups=self.num_key_value_heads,
+            )
 
     def forward(
         self,
@@ -114,6 +135,36 @@ class LlamaAttention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
+        if self._use_te_attn and past_key_values is None:
+            # TE training path: [B, S, H, D] format (bshd) throughout
+            query_states = q.view(hidden_shape)
+            key_states = k.view(hidden_shape)
+            value_states = v.view(hidden_shape)
+
+            if self.rope_fusion and len(position_embeddings) == 3:
+                _cos, _sin, freqs_cis = position_embeddings
+                from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb as te_apply_rope
+
+                query_states = te_apply_rope(query_states, freqs_cis, tensor_format="bshd", fused=True)
+                key_states = te_apply_rope(key_states, freqs_cis, tensor_format="bshd", fused=True)
+            else:
+                cos, sin = position_embeddings[:2]
+                cos = cos.unsqueeze(2)  # [B, S, 1, D]
+                sin = sin.unsqueeze(2)
+                query_states = (query_states * cos) + (rotate_half(query_states) * sin)
+                key_states = (key_states * cos) + (rotate_half(key_states) * sin)
+
+            query_states, key_states, value_states, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+                query_states, key_states, value_states, attention_mask, self.backend.attn, **kwargs
+            )
+            attn_output = self.attn_func(query_states, key_states, value_states, **_attn_kwargs)
+            attn_output = postprocess_output_for_attn(attn_output, self.backend.attn)
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None
+
+        # HF path: [B, H, S, D] format (bhsd) for inference or non-TE backends
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
@@ -125,13 +176,10 @@ class LlamaAttention(nn.Module):
             cos, sin = position_embeddings[:2]
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Handle past_key_values if provided (for generation)
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # Select attention interface based on config (matches HuggingFace)
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

@@ -1,0 +1,85 @@
+# Llama-3.1-70B pretrain benchmark: 8 nodes (64xH100)
+# Parallelism: tp1 cp2 pp1 dp32 (pure FSDP2 + CP)
+# Combined projections DISABLED — separate q/k/v and gate/up (HF-style)
+
+seed: 42
+
+benchmark:
+  warmup_steps: 5
+  peak_tflops: 989  # H100: 989, A100: 312
+  nsys_start: 8
+  nsys_end: 9
+  nsys_ranks: [0]
+  num_nodes: 4
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1   # dp=32: grad_acc=4 steps per rank
+  ckpt_every_steps: 2000
+  num_epochs: 1
+  max_steps: 12
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
+  torch_dtype: bf16
+  trust_remote_code: True
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: te
+    rope_fusion: True
+    attn: te
+
+checkpoint:
+  enabled: False
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 100
+  seq_len: 4096
+  num_samples: 1000000
+  batch_size: 1  # Must match step_scheduler.local_batch_size
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 0.0002
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  adam_w_mode: True
+
+distributed:
+  strategy: fsdp2
+  dp_size: null
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: False
+  activation_checkpointing: True
+  enable_async_tensor_parallel: False
+  enable_fsdp2_prefetch: True
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
+  enable_compile: False
+  defer_fsdp_grad_sync: False   # Must be False with GA>1: True → delayed resharding → OOM
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+
+nvtx: true
+
+wandb:
+  project: automodel-dev-zhiyul
+  entity: nvidia
+  name: llama-3-1-70b-pretrain-tp1cp2pp1dp32-8nodes
