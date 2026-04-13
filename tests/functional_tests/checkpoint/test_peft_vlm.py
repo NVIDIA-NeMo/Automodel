@@ -20,21 +20,21 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
-import yaml
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 
@@ -52,11 +52,11 @@ def get_validation_loss(
     with torch.no_grad():
         out = model(**val_batch)
         loss = calculate_loss(
-                loss_fn,
-                logits=out.logits,
-                labels=labels,
-                mask=loss_mask,
-            )
+            loss_fn,
+            logits=out.logits,
+            labels=labels,
+            mask=loss_mask,
+        )
         return loss
 
 
@@ -95,13 +95,15 @@ def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
 
 
 def compare_configs(source_config: dict, restored_config: dict):
-    """ Recursively compare two configs."""
+    """Recursively compare two configs."""
     for k, v in source_config.items():
         if k in restored_config:
             if isinstance(v, dict):
                 compare_configs(v, restored_config[k])
             else:
-                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                assert v == restored_config[k], (
+                    f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                )
 
 
 def load_safetensors(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -124,6 +126,7 @@ def to_cpu(
     Converts a state dictionary to CPU.
     """
     return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
+
 
 def get_test_peft_vlm_checkpoint_expected_keys():
     expected_model_keys = {
@@ -764,120 +767,6 @@ def test_hf_peft_checkpoint():
     restored_trainer.setup()
     restored_model = restored_trainer.model_parts[0]
 
-    # --- Compare all parameters & buffers between source and restored models,
-    #     and also compare each against the original HF checkpoint on disk ---
-    source_model = trainer.model_parts[0]
-
-    from nemo_automodel.components.checkpoint.checkpointing import _load_hf_checkpoint_preserving_dtype
-    hf_model_path = cfg.get("model.pretrained_model_name_or_path")
-    hf_state_dict = _load_hf_checkpoint_preserving_dtype(hf_model_path) or {}
-    print(f"HF checkpoint loaded: {len(hf_state_dict)} keys from {hf_model_path}", flush=True)
-    # Print first 10 keys from HF checkpoint and model to diagnose key mismatches
-    hf_keys_sorted = sorted(hf_state_dict.keys())
-    model_keys_sorted = sorted(n for n, _ in source_model.named_parameters() if "lora" not in n)
-    print(f"HF checkpoint keys (first 10): {hf_keys_sorted[:10]}", flush=True)
-    print(f"Model param keys  (first 10, no lora): {model_keys_sorted[:10]}", flush=True)
-    param_mismatches = []
-    buffer_mismatches = []
-    for (sn, sp), (rn, rp) in zip(
-        source_model.named_parameters(), restored_model.named_parameters()
-    ):
-        assert sn == rn, f"Parameter name mismatch: {sn} vs {rn}"
-        sp_full = sp.full_tensor() if hasattr(sp, "full_tensor") else sp
-        rp_full = rp.full_tensor() if hasattr(rp, "full_tensor") else rp
-        # Also look up the HF checkpoint value for this parameter
-        hf_val = hf_state_dict.get(sn)
-        src_vs_hf = ""
-        rst_vs_hf = ""
-        if hf_val is not None and hf_val.shape == sp_full.shape:
-            if not torch.equal(sp_full.cpu(), hf_val):
-                d = (sp_full.cpu().float() - hf_val.float()).abs()
-                src_vs_hf = f"src!=HF(max={d.max().item():.6e})"
-            else:
-                src_vs_hf = "src==HF"
-            if not torch.equal(rp_full.cpu(), hf_val):
-                d = (rp_full.cpu().float() - hf_val.float()).abs()
-                rst_vs_hf = f"rst!=HF(max={d.max().item():.6e})"
-            else:
-                rst_vs_hf = "rst==HF"
-        elif hf_val is None:
-            src_vs_hf = "no_hf_key"
-            rst_vs_hf = "no_hf_key"
-        else:
-            src_vs_hf = f"shape_mismatch(hf={list(hf_val.shape)})"
-            rst_vs_hf = src_vs_hf
-
-        if not torch.equal(sp_full, rp_full):
-            diff = (sp_full.float() - rp_full.float()).abs()
-            param_mismatches.append(
-                f"  PARAM {sn}: shape={list(sp_full.shape)} dtype={sp_full.dtype} "
-                f"max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e} "
-                f"src_norm={sp_full.float().norm().item():.4f} rst_norm={rp_full.float().norm().item():.4f} "
-                f"| {src_vs_hf} | {rst_vs_hf}"
-            )
-    for (sn, sb), (rn, rb) in zip(
-        source_model.named_buffers(), restored_model.named_buffers()
-    ):
-        assert sn == rn, f"Buffer name mismatch: {sn} vs {rn}"
-        if sb.is_meta or rb.is_meta:
-            buffer_mismatches.append(f"  BUFFER {sn}: src_meta={sb.is_meta} rst_meta={rb.is_meta}")
-            continue
-        sb_full = sb.full_tensor() if hasattr(sb, "full_tensor") else sb
-        rb_full = rb.full_tensor() if hasattr(rb, "full_tensor") else rb
-        if sb_full.shape != rb_full.shape:
-            buffer_mismatches.append(f"  BUFFER {sn}: shape mismatch {list(sb_full.shape)} vs {list(rb_full.shape)}")
-        elif not torch.equal(sb_full, rb_full):
-            diff = (sb_full.float() - rb_full.float()).abs()
-            buffer_mismatches.append(
-                f"  BUFFER {sn}: shape={list(sb_full.shape)} dtype={sb_full.dtype} "
-                f"max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e}"
-            )
-    if param_mismatches or buffer_mismatches:
-        print(f"\n{'='*80}", flush=True)
-        print(f"WEIGHT COMPARISON: {len(param_mismatches)} param mismatches, {len(buffer_mismatches)} buffer mismatches", flush=True)
-        for m in param_mismatches:
-            print(m, flush=True)
-        for m in buffer_mismatches:
-            print(m, flush=True)
-        print(f"{'='*80}\n", flush=True)
-    else:
-        print("WEIGHT COMPARISON: All parameters and buffers match exactly.", flush=True)
-
-    # --- Diagnostic: dump non-persistent buffers of both models before forward pass ---
-    for label, mdl in [("SOURCE", source_model), ("RESTORED", restored_model)]:
-        np_names = set()
-        for mod_name, module in mdl.named_modules():
-            for buf_name in getattr(module, "_non_persistent_buffers_set", set()):
-                fqn = f"{mod_name}.{buf_name}" if mod_name else buf_name
-                np_names.add(fqn)
-        print(f"\n  {label} non-persistent buffers ({len(np_names)}):", flush=True)
-        for bname, buf in mdl.named_buffers():
-            if bname not in np_names:
-                continue
-            if buf.is_meta:
-                print(f"    {bname}: STILL_META", flush=True)
-            elif buf.is_floating_point():
-                has_nan = torch.isnan(buf).any().item()
-                norm = buf.float().norm().item()
-                print(
-                    f"    {bname}: shape={list(buf.shape)} dtype={buf.dtype} "
-                    f"norm={norm:.6f} nan={has_nan} sample={buf.flatten()[:3].tolist()}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"    {bname}: shape={list(buf.shape)} dtype={buf.dtype} "
-                    f"sample={buf.flatten()[:5].tolist()}",
-                    flush=True,
-                )
-
-    # --- Diagnostic: check tie_word_embeddings and model config ---
-    model_cfg = getattr(restored_model, "config", None)
-    text_cfg = getattr(model_cfg, "text_config", model_cfg)
-    tie_we = getattr(text_cfg, "tie_word_embeddings", "MISSING")
-    print(f"\n  MODEL CONFIG: tie_word_embeddings={tie_we}", flush=True)
-    print(f"  MODEL CONFIG: architectures={getattr(model_cfg, 'architectures', 'MISSING')}", flush=True)
-
     source_model_loss = get_validation_loss(trainer.model_parts[0], val_batch, trainer.loss_fn, trainer.dist_env.device)
     restored_model_loss = get_validation_loss(restored_model, val_batch, trainer.loss_fn, trainer.dist_env.device)
     assert torch.allclose(source_model_loss, restored_model_loss), (
@@ -988,8 +877,7 @@ def test_hf_peft_checkpoint():
 
 
 def _rename_keys(d: dict, prepend: str):
-    """Rename the keys of *d* by prepending *prepend* to each key.
-    """
+    """Rename the keys of *d* by prepending *prepend* to each key."""
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
         key = f"{prepend}{k}"

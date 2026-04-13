@@ -165,6 +165,15 @@ def get_model_conversion_mapping(
     )
 
 
+_VLM_FALLBACK_KEY_MAPPINGS: dict[str, dict[str, str]] = {
+    "gemma3": {
+        r"^language_model\.model\.": "model.language_model.",
+        r"^vision_tower\.": "model.vision_tower.",
+        r"^multi_modal_projector\.": "model.multi_modal_projector.",
+    },
+}
+
+
 def get_combined_key_mapping(
     model_type: str,
     model_key_mapping: Optional[dict[str, str]] = None,
@@ -214,6 +223,14 @@ def get_combined_key_mapping(
                         for source, target in zip(sources, targets):
                             if source not in result:
                                 result[source] = target
+
+    # Fallback for VLM models where transformers dropped backward-compat
+    # conversion mappings (e.g. gemma3 in transformers >= 5.5 restructured
+    # the module hierarchy but removed the old→new key rename rules).
+    # The regex patterns are ^-anchored so they are no-ops when checkpoint
+    # keys already use the current naming convention.
+    if not result and model_type in _VLM_FALLBACK_KEY_MAPPINGS:
+        result.update(_VLM_FALLBACK_KEY_MAPPINGS[model_type])
 
     return result if result else None
 
