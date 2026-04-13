@@ -118,7 +118,6 @@ lr_scheduler:
 
 ci:
   time: "00:45:00"
-  vllm_deploy: true
   recipe_owner: adil-a
   checkpoint_robustness:
     trust_remote_code: true
@@ -128,6 +127,8 @@ ci:
     tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+  vllm_deploy:
+    enabled: true
 
 # Uncomment and configure for W&B logging
 # wandb:

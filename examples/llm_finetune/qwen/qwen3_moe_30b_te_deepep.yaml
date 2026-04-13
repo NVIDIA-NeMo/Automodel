@@ -111,10 +111,11 @@ ci:
   recipe_owner: hemildesai
   node_multiplier: true
   time: "00:15:00"
-  vllm_deploy: true
-  vllm_smoke_test: true
   checkpoint_robustness:
     hf_kl_threshold: 1e-4
     tokenizer_name: Qwen/Qwen3-30B-A3B
     no_check_resume: true
     dataset.num_samples_limit: 500
+  vllm_deploy:
+    enabled: true
+    smoke_test: true

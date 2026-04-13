@@ -95,7 +95,6 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
-  vllm_deploy: true
   recipe_owner: akoumpa
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
@@ -105,6 +104,8 @@ ci:
     cross_tp_kl_threshold: 5e-3
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
+  vllm_deploy:
+    enabled: true
 
 # Uncomment and configure for W&B logging
 # wandb:

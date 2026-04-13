@@ -163,7 +163,8 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
 
     # Generate vLLM deploy job if recipe opts in
     vllm_job = None
-    if ci_config.get('vllm_deploy'):
+    vllm_config = ci_config.get('vllm_deploy', {})
+    if vllm_config.get('enabled'):
         vllm_stage = 'peft_vllm_deploy' if 'peft' in config.stem else 'sft_vllm_deploy'
         vllm_job = {
             'extends': '.vllm_deploy_test',
@@ -173,6 +174,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
                 'TEST_LEVEL': f'{scope}',
             }
         }
+        extra_deps = vllm_config.get('extra_deps', [])
+        if extra_deps:
+            vllm_job['variables']['VLLM_EXTRA_DEPS'] = DQ(' '.join(extra_deps))
 
     return job, vllm_job
 

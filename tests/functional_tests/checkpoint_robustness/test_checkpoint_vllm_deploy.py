@@ -116,7 +116,8 @@ def _resolve_args(custom_args):
         trust_remote_code = True
 
     smoke_test = custom_args.get("vllm_smoke_test", False)
-    if not smoke_test and ci_cfg.get("vllm_smoke_test"):
+    vllm_deploy_cfg = ci_cfg.get("vllm_deploy", {})
+    if not smoke_test and vllm_deploy_cfg.get("smoke_test"):
         smoke_test = True
 
     max_new_tokens = int(custom_args.get("max_new_tokens", "20"))

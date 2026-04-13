@@ -100,7 +100,6 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
-  vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:35:00"
   checkpoint_robustness:
@@ -108,6 +107,8 @@ ci:
     tokenizer_name: microsoft/phi-4
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+  vllm_deploy:
+    enabled: true
 
 # Uncomment and configure for W&B logging
 # wandb:
