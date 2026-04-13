@@ -356,7 +356,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "transformers==5.5.1", "wandb"]
+known-third-party = ["datasets", "transformers", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
