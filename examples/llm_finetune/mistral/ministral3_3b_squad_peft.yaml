@@ -49,12 +49,12 @@ checkpoint:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
   dim: 8
-  alpha: 32
-  use_triton: True
-  # dtype needs a fix to resolve to type instead of string
-  # lora_dtype: torch.bfloat16
+  alpha: 16
+  use_triton: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*multi_modal_projector*"
 
 # torch.compile configuration
 compile:
