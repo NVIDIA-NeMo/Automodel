@@ -76,7 +76,7 @@ def _ensure_msc_available() -> None:
     """Raise an error if MSC is not installed but a cloud path is used."""
     if not MSC_AVAILABLE:
         raise ImportError(
-            "multistorageclient is required for cloud storage paths."
+            "multistorageclient is required for cloud storage paths. "
             "Install it with: pip install multi-storage-client "
             "--index-url https://pypi.nvidia.com"
         )
@@ -392,7 +392,7 @@ class Checkpointer:
             key_mapping: Optional key remapping when reading from HF checkpoints.
         """
         # Validate checkpoint directory
-        if not os.path.exists(model_path):
+        if not os.path.exists(model_path) and not if_cloud_path(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
         model_state = ModelState(
             model,
@@ -709,7 +709,7 @@ class Checkpointer:
             else:
                 state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
-            if is_cloud_path(path):
+            if is_cloud_path(path) and storage_reader is None:
                 _ensure_msc_available()
                 storage_reader = msc.torch.MultiStorageFileSystemReader(path)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
@@ -752,7 +752,7 @@ class Checkpointer:
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
 
         # Routes to MSC storage write for cloud paths
-        if is_cloud_path(path):
+        if is_cloud_path(path) and storage_writer is None:
             _ensure_msc_available()
             storage_writer = msc.torch.MultiStorageFileSystemWriter(path)
 
