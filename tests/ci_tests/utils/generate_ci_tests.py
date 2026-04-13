@@ -73,7 +73,7 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     search_path = f"{automodel_dir}/examples/{test_folder}"
 
     # Check scope
-    if scope == "release":
+    if scope in ("release", "perf"):
         for f in Path(f"{search_path}").rglob("*.yaml"):
             relative_path = f.relative_to(automodel_dir)
             yml_configs.append(relative_path)
@@ -142,7 +142,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
 
     # Configure test stage based on recipe type and robustness config
-    if 'benchmark' in config.stem:
+    if 'benchmark' in test_folder:
+        job['stage'] = 'performance'
+    elif 'benchmark' in config.stem:
         job['stage'] = 'benchmark'
     elif 'peft' in config.stem:
         job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
