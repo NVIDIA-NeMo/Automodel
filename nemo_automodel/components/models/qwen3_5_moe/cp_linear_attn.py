@@ -509,6 +509,7 @@ def patch_hf_model(model, cp_enabled=False):
         return
 
     _logger = logging.getLogger(__name__)
+    _PATCHED_ATTR = "_fp32_getattr_patched"
     patched = 0
     patched_classes = set()
     for name, mod in model.named_modules():
@@ -533,9 +534,11 @@ def patch_hf_model(model, cp_enabled=False):
         if holder is not None:
             mod.add_module("_fp32_params", holder)
 
+            # Guard against re-wrapping __getattr__ on repeated calls.
             cls = type(mod)
-            if cls not in patched_classes:
+            if cls not in patched_classes and not getattr(cls, _PATCHED_ATTR, False):
                 cls.__getattr__ = _make_fp32_getattr(cls.__getattr__)
+                setattr(cls, _PATCHED_ATTR, True)
                 patched_classes.add(cls)
         patched += 1
 
