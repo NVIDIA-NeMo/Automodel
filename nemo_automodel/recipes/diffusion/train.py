@@ -197,10 +197,7 @@ def build_model_and_optimizer(
         # FSDP2 replaces parameter storage, so AdamW with stale refs never commits
         # updates to the actual sharded parameters. Mirrors the LLM pattern in
         # nemo_automodel/recipes/llm/train_ft.py line 313.
-        trainable_params = [
-            p for n, p in transformer_module.named_parameters()
-            if "lora_" in n and p.requires_grad
-        ]
+        trainable_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
         if not trainable_params:
             raise RuntimeError(
                 "lora_cfg.enabled=True but no LoRA params found. "
@@ -431,11 +428,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         lora_cfg_raw = self.cfg.get("lora", None)
         if lora_cfg_raw is not None:
             from nemo_automodel.components.lora.config import LoRAConfig
-            raw = (
-                lora_cfg_raw.to_dict()
-                if hasattr(lora_cfg_raw, "to_dict")
-                else dict(lora_cfg_raw)
-            )
+
+            raw = lora_cfg_raw.to_dict() if hasattr(lora_cfg_raw, "to_dict") else dict(lora_cfg_raw)
             self.lora_cfg = LoRAConfig(**raw)
         else:
             self.lora_cfg = None
@@ -444,10 +438,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         # Required when lora.enabled=true.
         self.model_type = self.cfg.get("model.model_type", None)
         if self.lora_cfg and self.lora_cfg.enabled and not self.model_type:
-            raise ValueError(
-                "model.model_type must be set when lora.enabled=true. "
-                "Options: 'flux', 'wan', 'hunyuan'"
-            )
+            raise ValueError("model.model_type must be set when lora.enabled=true. Options: 'flux', 'wan', 'hunyuan'")
 
         lora_status = (
             f"enabled (rank={self.lora_cfg.rank}, alpha={self.lora_cfg.alpha})"
@@ -624,8 +615,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
             if self._lora_peft_config is None:
                 raise RuntimeError(
-                    "LoRA is enabled but _lora_peft_config is None. "
-                    "inject_lora() may not have run correctly."
+                    "LoRA is enabled but _lora_peft_config is None. inject_lora() may not have run correctly."
                 )
             # All ranks must call this (FSDP2 gather is a distributed collective).
             # Only main process writes files.
@@ -697,7 +687,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                                 grad_val = p.grad.to_local().float().norm().item() if p.grad is not None else None
                             except Exception:
                                 grad_val = p.grad.float().norm().item() if p.grad is not None else None
-                            logging.info(f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}")
+                            logging.info(
+                                f"[GRAD CHECK] {n}: grad_norm={grad_val}, param_norm={p.data.float().norm().item():.6f}"
+                            )
                             break
 
                 self.optimizer.step()
