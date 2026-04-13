@@ -135,9 +135,9 @@ jobs:
           package-name: nemo_automodel
           python-binary: ./venv/bin/python
 
-  ngc-cuda-test-pip:
+  cuda-wheelhouse:
     runs-on: linux-amd64-cpu16
-    name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
+    name: Build CUDA wheelhouse - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
     container:
       image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
     environment: nemo-ci
@@ -149,12 +149,89 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        extra-groups: ["", "cuda", "vlm", "fa", "all"]
     env:
-      EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+      WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Restore CUDA wheelhouse cache
+        id: cuda-wheelhouse-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WHEELHOUSE_DIR }}
+          key: install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock', '.github/workflows/install-test.yml') }}
+          restore-keys: |
+            install-test-cuda-wheelhouse-${{ runner.os }}-py${{ matrix.python-version }}-
+            install-test-cuda-wheelhouse-${{ runner.os }}-
+
+      - name: Build cached CUDA dependency wheels
+        if: steps.cuda-wheelhouse-cache.outputs.cache-hit != 'true'
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-pip python3-venv git
+          python3 -m venv ./venv
+
+          . ./venv/bin/activate
+
+          pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
+          pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
+
+          mkdir -p "${WHEELHOUSE_DIR}"
+          pip wheel --no-deps --no-build-isolation --wheel-dir "${WHEELHOUSE_DIR}" \
+            causal-conv1d \
+            mamba-ssm \
+            nv-grouped-gemm \
+            transformer-engine-torch \
+            "transformer-engine[pytorch]<=2.11.0"
+
+          # Fail fast if expected heavyweight CUDA wheels are missing.
+          ls -1 "${WHEELHOUSE_DIR}"/*.whl
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/causal_conv1d*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
+
+      - name: Upload CUDA wheelhouse artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          path: ${{ env.WHEELHOUSE_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  ngc-cuda-test-pip:
+    runs-on: linux-amd64-cpu16
+    name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
+    container:
+      image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+    environment: nemo-ci
+    needs: [pre-flight, cuda-wheelhouse]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+        extra-groups: ["", "cuda", "vlm", "fa", "all"]
+    env:
+      EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
+      WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download cached CUDA wheelhouse
+        uses: actions/download-artifact@v7
+        with:
+          name: cuda-wheelhouse-py${{ matrix.python-version }}
+          path: ${{ env.WHEELHOUSE_DIR }}
 
       - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
         shell: bash -x -e -u -o pipefail {0}
@@ -165,18 +242,21 @@ jobs:
 
           . ./venv/bin/activate
 
+          export PIP_FIND_LINKS="${WHEELHOUSE_DIR}"
+          export PIP_PREFER_BINARY=1
+
           pip install --upgrade pip
 
           PIP_ARGS=()
 
           if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
-            pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
-            pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
+            pip install --find-links "${PIP_FIND_LINKS}" --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
+            pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
 
-          pip install ${PIP_ARGS[@]} .$EXTRA
+          pip install --find-links "${PIP_FIND_LINKS}" ${PIP_ARGS[@]} .$EXTRA
 
       - name: Checkout check-imports
         uses: actions/checkout@v6
@@ -245,7 +325,7 @@ jobs:
           python-binary: ./venv/bin/python
 
   install-test-summary:
-    needs: [pip-test, uv-test, ngc-cuda-test-uv, ngc-cuda-test-pip, pre-flight]
+    needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, ngc-cuda-test-pip, pre-flight]
     runs-on: ubuntu-latest
     name: Install test summary
     if: |
