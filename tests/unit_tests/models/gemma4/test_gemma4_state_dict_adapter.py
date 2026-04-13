@@ -370,3 +370,69 @@ class TestConvertSingleTensorToHf:
         assert len(result) == 1
         assert result[0][0] == fqn
         assert result[0][1] is tensor
+
+    def test_router_proj_weight_remapped(self, adapter):
+        tensor = torch.randn(HIDDEN, HIDDEN)
+        fqn = "model.language_model.layers.0.moe.gate.proj.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.language_model.layers.0.router.proj.weight"
+        assert result[0][1] is tensor
+
+    def test_router_scale_remapped(self, adapter):
+        tensor = torch.randn(HIDDEN)
+        fqn = "model.language_model.layers.1.moe.gate.scale"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.language_model.layers.1.router.scale"
+        assert result[0][1] is tensor
+
+    def test_gate_and_up_projs_transposed_and_renamed(self, adapter):
+        tensor = torch.randn(N_EXPERTS, HIDDEN, 2 * EXPERT_INTER)
+        fqn = "model.language_model.layers.0.moe.experts.gate_and_up_projs"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 1
+        assert result[0][0] == "model.language_model.layers.0.experts.gate_up_proj"
+        assert result[0][1].shape == (N_EXPERTS, 2 * EXPERT_INTER, HIDDEN)
+        torch.testing.assert_close(result[0][1], tensor.transpose(-2, -1).contiguous())
+
+    def test_down_projs_transposed_renamed_and_emits_scale(self, adapter):
+        tensor = torch.randn(N_EXPERTS, EXPERT_INTER, HIDDEN)
+        fqn = "model.language_model.layers.0.moe.experts.down_projs"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+        assert len(result) == 2
+        hf_key, transposed = result[0]
+        scale_key, scale_tensor = result[1]
+
+        assert hf_key == "model.language_model.layers.0.experts.down_proj"
+        assert transposed.shape == (N_EXPERTS, HIDDEN, EXPERT_INTER)
+        torch.testing.assert_close(transposed, tensor.transpose(-2, -1).contiguous())
+
+        assert scale_key == "model.language_model.layers.0.router.per_expert_scale"
+        assert scale_tensor.shape == (N_EXPERTS,)
+        torch.testing.assert_close(scale_tensor, torch.ones(N_EXPERTS, dtype=tensor.dtype))
+
+    def test_exclude_key_regex_filters_key(self, adapter):
+        tensor = torch.randn(HIDDEN, HIDDEN)
+        fqn = "model.language_model.layers.0.moe.gate.proj.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r".*moe\.gate.*")
+
+        assert result == []
+
+    def test_exclude_key_regex_does_not_filter_non_matching(self, adapter):
+        tensor = torch.randn(HIDDEN, HIDDEN)
+        fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
+
+        result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r".*moe\.gate.*")
+
+        assert len(result) == 1
+        assert result[0][0] == fqn

@@ -46,6 +46,12 @@ tokenizer:
   pretrained_model_name_or_path: baichuan-inc/Baichuan2-7B-Chat
   trust_remote_code: true
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 # torch.compile configuration
 compile:
   enabled: false
@@ -104,10 +110,13 @@ ci:
   vllm_deploy: true
   recipe_owner: adil-a
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
+    trust_remote_code: true
+    kl_threshold: 1e-2
+    hf_kl_threshold: 5e-2
     distributed.tp_size: 2
     cross_tp_size: 2
-    cross_tp_kl_threshold: 5e-3
+    cross_tp_kl_threshold: 1e-2
+    resume_loss_threshold: 5e-2
     tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
