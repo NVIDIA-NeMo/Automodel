@@ -150,7 +150,7 @@ class TestGetHfConfigUnrecognizedModelType:
             "nemo_automodel._transformers.model_init.AutoConfig.from_pretrained",
             side_effect=_HF_UNRECOGNIZED_ERROR,
         ):
-            with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
+            with pytest.raises(ValueError, match="pip install --upgrade transformers nemo_automodel"):
                 get_hf_config("fake/qwen3_1024_model", attn_implementation="eager")
 
     def test_message_does_not_mention_transformers(self):
@@ -163,8 +163,7 @@ class TestGetHfConfigUnrecognizedModelType:
             with pytest.raises(ValueError) as exc_info:
                 get_hf_config("fake/qwen3_1024_model", attn_implementation="eager")
             msg = str(exc_info.value)
-            assert "pip install --upgrade nemo_automodel" in msg
-            assert "pip install --upgrade nemo_automodel transformers" not in msg
+            assert "pip install --upgrade transformers nemo_automodel" in msg
 
     def test_unrecognized_model_type_suggests_install_from_source(self):
         from nemo_automodel._transformers.model_init import get_hf_config
@@ -333,7 +332,7 @@ class TestFromConfigUnrecognizedModelType:
             "nemo_automodel._transformers.model_init.AutoConfig.from_pretrained",
             side_effect=_HF_UNRECOGNIZED_ERROR,
         ):
-            with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
+            with pytest.raises(ValueError, match="pip install --upgrade transformers nemo_automodel"):
                 get_hf_config("org/some_new_model", attn_implementation="eager")
 
     def test_from_config_string_does_not_mention_transformers(self):
@@ -346,8 +345,7 @@ class TestFromConfigUnrecognizedModelType:
             with pytest.raises(ValueError) as exc_info:
                 get_hf_config("org/some_new_model", attn_implementation="eager")
             msg = str(exc_info.value)
-            assert "pip install --upgrade nemo_automodel" in msg
-            assert "pip install --upgrade nemo_automodel transformers" not in msg
+            assert "pip install --upgrade transformers nemo_automodel" in msg
 
     def test_from_config_string_suggests_install_from_source(self):
         from nemo_automodel._transformers.model_init import get_hf_config
