@@ -28,11 +28,11 @@ class MoEParallelizerConfig:
     """Configuration for MoE model parallelization (EP + FSDP settings).
 
     Attributes:
-        ignore_router_for_ac: If True, uses MoE-act-only selective activation checkpointing:
-            only the MoE sublayer within each block is wrapped (attention activations are saved
-            normally). Within the MoE, a selective policy saves router gate outputs so routing
-            decisions are not recomputed, while expert activations are preferred for recompute.
-            If False (default), the full transformer block is wrapped for activation checkpointing.
+        ignore_router_for_ac: If True, uses MoE-act-only activation checkpointing: only the
+            MoE sublayer within each block is wrapped. Attention activations (QKV, softmax,
+            O-proj) are saved normally; the entire MoE forward (router + experts) is recomputed
+            during backward. Equivalent to Megatron's ``recompute_modules=['moe_act']``.
+            If False (default), the full transformer block is wrapped.
     """
 
     ignore_router_for_ac: bool = False

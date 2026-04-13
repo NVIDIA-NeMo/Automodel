@@ -110,10 +110,10 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True, applies MoE-act-only selective checkpointing: only the MoE
-            sublayer within each block is wrapped, leaving attention activations saved. Within
-            the MoE sublayer a selective policy MUST_SAVEs the router gate output (so routing
-            decisions are not recomputed) and PREFER_RECOMPUTEs expert activations.
+        ignore_router: If True, applies MoE-act-only checkpointing: only the MoE sublayer
+            within each block is wrapped. Attention activations (QKV, softmax, O-proj) are
+            saved normally. The entire MoE forward (router + experts) is recomputed during
+            backward, equivalent to Megatron's ``recompute_modules=['moe_act']``.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -161,17 +161,15 @@ def apply_ac(
     for layer_id, block in _model.layers.named_children():
         if ignore_router:
             # MoE-act-only: wrap only the MoE sublayer so attention activations are saved.
-            # The selective policy inside the MoE wrapper saves the router gate output and
-            # prefers to recompute expert activations.
+            # The entire MoE forward (router + experts) is recomputed during backward;
+            # no selective policy is needed since we're already scoped to the MoE layer.
             moe_attr = "moe" if hasattr(block, "moe") else "mlp"
             moe_module = getattr(block, moe_attr, None)
             if moe_module is not None and isinstance(moe_module, MoE):
                 setattr(
                     block,
                     moe_attr,
-                    ptd_checkpoint_wrapper(
-                        moe_module, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
-                    ),
+                    ptd_checkpoint_wrapper(moe_module, preserve_rng_state=True),
                 )
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
@@ -217,7 +215,10 @@ def apply_fsdp(
     _model = get_text_module(_model)
 
     for _, block in _model.layers.named_children():
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        moe_raw = block.moe if hasattr(block, "moe") else block.mlp
+        # Peel off any checkpoint wrapper (applied by apply_ac) so isinstance(MoE) checks
+        # and expert param collection work correctly even after AC wrapping.
+        moe_module = getattr(moe_raw, "_checkpoint_wrapped_module", moe_raw)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).

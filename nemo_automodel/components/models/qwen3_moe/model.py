@@ -83,10 +83,19 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        # Unwrap CheckpointWrapper (applied by activation checkpointing) to determine
+        # the underlying module type before dispatching. The wrapper's __call__ still
+        # applies gradient checkpointing transparently; we only need the wrapped type
+        # to decide whether to pass `padding_mask`.
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        _underlying = self.mlp._checkpoint_wrapped_module if isinstance(self.mlp, CheckpointWrapper) else self.mlp
+        if isinstance(_underlying, MLP):
             return self.mlp(x)
         else:
-            assert isinstance(self.mlp, MoE)
+            assert isinstance(_underlying, MoE), (
+                f"Expected mlp to be MLP or MoE (possibly wrapped), got {type(_underlying)}"
+            )
             return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):

@@ -161,6 +161,7 @@ RMSNorm is negligible (<0.5% of kernel time). Not a performance concern.
 | Attention kernel (cuDNN vs FA2) | Megatron advantage | ~2pp MFU — **real unfairness**; Automodel cannot use cuDNN with current CP>1 SDPA constraint |
 | RS NCCL bandwidth | Megatron disadvantage | ~1pp MFU lost; Megatron's `NCCL_P2P_NET_CHUNKSIZE` reduces RS efficiency |
 | AG–GEMM overlap | Megatron slight advantage | 67.6% vs 62.0%; Megatron's `--overlap-param-gather` more aggressive than `fsdp2_backward_prefetch_depth=2` |
+| AG/RS copy overhead (contiguous buffer) | Megatron advantage | ~6.1% kernel time / ~4.7% wall time; FSDP2 pays 1,979 ms/step in pack/unpack copies; MFSDP pays 64 ms (flat buffer, no staging) |
 | Gradient dtype | Fair | Both FP32 RS |
 | Model architecture | Fair | Same TP/CP/PP/DP, MBS, GBS, seqlen |
 | Cross-entropy fusion | Megatron minor advantage | `--cross-entropy-loss-fusion te` |
@@ -177,6 +178,24 @@ Primary driver: cuDNN attention (~2pp). Secondary: overlap quality and NCCL sett
 2. **Tune FSDP2 prefetch depth** — increase `fsdp2_forward_prefetch_depth` to reduce exposed AG time (currently 38% AG exposed vs Megatron's 32%; tuning depth or bucket size may close this).
 3. **Match NCCL env vars** — test with Megatron's `NCCL_P2P_NET_CHUNKSIZE` and `NCCL_IB_SL` settings to understand their impact on RS bandwidth (currently FSDP2 is faster without them).
 4. **Cross-entropy fusion** — add TE fused cross-entropy loss (`--cross-entropy-loss-fusion te` equivalent) to reduce activation memory and fuse the softmax+loss kernel.
+5. **Adopt contiguous flat parameter buffer (M-FSDP-style)** — FSDP2 stores parameters as individual tensors, requiring explicit pack/unpack copies before every AllGather and ReduceScatter. Megatron MFSDP maintains a single contiguous memory slab so AG/RS operate directly on it with no staging. The measured GPU kernel overhead per step:
+
+   | Kernel | Count | Total (ms) | Avg (µs) | Role |
+   |---|---|---|---|---|
+   | `chunk_cat_cuda_kernel` | 324 | 940 | 2,902 | Pre-RS: pack param-wise gradients into contiguous buffer |
+   | `split_with_sizes_copy_out_contiguous_no_cast_kernel` | 640 | 822 | 1,284 | Post-AG: unpack contiguous buffer back to param tensors |
+   | `CatArrayBatchedCopy` | 1,600 | 191 | 119 | Pre-AG batched per-param shard copy |
+   | `CatArrayBatchedCopy_vectorized` | 1,600 | 26 | 16 | Vectorized variant |
+   | **FSDP2 total** | | **1,979** | | |
+   | **MFSDP total** (`CatArrayBatchedCopy_vectorized` only) | | **64** | | No pre-RS/post-AG copy needed |
+
+   Two views of the overhead:
+   - **6.1% of FSDP2 kernel time** (1,979 / 32,399 ms): wasted compute capacity — GPU time spent on bookkeeping MFSDP never pays. This is the fairer efficiency gap metric.
+   - **4.7% of FSDP2 wall time** (940 / 20,031 ms): hard latency floor from `chunk_cat` alone, which is 100% serial before each RS and cannot be overlapped.
+
+   The serial nature of `chunk_cat` was confirmed by measuring the gap between its end and the immediately following RS kernel start across 10 representative calls — consistently **7–11 µs** (effectively zero; RS is hard-blocked on `chunk_cat`). The post-AG `split_with_sizes_copy_out` (822 ms) runs concurrently with RS on a separate stream but occupies the compute stream for ~1,284 µs per layer, reducing the GEMM–RS overlap window. `CatArrayBatchedCopy` (191 ms) is interleaved with GEMMs and partially hidden.
+
+   Adopting a flat contiguous buffer in Automodel (analogous to `use_orig_params=False` with custom bucketing, or a dedicated M-FSDP-style slab) would eliminate `chunk_cat` and `split_with_sizes_copy_out` entirely and reduce `CatArrayBatchedCopy` to the ~64 ms MFSDP baseline, recovering up to **~4.7% step time** from the serial path and **~6.1% compute efficiency**.
 
 ---
 
