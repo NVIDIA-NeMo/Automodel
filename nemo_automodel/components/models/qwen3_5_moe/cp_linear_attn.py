@@ -97,9 +97,8 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     ):
         """HF GatedDeltaNet forward with FSDP-safe fp32 gate computation.
 
-        Identical to ``Qwen3_5GatedDeltaNet.forward`` except the gate ``g``
-        is computed via ``_compute_gate`` which routes through the
-        ``_fp32_params`` holder so FSDP unshard/reshard works naturally.
+        Copied from transformers==5.3.0 Qwen3_5GatedDeltaNet.forward
+        with gate computation replaced by self._compute_gate(a).
         """
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
