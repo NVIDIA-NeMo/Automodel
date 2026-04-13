@@ -40,6 +40,12 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 # torch.compile configuration
 compile:
   enabled: false
@@ -94,6 +100,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3

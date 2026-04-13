@@ -46,8 +46,8 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false 
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -101,8 +101,9 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
-  recipe_owner: HuiyingLi
   time: "00:45:00"
+  vllm_deploy: true
+  recipe_owner: HuiyingLi
   checkpoint_robustness:
     hf_kl_threshold: 9e-3
     distributed.tp_size: 2

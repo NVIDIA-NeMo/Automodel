@@ -28,6 +28,8 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     build_pipeline_schedule,
     pipeline_model,
     _precompute_stage_shapes,
+    _get_hidden_and_vocab_size,
+    reset_pp_stage_shapes,
 )
 
 
@@ -836,6 +838,19 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].device.type == "meta"
 
+    def test_vl_composite_config_fallback(self):
+        """VL composite configs (no hidden_size on root) should fall back to text_config."""
+        import types
+
+        text_config = types.SimpleNamespace(hidden_size=64, vocab_size=128)
+        vl_config = types.SimpleNamespace(text_config=text_config)
+
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        _precompute_stage_shapes([stage], vl_config, microbatch_size=2, seq_len=16)
+
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (2, 16, 64)
+
     @patch('nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages')
     @patch('nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule')
     def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
@@ -909,3 +924,222 @@ class TestPrecomputeStageShapes:
 
         # inputs_meta should remain None (serial shape inference at runtime)
         assert mock_stage.inputs_meta is None
+
+
+class TestGetHiddenAndVocabSize:
+    """Test _get_hidden_and_vocab_size helper."""
+
+    def _make_config(self, hidden_size=None, vocab_size=None, text_config=None):
+        import types
+        cfg = types.SimpleNamespace()
+        if hidden_size is not None:
+            cfg.hidden_size = hidden_size
+        if vocab_size is not None:
+            cfg.vocab_size = vocab_size
+        if text_config is not None:
+            cfg.text_config = text_config
+        return cfg
+
+    def test_flat_config(self):
+        """LLM-style config with hidden_size and vocab_size at top level."""
+        cfg = self._make_config(hidden_size=4096, vocab_size=32000)
+        h, v = _get_hidden_and_vocab_size(cfg)
+        assert h == 4096
+        assert v == 32000
+
+    def test_nested_text_config(self):
+        """VLM-style config where sizes live under text_config."""
+        import types
+        text_cfg = types.SimpleNamespace(hidden_size=2048, vocab_size=128256)
+        cfg = self._make_config(text_config=text_cfg)
+        h, v = _get_hidden_and_vocab_size(cfg)
+        assert h == 2048
+        assert v == 128256
+
+    def test_partial_nested_config(self):
+        """Top-level hidden_size with vocab_size only in text_config."""
+        import types
+        text_cfg = types.SimpleNamespace(vocab_size=50000)
+        cfg = self._make_config(hidden_size=1024, text_config=text_cfg)
+        h, v = _get_hidden_and_vocab_size(cfg)
+        assert h == 1024
+        assert v == 50000
+
+    def test_top_level_takes_precedence(self):
+        """When both top-level and text_config have values, top-level wins."""
+        import types
+        text_cfg = types.SimpleNamespace(hidden_size=999, vocab_size=999)
+        cfg = self._make_config(hidden_size=4096, vocab_size=32000, text_config=text_cfg)
+        h, v = _get_hidden_and_vocab_size(cfg)
+        assert h == 4096
+        assert v == 32000
+
+    def test_missing_hidden_size_raises(self):
+        """Should raise ValueError when hidden_size cannot be found."""
+        cfg = self._make_config(vocab_size=32000)
+        with pytest.raises(ValueError, match="Cannot determine hidden_size"):
+            _get_hidden_and_vocab_size(cfg)
+
+    def test_missing_vocab_size_raises(self):
+        """Should raise ValueError when vocab_size cannot be found."""
+        cfg = self._make_config(hidden_size=4096)
+        with pytest.raises(ValueError, match="Cannot determine vocab_size"):
+            _get_hidden_and_vocab_size(cfg)
+
+    def test_both_missing_raises(self):
+        """Should raise ValueError when both are missing and no text_config."""
+        import types
+        cfg = types.SimpleNamespace()
+        with pytest.raises(ValueError, match="Cannot determine hidden_size"):
+            _get_hidden_and_vocab_size(cfg)
+
+    def test_text_config_missing_both_raises(self):
+        """text_config exists but doesn't have the attributes either."""
+        import types
+        text_cfg = types.SimpleNamespace()
+        cfg = self._make_config(text_config=text_cfg)
+        with pytest.raises(ValueError, match="Cannot determine hidden_size"):
+            _get_hidden_and_vocab_size(cfg)
+
+
+class TestResetPpStageShapes:
+    """Test reset_pp_stage_shapes function."""
+
+    def _make_stage(self, is_first, is_last, has_lm_head, param_dtype=torch.bfloat16):
+        """Create a mock stage that mimics PipelineStage attributes."""
+        stage = Mock()
+        stage.is_first = is_first
+        stage.is_last = is_last
+        stage.inputs_meta = None
+        stage._outputs_meta = None
+        stage.args_recv_info = {"some_key": "some_val"}
+        stage.grad_recv_info = {"grad_key": "grad_val"}
+        stage.grad_send_info = Mock()
+
+        submod = Mock()
+        param = torch.empty(1, dtype=param_dtype)
+        submod.parameters.return_value = iter([param])
+        if has_lm_head:
+            submod.lm_head = Mock()
+        else:
+            submod.lm_head = None
+        stage.submod = submod
+        return stage
+
+    def _make_config(self, hidden_size=64, vocab_size=128):
+        import types
+        return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
+
+    def _make_schedule(self, initialized=True):
+        schedule = Mock()
+        schedule._stage_forward_initialized = initialized
+        schedule._stage_backward_initialized = initialized
+        schedule._stages_forward_initialized = initialized
+        schedule._stages_backward_initialized = initialized
+        return schedule
+
+    def test_clears_stage_state(self):
+        """reset should clear _outputs_meta, inputs_meta, and recv/send buffers."""
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        # Pre-populate state to simulate a previously-initialized stage
+        stage._outputs_meta = (torch.empty(2, 16, 64, device="meta"),)
+        stage.inputs_meta = (torch.empty(2, 16, device="meta", dtype=torch.long),)
+        schedule = self._make_schedule()
+        config = self._make_config()
+
+        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=32)
+
+        # After reset, inputs_meta should be set to new shapes (seq_len=32)
+        assert stage.inputs_meta[0].shape == (2, 32)
+        # _configure_outputs_meta should have been called with new shapes
+        stage._configure_outputs_meta.assert_called_once()
+
+    def test_schedule_reinitialized(self):
+        """_stages_initialized should be set to False after reset."""
+        stage = self._make_stage(is_first=True, is_last=True, has_lm_head=True)
+        schedule = self._make_schedule(initialized=True)
+        config = self._make_config()
+
+        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=1, seq_len=64)
+
+        assert schedule._stage_forward_initialized is False
+        assert schedule._stage_backward_initialized is False
+        assert schedule._stages_forward_initialized is False
+        assert schedule._stages_backward_initialized is False
+
+    def test_recv_buffers_cleared(self):
+        """args_recv_info, grad_recv_info, grad_send_info should be cleared."""
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False)
+        schedule = self._make_schedule()
+        config = self._make_config()
+
+        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=16)
+
+        assert stage.args_recv_info == {}
+        assert stage.grad_recv_info == {}
+        assert stage.grad_send_info is None
+
+    def test_multi_stage_reset(self):
+        """Reset should work across a full 3-stage pipeline."""
+        stages = [
+            self._make_stage(is_first=True, is_last=False, has_lm_head=False),
+            self._make_stage(is_first=False, is_last=False, has_lm_head=False),
+            self._make_stage(is_first=False, is_last=True, has_lm_head=True),
+        ]
+        schedule = self._make_schedule()
+        config = self._make_config(hidden_size=128, vocab_size=256)
+
+        reset_pp_stage_shapes(schedule, stages, config, microbatch_size=4, seq_len=64)
+
+        # Stage 0: input_ids [4, 64]
+        assert stages[0].inputs_meta[0].shape == (4, 64)
+        assert stages[0].inputs_meta[0].dtype == torch.long
+
+        # Stage 1: hidden [4, 64, 128]
+        assert stages[1].inputs_meta[0].shape == (4, 64, 128)
+
+        # Stage 2: hidden → logits [4, 64, 256]
+        out_call = stages[2]._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (4, 64, 256)
+
+        # All recv/send buffers should be cleared
+        for stage in stages:
+            assert stage.args_recv_info == {}
+            assert stage.grad_recv_info == {}
+            assert stage.grad_send_info is None
+
+        assert schedule._stage_forward_initialized is False
+        assert schedule._stage_backward_initialized is False
+        assert schedule._stages_forward_initialized is False
+        assert schedule._stages_backward_initialized is False
+
+    def test_shapes_change_on_new_seq_len(self):
+        """Calling reset twice with different seq_lens should produce different shapes."""
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        schedule = self._make_schedule()
+        config = self._make_config()
+
+        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=2, seq_len=16)
+        assert stage.inputs_meta[0].shape == (2, 16)
+
+        # Reset for new call — need a fresh stage since _configure_outputs_meta tracks calls
+        stage2 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
+        schedule2 = self._make_schedule()
+        reset_pp_stage_shapes(schedule2, [stage2], config, microbatch_size=2, seq_len=128)
+        assert stage2.inputs_meta[0].shape == (2, 128)
+
+    def test_vlm_nested_config(self):
+        """reset_pp_stage_shapes should work with VLM-style nested text_config."""
+        import types
+        text_cfg = types.SimpleNamespace(hidden_size=2048, vocab_size=128256)
+        config = types.SimpleNamespace(text_config=text_cfg)
+
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
+        schedule = self._make_schedule()
+
+        reset_pp_stage_shapes(schedule, [stage], config, microbatch_size=1, seq_len=512)
+
+        # Should use text_config's sizes
+        assert stage.inputs_meta[0].shape == (1, 512, 2048)
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        assert out_call[0].shape == (1, 512, 128256)

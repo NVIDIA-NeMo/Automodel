@@ -49,6 +49,12 @@ compile:
   dynamic: true  # Set to false for better performance with fixed shapes
   backend: null  # Use default backend (inductor)
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
@@ -101,6 +107,8 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
   recipe_owner: adil-a
   time: "00:15:00"
   checkpoint_robustness:
