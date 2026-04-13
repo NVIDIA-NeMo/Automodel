@@ -148,7 +148,7 @@ def main():
         from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
         from nemo_automodel.components.launcher.interactive import InteractiveLauncher
 
-        cfg = parse_args_and_load_config(str(config_path))
+        cfg = parse_args_and_load_config(str(config_path), argv=extra)
         return InteractiveLauncher().launch(cfg, config_path, recipe_target, args.nproc_per_node, extra)
 
 
