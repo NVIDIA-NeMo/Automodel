@@ -159,7 +159,7 @@ RMSNorm is negligible (<0.5% of kernel time). Not a performance concern.
 | Difference | Direction | Impact |
 |---|---|---|
 | Attention kernel (cuDNN vs FA2) | Megatron advantage | ~2pp MFU — **real unfairness**; Automodel cannot use cuDNN with current CP>1 SDPA constraint |
-| RS NCCL bandwidth | Megatron disadvantage | ~1pp MFU lost; Megatron's `NCCL_P2P_NET_CHUNKSIZE` reduces RS efficiency |
+| RS NCCL bandwidth | Megatron disadvantage | ~1pp MFU lost; Megatron's `NCCL_P2P_NET_CHUNKSIZE` reduces RS efficiency, effective bandwidth from ~1.57 GB/s (FSDP2 default) to ~0.94 GB/s (~1.67× slower per RS call) in Megatron |
 | AG–GEMM overlap | Megatron slight advantage | 67.6% vs 62.0%; ~60 ms more exposed AG in FSDP2 despite faster individual AGs. Likely partly due to pre-AG `CatArrayBatchedCopy` delaying effective AG launch; Megatron stream scheduling may also differ but not directly confirmed |
 | AG/RS copy overhead (contiguous buffer) | Megatron advantage | ~6.1% kernel time / ~4.7% wall time; FSDP2 pays 1,979 ms/step in pack/unpack copies; MFSDP pays 64 ms (flat buffer, no staging) |
 | Gradient dtype | Fair | Both FP32 RS |
