@@ -40,7 +40,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
   save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
@@ -111,3 +111,10 @@ ci:
   recipe_owner: hemildesai
   node_multiplier: true
   time: "00:15:00"
+  vllm_deploy: true
+  vllm_smoke_test: true
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-4
+    tokenizer_name: Qwen/Qwen3-30B-A3B
+    no_check_resume: true
+    dataset.num_samples_limit: 500

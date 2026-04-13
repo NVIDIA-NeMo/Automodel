@@ -381,6 +381,11 @@ def _init_model(
         init_param_names = _get_init_param_names(model_cls)
         _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
         kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+        # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
+        if "backend" in kwargs and isinstance(kwargs["backend"], dict):
+            from nemo_automodel.components.models.common.utils import BackendConfig
+
+            kwargs["backend"] = BackendConfig(**kwargs["backend"])
         # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
         if torch_dtype != "auto":
             hf_config.torch_dtype = torch_dtype

@@ -73,7 +73,7 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     search_path = f"{automodel_dir}/examples/{test_folder}"
 
     # Check scope
-    if scope == "release":
+    if scope in ("release", "perf"):
         for f in Path(f"{search_path}").rglob("*.yaml"):
             relative_path = f.relative_to(automodel_dir)
             yml_configs.append(relative_path)
@@ -142,7 +142,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
 
     # Configure test stage based on recipe type and robustness config
-    if 'benchmark' in config.stem:
+    if 'benchmark' in test_folder:
+        job['stage'] = 'performance'
+    elif 'benchmark' in config.stem:
         job['stage'] = 'benchmark'
     elif 'peft' in config.stem:
         job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
@@ -159,7 +161,20 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         slurm_time = job['variables'].get('TIME', '00:10:00')
         job['variables']['TIME'] = DQ(slurm_time_multiplier(slurm_time, 2))
 
-    return job
+    # Generate vLLM deploy job if recipe opts in
+    vllm_job = None
+    if ci_config.get('vllm_deploy'):
+        vllm_stage = 'peft_vllm_deploy' if 'peft' in config.stem else 'sft_vllm_deploy'
+        vllm_job = {
+            'extends': '.vllm_deploy_test',
+            'stage': vllm_stage,
+            'variables': {
+                'CONFIG_PATH': f'{config}',
+                'TEST_LEVEL': f'{scope}',
+            }
+        }
+
+    return job, vllm_job
 
 
 def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
@@ -201,7 +216,10 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         if model_name in exempt_models_list or config_name in exempt_configs_list:
             continue
 
-        pipeline[f'{config_name}'] = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        job, vllm_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        pipeline[f'{config_name}'] = job
+        if vllm_job:
+            pipeline[f'{config_name}_vllm_deploy'] = vllm_job
 
     return pipeline
 
