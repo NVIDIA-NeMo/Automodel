@@ -49,10 +49,10 @@ peft:
   use_triton: True
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false 
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
