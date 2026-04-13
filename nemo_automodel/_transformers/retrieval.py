@@ -130,6 +130,7 @@ def build_encoder_backbone(
     model_type = getattr(config, "model_type", "")
 
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+
     if task_map is not None:
         arch_name = task_map.get(task)
         if arch_name is None:
@@ -196,9 +197,16 @@ _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
 }
+_MINISTRAL3_BIDIREC_TASKS = {
+    "embedding": "Ministral3BidirectionalModel",
+}
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
+    "ministral3": _MINISTRAL3_BIDIREC_TASKS,
+    "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
+    # Mistral3-VL Hub configs use top-level model_type "mistral3" (language is nested under text_config).
+    "mistral3": _MINISTRAL3_BIDIREC_TASKS,
 }
 
 
