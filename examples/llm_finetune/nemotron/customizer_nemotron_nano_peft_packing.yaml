@@ -18,11 +18,11 @@ model:
     enable_deepep: false
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
-  dp_size: 1
+  dp_size: null
   tp_size: 1
   pp_size: 1
   cp_size: 1
-  ep_size: null
+  ep_size: 4
   sequence_parallel: false
 step_scheduler:
   global_batch_size: 8
@@ -39,9 +39,6 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
-lr_scheduler:
-  lr_decay_style: cosine
-  lr_warmup_steps: 0
 checkpoint:
   enabled: true
   model_save_format: safetensors
@@ -85,8 +82,8 @@ peft:
   dim: 16
   alpha: 32
   dropout: 0.0
-  match_all_linear: true
   use_triton: true
+  exclude_modules: ["*.out_proj"]
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 parallelizer:
@@ -95,10 +92,10 @@ parallelizer:
 
 ci:
   time: "00:30:00"
+  nproc_per_node: 4
   checkpoint_robustness:
     hf_kl_threshold: 1e-1
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     no_check_resume: true
     experts_implementation: grouped_mm
     trust_remote_code: true
-    distributed.ep_size: 8

@@ -39,9 +39,6 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
-lr_scheduler:
-  lr_decay_style: cosine
-  lr_warmup_steps: 0
 checkpoint:
   enabled: true
   model_save_format: safetensors
@@ -95,6 +92,7 @@ parallelizer:
 
 ci:
   time: "00:30:00"
+  nproc_per_node: 1
   checkpoint_robustness:
     hf_kl_threshold: 5e-2
     tokenizer_name: openai/gpt-oss-20b

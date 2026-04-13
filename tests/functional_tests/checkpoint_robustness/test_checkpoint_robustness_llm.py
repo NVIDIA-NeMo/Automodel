@@ -375,6 +375,12 @@ def test_checkpoint_robustness():
         cfg.step_scheduler.max_steps = resume_max_steps
         cfg.checkpoint.checkpoint_dir = baseline_dir
         cfg.checkpoint.enabled = False
+        # Phase 1 computed lr_decay_steps = min(total_epoch_steps, original_max_steps).
+        # With resume_max_steps the baseline would compute a *different* lr_decay_steps,
+        # causing the LR curve (and thus model weights) at step N to diverge from
+        # Phase 1's checkpoint.  Pin lr_decay_steps to match Phase 1.
+        if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
+            cfg.lr_scheduler.lr_decay_steps = original_max_steps
         baseline_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         baseline_trainer.setup()
         baseline_trainer.run_train_validation_loop()
@@ -393,7 +399,9 @@ def test_checkpoint_robustness():
         torch.cuda.empty_cache()
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
-        # Resume: reload from Phase 1 checkpoint and train to resume_max_steps
+        # Resume: reload from Phase 1 checkpoint and train to resume_max_steps.
+        # The checkpoint restores lr_decay_steps = original_max_steps, matching
+        # the baseline above.  No scheduler override needed.
         cfg = parse_args_and_load_config()
         cfg.checkpoint.restore_from = str(ckpt_step_dir)
         cfg.step_scheduler.max_steps = resume_max_steps
