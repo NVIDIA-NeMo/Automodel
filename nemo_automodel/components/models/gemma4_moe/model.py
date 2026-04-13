@@ -248,15 +248,18 @@ class Gemma4MoETextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.expert_intermediate_size or getattr(config, "moe_intermediate_size", None),
@@ -274,6 +277,9 @@ class Gemma4MoETextModelBackend(nn.Module):
             expert_activation="geglu",
             softmax_before_topk=False,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
@@ -452,11 +458,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             return
 
         # --- MoE path: replace the text model ---
+        moe_overrides = kwargs.pop("moe_overrides", None)
         self.model.__class__ = Gemma4MoEModel
         self.model.language_model = Gemma4MoETextModelBackend(
             text_config,
             backend=self.backend,
             moe_config=moe_config,
+            moe_overrides=moe_overrides,
         )
 
         # Expose moe_config for the MoE parallelizer assertion
