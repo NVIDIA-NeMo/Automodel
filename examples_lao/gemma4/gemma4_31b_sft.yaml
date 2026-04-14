@@ -84,7 +84,7 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
-    max_length: 4096
+    max_length: 2048
 
 optimizer:
   _target_: torch.optim.AdamW
