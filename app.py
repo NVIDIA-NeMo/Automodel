@@ -31,17 +31,18 @@ import os
 import sys
 import warnings
 
-from nemo_automodel.cli.app import main
-
 # Pydantic v2 emits UnsupportedFieldAttributeWarning for Field(repr=...) /
 # Field(frozen=...) used inside 3.12-style `type` aliases in third-party libs.
 # There is nothing actionable for us here, so silence them globally.
+# Must run before any import that triggers pydantic schema generation.
 try:
     from pydantic.warnings import UnsupportedFieldAttributeWarning
 
     warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
 except ImportError:
     pass
+
+from nemo_automodel.cli.app import main
 
 logger = logging.getLogger(__name__)
 
