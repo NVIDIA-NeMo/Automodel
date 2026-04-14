@@ -38,8 +38,9 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973
+# Address CVE-2025-68973; install ffmpeg for torchcodec audio/video decoding
 RUN apt-get update && apt install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -153,6 +154,11 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
     uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
+
+# Rebuild torchcodec from source to match the container's PyTorch ABI
+RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+    pip install --no-build-isolation --force-reinstall --no-deps \
+        git+https://github.com/pytorch/torchcodec.git@v0.8.0
 
 # Patch wandb-core: bump vulnerable Go deps (CVE fixes)
 ARG TARGETARCH
