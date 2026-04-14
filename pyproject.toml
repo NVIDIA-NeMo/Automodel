@@ -91,7 +91,7 @@ dependencies = [
 
 [project.optional-dependencies]
 diffusion = [
-    "diffusers>=0.36.0",
+    "diffusers>=0.37.0",
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
