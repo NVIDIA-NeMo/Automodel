@@ -49,6 +49,9 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export PYTHONFAULTHANDLER=1
 
+# Avoid CUDA allocator fragmentation (fixes "reserved but unallocated" OOM)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 for name in MASTER_ADDR MASTER_PORT RANK WORLD_SIZE; do
     if [ -z "${!name:-}" ]; then
         echo "Missing required environment variable: ${name}" >&2
