@@ -1,6 +1,6 @@
 # Llama (Bidirectional)
 
-NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention** so each token can attend to all other tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
+NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses non-causal **bidirectional attention**, so each token can attend to all (future or past) tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
 
 For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](../../reranker/meta/llama-bidirectional.md).
 For the NVIDIA model page, see [Llama-Embed-Nemotron-8B](../nvidia/llama-embed-nemotron-8b.md).
