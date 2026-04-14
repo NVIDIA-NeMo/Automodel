@@ -1,0 +1,106 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gemma 4 31B full SFT example.
+# This repository currently supports Gemma4 through the VLM / ImageTextToText path,
+# so this config uses the VLM finetune recipe instead of the LLM finetune recipe.
+#
+# Launch example:
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples_lao/gemma4/gemma4_31b_sft.yaml
+#
+# Before running:
+# 1. Replace the dataset _target_ / path_or_dataset / split fields with your own dataset.
+# 2. Keep gemma4_prefix_collate_fn for 31B unless you know your data formatting does not need it.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 360
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 2026
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-31B-it
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: true
+  use_sdpa_patching: false
+  attn_implementation: sdpa
+  # Gemma4 31B does not use kv_shared layers, so keep use_cache disabled for training.
+  text_config:
+    use_cache: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_lao/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  # 31B generally needs activation checkpointing to avoid OOM under FSDP2.
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:make_parquet_messages_dataset
+  path_or_dataset:
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dayuzhong_instruct_gemini3.1_5w.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dyz_trans_10w_gemini3.1.parquet
+  split: train
+  shuffle_seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: gemma4-31b-sft
