@@ -40,6 +40,9 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   torch_dtype: bf16
+  quantization_config:
+    _target_: transformers.FineGrainedFP8Config
+    dequantize: true
 
 checkpoint:
   enabled: true
