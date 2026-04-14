@@ -586,10 +586,11 @@ class Checkpointer:
             model_name: Name of the model or an absolute path to a snapshot
             load_base_model: If True, restore from HF base checkpoint
         """
+        model_type = getattr(getattr(model, "config", None), "model_type", None)
+
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
-            model_type = getattr(getattr(model, "config", None), "model_type", None)
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
             key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
@@ -605,7 +606,7 @@ class Checkpointer:
                 key_mapping=key_mapping,
             )
 
-        _reinit_non_persistent_buffers(model, device)
+        _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
@@ -1031,7 +1032,13 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
 
-def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> None:
+_MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset({
+    "gemma3",
+    "nemotron-nas",
+})
+
+
+def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model_type: str | None = None) -> None:
     """
     Recompute non-persistent buffers that are not saved in checkpoints.
 
@@ -1039,6 +1046,9 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> No
     materialization they contain uninitialized CUDA memory.  When
     ``initialize_weights()`` is skipped (e.g. for Gemma3 to avoid DTensor
     issues), these buffers must be recomputed explicitly.
+
+    Only runs for models listed in ``_MODELS_REQUIRING_BUFFER_REINIT`` to
+    avoid unexpected side-effects on arbitrary HF Hub models.
 
     Handles four patterns:
 
@@ -1054,7 +1064,12 @@ def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device) -> No
     Args:
         model: Model to reinitialize non-persistent buffers for.
         device: Device to create the new buffers on.
+        model_type: The ``config.model_type`` string.  If not in
+            ``_MODELS_REQUIRING_BUFFER_REINIT`` the function is a no-op.
     """
+    if model_type not in _MODELS_REQUIRING_BUFFER_REINIT:
+        return
+
     for name, module in model.named_modules():
         # Pattern 1: standard RoPE with rope_init_fn + rope_kwargs (Nemotron-NAS)
         if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
