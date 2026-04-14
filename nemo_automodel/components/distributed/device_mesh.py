@@ -35,6 +35,7 @@ from typing import Optional, Tuple, Union
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from nemo_automodel.components.distributed.mesh_utils import _unflatten_compat
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     FSDP2Config,
@@ -224,7 +225,8 @@ def _create_fsdp2_device_mesh(
     moe_mesh = None
     if ep_size > 1:
         non_pp_mesh = device_mesh[("dp_replicate", "dp_shard", "cp", "tp")]._flatten()
-        moe_mesh = non_pp_mesh._unflatten(
+        moe_mesh = _unflatten_compat(
+            non_pp_mesh,
             0,
             (ep_shard_size, ep_size),
             ("ep_shard", "ep"),

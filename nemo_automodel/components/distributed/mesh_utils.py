@@ -242,7 +242,8 @@ def _create_fsdp2_device_mesh(
     if ep_size > 1:
         non_pp_dims = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
         non_pp_mesh = device_mesh[non_pp_dims]._flatten()
-        moe_mesh = non_pp_mesh._unflatten(
+        moe_mesh = _unflatten_compat(
+            non_pp_mesh,
             0,
             (ep_shard_size, ep_size),
             (MeshAxisName.EP_SHARD, MeshAxisName.EP),
@@ -313,6 +314,21 @@ def _create_megatron_fsdp_device_mesh(
     return device_mesh
 
 
+def _unflatten_compat(flat_mesh: "DeviceMesh", dim: int, sizes: tuple, names: tuple) -> "DeviceMesh":
+    """Compatibility shim for DeviceMesh._unflatten(), which was added in PyTorch 2.10.
+
+    Reconstructs a multi-dimensional mesh from a flat mesh by reshaping its
+    rank tensor.  ``dim`` must be 0 (only case used in this codebase).
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+
+    if hasattr(flat_mesh, '_unflatten'):
+        return flat_mesh._unflatten(dim, sizes, names)
+    # PyTorch 2.9.x fallback: reshape the underlying rank tensor directly.
+    new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
+    return DeviceMesh(flat_mesh.device_type, new_mesh_tensor, mesh_dim_names=names)
+
+
 def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
     """Access a 1D submesh by parallelism name (e.g. ``"dp"``, ``"tp"``, ``"dp_cp"``).
 
@@ -375,7 +391,7 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         if fm.size() != target:
             continue
         try:
-            result = fm._unflatten(0, sizes, names)
+            result = _unflatten_compat(fm, 0, sizes, names)
         except (ValueError, RuntimeError):
             continue
         # Validate: for each requested dim, verify its process group matches
