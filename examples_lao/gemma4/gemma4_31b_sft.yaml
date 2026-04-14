@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma 4 31B LoRA / PEFT SFT example.
+# Gemma 4 31B Full-Parameter SFT example.
 # This repository currently supports Gemma4 through the VLM / ImageTextToText path,
 # so this config uses the VLM finetune recipe instead of the LLM finetune recipe.
+# Vision tower and audio tower are frozen; the full language model is trained.
 #
 # Launch example:
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples_lao/gemma4/gemma4_31b_sft.yaml
 #
 # Before running:
 # 1. Replace the dataset _target_ / path_or_dataset / split fields with your own dataset.
-# 2. Keep gemma4_prefix_collate_fn for 31B unless you know your data formatting does not need it.
+# 2. Keep gemma4_prefix_truncating_collate_fn for 31B.
 
 recipe: FinetuneRecipeForVLM
 
@@ -52,23 +53,9 @@ model:
   text_config:
     use_cache: false
 
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: false
-  exclude_modules:
-    - "*vision_tower*"
-    - "*vision*"
-    - "*visual*"
-    - "*image_encoder*"
-    - "*lm_head*"
-    - "*audio*"
-  dim: 16
-  alpha: 32
-  use_triton: true
-
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_lora_lao/
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_lao/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -118,4 +105,4 @@ freeze_config:
 # wandb:
 #   project: <your-project>
 #   entity: <your-entity>
-#   name: gemma4-31b-lora
+#   name: gemma4-31b-sft
