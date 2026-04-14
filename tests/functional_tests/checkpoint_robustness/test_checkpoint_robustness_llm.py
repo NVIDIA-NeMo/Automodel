@@ -400,8 +400,6 @@ def test_checkpoint_robustness():
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
         # Resume: reload from Phase 1 checkpoint and train to resume_max_steps.
-        # The checkpoint restores lr_decay_steps = original_max_steps, matching
-        # the baseline above.  No scheduler override needed.
         cfg = parse_args_and_load_config()
         cfg.checkpoint.restore_from = str(ckpt_step_dir)
         cfg.step_scheduler.max_steps = resume_max_steps
