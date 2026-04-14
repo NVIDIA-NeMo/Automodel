@@ -1942,9 +1942,7 @@ class MistralCommonBackend(PreTrainedTokenizerBase):
         if not os.path.isdir(pretrained_model_name_or_path) and os.environ.get("HF_HUB_OFFLINE", "0") == "1":
             from huggingface_hub import snapshot_download
 
-            pretrained_model_name_or_path = snapshot_download(
-                pretrained_model_name_or_path, local_files_only=True
-            )
+            pretrained_model_name_or_path = snapshot_download(pretrained_model_name_or_path, local_files_only=True)
 
         if not os.path.isdir(pretrained_model_name_or_path):
             tokenizer_path = download_tokenizer_from_hf_hub(
