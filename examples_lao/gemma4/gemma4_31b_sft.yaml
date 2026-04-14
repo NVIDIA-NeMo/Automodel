@@ -27,7 +27,7 @@ recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 2
+  local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: null
   num_epochs: 1
@@ -84,6 +84,7 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+    max_length: 4096
 
 optimizer:
   _target_: torch.optim.AdamW
