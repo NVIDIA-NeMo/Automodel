@@ -47,7 +47,7 @@ fi
 NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
 
 # Customizer contract test dataset overrides
-if [[ "${CONFIG_PATH}" == *customizer/* ]]; then
+if [[ "${CONFIG_PATH}" == *customizer_* ]]; then
   CUSTOMIZER_DATA="${NEMO_CI_PATH}/datasets/customizer/sample-datasets"
   if [[ "${CONFIG_PATH}" == *chat* ]]; then
     CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/train.jsonl \
@@ -58,6 +58,9 @@ if [[ "${CONFIG_PATH}" == *customizer/* ]]; then
   fi
   CONFIG="${CONFIG} ${CUSTOMIZER_DATASET_ARGS}"
 fi
+
+# Per-config nproc override (set via ci.nproc_per_node in recipe YAML)
+NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
 
 # Command to execute, defaults to torchrun
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
@@ -77,9 +80,14 @@ ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
   --step_scheduler.max_steps 5 \
   --step_scheduler.ckpt_every_steps 5 \
   --step_scheduler.val_every_steps 5 \
+<<<<<<< HEAD
   --step_scheduler.global_batch_size 32 \
+  --step_scheduler.local_batch_size 2"
+=======
+  --step_scheduler.global_batch_size 16 \
   --step_scheduler.local_batch_size 2 \
   ${CUSTOMIZER_DATASET_ARGS:-}"
+>>>>>>> 3cf41be5 (ci: enable checkpoint robustness testing for customizer configs)
 
 if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
   ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
