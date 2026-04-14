@@ -12,28 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
     CrossEncoderModel,
-    configure_encoder_metadata,
     _init_encoder_common,
+    configure_encoder_metadata,
     pool,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
-from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
@@ -548,3 +549,198 @@ def test_init_encoder_common_name_or_path_for_generic():
     _init_encoder_common(encoder, fake)
 
     assert encoder.name_or_path == "Qwen/Qwen3-1.7B"
+
+
+# ---------------------------------------------------------------------------
+# is_causal=False refactor: config, forward delegation, encode kwarg,
+# extract_submodel, and generic-path is_causal flags
+# ---------------------------------------------------------------------------
+
+
+def _tiny_bidirec_config(**overrides):
+    defaults = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        pad_token_id=0,
+    )
+    defaults.update(overrides)
+    return LlamaBidirectionalConfig(**defaults)
+
+
+def test_config_is_causal_set_to_false():
+    """config.is_causal must be False after init — required for create_causal_mask
+    to redirect to create_bidirectional_mask in the parent forward()."""
+    cfg = _tiny_bidirec_config()
+    model = LlamaBidirectionalModel(cfg)
+    assert model.config.is_causal is False
+
+
+def test_no_forward_override():
+    """LlamaBidirectionalModel must NOT define its own forward().
+    It relies on the parent LlamaModel.forward() which calls create_causal_mask
+    and respects config.is_causal = False."""
+    assert "forward" not in LlamaBidirectionalModel.__dict__
+    assert LlamaBidirectionalModel.forward is LlamaModel.forward
+
+
+def test_bidirectional_output_via_parent_forward():
+    """Parent forward() should produce bidirectional attention when
+    config.is_causal = False — changing a later token must affect
+    an earlier token's hidden state."""
+    cfg = _tiny_bidirec_config()
+    model = LlamaBidirectionalModel(cfg)
+    model.eval()
+
+    ids_a = torch.tensor([[1, 2, 3, 4]])
+    ids_b = torch.tensor([[1, 2, 3, 5]])  # only last token differs
+    mask = torch.ones_like(ids_a)
+
+    with torch.no_grad():
+        out_a = model(input_ids=ids_a, attention_mask=mask)
+        out_b = model(input_ids=ids_b, attention_mask=mask)
+
+    # In bidirectional attention, changing token 4 affects ALL positions,
+    # including position 0. In causal attention, position 0 would be identical.
+    hidden_a = out_a.last_hidden_state[0, 0]
+    hidden_b = out_b.last_hidden_state[0, 0]
+    assert not torch.allclose(hidden_a, hidden_b, atol=1e-5), (
+        "Position 0 hidden state should differ when a later token changes "
+        "(bidirectional attention). If identical, attention is still causal."
+    )
+
+
+class _SpyModel(nn.Module):
+    """A fake model that records the kwargs passed to forward()."""
+
+    def __init__(self, hidden_size=16):
+        super().__init__()
+        self.config = MagicMock(hidden_size=hidden_size)
+        self.captured_kwargs = {}
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        self.captured_kwargs = dict(kwargs)
+        bsz, seq = input_ids.shape
+        h = self.config.hidden_size
+        last = torch.ones(bsz, seq, h)
+        return BaseModelOutputWithPast(
+            last_hidden_state=last,
+            hidden_states=[last],
+        )
+
+
+def test_encode_passes_is_causal_false():
+    """BiEncoderModel.encode() must pass is_causal=False to the model's
+    forward() so FA2/SDPA kernels don't apply causal masking."""
+    spy = _SpyModel(hidden_size=16)
+    encoder = BiEncoderModel(model=spy, pooling="avg", l2_normalize=False)
+
+    input_dict = {
+        "input_ids": torch.ones(2, 4, dtype=torch.long),
+        "attention_mask": torch.ones(2, 4, dtype=torch.long),
+    }
+    encoder.encode(input_dict)
+
+    assert "is_causal" in spy.captured_kwargs, (
+        "encode() must pass is_causal kwarg to model forward"
+    )
+    assert spy.captured_kwargs["is_causal"] is False
+
+
+class _FakeLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("Cfg", (), {"model_type": "fake_text"})()
+        self.layers = nn.ModuleList()
+        self.linear = nn.Linear(8, 8)
+
+
+class _FakeVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = _FakeLanguageModel()
+        self.vision_model = nn.Linear(4, 4)
+
+
+def test_extract_submodel(monkeypatch):
+    """build_encoder_backbone with extract_submodel='language_model' should
+    return the language_model submodule, not the full VLM."""
+    from nemo_automodel._transformers import retrieval
+
+    vlm = _FakeVLM()
+
+    monkeypatch.setattr(
+        retrieval, "AutoModel",
+        type("AutoModel", (), {"from_pretrained": staticmethod(lambda *a, **kw: vlm)}),
+    )
+    monkeypatch.setattr(
+        retrieval, "AutoConfig",
+        type("AutoConfig", (), {"from_pretrained": staticmethod(
+            lambda *a, **kw: type("Cfg", (), {"model_type": "fake_vlm"})()
+        )}),
+    )
+
+    result = retrieval.build_encoder_backbone(
+        model_name_or_path="fake/vlm",
+        task="embedding",
+        extract_submodel="language_model",
+    )
+    assert result is vlm.language_model
+
+
+class _FakeAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.is_causal = True
+
+
+class _FakeDecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = _FakeAttention()
+
+
+class _FakeDecoderModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("Cfg", (), {"model_type": "fake_decoder"})()
+        self.layers = nn.ModuleList([_FakeDecoderLayer(), _FakeDecoderLayer()])
+
+
+def _mock_generic_automodel(monkeypatch):
+    from nemo_automodel._transformers import retrieval
+
+    fake_model = _FakeDecoderModel()
+    monkeypatch.setattr(
+        retrieval, "AutoModel",
+        type("AutoModel", (), {"from_pretrained": staticmethod(lambda *a, **kw: fake_model)}),
+    )
+    monkeypatch.setattr(
+        retrieval, "AutoConfig",
+        type("AutoConfig", (), {"from_pretrained": staticmethod(
+            lambda *a, **kw: type("Cfg", (), {"model_type": "fake_decoder"})()
+        )}),
+    )
+    return fake_model
+
+
+def test_build_encoder_backbone_sets_config_is_causal(monkeypatch):
+    """build_encoder_backbone must set config.is_causal = False on generic models."""
+    _mock_generic_automodel(monkeypatch)
+    from nemo_automodel._transformers import retrieval
+
+    result = retrieval.build_encoder_backbone("fake/path", task="embedding")
+    assert result.config.is_causal is False
+
+
+def test_build_encoder_backbone_sets_attention_is_causal(monkeypatch):
+    """build_encoder_backbone must set module.is_causal = False on all attention layers."""
+    _mock_generic_automodel(monkeypatch)
+    from nemo_automodel._transformers import retrieval
+
+    result = retrieval.build_encoder_backbone("fake/path", task="embedding")
+    for layer in result.layers:
+        assert layer.self_attn.is_causal is False
