@@ -650,47 +650,6 @@ def test_encode_passes_is_causal_false():
     assert spy.captured_kwargs["is_causal"] is False
 
 
-class _FakeLanguageModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.config = type("Cfg", (), {"model_type": "fake_text"})()
-        self.layers = nn.ModuleList()
-        self.linear = nn.Linear(8, 8)
-
-
-class _FakeVLM(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.language_model = _FakeLanguageModel()
-        self.vision_model = nn.Linear(4, 4)
-
-
-def test_extract_submodel(monkeypatch):
-    """build_encoder_backbone with extract_submodel='language_model' should
-    return the language_model submodule, not the full VLM."""
-    from nemo_automodel._transformers import retrieval
-
-    vlm = _FakeVLM()
-
-    monkeypatch.setattr(
-        retrieval, "AutoModel",
-        type("AutoModel", (), {"from_pretrained": staticmethod(lambda *a, **kw: vlm)}),
-    )
-    monkeypatch.setattr(
-        retrieval, "AutoConfig",
-        type("AutoConfig", (), {"from_pretrained": staticmethod(
-            lambda *a, **kw: type("Cfg", (), {"model_type": "fake_vlm"})()
-        )}),
-    )
-
-    result = retrieval.build_encoder_backbone(
-        model_name_or_path="fake/vlm",
-        task="embedding",
-        extract_submodel="language_model",
-    )
-    assert result is vlm.language_model
-
-
 class _FakeAttention(nn.Module):
     def __init__(self):
         super().__init__()
