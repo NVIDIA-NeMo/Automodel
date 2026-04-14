@@ -61,11 +61,13 @@ uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_prepara
 automodel examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml --nproc-per-node 8
 ```
 
-See the [Installation Guide](../../../guides/installation.md) and [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md).
+See the [Installation Guide](../../../guides/installation.md).
 
+<!-- TODO: uncomment when finetune guide is published.
 ## Fine-Tuning
 
 See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA/PEFT configuration.
+-->
 
 ## Hugging Face Model Cards
 

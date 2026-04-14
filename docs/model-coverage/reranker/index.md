@@ -27,9 +27,11 @@ Any HuggingFace model loadable via `AutoModelForSequenceClassification` can be u
 
 Retrieval fine-tuning requires query-document pairs: each example is a query paired with one positive document and one or more negative documents. Both inline JSONL and corpus ID-based JSON formats are supported. See the [Retrieval Dataset](../../guides/llm/retrieval-dataset.md) guide.
 
+<!-- TODO: uncomment when finetune guide is published.
 ## Train Reranking Models
 
 For a complete walkthrough of training configuration, model-specific settings, and launch commands, see the [Embedding and Reranking Fine-Tuning Guide](../../guides/retrieval/finetune.md).
+-->
 
 ```{toctree}
 :hidden:
