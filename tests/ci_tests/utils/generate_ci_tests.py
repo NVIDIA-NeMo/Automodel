@@ -56,14 +56,24 @@ def slurm_time_multiplier(time: str, multiplier: int):
     return updated_time
 
 
+# Scopes that auto-discover all configs via rglob (no recipe list needed).
+# All other scope/folder combinations read from {scope}_recipes.yml.
+AUTO_DISCOVER_SCOPES = {
+    "release": ["llm_finetune", "vlm_finetune"],
+    "performance": ["llm_benchmark", "vlm_benchmark"],
+}
+
+
 def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     """
-    Detect recipe YAML configurations to include in the CI pipeline. Nightly scope reads from
-    a scope-specific recipe list. Release scope collects all YAML configurations within the test_folder.
+    Detect recipe YAML configurations to include in the CI pipeline.
+
+    Auto-discovery scopes (defined in AUTO_DISCOVER_SCOPES) collect all YAML files
+    via rglob. All other scopes read from a scope-specific recipe list.
 
     Args:
         automodel_dir: Path to the Automodel directory
-        scope: Scope of the testing (nightly, release)
+        scope: Scope of the testing (nightly, release, convergence, performance)
         test_folder: Name of the test folder under Automodel/examples
 
     Returns:
@@ -72,8 +82,8 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     yml_configs = []
     search_path = f"{automodel_dir}/examples/{test_folder}"
 
-    # Check scope
-    if scope == "release":
+    auto_folders = AUTO_DISCOVER_SCOPES.get(scope, [])
+    if test_folder in auto_folders:
         for f in Path(f"{search_path}").rglob("*.yaml"):
             relative_path = f.relative_to(automodel_dir)
             yml_configs.append(relative_path)
@@ -142,7 +152,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
 
     # Configure test stage based on recipe type and robustness config
-    if 'benchmark' in config.stem:
+    if 'benchmark' in test_folder:
+        job['stage'] = 'performance'
+    elif 'benchmark' in config.stem:
         job['stage'] = 'benchmark'
     elif 'peft' in config.stem:
         job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
