@@ -38,6 +38,7 @@ from transformers.models.mbart.modeling_mbart import (
 )
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.shared.import_utils import is_transformers_min_version
 
 # -----------------------------------------------------------------------------
 # NemotronParse configuration
@@ -336,12 +337,16 @@ class NemotronParseDecoder(MBartPreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=False,
                 )
-            hidden_states = layer_outputs[0]
+            # transformers >= 5.5: MBartDecoderLayer returns a tensor directly
+            if isinstance(layer_outputs, torch.Tensor):
+                hidden_states = layer_outputs
+            else:
+                hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-                if encoder_hidden_states is not None:
-                    all_cross_attentions += (layer_outputs[2],)
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+                    if encoder_hidden_states is not None:
+                        all_cross_attentions += (layer_outputs[2],)
 
         hidden_states = self.layer_norm(hidden_states)
 
@@ -512,7 +517,18 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
             encoder_outputs = BaseModelOutput(*encoder_outputs)
 
         encoder_hidden_states = encoder_outputs[0]
-        encoder_attention_mask = None
+        # Transformers >= 5.5 SDPA attention requires an explicit mask;
+        # passing ``None`` causes shape mismatches in
+        # ``scaled_dot_product_attention``.  Earlier versions work fine
+        # without one.
+        if is_transformers_min_version("5.5.0"):
+            encoder_attention_mask = torch.ones(
+                encoder_hidden_states.shape[:2],
+                dtype=torch.long,
+                device=encoder_hidden_states.device,
+            )
+        else:
+            encoder_attention_mask = None
 
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
             decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)

@@ -114,7 +114,11 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 continue
 
             # --- Expert weight keys ---
-            expert_match = re.search(r"(layers\.\d+)\.(?:moe|experts)\.(gate_up_proj|down_proj|per_expert_scale)$", key)
+            # Match combined gate_up_proj (transformers >= 5.5) as well as separate
+            # gate_proj / up_proj from older HF checkpoints.
+            expert_match = re.search(
+                r"(layers\.\d+)\.(?:moe|experts)\.(gate_up_proj|gate_proj|up_proj|down_proj|per_expert_scale)$", key
+            )
             if expert_match:
                 layer_path = expert_match.group(1)
                 weight_name = expert_match.group(2)
@@ -124,19 +128,39 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             # --- Pass-through keys ---
             state_dict[key] = value
 
-        # Process collected expert weights per layer
-        _REQUIRED_EXPERT_KEYS = {"gate_up_proj", "down_proj"}
+        # Process collected expert weights per layer.
+        # Older HF checkpoints store separate gate_proj and up_proj; newer
+        # checkpoints (transformers >= 5.5) use a combined gate_up_proj.  We
+        # accept both formats and normalise to the combined representation.
         for layer_path, tensors in expert_buffers.items():
-            missing = _REQUIRED_EXPERT_KEYS - tensors.keys()
-            if missing:
+            has_combined = "gate_up_proj" in tensors
+            has_separate = "gate_proj" in tensors and "up_proj" in tensors
+
+            if has_combined:
+                gate_up_proj = tensors["gate_up_proj"]  # [E, 2*inter, hidden]
+            elif has_separate:
+                # Separate gate_proj [E, hidden, inter] and up_proj [E, hidden, inter]
+                # Concatenate along the inter dimension and transpose to match
+                # the combined HF layout [E, 2*inter, hidden].
+                gate_proj = tensors["gate_proj"]  # [E, hidden, inter]
+                up_proj = tensors["up_proj"]  # [E, hidden, inter]
+                gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1).transpose(-2, -1)
+            else:
+                _REQUIRED_EXPERT_KEYS = {"gate_up_proj", "down_proj"}
+                missing = _REQUIRED_EXPERT_KEYS - tensors.keys()
                 raise RuntimeError(
                     f"Incomplete expert weights for {layer_path}: missing {missing}. "
                     f"Available keys: {list(tensors.keys())}"
                 )
 
-            gate_up_proj = tensors["gate_up_proj"]  # [E, 2*inter, hidden]
-            down_proj = tensors["down_proj"]  # [E, hidden, inter]
-            per_expert_scale = tensors["per_expert_scale"]  # [E]
+            if "down_proj" not in tensors:
+                raise RuntimeError(
+                    f"Incomplete expert weights for {layer_path}: missing {{'down_proj'}}. "
+                    f"Available keys: {list(tensors.keys())}"
+                )
+
+            down_proj = tensors["down_proj"]  # [E, hidden, inter] or [E, inter, hidden]
+            per_expert_scale = tensors.get("per_expert_scale", torch.ones(down_proj.shape[0]))
 
             # Transpose gate_up_proj from HF [E, 2*inter, hidden] to NeMo [E, hidden, 2*inter]
             gate_and_up = gate_up_proj.transpose(-2, -1)  # [E, hidden, 2*inter]

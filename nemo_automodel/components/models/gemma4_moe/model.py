@@ -441,9 +441,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 setattr(cfg_text, k, v)
 
         # Compat: checkpoints renamed expert_intermediate_size → moe_intermediate_size.
+        # Synchronise both attributes so HF (reads moe_intermediate_size in
+        # transformers >= 5.5) and NeMo (reads expert_intermediate_size) both
+        # see the correct value.
         cfg_text = config.text_config if hasattr(config, "text_config") else config
         if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
             cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
+        if not getattr(cfg_text, "moe_intermediate_size", None) and getattr(cfg_text, "expert_intermediate_size", None):
+            cfg_text.moe_intermediate_size = cfg_text.expert_intermediate_size
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)

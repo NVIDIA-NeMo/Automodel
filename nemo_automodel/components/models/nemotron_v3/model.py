@@ -211,6 +211,15 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     main_input_name: str = "input_ids"
 
     @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        # NemotronV3 uses a custom NemotronHybridCache (Mamba2 + Attention).
+        # Returning False prevents GenerationMixin from pre-creating a
+        # DynamicCache in ``_prepare_cache_for_generation``, which would
+        # bypass the NemotronHybridCache construction in
+        # ``prepare_inputs_for_generation``.
+        return False
+
+    @classmethod
     def from_config(
         cls,
         config,
