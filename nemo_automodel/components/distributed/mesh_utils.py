@@ -366,9 +366,12 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
 
     sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
     target = prod(sizes)
-    root = device_mesh._get_root_mesh()
+    if hasattr(device_mesh, '_get_root_mesh'):
+        root = device_mesh._get_root_mesh()
+    else:
+        root = device_mesh
 
-    for fm in root._flatten_mapping.values():
+    for fm in getattr(root, '_flatten_mapping', {}).values():
         if fm.size() != target:
             continue
         try:
