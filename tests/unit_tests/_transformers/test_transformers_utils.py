@@ -385,10 +385,11 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         config = FakePhi4mmCfg(tie_word_embeddings=True)
         model = FakePhi4mmModel(config)
-        tied = model._tied_weights_keys
+        tied = model._nemo_tied_weights_keys
         assert isinstance(tied, dict)
         assert "lm_head.weight" in tied
         assert tied["lm_head.weight"] == "model.embed_tokens.weight"
+        assert model._tied_weights_keys == {}
 
     def test_tied_weights_keys_patch_converts_any_model(self):
         """The post_init patch should convert _tied_weights_keys for any model, not just phi4mm."""
@@ -413,10 +414,11 @@ class TestApplyCacheCompatibilityPatchesIntegration:
 
         config = FakeOtherCfg(tie_word_embeddings=True)
         model = FakeOtherModel(config)
-        tied = model._tied_weights_keys
+        tied = model._nemo_tied_weights_keys
         assert isinstance(tied, dict)
-        assert "lm_head.weight" in tied
+        assert "lm_head.weight" in model._nemo_tied_weights_keys
         assert tied["lm_head.weight"] == "model.embed_tokens.weight"
+        assert model._tied_weights_keys == {}
 
     def test_patches_peft_prepare_inputs(self):
         """PeftModelForCausalLM.__init__ should be patched for missing prepare_inputs_for_generation."""
