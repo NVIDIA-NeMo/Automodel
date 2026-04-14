@@ -106,7 +106,6 @@ ci:
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
-    distributed.tp_size: 2
     tokenizer_name: nvidia/Nemotron-Flash-1B
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
