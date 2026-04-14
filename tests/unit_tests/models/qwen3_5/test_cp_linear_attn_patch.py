@@ -141,6 +141,148 @@ class TestPatchHfModel:
         assert la.A_log is new_tensor
 
 
+class TestFp32ParamHolder:
+    """Tests for _Fp32ParamHolder forward (gate computation)."""
+
+    @staticmethod
+    def _stub_and_import(monkeypatch):
+        for path in (
+            "transformers.models.qwen3_5_moe",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_5",
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+        ):
+            if path not in sys.modules:
+                stub = types.ModuleType(path)
+                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+                monkeypatch.setitem(sys.modules, path, stub)
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import _Fp32ParamHolder
+
+        return _Fp32ParamHolder
+
+    def test_holder_forward_computes_gate(self, monkeypatch):
+        """_Fp32ParamHolder.forward returns g = -A_log.exp() * softplus(a + dt_bias)."""
+        _Fp32ParamHolder = self._stub_and_import(monkeypatch)
+        holder = _Fp32ParamHolder()
+        holder.A_log = nn.Parameter(torch.ones(4, dtype=torch.float32))
+        a = torch.zeros(4)
+        dt_bias = torch.zeros(4)
+        g = holder(a, dt_bias)
+        # g = -exp(1) * softplus(0 + 0) = -e * softplus(0) = -e * ln(2)
+        expected = -torch.ones(4).float().exp() * torch.nn.functional.softplus(torch.zeros(4))
+        assert torch.allclose(g, expected, atol=1e-5)
+
+    def test_holder_forward_dtype_is_float32(self, monkeypatch):
+        """Gate computation happens in float32 even with bfloat16 inputs."""
+        _Fp32ParamHolder = self._stub_and_import(monkeypatch)
+        holder = _Fp32ParamHolder()
+        holder.A_log = nn.Parameter(torch.ones(4, dtype=torch.float32))
+        a = torch.zeros(4, dtype=torch.bfloat16)
+        dt_bias = torch.zeros(4, dtype=torch.bfloat16)
+        g = holder(a, dt_bias)
+        assert g.dtype == torch.float32
+
+
+class TestComputeGate:
+    """Tests for CPAwareGatedDeltaNet._compute_gate routing."""
+
+    @staticmethod
+    def _stub_and_import(monkeypatch):
+        for path in (
+            "transformers.models.qwen3_5_moe",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_5",
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+        ):
+            if path not in sys.modules:
+                stub = types.ModuleType(path)
+                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+                monkeypatch.setitem(sys.modules, path, stub)
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
+            CPAwareGatedDeltaNet,
+            _Fp32ParamHolder,
+            patch_hf_model,
+        )
+
+        return CPAwareGatedDeltaNet, _Fp32ParamHolder, patch_hf_model
+
+    def test_compute_gate_routes_through_holder(self, fake_model, monkeypatch):
+        """_compute_gate calls _fp32_params.forward when holder exists."""
+        CPAwareGatedDeltaNet, _Fp32ParamHolder, patch_hf_model = self._stub_and_import(monkeypatch)
+        patch_hf_model(fake_model, cp_enabled=False)
+        la = fake_model.layers[0].linear_attn
+        assert isinstance(la, CPAwareGatedDeltaNet)
+        a = torch.zeros(4)
+        with patch.object(la._fp32_params, "forward", return_value=torch.zeros(4)) as mock_fwd:
+            la._compute_gate(a)
+            mock_fwd.assert_called_once()
+
+    def test_compute_gate_fallback_without_holder(self, fake_model, monkeypatch):
+        """_compute_gate falls back to inline computation without _fp32_params."""
+        CPAwareGatedDeltaNet, _, patch_hf_model = self._stub_and_import(monkeypatch)
+        la = fake_model.layers[0].linear_attn
+        la.__class__ = CPAwareGatedDeltaNet
+        la._cp_mesh = None
+        # No _fp32_params — A_log is still in _parameters
+        a = torch.zeros(4)
+        g = la._compute_gate(a)
+        assert g.dtype == torch.float32
+        assert g.shape == (4,)
+
+
+class TestPatchHfModelSentinel:
+    """Test that __getattr__ patching is idempotent."""
+
+    @staticmethod
+    def _stub_and_import(monkeypatch):
+        for path in (
+            "transformers.models.qwen3_5_moe",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_5",
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+        ):
+            if path not in sys.modules:
+                stub = types.ModuleType(path)
+                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+                monkeypatch.setitem(sys.modules, path, stub)
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
+        return patch_hf_model
+
+    def test_double_patch_does_not_rewrap_getattr(self, monkeypatch):
+        """Calling patch_hf_model twice does not chain __getattr__ wrappers."""
+        patch_hf_model = self._stub_and_import(monkeypatch)
+
+        model1 = nn.Module()
+        model1.layers = nn.ModuleList([nn.Module()])
+        model1.layers[0].linear_attn = _FakeGatedDeltaNet()
+        model1.layers[0].layer_type = "linear_attention"
+        patch_hf_model(model1, cp_enabled=False)
+        getattr_after_first = type(model1.layers[0].linear_attn).__getattr__
+
+        model2 = nn.Module()
+        model2.layers = nn.ModuleList([nn.Module()])
+        model2.layers[0].linear_attn = _FakeGatedDeltaNet()
+        model2.layers[0].layer_type = "linear_attention"
+        patch_hf_model(model2, cp_enabled=False)
+        getattr_after_second = type(model2.layers[0].linear_attn).__getattr__
+
+        # Same function, not a wrapper of a wrapper
+        assert getattr_after_first is getattr_after_second
+
+
 class TestAttachLinearAttnPositionHooks:
     def test_hook_caches_position_ids(self, fake_model):
         """Pre-hook stores position_ids on linear_attn module."""
