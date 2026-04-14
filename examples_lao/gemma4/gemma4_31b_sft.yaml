@@ -47,7 +47,7 @@ model:
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
-  attn_implementation: sdpa
+  attn_implementation: flash_attention_2
   # Gemma4 31B does not use kv_shared layers, so keep use_cache disabled for training.
   text_config:
     use_cache: false
