@@ -109,3 +109,4 @@ freeze_config:
 
 ci:
   recipe_owner: HuiyingLi
+  time: "00:15:00"
