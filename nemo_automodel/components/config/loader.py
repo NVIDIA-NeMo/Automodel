@@ -461,11 +461,14 @@ class ConfigNode:
             else:
                 config_kwargs[k] = self._instantiate_value(v)
 
-        # Override/add with passed kwargs
-        config_kwargs.update(kwargs)
-        # Resolve env interpolations at the last moment, so printing/saving the config
-        # does not leak secrets (e.g., `${oc.env:HF_TOKEN}` remains in YAML output).
+        # Resolve env interpolations on config-derived kwargs only, before merging
+        # runtime arguments (e.g. `examples`, `processor`).  Doing it after the
+        # update() would cause resolve_yaml_env_vars to scan actual data content,
+        # which can contain arbitrary strings like "$P" and raise spurious KeyErrors.
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
+
+        # Override/add with passed kwargs (runtime data — must NOT be env-var-resolved)
+        config_kwargs.update(kwargs)
 
         import traceback
 
