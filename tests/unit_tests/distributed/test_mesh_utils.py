@@ -155,7 +155,13 @@ class TestGetSubmesh:
         root = Mock()
         root._flatten_mapping = {"dp_shard_cp": dp_shard_cp_flat, "dp_cp": dp_cp_flat}
         mesh._get_root_mesh = Mock(return_value=root)
-        mesh.__getitem__ = Mock(return_value=dp_rep_submesh)
+
+        def getitem(key):
+            if key == "dp_replicate":
+                return dp_rep_submesh
+            raise KeyError(key)
+
+        mesh.__getitem__ = Mock(side_effect=getitem)
 
         monkeypatch.setattr(
             "torch.distributed.get_process_group_ranks",
@@ -167,6 +173,81 @@ class TestGetSubmesh:
         dp_cp_flat._unflatten.assert_called_once_with(
             0, (2, 4), ("dp_replicate", "dp_shard_cp")
         )
+        assert result is unflatten_result
+
+    def test_mixed_physical_flattened_prefers_direct_slice(self):
+        """Direct slicing should win so the submesh stays attached to the root mesh."""
+        direct_submesh = Mock()
+        mesh = self._make_mock_mesh(("pp", "dp_replicate", "dp_shard", "cp", "tp"))
+        mesh.__getitem__ = Mock(return_value=direct_submesh)
+
+        dp_flat = Mock()
+        dp_flat.size = Mock(return_value=16)
+        dp_flat._unflatten = Mock()
+        dp_shard_cp_flat = Mock()
+        dp_shard_cp_flat.size = Mock(return_value=16)
+        dp_shard_cp_flat._unflatten = Mock()
+        dp_cp_flat = Mock()
+        dp_cp_flat.size = Mock(return_value=16)
+        dp_cp_flat._unflatten = Mock()
+        mesh._get_root_mesh.return_value._flatten_mapping = {
+            "dp": dp_flat,
+            "dp_shard_cp": dp_shard_cp_flat,
+            "dp_cp": dp_cp_flat,
+        }
+
+        result = get_submesh(mesh, ("dp_replicate", "dp_shard_cp"))
+
+        mesh.__getitem__.assert_called_once_with(("dp_replicate", "dp_shard_cp"))
+        dp_flat._unflatten.assert_not_called()
+        dp_shard_cp_flat._unflatten.assert_not_called()
+        dp_cp_flat._unflatten.assert_not_called()
+        assert result is direct_submesh
+
+    def test_mixed_physical_flattened_ambiguous_parent_prefers_superset_parent(self, monkeypatch):
+        """Fallback should reject same-size flattened parents that do not cover all source dims."""
+        group_sentinel = Mock()
+
+        dp_flat = Mock()
+        dp_flat.size = Mock(return_value=16)
+        dp_flat._unflatten = Mock()
+
+        dp_shard_cp_flat = Mock()
+        dp_shard_cp_flat.size = Mock(return_value=16)
+        dp_shard_cp_flat._unflatten = Mock()
+        dp_shard_cp_flat.get_group = Mock(return_value=group_sentinel)
+
+        dp_cp_flat = Mock()
+        dp_cp_flat.size = Mock(return_value=16)
+        unflatten_result = Mock()
+        unflatten_result.__getitem__ = Mock(return_value=Mock(get_group=Mock(return_value=group_sentinel)))
+        dp_cp_flat._unflatten = Mock(return_value=unflatten_result)
+
+        dp_rep_submesh = Mock()
+        dp_rep_submesh.size = Mock(return_value=1)
+        dp_rep_submesh.get_group = Mock(return_value=group_sentinel)
+
+        mesh = Mock()
+        mesh.mesh_dim_names = ("pp", "dp_replicate", "dp_shard", "cp", "tp")
+        root = Mock()
+        root._flatten_mapping = {"dp": dp_flat, "dp_shard_cp": dp_shard_cp_flat, "dp_cp": dp_cp_flat}
+        root.__getitem__ = Mock(side_effect=KeyError(("dp_replicate", "dp_shard_cp")))
+        mesh._get_root_mesh = Mock(return_value=root)
+
+        def getitem(key):
+            if key == "dp_replicate":
+                return dp_rep_submesh
+            raise KeyError(key)
+
+        mesh.__getitem__ = Mock(side_effect=getitem)
+
+        monkeypatch.setattr("torch.distributed.get_process_group_ranks", lambda g: [0])
+
+        result = get_submesh(mesh, ("dp_replicate", "dp_shard_cp"))
+
+        dp_flat._unflatten.assert_not_called()
+        dp_shard_cp_flat._unflatten.assert_not_called()
+        dp_cp_flat._unflatten.assert_called_once_with(0, (1, 16), ("dp_replicate", "dp_shard_cp"))
         assert result is unflatten_result
 
     def test_all_physical_multi_dim(self):

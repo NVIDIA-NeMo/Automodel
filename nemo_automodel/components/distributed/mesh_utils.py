@@ -368,8 +368,25 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
     """
     if len(names) == 1:
         return get_flat_mesh(device_mesh, names[0])
-    if all(n in device_mesh.mesh_dim_names for n in names):
-        return device_mesh[names]
+    # Prefer native DeviceMesh slicing first. Newer PyTorch versions, together
+    # with our 2.10 compatibility patch, can slice tuples that mix physical and
+    # flattened dims (for example ("dp_replicate", "dp_shard_cp")). This keeps
+    # the returned mesh attached to the original root mesh, which FSDP requires
+    # when TP/EP use sibling submeshes from that same root mesh.
+    if hasattr(device_mesh, "_get_root_mesh"):
+        root = device_mesh._get_root_mesh()
+    else:
+        root = device_mesh
+
+    seen_candidates = set()
+    for candidate in (device_mesh, root):
+        if id(candidate) in seen_candidates:
+            continue
+        seen_candidates.add(id(candidate))
+        try:
+            return candidate[names]
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            continue
 
     # Some dims were created via _flatten(); resolve sizes and unflatten from parent.
     # Strategy: find a parent flattened mesh whose size equals the product of
@@ -382,14 +399,29 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
 
     sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
     target = prod(sizes)
-    if hasattr(device_mesh, '_get_root_mesh'):
-        root = device_mesh._get_root_mesh()
-    else:
-        root = device_mesh
+    flatten_dim_sources = {
+        MeshAxisName.DP: frozenset((MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD)),
+        MeshAxisName.DP_SHARD_CP: frozenset((MeshAxisName.DP_SHARD, MeshAxisName.CP)),
+        MeshAxisName.DP_CP: frozenset((MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP)),
+    }
 
-    for fm in getattr(root, '_flatten_mapping', {}).values():
+    requested_sources = set()
+    for name in names:
+        requested_sources.update(flatten_dim_sources.get(name, (name,)))
+
+    flatten_mapping = getattr(root, "_flatten_mapping", {})
+    preferred_parents = []
+    fallback_parents = []
+    for flat_name, fm in flatten_mapping.items():
         if fm.size() != target:
             continue
+        parent_sources = flatten_dim_sources.get(flat_name, frozenset((flat_name,)))
+        if requested_sources.issubset(parent_sources):
+            preferred_parents.append(fm)
+        else:
+            fallback_parents.append(fm)
+
+    for fm in preferred_parents + fallback_parents:
         try:
             result = _unflatten_compat(fm, 0, sizes, names)
         except (ValueError, RuntimeError):
@@ -404,6 +436,12 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
                 valid = False
                 break
         if valid:
+            # FSDP2 requires the DP and TP/EP meshes to share the same root
+            # mesh (it checks ``dp_mesh._parent_mesh is tp_mesh._parent_mesh``).
+            # ``_unflatten_compat`` may produce a disconnected DeviceMesh
+            # (especially on PyTorch < 2.10 where ``_unflatten`` is absent).
+            # Force the parent to the root so the assertion passes.
+            result._parent_mesh = root
             return result
     raise KeyError(
         f"No parent flattened mesh found for dims {names} with target size {target}. "
