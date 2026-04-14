@@ -89,13 +89,13 @@ Find the right guide for your task -- fine-tuning, pretraining, distillation, di
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
 | **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](guides/llm/finetune.md)               |
-| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)        |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)     |
 | **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.md)             |
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
-| **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                 |
+| **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3_5.md)                |
-| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
+| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                             |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large_moe_finetune.md)         |
 | **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.md) |
 | **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](guides/quantization-aware-training.md)       |
@@ -233,6 +233,8 @@ Large Language Models <model-coverage/llm/index.md>
 Vison Language Models <model-coverage/vlm/index.md>
 Omni <model-coverage/omni/index.md>
 Diffusion <model-coverage/diffusion/index.md>
+Embedding Models <model-coverage/embedding/index.md>
+Reranking Models <model-coverage/reranker/index.md>
 ::::
 
 ::::{toctree}
