@@ -1,0 +1,118 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Profiling config for Qwen3 MoE 30B — DeepEP, 4 nodes (32 GPUs), autonvtx enabled
+# Same as qwen3_moe_30b_te_deepep_4nodes.yaml but with nvtx: true for autonvtx tracing.
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 10
+  peak_tflops: 989  # H100 peak TFLOPs
+  nsys_start: 12
+  nsys_end: 15
+  nsys_ranks: [0]
+  num_nodes: 4
+
+nvtx: true
+
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 512
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 20
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  moe:
+    ignore_router_for_ac: true  # Selective recompute: only MoE layer recomputed (moe_act), attn saved
+    # reshard_after_forward: true not used — overlapping meshes error with ep_shard+dp on same 32 GPUs
+
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: gmm
+    dispatcher: deepep
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  num_samples: 100000
+
+dataloader:
+  batch_size: null  # Dataset already yields batches
+  _target_: torch.utils.data.DataLoader
+  num_workers: 0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  lr: 0.00012
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weight_dtype: torch.float32
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
