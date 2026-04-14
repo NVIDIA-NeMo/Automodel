@@ -164,9 +164,7 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         return priorities[0]
 
 
-def _apply_preload_overrides(
-    tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel, _retry_depth=0
-):
+def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel):
     """
     Compute final attention implementation and liger-kernel flag based on TP/CP and packed sequence constraints.
     """
@@ -180,19 +178,12 @@ def _apply_preload_overrides(
 
     if has_packed_sequence:
         if cp_size == 1:
-            if _retry_depth > 0:
-                logger.warning(
-                    "Packed sequences require flash_attention_2 but the model rejected it. "
-                    "Proceeding with %s; packing may not produce correct attention masks.",
-                    attn_implementation,
-                )
-            else:
-                assert HAS_FA, "Flash Attention is not available"
-                attn_implementation = "flash_attention_2"
-                logger.warning(
-                    "Packed sequence is supported only with Flash Attention. "
-                    "Setting model's attn_implementation to flash_attention_2"
-                )
+            assert HAS_FA, "Flash Attention is not available"
+            attn_implementation = "flash_attention_2"
+            logger.warning(
+                "Packed sequence is supported only with Flash Attention. "
+                "Setting model's attn_implementation to flash_attention_2"
+            )
         else:
             # TODO: support packed sequence with CP size > 1
             raise ValueError("Packed sequence is only supported with CP size 1")

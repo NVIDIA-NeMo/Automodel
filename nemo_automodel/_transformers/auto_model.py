@@ -321,7 +321,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 has_packed_sequence,
                 attn_implementation,
                 use_liger_kernel,
-                _retry_depth=_retry_depth,
             )
         device = torch.cuda.current_device()
 
