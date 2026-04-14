@@ -862,7 +862,6 @@ class _NeMoAutoModelForRetrievalBase:
         moe_config: Optional[MoEParallelizerConfig] = None,
         compile_config: Optional["CompileConfig"] = None,
         peft_config: Optional[dict] = None,
-        _retry_depth: int = 0,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
@@ -903,8 +902,6 @@ class _NeMoAutoModelForRetrievalBase:
         logger.info(f"Loading {cls.__name__} from {pretrained_model_name_or_path}")
 
         def _retry(**override):
-            if _retry_depth >= _MAX_BUILD_RETRIES:
-                raise
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
                 attn_implementation=attn_implementation,
@@ -919,7 +916,6 @@ class _NeMoAutoModelForRetrievalBase:
                 moe_config=moe_config,
                 compile_config=compile_config,
                 peft_config=peft_config,
-                _retry_depth=_retry_depth + 1,
                 **kwargs,
             )
 
