@@ -98,11 +98,13 @@ automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
 :::
 
-See the [Installation Guide](../../../guides/installation.md) and [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md).
+See the [Installation Guide](../../../guides/installation.md).
 
+<!-- TODO: uncomment when finetune guide is published.
 ## Fine-Tuning
 
 See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA/PEFT configuration.
+-->
 
 ## Hugging Face Model Cards
 
