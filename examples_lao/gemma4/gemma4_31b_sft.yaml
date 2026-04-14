@@ -85,8 +85,8 @@ dataloader:
   num_workers: 0
   pin_memory: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
-    max_length: 256
+    _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:gemma4_prefix_truncating_collate_fn
+    max_length: 512
 
 optimizer:
   _target_: torch.optim.AdamW

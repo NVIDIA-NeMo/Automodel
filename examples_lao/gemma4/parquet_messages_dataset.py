@@ -15,9 +15,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from datasets import load_dataset
+import torch
+
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    HAVE_QWEN_VL_UTILS,
+    MISSING_QWEN_VL_UTILS_MSG,
+    _count_media_per_sample,
+    _ensure_rgb,
+    _inject_thinking_prefix_tokens,
+    build_labels_from_template,
+    mask_fake_vision_tokens_batch,
+)
 
 
 def _as_list(path_or_dataset: str | Sequence[str]) -> list[str]:
@@ -87,3 +98,61 @@ def make_parquet_messages_dataset(
         dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
 
     return dataset.map(_to_conversation, remove_columns=dataset.column_names)
+
+
+def gemma4_prefix_truncating_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    """Gemma4 collate that truncates overlong text samples instead of dropping them."""
+    if not HAVE_QWEN_VL_UTILS:
+        raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
+
+    conversations = _ensure_rgb([example["conversation"] for example in examples])
+
+    processor_kwargs = {
+        "tokenize": True,
+        "padding": "max_length" if max_length is not None else True,
+        "truncation": True,
+        "return_tensors": "pt",
+        "return_dict": True,
+    }
+    if max_length is not None:
+        processor_kwargs["max_length"] = max_length
+
+    batch = processor.apply_chat_template(conversations, **processor_kwargs)
+    tokenizer = getattr(processor, "tokenizer", processor)
+    batch = _inject_thinking_prefix_tokens(batch, tokenizer)
+
+    if max_length is not None and batch["input_ids"].size(1) > max_length:
+        for key in list(batch.keys()):
+            value = batch[key]
+            if isinstance(value, torch.Tensor) and value.dim() >= 2 and value.size(1) > max_length and key != "pixel_values":
+                batch[key] = value[:, :max_length]
+
+    if "pixel_values" in batch:
+        batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+    if "pixel_values_videos" in batch:
+        batch["pixel_values_videos"] = batch["pixel_values_videos"].to(torch.bfloat16)
+
+    labels = build_labels_from_template(batch["input_ids"], conversations, processor)
+    batch["labels"] = labels[:, 1:]
+
+    input_shape = batch["input_ids"].shape
+    for key in list(batch.keys()):
+        value = batch[key]
+        if isinstance(value, torch.Tensor) and value.shape == input_shape and key != "labels":
+            batch[key] = value[:, :-1]
+
+    fake_indices = [i for i, example in enumerate(examples) if example.get("_injected_fake")]
+    if fake_indices:
+        mask_fake_vision_tokens_batch(batch, processor, fake_indices)
+
+    image_counts, video_counts = _count_media_per_sample(conversations)
+    if any(count > 0 for count in image_counts):
+        batch["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+    if any(count > 0 for count in video_counts):
+        batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
+
+    return batch
