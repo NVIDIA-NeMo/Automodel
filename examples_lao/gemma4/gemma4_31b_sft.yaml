@@ -56,14 +56,16 @@ checkpoint:
   enabled: true
   checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_lao/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
-  sequence_parallel: true
+  sequence_parallel: false
+  offload_policy:
+    _target_: torch.distributed.fsdp.CPUOffloadPolicy
   # 31B generally needs activation checkpointing to avoid OOM under FSDP2.
   activation_checkpointing: true
 
