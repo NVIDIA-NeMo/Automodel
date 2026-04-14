@@ -42,6 +42,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -167,11 +168,11 @@ class RotaryEmbedParallel(SequenceParallel):
 
 
 def _parallelize_gemma3(
-    model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration],
+    model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration, Gemma4ForConditionalGeneration],
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Gemma3ForCausalLM model across data and tensor parallel dimensions."""
-    if isinstance(model, Gemma3ForConditionalGeneration):
+    if isinstance(model, (Gemma3ForConditionalGeneration, Gemma4ForConditionalGeneration)):
         model_prefix = "model.language_model"
     else:
         model_prefix = "model"
@@ -557,6 +558,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
+    _get_class_qualname(Gemma4ForConditionalGeneration): _parallelize_gemma3,
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
