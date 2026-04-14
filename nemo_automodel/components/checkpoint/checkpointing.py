@@ -1032,10 +1032,12 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
 
-_MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset({
-    "gemma3",
-    "nemotron-nas",
-})
+_MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
+    {
+        "gemma3",
+        "nemotron-nas",
+    }
+)
 
 
 def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model_type: str | None = None) -> None:
