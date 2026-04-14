@@ -401,9 +401,17 @@ class Checkpointer:
         # the broadcast_from_rank0 hang where rank 0's synchronous CPU→GPU copies
         # fall behind other ranks' async allocations.
         is_safetensors = _is_safetensors_checkpoint(model_path)
+        # Full-state-dict loading requires every rank to hold the complete model
+        # in CPU memory and then scatter to GPU shards.  For large models (e.g.
+        # Gemma4 38-40B ≈ 76 GB bf16) PyTorch's set_model_state_dict briefly
+        # materialises each full tensor on GPU before scattering, causing OOM on
+        # 80 GB cards.  Restrict this path to single-GPU runs; multi-GPU runs
+        # use the DCP path below which loads only each rank's local shard.
+        _single_gpu = get_world_size_safe() <= 1
         if (
             is_init_step
             and len(model_state.model) == 1
+            and _single_gpu
             and (_is_bin_checkpoint(model_path) or (is_safetensors and not _is_custom_model(model_state.model[0])))
         ):
             t0 = time.monotonic()
