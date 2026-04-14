@@ -61,9 +61,9 @@ checkpoint:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 1
+  tp_size: 2
   cp_size: 1
-  sequence_parallel: false
+  sequence_parallel: true
   # 31B generally needs activation checkpointing to avoid OOM under FSDP2.
   activation_checkpointing: true
 
