@@ -34,7 +34,7 @@ if [ "$TEST_LEVEL" = "convergence" ]; then
          --wandb.entity Nemo-automodel \
          --wandb.name ${TEST_NAME} \
          --wandb.dir /tmp/wandb/"
-elif [ "$TEST_LEVEL" = "perf" ]; then
+elif [ "$TEST_LEVEL" = "performance" ]; then
   CONFIG="${CONFIG}"
 else
   CONFIG="${CONFIG} \
@@ -88,7 +88,7 @@ echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_E
 echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
 
 # Collect benchmark artifact for performance tests
-if [ "$TEST_LEVEL" = "perf" ]; then
+if [ "$TEST_LEVEL" = "performance" ]; then
   echo "[benchmark] Collecting benchmark artifact..."
   python3 /opt/Automodel/tests/ci_tests/scripts/collect_benchmark_artifact.py \
     --config /opt/Automodel/${CONFIG_PATH} \
