@@ -95,7 +95,6 @@ diffusion = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
-    "kernels",
     "opencv-python-headless",
     "torchvision",
 ]
