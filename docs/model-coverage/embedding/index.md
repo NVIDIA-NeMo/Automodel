@@ -15,10 +15,18 @@ Embedding models use bi-encoders to produce dense representations for queries an
 | Owner | Model | Architecture | Wrapper Class | Tasks |
 |---|---|---|---|---|
 | Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalModel` | `NeMoAutoModelBiEncoder` | Embedding, Dense Retrieval |
+| NVIDIA | [Llama-Embed-Nemotron-8B](nvidia/llama-embed-nemotron-8b.md) | `LlamaBidirectionalModel` | `NeMoAutoModelBiEncoder` | Embedding, Dense Retrieval |
 
 ### HuggingFace Auto Backbones
 
 Any HuggingFace model loadable via `AutoModel` can be used as an embedding backbone. This fallback path uses the model's native attention — no bidirectional conversion is applied.
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| {download}`llama3_2_1b.yaml <../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml>` | Bi-encoder — Llama 3.2 1B embedding model |
+| {download}`llama_embed_nemotron_8b.yaml <../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml>` | Bi-encoder — Llama-Embed-Nemotron-8B reproduction recipe |
 
 ## Supported Workflows
 
@@ -38,4 +46,5 @@ For a complete walkthrough of training configuration, model-specific settings, a
 :hidden:
 
 meta/llama-bidirectional
+nvidia/llama-embed-nemotron-8b
 ```

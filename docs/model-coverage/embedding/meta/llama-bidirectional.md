@@ -3,6 +3,7 @@
 NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention** so each token can attend to all other tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
 
 For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](../../reranker/meta/llama-bidirectional.md).
+For the NVIDIA model page, see [Llama-Embed-Nemotron-8B](../nvidia/llama-embed-nemotron-8b.md).
 
 :::{card}
 | | |
@@ -52,7 +53,6 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 | Recipe | Description |
 |---|---|
 | {download}`llama3_2_1b.yaml <../../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml>` | Bi-encoder — Llama 3.2 1B embedding model |
-| {download}`llama_embed_nemotron_8b.yaml <../../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml>` | Bi-encoder — Llama 3.1 8B (Embed Nemotron recipe) |
 
 ## Try with NeMo AutoModel
 
