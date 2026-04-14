@@ -223,10 +223,18 @@ def _create_fsdp2_device_mesh(
     dp_shard_cp_mesh_dim_names.append(MeshAxisName.CP)
     dp_cp_mesh_dim_names.append(MeshAxisName.CP)
 
-    # Flatten submeshes
-    device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
-    device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
-    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    # Flatten submeshes.
+    # PyTorch >= 2.10 stores results in root._flatten_mapping automatically.
+    # PyTorch 2.9.x returns the mesh but does NOT store it, so we keep our own
+    # mapping and attach it to the root mesh for use in get_flat_mesh().
+    _dp_flat = device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
+    _dp_shard_cp_flat = device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
+    _dp_cp_flat = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    if not hasattr(device_mesh, '_flatten_mapping'):
+        device_mesh._flatten_mapping = {}
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP, _dp_flat)
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_SHARD_CP, _dp_shard_cp_flat)
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
     # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
     # EP spans dp, cp, and tp — the full non-pp rank space.
@@ -297,7 +305,10 @@ def _create_megatron_fsdp_device_mesh(
 
     # Flatten dp+cp if cp > 1
     if cp_size > 1:
-        device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+        _dp_cp_flat = device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+        if not hasattr(device_mesh, '_flatten_mapping'):
+            device_mesh._flatten_mapping = {}
+        device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
     return device_mesh
 
@@ -314,12 +325,16 @@ def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
     """
     if name in device_mesh.mesh_dim_names:
         return device_mesh[name]
-    root = device_mesh._get_root_mesh()
-    if name in root._flatten_mapping:
+    # _get_root_mesh() was added in PyTorch 2.10; fall back for 2.9.x.
+    if hasattr(device_mesh, '_get_root_mesh'):
+        root = device_mesh._get_root_mesh()
+    else:
+        root = device_mesh
+    if hasattr(root, '_flatten_mapping') and name in root._flatten_mapping:
         return root._flatten_mapping[name]
     raise KeyError(
         f"Mesh dim {name!r} not found in mesh_dim_names {device_mesh.mesh_dim_names} "
-        f"or root _flatten_mapping {set(root._flatten_mapping)}"
+        f"or root _flatten_mapping {set(getattr(root, '_flatten_mapping', {}))}"
     )
 
 
