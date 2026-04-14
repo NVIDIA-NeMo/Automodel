@@ -12,10 +12,10 @@ Embedding models use bi-encoders to produce dense representations for queries an
 
 ### Optimized Backbones (Bidirectional Attention)
 
-| Owner | Model | Architecture | Wrapper Class | Tasks |
+| Owner | Model | Architecture | Auto Class | Tasks |
 |---|---|---|---|---|
-| Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalModel` | `NeMoAutoModelBiEncoder` | Embedding, Dense Retrieval |
-| NVIDIA | [Llama-Embed-Nemotron-8B](nvidia/llama-embed-nemotron-8b.md) | `LlamaBidirectionalModel` | `NeMoAutoModelBiEncoder` | Embedding, Dense Retrieval |
+| Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| NVIDIA | [Llama-Embed-Nemotron-8B](nvidia/llama-embed-nemotron-8b.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
 
 ### HuggingFace Auto Backbones
 
