@@ -32,7 +32,7 @@ Any HuggingFace model loadable via `AutoModel` can be used as an embedding backb
 
 - **Fine-tuning (Bi-Encoder):** Contrastive learning on query-document pairs to produce embedding models
 - **LoRA/PEFT:** Parameter-efficient fine-tuning for embedding backbones
-- **ONNX Export:** Export trained embedding models for deployment
+- **ONNX Export:** Export trained embedding models for deployment (case-by-case, model dependant)
 
 ## Dataset
 
