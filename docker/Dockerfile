@@ -156,6 +156,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY . /opt/Automodel
 
+# Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi
+
 WORKDIR /opt/Automodel
 
 COPY <<EOF /opt/venv/env.sh
