@@ -137,6 +137,7 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         'node_multiplier': 'NODE_MULTIPLIER',
         'local_batch_size': 'LOCAL_BATCH_SIZE',
         'recipe_owner': 'RECIPE_OWNER',
+        'nproc_per_node': 'CONFIG_NPROC_PER_NODE',
     }
     for ci_key, ci_var in ci_key_map.items():
         if ci_key in ci_config:
