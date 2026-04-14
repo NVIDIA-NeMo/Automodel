@@ -14,11 +14,14 @@
 
 """Runtime RoPE patches for legacy v4-style remote-code models."""
 
+import logging
 import types
 
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
+
+logger = logging.getLogger(__name__)
 
 
 def _to_local(t):
@@ -106,13 +109,12 @@ def fix_rotary_embeddings(model_parts):
 
             module.forward = types.MethodType(_safe_rope_forward, module)
 
-            print(
+            logger.info(
                 f"[fix_rope] {fqn}: patched forward + inv_freq (bad={bad} base={base} dim={dim})",
-                flush=True,
             )
             fixed += 1
 
-    print(f"[fix_rope] patched {fixed} rotary embeddings.", flush=True)
+    logger.info(f"[fix_rope] patched {fixed} rotary embeddings.")
     return fixed
 
 
