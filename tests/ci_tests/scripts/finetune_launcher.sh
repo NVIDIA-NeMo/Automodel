@@ -43,6 +43,9 @@ else
         --step_scheduler.val_every_steps 100"
 fi
 
+# Per-config nproc override (set via ci.nproc_per_node in recipe YAML)
+NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
+
 # Command to execute, defaults to torchrun
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
