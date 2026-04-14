@@ -94,7 +94,7 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k25_vl_collate_fn
-    max_length: 2048
+    max_length: 1024
   drop_last: true
 
 validation_dataset:
@@ -107,7 +107,7 @@ validation_dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k25_vl_collate_fn
-    max_length: 2048
+    max_length: 1024
   drop_last: true
 
 optimizer:
