@@ -89,6 +89,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
@@ -233,7 +234,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
                 # sharding so the module structure is stable when fully_shard() indexes params.
                 for layer in layers:
-                    for attr in ("self_attn", "mlp"):
+                    for attr in ("self_attn", "mlp", "moe"):
                         m = getattr(layer, attr, None)
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
@@ -267,6 +268,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         # corrupting K/V entries that shared layers depend on.
                         if hasattr(layer, "self_attn") and not _has_kv_sharing:
                             layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
+
+                        # Gemma4MoE: checkpoint the MoE block in addition to self_attn and mlp
+                        if hasattr(layer, "moe"):
+                            layers[i].moe = checkpoint_wrapper(layers[i].moe)  # type: ignore
 
                         if hasattr(layer, "input_layernorm"):
                             layers[i].input_layernorm = checkpoint_wrapper(
@@ -865,14 +870,14 @@ def get_hf_tp_shard_plan(model):
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
 
-    elif model_cls == Gemma3ForConditionalGeneration:
+    elif model_cls in [Gemma3ForConditionalGeneration, Gemma4ForConditionalGeneration]:
         # In transformers v5, Gemma3 uses 'model' instead of 'language_model'
-        if _is_transformers_v5_or_higher():
+        if model_cls == Gemma3ForConditionalGeneration and _is_transformers_v5_or_higher():
             inner_model = model.model
             model_prefix = "model"
         else:
-            inner_model = model.language_model
-            model_prefix = "language_model"
+            inner_model = model.model.language_model
+            model_prefix = "model.language_model"
 
     elif model_cls == Llama4ForConditionalGeneration:
         inner_model = model.language_model.model
@@ -1152,7 +1157,7 @@ def validate_tp_mesh(model, tp_mesh):
         num_attention_heads = model.language_model.model.config.num_attention_heads
         num_key_value_heads = model.language_model.model.config.num_key_value_heads
 
-    elif model_cls == Gemma3ForConditionalGeneration:
+    elif model_cls in [Gemma3ForConditionalGeneration, Gemma4ForConditionalGeneration]:
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
     elif model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
@@ -1253,6 +1258,7 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     )
     VLM_MODEL_CLS_TO_LAYERS = {
         Gemma3ForConditionalGeneration: _gemma3_layers,
+        Gemma4ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.vision_model.encoder.layers"],
         Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
         Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
         # Note: `model.` is not a mistake here, it's the full fqn
