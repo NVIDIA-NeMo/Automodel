@@ -429,13 +429,14 @@ def apply_model_infrastructure(
     )
 
     checkpoint_already_loaded = False
+    offload_init_device = torch.device("cpu") if getattr(model_wrapper, "offload_policy", None) is not None else device
     if load_before_shard:
         if is_meta_device:
             lora_a_init = getattr(peft_config, "lora_A_init", None)
-            checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(model, offload_init_device, peft_init_method=lora_a_init)
             checkpointer.load_base_model(
                 model,
-                device,
+                offload_init_device,
                 cache_dir,
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
@@ -444,7 +445,13 @@ def apply_model_infrastructure(
             # Non-meta models already have weights from from_pretrained.
             # Still call load_base_model with load_base_model=False to
             # handle weight tying
-            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
+            checkpointer.load_base_model(
+                model,
+                offload_init_device,
+                cache_dir,
+                pretrained_model_name_or_path,
+                load_base_model=False,
+            )
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
@@ -503,7 +510,7 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
-            checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(mp, offload_init_device, peft_init_method=lora_a_init)
 
     # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
     should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
@@ -512,7 +519,7 @@ def apply_model_infrastructure(
         for mp in model_parts:
             checkpointer.load_base_model(
                 mp,
-                device,
+                offload_init_device,
                 cache_dir,
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
@@ -534,7 +541,7 @@ def apply_model_infrastructure(
         # target device) to avoid triggering FSDP's reset_sharded_param which
         # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
         # See: https://github.com/pytorch/pytorch/issues/151085
-        if not should_load_checkpoint:
+        if not should_load_checkpoint and getattr(model_wrapper, "offload_policy", None) is None:
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
