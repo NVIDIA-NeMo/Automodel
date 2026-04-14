@@ -165,7 +165,7 @@ class BackendConfig:
             torch.dtype or string (e.g., "torch.float32", "float32").
     """
 
-    attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex"] = "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()

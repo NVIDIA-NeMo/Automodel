@@ -75,14 +75,30 @@ Counts differ across rows — this does **not** necessarily mean different total
 | Flash-attn FWD/BWD | 1,280 / 640 | 1,280 / 640 | Same | MFSDP 0.57–0.61× (faster) | **Identical count, different kernels.** 80 layers × 4 GA = 320 FWD, 160 BWD per step. Performance gap is entirely due to cuDNN WGMMA kernel vs FlashAttention-2. |
 | RMSNorm FWD/BWD | 1,284 / 644 | 1,284 / 644 | Same | ~1.0× (same) | **Identical, as expected.** 80 layers × 2 norms/layer × 2 FWD passes (original + recompute) × GA=4 = 1,280 ≈ 1,284. BWD: 80 × 2 × GA=4 = 640. Both match exactly — confirms same model structure and recompute strategy. |
 
-**Communication vs Compute (per step):**
+**Communication vs Compute (per training iteration):**
 
 | | MFSDP | FSDP2 |
 |---|---|---|
 | Comm (AG+RS+AR+P2P) | 17,245 ms (49.0% of kernel) | 13,040 ms (40.2% of kernel) |
 | Compute (GEMM+attn FWD+BWD main) | 16,717 ms (47.5% of kernel) | 15,472 ms (47.8% of kernel) |
-| AG–GEMM overlap | **67.6%** (~2,456 ms exposed) | **62.0%** (~2,110 ms exposed) |
-| RS–GEMM overlap | **87.8%** (~1,145 ms exposed) | **84.6%** (~676 ms exposed) |
+
+**Comm–Compute Overlap: 3-bucket decomposition** (per training iteration; denominator = merged comm wall time; computed by `analyze_comm_compute_overlap.py`):
+
+| Bucket | MFSDP AllGather | FSDP2 AllGather | MFSDP ReduceScatter | FSDP2 ReduceScatter |
+|---|---|---|---|---|
+| Comm wall time | 7,571 ms | ~6,710 ms | 9,347 ms | ~5,791 ms |
+| A. Hidden by GEMM + attn | 83.5% | 82.4% | 89.9% | 84.3% |
+| B. Hidden by norm / rope / elem | 7.7% | 11.2% | 4.8% | 12.6% |
+| **C. Truly exposed** | **8.8% (668 ms)** | **6.4% (432 ms)** | **5.3% (496 ms)** | **3.1% (181 ms)** |
+| **Total C (AG+RS)** | | **1,164 ms/iter** | | **613 ms/iter** |
+
+> **Normalization**: MFSDP window = 37.6s / 2 training iterations → ÷2. FSDP2 window covers only 3 of 4 GA steps per iteration: `iteration_7_ga_step_0` appears in just 1 of 8 rank profiles (COUNT=1 vs COUNT=8 for steps 1–3), meaning nsys started recording mid-step and ga_step_0 is incomplete. The 3 complete steps (ga_step_1–3) are extrapolated to 1 full iteration by ×(4/3). For a cleaner comparison, re-profile FSDP2 with nsys capturing a full iteration start-to-finish.
+>
+> **Bucket A** (GEMM+attn overlap) is nearly identical between runs (~83–90%). The old "AG–GEMM overlap" metric was denominated by sum-of-individual-kernel durations (not merged wall), making MFSDP and FSDP2 numbers incomparable.
+>
+> **Bucket B** is fragile: it disappears if norm/rope/elementwise ops speed up. FSDP2's higher B on RS reflects `split_with_sizes_copy` running on the compute stream during RS.
+>
+> **Bucket C gap breakdown** — the ~550 ms/iter difference splits as: **RS gap 315 ms** (496 − 181) vs **AG gap 238 ms** (669 − 431). RS dominates because MFSDP RS wall is 61% longer (9,347 vs 5,791 ms) due to the NCCL chunk-size issue, so even a small C% difference compounds into large absolute exposed ms. AG walls are much closer (7,571 vs 6,710 ms, 13% gap).
 
 ---
 
@@ -160,7 +176,7 @@ RMSNorm is negligible (<0.5% of kernel time). Not a performance concern.
 |---|---|---|
 | Attention kernel (cuDNN vs FA2) | Megatron advantage | ~2pp MFU — **real unfairness**; Automodel cannot use cuDNN with current CP>1 SDPA constraint |
 | RS NCCL bandwidth | Megatron disadvantage | ~1pp MFU lost; Megatron's `NCCL_P2P_NET_CHUNKSIZE` reduces RS efficiency, effective bandwidth from ~1.57 GB/s (FSDP2 default) to ~0.94 GB/s (~1.67× slower per RS call) in Megatron |
-| AG–GEMM overlap | Megatron slight advantage | 67.6% vs 62.0%; ~60 ms more exposed AG in FSDP2 despite faster individual AGs. Likely partly due to pre-AG `CatArrayBatchedCopy` delaying effective AG launch; Megatron stream scheduling may also differ but not directly confirmed |
+| Comm overlap (bucket C exposed) | **FSDP2 advantage** | FSDP2 truly-exposed: AG 432 ms + RS 181 ms = **613 ms/iter**; MFSDP: AG 668 ms + RS 496 ms = **1,164 ms/iter**. FSDP2 exposes ~550 ms/iter less, mainly from better RS scheduling with prefetch. Note: bucket A (GEMM+attn overlap fraction) is nearly identical at 82–90% in both runs. |
 | AG/RS copy overhead (contiguous buffer) | Megatron advantage | ~6.1% kernel time / ~4.7% wall time; FSDP2 pays 1,979 ms/step in pack/unpack copies; MFSDP pays 64 ms (flat buffer, no staging) |
 | Gradient dtype | Fair | Both FP32 RS |
 | Model architecture | Fair | Same TP/CP/PP/DP, MBS, GBS, seqlen |
@@ -175,7 +191,7 @@ Primary driver: cuDNN attention (~2pp). Secondary: overlap quality and NCCL sett
 ## 6. Improvement Opportunities for Automodel
 
 1. **Enable cuDNN SDPA** — largest single lever (~2pp MFU). Switch from FA2 (`flash_fwd_kernel`) to cuDNN WGMMA kernel by enabling `torch.backends.cuda.enable_cudnn_sdp(True)` in the attention backend.
-2. **Tune FSDP2 prefetch depth** — increase `fsdp2_forward_prefetch_depth` to reduce exposed AG time (currently 38% AG exposed vs Megatron's 32%; tuning depth or bucket size may close this).
+2. **Tune FSDP2 prefetch depth** — increase `fsdp2_forward_prefetch_depth` to further reduce exposed AG time. Currently FSDP2 AG bucket C = 6.4% (432 ms/iter) vs MFSDP 8.8% (668 ms/iter); FSDP2 already has better exposure, but the 12 ">1 ms" exposed windows (257 ms) suggest a few large gaps remain worth closing.
 3. **Match NCCL env vars** — test with Megatron's `NCCL_P2P_NET_CHUNKSIZE` and `NCCL_IB_SL` settings to understand their impact on RS bandwidth (currently FSDP2 is faster without them).
 4. **Cross-entropy fusion** — add TE fused cross-entropy loss (`--cross-entropy-loss-fusion te` equivalent) to reduce activation memory and fuse the softmax+loss kernel.
 5. **Adopt contiguous flat parameter buffer (M-FSDP-style)** — FSDP2 stores parameters as individual tensors, requiring explicit pack/unpack copies before every AllGather and ReduceScatter. Megatron MFSDP maintains a single contiguous memory slab so AG/RS operate directly on it with no staging. The measured GPU kernel overhead per step:
@@ -202,5 +218,5 @@ Primary driver: cuDNN attention (~2pp). Secondary: overlap quality and NCCL sett
 ## 7. Improvement Opportunities for Megatron MFSDP
 
 1. **Remove or retune `NCCL_P2P_NET_CHUNKSIZE=2097152`** — most actionable win. This env var reduces RS effective bandwidth from ~1.57 GB/s (FSDP2 default) to ~0.94 GB/s (~1.67× slower per RS call). RS accounts for 26.6% of kernel time; recovering this bandwidth would save ~3.5s/step and recover ~1pp MFU. Test without this flag first.
-2. **Reduce AG bucket size** — MFSDP issues 644 AGs/step at avg 11,756 µs each vs FSDP2's 643 AGs at 10,280 µs. Despite similar counts, MFSDP's individually larger AGs may reduce overlap granularity per GEMM. Tuning `--param-gather-bucket-size` (or equivalent) to create finer-grained AGs could improve AG–GEMM overlap beyond the current 67.6%.
+2. **Reduce AG bucket size** — MFSDP issues 644 AGs/step at avg 11,756 µs each vs FSDP2's 643 AGs at 10,280 µs. Despite similar counts, MFSDP's individually larger AGs leave more compute-stream idle time (bucket C = 668 ms/iter vs FSDP2's 432 ms/iter). Tuning `--param-gather-bucket-size` to create finer-grained AGs could reduce bucket C toward FSDP2's level.
 3. **Validate `NCCL_IB_SL=1` impact** — this sets InfiniBand Service Level, which can affect QoS and routing. Confirm it improves (vs degrades) bandwidth on the current fabric; it may be a carry-over from an older network topology.

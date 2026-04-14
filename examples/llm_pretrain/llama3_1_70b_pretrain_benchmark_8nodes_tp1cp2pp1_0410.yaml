@@ -31,6 +31,7 @@ model:
   attn_implementation: sdpa  # required for cp>1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa  # TE attn does not support cp>1; keep sdpa
     rms_norm: te
 
 checkpoint:
