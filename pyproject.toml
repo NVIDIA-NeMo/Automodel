@@ -82,7 +82,7 @@ dependencies = [
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers>=5.3.0,<5.4.0",
+    "transformers==5.5.4",
     "wandb",
     "torchao",
     "mlflow",
@@ -361,7 +361,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "transformers", "wandb"]
+known-third-party = ["datasets", "transformers==5.5.4", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
