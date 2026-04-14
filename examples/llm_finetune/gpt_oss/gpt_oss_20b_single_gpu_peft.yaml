@@ -110,3 +110,4 @@ optimizer:
 
 ci:
   recipe_owner: adil-a
+  nproc_per_node: 1
