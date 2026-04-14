@@ -38,9 +38,9 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973; install ffmpeg for torchcodec audio/video decoding
-RUN apt-get update && apt install -y --only-upgrade gnupg && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg libavcodec-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
