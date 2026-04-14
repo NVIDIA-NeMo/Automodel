@@ -753,6 +753,9 @@ def kimi_k25_vl_collate_fn(
         }
         if medias:
             processor_kwargs["medias"] = medias
+        if max_length is not None and not drop_overlong:
+            processor_kwargs["truncation"] = True
+            processor_kwargs["max_length"] = max_length
 
         sample_batch = processor(**processor_kwargs)
 
@@ -765,18 +768,14 @@ def kimi_k25_vl_collate_fn(
             grid_thws = sample_batch["grid_thws"]
             input_ids, attention_mask = _expand_image_tokens(input_ids, attention_mask, grid_thws, media_token_id)
 
-        # Truncate or drop overlong samples after expansion
-        if max_length is not None and input_ids.shape[0] > max_length:
-            if drop_overlong:
-                logger.warning(
-                    "Dropping expanded sample with %d tokens (max_length=%d).",
-                    input_ids.shape[0],
-                    max_length,
-                )
-                continue
-            else:
-                input_ids = input_ids[:max_length]
-                attention_mask = attention_mask[:max_length]
+        # Drop overlong samples after expansion if requested
+        if drop_overlong and max_length is not None and input_ids.shape[0] > max_length:
+            logger.warning(
+                "Dropping expanded sample with %d tokens (max_length=%d).",
+                input_ids.shape[0],
+                max_length,
+            )
+            continue
 
         kept_conversations.append(conversation)
 
