@@ -39,6 +39,8 @@ configs:
   # -- gpt_oss --
   - gpt_oss/gpt_oss_20b.yaml
   - gpt_oss/gpt_oss_20b_single_gpu.yaml
+  - gpt_oss/customizer_gpt_oss_full_sft.yaml
+  - gpt_oss/customizer_gpt_oss_full_sft_chat.yaml
 
   # -- granite --
   - granite/granite_3_3_2b_instruct_squad.yaml
@@ -47,6 +49,9 @@ configs:
   - llama3_1/llama3_1_8b_hellaswag_pp.yaml
   - llama3_2/llama3_2_1b_squad.yaml
   - llama3_2/llama3_2_1b_hellaswag.yaml
+  - llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml
+  - llama3_2/customizer_llama_3_2_1b_full_sft.yaml
+  - llama3_2/customizer_llama_3_2_1b_full_sft_chat.yaml
 
   # -- mistral --
   - mistral/mistral_nemo_2407_squad.yaml
@@ -61,6 +66,8 @@ configs:
   - nemotron/nemotron_nano_v3_hellaswag.yaml
   - nemotron/nemotron_super_v3_hellaswag.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad.yaml
+  - nemotron/customizer_nemotron_nano_full_sft.yaml
+  - nemotron/customizer_nemotron_nano_full_sft_chat.yaml
   - nemotron_flash/nemotron_flash_1b_squad.yaml
 
   # -- olmo --
@@ -101,9 +108,13 @@ configs:
   # -- gpt_oss --
   - gpt_oss/gpt_oss_20b_peft.yaml
   - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
+  - gpt_oss/customizer_gpt_oss_peft.yaml
+  - gpt_oss/customizer_gpt_oss_peft_packing.yaml
 
   # -- llama --
   - llama3_2/llama3_2_1b_hellaswag_peft.yaml
+  - llama3_2/customizer_llama_3_2_1b_peft.yaml
+  - llama3_2/customizer_llama_3_2_1b_peft_packing.yaml
 
   # -- mistral --
   - mistral/ministral3_3b_squad_peft.yaml
@@ -114,6 +125,8 @@ configs:
   - nemotron/nemotron_nano_v3_hellaswag_peft.yaml
   - nemotron/nemotron_super_v3_hellaswag_peft.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
+  - nemotron/customizer_nemotron_nano_peft.yaml
+  - nemotron/customizer_nemotron_nano_peft_packing.yaml
   - nemotron_flash/nemotron_flash_1b_squad_peft.yaml
 
   # -- phi --

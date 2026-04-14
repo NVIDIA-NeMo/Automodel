@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.utils.test_utils import run_test_script
 import shutil
+
+from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "llm_pretrain_and_kd"
 TEST_FILENAME = "L2_ClipGradNorm_Test.sh"
 KD_SCRIPT = "L2_KD_Transformer_SFT.sh"
+
 
 class TestPretrainLLM:
     def test_pretrain(self):
@@ -56,3 +58,5 @@ class TestPretrainLLM:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
 
+    def test_hf_doc_pretrain_instantiation(self):
+        run_test_script(TEST_FOLDER, "L2_HF_Doc_Pretrain_Instantiation.sh")

@@ -43,6 +43,19 @@ else
         --step_scheduler.val_every_steps 100"
 fi
 
+# Customizer contract test dataset overrides
+if [[ "${CONFIG_PATH}" == *customizer_* ]]; then
+  CUSTOMIZER_DATA="${NEMO_CI_PATH}/datasets/customizer/sample-datasets"
+  if [[ "${CONFIG_PATH}" == *chat* ]]; then
+    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/train.jsonl \
+      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/validation.jsonl"
+  else
+    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/train.jsonl \
+      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/validation.jsonl"
+  fi
+  CONFIG="${CONFIG} ${CUSTOMIZER_DATASET_ARGS}"
+fi
+
 # Command to execute, defaults to torchrun
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
@@ -62,7 +75,8 @@ ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
   --step_scheduler.ckpt_every_steps 5 \
   --step_scheduler.val_every_steps 5 \
   --step_scheduler.global_batch_size 32 \
-  --step_scheduler.local_batch_size 2"
+  --step_scheduler.local_batch_size 2 \
+  ${CUSTOMIZER_DATASET_ARGS:-}"
 
 if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
   ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
