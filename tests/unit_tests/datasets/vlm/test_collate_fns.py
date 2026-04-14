@@ -1025,7 +1025,7 @@ def test_kimi_k25_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
 
 
 def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
-    """Test kimi_k25_vl_collate_fn drops samples exceeding max_length instead of truncating."""
+    """Test kimi_k25_vl_collate_fn drops samples when drop_overlong=True."""
 
     # Custom processor that produces longer sequences
     class LongSequenceProcessor:
@@ -1050,9 +1050,90 @@ def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
     ]
     examples = [{"conversation": conversation}]
 
-    # All samples exceed max_length=20 → ValueError
+    # All samples exceed max_length=20 with drop_overlong=True → ValueError
     with pytest.raises(ValueError, match="All samples in batch exceed max_length"):
-        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20, drop_overlong=True)
+
+
+def test_kimi_k25_vl_collate_fn_truncates_by_default(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn truncates (not drops) overlong samples by default."""
+
+    class LongSequenceProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            # Produce a 50-token sequence
+            input_ids = torch.arange(1, 51).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = LongSequenceProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # With drop_overlong=False (default), sample should be truncated not dropped
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # After truncation to 20 and autoregressive shift (:-1), seq_len = 19
+    assert batch["input_ids"].shape == (1, 19)
+    assert batch["attention_mask"].shape == (1, 19)
+    assert batch["labels"].shape == (1, 19)
+
+
+def test_kimi_k25_vl_collate_fn_no_drop_preserves_batch_size(collate_mod, monkeypatch):
+    """Test that default (no drop) preserves all samples in batch for PP compatibility."""
+    call_count = [0]
+
+    class VariableLengthProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            call_count[0] += 1
+            # First sample: 50 tokens (overlong), second: 10 tokens (short)
+            length = 50 if call_count[0] == 1 else 10
+            input_ids = torch.arange(1, length + 1).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = VariableLengthProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}, {"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # Both samples preserved (truncated, not dropped). After shift: 19 tokens.
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape[1] == 19
 
 
 def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):

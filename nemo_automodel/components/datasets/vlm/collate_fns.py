@@ -703,6 +703,7 @@ def kimi_k25_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: Optional[int] = None,
+    drop_overlong: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
 
@@ -714,8 +715,8 @@ def kimi_k25_vl_collate_fn(
     """
     conversations = [example["conversation"] for example in examples]
 
-    # Pre-filter to avoid expensive processing of obviously overlong samples
-    if max_length is not None:
+    # Optionally drop overlong samples before processing
+    if max_length is not None and drop_overlong:
         conversations, _kept = _drop_overlong_samples(conversations, processor, max_length)
 
     # Get media token ID
@@ -764,14 +765,18 @@ def kimi_k25_vl_collate_fn(
             grid_thws = sample_batch["grid_thws"]
             input_ids, attention_mask = _expand_image_tokens(input_ids, attention_mask, grid_thws, media_token_id)
 
-        # Drop overlong samples instead of truncating
+        # Truncate or drop overlong samples after expansion
         if max_length is not None and input_ids.shape[0] > max_length:
-            logger.warning(
-                "Dropping expanded sample with %d tokens (max_length=%d).",
-                input_ids.shape[0],
-                max_length,
-            )
-            continue
+            if drop_overlong:
+                logger.warning(
+                    "Dropping expanded sample with %d tokens (max_length=%d).",
+                    input_ids.shape[0],
+                    max_length,
+                )
+                continue
+            else:
+                input_ids = input_ids[:max_length]
+                attention_mask = attention_mask[:max_length]
 
         kept_conversations.append(conversation)
 
