@@ -78,6 +78,9 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
 )
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+)
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
 from nemo_automodel.components.distributed.optimized_tp_plans import (
@@ -1269,6 +1272,7 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+        Qwen3_5ForConditionalGeneration: ["model.language_model.layers", "model.visual.blocks"],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],
