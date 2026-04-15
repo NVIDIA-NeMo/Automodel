@@ -272,5 +272,3 @@ def test_context_manager_calls_end_run(monkeypatch):
     with MLflowLogger(experiment_name="exp", run_name="rx", tags={}):
         pass
     assert calls["end_run"] == 1
-
-

@@ -488,7 +488,7 @@ class TestQwen3VLMoeForConditionalGeneration:
         squeezed_position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         squeezed_padding_mask = torch.ones(batch, seq_len, dtype=torch.bool, device=device)
         squeezed_kwargs = {"foo": "bar"}
-        
+
         # Mock the model.model.forward to avoid internal tensor operations
         mock_hidden = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
 
@@ -502,7 +502,7 @@ class TestQwen3VLMoeForConditionalGeneration:
             mock_output = MagicMock()
             mock_output.last_hidden_state = mock_hidden
             mock_model_forward.return_value = mock_output
-            
+
             result = model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -513,14 +513,14 @@ class TestQwen3VLMoeForConditionalGeneration:
 
             # Result should be logits from lm_head
             assert result.shape == (batch, seq_len, vl_config.text_config.vocab_size)
-            
+
             # Verify squeeze_input_for_thd was called with correct args
             squeeze_args = mock_squeeze.call_args[0]
             assert squeeze_args[0] is input_ids
             assert squeeze_args[1] is position_ids
             assert squeeze_args[2] is padding_mask
             assert squeeze_args[3]["qkv_format"] == "thd"
-            
+
             # Verify model.model.forward was called
             mock_model_forward.assert_called_once()
 

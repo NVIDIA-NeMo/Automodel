@@ -55,4 +55,3 @@ class TestPretrainLLM:
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
-
