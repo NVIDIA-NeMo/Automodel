@@ -56,14 +56,24 @@ def slurm_time_multiplier(time: str, multiplier: int):
     return updated_time
 
 
+# Scopes that auto-discover all configs via rglob (no recipe list needed).
+# All other scope/folder combinations read from {scope}_recipes.yml.
+AUTO_DISCOVER_SCOPES = {
+    "release": ["llm_finetune", "vlm_finetune"],
+    "performance": ["llm_benchmark", "vlm_benchmark"],
+}
+
+
 def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     """
-    Detect recipe YAML configurations to include in the CI pipeline. Nightly scope reads from
-    a scope-specific recipe list. Release scope collects all YAML configurations within the test_folder.
+    Detect recipe YAML configurations to include in the CI pipeline.
+
+    Auto-discovery scopes (defined in AUTO_DISCOVER_SCOPES) collect all YAML files
+    via rglob. All other scopes read from a scope-specific recipe list.
 
     Args:
         automodel_dir: Path to the Automodel directory
-        scope: Scope of the testing (nightly, release)
+        scope: Scope of the testing (nightly, release, convergence, performance)
         test_folder: Name of the test folder under Automodel/examples
 
     Returns:
@@ -72,8 +82,8 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     yml_configs = []
     search_path = f"{automodel_dir}/examples/{test_folder}"
 
-    # Check scope
-    if scope == "release":
+    auto_folders = AUTO_DISCOVER_SCOPES.get(scope, [])
+    if test_folder in auto_folders:
         for f in Path(f"{search_path}").rglob("*.yaml"):
             relative_path = f.relative_to(automodel_dir)
             yml_configs.append(relative_path)
@@ -127,6 +137,7 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         'node_multiplier': 'NODE_MULTIPLIER',
         'local_batch_size': 'LOCAL_BATCH_SIZE',
         'recipe_owner': 'RECIPE_OWNER',
+        'nproc_per_node': 'CONFIG_NPROC_PER_NODE',
     }
     for ci_key, ci_var in ci_key_map.items():
         if ci_key in ci_config:
@@ -142,7 +153,9 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
 
     # Configure test stage based on recipe type and robustness config
-    if 'benchmark' in config.stem:
+    if 'benchmark' in test_folder:
+        job['stage'] = 'performance'
+    elif 'benchmark' in config.stem:
         job['stage'] = 'benchmark'
     elif 'peft' in config.stem:
         job['stage'] = 'peft_ckpt_robustness' if has_robustness else 'peft'
@@ -159,7 +172,20 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         slurm_time = job['variables'].get('TIME', '00:10:00')
         job['variables']['TIME'] = DQ(slurm_time_multiplier(slurm_time, 2))
 
-    return job
+    # Generate vLLM deploy job if recipe opts in
+    vllm_job = None
+    if ci_config.get('vllm_deploy'):
+        vllm_stage = 'peft_vllm_deploy' if 'peft' in config.stem else 'sft_vllm_deploy'
+        vllm_job = {
+            'extends': '.vllm_deploy_test',
+            'stage': vllm_stage,
+            'variables': {
+                'CONFIG_PATH': f'{config}',
+                'TEST_LEVEL': f'{scope}',
+            }
+        }
+
+    return job, vllm_job
 
 
 def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
@@ -201,7 +227,10 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         if model_name in exempt_models_list or config_name in exempt_configs_list:
             continue
 
-        pipeline[f'{config_name}'] = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        job, vllm_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        pipeline[f'{config_name}'] = job
+        if vllm_job:
+            pipeline[f'{config_name}_vllm_deploy'] = vllm_job
 
     return pipeline
 

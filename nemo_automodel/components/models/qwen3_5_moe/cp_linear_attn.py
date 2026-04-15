@@ -93,10 +93,14 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             return super().forward(
                 hidden_states,
                 cache_params=cache_params,
-                cache_position=cache_position,
                 attention_mask=attention_mask,
             )
 
+        # HF decoder layers don't pass position_ids to linear_attn.
+        # Use cached value from the decoder layer pre-hook, then clear it.
+        if position_ids is None:
+            position_ids = getattr(self, "_cached_position_ids", None)
+            self._cached_position_ids = None
         return self._forward_with_cp(
             hidden_states,
             position_ids=position_ids,
@@ -334,3 +338,53 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             cp_group=cp_group,
         )
         return output
+
+
+def patch_hf_model(model, cp_enabled=False):
+    """Patch HF Qwen3.5 GatedDeltaNet modules for FSDP and optional CP support.
+
+    For FSDP compatibility, move float32 bare params (A_log) into a
+    _fp32_params submodule so fully_shard_by_dtype can wrap them separately.
+
+    When ``cp_enabled=True``, also swap each module's __class__ to
+    CPAwareGatedDeltaNet for context parallelism support.
+    """
+    import logging
+
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+    except ImportError:
+        return
+
+    _logger = logging.getLogger(__name__)
+    patched = 0
+    for name, mod in model.named_modules():
+        if not isinstance(mod, Qwen3_5GatedDeltaNet):
+            continue
+
+        if cp_enabled:
+            mod.__class__ = CPAwareGatedDeltaNet
+            mod._cp_mesh = None
+
+        # Move float32 bare params into a holder submodule for FSDP.
+        # The __dict__ reference lets HF forward access self.A_log directly,
+        # while FSDP manages the param via the _fp32_params submodule.
+        holder = None
+        for pname in list(mod._parameters.keys()):
+            param = mod._parameters[pname]
+            if param is not None and param.dtype == torch.float32:
+                if holder is None:
+                    holder = torch.nn.Module()
+                setattr(holder, pname, param)
+                del mod._parameters[pname]
+                mod.__dict__[pname] = param
+        if holder is not None:
+            mod.add_module("_fp32_params", holder)
+        patched += 1
+
+    if patched > 0:
+        _logger.info(
+            "Patched %d GatedDeltaNet modules (cp=%s) with FSDP-safe fp32 param wrapping.",
+            patched,
+            cp_enabled,
+        )

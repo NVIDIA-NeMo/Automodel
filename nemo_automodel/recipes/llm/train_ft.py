@@ -14,6 +14,17 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
 import inspect
 import logging
 import pathlib
@@ -862,7 +873,7 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             val_check_interval=cfg.get("step_scheduler.val_every_steps", None),
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            pp_enabled=False,
+            pp_enabled=pp_enabled,
             cp_size=cfg.get("distributed.cp_size", 1),
             model=model,
         )[0]
@@ -1344,6 +1355,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 input_ids = batch.pop("input_ids")
 
+                # Update PP stage shapes for the current batch's seq_len.
+                # This is a no-op when the length hasn't changed.
+                self.pp.update_seq_len(input_ids.shape[1])
+
                 # Filter out None values and empty dicts from batch to avoid PP chunking errors
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
@@ -1594,18 +1609,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        # For PP, send val_loss from last stage to main rank for logging
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
             val_loss = val_loss.to(self.dist_env.device)
-            # Send loss to first rank from the last stage
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
             src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
             if self.dist_env.rank == src_rank:
                 torch.distributed.send(val_loss, dst=0)
+                torch.distributed.send(pp_num_tokens, dst=0)
             elif self.dist_env.is_main:
                 torch.distributed.recv(val_loss, src=src_rank)
+                torch.distributed.recv(pp_num_tokens, src=src_rank)
+                total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 

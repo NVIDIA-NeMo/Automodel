@@ -1,6 +1,6 @@
 (diffusion-finetune)=
 
-# Diffusion Model Fine-Tuning with NeMo AutoModel
+# Diffusion Model Fine-Tuning
 
 ## Introduction
 

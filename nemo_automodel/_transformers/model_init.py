@@ -313,7 +313,7 @@ def _restore_loaded_model_dtype(
         logger.info("Restored checkpoint dtypes for %d tensors from %s", restored_count, pretrained_model_name_or_path)
 
 
-def _init_model(
+def __init_model(
     cls,
     pretrained_model_name_or_path_or_config,
     attn_implementation,
@@ -381,6 +381,11 @@ def _init_model(
         init_param_names = _get_init_param_names(model_cls)
         _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
         kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+        # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
+        if "backend" in kwargs and isinstance(kwargs["backend"], dict):
+            from nemo_automodel.components.models.common.utils import BackendConfig
+
+            kwargs["backend"] = BackendConfig(**kwargs["backend"])
         # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
         if torch_dtype != "auto":
             hf_config.torch_dtype = torch_dtype
@@ -419,6 +424,57 @@ def _init_model(
         pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
+
+
+def _tie_weights_nemo(model):
+    if not hasattr(model, "_nemo_tied_weights_keys"):
+        return
+
+    def get_module_by_fqn(model, fqn):
+        from functools import reduce
+
+        fqn = fqn.split(".")
+        if fqn[-1] == "weight":
+            fqn = fqn[:-1]
+        return reduce(getattr, fqn, model)
+
+    for k, v in model._nemo_tied_weights_keys.items():
+        get_module_by_fqn(model, k).weight = get_module_by_fqn(model, v).weight
+
+
+def _init_model(
+    cls,
+    pretrained_model_name_or_path_or_config,
+    attn_implementation,
+    torch_dtype,
+    quantization_config,
+    force_hf,
+    *model_args,
+    **kwargs,
+):
+    is_custom_model, model = __init_model(
+        cls,
+        pretrained_model_name_or_path_or_config,
+        attn_implementation,
+        torch_dtype,
+        quantization_config,
+        force_hf,
+        *model_args,
+        **kwargs,
+    )
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/a3a57176f68add7917faaa32f19228f49fcbb1ba/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml#L41
+    # this happens in nemotron_flash, where we load using force_hf, and the model is pre 5.x
+    #
+    # for safety, we tied weights after _model_init. We could do the tying in post_init, but it could be overwritten.
+    # So the sequence is roughly:
+    #   1. HF constructs NemotronFlashForCausalLM(config).
+    #   2. Inside that constructor, self.post_init() runs.
+    #   3. Only after construction returns does from_pretrained() finish loading/applying checkpoint weights.
+    #   4. That later load can assign lm_head.weight and model.embed_tokens.weight separately, which breaks any alias we create inside post_init().
+
+    if hasattr(model, "_nemo_tied_weights_keys"):
+        _tie_weights_nemo(model)
+    return is_custom_model, model
 
 
 def get_architectures(hf_config):

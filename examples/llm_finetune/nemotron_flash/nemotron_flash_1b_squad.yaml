@@ -48,6 +48,12 @@ model:
     attn_implementation_new: flash_attention_2
     _attn_implementation: flash_attention_2
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 distributed:
   strategy: fsdp2
   dp_size: none
@@ -95,11 +101,11 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  vllm_deploy: true
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
-    distributed.tp_size: 2
     tokenizer_name: nvidia/Nemotron-Flash-1B
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

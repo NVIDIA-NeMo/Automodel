@@ -14,6 +14,17 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
 import logging
 import pathlib
 import time
@@ -338,9 +349,12 @@ def build_dataloader(
         "shuffle": cfg_dl.get("shuffle", True),
     }
     if device_mesh is not None:
+        from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["dp"].size(),
-            "rank": device_mesh["dp"].get_local_rank(),
+            "num_replicas": dp_mesh.size(),
+            "rank": dp_mesh.get_local_rank(),
         }
 
     with ScopedRNG(seed=seed, ranked=True):

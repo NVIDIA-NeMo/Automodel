@@ -42,10 +42,10 @@ model:
   torch_dtype: bf16
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: false 
+  save_consolidated: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -101,8 +101,9 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  vllm_deploy: true
   recipe_owner: HuiyingLi
-  time: "00:20:00"
+  time: "00:30:00"
   checkpoint_robustness:
     hf_kl_threshold: 8e-2
     distributed.tp_size: 2

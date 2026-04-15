@@ -40,6 +40,9 @@ def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
     if chat_template is None:
         return None
 
+    if "{%" in chat_template or "{{" in chat_template:
+        return chat_template
+
     p = Path(chat_template)
     if p.exists():
         content = p.read_text(encoding="utf-8")
@@ -546,8 +549,14 @@ def format_chat_template(
     if not _has_chat_template(tokenizer):
         raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
 
-    template_has_generation_kwd = GENERATION_REGEX.search(tokenizer.chat_template) is not None
-    template_mentions_reasoning_content = "reasoning_content" in tokenizer.chat_template
+    # Resolve the template string — some tokenizers store multiple templates as a dict
+    # (keyed by name, e.g. "default", "tool_use"). We need the raw string for regex checks.
+    chat_template_str = tokenizer.chat_template
+    if isinstance(chat_template_str, dict):
+        chat_template_str = chat_template_str.get("default", next(iter(chat_template_str.values())))
+
+    template_has_generation_kwd = GENERATION_REGEX.search(chat_template_str) is not None
+    template_mentions_reasoning_content = "reasoning_content" in chat_template_str
     has_reasoning_content = any(
         message.get("role") == "assistant" and bool(message.get("reasoning_content")) for message in formatted_text
     )

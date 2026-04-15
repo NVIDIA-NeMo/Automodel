@@ -48,6 +48,12 @@ model:
     attn_implementation_new: flash_attention_2
     _attn_implementation: flash_attention_2
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   match_all_linear: True
@@ -102,6 +108,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  vllm_deploy: true
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
