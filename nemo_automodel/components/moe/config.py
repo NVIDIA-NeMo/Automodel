@@ -40,6 +40,7 @@ class MoEParallelizerConfig:
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
     mp_policy: Optional[MixedPrecisionPolicy] = None
+    expert_reduce_dtype: Optional[Union[str, torch.dtype]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}

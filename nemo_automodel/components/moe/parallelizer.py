@@ -183,6 +183,7 @@ def apply_fsdp(
     ep_shard_enabled: bool,
     ep_shard_mesh: DeviceMesh | None = None,
     mp_policy: MixedPrecisionPolicy | None = None,
+    expert_reduce_dtype: str | torch.dtype | None = None,
     offload_policy: OffloadPolicy | None = None,
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -198,6 +199,17 @@ def apply_fsdp(
             output_dtype=torch.bfloat16,
             cast_forward_inputs=True,
         )
+
+    if expert_reduce_dtype is not None:
+        expert_reduce_dtype = dtype_from_str(expert_reduce_dtype, default=mp_policy.reduce_dtype)
+        expert_mp_policy = MixedPrecisionPolicy(
+            param_dtype=mp_policy.param_dtype,
+            reduce_dtype=expert_reduce_dtype,
+            output_dtype=mp_policy.output_dtype,
+            cast_forward_inputs=mp_policy.cast_forward_inputs,
+        )
+    else:
+        expert_mp_policy = mp_policy
 
     fully_shard_default = functools.partial(
         fully_shard,
@@ -225,6 +237,7 @@ def apply_fsdp(
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
+                mp_policy=expert_mp_policy,
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=reshard_after_forward,
             )
@@ -359,6 +372,7 @@ def parallelize_model(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    expert_reduce_dtype: str | torch.dtype | None = None,
 ):
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
@@ -397,6 +411,7 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
+            expert_reduce_dtype=expert_reduce_dtype,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

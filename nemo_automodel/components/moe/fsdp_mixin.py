@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any, Callable, Iterator, Optional
 
 import torch
 from torch.distributed.fsdp import FSDPModule, fully_shard
+
+logger = logging.getLogger(__name__)
 from torch.distributed.pipelining._backward import stage_backward, stage_backward_input, stage_backward_weight
 from torch.nn.parallel import DistributedDataParallel
 
@@ -45,11 +48,21 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
         yield module.visual
 
     # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
+    yield from _iter_expert_fsdp_modules(module)
+
+
+def _iter_expert_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
+    """Yields only expert FSDP modules (one per MoE layer)."""
+    _model = module.model if hasattr(module, "model") else module
     if hasattr(_model, "layers"):
         for _, block in _model.layers.named_children():
             for attr in ("mlp", "moe"):
                 mod = getattr(block, attr, None)
-                if mod is not None and hasattr(mod, "experts"):
+                if mod is None:
+                    continue
+                # Peel checkpoint wrapper (applied by apply_ac) so experts are visible
+                mod = getattr(mod, "_checkpoint_wrapped_module", mod)
+                if hasattr(mod, "experts"):
                     experts = mod.experts
                     if isinstance(experts, FSDPModule):
                         yield experts
@@ -114,6 +127,21 @@ class MoEFSDPSyncMixin:
                 reshard_after_backward=False,
                 requires_gradient_sync=False,
             )
+
+        # The outer model's recursive set propagates to expert FSDPs too. Re-enable
+        # expert sync so RS fires every microbatch instead of accumulating a full
+        # unsharded f32 gradient buffer (302 MB × N layers → OOM with reduce_dtype=float32).
+        n_expert_fsdp = 0
+        for fsdp_module in _iter_expert_fsdp_modules(self):
+            fsdp_module.set_requires_gradient_sync(True, recurse=False)
+            fsdp_module.set_reshard_after_backward(True, recurse=False)
+            n_expert_fsdp += 1
+        if n_expert_fsdp == 0:
+            logger.warning("prepare_for_grad_accumulation: no expert FSDP modules found — "
+                           "expert RS will be deferred (may OOM with reduce_dtype=float32)")
+        else:
+            logger.info("prepare_for_grad_accumulation: configured %d expert FSDP modules "
+                        "(requires_gradient_sync=True, reshard_after_backward=True)", n_expert_fsdp)
 
     def prepare_for_final_backward(self, pp_enabled: bool = False) -> None:
         """Enable gradient sync and resharding for the final backward pass.

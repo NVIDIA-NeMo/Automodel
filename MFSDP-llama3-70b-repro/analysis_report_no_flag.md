@@ -17,8 +17,7 @@ both sides have identical NCCL environments. Effect of adding those flags is not
 |---|---|---|
 | Framework | Megatron-LM (`--use-megatron-fsdp`) | Automodel PyTorch FSDP2 |
 | Container | `pytorch26.03_te2.14_deepep_x86` | `nemo-automodel:26.04.rc4` |
-| Slurm job | 11126057 | 11124101 |
-| nsys-rep | `MFSDP-llama3-70b-repro/nsys/..._no_flag.nsys-rep` | `slurm_jobs/11124101/nsys_llama31_70b_..._node0.nsys-rep` |
+| nsys-rep | `MFSDP-llama3-70b-repro/nsys/llama3_70b_mfsdp_tp1_pp1_ep1_cp1_hsdp1_alltoall_mbs1_gbs128_seqlen4096_cw_n8_full-recompute_no_flag.nsys-rep` | `slurm_jobs/11124101/nsys_llama31_70b_pretrain_tp1cp1pp1_te_attn_cp1_no_compile_gbs128_seqlen4096_node0.nsys-rep` |
 | Profile steps | 10–12 | 7–8 |
 | Profile window | 17,861ms (2 steps) | 12,936ms (1.5 steps) |
 | **Step time (log)** | **~8,950ms** | **8,646ms** |
@@ -74,12 +73,13 @@ All per-step values below are raw ÷ n_iters.
 | Total comm/step | 7,668ms | **6,792ms** | FSDP2 −11.4% |
 | Total GEMM/step | 7,226ms | **6,503ms** | FSDP2 −10.0% |
 | Attention (FWD+BWD)/step | 482ms | **459ms** | Near-tie |
-| Buffer copy overhead/step | **9ms** | 878ms | MFSDP 96× less |
+| Buffer copy overhead/step | **9ms** | 878ms | MFSDP 96× less (~10% step time) |
 
 ### FSDP2 Advantages
 
-1. **AllGather −19.9%** (4,130ms → 3,309ms): FSDP2's prefetch pipelining and `split_with_sizes_copy_out`
-   overlap make AG effectively faster. Structural scheduling advantage.
+1. **AllGather −19.9%** (4,130ms → 3,309ms): The wall-time reduction is likely due to differences in
+   collective implementation or message chunking, not prefetch pipelining. Prefetching improves
+   comm/compute **overlap** (hiding AG behind GEMM), but does not reduce the AG kernel duration itself.
 
 2. **GEMM −10.0%** (7,226ms → 6,503ms): Driven by two factors:
    - **`tss` vs `tst` cuBLAS epilogue** on 192×192 FFN tiles: MFSDP's flat buffer produces output tensor
@@ -88,9 +88,11 @@ All per-step values below are raw ÷ n_iters.
    - **Separate projection tile shapes**: FSDP2's smaller per-projection GEMMs fit cuBLAS tile heuristics
      more efficiently.
 
-3. **ReduceScatter — parity at baseline**: MFSDP RS (21,491µs) = FSDP2 RS (21,494µs) exactly with no
-   NCCL tuning. Note: adding `NCCL_P2P_NET_CHUNKSIZE=2097152` and `NCCL_IB_SL=1` to MFSDP gives 33%
-   RS speedup (2,613ms vs 3,482ms/step), which would flip this category to MFSDP's favor.
+3. **ReduceScatter — parity**: MFSDP RS (21,491µs) ≈ FSDP2 RS (21,494µs). No meaningful difference.
+
+4. **Better comm–compute overlap**: FSDP2 leaves less comm truly exposed — AG 6.4% (432ms) vs MFSDP
+   8.8% (668ms); RS 3.1% (181ms) vs MFSDP 5.3% (496ms). Total exposed comm: FSDP2 **613ms** vs MFSDP
+   **1,164ms** per profiling window (~173ms/step difference). See §4.8 for full breakdown.
 
 ### MFSDP Advantages
 
@@ -99,9 +101,9 @@ All per-step values below are raw ÷ n_iters.
    FSDP2's copy overhead is overlapped with communication, so the wall-time benefit is partial. However,
    the `chunk_cat` serial path (2,937µs before each RS) inflates FSDP2's measured RS latency.
 
-2. **NCCL tuning upside**: With cluster-specific NCCL flags, MFSDP RS drops from 3,524ms → 2,613ms/step
-   (−33%), nearly closing the entire wall-time gap. FSDP2 wall time would improve similarly if those
-   same flags were applied.
+2. **NCCL tuning upside**: With cluster-specific NCCL flags (`NCCL_P2P_NET_CHUNKSIZE=2097152`,
+   `NCCL_IB_SL=1`), MFSDP RS drops from 3,524ms → 2,613ms/step (−33%), nearly closing the entire
+   wall-time gap.
 
 ---
 
@@ -109,16 +111,9 @@ All per-step values below are raw ÷ n_iters.
 
 ### For Automodel FSDP2
 
-1. **Tune NCCL settings** — `NCCL_P2P_NET_CHUNKSIZE=2097152` and `NCCL_IB_SL=1` gave MFSDP 33% RS
-   speedup on this cluster. Testing for FSDP2 could reduce RS from 3,482ms → ~2,613ms/step, widening
-   the FSDP2 wall-time lead from 3.5% to ~13%.
-
-2. **Adopt contiguous flat parameter buffer** — Eliminates `chunk_cat` serial bottleneck (476ms/step
+1. **Adopt contiguous flat parameter buffer** — Eliminates `chunk_cat` serial bottleneck (476ms/step
    before each RS) and `split_with_sizes_copy_out` (402ms/step post-AG). Even though mostly overlapped
    today, `chunk_cat` is a hard ceiling on RS latency improvement.
-
-3. **Maintain AG scheduling quality** — FSDP2's AG pipelining (+19.9% advantage) is a genuine strength.
-   Ensure prefetch depth and `split_with_sizes_copy_out` overlap are preserved in future refactors.
 
 ### For Megatron MFSDP
 
@@ -172,7 +167,6 @@ variance between jobs.
 | Attention BWD (cuDNN) | 160 | 283 | 160 | 269 | Near-tie |
 | RMSNorm FWD+BWD | 964 | ~73 | 964 | ~83 | Tie |
 | Copy overhead (buffer) | 161 | **9** | ~962 | **878** | MFSDP 96× less |
-| **Total kernel/step** | | **15,927** | | **15,240** | MFSDP +4.5% more |
 | **Step wall time** | | **8,931** | | **8,624** | **FSDP2 −3.5%** |
 
 Comm vs Compute:
@@ -187,13 +181,13 @@ Comm vs Compute:
 > **Reading guide**: Compare **total ms/step**, not avg µs. Avg µs differs because the calls cover
 > different problem sizes (see ³).
 
-| Kernel shape | MFSDP ms/step | MFSDP avg µs | FSDP2 ms/step | FSDP2 avg µs | Notes |
+| Kernel shape | MFSDP ms/step | MFSDP avg µs | FSDP2 ms/step | FSDP2 avg µs | Winner |
 |---|---|---|---|---|---|
 | `tst_320x128_TNT` | 2,495 | 3,887 | 1,937 | 3,017 | Not apples-to-apples — see ³ |
-| `tst_256x128_NNT` | 1,406 | 2,917 | 1,316 | 1,368 | FSDP2 2× calls (separate proj) |
-| `tst_256x128_TNT` | 1,290 | 2,016 | 946 | 739 | FSDP2 2× calls (separate proj) |
-| `tss_192x192_NTN` | 1,143 | **3,712** | 982 (`tst`) | **3,048** | MFSDP +21.8% — `tss` vs `tst` ⁴ |
-| `tss_192x192_NTN` v2 | 541 | **3,382** | 507 (`tst`) | **3,167** | MFSDP +6.8% — `tss` vs `tst` |
+| `tst_256x128_NNT` | 1,406 | 2,917 | 1,316 | 1,368 | FSDP2 −6.4% |
+| `tst_256x128_TNT` | 1,290 | 2,016 | 946 | 739 | FSDP2 −26.7% |
+| `tss_192x192_NTN` | 1,143 | **3,712** | 982 (`tst`) | **3,048** | FSDP2 −14.1% (`tss` vs `tst`) ⁴ |
+| `tss_192x192_NTN` v2 | 541 | **3,382** | 507 (`tst`) | **3,167** | FSDP2 −6.3% (`tss` vs `tst`) |
 | `tst_320x128_NNT` | 497 | 3,105 | 503 | 3,141 | Tie |
 | **Total GEMM** | **7,226** | | **6,503** | | **FSDP2 −10.0%** |
 
@@ -261,3 +255,82 @@ concurrent NCCL streams.
 - **Effect on `tss` vs `tst`**: None. That is driven by output tensor memory layout (flat buffer
   base pointer alignment), not SM availability.
 - **Wall-time impact**: ~5% slower RMSNorm per call → ~4ms/step; negligible in the overall comparison.
+
+### 4.8 Comm–Compute Overlap Analysis
+
+Source: `analyze_comm_compute_overlap.py`, 3-bucket decomposition over the profiling window.
+Denominator: merged comm wall time (union of intervals when the collective is running).
+
+| Bucket | MFSDP AG | FSDP2 AG | MFSDP RS | FSDP2 RS |
+|---|---|---|---|---|
+| Comm wall time (window) | 7,571ms | ~6,710ms | 9,347ms | ~5,791ms |
+| **A. Hidden by GEMM + attn** | 83.5% | 82.4% | 89.9% | 84.3% |
+| **B. Hidden by norm / rope / elem** | 7.7% | 11.2% | 4.8% | 12.6% |
+| **C. Truly exposed** | **8.8% (668ms)** | **6.4% (432ms)** | **5.3% (496ms)** | **3.1% (181ms)** |
+| **Total hidden (A+B)** | 91.2% | 93.6% | 94.7% | 96.9% | |
+
+**Total truly exposed comm per profiling window:**
+
+| | MFSDP | FSDP2 |
+|---|---|---|
+| AG exposed | 668ms | 432ms |
+| RS exposed | 496ms | 181ms |
+| **Total exposed** | **1,164ms** | **613ms** |
+| Per step (÷n_iters) | ~582ms | ~409ms |
+| **Difference/step** | | **+173ms more exposed in MFSDP** |
+
+**Key observations:**
+
+1. **Both runs overlap >90% of comm** — the overlap scheduling is effective in both frameworks. The
+   difference is in the residual exposed tail.
+
+2. **FSDP2 hides more comm via lighter ops (Bucket B)**: FSDP2 norm/rope/elementwise bucket covers
+   11.2% of AG and 12.6% of RS, vs MFSDP's 7.7% and 4.8%. FSDP2 schedules more lightweight ops
+   concurrent with comm, filling gaps that MFSDP leaves exposed.
+
+3. **MFSDP RS has larger wall time** (9,347ms vs 5,791ms over the window) despite nearly identical
+   kernel durations per call. This suggests MFSDP RS calls are more spaced out in wall time (lower
+   packing density), leaving more gaps between RS kernels that appear as exposed comm.
+
+4. **The 173ms/step extra exposed comm in MFSDP accounts for ~56% of the 307ms wall-time gap**
+   (8,931ms − 8,624ms). Combined with the GEMM `tss` vs `tst` penalty (~175ms/step), these two
+   factors together explain essentially the entire performance difference.
+
+---
+
+## 5. Memory Analysis
+
+Source: Megatron `--log-memory-to-tensorboard` (MFSDP, rank 0) and Automodel per-iteration log
+(FSDP2, rank 0). Steady-state values after warmup iteration.
+
+### 5.1 Summary
+
+| Metric | MFSDP | FSDP2 | Difference |
+|---|---|---|---|
+| **Peak allocated** | **46.2 GB** | **53.1 GB** | FSDP2 +6.9 GB (+15%) |
+| **Reserved** | **61.59 GB** | **68.07 GB** | FSDP2 +6.5 GB (+10%) |
+| Headroom (reserved − peak alloc) | 15.4 GB | 15.0 GB | ~tie |
+| H100 capacity (80 GB) utilization | 77% | 85% | FSDP2 closer to limit |
+
+**MFSDP uses ~6.5–7 GB less per GPU** across both metrics.
+
+### 5.2 Root Cause
+
+**Peak allocated gap (6.9 GB)**: During AllGather, FSDP2 runs `chunk_cat` to pack individual parameter
+tensors into a flat send buffer. At the AG peak, both the original per-parameter tensors and the packed
+flat buffer are live simultaneously — two copies of the weight shards coexist briefly. MFSDP's
+parameters already live in a flat contiguous buffer, so AllGather requires no temporary copy; no
+duplication occurs.
+
+**Reserved gap (6.5 GB)**: PyTorch's caching allocator sizes its reserved blocks to the peak allocated
+watermark. A lower peak allocated → smaller blocks acquired from CUDA → less reserved memory held.
+The reserved gap tracks the allocated gap closely, confirming the cause is structural (flat buffer
+vs copy-on-AG) rather than allocator fragmentation.
+
+### 5.3 Implication
+
+At 80 GB H100 SXM capacity, MFSDP's lower footprint (77% vs 85% utilization) leaves ~6.5 GB more
+headroom per GPU. This margin could be used to:
+- Increase MBS (micro-batch size) for higher GPU utilization
+- Extend sequence length beyond 4096
+- Enable longer activation checkpointing intervals (fewer recompute layers)
