@@ -247,8 +247,8 @@ def _get_stop_token_id(tokenizer) -> Optional[int]:
 
 
 # Processor types whose chat template uses ``<|im_start|>``/``<|im_end|>``
-# markers.  For these we can reliably locate assistant turns by scanning the
-# token ids instead of re-tokenizing (which is sensitive to BPE context).
+# markers.  For these we use the fast ``_get_assistant_marker`` /
+# ``_get_stop_token_id`` helpers (no dummy-conversation overhead).
 _IMSTART_TEMPLATE_PROCESSORS = frozenset(
     {
         "Qwen2VLProcessor",
@@ -260,45 +260,109 @@ _IMSTART_TEMPLATE_PROCESSORS = frozenset(
 )
 
 
-def build_labels_from_template(
-    input_ids_batch: torch.Tensor,
-    conversations: Sequence[Sequence[Dict[str, Any]]],
-    processor,
-) -> torch.Tensor:
-    """Build training labels by scanning ``input_ids`` for chat-template role markers.
+def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
+    """Derive the assistant-turn start marker and end-of-turn token id from the
+    tokenizer's own chat template.
 
-    Instead of re-tokenizing assistant text and searching for it (fragile due
-    to BPE context sensitivity), this function locates the structural markers
-    that the chat template inserts around each assistant turn:
+    The function applies a minimal dummy conversation that contains a known
+    sentinel string as the assistant reply, then locates the sentinel in the
+    resulting token sequence.  Everything between the end of the user turn and
+    the start of the sentinel becomes the **assistant marker**; the first token
+    *after* the sentinel becomes the **end-of-turn id**.
 
-        ``<|im_start|>assistant\\n`` … content … ``<|im_end|>``
+    This approach is robust to BPE context-sensitivity and works for any model
+    whose template wraps assistant turns with fixed token sequences — e.g.
+    Gemma4's ``<start_of_turn>model\\n`` … ``<end_of_turn>``.
 
-    Labels are set to the actual token ids for the **content** region
-    (including ``<|im_end|>``); everything else is ``-100``.
+    .. note::
+        ``apply_chat_template`` may return a :class:`~transformers.BatchEncoding`
+        (a ``UserDict`` subclass, **not** a plain :class:`dict`), so
+        ``isinstance(result, dict)`` is ``False``.  We access ``result["input_ids"]``
+        directly, which works for both ``BatchEncoding`` and plain ``dict`` / ``list``.
 
-    Falls back to the old :func:`build_labels` for processor types that do
-    not use the ``<|im_start|>``/``<|im_end|>`` convention (e.g. Kimi, Phi4,
-    Nemotron-Parse).
+    Returns
+    -------
+    tuple[list[int], int]
+        ``(assistant_marker, end_of_turn_id)``
+
+    Raises
+    ------
+    ValueError
+        If the sentinel cannot be located in the template output or if the
+        resulting marker is empty.
     """
-    processor_type = type(processor).__name__
-    if processor_type not in _IMSTART_TEMPLATE_PROCESSORS:
-        return build_labels(input_ids_batch, conversations, processor)
 
-    tokenizer = getattr(processor, "tokenizer", processor)
-    assistant_marker = _get_assistant_marker(tokenizer)
-    stop_id = _get_stop_token_id(tokenizer)
+    def _extract_ids(result) -> List[int]:
+        try:
+            return list(result["input_ids"])
+        except (KeyError, TypeError):
+            return list(result)
 
-    # Safety net: if the tokenizer somehow lacks the expected tokens, fall back.
-    if assistant_marker is None or stop_id is None:
-        logger.warning(
-            "Processor %s is listed as im_start-style but tokenizer lacks "
-            "<|im_start|>/<|im_end|> tokens. Falling back to pattern-match labels.",
-            processor_type,
+    sentinel = "XSENTINELMARKERX"
+    all_ids = _extract_ids(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"}, {"role": "assistant", "content": sentinel}],
+            tokenize=True,
+            add_generation_prompt=False,
         )
-        return build_labels(input_ids_batch, conversations, processor)
+    )
+    user_ids = _extract_ids(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"}],
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+    )
+    sentinel_ids = tokenizer.encode(sentinel, add_special_tokens=False)
 
+    for i in range(len(all_ids) - len(sentinel_ids) + 1):
+        if all_ids[i : i + len(sentinel_ids)] == sentinel_ids:
+            end_idx = i + len(sentinel_ids)
+            if end_idx >= len(all_ids):
+                raise ValueError(
+                    f"No token found after sentinel in template output {all_ids}."
+                )
+            end_of_turn_id: int = all_ids[end_idx]
+            assistant_marker: List[int] = all_ids[len(user_ids) : i]
+            if not assistant_marker:
+                raise ValueError(
+                    f"Assistant marker is empty (user_len={len(user_ids)}, sentinel_pos={i}). "
+                    f"Full sequence: {all_ids}"
+                )
+            return assistant_marker, end_of_turn_id
+
+    raise ValueError(
+        f"Sentinel '{sentinel}' (ids={sentinel_ids}) not found in template output {all_ids}."
+    )
+
+
+def _build_labels_from_markers(
+    input_ids_batch: torch.Tensor,
+    assistant_marker: List[int],
+    stop_id: int,
+) -> torch.Tensor:
+    """Scan ``input_ids`` for ``assistant_marker`` … ``stop_id`` and build labels.
+
+    For each sequence in the batch, every token between the end of an
+    assistant marker and the corresponding ``stop_id`` (inclusive) is copied
+    into the labels tensor; all other positions are set to ``-100``.
+
+    Parameters
+    ----------
+    input_ids_batch:
+        Shape ``(B, L)``.
+    assistant_marker:
+        Token-id sequence that opens an assistant turn (e.g.
+        ``[<|im_start|>, assistant_id, newline_id]`` for Qwen or
+        ``[<start_of_turn>, model_id, newline_id]`` for Gemma4).
+    stop_id:
+        Single token id that closes a turn (e.g. ``<|im_end|>`` or
+        ``<end_of_turn>``).
+    """
     marker_len = len(assistant_marker)
-    marker_tensor = torch.tensor(assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device)
+    marker_tensor = torch.tensor(
+        assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device
+    )
 
     labels_list: List[torch.Tensor] = []
 
@@ -308,17 +372,15 @@ def build_labels_from_template(
         i = 0
 
         while i <= seq_len - marker_len:
-            # Look for the assistant marker pattern.
             if torch.equal(encoded[i : i + marker_len], marker_tensor):
                 content_start = i + marker_len  # first token of assistant content
 
-                # Scan forward to find the closing <|im_end|>.
+                # Scan forward to find the closing stop token.
                 content_end = content_start
                 while content_end < seq_len and encoded[content_end].item() != stop_id:
                     content_end += 1
 
-                # Include the <|im_end|> stop token in labels so the model
-                # learns to emit it.
+                # Include the stop token in labels so the model learns to emit it.
                 if content_end < seq_len:
                     content_end += 1
 
@@ -330,6 +392,75 @@ def build_labels_from_template(
         labels_list.append(labels)
 
     return torch.stack(labels_list)
+
+
+def build_labels_from_template(
+    input_ids_batch: torch.Tensor,
+    conversations: Sequence[Sequence[Dict[str, Any]]],
+    processor,
+) -> torch.Tensor:
+    """Build training labels by scanning ``input_ids`` for chat-template role markers.
+
+    Instead of re-tokenizing assistant text and searching for it (fragile due
+    to BPE context sensitivity), this function locates the structural markers
+    that the chat template inserts around each assistant turn and sets labels
+    only for the content region.
+
+    Two strategies are attempted in order:
+
+    1. **Fast path** (``_IMSTART_TEMPLATE_PROCESSORS``): for Qwen-family models
+       whose tokenizers expose ``<|im_start|>`` / ``<|im_end|>`` via
+       :func:`convert_tokens_to_ids`, the marker ids are resolved directly
+       without applying any dummy conversation.
+
+    2. **General path** (``_derive_turn_markers``): for all other processors
+       (e.g. Gemma4), the assistant-turn markers are derived automatically by
+       applying a minimal dummy conversation that contains a sentinel string.
+       This handles models whose tokenizers do not reliably expose special-token
+       ids via ``convert_tokens_to_ids`` or ``encode``.
+
+    If both strategies fail, the function falls back to the legacy
+    :func:`build_labels` (BPE pattern-matching), which logs a warning because
+    it is sensitive to tokenisation context and may produce ``num_label_tokens=0``
+    / nan loss on some samples.
+    """
+    processor_type = type(processor).__name__
+    tokenizer = getattr(processor, "tokenizer", processor)
+
+    # ------------------------------------------------------------------
+    # Fast path: Qwen-family processors with <|im_start|>/<|im_end|>.
+    # ------------------------------------------------------------------
+    if processor_type in _IMSTART_TEMPLATE_PROCESSORS:
+        assistant_marker = _get_assistant_marker(tokenizer)
+        stop_id = _get_stop_token_id(tokenizer)
+        if assistant_marker is not None and stop_id is not None:
+            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
+        logger.warning(
+            "Processor %s is listed in _IMSTART_TEMPLATE_PROCESSORS but the tokenizer "
+            "does not expose <|im_start|>/<|im_end|>. Trying template-derived markers.",
+            processor_type,
+        )
+
+    # ------------------------------------------------------------------
+    # General path: derive markers from the chat template via sentinel.
+    # Handles Gemma4 and any future model automatically.
+    # ------------------------------------------------------------------
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            assistant_marker, stop_id = _derive_turn_markers(tokenizer)
+            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
+        except Exception as exc:
+            logger.warning(
+                "Processor %s: could not derive turn markers from chat template (%s). "
+                "Falling back to BPE pattern-match labels, which may produce nan loss.",
+                processor_type,
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Last-resort fallback: BPE pattern-matching (fragile).
+    # ------------------------------------------------------------------
+    return build_labels(input_ids_batch, conversations, processor)
 
 
 def phi4_mm_collate_fn(examples, processor):
