@@ -14,8 +14,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from datasets import load_dataset
 import torch
@@ -26,9 +27,93 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     _count_media_per_sample,
     _ensure_rgb,
     _inject_thinking_prefix_tokens,
-    build_labels_from_template,
     mask_fake_vision_tokens_batch,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _build_gemma4_labels_from_template(
+    input_ids_batch: torch.Tensor,
+    processor,
+) -> torch.Tensor:
+    """Build training labels for Gemma4 by scanning token IDs for role markers.
+
+    Gemma4's chat template wraps every assistant turn as:
+        <start_of_turn>model\\n … content … <end_of_turn>
+
+    We locate these markers directly in ``input_ids`` (no re-tokenisation),
+    which avoids the BPE context-sensitivity bugs of the generic
+    ``build_labels`` fallback.
+
+    Labels are set to the real token ids for the **content + <end_of_turn>**
+    region; all other positions are ``-100``.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+
+    # ------------------------------------------------------------------
+    # Resolve the marker token ids once per batch.
+    # <start_of_turn> is a special token → convert_tokens_to_ids is safe.
+    # "model\n" is plain text → encode without special tokens.
+    # ------------------------------------------------------------------
+    try:
+        start_of_turn_id: int = tokenizer.convert_tokens_to_ids("<start_of_turn>")
+        end_of_turn_id: int = tokenizer.convert_tokens_to_ids("<end_of_turn>")
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if start_of_turn_id == unk_id or end_of_turn_id == unk_id:
+            raise ValueError("Gemma4 special tokens not in tokenizer vocab.")
+    except Exception as exc:
+        logger.warning(
+            "_build_gemma4_labels_from_template: failed to resolve special tokens (%s). "
+            "Returning all-(-100) labels for this batch.",
+            exc,
+        )
+        return torch.full_like(input_ids_batch, -100)
+
+    model_nl_ids: List[int] = tokenizer.encode("model\n", add_special_tokens=False)
+    assistant_marker: List[int] = [start_of_turn_id] + model_nl_ids
+    marker_len = len(assistant_marker)
+    marker_tensor = torch.tensor(
+        assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device
+    )
+
+    labels_list: List[torch.Tensor] = []
+
+    for encoded in input_ids_batch:
+        labels = torch.full_like(encoded, -100)
+        seq_len = len(encoded)
+        i = 0
+        num_assistant_turns = 0
+
+        while i <= seq_len - marker_len:
+            if torch.equal(encoded[i : i + marker_len], marker_tensor):
+                content_start = i + marker_len  # first token of assistant content
+
+                # Scan forward to find the closing <end_of_turn>.
+                content_end = content_start
+                while content_end < seq_len and encoded[content_end].item() != end_of_turn_id:
+                    content_end += 1
+
+                # Include the <end_of_turn> stop token so the model learns to emit it.
+                if content_end < seq_len:
+                    content_end += 1
+
+                labels[content_start:content_end] = encoded[content_start:content_end]
+                num_assistant_turns += 1
+                i = content_end
+            else:
+                i += 1
+
+        if num_assistant_turns == 0:
+            logger.warning(
+                "_build_gemma4_labels_from_template: no assistant turn markers found "
+                "in a sequence of length %d. Labels will be all -100 for this sample.",
+                seq_len,
+            )
+
+        labels_list.append(labels)
+
+    return torch.stack(labels_list)
 
 
 def _as_list(path_or_dataset: str | Sequence[str]) -> list[str]:
@@ -162,7 +247,7 @@ def gemma4_prefix_truncating_collate_fn(
     if "pixel_values_videos" in batch:
         batch["pixel_values_videos"] = batch["pixel_values_videos"].to(torch.bfloat16)
 
-    labels = build_labels_from_template(batch["input_ids"], conversations, processor)
+    labels = _build_gemma4_labels_from_template(batch["input_ids"], processor)
     batch["labels"] = labels[:, 1:]
 
     input_shape = batch["input_ids"].shape
