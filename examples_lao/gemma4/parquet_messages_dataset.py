@@ -50,10 +50,18 @@ def _resolve_gemma4_markers(tokenizer):
         ``<start_of_turn>model\\n``).
         ``end_of_turn_id`` is the single token id that closes a turn (106).
     """
+    def _extract_ids(result) -> List[int]:
+        """Handle both plain list and BatchEncoding (UserDict, not dict) returns."""
+        try:
+            return list(result["input_ids"])
+        except (KeyError, TypeError):
+            return list(result)
+
     sentinel = "XSENTINELMARKERX"
     dummy = [{"role": "user", "content": "u"}, {"role": "assistant", "content": sentinel}]
-    result = tokenizer.apply_chat_template(dummy, tokenize=True, add_generation_prompt=False)
-    all_ids: List[int] = result["input_ids"] if isinstance(result, dict) else list(result)
+    all_ids: List[int] = _extract_ids(
+        tokenizer.apply_chat_template(dummy, tokenize=True, add_generation_prompt=False)
+    )
 
     sentinel_ids: List[int] = tokenizer.encode(sentinel, add_special_tokens=False)
 
@@ -67,13 +75,12 @@ def _resolve_gemma4_markers(tokenizer):
             end_of_turn_id: int = all_ids[end_idx]
 
             # Derive the user-turn length so we can slice out the assistant marker
-            user_result = tokenizer.apply_chat_template(
-                [{"role": "user", "content": "u"}],
-                tokenize=True,
-                add_generation_prompt=False,
-            )
-            user_ids: List[int] = (
-                user_result["input_ids"] if isinstance(user_result, dict) else list(user_result)
+            user_ids: List[int] = _extract_ids(
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": "u"}],
+                    tokenize=True,
+                    add_generation_prompt=False,
+                )
             )
             assistant_marker: List[int] = all_ids[len(user_ids) : i]
 
