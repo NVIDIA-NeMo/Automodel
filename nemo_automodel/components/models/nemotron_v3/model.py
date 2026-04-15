@@ -485,8 +485,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         batch_size = input_ids.shape[0]
 
-        # Create cache on first call
-        if past_key_values is None:
+        # Create cache on first call, or replace non-NemotronHybridCache
+        # (transformers v5.5+ GenerationMixin may pre-create a DynamicCache)
+        if past_key_values is None or not isinstance(past_key_values, NemotronHybridCache):
             past_key_values = NemotronHybridCache(self.config, batch_size, self.dtype, self.device)
             # First call: cache_position covers the full prompt
             if cache_position is None:

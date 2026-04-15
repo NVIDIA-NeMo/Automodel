@@ -485,9 +485,15 @@ class Checkpointer:
             device: Target device for materialized parameters.
             peft_init_method: Initialization method for PEFT adapters (e.g. "xavier").
         """
-        to_empty_parameters_only(model, device=device)
+        # Only materialize parameters that are actually on the meta device.
+        # When the caller sets is_meta_device=True but the model was already
+        # constructed on a real device (e.g. ContextManagers was patched to
+        # a no-op), calling to_empty_parameters_only would replace valid
+        # weights with uninitialized CUDA memory.
+        has_meta_params = any(p.device.type == "meta" for p in model.parameters())
+        if has_meta_params:
+            to_empty_parameters_only(model, device=device)
 
-        # to_empty_parameters_only only materializes parameters, not buffers.
         # Buffers (e.g. RoPE inv_freq) may still be on meta device.  Move them
         # to *device* with uninitialized storage so that the subsequent
         # initialize_weights() call can overwrite them with proper values
@@ -580,10 +586,11 @@ class Checkpointer:
             model_name: Name of the model or an absolute path to a snapshot
             load_base_model: If True, restore from HF base checkpoint
         """
+        model_type = getattr(getattr(model, "config", None), "model_type", None)
+
         if load_base_model:
             assert model_name is not None, "model_name is required when loading base model"
             # Get combined key mapping from model attribute and model-type specific conversions
-            model_type = getattr(getattr(model, "config", None), "model_type", None)
             model_key_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
             key_mapping = get_combined_key_mapping(model_type, model_key_mapping)
             # NemotronH remote code (trust_remote_code) uses backbone.* params matching checkpoint keys
@@ -599,7 +606,7 @@ class Checkpointer:
                 key_mapping=key_mapping,
             )
 
-        _reinit_rope_buffers(model, device)
+        _reinit_non_persistent_buffers(model, device, model_type=model_type)
 
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
@@ -1025,18 +1032,48 @@ def _init_peft_adapters(model: nn.Module, peft_init_method: str) -> None:
                 logging.warning(f"Failed to initialize weights for PEFT adapter `{module.__class__.__name__}`: {e}")
 
 
-def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
+_MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
+    {
+        "gemma3",
+        "nemotron-nas",
+    }
+)
+
+
+def _reinit_non_persistent_buffers(model: nn.Module, device: torch.device, model_type: str | None = None) -> None:
     """
-    Recompute non-persistent RoPE ``inv_freq`` buffers for Nemotron-NAS models.
+    Recompute non-persistent buffers that are not saved in checkpoints.
+
+    Non-persistent buffers are not saved in checkpoints, so after meta-device
+    materialization they contain uninitialized CUDA memory.  When
+    ``initialize_weights()`` is skipped (e.g. for Gemma3 to avoid DTensor
+    issues), these buffers must be recomputed explicitly.
+
+    Only runs for models listed in ``_MODELS_REQUIRING_BUFFER_REINIT`` to
+    avoid unexpected side-effects on arbitrary HF Hub models.
+
+    Handles four patterns:
+
+    1. **Standard RoPE** — single ``inv_freq`` buffer with ``rope_init_fn`` +
+       ``rope_kwargs`` (e.g. Nemotron-NAS).
+    2. **Per-layer-type RoPE** — ``{layer_type}_inv_freq`` buffers via
+       ``compute_default_rope_parameters`` (e.g. Gemma3RotaryEmbedding).
+    3. **Scaled embedding** — ``embed_scale`` buffer on ``ScaledWordEmbedding``
+       modules (Gemma family), recomputed from ``scalar_embed_scale``.
+    4. **Vision position IDs** — ``position_ids`` buffer on vision embedding
+       modules (SigLIP), recomputed from ``num_positions``.
+
     Args:
-        model: Model to reinitialize RoPE buffers for.
+        model: Model to reinitialize non-persistent buffers for.
         device: Device to create the new buffers on.
+        model_type: The ``config.model_type`` string.  If not in
+            ``_MODELS_REQUIRING_BUFFER_REINIT`` the function is a no-op.
     """
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type not in ("nemotron-nas",):
+    if model_type not in _MODELS_REQUIRING_BUFFER_REINIT:
         return
 
     for name, module in model.named_modules():
+        # Pattern 1: standard RoPE with rope_init_fn + rope_kwargs (Nemotron-NAS)
         if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq") and hasattr(module, "rope_kwargs"):
             try:
                 inv_freq, _ = module.rope_init_fn(module.config, device, **module.rope_kwargs)
@@ -1046,6 +1083,51 @@ def _reinit_rope_buffers(model: nn.Module, device: torch.device) -> None:
                 logging.debug(f"Reinitialized RoPE inv_freq for {name} on device {device}")
             except Exception as e:
                 logging.warning(f"Failed to reinitialize RoPE inv_freq for {name}: {e}")
+
+        # Pattern 2: per-layer-type RoPE (Gemma3RotaryEmbedding and similar)
+        elif hasattr(module, "layer_types") and hasattr(module, "rope_type") and hasattr(module, "config"):
+            rope_config = getattr(module, "config", None)
+            rope_parameters = getattr(rope_config, "rope_parameters", None)
+            if rope_parameters is None:
+                continue
+            for layer_type in getattr(module, "layer_types", []):
+                inv_freq_attr = f"{layer_type}_inv_freq"
+                if not hasattr(module, inv_freq_attr):
+                    continue
+                try:
+                    rope_init_fn = getattr(module, "compute_default_rope_parameters", None)
+                    if rope_init_fn is None:
+                        continue
+                    rope_type = module.rope_type.get(layer_type, "default")
+                    if rope_type != "default":
+                        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+                        rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+                    curr_inv_freq, curr_attention_scaling = rope_init_fn(rope_config, device, layer_type=layer_type)
+                    setattr(module, inv_freq_attr, curr_inv_freq)
+                    orig_attr = f"{layer_type}_original_inv_freq"
+                    if hasattr(module, orig_attr):
+                        setattr(module, orig_attr, curr_inv_freq.clone())
+                    setattr(module, f"{layer_type}_attention_scaling", curr_attention_scaling)
+                    logging.debug(f"Reinitialized RoPE {inv_freq_attr} for {name} on device {device}")
+                except Exception as e:
+                    logging.warning(f"Failed to reinitialize RoPE {inv_freq_attr} for {name}: {e}")
+
+        # Pattern 3: ScaledWordEmbedding embed_scale (Gemma family)
+        if hasattr(module, "scalar_embed_scale") and "embed_scale" in getattr(module, "_buffers", {}):
+            try:
+                module.embed_scale = torch.tensor(module.scalar_embed_scale, device=device)
+                logging.debug(f"Reinitialized embed_scale={module.scalar_embed_scale} for {name} on device {device}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize embed_scale for {name}: {e}")
+
+        # Pattern 4: Vision embedding position_ids (SigLIP and similar)
+        if hasattr(module, "num_positions") and "position_ids" in getattr(module, "_buffers", {}):
+            try:
+                module.position_ids = torch.arange(module.num_positions, device=device).expand((1, -1))
+                logging.debug(f"Reinitialized position_ids (num_positions={module.num_positions}) for {name}")
+            except Exception as e:
+                logging.warning(f"Failed to reinitialize position_ids for {name}: {e}")
 
 
 def _apply(module, fn, recurse=True) -> nn.Module:
