@@ -40,7 +40,8 @@ except ImportError:
     HF_HUB_CACHE = None
 
 from packaging.version import parse
-from safetensors.torch import load_file, save_file, load as safetensors_load
+from safetensors.torch import load as safetensors_load
+from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
