@@ -50,6 +50,7 @@ ci:
   nodes: 2                        # Optional. SLURM node count (default: 1)
   node_multiplier: true           # Optional. Dynamic node scaling
   local_batch_size: 2             # Optional. Override batch size for CI
+  nproc_per_node: 1               # Optional. GPUs per node, overrides cluster default (CI var: CONFIG_NPROC_PER_NODE)
   vllm_deploy: true               # Optional. Enable vLLM deployment test
   checkpoint_robustness:          # Optional. Enable robustness testing
     hf_kl_threshold: 1e-3

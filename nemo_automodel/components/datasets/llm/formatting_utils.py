@@ -40,6 +40,9 @@ def _resolve_chat_template(chat_template: Optional[str]) -> Optional[str]:
     if chat_template is None:
         return None
 
+    if "{%" in chat_template or "{{" in chat_template:
+        return chat_template
+
     p = Path(chat_template)
     if p.exists():
         content = p.read_text(encoding="utf-8")
