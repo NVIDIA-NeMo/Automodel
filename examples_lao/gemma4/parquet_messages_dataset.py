@@ -57,21 +57,28 @@ def _build_gemma4_labels_from_template(
     # "model\n" is plain text → encode without special tokens.
     # ------------------------------------------------------------------
     try:
-        start_of_turn_id: int = tokenizer.convert_tokens_to_ids("<start_of_turn>")
-        end_of_turn_id: int = tokenizer.convert_tokens_to_ids("<end_of_turn>")
-        unk_id = getattr(tokenizer, "unk_token_id", None)
-        if start_of_turn_id == unk_id or end_of_turn_id == unk_id:
-            raise ValueError("Gemma4 special tokens not in tokenizer vocab.")
+        # Use encode() rather than convert_tokens_to_ids() because Gemma4's
+        # tokenizer stores <start_of_turn>/<end_of_turn> under internal names
+        # that don't match their surface strings, causing convert_tokens_to_ids
+        # to silently return wrong ids (e.g. 3 instead of 105/106).
+        # encode() correctly resolves them as added special tokens.
+        assistant_marker: List[int] = tokenizer.encode(
+            "<start_of_turn>model\n", add_special_tokens=False
+        )
+        end_of_turn_ids: List[int] = tokenizer.encode(
+            "<end_of_turn>", add_special_tokens=False
+        )
+        if not assistant_marker or not end_of_turn_ids:
+            raise ValueError("Empty encoding for Gemma4 turn markers.")
+        end_of_turn_id: int = end_of_turn_ids[0]
     except Exception as exc:
         logger.warning(
-            "_build_gemma4_labels_from_template: failed to resolve special tokens (%s). "
+            "_build_gemma4_labels_from_template: failed to resolve turn markers (%s). "
             "Returning all-(-100) labels for this batch.",
             exc,
         )
         return torch.full_like(input_ids_batch, -100)
 
-    model_nl_ids: List[int] = tokenizer.encode("model\n", add_special_tokens=False)
-    assistant_marker: List[int] = [start_of_turn_id] + model_nl_ids
     marker_len = len(assistant_marker)
     marker_tensor = torch.tensor(
         assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device
