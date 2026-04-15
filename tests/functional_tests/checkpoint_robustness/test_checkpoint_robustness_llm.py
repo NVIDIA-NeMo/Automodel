@@ -247,6 +247,20 @@ def test_checkpoint_robustness():
                     assert "_scales" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
         print(f"[Phantom keys] Scanned {len(sf_files)} files, no _blocks/_scales keys ✓")
 
+    # Pre-populate HF dynamic module cache on rank 0 to prevent filesystem races
+    # when all ranks simultaneously load trust_remote_code models from local paths.
+    # On shared filesystems (e.g. Lustre), concurrent shutil.copy2 calls from
+    # multiple ranks cause PermissionError.
+    if not is_peft:
+        if _rank0():
+            from transformers import AutoConfig
+
+            try:
+                AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
+            except Exception:
+                pass
+        _barrier()
+
     cfg = parse_args_and_load_config()
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
