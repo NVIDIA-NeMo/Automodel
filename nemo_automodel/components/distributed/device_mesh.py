@@ -35,12 +35,12 @@ from typing import Optional, Tuple, Union
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
-from nemo_automodel.components.distributed.mesh_utils import _unflatten_compat
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     FSDP2Config,
     MegatronFSDPConfig,
 )
+from nemo_automodel.components.distributed.mesh_utils import _unflatten_compat
 
 
 def create_device_mesh(
