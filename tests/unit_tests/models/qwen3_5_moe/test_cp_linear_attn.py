@@ -257,19 +257,19 @@ class TestRedoAttentionLoadBalancing:
 
 
 class TestForwardFastPath:
-    def test_no_cp_mesh_delegates_to_super(self, module, device):
-        """When _cp_mesh is None, forward should delegate to the HF parent class."""
+    def test_no_cp_mesh_delegates_to_forward_no_cp(self, module, device):
+        """When _cp_mesh is None, forward should delegate to _forward_no_cp."""
         assert module._cp_mesh is None
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
         with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+            module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)
+        ) as mock_no_cp_fwd:
             module.forward(hidden)
-            mock_super_fwd.assert_called_once()
+            mock_no_cp_fwd.assert_called_once()
 
-    def test_cp_mesh_size_1_delegates_to_super(self, module, device):
-        """When _cp_mesh.size() == 1, forward should delegate to the HF parent class."""
+    def test_cp_mesh_size_1_delegates_to_forward_no_cp(self, module, device):
+        """When _cp_mesh.size() == 1, forward should delegate to _forward_no_cp."""
         mesh = MagicMock()
         mesh.size.return_value = 1
         module._cp_mesh = mesh
@@ -277,10 +277,10 @@ class TestForwardFastPath:
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
         with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+            module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)
+        ) as mock_no_cp_fwd:
             module.forward(hidden)
-            mock_super_fwd.assert_called_once()
+            mock_no_cp_fwd.assert_called_once()
 
     def test_no_cp_does_not_forward_cache_position(self, module, device):
         """cache_position should not be forwarded to super (removed in transformers>=5.5)."""
