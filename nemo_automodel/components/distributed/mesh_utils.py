@@ -230,7 +230,7 @@ def _create_fsdp2_device_mesh(
     _dp_flat = device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
     _dp_shard_cp_flat = device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
     _dp_cp_flat = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
-    if not hasattr(device_mesh, '_flatten_mapping'):
+    if not hasattr(device_mesh, "_flatten_mapping"):
         device_mesh._flatten_mapping = {}
     device_mesh._flatten_mapping.setdefault(MeshAxisName.DP, _dp_flat)
     device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_SHARD_CP, _dp_shard_cp_flat)
@@ -307,7 +307,7 @@ def _create_megatron_fsdp_device_mesh(
     # Flatten dp+cp if cp > 1
     if cp_size > 1:
         _dp_cp_flat = device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
-        if not hasattr(device_mesh, '_flatten_mapping'):
+        if not hasattr(device_mesh, "_flatten_mapping"):
             device_mesh._flatten_mapping = {}
         device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
@@ -322,7 +322,7 @@ def _unflatten_compat(flat_mesh: "DeviceMesh", dim: int, sizes: tuple, names: tu
     """
     from torch.distributed.device_mesh import DeviceMesh
 
-    if hasattr(flat_mesh, '_unflatten'):
+    if hasattr(flat_mesh, "_unflatten"):
         return flat_mesh._unflatten(dim, sizes, names)
     # PyTorch 2.9.x fallback: reshape the underlying rank tensor directly.
     new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
@@ -342,11 +342,11 @@ def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
     if name in device_mesh.mesh_dim_names:
         return device_mesh[name]
     # _get_root_mesh() was added in PyTorch 2.10; fall back for 2.9.x.
-    if hasattr(device_mesh, '_get_root_mesh'):
+    if hasattr(device_mesh, "_get_root_mesh"):
         root = device_mesh._get_root_mesh()
     else:
         root = device_mesh
-    if hasattr(root, '_flatten_mapping') and name in root._flatten_mapping:
+    if hasattr(root, "_flatten_mapping") and name in root._flatten_mapping:
         return root._flatten_mapping[name]
     raise KeyError(
         f"Mesh dim {name!r} not found in mesh_dim_names {device_mesh.mesh_dim_names} "
@@ -382,12 +382,12 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
 
     sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
     target = prod(sizes)
-    if hasattr(device_mesh, '_get_root_mesh'):
+    if hasattr(device_mesh, "_get_root_mesh"):
         root = device_mesh._get_root_mesh()
     else:
         root = device_mesh
 
-    for fm in getattr(root, '_flatten_mapping', {}).values():
+    for fm in getattr(root, "_flatten_mapping", {}).values():
         if fm.size() != target:
             continue
         try:
