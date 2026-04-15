@@ -33,6 +33,65 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_gemma4_markers(tokenizer):
+    """Derive the assistant-turn marker IDs and end-of-turn ID from a live
+    chat-template application.
+
+    This avoids relying on ``convert_tokens_to_ids`` or ``encode``, both of
+    which can return wrong results for Gemma4 special tokens because the
+    tokenizer stores them under internal names that don't match their surface
+    strings (e.g. ``<start_of_turn>`` → 3 instead of 105).
+
+    Returns
+    -------
+    (assistant_marker, end_of_turn_id)
+        ``assistant_marker`` is the list of token ids that immediately precede
+        the assistant's content (e.g. ``[105, 4368, 107]`` for
+        ``<start_of_turn>model\\n``).
+        ``end_of_turn_id`` is the single token id that closes a turn (106).
+    """
+    sentinel = "XSENTINELMARKERX"
+    dummy = [{"role": "user", "content": "u"}, {"role": "assistant", "content": sentinel}]
+    result = tokenizer.apply_chat_template(dummy, tokenize=True, add_generation_prompt=False)
+    all_ids: List[int] = result["input_ids"] if isinstance(result, dict) else list(result)
+
+    sentinel_ids: List[int] = tokenizer.encode(sentinel, add_special_tokens=False)
+
+    # Locate the sentinel inside all_ids
+    for i in range(len(all_ids) - len(sentinel_ids) + 1):
+        if all_ids[i : i + len(sentinel_ids)] == sentinel_ids:
+            # Token immediately after sentinel should be <end_of_turn>
+            end_idx = i + len(sentinel_ids)
+            if end_idx >= len(all_ids):
+                raise ValueError("No token found after sentinel – cannot determine end_of_turn_id.")
+            end_of_turn_id: int = all_ids[end_idx]
+
+            # Derive the user-turn length so we can slice out the assistant marker
+            user_result = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "u"}],
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+            user_ids: List[int] = (
+                user_result["input_ids"] if isinstance(user_result, dict) else list(user_result)
+            )
+            assistant_marker: List[int] = all_ids[len(user_ids) : i]
+
+            if not assistant_marker:
+                raise ValueError("Assistant marker is empty – template layout unexpected.")
+
+            logger.debug(
+                "_resolve_gemma4_markers: marker=%s end_of_turn_id=%d",
+                assistant_marker,
+                end_of_turn_id,
+            )
+            return assistant_marker, end_of_turn_id
+
+    raise ValueError(
+        f"Sentinel '{sentinel}' (ids={sentinel_ids}) not found in template output {all_ids}."
+    )
+
+
 def _build_gemma4_labels_from_template(
     input_ids_batch: torch.Tensor,
     processor,
@@ -57,20 +116,7 @@ def _build_gemma4_labels_from_template(
     # "model\n" is plain text → encode without special tokens.
     # ------------------------------------------------------------------
     try:
-        # Use encode() rather than convert_tokens_to_ids() because Gemma4's
-        # tokenizer stores <start_of_turn>/<end_of_turn> under internal names
-        # that don't match their surface strings, causing convert_tokens_to_ids
-        # to silently return wrong ids (e.g. 3 instead of 105/106).
-        # encode() correctly resolves them as added special tokens.
-        assistant_marker: List[int] = tokenizer.encode(
-            "<start_of_turn>model\n", add_special_tokens=False
-        )
-        end_of_turn_ids: List[int] = tokenizer.encode(
-            "<end_of_turn>", add_special_tokens=False
-        )
-        if not assistant_marker or not end_of_turn_ids:
-            raise ValueError("Empty encoding for Gemma4 turn markers.")
-        end_of_turn_id: int = end_of_turn_ids[0]
+        assistant_marker, end_of_turn_id = _resolve_gemma4_markers(tokenizer)
     except Exception as exc:
         logger.warning(
             "_build_gemma4_labels_from_template: failed to resolve turn markers (%s). "
