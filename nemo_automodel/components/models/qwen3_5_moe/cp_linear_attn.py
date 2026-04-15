@@ -208,7 +208,6 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             return self._forward_no_cp(
                 hidden_states,
                 cache_params=cache_params,
-                cache_position=cache_position,
                 attention_mask=attention_mask,
             )
 
