@@ -289,7 +289,7 @@ def test_checkpoint_robustness():
         from transformers import AutoModelForCausalLM
 
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
-        if experts_implementation:
+        if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
         if hf_device_map_auto:
