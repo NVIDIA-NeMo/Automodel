@@ -563,6 +563,7 @@ def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkey
 
     assert captured_kwargs.get("max_length") == 512
     assert captured_kwargs.get("padding") == "max_length"
+    assert captured_kwargs.get("truncation") is True
 
 
 def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
