@@ -147,8 +147,10 @@ def gemma4_prefix_truncating_collate_fn(
 
     # Drop samples whose assistant response was fully truncated (all labels == -100).
     # This prevents nan loss / zero grad_norm when max_length cuts off the response.
+    # Guard: only filter if at least one valid sample remains; otherwise keep the
+    # whole batch as-is (a single nan step is safer than an empty-tensor crash).
     valid = (batch["labels"] != -100).any(dim=-1)  # [B]
-    if not valid.all():
+    if valid.any() and not valid.all():
         for key in list(batch.keys()):
             val = batch[key]
             if isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[0] == valid.shape[0]:
