@@ -84,7 +84,7 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:gemma4_prefix_truncating_collate_fn
-    max_length: 512
+    max_length: 4096
 
 optimizer:
   _target_: torch.optim.AdamW
