@@ -794,6 +794,9 @@ def kimi_k25_vl_collate_fn(
                 all_grid_thws.append(grid_thws)
                 if "pixel_values" in sample_batch:
                     all_pixel_values.append(sample_batch["pixel_values"])
+            else:
+                # Replace orphaned image tokens so the model doesn't look for missing pixel data
+                input_ids = input_ids.masked_fill(input_ids == media_token_id, pad_token_id)
         elif "pixel_values" in sample_batch:
             all_pixel_values.append(sample_batch["pixel_values"])
 

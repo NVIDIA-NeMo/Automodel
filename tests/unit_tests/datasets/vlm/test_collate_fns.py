@@ -1145,6 +1145,61 @@ def test_kimi_k25_vl_collate_fn_no_drop_preserves_batch_size(collate_mod, monkey
     assert batch["input_ids"].shape[1] == 19
 
 
+def test_kimi_k25_vl_collate_fn_truncation_drops_image_data(collate_mod, monkeypatch):
+    """Test that truncation into image region drops pixel_values/grid_thws and replaces orphaned tokens."""
+    MEDIA_TOKEN_ID = 163605
+    PAD_TOKEN_ID = 0
+
+    class ImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=PAD_TOKEN_ID)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            # 5 text tokens + 1 image placeholder = 6 tokens pre-expansion
+            input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            # grid_thws: t=1, h=8, w=8 → (8//2)*(8//2) = 16 expanded image tokens
+            # Post-expansion: 5 text + 16 image = 21 tokens
+            grid_thws = torch.tensor([[1, 8, 8]])
+            pixel_values = torch.randn(1, 3, 64, 64)
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "grid_thws": grid_thws,
+                "pixel_values": pixel_values,
+            }
+
+    processor = ImageProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "image", "image": "test.jpg"}, {"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # max_length=15 < 21 post-expansion tokens → truncation cuts into image region
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=15)
+
+    # Sample should be kept (not dropped) but image data excluded
+    assert batch["input_ids"].shape[0] == 1
+    # No pixel_values or grid_thws since image was partially truncated
+    assert "pixel_values" not in batch
+    assert "grid_thws" not in batch
+    assert "image_grid_hws" not in batch
+    # Orphaned image tokens should be replaced with pad_token_id
+    assert (batch["input_ids"] == MEDIA_TOKEN_ID).sum().item() == 0
+
+
 def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
     """Test kimi_k25_vl_collate_fn handles multiple examples with padding."""
     # Processor that produces variable length sequences
