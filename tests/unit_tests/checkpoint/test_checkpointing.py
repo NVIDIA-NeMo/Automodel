@@ -157,7 +157,7 @@ class TestReinitRopeBuffers:
         original_inv_freq = rope.inv_freq.clone()
         model.rope = rope
 
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="llama")
 
         assert torch.equal(model.rope.inv_freq, original_inv_freq)
 
@@ -184,7 +184,7 @@ class TestReinitRopeBuffers:
         real_model.config = config
         # We need to mock named_modules to return our mock rope
         with patch.object(real_model, "named_modules", return_value=[("", real_model), ("layers.0.rotary", rope)]):
-            _reinit_non_persistent_buffers(real_model, torch.device("cpu"))
+            _reinit_non_persistent_buffers(real_model, torch.device("cpu"), model_type="nemotron-nas")
 
         rope.rope_init_fn.assert_called_once_with(rope.config, torch.device("cpu"), seq_len=128)
         assert rope.inv_freq is new_inv_freq
@@ -206,7 +206,7 @@ class TestReinitRopeBuffers:
         rope.original_inv_freq = torch.zeros(3)
 
         with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
-            _reinit_non_persistent_buffers(model, torch.device("cpu"))
+            _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
 
         assert rope.inv_freq is new_inv_freq
         # original_inv_freq should be a clone of new_inv_freq
@@ -223,14 +223,14 @@ class TestReinitRopeBuffers:
         model.layer = torch.nn.Linear(4, 4)
 
         # Should not raise
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
 
     def test_no_config_returns_early(self):
         """Model without config attribute returns early."""
         model = torch.nn.Module()
 
-        # Should not raise
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        # Should not raise — model_type=None is not in the allowlist
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type=None)
 
     def test_rope_init_fn_failure_logs_warning(self):
         """If rope_init_fn raises, a warning is logged and other modules continue."""
@@ -247,7 +247,7 @@ class TestReinitRopeBuffers:
 
         with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
             # Should not raise, just log a warning
-            _reinit_non_persistent_buffers(model, torch.device("cpu"))
+            _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
 
     def test_embed_scale_reinitialized_from_scalar(self):
         """ScaledWordEmbedding embed_scale buffer is recomputed from scalar_embed_scale."""
@@ -257,7 +257,7 @@ class TestReinitRopeBuffers:
         emb.register_buffer("embed_scale", torch.tensor(float("nan")), persistent=False)
         model.embed_tokens = emb
 
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
 
         assert emb.embed_scale.item() == 48.0
 
@@ -268,7 +268,7 @@ class TestReinitRopeBuffers:
         emb.register_buffer("embed_scale", torch.tensor(float("nan")), persistent=False)
         model.embed_tokens = emb
 
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
 
         # embed_scale should remain NaN because there's no scalar_embed_scale to recover from
         assert torch.isnan(emb.embed_scale)
@@ -281,7 +281,7 @@ class TestReinitRopeBuffers:
         vis_emb.register_buffer("position_ids", torch.full((1, 16), 999999, dtype=torch.long), persistent=False)
         model.vision_embeddings = vis_emb
 
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
 
         expected = torch.arange(16).expand((1, -1))
         assert torch.equal(vis_emb.position_ids, expected)
@@ -294,7 +294,7 @@ class TestReinitRopeBuffers:
         vis_emb.register_buffer("position_ids", garbage.clone(), persistent=False)
         model.vision_embeddings = vis_emb
 
-        _reinit_non_persistent_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
 
         assert torch.equal(vis_emb.position_ids, garbage)
 
@@ -744,11 +744,12 @@ class TestCheckpointerSaveModelDiffusersRename:
         return checkpointer
 
     @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf", side_effect=lambda *a, **kw: a[1])
+    @patch(
+        "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+        side_effect=lambda *a, **kw: a[1],
+    )
     @patch("torch.distributed.is_initialized", return_value=False)
-    def test_save_model_renames_index_on_all_ranks_path(
-        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
-    ):
+    def test_save_model_renames_index_on_all_ranks_path(self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path):
         weights_path = tmp_path / "step_100"
         consolidated_dir = weights_path / "model" / "consolidated"
 
@@ -772,7 +773,10 @@ class TestCheckpointerSaveModelDiffusersRename:
         assert (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
 
     @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
-    @patch("nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf", side_effect=lambda *a, **kw: a[1])
+    @patch(
+        "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+        side_effect=lambda *a, **kw: a[1],
+    )
     @patch("torch.distributed.is_initialized", return_value=False)
     def test_save_model_preserves_index_when_not_diffusers_compatible(
         self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
