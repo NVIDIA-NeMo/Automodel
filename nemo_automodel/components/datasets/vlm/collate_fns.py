@@ -783,9 +783,18 @@ def kimi_k25_vl_collate_fn(
 
         kept_conversations.append(conversation)
 
+        # Only include image data if all expanded image tokens survived truncation.
+        # Partial truncation into image regions would cause a mismatch in the model forward.
         if grid_thws is not None:
-            all_grid_thws.append(grid_thws)
-        if "pixel_values" in sample_batch:
+            t, h, w = grid_thws[0].tolist()
+            merge_h, merge_w = 2, 2
+            expected_image_tokens = int((h // merge_h) * (w // merge_w))
+            actual_image_tokens = (input_ids == media_token_id).sum().item()
+            if actual_image_tokens == expected_image_tokens:
+                all_grid_thws.append(grid_thws)
+                if "pixel_values" in sample_batch:
+                    all_pixel_values.append(sample_batch["pixel_values"])
+        elif "pixel_values" in sample_batch:
             all_pixel_values.append(sample_batch["pixel_values"])
 
         all_expanded.append(
