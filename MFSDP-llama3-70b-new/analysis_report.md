@@ -126,22 +126,41 @@ Both DP=64, same message sizes (~27 MB per call), same RING_LL kernel, same call
 
 ## 4. GEMM Analysis
 
-### Per-Kernel Breakdown (per iteration = raw ÷ 2)
+Normalized to **per-GA-step** (n_ga=4: 2 iters × 2 ga_steps each). MFSDP window = full 2-iter kernel span; FSDP2 window = `iteration_7_ga_step_0` through end of `iteration_8_ga_step_1` (correctly deduplicated for 8 on-node ranks).
 
-| Kernel | MFSDP /iter | MFSDP avg µs | FSDP2 /iter | FSDP2 avg µs | Notes |
+> **Context: fused vs. separate projections.** MFSDP fuses Q+K+V into one weight matrix and gate+up into one — producing fewer, larger GEMMs. FSDP2 keeps all 7 projections separate — producing more, smaller GEMMs. This makes a total-count comparison misleading; per-shape analysis below identifies which kernels are truly comparable.
+
+### Per-Shape Side-by-Side (per GA-step)
+
+| Kernel (shortened) | MFSDP cnt/GA | MFSDP avg µs | MFSDP ms/GA | FSDP2 cnt/GA | FSDP2 avg µs | FSDP2 ms/GA | Δ avg | Notes |
+|---|---|---|---|---|---|---|---|---|
+| `tst_320x128_TNT` | **321** | 3,929 | 1,261 | **321** | 3,013 | 967 | **FSDP2 −23%** | Same count → direct comparison; FSDP2 faster due to less AG-ring bimodal degradation |
+| `tst_256x128_NNT` | 241 | 2,954 | 712 | 481 | 1,370 | 659 | FSDP2 −54%/call | 2× count in FSDP2 (sep. k/v or sep. gate/up); total −7% |
+| `tst_256x128_TNT` | 320 | 2,089 | 668 | 640 | 739 | 473 | FSDP2 −65%/call | 2× count in FSDP2; total −29% |
+| `tss_192x192_NTN` (MFSDP) → `tst_192x192_NTN` (FSDP2) | **161** | 3,618 | 583 | **161** | 3,038 | 489 | **FSDP2 −16%** | Same count → direct comparison; tss vs tst variant |
+| `tss_192x192_NTN` v2 (MFSDP) → `tst_192x192_NTN` v2 (FSDP2) | **80** | 3,448 | 276 | **80** | 3,167 | 253 | **FSDP2 −8%** | Same count; tss vs tst variant |
+| `tst_320x128_NNT` | **80** | 2,962 | 237 | **80** | 3,139 | 251 | MFSDP −6% | Same count; sole kernel where MFSDP wins |
+| `tst_320x128_NTT` | 80 (`tss`) | 893 | 72 | 160 | 866 | 139 | Tie/call | 2× count in FSDP2; small overhead |
+| `tst_256x128_NTT` | 0 | — | 0 | 160 | 115 | 18 | FSDP2 only | New in FSDP2; negligible |
+| **Total GEMM** | **1,283** | | **3,808** | **2,083** | | **3,250** | **FSDP2 −14.7%** | |
+
+### Kernels with Same Count: Direct Apples-to-Apples
+
+The most meaningful comparison is kernels with equal count per-GA-step — same operation, same matrix shape, different framework:
+
+| Shape | cnt/GA (both) | MFSDP µs | FSDP2 µs | Gap | Root cause |
 |---|---|---|---|---|---|
-| `tst_320x128_64x3 TNT` | 642 | **3,929** | 642 | **3,013** | Same count; MFSDP **30% slower** — AG interference |
-| `tst_256x128_64x4 NNT` | 482 | 2,954 | 962 | 1,370 | 2× more in FSDP2 (sep. Q/K/V and gate/up) |
-| `tss_192x192_64x3 NTN` (MFSDP) / `tst_192x192` (FSDP2) | 322 | **3,618** | 322 | **3,038** | MFSDP **19% slower** — tss vs tst variant |
-| `tst_256x128_64x4 TNT` | 640 | 2,089 | 1,280 | 739 | 2× more in FSDP2 |
-| `tss_192x192 v NTN` / `tst_192x192 v` | 160 | 3,448 | 160 | 3,167 | MFSDP **9% slower** — tss vs tst |
-| `tst_320x128_64x3 NNT` | 160 | 2,962 | 160 | 3,139 | Tie (slight FSDP2 disadvantage) |
+| `tst_320x128_TNT` | 321 | 3,929 | 3,013 | **FSDP2 −23%** | AG-interference bimodal (MFSDP GEMMs launch during peak ring traffic) |
+| `tst_192x192_NTN` (×2 variants) | 241 total | 3,568 avg | 3,066 avg | **FSDP2 −14%** | `tss` (MFSDP) vs `tst` (FSDP2) — TMA epilogue 14% faster |
+| `tst_320x128_NNT` | 80 | 2,962 | 3,139 | MFSDP −6% | Only shape MFSDP wins; likely cluster noise |
 
-Two root causes for MFSDP's 15% higher total GEMM time:
+Two root causes for MFSDP's 14.7% higher total GEMM time:
 
-**1 — AllGather interference (bimodal timing).** `tst_320x128_TNT` with same count (642/iter) and same grid dimensions shows MFSDP avg 3,929 µs vs FSDP2 3,013 µs (**30% gap**). Confirmed cause: GEMMs launching during peak 64-GPU ring traffic take ~5× longer (~5,400 µs) than GEMMs launching early in the AG lifecycle (~1,100 µs). The bimodal average elevates MFSDP's GEMM total. FSDP2's prefetch scheduling causes GEMMs to more often start before peak ring contention.
+**1 — AllGather interference (bimodal timing).** `tst_320x128_TNT` with same count (321/GA) and same grid dimensions shows MFSDP avg 3,929 µs vs FSDP2 3,013 µs (**23% gap**). GEMMs launching during peak 64-GPU ring traffic take ~5× longer than those launching early in the AG lifecycle. FSDP2's `fsdp2_forward_prefetch_depth=1` schedules GEMMs before ring contention peaks; MFSDP's flat-buffer AG/GEMM scheduling has more overlap at peak traffic.
 
-**2 — tss vs tst variant.** MFSDP autotuner selects `tss` (shared-memory epilogue) for 192×192 shapes while FSDP2 selects `tst` (TMA epilogue). `tst` is 9–19% faster. Grid dimensions are identical (same matrix shapes) — the variant difference is autotuner state, likely influenced by AG interference during MFSDP's autotuning phase.
+**2 — tss vs tst variant.** MFSDP autotuner selects `tss` (shared-memory epilogue) for 192×192 shapes while FSDP2 selects `tst` (TMA epilogue). `tst` is 8–16% faster for this shape. Grid dimensions are identical — the variant difference is autotuner choice, likely biased by AG interference during MFSDP's initial autotuning.
+
+**3 — Fused vs. separate projection split.** FSDP2's separate k/v and gate/up produce 2× calls per GA-step but each call is 54–65% shorter (smaller N dimension → shorter per-call latency, lower peak-traffic exposure). Total for these shapes: FSDP2 is 7–29% faster despite 2× call count.
 
 ---
 
