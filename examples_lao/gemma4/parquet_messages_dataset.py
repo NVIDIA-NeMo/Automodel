@@ -69,6 +69,19 @@ def _to_conversation(example: dict) -> dict:
     return {"conversation": conversation}
 
 
+def _is_valid_sample(example: dict) -> bool:
+    """Return True only if the sample has at least one non-empty assistant turn."""
+    msgs = example.get("messages")
+    if not isinstance(msgs, list):
+        return False
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and str(msg.get("content") or "").strip():
+            return True
+    return False
+
+
 def make_parquet_messages_dataset(
     path_or_dataset,
     split: str = "train",
@@ -83,6 +96,9 @@ def make_parquet_messages_dataset(
     and `gemma4_prefix_collate_fn`, i.e. each sample is a dict with a
     `conversation` field containing OpenAI-style role/content messages rendered
     as text-only multimodal parts.
+
+    Samples without a valid (non-empty) assistant turn are filtered out before
+    conversion to avoid nan loss during training.
     """
 
     data_files = _as_list(path_or_dataset)
@@ -91,6 +107,16 @@ def make_parquet_messages_dataset(
         raise FileNotFoundError(f"Missing parquet file(s): {missing}")
 
     dataset = load_dataset("parquet", data_files=data_files, split=split)
+
+    # Filter out samples with no assistant turn or empty assistant response
+    before = len(dataset)
+    dataset = dataset.filter(_is_valid_sample)
+    dropped = before - len(dataset)
+    if dropped:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Filtered {dropped}/{before} samples with missing or empty assistant turns."
+        )
 
     if shuffle_seed is not None:
         dataset = dataset.shuffle(seed=shuffle_seed)
