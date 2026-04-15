@@ -261,23 +261,26 @@ concurrent NCCL streams.
 Source: `analyze_comm_compute_overlap.py`, 3-bucket decomposition over the profiling window.
 Denominator: merged comm wall time (union of intervals when the collective is running).
 
+All values normalized per step (MFSDP window ÷2, FSDP2 window ÷1.5). Note: comm wall time is the
+merged wall-clock span of collective intervals (including idle gaps between calls), so it differs from
+kernel execution time in §4.3 — see observation 3 below.
+
 | Bucket | MFSDP AG | FSDP2 AG | MFSDP RS | FSDP2 RS |
 |---|---|---|---|---|
-| Comm wall time (window) | 7,571ms | ~6,710ms | 9,347ms | ~5,791ms |
+| Comm wall time/step | 3,786ms | 4,473ms | 4,674ms | 3,861ms |
 | **A. Hidden by GEMM + attn** | 83.5% | 82.4% | 89.9% | 84.3% |
 | **B. Hidden by norm / rope / elem** | 7.7% | 11.2% | 4.8% | 12.6% |
-| **C. Truly exposed** | **8.8% (668ms)** | **6.4% (432ms)** | **5.3% (496ms)** | **3.1% (181ms)** |
-| **Total hidden (A+B)** | 91.2% | 93.6% | 94.7% | 96.9% | |
+| **C. Truly exposed** | **8.8% (334ms)** | **6.4% (288ms)** | **5.3% (248ms)** | **3.1% (121ms)** |
+| **Total hidden (A+B)** | 91.2% | 93.6% | 94.7% | 96.9% |
 
-**Total truly exposed comm per profiling window:**
+**Total truly exposed comm per step:**
 
 | | MFSDP | FSDP2 |
 |---|---|---|
-| AG exposed | 668ms | 432ms |
-| RS exposed | 496ms | 181ms |
-| **Total exposed** | **1,164ms** | **613ms** |
-| Per step (÷n_iters) | ~582ms | ~409ms |
-| **Difference/step** | | **+173ms more exposed in MFSDP** |
+| AG exposed | 334ms | 288ms |
+| RS exposed | 248ms | 121ms |
+| **Total exposed** | **582ms** | **409ms** |
+| **Difference** | | **+173ms more exposed in MFSDP** |
 
 **Key observations:**
 
@@ -288,9 +291,10 @@ Denominator: merged comm wall time (union of intervals when the collective is ru
    11.2% of AG and 12.6% of RS, vs MFSDP's 7.7% and 4.8%. FSDP2 schedules more lightweight ops
    concurrent with comm, filling gaps that MFSDP leaves exposed.
 
-3. **MFSDP RS has larger wall time** (9,347ms vs 5,791ms over the window) despite nearly identical
-   kernel durations per call. This suggests MFSDP RS calls are more spaced out in wall time (lower
-   packing density), leaving more gaps between RS kernels that appear as exposed comm.
+3. **Comm wall time vs kernel time (§4.3)**: FSDP2 AG wall time (4,473ms/step) is larger than its
+   kernel time (3,309ms/step) because prefetch scheduling spreads AG calls over a longer wall-clock
+   window. MFSDP RS wall time (4,674ms/step) exceeds its kernel time (3,524ms/step) because RS calls
+   are gated by gradient availability and spaced apart by BWD GEMM between layers.
 
 4. **The 173ms/step extra exposed comm in MFSDP accounts for ~56% of the 307ms wall-time gap**
    (8,931ms − 8,624ms). Combined with the GEMM `tss` vs `tst` penalty (~175ms/step), these two
