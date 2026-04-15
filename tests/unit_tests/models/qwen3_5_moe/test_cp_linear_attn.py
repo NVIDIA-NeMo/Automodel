@@ -282,6 +282,19 @@ class TestForwardFastPath:
             module.forward(hidden)
             mock_no_cp_fwd.assert_called_once()
 
+    def test_no_cp_does_not_forward_cache_position(self, module, device):
+        """cache_position should not be forwarded to super (removed in transformers>=5.5)."""
+        assert module._cp_mesh is None
+        B, S, D = 1, 8, module.hidden_size
+        hidden = torch.randn(B, S, D, device=device)
+        with patch.object(
+            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
+        ) as mock_super_fwd:
+            module.forward(hidden, cache_position=torch.arange(S, device=device))
+            mock_super_fwd.assert_called_once()
+            _, kwargs = mock_super_fwd.call_args
+            assert "cache_position" not in kwargs
+
     def test_cp_mesh_gt_1_calls_forward_with_cp(self, module, device):
         """When _cp_mesh.size() > 1, forward should call _forward_with_cp."""
         mesh = MagicMock()
