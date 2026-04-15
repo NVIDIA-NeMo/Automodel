@@ -248,7 +248,7 @@ NanoGPT Pretraining <guides/llm/nanogpt-pretraining.md>
 Sequence Classification <guides/llm/sequence-classification.md>
 Gemma 3 / 3n <guides/omni/gemma3-3n.md>
 Gemma 4 <guides/vlm/gemma4.md>
-Qwen3.5-VL <guides/vlm/qwen3_5.md>
+Qwen3.5-VL <guides/vlm/qwen3-5.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 QAT <guides/quantization-aware-training.md>
 Databricks <guides/llm/databricks.md>
