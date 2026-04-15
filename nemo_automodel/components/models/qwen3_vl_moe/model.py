@@ -228,13 +228,15 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
 
             # Compute mRoPE position_ids if not pre-computed
             if position_ids is None:
+                mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
                 attention_mask_tensor = (
                     attention_mask if not isinstance(attention_mask, dict) else attention_mask.get("full_attention")
                 )
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids,
-                    image_grid_thw,
-                    video_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
                     attention_mask=attention_mask_tensor,
                 )
                 self.rope_deltas = rope_deltas
