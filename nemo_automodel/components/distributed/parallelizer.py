@@ -47,7 +47,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 
-from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh, get_submesh
+from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
 
 def _is_transformers_v5_or_higher() -> bool:
