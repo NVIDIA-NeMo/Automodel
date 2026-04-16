@@ -16,8 +16,20 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import sys
+import warnings
 from types import ModuleType
 from typing import Any
+
+# Pydantic v2 emits UnsupportedFieldAttributeWarning for Field(repr=...) /
+# Field(frozen=...) used inside 3.12-style `type` aliases in third-party libs.
+# Suppress early so any later import that triggers pydantic schema generation
+# (e.g. transformers, huggingface_hub) won't emit these warnings.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
 
 from .package_info import __package_name__, __version__
 
