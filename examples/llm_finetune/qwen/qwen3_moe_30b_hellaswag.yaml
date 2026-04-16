@@ -11,7 +11,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 1024
-  local_batch_size: 128
+  local_batch_size: 64
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
@@ -46,6 +46,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_sft
   model_save_format: safetensors
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -90,6 +91,7 @@ optimizer:
   eps: 1e-8
 
 ci:
+  recipe_owner: hemildesai
   time: "00:15:00"
   checkpoint_robustness:
     hf_kl_threshold: 1e-4

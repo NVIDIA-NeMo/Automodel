@@ -82,7 +82,7 @@ dependencies = [
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers>=5.3.0,<5.4.0",
+    "transformers==5.5.0",
     "wandb",
     "torchao",
     "mlflow",
@@ -128,7 +128,7 @@ moe = [
 vlm = [
     "albumentations",
     "backoff",
-    "mistral_common[opencv]>=1.9.0",
+    "mistral_common[opencv]>=1.11.0",
     "numpy",
     "numba",
     "open-clip-torch",
@@ -211,7 +211,7 @@ constraint-dependencies = [
     "mlflow>=3.11.1", # Address CVE (no fix available, pinning to latest)
     "tornado>=6.5.5",
     "onnx>=1.21.0",
-    "pyjwt>=2.10.1",
+    "pyjwt>=2.12.0",
     "pytest>=8.4.3",
     "pygments>=2.20.0",
 ]
