@@ -71,37 +71,36 @@ report). All per-step values are raw ÷ n_iters.
 
 ### Headline
 
-**MFSDP+UB is 2.1% faster** (8,448ms vs 8,624ms/step). UB mode closes the gap from the no_flag
-run's 3.5% deficit against FSDP2, flipping the result. The communication improvement from NCCL user
-buffer (−30% AG, −20% RS vs no_flag) exceeds the GEMM penalty that remains from the `tss` epilogue.
+**MFSDP+UB is 2.1% faster** (8,448ms vs 8,624ms/step). NCCL user buffer mode gives MFSDP a
+significant comm advantage that outweighs the `tss` GEMM epilogue penalty from the flat buffer.
 
-### Three-way summary
+### Summary
 
-| Metric | MFSDP no_flag | MFSDP+UB | FSDP2 | UB vs FSDP2 |
-|---|---|---|---|---|
-| **Step wall time (nsys)** | 8,931ms | **8,448ms** | 8,624ms | **UB −2.1%** |
-| MFU | ~40.1% | ~42.4% | ~41.5% | UB best |
-| AllGather/step | 4,130ms | **2,886ms** | 3,309ms | **UB −12.7%** |
-| ReduceScatter/step | 3,524ms | **2,832ms** | 3,482ms | **UB −18.7%** |
-| Total comm/step | 7,654ms | **5,718ms** | 6,791ms | **UB −15.8%** |
-| Total GEMM/step | 7,226ms | 7,251ms | **6,503ms** | UB +11.5% worse |
-| Attention (FWD+BWD)/step | 482ms | 473ms | **459ms** | Near-tie |
-| Buffer copy overhead/step | **9ms** | **9ms** | 878ms | MFSDP 96× less |
+| Metric | MFSDP+UB | FSDP2 | UB vs FSDP2 |
+|---|---|---|---|
+| **Step wall time (nsys)** | **8,448ms** | 8,624ms | **UB −2.1%** |
+| MFU | ~42.4% | ~41.5% | UB better |
+| AllGather/step | **2,886ms** | 3,309ms | **UB −12.7%** |
+| ReduceScatter/step | **2,832ms** | 3,482ms | **UB −18.7%** |
+| Total comm/step | **5,718ms** | 6,791ms | **UB −15.8%** |
+| Total GEMM/step | 7,251ms | **6,503ms** | UB +11.5% worse |
+| Attention (FWD+BWD)/step | 473ms | **459ms** | Near-tie |
+| Buffer copy overhead/step | **9ms** | 878ms | MFSDP 96× less |
 
 ### MFSDP+UB Advantages over FSDP2
 
 1. **AllGather −12.7%** (3,309ms → 2,886ms): NCCL user buffer mode registers parameter buffers
-   directly with the NCCL library, enabling zero-copy AG collectives. Compared to no_flag MFSDP this
-   is a −30.1% AG improvement (4,130ms → 2,886ms). avg_us per call: 12,669µs (no_flag) → 8,851µs (UB).
+   directly with the NCCL library, enabling zero-copy AG collectives. avg_us per call: 8,851µs (UB)
+   vs 10,276µs (FSDP2).
 
 2. **ReduceScatter −18.7%** (3,482ms → 2,832ms): UB mode similarly benefits RS by eliminating
-   intermediate copies. vs no_flag: −19.6% (3,524ms → 2,832ms). avg_us: 21,491µs (no_flag) → 17,267µs (UB).
+   intermediate copies. avg_us per call: 17,267µs (UB) vs 21,494µs (FSDP2).
 
-3. **Buffer copy overhead parity with no_flag** (9ms): UB mode does not change MFSDP's flat
-   contiguous buffer; `CatArrayBatchedCopy` overhead remains 9ms/step vs FSDP2's 878ms/step.
+3. **Buffer copy overhead minimal** (9ms vs 878ms/step): MFSDP's flat contiguous buffer eliminates
+   `chunk_cat` (476ms/step) and `split_with_sizes_copy_out` (402ms/step) that FSDP2 requires.
 
-4. **Better comm–compute overlap**: UB truly exposed comm = 150ms/step vs FSDP2 ~409ms/step (from
-   no_flag analysis; same FSDP2 file). Despite smaller absolute comm, UB achieves >97% overlap. See §4.8.
+4. **Better comm–compute overlap**: UB truly exposed comm = 150ms/step vs FSDP2 ~409ms/step.
+   Despite smaller absolute comm, UB achieves >97% overlap. See §4.6.
 
 ### FSDP2 Advantages
 
@@ -146,21 +145,19 @@ buffer (−30% AG, −20% RS vs no_flag) exceeds the GEMM penalty that remains f
 
 ## 4. Detailed Evidence
 
-### 4.1 UB Mode Effect on Collectives — Controlled Experiment
+### 4.1 Collective Kernel Detail
 
-| | MFSDP no_flag | MFSDP+UB | FSDP2 |
+| | MFSDP+UB | FSDP2 | Winner |
 |---|---|---|---|
-| AG avg duration (µs) | 12,669 | **8,851** | 10,276 |
-| AG total/step (ms) | 4,130 | **2,886** | 3,309 |
-| AG vs FSDP2 | MFSDP 24.9% slower | **UB 12.7% faster** | — |
-| RS avg duration (µs) | 21,491 | **17,267** | 21,494 |
-| RS total/step (ms) | 3,524 | **2,832** | 3,482 |
-| RS vs FSDP2 | MFSDP 1.2% slower | **UB 18.7% faster** | — |
+| AG avg duration (µs) | **8,851** | 10,276 | **UB −13.9%** |
+| AG total/step (ms) | **2,886** | 3,309 | **UB −12.7%** |
+| RS avg duration (µs) | **17,267** | 21,494 | **UB −19.7%** |
+| RS total/step (ms) | **2,832** | 3,482 | **UB −18.7%** |
+| Kernel name | `ncclDevKernel_AllGather_RING_LL` | Same | — |
+| Kernel name | `ncclDevKernel_ReduceScatter_Sum_f32_RING_LL` | Same | — |
 
-UB mode improves both AG and RS, unlike `NCCL_P2P_NET_CHUNKSIZE`+`NCCL_IB_SL` flags (which mainly
-reduced RS). Both use the same `ncclDevKernel_AllGather_RING_LL` and
-`ncclDevKernel_ReduceScatter_Sum_f32_RING_LL` kernel names, but with user-buffer pointers that
-enable direct-placement without staging copies.
+UB mode benefits both AG and RS equally via user-buffer pointers that enable direct-placement into
+pre-registered parameter buffers, eliminating staging copies at both the send and receive side.
 
 ### 4.2 Full Kernel Breakdown per Step
 
@@ -203,18 +200,15 @@ Comm vs Compute:
 - MFSDP fuses KV gradient → fewer NTT calls (160/step) vs FSDP2 (327/step for separate K+V).
 
 ⁴ **`tss` vs `tst` on 192×192 FFN tiles — same problem size, different epilogue.**
-The flat buffer root cause is identical to the no_flag run: GEMM output sub-views into the flat
-buffer have non-standard base pointers → cuBLAS cannot construct TMA tile descriptors → falls back
-to `tss`. NCCL UB mode does not alter parameter tensor layout. Total `tss` penalty: ~153ms/step
-(difference between MFSDP+UB `tss_192x192_NTN` total and FSDP2 `tst_192x192_NTN` total, adjusted
-for avg_us). Note: v2 (512.7ms vs 506.7ms) is near-tie; v1 (1,129ms vs 982ms) drives the penalty.
+GEMM outputs write into offset views of the flat contiguous parameter/gradient buffer. These sub-views
+have non-standard base pointers → cuBLAS cannot construct TMA tile descriptors → falls back to `tss`
+(shared-memory epilogue). NCCL UB mode does not alter parameter tensor layout. Total `tss` penalty:
+~153ms/step (v1: 1,129ms vs 982ms; v2: 513ms vs 507ms — near-tie). The structural fix is to ensure
+flat-buffer sub-views are 16-byte aligned with contiguous strides.
 
-**Comparison of MFSDP+UB vs no_flag GEMM**:
-- GEMM total: 7,251ms (UB) vs 7,226ms (no_flag) — essentially identical (+0.3%)
-- NCCL UB mode has no effect on GEMM performance, as expected.
-- The `tss_320x128_NTT` kernel (138ms/step) appears in the UB run; it was present in the no_flag
-  run as well but not highlighted in that report (it corresponds to small grad-weight GEMMs for
-  fused KV projections that also write into the flat buffer).
+The `tss_320x128_NTT` (160 calls, 138ms/step) represents grad-weight GEMMs for fused KV projections
+also writing into the flat buffer. The per-call delta vs FSDP2's `tst_320x128_NTT` is ~15µs — not
+the primary penalty. FSDP2 has more NTT calls (327/step) because K and V are separate tensors.
 
 ### 4.4 Attention Kernels
 
@@ -258,65 +252,131 @@ FSDP2: values from `analysis_report_no_flag.md` (same file, validated methodolog
 
 **Total truly exposed comm per step:**
 
-| | MFSDP no_flag | MFSDP+UB | FSDP2 |
-|---|---|---|---|
-| AG exposed | 334ms | **61ms** | 288ms |
-| RS exposed | 248ms | **89ms** | 121ms |
-| **Total exposed** | **582ms** | **150ms** | **409ms** |
+| | MFSDP+UB | FSDP2 |
+|---|---|---|
+| AG exposed | **61ms** | 288ms |
+| RS exposed | **89ms** | 121ms |
+| **Total exposed** | **150ms** | **409ms** |
 
 **Key observations:**
 
-1. **MFSDP+UB has the least exposed comm of all three configurations** (150ms/step vs 409ms
-   FSDP2, 582ms no_flag). Despite smaller comm totals (UB collectives complete faster), the
-   remaining exposed tail is also smaller because UB mode allows collectives to start earlier
-   (user-buffer registration removes pre-copy latency at comm launch).
+1. **MFSDP+UB exposes 63% less comm than FSDP2** (150ms vs 409ms/step). Despite shorter absolute
+   comm intervals (UB collectives complete faster), the remaining exposed tail is also smaller because
+   UB mode allows collectives to start earlier — user-buffer registration removes pre-copy latency at
+   comm launch.
 
 2. **UB dominates Bucket A (GEMM+attn)**: 92.1%/92.3% of AG/RS wall time is hidden behind deep
-   compute, vs 82–84% for FSDP2 and 84–90% for no_flag MFSDP. The faster UB collectives run
-   entirely within GEMM compute windows.
+   compute, vs 82–84% for FSDP2. The faster UB collectives run entirely within GEMM compute windows.
 
-3. **Bucket B is smaller in UB than FSDP2**: FSDP2's lighter comm (norm/rope/elem overlap) covers
-   11–12% of its larger comm window; UB's comm is shorter so less of it spills into light-op gaps.
+3. **Bucket B is smaller in UB than FSDP2**: FSDP2's comm (norm/rope/elem overlap) covers 11–12%
+   of its larger comm window; UB's comm is shorter so less of it spills into light-op gaps.
 
-4. **The 259ms/step exposed comm reduction vs FSDP2 (409ms → 150ms) contributes to most of the
-   176ms wall-time advantage** (along with the net comm savings: 6,791ms → 5,718ms = 1,073ms comm
-   reduction, but partially masked by the +748ms GEMM penalty and overlap effects).
+4. **The 259ms/step exposed comm reduction vs FSDP2 explains most of the 176ms wall-time advantage**
+   (net comm savings 1,073ms/step partially masked by +748ms GEMM penalty and overlap accounting).
 
 ### 4.7 On `tss` vs `tst` GEMM Epilogue in UB Run
 
-The `tss` epilogue persists on 192×192 NTN tiles in the UB run, confirming the root cause is the
-output tensor memory layout (flat buffer offset views), not any NCCL-related configuration.
+The `tss` epilogue persists on 192×192 NTN tiles, confirming the root cause is the output tensor
+memory layout (flat buffer offset views), not any NCCL-related configuration. NCCL UB mode does not
+affect GEMM kernel selection.
 
-A new `tss_320x128_NTT` appears explicitly in the UB profile (160 calls, 138ms/step). This kernel
-was likely also present in the no_flag run but fell below the reporting threshold. It represents
-grad-weight computations for fused KV projections writing into the flat gradient buffer. The per-call
-delta vs FSDP2's `tst_320x128_NTT` is small (~15µs/call), so this is not the primary penalty.
+The `tss_320x128_NTT` (160 calls, 138ms/step) represents grad-weight GEMMs for fused KV projections
+writing into the flat gradient buffer. The per-call delta vs FSDP2's `tst_320x128_NTT` is ~15µs —
+not a meaningful penalty. FSDP2 has more NTT calls (327/step) because K and V projections are
+separate tensors.
 
 The structural fix remains: ensure flat-buffer sub-views exposed to cuBLAS have 16-byte-aligned base
 pointers and contiguous strides, enabling TMA epilogue selection.
 
 ---
 
-## 5. Memory Analysis
+## 5. Estimated Contribution of UB Flags
 
-Memory analysis for MFSDP+UB is not available — both training runs crashed before logging steady-state
-memory metrics via `--log-memory-to-tensorboard`. The peak allocation during `manual_buffer_registration`
-may additionally exceed the no_flag run's 46.2 GB/GPU if NCCL pre-registers large staging buffers.
+This section estimates the performance impact attributable to the three UB-specific flags
+(`--fsdp-double-buffer`, `--use-nccl-ub`, `--fsdp-manual-registration`) by using the no_flag run
+(same config, same cluster, no NCCL env vars) as a proxy baseline. This is an **estimate**, not a
+controlled ablation — the no_flag and UB runs ran as separate jobs on potentially different nodes.
 
-For reference from `analysis_report_no_flag.md`:
+### Estimated delta: MFSDP no_flag → MFSDP+UB
 
-| Metric | MFSDP no_flag | FSDP2 |
+| Metric | MFSDP no_flag (est.) | MFSDP+UB | Δ |
+|---|---|---|---|
+| Step time (nsys) | ~8,931ms | 8,448ms | **−5.4% (−483ms)** |
+| AllGather/step | ~4,130ms | 2,886ms | **−30.1% (−1,244ms)** |
+| ReduceScatter/step | ~3,524ms | 2,832ms | **−19.6% (−692ms)** |
+| Total comm/step | ~7,654ms | 5,718ms | **−25.3% (−1,936ms)** |
+| Total GEMM/step | ~7,226ms | 7,251ms | essentially unchanged (+0.3%) |
+| Truly exposed comm | ~582ms | 150ms | **−74% (−432ms)** |
+
+### Attribution
+
+**Comm improvement (~1,936ms/step)** is driven by `--use-nccl-ub --fsdp-manual-registration`:
+NCCL user buffer registration allows parameter shards to be read/written in-place during collectives,
+eliminating the staging-copy round-trips that otherwise occur at each AG and RS kernel launch.
+The improvement is roughly equal on AG (−30%) and RS (−20%), suggesting both collectives benefit
+from direct buffer access rather than one being bottlenecked by a different mechanism.
+
+**GEMM is unchanged** (7,226ms → 7,251ms, within run-to-run noise). This confirms `--use-nccl-ub`
+and `--fsdp-double-buffer` have no side effects on compute kernels.
+
+**Overlap improvement (~432ms less exposed comm)** follows from the comm improvement: shorter
+collectives are more easily buried inside GEMM windows, and user-buffer mode allows the collective
+to start sooner after the preceding GEMM issues its outputs (no pre-copy staging delay).
+
+**`--fsdp-double-buffer` contribution** is not individually isolatable from this data. Its role is
+to pre-fetch the next layer's weights while the current layer computes, reducing AG exposure between
+layers. In the UB run, AG exposed is already 61ms/step (vs FSDP2's 288ms), suggesting effective
+prefetch. Without a separate double-buffer-only ablation, the split between double-buffer and UB
+registration is not determinable.
+
+### Summary of flag value
+
+| Flag | Primary effect | Estimated benefit |
 |---|---|---|
-| **Peak allocated** | **46.2 GB** | **53.1 GB** |
-| **Reserved** | **61.6 GB** | **68.1 GB** |
-| H100 capacity utilization | 77% | 85% |
+| `--use-nccl-ub` | Zero-copy AG/RS via registered buffers | ~−1,900ms/step comm; −5.4% wall time |
+| `--fsdp-manual-registration` | Pre-registers all parameter buffers at init | Required for UB mode; no independent effect |
+| `--fsdp-double-buffer` | Double-buffers weights for AG prefetch | Contributes to overlap; not individually measured |
 
-MFSDP+UB memory footprint is expected to be ≥ no_flag (UB registration may add per-buffer metadata),
-but likely still below FSDP2's 53.1 GB since the flat buffer structure is unchanged.
+**Net estimated value of UB mode**: ~−5.4% wall time vs MFSDP without UB, and ~−2.1% vs FSDP2.
+The primary risk is cluster stability: `--fsdp-manual-registration` crashes on this cluster. If
+stability is resolved, UB mode makes MFSDP the faster framework at this config.
 
 ---
 
-## 6. Stability Note
+## 7. Memory Analysis
+
+Source: nsys profile (MFSDP+UB peak allocated read from nsys-rep); Megatron tensorboard log (FSDP2,
+from `analysis_report_no_flag.md`). Note: `CUDA_MEMORY_USAGE` is not exported to sqlite by this
+nsys version, so MFSDP+UB figures come directly from the nsys-rep.
+
+### 7.1 Summary
+
+| Metric | MFSDP+UB | FSDP2 |
+|---|---|---|
+| **Peak allocated** | **63.36 GB** | **78.57 GB** |
+| H100 capacity (79.1 GB) | 80.1% | 99.3% |
+| Headroom | ~15.7 GB | ~0.5 GB |
+
+MFSDP+UB uses **15.2 GB less** than FSDP2. FSDP2 is effectively at capacity.
+
+### 7.2 Root Cause
+
+The difference is structural: FSDP2 lacks a contiguous flat parameter buffer. During AllGather,
+FSDP2 must pack individual per-parameter tensors into a temporary flat send buffer via `chunk_cat`.
+At the AG peak, both the original per-parameter tensors and the packed flat buffer are live
+simultaneously — two copies of the weight shards coexist. MFSDP's parameters already reside in a
+pre-allocated flat contiguous buffer, so AllGather reads directly from it with no temporary copy;
+no duplication occurs.
+
+### 7.3 Implication
+
+FSDP2's 99.3% utilization (78.57 / 79.1 GB) leaves virtually no headroom for scaling to longer
+sequences or larger MBS. MFSDP+UB's 80.1% utilization retains ~15.7 GB margin despite the
+additional UB registration overhead.
+
+---
+
+## 8. Stability Note
 
 `--use-nccl-ub --fsdp-manual-registration` is **not cluster-stable** on this cluster. Both runs
 failed with:

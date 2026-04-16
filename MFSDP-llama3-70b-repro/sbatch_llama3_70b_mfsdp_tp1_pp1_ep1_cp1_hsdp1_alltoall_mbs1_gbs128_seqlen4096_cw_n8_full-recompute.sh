@@ -25,7 +25,7 @@ WANDB=${WANDB:-1}       # Set to 1 to enable WandB logging
 # Environment
 export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_NODEID
 export NCCL_IB_TIMEOUT=19
-qxport NVTE_FWD_LAYERNORM_SM_MARGIN=16
+export NVTE_FWD_LAYERNORM_SM_MARGIN=16
 export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 unset CUDA_DEVICE_MAX_CONNECTIONS
@@ -131,8 +131,8 @@ PRETRAIN_ARGS+=(
     --init-model-with-meta-device
     --calculate-per-token-loss
     --fsdp-double-buffer
-    --use-nccl-ub
-    --fsdp-manual-registration
+    # --use-nccl-ub              # disabled — NCCL cuda error 801 'operation not supported' on this cluster
+    # --fsdp-manual-registration # disabled — requires nccl-ub; causes manual_buffer_registration crash
     --ckpt-format fsdp_dtensor
 )
 

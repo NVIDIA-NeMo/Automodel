@@ -22,8 +22,8 @@ seed: 1234
 benchmark:
   warmup_steps: 10
   peak_tflops: 989  # H100 peak TFLOPs
-  nsys_start: 12
-  nsys_end: 15
+  nsys_start: 7
+  nsys_end: 8
   nsys_ranks: [0]
   num_nodes: 4
 
@@ -36,7 +36,7 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
-  max_steps: 20
+  max_steps: 15
 
 distributed:
   strategy: fsdp2
@@ -47,6 +47,10 @@ distributed:
 
   sequence_parallel: false
   activation_checkpointing: true
+  moe:
+    ignore_router_for_ac: true  # Selective recompute: MoE act only — matches MFSDP selective/moe_act
+    reshard_after_forward: true  # Reshard after forward — matches MFSDP behaviour (re-AG during recompute)
+
 
   mp_policy:
     param_dtype: bfloat16
