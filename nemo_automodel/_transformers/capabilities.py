@@ -215,7 +215,7 @@ class ModelSupports:
     @property
     def supports_gradient_checkpointing(self) -> bool:
         """Gradient checkpointing is supported."""
-        if self.supports_ep:
+        if self.supports_ep and self.ep_size > 1:
             return False
         for cls in type(self._model).__mro__:
             if "supports_gradient_checkpointing" in cls.__dict__:
