@@ -4,18 +4,6 @@
 **Model**: LLaMA3.1-70B
 **Config**: TP=1, CP=1, PP=1, DP=64, MBS=1, GBS=128, SeqLen=4096, 8 nodes (64×H100 SXM), full-recompute
 
-**Relationship to prior analysis**: This report replaces `analysis_report_ub.md` for all FSDP2 kernel
-metrics. The prior report used n=1.5 normalization for FSDP2, derived from RMSNorm count (963 ÷ 642).
-Here, FSDP2 metrics are extracted directly from the **exact iter 8 NVTX window** (no normalization
-needed), yielding unambiguous per-step values. MFSDP+UB remains N_STEPS=2 (no NVTX markers;
-confirmed by kernel counts). All other analysis (NCCL UB stability note, tss epilogue root cause,
-memory, estimated flag contributions) is unchanged.
-
-**Note on NCCL user buffer (UB) mode**: Both training runs (jobs 11134002, 11139868) crashed with a
-NCCL `DistBackendError: Failed to window register segment` error. The nsys capture occurred at
-steps 10–11, before the crash, so the profile is valid. No log-based throughput metrics are
-available; MFSDP+UB step time is derived from the nsys window (16,897ms ÷ 2 = 8,448ms/step).
-
 ---
 
 ## Runs Compared
