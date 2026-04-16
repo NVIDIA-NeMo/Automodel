@@ -1206,6 +1206,20 @@ def pad_collate_fn(
         "attention_mask": torch.stack(padded_attention_mask),
     }
 
+    # Pad sequence-length tensors that mirror input_ids (e.g. mm_token_type_ids)
+    for seq_key in ("mm_token_type_ids",):
+        if any(seq_key in ex for ex in examples):
+            padded = []
+            for ex in examples:
+                t = ex.get(seq_key)
+                if t is None:
+                    padded.append(torch.zeros(pad_to, dtype=torch.long))
+                else:
+                    t = t[0] if t.dim() == 2 else t
+                    p = pad_to - t.shape[0]
+                    padded.append(torch.cat([t, torch.zeros(p, dtype=t.dtype)]) if p > 0 else t[:pad_to])
+            batch[seq_key] = torch.stack(padded)
+
     # ------------------------------------------------------------------
     # Autoregressive shift: labels[t] predicts input_ids[t+1]
     # ------------------------------------------------------------------
@@ -1252,7 +1266,7 @@ def pad_collate_fn(
                 video_counts.append(0)
         batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
-    for key in ("image_grid_thw", "video_grid_thw"):
+    for key in ("image_grid_thw", "video_grid_thw", "image_position_ids"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
             batch[key] = torch.cat(tensors, dim=0)
@@ -1500,6 +1514,57 @@ def gemma4_prefix_collate_fn(
     return default_collate_fn(examples, processor, max_length, _post_tokenize_hook=_inject)
 
 
+def llava_onevision_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for LLaVA-OneVision-1.5 processors.
+
+    Handles image and video inputs using the Qwen-style chat template and
+    qwen_vl_utils for vision info processing.
+    """
+    conversations = [example["conversation"] for example in examples]
+
+    texts = [processor.apply_chat_template(conversation, tokenize=False) for conversation in conversations]
+
+    images, videos = _extract_media_from_conversations(conversations)
+
+    batch = processor(
+        text=texts,
+        images=images,
+        videos=videos,
+        padding=True,
+        return_tensors="pt",
+        do_sample_frames=False,
+    )
+
+    labels = build_labels_from_template(
+        batch["input_ids"],
+        conversations,
+        processor,
+    )
+    batch["labels"] = labels[:, 1:]
+
+    input_shape = batch["input_ids"].shape
+    for key, value in list(batch.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            batch[key] = value[:, :-1]
+
+    # Mask fake vision tokens for samples that had fake images injected at dataset level.
+    fake_indices = [i for i, ex in enumerate(examples) if ex.get("_injected_fake")]
+    if fake_indices:
+        mask_fake_vision_tokens_batch(batch, processor, fake_indices)
+
+    # Per-sample media counts for PP chunking
+    image_counts, video_counts = _count_media_per_sample(conversations)
+    if any(c > 0 for c in image_counts):
+        batch["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+    if any(c > 0 for c in video_counts):
+        batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
+
+    return batch
+
+
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
@@ -1507,5 +1572,6 @@ COLLATE_FNS = {
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
+    "LlavaOneVisionProcessor": llava_onevision_collate_fn,
     "default": default_collate_fn,
 }

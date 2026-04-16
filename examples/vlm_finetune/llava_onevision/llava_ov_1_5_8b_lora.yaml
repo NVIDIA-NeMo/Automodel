@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Gemma 4 2B with MedPix dataset for image description
-# Run command:
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
+# Configuration for LoRA fine-tuning LLaVA-OneVision-1.5 8B with LLaVA-Instruct-150K
+#
+# To run this recipe:
+#   automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
+  global_batch_size: 32
+  local_batch_size: 2
+  max_steps: 1000
   ckpt_every_steps: 500
   val_every_steps: 500
-  num_epochs: 2
 
 dist_env:
   backend: nccl
@@ -36,71 +38,72 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: google/gemma-4-E2B-it
-  torch_dtype: torch.bfloat16
-  use_liger_kernel: true
-  use_sdpa_patching: false
-  attn_implementation: eager
-  # 2B uses kv_shared layers, hence use_cache: true.
-  text_config:
-    use_cache: true
+  pretrained_model_name_or_path: lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
+  attn_implementation: flash_attention_2
 
 processor:
-  padding_side: right
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
+  trust_remote_code: true
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/gemma4_2b_it/
+  checkpoint_dir: vlm_checkpoints/llava_ov_8b_lora/
   model_save_format: torch_save
-  save_consolidated: false
 
 distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
   cp_size: 1
-
   sequence_parallel: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_llava_onevision_dataset
+  path_or_dataset: liuhaotian/LLaVA-Instruct-150K
   split: train[:1000]
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 0
+  num_workers: 4
   pin_memory: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-
-validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation[:500]
-
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.llava_onevision_collate_fn
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1e-5
+  lr: 1e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
-freeze_config:
-  freeze_embeddings: true
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
+peft:
+  enabled: true
+  method: lora
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
 
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: true
+
+# Uncomment and configure for W&B logging
 # wandb:
-#   project: <your-project>
-#   entity: <your-entity>
-#   name: <your-run-name>
+#   project:
+#   entity:
+#   name:
+#   save_dir:
 
 ci:
-  recipe_owner: hemildesai
+  recipe_owner: <owner>

@@ -12,55 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Gemma 4 2B with MedPix dataset for image description
-# Run command:
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_2b.yaml
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 16
   local_batch_size: 1
-  ckpt_every_steps: 500
-  val_every_steps: 500
+  ckpt_every_steps: 1000
+  val_every_steps: 100
   num_epochs: 2
+  max_steps: 100
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 60
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 42
+  seed: 1234
   ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: google/gemma-4-E2B-it
-  torch_dtype: torch.bfloat16
-  use_liger_kernel: true
-  use_sdpa_patching: false
-  attn_implementation: eager
-  # 2B uses kv_shared layers, hence use_cache: true.
-  text_config:
-    use_cache: true
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
 
 processor:
-  padding_side: right
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/gemma4_2b_it/
-  model_save_format: torch_save
+  checkpoint_dir: /checkpoints/qwen3_6_35b/
+  model_save_format: safetensors
   save_consolidated: false
 
 distributed:
   strategy: fsdp2
-  dp_size: none
   tp_size: 1
   cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 8
 
   sequence_parallel: false
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -68,39 +79,42 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
-  split: train[:1000]
+  split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 0
-  pin_memory: true
+  num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+  drop_last: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation[:500]
+  split: validation
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1e-5
-  weight_decay: 0.01
   betas: [0.9, 0.95]
-
-freeze_config:
-  freeze_embeddings: true
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
-
-# wandb:
-#   project: <your-project>
-#   entity: <your-entity>
-#   name: <your-run-name>
+  eps: 1e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
 
 ci:
-  recipe_owner: hemildesai
+  recipe_owner: HuiyingLi
+  time: "00:30:00"
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_name>
+#   save_dir: <your_wandb_save_dir>
