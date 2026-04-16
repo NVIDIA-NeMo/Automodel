@@ -36,8 +36,6 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
-from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
-
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     PARALLELIZE_FUNCTIONS,
     RotaryEmbedParallel,
@@ -47,6 +45,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     _parallelize_llama,
     _parallelize_qwen,
 )
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 
 
 class MockModel:
@@ -118,7 +117,7 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         sequence_sharding = [Shard(1)]
 
-        result = RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
+        RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should have called from_local twice
         assert mock_from_local.call_count == 2
