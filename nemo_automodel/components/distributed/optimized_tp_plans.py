@@ -227,7 +227,7 @@ def _parallelize_gemma4(
         import warnings
 
         warnings.warn(
-            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored. ",
+            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored.",
             stacklevel=2,
         )
 
