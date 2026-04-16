@@ -48,7 +48,7 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_31b_it_tp4/
-  model_save_format: torch_save
+  model_save_format: safetensors
   save_consolidated: false
 
 distributed:
