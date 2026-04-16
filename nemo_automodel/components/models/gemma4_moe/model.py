@@ -392,6 +392,7 @@ class Gemma4MoEModel(HFGemma4Model):
 # Top-level conditional-generation model
 # ---------------------------------------------------------------------------
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
+    supports_gradient_checkpointing = True
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
