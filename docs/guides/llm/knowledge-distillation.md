@@ -1,4 +1,4 @@
-# Knowledge Distillation with NeMo AutoModel
+# Knowledge Distillation
 
 This guide walks through fine-tuning a **student** LLM with the help of a
 larger **teacher** model using the `kd` (knowledge distillation) recipe.
