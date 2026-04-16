@@ -38,9 +38,9 @@ elif [ "$TEST_LEVEL" = "performance" ]; then
   CONFIG="${CONFIG}"
 else
   CONFIG="${CONFIG} \
-        --step_scheduler.ckpt_every_steps 100 \
-        --step_scheduler.max_steps ${MAX_STEPS:-100} \
-        --step_scheduler.val_every_steps 100"
+        --step_scheduler.ckpt_every_steps 50 \
+        --step_scheduler.max_steps ${MAX_STEPS:-50} \
+        --step_scheduler.val_every_steps 50"
 fi
 
 # Per-config nproc override (set via ci.nproc_per_node in recipe YAML)
