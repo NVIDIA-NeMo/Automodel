@@ -1275,10 +1275,6 @@ class TestActivationCheckpointingKVSharing:
             "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
             lambda *a, **kw: None,
         )
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer.get_submesh",
-            lambda mesh, names: MagicMock(),
-        )
 
     def _run_parallelize(self, model, activation_checkpointing=True):
         """Invoke the strategy under test and return the model."""
