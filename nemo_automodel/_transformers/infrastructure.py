@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
+from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -102,6 +103,14 @@ def _apply_peft_and_lower_precision(
         # Attach helpers for delayed fake-quant toggling if desired
         model._qat_mode = qat_mode  # type: ignore[attr-defined]
 
+    return model
+
+
+def _apply_runtime_compatibility_fixes(model):
+    """Apply targeted runtime workarounds after sharding/load completes."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    if should_fix_rotary_embeddings(model_parts):
+        fix_rotary_embeddings(model_parts)
     return model
 
 
@@ -566,4 +575,5 @@ def apply_model_infrastructure(
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
 
+    model = _apply_runtime_compatibility_fixes(model)
     return model
