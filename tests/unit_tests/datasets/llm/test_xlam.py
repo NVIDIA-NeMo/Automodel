@@ -185,4 +185,3 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
     assert dummy_ds.map_calls[0]["batched"] is False
     assert dummy_ds.map_calls[0]["remove_columns"] == ["id", "query", "answers", "tools"]
     assert fmt_calls[0]["pad"] == 13 and fmt_calls[0]["eos"] == tok.eos_token_id
-

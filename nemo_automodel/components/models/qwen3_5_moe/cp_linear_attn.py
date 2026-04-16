@@ -93,7 +93,6 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             return super().forward(
                 hidden_states,
                 cache_params=cache_params,
-                cache_position=cache_position,
                 attention_mask=attention_mask,
             )
 
