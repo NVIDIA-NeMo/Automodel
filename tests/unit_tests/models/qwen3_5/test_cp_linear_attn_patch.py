@@ -376,13 +376,15 @@ class TestQwen35ParallelizationStrategyParallelize:
         cp_mesh.ndim = 1
 
         mesh.mesh_dim_names = ("dp_replicate", "dp_shard_cp", "tp")
-        mesh.__getitem__ = MagicMock(side_effect=lambda key: {
-            "dp_replicate": MagicMock(size=MagicMock(return_value=1), ndim=1),
-            "dp_shard_cp": dp_shard_mesh,
-            "tp": tp_mesh,
-            "cp": cp_mesh,
-            ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
-        }[key])
+        mesh.__getitem__ = MagicMock(
+            side_effect=lambda key: {
+                "dp_replicate": MagicMock(size=MagicMock(return_value=1), ndim=1),
+                "dp_shard_cp": dp_shard_mesh,
+                "tp": tp_mesh,
+                "cp": cp_mesh,
+                ("dp_replicate", "dp_shard_cp"): dp_shard_mesh,
+            }[key]
+        )
 
         return mesh, cp_mesh, tp_mesh
 
@@ -439,9 +441,7 @@ class TestQwen35ParallelizationStrategyParallelize:
         mesh, cp_mesh, tp_mesh = mock_device_mesh
         strategy = Qwen3_5ParallelizationStrategy()
 
-        with patch(
-            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"
-        ) as mock_patch:
+        with patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model") as mock_patch:
             result = strategy.parallelize(model=fake_model, device_mesh=mesh)
 
         # patch_hf_model was called (cp_enabled=False because "cp" not in mesh_dim_names)
@@ -510,11 +510,11 @@ class TestQwen35ParallelizationStrategyParallelize:
         if cp_mod_key in sys.modules:
             monkeypatch.delitem(sys.modules, cp_mod_key)
 
+        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
         from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
             CPAwareGatedDeltaNet,
             patch_hf_model,
         )
-        from nemo_automodel.components.distributed.parallelizer import Qwen3_5ParallelizationStrategy
 
         mesh, cp_mesh, tp_mesh = mock_device_mesh
         # Enable CP by adding "cp" to mesh_dim_names and making cp_mesh.size() > 1
@@ -529,9 +529,7 @@ class TestQwen35ParallelizationStrategyParallelize:
 
         strategy = Qwen3_5ParallelizationStrategy()
 
-        with patch(
-            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"
-        ):
+        with patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"):
             strategy.parallelize(model=fake_model, device_mesh=mesh)
 
         # CP mesh should be set
@@ -551,7 +549,9 @@ class TestQwen35ParallelizationStrategyParallelize:
         # Build a model with layers in a ModuleList
         model = nn.Module()
         model.config = types.SimpleNamespace(
-            num_attention_heads=8, num_key_value_heads=8, hidden_size=64,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            hidden_size=64,
         )
         model.__class__.__name__ = "Qwen3_5ForCausalLM"
         inner = nn.Module()
@@ -564,13 +564,13 @@ class TestQwen35ParallelizationStrategyParallelize:
 
         # Capture what the custom _fsdp_by_dtype does
         shard_by_dtype_calls = []
-        with patch(
-            "nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype",
-            side_effect=lambda *a, **kw: shard_by_dtype_calls.append(a[0]),
-        ), patch(
-            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"
-        ), patch(
-            "nemo_automodel.components.distributed.parallelizer._pre_shard_combined_projections"
+        with (
+            patch(
+                "nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype",
+                side_effect=lambda *a, **kw: shard_by_dtype_calls.append(a[0]),
+            ),
+            patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.patch_hf_model"),
+            patch("nemo_automodel.components.distributed.parallelizer._pre_shard_combined_projections"),
         ):
             # Make extract_layers return the real layers
             mock_env["apply_fsdp"].side_effect = lambda module, mesh, mp, offload=None: (
@@ -649,7 +649,11 @@ def _build_forward_module(monkeypatch):
     mod.in_proj_b = nn.Linear(_HIDDEN, _NUM_V_HEADS, bias=False)
     mod.in_proj_a = nn.Linear(_HIDDEN, _NUM_V_HEADS, bias=False)
     mod.conv1d = nn.Conv1d(
-        _CONV_DIM, _CONV_DIM, _CONV_KERNEL, groups=_CONV_DIM, padding=_CONV_KERNEL - 1,
+        _CONV_DIM,
+        _CONV_DIM,
+        _CONV_KERNEL,
+        groups=_CONV_DIM,
+        padding=_CONV_KERNEL - 1,
     )
     mod.out_proj = nn.Linear(_VALUE_DIM, _HIDDEN, bias=False)
 
@@ -713,9 +717,11 @@ class TestForwardNoCp:
     def test_forward_no_cp_with_causal_conv1d_fn(self, monkeypatch):
         """When causal_conv1d_fn is set, it is called instead of conv1d fallback."""
         mod, _ = _build_forward_module(monkeypatch)
+
         # Install a mock causal_conv1d_fn
         def _mock_causal_conv1d_fn(*, x, weight, bias, activation, seq_idx):
             return torch.nn.functional.silu(x)
+
         mod.causal_conv1d_fn = _mock_causal_conv1d_fn
         x = torch.randn(1, 6, _HIDDEN)
         out = mod._forward_no_cp(x)
@@ -810,7 +816,9 @@ class TestForwardDispatch:
             called_with["cache_params"] = cache_params
             called_with["cache_position"] = cache_position
             called_with["attention_mask"] = attention_mask
-            return orig_fwd(hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask)
+            return orig_fwd(
+                hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask
+            )
 
         mod._forward_no_cp = _spy
 
