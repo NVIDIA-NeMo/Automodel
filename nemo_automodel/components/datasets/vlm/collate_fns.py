@@ -317,21 +317,16 @@ def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
         if all_ids[i : i + len(sentinel_ids)] == sentinel_ids:
             end_idx = i + len(sentinel_ids)
             if end_idx >= len(all_ids):
-                raise ValueError(
-                    f"No token found after sentinel in template output {all_ids}."
-                )
+                raise ValueError(f"No token found after sentinel in template output {all_ids}.")
             end_of_turn_id: int = all_ids[end_idx]
             assistant_marker: List[int] = all_ids[len(user_ids) : i]
             if not assistant_marker:
                 raise ValueError(
-                    f"Assistant marker is empty (user_len={len(user_ids)}, sentinel_pos={i}). "
-                    f"Full sequence: {all_ids}"
+                    f"Assistant marker is empty (user_len={len(user_ids)}, sentinel_pos={i}). Full sequence: {all_ids}"
                 )
             return assistant_marker, end_of_turn_id
 
-    raise ValueError(
-        f"Sentinel '{sentinel}' (ids={sentinel_ids}) not found in template output {all_ids}."
-    )
+    raise ValueError(f"Sentinel '{sentinel}' (ids={sentinel_ids}) not found in template output {all_ids}.")
 
 
 def _build_labels_from_markers(
@@ -358,9 +353,7 @@ def _build_labels_from_markers(
         ``<end_of_turn>``).
     """
     marker_len = len(assistant_marker)
-    marker_tensor = torch.tensor(
-        assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device
-    )
+    marker_tensor = torch.tensor(assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device)
 
     labels_list: List[torch.Tensor] = []
 
