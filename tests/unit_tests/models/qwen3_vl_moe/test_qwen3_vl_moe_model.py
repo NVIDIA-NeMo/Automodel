@@ -24,12 +24,10 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeTextConfig,
 )
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
-)
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
 )
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_vl_moe.model import (
     Fp32SafeQwen3VLMoeTextRotaryEmbedding,
     Fp32SafeQwen3VLMoeVisionRotaryEmbedding,
@@ -40,7 +38,6 @@ from nemo_automodel.components.models.qwen3_vl_moe.model import (
     Qwen3VLMoeTextModelBackend,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -170,7 +167,6 @@ class TestQwen3VLMoeBlock:
 
         # Mock parent forward to capture freqs_cis
         captured_kwargs = {}
-        original_forward = block.__class__.__bases__[0].forward
 
         def mock_forward(self, x, freqs_cis, **kwargs):
             captured_kwargs["freqs_cis"] = freqs_cis
