@@ -42,7 +42,6 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -215,7 +214,7 @@ def _parallelize_gemma3(
 
 
 def _parallelize_gemma4(
-    model: Gemma4ForConditionalGeneration,
+    model,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Gemma4ForConditionalGeneration model across tensor parallel dimensions.
@@ -593,7 +592,10 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
-    _get_class_qualname(Gemma4ForConditionalGeneration): _parallelize_gemma4,
+    # String-keyed to avoid an eager import that would pull
+    # components.checkpoint into components.distributed (import-linter
+    # violation; see gemma4_moe/state_dict_adapter).
+    "nemo_automodel.components.models.gemma4_moe.model.Gemma4ForConditionalGeneration": _parallelize_gemma4,
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
