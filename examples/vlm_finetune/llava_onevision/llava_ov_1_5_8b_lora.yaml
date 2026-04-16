@@ -1,0 +1,109 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Configuration for LoRA fine-tuning LLaVA-OneVision-1.5 8B with LLaVA-Instruct-150K
+#
+# To run this recipe:
+#   automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 2
+  max_steps: 1000
+  ckpt_every_steps: 500
+  val_every_steps: 500
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
+  attn_implementation: flash_attention_2
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/llava_ov_8b_lora/
+  model_save_format: torch_save
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_llava_onevision_dataset
+  path_or_dataset: liuhaotian/LLaVA-Instruct-150K
+  split: train[:1000]
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.llava_onevision_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+peft:
+  enabled: true
+  method: lora
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: true
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project:
+#   entity:
+#   name:
+#   save_dir:
+
+ci:
+  recipe_owner: <owner>

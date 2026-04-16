@@ -131,6 +131,61 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
     return [format(example) for example in dataset]
 
 
+def make_llava_onevision_dataset(
+    path_or_dataset="liuhaotian/LLaVA-Instruct-150K",
+    split="train",
+    **kwargs,
+):
+    """Load and preprocess the LLaVA-Instruct-150K dataset for LLaVA-OneVision-1.5.
+
+    This function loads conversation-format data with images and returns it in
+    the standard NeMo VLM format expected by the collate function.
+
+    Args:
+        path_or_dataset: Path to the dataset on HuggingFace Hub or local path.
+        split: Dataset split to load (e.g., "train", "train[:1000]").
+        **kwargs: Additional arguments passed to load_dataset.
+
+    Returns:
+        List of dicts with "conversation" and "image" keys.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+
+    def format(example):
+        conversations = example.get("conversations", [])
+        image = example.get("image", None)
+
+        # Convert conversations to NeMo VLM format
+        nemo_conversation = []
+        for turn in conversations:
+            role = turn.get("from", "")
+            content = turn.get("value", "")
+
+            # Map role names
+            if role == "human":
+                role = "user"
+            elif role == "gpt":
+                role = "assistant"
+
+            # Parse content for image placeholders
+            content_items = []
+            if "<image>" in content:
+                content_items.append({"type": "image", "image": image})
+                content = content.replace("<image>", "").strip()
+
+            if content:
+                content_items.append({"type": "text", "text": content})
+
+            nemo_conversation.append({"role": role, "content": content_items})
+
+        return {
+            "conversation": nemo_conversation,
+            "image": image,
+        }
+
+    return [format(example) for example in dataset]
+
+
 def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
     """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
     dataset = load_dataset(path_or_dataset, split=split)
