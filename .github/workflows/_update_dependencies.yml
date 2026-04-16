@@ -40,7 +40,12 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
       - name: Install Azure CLI
-        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        run: |
+          for i in 1 2 3; do
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Azure Login
         uses: azure/login@v2
