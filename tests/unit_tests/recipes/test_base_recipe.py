@@ -58,7 +58,7 @@ def _patch_checkpoint_ops(monkeypatch):
             self.tp_rank = tp_rank
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
-        
+
         def save_model(self, model=None, weights_path=None, peft_config=None, tokenizer=None):
             """Save model state dict."""
             if model is None:
