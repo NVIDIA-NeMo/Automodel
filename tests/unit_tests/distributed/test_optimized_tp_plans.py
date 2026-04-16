@@ -513,6 +513,7 @@ class TestParallelPlanStructure:
             (MockModel("llama", tie_word_embeddings=False), _parallelize_llama),
             (MockModel("qwen2", tie_word_embeddings=False), _parallelize_qwen),
             (MockModel("gemma3_causal"), _parallelize_gemma3),
+            (MockModel("gemma4_conditional"), _parallelize_gemma4),
         ]
 
         valid_styles = (
@@ -541,6 +542,7 @@ class TestParallelPlanStructure:
             (MockModel("llama", tie_word_embeddings=False), _parallelize_llama),
             (MockModel("qwen2", tie_word_embeddings=False), _parallelize_qwen),
             (MockModel("gemma3_causal"), _parallelize_gemma3),
+            (MockModel("gemma4_conditional"), _parallelize_gemma4),
         ]
 
         for model, func in mock_models:
