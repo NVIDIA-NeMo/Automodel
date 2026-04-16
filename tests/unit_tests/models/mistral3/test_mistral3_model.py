@@ -106,4 +106,3 @@ class TestMinistral3ForCausalLM:
 
 
 # NOTE: HFCheckpointingMixin tests are now in tests/unit_tests/models/common/test_hf_checkpointing_mixin.py
-
