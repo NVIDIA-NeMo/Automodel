@@ -16,8 +16,6 @@
 import re
 from typing import Any, Optional
 
-import torch
-
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 
 
