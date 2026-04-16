@@ -18,9 +18,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn import LayerNorm
-
 from transformers.activations import ACT2FN
 
 
@@ -80,15 +78,11 @@ class RicePatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         kernel_size = [patch_size, patch_size]
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=False
-        )
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.patch_size, self.patch_size
-        )
+        hidden_states = hidden_states.view(-1, self.in_channels, self.patch_size, self.patch_size)
         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
         return hidden_states
 
@@ -148,12 +142,7 @@ class RiceAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        q, k, v = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
 
         if position_embeddings is None:
             emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
