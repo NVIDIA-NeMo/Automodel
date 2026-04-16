@@ -228,6 +228,12 @@ def get_is_hf_model(config, force_hf):
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
     if not os.path.isdir(pretrained_model_name_or_path):
+        if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
+            logger.info(
+                "HF_HUB_OFFLINE=1: skipping weight download for %s (using cached weights)",
+                pretrained_model_name_or_path,
+            )
+            return
         num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
         if num_nodes > 1:
             logger.info(
