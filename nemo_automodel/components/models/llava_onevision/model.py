@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -152,9 +151,7 @@ class RiceTransformer(nn.Module):
         self.class_embedding = nn.Parameter(scale * torch.randn(config.hidden_size))
         self.class_pos_emb = nn.Parameter(torch.randn(1, head_dim // 2))
 
-        self.blocks = nn.ModuleList(
-            [RiceBlock(config) for _ in range(config.depth)]
-        )
+        self.blocks = nn.ModuleList([RiceBlock(config) for _ in range(config.depth)])
         self.pre_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.merger = RicePatchMerger(
             dim=config.text_hidden_size,
@@ -215,7 +212,6 @@ class RiceTransformer(nn.Module):
         # Add class token embedding
         batch_size = hidden_states.shape[0]
         class_emb = self.class_embedding.expand(batch_size, -1)
-        class_pos = self.class_pos_emb.expand(batch_size, -1)
         hidden_states = torch.cat([class_emb, hidden_states], dim=0)
 
         # Compute cu_seqlens for block-diagonal attention
@@ -226,8 +222,12 @@ class RiceTransformer(nn.Module):
             ]
         ).to(dtype=torch.int32)
 
-        # Compute rotary position embeddings
+        # Compute rotary position embeddings for patches
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        # Prepend class token positional embedding
+        class_pos = self.class_pos_emb.expand(batch_size, -1)
+        rotary_pos_emb = torch.cat([class_pos, rotary_pos_emb], dim=0)
 
         # Forward through blocks
         hidden_states = self.pre_layernorm(hidden_states)
@@ -301,7 +301,8 @@ class LlavaOneVisionModel(nn.Module):
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
                     raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                        f"Image features and image tokens do not match: "
+                        f"tokens: {n_image_tokens}, features {n_image_features}"
                     )
 
                 image_mask = (
@@ -355,9 +356,7 @@ class LlavaOneVisionForConditionalGeneration(HFCheckpointingMixin, nn.Module):
         *model_args,
         **kwargs,
     ):
-        config = LlavaOneVisionConfig.from_pretrained(
-            pretrained_model_name_or_path, trust_remote_code=True
-        )
+        config = LlavaOneVisionConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
@@ -434,9 +433,7 @@ class LlavaOneVisionForConditionalGeneration(HFCheckpointingMixin, nn.Module):
             and self._vlm_pixel_values_chunks is not None
         ):
             has_media_tokens = (
-                input_ids is not None
-                and self.image_token_id is not None
-                and (input_ids == self.image_token_id).any()
+                input_ids is not None and self.image_token_id is not None and (input_ids == self.image_token_id).any()
             )
             if has_media_tokens:
                 chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
