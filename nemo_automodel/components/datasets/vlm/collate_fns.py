@@ -11,9 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+import random
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import MagicMock
 
 import torch
+from PIL import Image as PILImage
 
 from nemo_automodel.shared.import_utils import MISSING_QWEN_VL_UTILS_MSG
 
@@ -32,12 +36,6 @@ try:
 except ImportError:
     HAVE_QWEN_OMNI_UTILS = False
     process_mm_info = MagicMock()
-
-import logging
-import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-from PIL import Image as PILImage
 
 logger = logging.getLogger(__name__)
 
