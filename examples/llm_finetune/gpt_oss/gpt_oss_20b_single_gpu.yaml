@@ -97,3 +97,4 @@ optimizer:
 
 ci:
   recipe_owner: akoumpa
+  nproc_per_node: 1
