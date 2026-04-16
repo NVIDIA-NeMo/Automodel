@@ -111,7 +111,12 @@ jobs:
           ref: ${{ env.TARGET_BRANCH }}
 
       - name: Install GPG
-        run: sudo apt-get install -y gnupg2
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y gnupg2 && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
