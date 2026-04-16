@@ -787,10 +787,7 @@ def kimi_k25_vl_collate_fn(
         # Partial truncation into image regions would cause a mismatch in the model forward.
         if grid_thws is not None:
             merge_h, merge_w = 2, 2
-            expected_image_tokens = sum(
-                int((h // merge_h) * (w // merge_w))
-                for _, h, w in grid_thws.tolist()
-            )
+            expected_image_tokens = sum(int((h // merge_h) * (w // merge_w)) for _, h, w in grid_thws.tolist())
             actual_image_tokens = (input_ids == media_token_id).sum().item()
             if actual_image_tokens == expected_image_tokens:
                 all_grid_thws.append(grid_thws)
