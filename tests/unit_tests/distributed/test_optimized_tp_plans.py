@@ -36,11 +36,14 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
+
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     PARALLELIZE_FUNCTIONS,
     RotaryEmbedParallel,
     _get_class_qualname,
     _parallelize_gemma3,
+    _parallelize_gemma4,
     _parallelize_llama,
     _parallelize_qwen,
 )
@@ -48,6 +51,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
 
 class MockModel:
     """Mock model class for testing."""
+
     def __init__(self, model_type="llama", tie_word_embeddings=False):
         self.config = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
         self.__class__ = {
@@ -57,11 +61,13 @@ class MockModel:
             "qwen3_seq_cls": Qwen3ForSequenceClassification,
             "gemma3_causal": Gemma3ForCausalLM,
             "gemma3_conditional": Gemma3ForConditionalGeneration,
+            "gemma4_conditional": Gemma4ForConditionalGeneration,
         }[model_type]
 
 
 class MockDeviceMesh:
     """Mock device mesh for testing."""
+
     def __init__(self):
         pass
 
@@ -85,17 +91,15 @@ class TestRotaryEmbedParallel:
         # Mock sequence sharding
         sequence_sharding = [Shard(1)]
 
-        result = RotaryEmbedParallel._prepare_input_fn(
-            sequence_sharding, mod, inputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should return same type with original inputs unchanged
         assert type(result) == type(inputs)
         assert result[0] == mock_dtensor1
         assert result[1] == mock_dtensor2
 
-    @patch('torch.distributed.get_rank')
-    @patch.object(DTensor, 'from_local')
+    @patch("torch.distributed.get_rank")
+    @patch.object(DTensor, "from_local")
     def test_prepare_input_fn_with_tensor(self, mock_from_local, mock_get_rank):
         """Test _prepare_input_fn when input is regular tensor."""
         mock_get_rank.return_value = 0
@@ -114,29 +118,27 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         sequence_sharding = [Shard(1)]
 
-        result = RotaryEmbedParallel._prepare_input_fn(
-            sequence_sharding, mod, inputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should have called from_local twice
         assert mock_from_local.call_count == 2
 
         # First call should be for sequence parallel sharding
         first_call = mock_from_local.call_args_list[0]
-        assert first_call[1]['local_tensor'] is tensor1
-        assert first_call[1]['device_mesh'] is device_mesh
-        assert first_call[1]['placements'] == sequence_sharding
-        assert first_call[1]['run_check'] is True
+        assert first_call[1]["local_tensor"] is tensor1
+        assert first_call[1]["device_mesh"] is device_mesh
+        assert first_call[1]["placements"] == sequence_sharding
+        assert first_call[1]["run_check"] is True
 
         # Second call should be for replication
         second_call = mock_from_local.call_args_list[1]
-        assert second_call[1]['local_tensor'] is tensor2
-        assert second_call[1]['device_mesh'] is device_mesh
-        assert second_call[1]['placements'] == (Replicate(),)
-        assert second_call[1]['run_check'] is False
+        assert second_call[1]["local_tensor"] is tensor2
+        assert second_call[1]["device_mesh"] is device_mesh
+        assert second_call[1]["placements"] == (Replicate(),)
+        assert second_call[1]["run_check"] is False
 
-    @patch('torch.distributed.get_rank')
-    @patch.object(DTensor, 'from_local')
+    @patch("torch.distributed.get_rank")
+    @patch.object(DTensor, "from_local")
     def test_prepare_input_fn_value_error(self, mock_from_local, mock_get_rank):
         """Test _prepare_input_fn handles ValueError properly."""
         mock_get_rank.return_value = 1
@@ -149,9 +151,7 @@ class TestRotaryEmbedParallel:
         sequence_sharding = [Shard(1)]
 
         with pytest.raises(ValueError) as exc_info:
-            RotaryEmbedParallel._prepare_input_fn(
-                sequence_sharding, mod, inputs, device_mesh
-            )
+            RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should wrap original error with helpful context
         assert "Failed to shard tensor for sequence parallelism" in str(exc_info.value)
@@ -169,9 +169,7 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         device_mesh = MockDeviceMesh()
 
-        result = RotaryEmbedParallel._prepare_output_fn(
-            True, mod, outputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_output_fn(True, mod, outputs, device_mesh)
 
         # Should call to_local on both outputs
         assert mock_dtensor1.to_local.called
@@ -186,9 +184,7 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         device_mesh = MockDeviceMesh()
 
-        result = RotaryEmbedParallel._prepare_output_fn(
-            False, mod, outputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_output_fn(False, mod, outputs, device_mesh)
 
         # Should not call to_local
         assert not mock_dtensor1.to_local.called
@@ -242,6 +238,57 @@ class TestParallelizeFunctions:
 
         for pattern in expected_patterns:
             assert pattern in result
+
+    def test_parallelize_gemma4_conditional_basic(self):
+        """Test _parallelize_gemma4 with Gemma4ForConditionalGeneration."""
+        model = MockModel("gemma4_conditional")
+
+        result = _parallelize_gemma4(model, sequence_parallel=False)
+
+        # Gemma4 VLM uses the "model.language_model" prefix for the text backbone.
+        expected_patterns = [
+            "model.language_model.embed_tokens",
+            "model.language_model.layers.*.self_attn.q_proj",
+            "model.language_model.layers.*.self_attn.k_proj",
+            "model.language_model.layers.*.self_attn.v_proj",
+            "model.language_model.layers.*.self_attn.o_proj",
+            "model.language_model.layers.*.mlp.up_proj",
+            "model.language_model.layers.*.mlp.gate_proj",
+            "model.language_model.layers.*.mlp.down_proj",
+            "lm_head",
+        ]
+        for pattern in expected_patterns:
+            assert pattern in result
+
+        assert isinstance(result["model.language_model.layers.*.self_attn.q_proj"], ColwiseParallel)
+        assert isinstance(result["model.language_model.layers.*.self_attn.o_proj"], RowwiseParallel)
+        assert isinstance(result["model.language_model.layers.*.mlp.down_proj"], RowwiseParallel)
+        assert isinstance(result["lm_head"], ColwiseParallel)
+
+    def test_parallelize_gemma4_no_llama_style_prefix(self):
+        """Guard against regressing to Llama-style ``model.embed_tokens`` keys.
+
+        Gemma4 VLM's text backbone lives under ``model.language_model``; a
+        Llama-style key would silently no-op under parallelize_module and
+        leave embeddings unsharded.
+        """
+        model = MockModel("gemma4_conditional")
+        result = _parallelize_gemma4(model, sequence_parallel=False)
+
+        assert "model.embed_tokens" not in result
+        assert "model.layers.*.self_attn.q_proj" not in result
+
+    def test_parallelize_gemma4_sequence_parallel_warns_and_ignored(self):
+        """SP is unsupported for Gemma4; requesting it should warn, not raise."""
+        model = MockModel("gemma4_conditional")
+
+        with pytest.warns(UserWarning, match="sequence_parallel=True is not yet supported for Gemma4"):
+            plan_sp = _parallelize_gemma4(model, sequence_parallel=True)
+
+        plan_no_sp = _parallelize_gemma4(model, sequence_parallel=False)
+
+        # SP is silently ignored — plans must be identical.
+        assert set(plan_sp.keys()) == set(plan_no_sp.keys())
 
     def test_parallelize_gemma3_with_sequence_parallel(self):
         """Test _parallelize_gemma3 with sequence parallelism enabled."""
@@ -401,10 +448,16 @@ class TestParallelizeFunctionsMapping:
             LlamaForCausalLM,
             Gemma3ForCausalLM,
             Gemma3ForConditionalGeneration,
+            Gemma4ForConditionalGeneration,
         ]
 
         for model_type in expected_types:
             assert _get_class_qualname(model_type) in PARALLELIZE_FUNCTIONS
+
+    def test_gemma4_uses_parallelize_gemma4(self):
+        """Gemma4 VLM must dispatch to _parallelize_gemma4, not the Gemma3 or default plan."""
+        func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Gemma4ForConditionalGeneration)]
+        assert func is _parallelize_gemma4
 
     def test_mapping_functions_are_callable(self):
         """Test that all functions in the mapping are callable."""
@@ -420,6 +473,7 @@ class TestParallelizeFunctionsMapping:
             LlamaForCausalLM,
             Gemma3ForCausalLM,
             Gemma3ForConditionalGeneration,
+            Gemma4ForConditionalGeneration,
         ]
         for model_type in all_model_types:
             func = PARALLELIZE_FUNCTIONS[_get_class_qualname(model_type)]
@@ -474,16 +528,12 @@ class TestParallelPlanStructure:
             # Test without sequence parallel
             plan = func(model, sequence_parallel=False)
             for pattern, style in plan.items():
-                assert isinstance(style, valid_styles), (
-                    f"Invalid style {type(style)} for pattern {pattern}"
-                )
+                assert isinstance(style, valid_styles), f"Invalid style {type(style)} for pattern {pattern}"
 
             # Test with sequence parallel
             plan_sp = func(model, sequence_parallel=True)
             for pattern, style in plan_sp.items():
-                assert isinstance(style, valid_styles), (
-                    f"Invalid style {type(style)} for pattern {pattern} with SP"
-                )
+                assert isinstance(style, valid_styles), f"Invalid style {type(style)} for pattern {pattern} with SP"
 
     def test_module_patterns_are_strings(self):
         """Test that all module patterns are strings."""
