@@ -41,6 +41,11 @@ from PIL import Image as PILImage
 
 logger = logging.getLogger(__name__)
 
+# Default vision-tower patch merge kernel used by `_expand_image_tokens` and any
+# caller that needs to predict expanded image-token counts. Keep this as the
+# single source of truth so the two computations cannot silently drift apart.
+_DEFAULT_MERGE_KERNEL: Tuple[int, int] = (2, 2)
+
 # ---------------------------------------------------------------------------
 # Fake image fallback for FSDP / DeepSpeed Zero3
 # ---------------------------------------------------------------------------
@@ -647,7 +652,7 @@ def _expand_image_tokens(
     attention_mask: torch.Tensor,
     grid_thws: torch.Tensor,
     media_token_id: int,
-    merge_kernel_size: Tuple[int, int] = (2, 2),
+    merge_kernel_size: Tuple[int, int] = _DEFAULT_MERGE_KERNEL,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Expand single image placeholder tokens to the correct number based on grid_thws.
 
@@ -786,7 +791,7 @@ def kimi_k25_vl_collate_fn(
         # Only include image data if all expanded image tokens survived truncation.
         # Partial truncation into image regions would cause a mismatch in the model forward.
         if grid_thws is not None:
-            merge_h, merge_w = 2, 2
+            merge_h, merge_w = _DEFAULT_MERGE_KERNEL
             expected_image_tokens = sum(int((h // merge_h) * (w // merge_w)) for _, h, w in grid_thws.tolist())
             actual_image_tokens = (input_ids == media_token_id).sum().item()
             if actual_image_tokens == expected_image_tokens:
