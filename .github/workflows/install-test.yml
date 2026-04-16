@@ -151,6 +151,7 @@ jobs:
         python-version: ["3.12"]
     env:
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse
+      TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -174,9 +175,7 @@ jobs:
         if: steps.cuda-wheelhouse-cache.outputs.cache-hit != 'true'
         shell: bash -x -e -u -o pipefail {0}
         run: |
-          apt-get update
-          apt-get install -y python3 python3-pip python3-venv git
-          python3 -m venv ./venv
+          python -m venv ./venv
 
           . ./venv/bin/activate
 
@@ -192,9 +191,14 @@ jobs:
             transformer-engine-torch \
             "transformer-engine[pytorch]<=2.11.0"
 
-          # Fail fast if expected heavyweight CUDA wheels are missing.
+      - name: Verify CUDA wheelhouse contents
+        shell: bash -x -e -u -o pipefail {0}
+        run: |
+          # Ensure cache hit and freshly-built paths both provide the expected heavy wheels.
           ls -1 "${WHEELHOUSE_DIR}"/*.whl
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/causal_conv1d*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/mamba_ssm*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/nv_grouped_gemm*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
 
       - name: Upload CUDA wheelhouse artifact
