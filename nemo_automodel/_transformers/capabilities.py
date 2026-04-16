@@ -43,14 +43,10 @@ def _has_optimized_tp_plan(model_cls: type) -> bool:
     """Check if *model_cls* has an entry in ``PARALLELIZE_FUNCTIONS``."""
     from nemo_automodel.components.distributed.optimized_tp_plans import (
         PARALLELIZE_FUNCTIONS,
+        _get_class_qualname,
     )
 
-    def get_name(x):
-        if isinstance(x, str):
-            return x
-        return x.__name__
-
-    return model_cls in PARALLELIZE_FUNCTIONS or model_cls.__name__ in set(map(get_name, PARALLELIZE_FUNCTIONS))
+    return _get_class_qualname(model_cls) in PARALLELIZE_FUNCTIONS
 
 
 def _is_moe(model_cls: type) -> bool:
@@ -182,6 +178,7 @@ class ModelSupports:
         | Model kind       | Attention      | CP?     |
         +------------------+----------------+---------+
         | Custom           | TE             | Yes     |
+        | Custom hybrid    | TE / SDPA      | Yes     |
         | Custom           | FlexAttention  | No      |
         | HF (pure attn)   | SDPA           | Yes     |
         | HF (pure attn)   | no SDPA        | No      |
@@ -189,6 +186,9 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
+            if _is_hybrid(self._model):
+                backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+                return backend_attn in ("te", "sdpa")
             return _uses_te_attention(self._model)
         if _is_hybrid(self._model):
             return False
@@ -215,7 +215,7 @@ class ModelSupports:
     @property
     def supports_gradient_checkpointing(self) -> bool:
         """Gradient checkpointing is supported."""
-        if self.supports_ep:
+        if self.supports_ep and self.ep_size > 1:
             return False
         for cls in type(self._model).__mro__:
             if "supports_gradient_checkpointing" in cls.__dict__:
@@ -297,7 +297,16 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
         )
 
     if cp_size > 1 and not supports.supports_cp:
-        if _is_hybrid(model):
+        if _is_hybrid(model) and _has_backend(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for hybrid model {arch} "
+                f"requires the TE or SDPA attention backend (backend.attn='te' or 'sdpa').\n"
+                f"Please switch attention backend:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: te  # or sdpa"
+            )
+        elif _is_hybrid(model):
             errors.append(
                 f"Context parallelism (cp_size={cp_size}) is not supported for "
                 f"hybrid model {arch} (contains Mamba/SSM layers).\n"
@@ -378,10 +387,14 @@ def attach_capabilities_and_validate(model: "nn.Module", mesh: "MeshContext") ->
     Safe to call more than once -- subsequent calls are no-ops.
     """
     if "supports" not in type(model).__dict__:
-        model.__class__ = type(
-            model.__class__.__name__,
-            (model.__class__,),
+        orig_cls = model.__class__
+        new_cls = type(
+            orig_cls.__name__,
+            (orig_cls,),
             _build_class_dict(),
         )
+        new_cls.__module__ = orig_cls.__module__
+        new_cls.__qualname__ = orig_cls.__qualname__
+        model.__class__ = new_cls
     validate_for_mesh(model, mesh)
     return model

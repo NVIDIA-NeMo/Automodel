@@ -15,7 +15,13 @@
 # Finetuning config for DeepSeek V3.2 on HellaSwag
 # Replace /path/to/deepseek-v32 with the path to the DeepSeek V3.2 model
 
+# To run this recipe:
+#   automodel examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
 # Recipe validated using 256 H100 GPUs (32 nodes x 8)
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
@@ -122,3 +128,8 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
+
+ci:
+  recipe_owner: hemildesai
+  nodes: 32
+  time: "00:30:00"

@@ -31,6 +31,7 @@ from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -46,6 +47,7 @@ class NemotronV3Model(nn.Module):
         backend: BackendConfig | None = None,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         """Initialize NemotronV3Model.
 
@@ -53,17 +55,20 @@ class NemotronV3Model(nn.Module):
             config: NemotronH config with model parameters
             backend: Backend configuration for MoE and other components
             moe_config: MoE configuration (optional, will create default if None)
+            moe_overrides: Optional dict of overrides to apply to the default MoE config
         """
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.moe_config = moe_config or MoEConfig(
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+        moe_defaults = dict(
             n_routed_experts=config.n_routed_experts,
             n_shared_experts=1,  # NemotronV3 has 1 shared expert
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
-            train_gate=False,  # Router weights are trained but not using bias updates
+            train_gate=True,
             gate_bias_update_factor=0.0,
             aux_loss_coeff=0.0,  # No aux loss for NemotronV3
             score_func="sigmoid",  # NemotronV3 uses sigmoid scoring
@@ -82,6 +87,9 @@ class NemotronV3Model(nn.Module):
             force_e_score_correction_bias=True,  # NemotronV3 checkpoint has this buffer
             moe_latent_size=getattr(config, "moe_latent_size", None),
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # Embeddings
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
@@ -112,20 +120,7 @@ class NemotronV3Model(nn.Module):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Forward pass through the model.
-
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len] (optional)
-            attention_mask: 2D padding mask [batch_size, seq_len] (1=real, 0=padding)
-            causal_mask_mapping: Dict with precomputed 4D causal masks for attention layers
-            inputs_embeds: Input embeddings [batch_size, seq_len, hidden_size] (optional)
-            past_key_values: Optional NemotronHybridCache for incremental decoding.
-            cache_position: Token position indices for cache updates.
-            **kwargs: Additional arguments (ignored)
-
-        Returns:
-            Hidden states tensor [batch_size, seq_len, hidden_size]
-        """
+        """Forward pass through the model.  Supports BSHD ``[B, S, H]`` and THD ``[T, H]``."""
         # Get embeddings
         if inputs_embeds is None:
             if input_ids is None:
@@ -134,17 +129,34 @@ class NemotronV3Model(nn.Module):
         else:
             hidden_states = inputs_embeds
 
+        # When qkv_format="thd" is explicitly requested with batch_size=1,
+        # squeeze to 2D [T, H] so attention layers receive the correct shape
+        # for TE's thd qkv_format.  Note: cu_seqlens alone does NOT trigger
+        # the squeeze because cu_seqlens may be present solely for mamba's
+        # seq_idx construction (e.g. packed sequences with TE p2p CP where
+        # attention must stay in BSHD format).
+        squeezed_for_thd = False
+        if kwargs.get("qkv_format") == "thd" and hidden_states.dim() == 3 and hidden_states.shape[0] == 1:
+            hidden_states = hidden_states.squeeze(0)
+            squeezed_for_thd = True
+
+        is_thd = hidden_states.dim() == 2
+
         # TODO: attention mask currently does not work. A default causal mask is applied.
 
-        # Get 4D causal mask for attention layers (from precomputed masks)
+        # Get 4D causal mask for attention layers (from precomputed masks).
         causal_mask = causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else None
 
         # Apply transformer layers
         for layer in self.layers.values():
             # Pass appropriate mask based on layer type
-            if layer.block_type == "attention":
-                # Attention layers use 4D causal mask
-                mask = causal_mask
+            if is_thd:
+                mask = None
+            elif layer.block_type == "attention":
+                # Attention layers use 4D causal mask; fall back to 2D attention_mask
+                # when causal_mask is None (e.g. during TE+CP training where CP split
+                # removes the precomputed 4D mask) so TE can use padding_causal mode.
+                mask = causal_mask if causal_mask is not None else attention_mask
             elif layer.block_type == "mamba":
                 # Mamba layers use 2D padding mask during prefill, None during decode
                 mask = None if (past_key_values is not None and past_key_values.has_previous_state) else attention_mask
@@ -157,10 +169,15 @@ class NemotronV3Model(nn.Module):
                 attention_mask=mask,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
+                **kwargs,
             )
 
         # Final norm
         hidden_states = self.norm(hidden_states)
+
+        # Restore batch dimension if we squeezed for THD
+        if squeezed_for_thd:
+            hidden_states = hidden_states.unsqueeze(0)
 
         return hidden_states
 
@@ -250,7 +267,14 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         self.backend = backend or BackendConfig()
 
         # Base model
-        self.model = NemotronV3Model(config, backend=self.backend)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        moe_config = kwargs.pop("moe_config", None)
+        self.model = NemotronV3Model(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
         self.output_hidden_states = config.to_dict().get("output_hidden_states", False)
 
         # LM head
@@ -308,6 +332,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -315,32 +340,47 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
 
+        Supports both BSHD format (``input_ids`` shape ``[B, S]``) and THD format
+        (``input_ids`` shape ``[T]`` after ``squeeze_input_for_thd``).  When
+        ``kwargs["qkv_format"] == "thd"``, inputs are squeezed to THD before the
+        base-model forward and logits are unsqueezed back to ``[1, T, V]`` on exit.
+
         Args:
-            input_ids: Input token IDs [batch_size, seq_len] (optional)
-            attention_mask: 2D padding mask [batch_size, seq_len]
-            causal_mask_mapping: Dict with precomputed 4D causal masks
-            inputs_embeds: Pre-computed input embeddings (optional)
-            labels: Token IDs for loss computation [batch_size, seq_len] (optional)
+            input_ids: Input token IDs.  BSHD: ``[B, S]``; THD: ``[1, T]`` (squeezed internally).
+            attention_mask: 2D padding mask ``[B, S]``.
+            causal_mask_mapping: Dict with precomputed 4D causal masks.
+            inputs_embeds: Pre-computed input embeddings (optional).
+            labels: Token IDs for loss computation ``[B, S]`` (optional).
             past_key_values: Optional NemotronHybridCache for incremental decoding.
             use_cache: Whether to return past_key_values for subsequent steps.
             cache_position: Token position indices for cache updates.
-            position_ids: Unused – accepted for API compatibility with GenerationMixin.
+            position_ids: Unused -- accepted for API compatibility with GenerationMixin.
+            padding_mask: Padding mask ``[B, S]`` used by THD squeeze helper.
             logits_to_keep: If > 0, only compute logits for the last ``logits_to_keep``
                 token positions (avoids materialising the full logit matrix during generation).
-            output_hidden_states: Whether to return hidden states
-            return_dict: Accepted for API compatibility (always returns CausalLMOutputWithPast)
-            **kwargs: Additional arguments forwarded to the base model.
+            output_hidden_states: Whether to return hidden states.
+            return_dict: Accepted for API compatibility (always returns CausalLMOutputWithPast).
+            **kwargs: Additional arguments forwarded to the base model
+                (e.g. seq_idx, cu_seqlens, qkv_format, CP kwargs).
 
         Returns:
             :class:`~transformers.modeling_outputs.CausalLMOutputWithPast` with
-            ``logits`` (float32, ``[batch_size, seq_len, vocab_size]``), optional
-            ``loss``, ``past_key_values``, and ``hidden_states``.
+            ``logits`` (float32), optional ``loss``, ``past_key_values``, and
+            ``hidden_states``.
         """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config, "output_hidden_states", False)
         )
+
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
+                input_ids, position_ids, padding_mask, kwargs
+            )
+            attention_mask = None
+            causal_mask_mapping = None
 
         # Forward through base model
         hidden_states = self.model(
@@ -363,7 +403,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             logits = self.lm_head(hidden_states)
         else:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            if hidden_states.dim() == 2:
+                logits = self.lm_head(hidden_states[slice_indices, :])
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
@@ -374,6 +417,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
+
+        if is_thd:
+            logits = logits.unsqueeze(0)
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -439,8 +485,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         batch_size = input_ids.shape[0]
 
-        # Create cache on first call
-        if past_key_values is None:
+        # Create cache on first call, or replace non-NemotronHybridCache
+        # (transformers v5.5+ GenerationMixin may pre-create a DynamicCache)
+        if past_key_values is None or not isinstance(past_key_values, NemotronHybridCache):
             past_key_values = NemotronHybridCache(self.config, batch_size, self.dtype, self.device)
             # First call: cache_position covers the full prompt
             if cache_position is None:

@@ -14,9 +14,11 @@
 
 # Adjust batch config as needed.
 # Current config targeting DGX Spark
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 32
+  local_batch_size: 16
   ckpt_every_steps: 50
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 2
@@ -92,3 +94,7 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: akoumpa
+  nproc_per_node: 1

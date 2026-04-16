@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64
@@ -41,8 +43,8 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   strategy: fsdp2
@@ -87,9 +89,21 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
+ci:
+  recipe_owner: akoumpa
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
+    tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 5e-3
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

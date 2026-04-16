@@ -24,14 +24,29 @@ try:
     from deep_ep.utils import EventHandle, EventOverlap
 
     HAVE_DEEP_EP = True
-    Buffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", 20)))
 except ImportError:
     HAVE_DEEP_EP = False
+
+try:
+    import importlib.util
+
+    if importlib.util.find_spec("uccl") is None and importlib.util.find_spec("ep") is None:
+        raise ImportError("Neither uccl nor ep package is installed")
+    from nemo_automodel.components.moe.uccl_ep import UCCLBuffer
+    from nemo_automodel.components.moe.uccl_ep.buffer import EventHandle as UCCLEventHandle
+    from nemo_automodel.components.moe.uccl_ep.buffer import EventOverlap as UCCLEventOverlap
+
+    HAVE_UCCL_EP = True
+    # Default from env; overridden by MoEFlexTokenDispatcher.set_uccl_num_sms() at init time
+    UCCLBuffer.set_num_sms(int(os.environ.get("UCCL_EP_SM_NUMS", os.environ.get("DEEP_EP_SM_NUMS", 20))))
+except ImportError:
+    HAVE_UCCL_EP = False
 
 import torch
 
 _buffer = None
 _nvshmem_available = None
+_uccl_buffer = None
 
 
 def _is_nvshmem_available() -> bool:
@@ -293,6 +308,368 @@ if HAVE_DEEP_EP:
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
+    def set_deepep_num_sms(num_sms):
+        """Sets the number of SMs to use for DeepEP."""
+        Buffer.set_num_sms(num_sms)
+
 else:
     fused_dispatch = None
     fused_combine = None
+    set_deepep_num_sms = None
+
+
+# HybridEP support
+try:
+    from deep_ep import HybridEPBuffer
+
+    HAVE_HYBRIDEP = True
+except ImportError:
+    HAVE_HYBRIDEP = False
+
+_hybrid_ep_buffer = None
+
+
+def init_hybrid_ep_buffer(
+    group: torch.distributed.ProcessGroup,
+    hidden_dim: int,
+    seq_len: int,
+    num_local_experts: int,
+    num_sms_dispatch_api: int,
+    num_sms_combine_api: int,
+    fp8_dispatch: bool,
+) -> None:
+    """Initialize the HybridEP buffer, including buffer allocation and metadata initialization.
+
+    If a runtime dispatch/combine requires a larger buffer than the one
+    initialized, the buffer will be reallocated at runtime,
+    incuring extra run-time overhead.
+
+    Args:
+        group: Process group for HybridEP all-to-all communication.
+        hidden_dim: Hidden dimension of the input tensor.
+        seq_len: Maximum sequence length of the input tensor.
+        num_local_experts: Number of local experts.
+        num_sms_dispatch_api: Number of SMs used by the dispatch API.
+        num_sms_combine_api: Number of SMs used by the combine API.
+        fp8_dispatch: Whether to use FP8 communication during the dispatch phase.
+    """
+    assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+    global _hybrid_ep_buffer
+    _hybrid_ep_buffer = HybridEPBuffer(
+        group=group,
+        hidden_dim=hidden_dim,
+        max_num_of_tokens_per_rank=seq_len,
+        num_local_experts=num_local_experts,
+        use_fp8=fp8_dispatch,
+        num_sms_dispatch_api=num_sms_dispatch_api,
+        num_sms_combine_api=num_sms_combine_api,
+    )
+
+
+def reset_hybrid_ep_buffer():
+    """Reset the HybridEP buffer."""
+    global _hybrid_ep_buffer
+    _hybrid_ep_buffer = None
+
+
+class HybridEPDispatch(torch.autograd.Function):
+    """Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        routing_map,
+        probs,
+        group,
+        num_local_experts,
+        num_sms_dispatch_api=24,
+        num_sms_combine_api=24,
+        num_permuted_tokens=None,
+        pad_multiple=None,
+    ):
+        """Forward pass of fused dispatch of the HybridEP backend."""
+        if _hybrid_ep_buffer is None:
+            seq_len, hidden_dim = x.shape[-2:]
+            fp8_dispatch = False
+            init_hybrid_ep_buffer(
+                group,
+                hidden_dim,
+                seq_len,
+                num_local_experts,
+                num_sms_dispatch_api,
+                num_sms_combine_api,
+                fp8_dispatch,
+            )
+        non_blocking = num_permuted_tokens is not None
+        (
+            dispatched_hidden,
+            dispatched_probs,
+            dispatched_scaling_factor,
+            tokens_per_expert,
+            handle,
+        ) = _hybrid_ep_buffer.dispatch_with_permute(
+            hidden=x,
+            routing_map=routing_map,
+            probs=probs,
+            scaling_factor=None,
+            num_of_experts_per_rank=num_local_experts,
+            pad_multiple=pad_multiple,
+            num_permuted_tokens=num_permuted_tokens,
+            non_blocking=non_blocking,
+        )
+
+        ctx.handle = handle
+        ctx.pad_multiple = pad_multiple
+        return (
+            dispatched_hidden,
+            dispatched_probs,
+            dispatched_scaling_factor,
+            tokens_per_expert,
+            handle,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_x, grad_probs, grad_scaling_factor, grad_tokens_per_expert, grad_handle):
+        """Backward pass of fused dispatch of the HybridEP backend."""
+        handle = ctx.handle
+        combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
+            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+        )
+        return combined_hidden, None, combined_probs, None, None, None, None, None, None
+
+
+class HybridEPCombine(torch.autograd.Function):
+    """Fused combine operation for permute + combine a2a + permute using the HybridEP backend."""
+
+    @staticmethod
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
+        """Forward pass of fused combine of the HybridEP backend."""
+        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
+            hidden=x, handle=handle, pad_multiple=pad_multiple
+        )
+        ctx.handle = handle
+        ctx.pad_multiple = pad_multiple
+        ctx.num_permuted_tokens = num_permuted_tokens
+        return combined_hidden
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        """Backward pass of fused combine of the HybridEP backend."""
+        handle = ctx.handle
+        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+            hidden=grad_x,
+            scaling_factor=None,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            num_permuted_tokens=ctx.num_permuted_tokens,
+        )
+        return dispatched_hidden, None, None, None
+
+
+if HAVE_HYBRIDEP:
+
+    def hybrid_ep_dispatch(
+        x,
+        routing_map,
+        probs,
+        group,
+        num_local_experts,
+        num_sms_dispatch_api=24,
+        num_sms_combine_api=24,
+        num_permuted_tokens=None,
+        pad_multiple=None,
+    ):
+        """Perform fused dispatch for permute + dispatch a2a + permute using the HybridEP backend."""
+        return HybridEPDispatch.apply(
+            x,
+            routing_map,
+            probs,
+            group,
+            num_local_experts,
+            num_sms_dispatch_api,
+            num_sms_combine_api,
+            num_permuted_tokens,
+            pad_multiple,
+        )
+
+    def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None):
+        """Perform fused combine for unpermute + combine a2a + unpermute using the HybridEP backend."""
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+
+else:
+    hybrid_ep_dispatch = None
+    hybrid_ep_combine = None
+
+
+def get_uccl_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
+    """Get or create a UCCL-EP buffer for all-to-all communication."""
+    global _uccl_buffer
+    num_nvl_bytes, num_rdma_bytes = 0, 0
+    for config in (
+        UCCLBuffer.get_dispatch_config(group.size()),
+        UCCLBuffer.get_combine_config(group.size()),
+    ):
+        num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
+        num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+
+    if (
+        _uccl_buffer is None
+        or _uccl_buffer.group != group
+        or _uccl_buffer.num_nvl_bytes < num_nvl_bytes
+        or _uccl_buffer.num_rdma_bytes < num_rdma_bytes
+    ):
+        _uccl_buffer = UCCLBuffer(group, num_nvl_bytes, num_rdma_bytes)
+    return _uccl_buffer
+
+
+class UCCLFusedDispatch(torch.autograd.Function):
+    """Fused dispatch using UCCL-EP instead of DeepEP."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        previous_event = None
+        if async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        buffer = get_uccl_buffer(group, get_hidden_bytes(x))
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            layout_event,
+        ) = buffer.get_dispatch_layout(
+            token_indices,
+            num_experts,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        recv_x, recv_token_indices, recv_token_probs, num_recv_tokens_per_expert_list, handle, after_event = (
+            buffer.dispatch(
+                x,
+                topk_idx=token_indices,
+                topk_weights=token_probs,
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                previous_event=layout_event,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+        ctx.handle = handle
+        ctx.group = group
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle):
+        buffer = get_uccl_buffer(ctx.group, get_hidden_bytes(grad_output))
+        handle = ctx.handle
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        grad_x, grad_token_probs, after_event = buffer.combine(
+            grad_output.contiguous(),
+            handle,
+            topk_weights=grad_token_probs.float(),
+            previous_event=previous_event,
+            async_finish=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, grad_token_probs, None, None, None, None
+
+
+class UCCLFusedCombine(torch.autograd.Function):
+    """Fused combine using UCCL-EP instead of DeepEP."""
+
+    @staticmethod
+    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+        previous_event = None
+        if async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        buffer = get_uccl_buffer(group, get_hidden_bytes(x))
+        combined_x, _, after_event = buffer.combine(
+            x,
+            handle=handle,
+            async_finish=async_finish,
+            previous_event=previous_event,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+        ctx.handle = handle
+        ctx.group = group
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        return combined_x, None
+
+    @staticmethod
+    def backward(ctx, grad_output, _grad_event=None):
+        previous_event = None
+        if ctx.async_finish:
+            previous_event = UCCLEventOverlap(UCCLEventHandle())
+        buffer = get_uccl_buffer(ctx.group, get_hidden_bytes(grad_output))
+        grad_x, _, _, _, _, after_event = buffer.dispatch(
+            grad_output.contiguous(),
+            handle=ctx.handle,
+            previous_event=previous_event,
+            async_finish=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, None, None, None
+
+
+if HAVE_UCCL_EP:
+
+    def uccl_fused_dispatch(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Perform fused dispatch using UCCL-EP."""
+        return UCCLFusedDispatch.apply(
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
+    def uccl_fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+        """Perform fused combine using UCCL-EP."""
+        return UCCLFusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
+
+    def set_uccl_num_sms(num_sms):
+        """Sets the number of SMs to use for UCCL-EP."""
+        UCCLBuffer.set_num_sms(num_sms)
+
+else:
+    uccl_fused_dispatch = None
+    uccl_fused_combine = None
+    set_uccl_num_sms = None

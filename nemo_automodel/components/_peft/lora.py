@@ -20,6 +20,8 @@ from typing import Any, Literal, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_kernel import (
@@ -188,8 +190,16 @@ class LinearLoRA(nn.Linear):
         assert lora_dtype is None or isinstance(lora_dtype, torch.dtype)
         dtype = lora_dtype or obj.weight.dtype
 
-        obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
-        obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
+        if HAS_TE and isinstance(obj, transformer_engine.pytorch.Linear):
+            obj.lora_A = transformer_engine.pytorch.Linear(
+                in_features=in_features, out_features=dim, bias=False, device=device, params_dtype=dtype
+            )
+            obj.lora_B = transformer_engine.pytorch.Linear(
+                in_features=dim, out_features=out_features, bias=False, device=device, params_dtype=dtype
+            )
+        else:
+            obj.lora_A = nn.Linear(in_features, dim, bias=False, dtype=dtype, device=device)
+            obj.lora_B = nn.Linear(dim, out_features, bias=False, dtype=dtype, device=device)
         LinearLoRA.init_lora_weights(obj, lora_A_init_method)
         obj.dropout_p = dropout
         assert dropout_position in ["pre", "post"], ("dropout position can only be pre/post", dropout_position)
@@ -236,7 +246,21 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            res = F.linear(x, self.weight, bias)
+            # bmm avoids aten.view which cannot flatten a sharded dimension.
+            # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
+            # (sequence parallelism) or during AOT-autograd tracing with compile.
+            _x_needs_bmm = (
+                isinstance(x, DTensor)
+                and x.dim() == 3
+                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
+            )
+            if torch.compiler.is_compiling() or _x_needs_bmm:
+                b = x.shape[0]
+                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
+                if bias is not None:
+                    res = res + bias
+            else:
+                res = F.linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":
@@ -411,6 +435,10 @@ def patch_linear_module(
             assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), (
                 "quant_state is not supported with transformer_engine.pytorch.Linear"
             )
+        orig_linear.super_fwd = orig_linear.forward
+    elif HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
+        # Delegate base computation to TE's forward so TE kernels (including FP8)
+        # are used instead of falling back to F.linear().
         orig_linear.super_fwd = orig_linear.forward
 
     orig_linear.__class__ = new_cls

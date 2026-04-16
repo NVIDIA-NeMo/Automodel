@@ -82,13 +82,11 @@ export AUTOMODEL_INSTALL=all #(cuda, moe, vlm, ...)
 export BASE_IMAGE=pytorch #(cuda, pytorch)
 
 # Dependency install options [True, False]
-export INSTALL_DEEPEP=True
 export INSTALL_TE=True
 
 docker build -f docker/Dockerfile \
     --build-arg AUTOMODEL_INSTALL=$AUTOMODEL_INSTALL \
     --build-arg BASE_IMAGE=$BASE_IMAGE \
-    --build-arg INSTALL_DEEPEP=$INSTALL_DEEPEP \
     --build-arg INSTALL_MAMBA=$INSTALL_MAMBA \
     -t automodel --target=automodel_final .
 ```
@@ -139,6 +137,28 @@ Format:
 ruff check --fix .
 ruff format .
 ```
+
+## Pre-commit
+
+We recommand to use [perk](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
+
+Installation:
+
+```bash
+uv tool install perk
+```
+
+Usage:
+
+```bash
+# Install git hooks
+perk install
+
+# Run manually on all files
+perk run --all-files
+```
+
+After installing the git hooks, `git commit` will automatically run incremental checks.
 
 ## Adding Documentation
 

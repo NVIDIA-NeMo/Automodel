@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -71,11 +71,11 @@ class TestGetClosestValidFrameCount:
         [
             (1, 1),
             (2, 1),
-            (3, 1),   # equidistant, pick lower
+            (3, 1),  # equidistant, pick lower
             (4, 5),
             (5, 5),
             (6, 5),
-            (7, 5),   # equidistant, pick lower
+            (7, 5),  # equidistant, pick lower
             (8, 9),
             (9, 9),
             (10, 9),
@@ -150,11 +150,15 @@ class TestEncodeVideo:
         mock_dist.latent_dist.sample.return_value = latent_sample
         vae.encode.return_value = mock_dist
 
-        return {
-            "vae": vae,
-            "dtype": torch.float32,
-            "device": "cpu",
-        }, latent_mean, latent_sample
+        return (
+            {
+                "vae": vae,
+                "dtype": torch.float32,
+                "device": "cpu",
+            },
+            latent_mean,
+            latent_sample,
+        )
 
     def test_encode_video_deterministic(self, processor):
         models, latent_mean, _ = self._make_mock_models()
@@ -294,7 +298,7 @@ class TestEncodeFirstFrame:
         models = {"pipeline": pipeline, "dtype": torch.float16}
         frame = Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8))
 
-        result = processor.encode_first_frame(frame, models, device="cpu")
+        processor.encode_first_frame(frame, models, device="cpu")
         pipeline.encode_image.assert_called_once()
         # When input is PIL, it should be passed as-is
         call_kwargs = pipeline.encode_image.call_args

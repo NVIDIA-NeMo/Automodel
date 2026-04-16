@@ -22,6 +22,8 @@ HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_CUDA = torch.cuda.is_available()
 SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
@@ -31,8 +33,6 @@ from nemo_automodel.components.moe.experts import (
     get_expert_activation_for_deepep,
     is_gated_activation,
 )
-from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
@@ -486,6 +486,124 @@ class TestGroupedExperts:
             pytest.fail(f"GPU execution failed: {e}")
 
 
+class TestGroupedExpertsForwardLoopDTensorBias:
+    """Test that _forward_loop correctly handles DTensor biases.
+
+    When expert parallelism shards bias parameters as DTensors, the
+    _forward_loop path must convert them to local tensors before arithmetic
+    with the plain-tensor matmul outputs.  A missing conversion causes:
+        RuntimeError: aten.add.Tensor got mixed torch.Tensor and DTensor
+    """
+
+    @staticmethod
+    def _init_experts(moe_config, device):
+        moe_config.expert_bias = True
+        experts = GroupedExperts(moe_config)
+        experts = experts.to(device)
+        with torch.no_grad():
+            for p in experts.parameters():
+                p.normal_(0, 0.02)
+        return experts
+
+    def test_forward_loop_with_bias_produces_correct_shape(self, moe_config, device):
+        """Forward pass with expert_bias=True through _forward_loop should work."""
+        experts = self._init_experts(moe_config, device)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device
+        )
+
+        output = experts(x, token_mask, weights, indices)
+        assert output.shape == x.shape
+
+    def test_forward_loop_bias_affects_output(self, moe_config, device):
+        """Verify that biases actually influence the output (not silently ignored)."""
+        experts = self._init_experts(moe_config, device)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device
+        )
+
+        # Output with zero biases
+        with torch.no_grad():
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+        output_zero_bias = experts(x, token_mask, weights, indices)
+
+        # Output with non-zero biases
+        with torch.no_grad():
+            experts.gate_up_proj_bias.fill_(1.0)
+            experts.down_proj_bias.fill_(1.0)
+        output_nonzero_bias = experts(x, token_mask, weights, indices)
+
+        assert not torch.allclose(output_zero_bias, output_nonzero_bias), (
+            "Bias should change the output"
+        )
+
+    def test_forward_loop_dtensor_bias_converted_to_local(self, moe_config, device, monkeypatch):
+        """Verify that isinstance(bias, DTensor) triggers .to_local() in forward.
+
+        We monkeypatch the isinstance check in experts.py so that the plain
+        bias tensors are treated as DTensors.  A .to_local() method is attached
+        to confirm the conversion path is exercised.
+        """
+        import builtins
+
+        from torch.distributed.tensor import DTensor
+
+        experts = self._init_experts(moe_config, device)
+
+        to_local_calls = []
+        original_isinstance = builtins.isinstance
+
+        def patched_isinstance(obj, classinfo):
+            """Make bias parameters appear as DTensor instances."""
+            if original_isinstance(classinfo, type) and classinfo is DTensor:
+                if hasattr(obj, "_fake_dtensor"):
+                    return True
+            if original_isinstance(classinfo, tuple) and DTensor in classinfo:
+                if hasattr(obj, "_fake_dtensor"):
+                    return True
+            return original_isinstance(obj, classinfo)
+
+        def fake_to_local(self_tensor):
+            to_local_calls.append(self_tensor)
+            return self_tensor.data
+
+        # Mark biases as fake DTensors and add .to_local()
+        experts.gate_up_proj_bias._fake_dtensor = True
+        experts.gate_up_proj_bias.to_local = lambda: fake_to_local(experts.gate_up_proj_bias)
+        experts.down_proj_bias._fake_dtensor = True
+        experts.down_proj_bias.to_local = lambda: fake_to_local(experts.down_proj_bias)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, moe_config.n_activated_experts, dtype=torch.bfloat16, device=device)
+        indices = torch.randint(
+            0, moe_config.n_routed_experts, (num_tokens, moe_config.n_activated_experts), device=device
+        )
+
+        monkeypatch.setattr(builtins, "isinstance", patched_isinstance)
+        try:
+            output = experts(x, token_mask, weights, indices)
+        finally:
+            monkeypatch.undo()
+
+        assert output.shape == x.shape
+        assert len(to_local_calls) >= 2, (
+            f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
+        )
+
+
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
@@ -561,6 +679,38 @@ class TestGroupedExpertsDeepEP:
         )
 
         assert result.shape == value.shape
+
+    def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
+        """Test GroupedExpertsDeepEP initialization with hybridep backend."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+
+        assert experts.dispatcher_backend == "hybridep"
+        assert experts.dispatcher_num_sms == 24
+        assert experts.config == moe_config
+
+    def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
+        """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.get_group.return_value = Mock()
+
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher:
+            mock_dispatcher.return_value = Mock()
+
+            experts.init_token_dispatcher(mock_mesh)
+
+            # Verify the TokenDispatcherConfig was created with hybridep settings
+            call_kwargs = mock_dispatcher.call_args
+            config_arg = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
+            if config_arg is None:
+                config_arg = call_kwargs[0][2]  # positional arg
+            assert config_arg.moe_flex_dispatcher_backend == "hybridep"
+            assert config_arg.moe_hybridep_num_sms == 24
+            assert config_arg.moe_deepep_num_sms == 24
+
 
 class TestNonGatedActivations:
     """Test non-gated activation support (ReLU²) for memory-efficient MoE.

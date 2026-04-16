@@ -64,12 +64,12 @@ runs:
         echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         ref: ${{ steps.sha.outputs.main }}
 
     - name: Setup python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: 3.12
 
@@ -78,7 +78,11 @@ runs:
       run: |
         echo "::group::Install Azure CLI"
         # Create systemd override for proper dependencies
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        for i in 1 2 3; do
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
+          echo "Attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
         echo "::endgroup::"
 
     - name: Azure Login
@@ -96,8 +100,11 @@ runs:
     - name: Install GH CLI
       shell: bash
       run: |
-        apt-get update
-        apt-get install -y gh
+        for i in 1 2 3; do
+          apt-get update && apt-get install -y gh && break
+          echo "Attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
 
     - name: Normalize repo name to lowercase
       shell: bash
@@ -143,7 +150,6 @@ runs:
         context: .
         build-args: |
           BASE_IMAGE=pytorch
-          INSTALL_DEEPEP=True
         cache-from: |
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
           type=registry,ref=${{ env.container-registry }}/${{ env.REPO_LOWER }}:main-buildcache,mode=max

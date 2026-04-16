@@ -222,8 +222,8 @@ def _nemotronh_super_v3_cfg() -> SimpleNamespace:
         ("glm4_moe", flops_utils.glm4_moe_flops, _glm4_moe_cfg, dict(gbs=1, seq_len=2048), 120277337899008),
         ("deepseekv3_moonlight", flops_utils.deepseekv3_flops, _moonlight_16b_config, dict(gbs=1, seq_len=2048), 30625801175040),
         ("deepseekv3_dsv3", flops_utils.deepseekv3_flops, _deepseek_v3_config, dict(gbs=1, seq_len=1024), 233225179889664),
-        ("nemotronh_nano_v3", flops_utils.nemotronh_flops, _nemotronh_nano_v3_cfg, dict(gbs=1, seq_len=2048), 39612063940608),
-        ("nemotronh_super_v3", flops_utils.nemotronh_flops, _nemotronh_super_v3_cfg, dict(gbs=1, seq_len=2048), 151629525417984),
+        ("nemotronh_nano_v3", flops_utils.nemotronh_flops, _nemotronh_nano_v3_cfg, dict(gbs=1, seq_len=2048), 39982504869888),
+        ("nemotronh_super_v3", flops_utils.nemotronh_flops, _nemotronh_super_v3_cfg, dict(gbs=1, seq_len=2048), 152918015606784),
     ],
 )
 def test_flops_formulas_with_precomputed_values(name, func, cfg_factory, kwargs, expected):

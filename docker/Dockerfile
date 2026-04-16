@@ -38,13 +38,14 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973
-RUN apt-get update && apt install -y --only-upgrade gnupg && \
+# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
-ENV UV_VERSION="0.8.22"
+ENV UV_VERSION="0.10.11"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
@@ -74,22 +75,29 @@ RUN if [ "$INSTALL_TE" = "True" ]; then \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install Deepep
+# Install HybridEP
+## Dependency: RDMA Core
+RUN git clone https://github.com/linux-rdma/rdma-core.git && \
+    cd rdma-core && git checkout tags/v60.0 && sh build.sh
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+## Use stub of libnvidia-ml-dev during build only
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libnvidia-ml-dev
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG INSTALL_DEEPEP=False
-ARG DEEPEP_COMMIT=1dddd194c26911c35b4f53a148617dd73de0ffc9
-RUN if [ "$INSTALL_DEEPEP" = "True" ]; then \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && \
-    git pull && \
+ARG DEEPEP_COMMIT=7febc6e25660af0f54d95dd781ecdcd62265ecca
+RUN git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+ENV HYBRID_EP_MULTINODE=1
+RUN cd DeepEP && \
     git fetch origin $DEEPEP_COMMIT && \
     git checkout FETCH_HEAD && \
     patch -p1 < /opt/deepep.patch && \
     pip install --no-cache-dir nvidia-nvshmem-cu13==3.4.5 && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 pip install --no-build-isolation . && \
+    apt-get purge -y libnvidia-ml-dev && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
     rm -rf /opt/deepep.patch && \
-    rm -rf DeepEP; \
-    fi
+    cd / && rm -rf DeepEP rdma-core
 
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
@@ -108,14 +116,26 @@ RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     cd ../ && rm -rf bitsandbytes; \
     fi
 
+# Install UCCL-EP (Azure-compatible RDMA for expert parallelism)
+COPY scripts/setup_uccl_ep.sh /opt/setup_uccl_ep.sh
+ARG INSTALL_UCCL_EP=False
+RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
+    bash /opt/setup_uccl_ep.sh --no-efa && \
+    rm -f /opt/setup_uccl_ep.sh; \
+    fi
+
 # Address base image CVE
 RUN pip install "aiohttp>=3.13.3" \
+        "black>=26.3.1" \
         "jaraco-context>=6.1.0" \
         "nbconvert>=7.17.0" \
+        "onnx>=1.21.0" \
         "pillow>=12.1.1" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
-        "urllib3>=2.6.0"
+        "tornado>=6.5.5" \
+        "urllib3>=2.6.0" && \
+    rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
 
@@ -130,16 +150,46 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    --mount=type=cache,target=/root/.cache/uv \
-    if [ "$BASE_IMAGE" = "pytorch" ]; then \
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    uv cache prune --ci
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
+
+# Rebuild torchcodec from source to match the container's PyTorch ABI
+RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+    pip install --no-build-isolation --force-reinstall --no-deps \
+        git+https://github.com/pytorch/torchcodec.git@v0.8.0
+
+# Patch wandb-core: bump vulnerable Go deps (CVE fixes)
+ARG TARGETARCH
+RUN if python3 -c "import wandb" 2>/dev/null; then \
+        GRPC_VERSION=1.79.3 && \
+        OTEL_VERSION=1.35.0 && \
+        GO_VERSION=1.26.1 && \
+        WANDB_VERSION=$(python3 -c "import wandb; print(wandb.__version__)") && \
+        WANDB_CORE_BIN=/opt/venv/lib/python3.12/site-packages/wandb/bin/wandb-core && \
+        curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /tmp -xz && \
+        export PATH="/tmp/go/bin:$PATH" && \
+        export GOPATH=/tmp/gopath && \
+        git clone --depth 1 --branch "v${WANDB_VERSION}" https://github.com/wandb/wandb.git /tmp/wandb-src && \
+        cd /tmp/wandb-src/core && \
+        go get google.golang.org/grpc@v${GRPC_VERSION} && \
+        go get go.opentelemetry.io/otel/sdk@v${OTEL_VERSION} && \
+        go mod tidy && \
+        go mod vendor && \
+        CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
+            -o "${WANDB_CORE_BIN}" ./cmd/wandb-core/ && \
+        rm -rf /tmp/wandb-src /tmp/go /tmp/gopath; \
+    else \
+        echo "wandb not installed, skipping CVE patch"; \
+    fi
 
 COPY . /opt/Automodel
+
+# Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi
 
 WORKDIR /opt/Automodel
 

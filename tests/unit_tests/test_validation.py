@@ -27,6 +27,7 @@ from nemo_automodel._transformers.capabilities import (
     attach_capabilities_and_validate,
     validate_for_mesh,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
 _PARALLELIZE_PATH = "nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS"
 
@@ -84,13 +85,16 @@ def _mesh(tp=1, pp=1, cp=1, ep=1):
 
 def _attach(model):
     """Inject capabilities without validation (for testing supports properties)."""
-    if "supports" in type(model).__dict__:
-        return model
-    model.__class__ = type(
-        model.__class__.__name__,
-        (model.__class__,),
-        _build_class_dict(),
-    )
+    if "supports" not in type(model).__dict__:
+        orig_cls = model.__class__
+        new_cls = type(
+            orig_cls.__name__,
+            (orig_cls,),
+            _build_class_dict(),
+        )
+        new_cls.__module__ = orig_cls.__module__
+        new_cls.__qualname__ = orig_cls.__qualname__
+        model.__class__ = new_cls
     return model
 
 
@@ -137,6 +141,14 @@ class TestAttachCapabilities:
         _attach(model)
         assert type(model).__name__ == "_Bare"
 
+    def test_preserves_module_and_qualname(self):
+        orig_module = _Bare.__module__
+        orig_qualname = _Bare.__qualname__
+        model = _Bare()
+        _attach(model)
+        assert type(model).__module__ == orig_module
+        assert type(model).__qualname__ == orig_qualname
+
     def test_attach_and_validate_calls_validation(self):
         model = _Bare()
         with patch(_PARALLELIZE_PATH, {}):
@@ -153,7 +165,7 @@ class TestModelSupportsTP:
     def test_tp_true_with_optimized_plan(self):
         model = _Bare()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {_Bare: lambda: {}}):
+        with patch(_PARALLELIZE_PATH, {_get_class_qualname(_Bare): lambda model, sp: {}}):
             assert model.supports.supports_tp is True
 
     def test_tp_true_with_hf_native_plan(self):
