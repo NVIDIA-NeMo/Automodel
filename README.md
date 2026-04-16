@@ -22,6 +22,7 @@
 
 ## 📣 News and Discussions
 - [04/16/2026][**Qwen3.6 MoE**](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) We now support finetuning `Qwen/Qwen3.6-35B-A3B`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml).
+- [04/16/2026][**LLaVA-OneVision-1.5**](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct) We now support finetuning `lmms-lab/LLaVA-OneVision-1.5-4B-Instruct`, thanks to @vgauraha62. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml).
 - [04/12/2026][**MiniMax-M2.7**](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) We now support finetuning `MiniMaxAI/MiniMax-M2.7`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml).
 - [04/07/2026][**GLM-5.1**](https://huggingface.co/zai-org/GLM-5.1) We now support finetuning `zai-org/GLM-5.1`. GLM-5.1 is Zhipu AI's latest open-source MoE model featuring MLA + DeepSeek Sparse Attention. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) and [discussion](https://github.com/NVIDIA-NeMo/Automodel/discussions/1719).
 - [04/02/2026][**Gemma 4**](https://huggingface.co/collections/google/gemma-4) We support fine-tuning for Gemma4 (2B, 4B, 31B, 26BA4B)! Check out our [recipes](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune/gemma4).
