@@ -1206,6 +1206,20 @@ def pad_collate_fn(
         "attention_mask": torch.stack(padded_attention_mask),
     }
 
+    # Pad sequence-length tensors that mirror input_ids (e.g. mm_token_type_ids)
+    for seq_key in ("mm_token_type_ids",):
+        if any(seq_key in ex for ex in examples):
+            padded = []
+            for ex in examples:
+                t = ex.get(seq_key)
+                if t is None:
+                    padded.append(torch.zeros(pad_to, dtype=torch.long))
+                else:
+                    t = t[0] if t.dim() == 2 else t
+                    p = pad_to - t.shape[0]
+                    padded.append(torch.cat([t, torch.zeros(p, dtype=t.dtype)]) if p > 0 else t[:pad_to])
+            batch[seq_key] = torch.stack(padded)
+
     # ------------------------------------------------------------------
     # Autoregressive shift: labels[t] predicts input_ids[t+1]
     # ------------------------------------------------------------------
@@ -1252,7 +1266,7 @@ def pad_collate_fn(
                 video_counts.append(0)
         batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
-    for key in ("image_grid_thw", "video_grid_thw"):
+    for key in ("image_grid_thw", "video_grid_thw", "image_position_ids"):
         tensors = [ex[key] for ex in examples if key in ex and ex[key] is not None]
         if tensors:
             batch[key] = torch.cat(tensors, dim=0)

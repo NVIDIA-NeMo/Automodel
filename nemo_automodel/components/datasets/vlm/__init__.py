@@ -20,6 +20,7 @@ from .datasets import (
     make_rdr_dataset,
     make_unimm_chat_dataset,
 )
+from .mock import build_mock_vlm_dataset
 from .samplers import LengthGroupedSampler
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "make_cord_v2_dataset",
     "make_unimm_chat_dataset",
     "make_meta_dataset",
+    "build_mock_vlm_dataset",
     "PreTokenizedDatasetWrapper",
     "RobustDatasetWrapper",
     "LengthGroupedSampler",
