@@ -108,6 +108,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  vllm_deploy: true
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
@@ -117,8 +118,6 @@ ci:
     check_fused_qkv_keys: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  vllm_deploy:
-    enabled: true
 
 # Uncomment and configure for W&B logging
 # wandb:

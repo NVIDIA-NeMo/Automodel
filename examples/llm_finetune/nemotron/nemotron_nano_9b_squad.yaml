@@ -102,6 +102,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:25:00"
   checkpoint_robustness:
@@ -110,7 +111,3 @@ ci:
     tokenizer_name: nvidia/NVIDIA-Nemotron-Nano-9B-v2
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  vllm_deploy:
-    enabled: true
-    extra_deps:
-      - "mamba-ssm"

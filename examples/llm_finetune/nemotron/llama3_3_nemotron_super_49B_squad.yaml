@@ -119,6 +119,7 @@ ci:
   recipe_owner: akoumpa
   nodes: 2
   time: "00:45:00"
+  vllm_deploy: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 8
@@ -126,5 +127,3 @@ ci:
     hf_device_map_auto: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  vllm_deploy:
-    enabled: true

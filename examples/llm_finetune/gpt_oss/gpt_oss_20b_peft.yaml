@@ -115,6 +115,8 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
@@ -123,9 +125,6 @@ ci:
     no_check_resume: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
-  vllm_deploy:
-    enabled: true
-    smoke_test: true
 
 # Uncomment and configure for W&B logging
 # wandb:
