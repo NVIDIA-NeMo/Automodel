@@ -84,8 +84,9 @@ def maybe_init_distributed(cfg):
 def load_pipeline(cfg, dist_info):
     """Load the diffusion pipeline, auto-detecting model type.
 
-    Uses DiffusionPipeline for single-GPU or NeMoAutoDiffusionPipeline for
-    distributed inference with parallelization.
+    Uses NeMoAutoDiffusionPipeline for both single-GPU and distributed
+    inference. When no distributed config is present, parallelization is
+    skipped automatically.
 
     Args:
         cfg: Config node with `model.pretrained_model_name_or_path`.
@@ -94,7 +95,7 @@ def load_pipeline(cfg, dist_info):
     Returns:
         A diffusers pipeline instance.
     """
-    from diffusers import DiffusionPipeline
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
     model_id = cfg.model.pretrained_model_name_or_path
     dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
@@ -105,28 +106,25 @@ def load_pipeline(cfg, dist_info):
     if torch_dtype == torch.bfloat16:
         patch_t5_layer_norm()
 
+    # Build parallel_scheme from distributed config (None for single-GPU).
+    parallel_scheme = None
     if dist_info is not None and hasattr(cfg.distributed, "parallel_scheme"):
-        # Distributed path: use NeMoAutoDiffusionPipeline with parallelization
-        from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-
         parallel_scheme = _build_parallel_scheme(cfg.distributed.parallel_scheme, dist_info)
-        pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype,
-            parallel_scheme=parallel_scheme,
-        )
-        logger.info("Loaded distributed pipeline: %s", type(pipe).__name__)
-    else:
-        # Single-GPU path: standard diffusers auto-detection
-        pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=torch_dtype)
-        # Skip .to("cuda") when CPU offload is configured — enable_model_cpu_offload()
-        # expects the pipeline on CPU so it can set up per-module device hooks.
-        vae_cfg = getattr(cfg, "vae", None)
-        if not (vae_cfg is not None and getattr(vae_cfg, "enable_cpu_offload", False)):
-            pipe.to("cuda")
-        logger.info("Loaded pipeline: %s", type(pipe).__name__)
+
+    # CPU offload requires modules to stay on CPU so enable_model_cpu_offload()
+    # can install per-module device hooks (called later in apply_optimizations).
+    vae_cfg = getattr(cfg, "vae", None)
+    cpu_offload = vae_cfg is not None and getattr(vae_cfg, "enable_cpu_offload", False)
+
+    pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch_dtype,
+        parallel_scheme=parallel_scheme,
+        move_to_device=not cpu_offload,
+    )
 
     _fix_text_encoder_weight_tying(pipe)
+    logger.info("Loaded pipeline: %s (distributed=%s)", type(pipe).__name__, parallel_scheme is not None)
     return pipe
 
 
@@ -211,6 +209,7 @@ def load_checkpoint_into_pipeline(pipe, cfg):
 
     ema_path = checkpoint_dir / "ema_shadow.pt"
     consolidated_path = checkpoint_dir / "consolidated_model.bin"
+    consolidated_st_dir = checkpoint_dir / "model" / "consolidated"
     sharded_dir = checkpoint_dir / "model"
 
     if ema_path.exists():
@@ -225,6 +224,13 @@ def load_checkpoint_into_pipeline(pipe, cfg):
             state_dict = state_dict["model_state_dict"]
         pipe.transformer.load_state_dict(state_dict, strict=True)
         logger.info("Loaded consolidated checkpoint")
+    elif consolidated_st_dir.is_dir() and any(
+        name.endswith(".safetensors") for name in os.listdir(consolidated_st_dir)
+    ):
+        logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_st_dir)
+        pipe.transformer = type(pipe.transformer).from_pretrained(str(consolidated_st_dir), torch_dtype=torch_dtype)
+        pipe.transformer.to("cuda")
+        logger.info("Loaded consolidated safetensors checkpoint")
     elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
         logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
         pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
