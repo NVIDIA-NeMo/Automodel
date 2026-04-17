@@ -91,7 +91,7 @@ runs:
 
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
-      if: ${{ contains(inputs.runner, 'aws') }}
+      if: ${{ contains(inputs.runner, 'aws') || contains(inputs.runner, 'gcp') }}
       run: |
         for i in 1 2 3; do
           apt-get update && apt-get install -y uuid-runtime && break
