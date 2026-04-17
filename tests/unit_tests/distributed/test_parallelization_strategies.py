@@ -583,12 +583,12 @@ class TestWanParallelizationStrategy:
         return mesh, dp_mesh, tp_mesh
 
     def _mock_env(self, monkeypatch, dp_mesh_sentinel=None):
-        # Mock get_submesh to return the known dp_mesh sentinel from the fixture,
+        # Mock get_fsdp_dp_mesh to return the known dp_mesh sentinel from the fixture,
         # so we can assert the correct mesh is forwarded to apply_fsdp.
         if dp_mesh_sentinel is not None:
             monkeypatch.setattr(
-                "nemo_automodel.components.distributed.parallelizer.get_submesh",
-                lambda mesh, names: dp_mesh_sentinel,
+                "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+                lambda mesh, *a, **kw: dp_mesh_sentinel,
             )
 
         fully_shard_mock = MagicMock(side_effect=lambda model, **kwargs: model)

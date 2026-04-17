@@ -361,7 +361,7 @@ class TestGetFsdpDpMesh:
 
         result = get_fsdp_dp_mesh(mesh)
 
-        mesh.__getitem__.assert_called_once_with("dp_shard")
+        mesh.__getitem__.assert_any_call("dp_shard")
         assert result._key == "dp_shard"
         # Returned mesh is a slice of the original, not a freshly built one.
         assert result._mesh is mesh
@@ -376,7 +376,7 @@ class TestGetFsdpDpMesh:
 
         result = get_fsdp_dp_mesh(mesh)
 
-        mesh.__getitem__.assert_called_once_with(("dp_replicate", "dp_shard"))
+        mesh.__getitem__.assert_any_call(("dp_replicate", "dp_shard"))
         assert result._key == ("dp_replicate", "dp_shard")
         assert result._mesh is mesh
 
@@ -390,7 +390,7 @@ class TestGetFsdpDpMesh:
 
         result = get_fsdp_dp_mesh(mesh)
 
-        mesh.__getitem__.assert_called_once_with(("dp_shard", "cp"))
+        mesh.__getitem__.assert_any_call(("dp_shard", "cp"))
         assert result._key == ("dp_shard", "cp")
         assert result._mesh is mesh
 
@@ -411,8 +411,10 @@ class TestGetFsdpDpMesh:
 
         mock_get_submesh.assert_called_once_with(mesh, ("dp_replicate", "dp_shard_cp"))
         assert result is submesh_sentinel
-        # __getitem__ must NOT have been called directly.
-        mesh.__getitem__.assert_not_called()
+        # The returned mesh must come from get_submesh, not from a direct
+        # __getitem__ slice. Size probes via __getitem__ are allowed.
+        direct_slice_calls = [c for c in mesh.__getitem__.call_args_list if isinstance(c.args[0], tuple)]
+        assert direct_slice_calls == []
 
     # ------------------------------------------------------------------
     # Branch 5 – native dims not available → get_submesh fallback
