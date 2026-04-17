@@ -31,7 +31,7 @@ permissions:
   pull-requests: read
 
 env:
-  container-registry: nemoci.azurecr.io
+  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
   container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/automodel
 
 jobs:
@@ -388,7 +388,6 @@ jobs:
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
-    environment: nemo-ci
     if: |
       (
         success()
@@ -405,10 +404,6 @@ jobs:
           timeout: ${{ matrix.timeout || 10 }}
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
-          has-azure-credentials: "true"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
@@ -473,7 +468,6 @@ jobs:
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
-    environment: nemo-ci
     if: |
       (
         success()
@@ -490,10 +484,6 @@ jobs:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
-          has-azure-credentials: "true"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
@@ -554,10 +544,6 @@ jobs:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
-          has-azure-credentials: "false"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
@@ -614,7 +600,6 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && vars.ENABLE_CODECOV == 'true'
-    environment: nemo-ci
     steps:
       - name: Generate fake coverage report
         uses: actions/github-script@v8
