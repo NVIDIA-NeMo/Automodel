@@ -84,6 +84,7 @@ runs:
         subscription-id: ${{ inputs.azure-subscription-id }}
 
     - name: Azure ACR Login
+      if: ${{ inputs.has-azure-credentials == 'true' }}
       shell: bash
       run: |
         az acr login --name nemoci

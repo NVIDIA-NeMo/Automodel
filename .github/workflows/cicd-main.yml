@@ -499,11 +499,76 @@ jobs:
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
+  cicd-e2e-tests-gb200:
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include:
+          - test-name: L2_Pretrain_and_KD
+            test-folder: llm_pretrain_and_kd
+            timeout: 20
+          - test-name: L2_HF_DCP
+            test-folder: hf_dcp
+            timeout: 40
+          - test-name: L2_HF_PEFT
+            test-folder: hf_peft
+            timeout: 30
+          - test-name: L2_HF_Transformer
+            test-folder: hf_transformer
+            timeout: 20
+          - test-name: L2_HF_Transformer_Finetune
+            test-folder: hf_transformer_finetune
+            timeout: 40
+          - test-name: L2_HF_Transformer_LLM
+            test-folder: hf_transformer_llm
+            timeout: 40
+          - test-name: L2_HF_Transformer_VLM
+            test-folder: hf_transformer_vlm
+            timeout: 60
+          - test-name: L2_Datasets
+            test-folder: data
+            timeout: 20
+          - test-name: L2_Context_Parallel
+            test-folder: context_parallel
+            timeout: 20
+          - test-name: L2_Retrieval
+            test-folder: retrieval
+            timeout: 20
+    needs: [pre-flight, cicd-unit-tests, cicd-container-build]
+    runs-on: nemo-ci-gcp-gpu-x2
+    name: gb200_${{ matrix.test-name }}
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: main
+        uses: ./.github/actions/test-template
+        with:
+          test-folder: ${{ matrix.test-folder }}
+          timeout: ${{ matrix.timeout }}
+          is_unit_test: "false"
+          has-azure-credentials: "false"
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          PAT: ${{ secrets.PAT }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
+          runner: nemo-ci-gcp-gpu-x2
+
   Nemo_CICD_Test:
     needs:
       - pre-flight
       - cicd-unit-tests
       - cicd-e2e-tests
+      - cicd-e2e-tests-gb200
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
