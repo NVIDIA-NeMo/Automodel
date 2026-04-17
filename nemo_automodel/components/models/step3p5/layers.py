@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Step3p5RMSNorm(nn.Module):
@@ -145,9 +146,16 @@ class Step3p5MLP(nn.Module):
         self.intermediate_size = intermediate_size or config.intermediate_size
         self.swiglu_limit = swiglu_limit
 
-        self.gate_proj = initialize_linear_module(backend.linear, self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = initialize_linear_module(backend.linear, self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = initialize_linear_module(backend.linear, self.intermediate_size, self.hidden_size, bias=False)
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.gate_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.intermediate_size, bias=False, dtype=dtype
+        )
+        self.up_proj = initialize_linear_module(
+            backend.linear, self.hidden_size, self.intermediate_size, bias=False, dtype=dtype
+        )
+        self.down_proj = initialize_linear_module(
+            backend.linear, self.intermediate_size, self.hidden_size, bias=False, dtype=dtype
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up = self.up_proj(x)
@@ -198,17 +206,18 @@ class Step3p5Attention(nn.Module):
 
         # Projections
         attention_bias = getattr(config, "attention_bias", False)
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, attention_bias, dtype=dtype
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, attention_bias
+            backend.linear, self.num_heads * self.head_dim, config.hidden_size, attention_bias, dtype=dtype
         )
 
         # Per-head Q/K normalization using Step3p5RMSNorm
@@ -218,7 +227,9 @@ class Step3p5Attention(nn.Module):
         # Optional head-wise attention gate
         self.use_head_wise_attn_gate = getattr(config, "use_head_wise_attn_gate", False)
         if self.use_head_wise_attn_gate:
-            self.g_proj = initialize_linear_module(backend.linear, config.hidden_size, self.num_heads, bias=False)
+            self.g_proj = initialize_linear_module(
+                backend.linear, config.hidden_size, self.num_heads, bias=False, dtype=dtype
+            )
         else:
             self.g_proj = None
 

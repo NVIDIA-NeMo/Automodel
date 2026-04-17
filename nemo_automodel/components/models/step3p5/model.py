@@ -395,14 +395,17 @@ class Step3p5ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Step3p5Model(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Step3p5StateDictAdapter(
                 self.config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
+                dtype=model_dtype,
             )
 
     def get_input_embeddings(self):
