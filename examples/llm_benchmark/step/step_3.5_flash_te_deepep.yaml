@@ -71,6 +71,7 @@ model:
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: stepfun-ai/Step-3.5-Flash
+    trust_remote_code: true
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
