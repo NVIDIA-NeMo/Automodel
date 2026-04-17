@@ -18,6 +18,8 @@
 # To run this recipe, please use the following command:
 # torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 1
