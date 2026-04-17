@@ -77,10 +77,6 @@ class Block(nn.Module):
             attn_out = self.linear_attn(
                 hidden_states=self.input_layernorm(x),
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                qkv_format=attn_kwargs.get("qkv_format"),
-                cu_seqlens=attn_kwargs.get("cu_seqlens"),
-                seq_index=attn_kwargs.get("seq_index"),
             )
         elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
