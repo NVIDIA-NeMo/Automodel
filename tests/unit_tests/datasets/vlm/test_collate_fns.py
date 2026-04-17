@@ -559,12 +559,11 @@ def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkey
             return {"input_ids": input_ids, "pixel_values": pixel_values}
 
     processor = MaxLengthProcessor()
-    collate_mod.default_collate_fn(
-        [{"conversation": CONVERSATION}], processor, max_length=512
-    )
+    collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor, max_length=512)
 
     assert captured_kwargs.get("max_length") == 512
     assert captured_kwargs.get("padding") == "max_length"
+    assert captured_kwargs.get("truncation") is True
 
 
 def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -624,9 +623,7 @@ def test_kimi_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
-    )
+    monkeypatch.setattr(collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     collate_mod.kimi_vl_collate_fn(examples, processor, max_length=2048)
@@ -642,9 +639,7 @@ def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
-    )
+    monkeypatch.setattr(collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True)
 
     conversation_with_image = [
         {
@@ -671,9 +666,7 @@ def test_kimi_vl_collate_fn_passes_add_special_tokens_false(collate_mod, monkeyp
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True
-    )
+    monkeypatch.setattr(collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -897,9 +890,7 @@ class DummyKimiK25VLProcessor:
 
     def __call__(self, *, text, return_tensors, medias=None, **kwargs):
         assert return_tensors == "pt"
-        self.forward_calls.append(
-            {"text": text, "return_tensors": return_tensors, "medias": medias, **kwargs}
-        )
+        self.forward_calls.append({"text": text, "return_tensors": return_tensors, "medias": medias, **kwargs})
 
         # Simulate processor output with single placeholder
         input_ids = torch.tensor([[1, 2, self.media_placeholder_token_id, 3, 4]])
@@ -1035,7 +1026,8 @@ def test_kimi_k25_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
 
 
 def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
-    """Test kimi_k25_vl_collate_fn drops samples exceeding max_length instead of truncating."""
+    """Test kimi_k25_vl_collate_fn drops samples when drop_overlong=True."""
+
     # Custom processor that produces longer sequences
     class LongSequenceProcessor:
         def __init__(self):
@@ -1059,9 +1051,154 @@ def test_kimi_k25_vl_collate_fn_drops_overlong(collate_mod, monkeypatch):
     ]
     examples = [{"conversation": conversation}]
 
-    # All samples exceed max_length=20 → ValueError
+    # All samples exceed max_length=20 with drop_overlong=True → ValueError
     with pytest.raises(ValueError, match="All samples in batch exceed max_length"):
-        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+        collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20, drop_overlong=True)
+
+
+def test_kimi_k25_vl_collate_fn_truncates_by_default(collate_mod, monkeypatch):
+    """Test kimi_k25_vl_collate_fn passes truncation to processor by default (not drop)."""
+
+    captured_kwargs = {}
+
+    class TruncatingProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            max_len = kwargs.get("max_length", 50)
+            # Respect truncation like a real processor would
+            length = min(50, max_len) if kwargs.get("truncation") else 50
+            input_ids = torch.arange(1, length + 1).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = TruncatingProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # Processor should receive truncation=True and max_length=20
+    assert captured_kwargs.get("truncation") is True
+    assert captured_kwargs.get("max_length") == 20
+    # After processor truncation to 20 and autoregressive shift (:-1), seq_len = 19
+    assert batch["input_ids"].shape == (1, 19)
+    assert batch["attention_mask"].shape == (1, 19)
+    assert batch["labels"].shape == (1, 19)
+
+
+def test_kimi_k25_vl_collate_fn_no_drop_preserves_batch_size(collate_mod, monkeypatch):
+    """Test that default (no drop) preserves all samples in batch for PP compatibility."""
+    call_count = [0]
+
+    class TruncatingProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = 163605
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            call_count[0] += 1
+            max_len = kwargs.get("max_length", 50)
+            # First sample: 50 tokens, second: 10 tokens
+            base_length = 50 if call_count[0] == 1 else 10
+            length = min(base_length, max_len) if kwargs.get("truncation") else base_length
+            input_ids = torch.arange(1, length + 1).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = TruncatingProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}, {"conversation": conversation}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=20)
+
+    # Both samples preserved (truncated by processor, not dropped). After shift: 19 tokens.
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape[1] == 19
+
+
+def test_kimi_k25_vl_collate_fn_truncation_drops_image_data(collate_mod, monkeypatch):
+    """Test that truncation into image region drops pixel_values/grid_thws and replaces orphaned tokens."""
+    MEDIA_TOKEN_ID = 163605
+    PAD_TOKEN_ID = 0
+
+    class ImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=PAD_TOKEN_ID)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            # 5 text tokens + 1 image placeholder = 6 tokens pre-expansion
+            input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            # grid_thws: t=1, h=8, w=8 → (8//2)*(8//2) = 16 expanded image tokens
+            # Post-expansion: 5 text + 16 image = 21 tokens
+            grid_thws = torch.tensor([[1, 8, 8]])
+            pixel_values = torch.randn(1, 3, 64, 64)
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "grid_thws": grid_thws,
+                "pixel_values": pixel_values,
+            }
+
+    processor = ImageProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "image", "image": "test.jpg"}, {"type": "text", "text": "Hello"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+    ]
+    examples = [{"conversation": conversation}]
+
+    # max_length=15 < 21 post-expansion tokens → truncation cuts into image region
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=15)
+
+    # Sample should be kept (not dropped) but image data excluded
+    assert batch["input_ids"].shape[0] == 1
+    # No pixel_values or grid_thws since image was partially truncated
+    assert "pixel_values" not in batch
+    assert "grid_thws" not in batch
+    assert "image_grid_hws" not in batch
+    # Orphaned image tokens should be replaced with pad_token_id
+    assert (batch["input_ids"] == MEDIA_TOKEN_ID).sum().item() == 0
 
 
 def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
@@ -1189,49 +1326,61 @@ class TestEnsureRgb:
 
     def test_rgba_image_converted_to_rgb(self, collate_mod):
         img = PILImage.new("RGBA", (4, 4), (255, 0, 0, 128))
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         assert conversations[0][0]["content"][0]["image"].mode == "RGB"
 
     def test_grayscale_image_converted_to_rgb(self, collate_mod):
         img = PILImage.new("L", (4, 4), 128)
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         assert conversations[0][0]["content"][0]["image"].mode == "RGB"
 
     def test_palette_image_converted_to_rgb(self, collate_mod):
         img = PILImage.new("P", (4, 4))
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         assert conversations[0][0]["content"][0]["image"].mode == "RGB"
 
     def test_rgb_image_unchanged(self, collate_mod):
         img = PILImage.new("RGB", (4, 4), (255, 0, 0))
-        conversations = [[
-            {"role": "user", "content": [{"image": img}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"image": img}]},
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         result = conversations[0][0]["content"][0]["image"]
         assert result.mode == "RGB"
 
     def test_no_images_passthrough(self, collate_mod):
-        conversations = [[
-            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
-        ]]
+        conversations = [
+            [
+                {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+            ]
+        ]
         result = collate_mod._ensure_rgb(conversations)
         assert result == conversations
 
     def test_string_content_skipped(self, collate_mod):
-        conversations = [[
-            {"role": "assistant", "content": "plain string"},
-        ]]
+        conversations = [
+            [
+                {"role": "assistant", "content": "plain string"},
+            ]
+        ]
         result = collate_mod._ensure_rgb(conversations)
         assert result[0][0]["content"] == "plain string"
 
@@ -1242,14 +1391,19 @@ class TestEnsureRgb:
         rgba = PILImage.new("RGBA", (4, 4))
         gray = PILImage.new("L", (4, 4))
         rgb = PILImage.new("RGB", (4, 4))
-        conversations = [[
-            {"role": "user", "content": [
-                {"image": rgba},
-                {"type": "text", "text": "describe these"},
-                {"image": gray},
-                {"image": rgb},
-            ]},
-        ]]
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"image": rgba},
+                        {"type": "text", "text": "describe these"},
+                        {"image": gray},
+                        {"image": rgb},
+                    ],
+                },
+            ]
+        ]
         collate_mod._ensure_rgb(conversations)
         items = conversations[0][0]["content"]
         assert items[0]["image"].mode == "RGB"
@@ -1269,12 +1423,17 @@ class TestEnsureRgb:
         assert conversations[1][0]["content"][0]["image"].mode == "RGB"
 
     def test_non_image_dict_items_untouched(self, collate_mod):
-        conversations = [[
-            {"role": "user", "content": [
-                {"type": "text", "text": "hi"},
-                {"type": "video", "video": "clip.mp4"},
-            ]},
-        ]]
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hi"},
+                        {"type": "video", "video": "clip.mp4"},
+                    ],
+                },
+            ]
+        ]
         result = collate_mod._ensure_rgb(conversations)
         items = result[0][0]["content"]
         assert items[0] == {"type": "text", "text": "hi"}
@@ -1384,6 +1543,7 @@ class TestInjectFakeImage:
 
     def test_injects_into_first_user_list_content(self, collate_mod):
         import copy
+
         conversation = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         result = collate_mod.inject_fake_image_into_conversation(conversation)
 
@@ -1395,6 +1555,7 @@ class TestInjectFakeImage:
 
     def test_does_not_mutate_original(self, collate_mod):
         import copy
+
         original = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         result = collate_mod.inject_fake_image_into_conversation(original)
 
@@ -1430,10 +1591,12 @@ class TestMaskFakeVisionTokensBatch:
             tokenizer = DummyTokenizer()
 
         batch = {
-            "input_ids": torch.tensor([
-                [1, 2, IMAGE_PAD_ID, IMAGE_PAD_ID, 3],
-                [1, 2, 3, 4, 5],
-            ]),
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, IMAGE_PAD_ID, IMAGE_PAD_ID, 3],
+                    [1, 2, 3, 4, 5],
+                ]
+            ),
             "attention_mask": torch.ones(2, 5, dtype=torch.long),
         }
 
@@ -1452,10 +1615,12 @@ class TestMaskFakeVisionTokensBatch:
             tokenizer = DummyTokenizer()
 
         batch = {
-            "input_ids": torch.tensor([
-                [1, 2, IMAGE_PAD_ID, 3, 4],
-                [1, IMAGE_PAD_ID, IMAGE_PAD_ID, 4, 5],
-            ]),
+            "input_ids": torch.tensor(
+                [
+                    [1, 2, IMAGE_PAD_ID, 3, 4],
+                    [1, IMAGE_PAD_ID, IMAGE_PAD_ID, 4, 5],
+                ]
+            ),
             "attention_mask": torch.ones(2, 5, dtype=torch.long),
         }
 
@@ -1535,6 +1700,7 @@ class TestDefaultCollateFnFakeImage:
 
         # Simulate a sample that was injected with a fake image at dataset level.
         import copy
+
         fake_conv = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         fake_conv[0]["content"].insert(0, {"type": "image", "image": PILImage.new("RGB", (56, 56), (255, 255, 255))})
 
@@ -1550,9 +1716,7 @@ class TestDefaultCollateFnFakeImage:
                 return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
 
         processor = FakeImageProcessor()
-        batch = collate_mod.default_collate_fn(
-            [{"conversation": fake_conv, "_injected_fake": True}], processor
-        )
+        batch = collate_mod.default_collate_fn([{"conversation": fake_conv, "_injected_fake": True}], processor)
 
         # The image_pad token should be masked out (position 1 has IMAGE_PAD_ID).
         assert batch["attention_mask"][0, 1].item() == 0
@@ -1573,9 +1737,7 @@ class TestDefaultCollateFnFakeImage:
                 return {"input_ids": input_ids, "pixel_values": pixel_values}
 
         processor = TrackingProcessor()
-        collate_mod.default_collate_fn(
-            [{"conversation": IMAGE_CONVERSATION}], processor
-        )
+        collate_mod.default_collate_fn([{"conversation": IMAGE_CONVERSATION}], processor)
 
         # No _injected_fake flag — sample has real media.
         first_user_content = captured["conv_list"][0][0]["content"]
@@ -1591,6 +1753,7 @@ class TestQwen25CollateFnFakeImage:
         IMAGE_PAD_ID = 151655
 
         import copy
+
         fake_conv = copy.deepcopy(TEXT_ONLY_CONVERSATION)
         fake_conv[0]["content"].insert(0, {"type": "image", "image": PILImage.new("RGB", (56, 56), (255, 255, 255))})
 
@@ -1617,9 +1780,7 @@ class TestQwen25CollateFnFakeImage:
 
         monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
 
-        batch = collate_mod.qwen2_5_collate_fn(
-            [{"conversation": fake_conv, "_injected_fake": True}], processor
-        )
+        batch = collate_mod.qwen2_5_collate_fn([{"conversation": fake_conv, "_injected_fake": True}], processor)
 
         # The fake image should have been extracted.
         assert captured["images"] is not None
@@ -1707,8 +1868,8 @@ class TestBuildLabelsFromTemplate:
         labels = collate_mod.build_labels_from_template(input_ids, [conv], Qwen3VLProcessor())
 
         expected = torch.full_like(input_ids, -100)
-        expected[0, 11] = 20       # assistant content token 1
-        expected[0, 12] = 21       # assistant content token 2
+        expected[0, 11] = 20  # assistant content token 1
+        expected[0, 12] = 21  # assistant content token 2
         expected[0, 13] = _IM_END  # stop token
         assert torch.equal(labels, expected)
 
@@ -1732,14 +1893,14 @@ class TestBuildLabelsFromTemplate:
         # Layout: [IM_START,USER,NL, 20, IM_END,NL,  IM_START,ASST,NL, 20, IM_END,NL]
         #  pos:      0      1   2   3    4      5      6      7   8   9   10     11
         input_ids = _make_qwen_input_ids(
-            ("user", [20]),       # same content as assistant
+            ("user", [20]),  # same content as assistant
             ("assistant", [20]),  # should be labeled
         )
         labels = collate_mod.build_labels_from_template(input_ids, [[]], Qwen3VLProcessor())
 
         # Only the SECOND occurrence (in assistant) should be labeled.
         assert labels[0, 3].item() == -100  # user content [20]
-        assert labels[0, 9].item() == 20    # assistant content [20]
+        assert labels[0, 9].item() == 20  # assistant content [20]
 
     def test_fallback_for_non_qwen_processor(self, collate_mod):
         """Non-Qwen processor types fall back to old build_labels."""
@@ -1796,8 +1957,8 @@ class TestBuildLabelsFromTemplate:
 
         count0 = (labels[0] != -100).sum().item()
         count1 = (labels[1] != -100).sum().item()
-        assert count0 == 2   # [20, im_end]
-        assert count1 == 3   # [40, 41, im_end]
+        assert count0 == 2  # [20, im_end]
+        assert count1 == 3  # [40, 41, im_end]
 
 
 # ---------------------------------------------------------------------------
@@ -2009,7 +2170,9 @@ def test_drop_overlong_samples_filters_long(collate_mod):
     long_conv = [{"role": "user", "content": [{"type": "text", "text": "x" * 100}]}]
 
     result, kept = collate_mod._drop_overlong_samples(
-        [short_conv, long_conv], _DropTestProcessor(), max_length=50,
+        [short_conv, long_conv],
+        _DropTestProcessor(),
+        max_length=50,
     )
     assert len(result) == 1
     assert result[0] is short_conv
@@ -2022,7 +2185,9 @@ def test_drop_overlong_samples_keeps_short(collate_mod):
     conv2 = [{"role": "user", "content": [{"type": "text", "text": "x" * 20}]}]
 
     result, kept = collate_mod._drop_overlong_samples(
-        [conv1, conv2], _DropTestProcessor(), max_length=50,
+        [conv1, conv2],
+        _DropTestProcessor(),
+        max_length=50,
     )
     assert len(result) == 2
     assert result[0] is conv1
@@ -2037,7 +2202,9 @@ def test_drop_overlong_samples_all_long_raises(collate_mod):
 
     with pytest.raises(ValueError, match="All 2 samples"):
         collate_mod._drop_overlong_samples(
-            [long1, long2], _DropTestProcessor(), max_length=50,
+            [long1, long2],
+            _DropTestProcessor(),
+            max_length=50,
         )
 
 
@@ -2051,8 +2218,39 @@ def test_drop_overlong_samples_none_max_length_noop(collate_mod):
     assert kept == [0]
 
 
-def test_default_collate_fn_no_truncation(collate_mod, fake_qwen_utils, monkeypatch):
-    """Verify that with max_length set, truncation=False is passed to the processor."""
+def test_default_collate_fn_truncation_by_default(collate_mod, fake_qwen_utils, monkeypatch):
+    """Verify that with max_length set and drop_overlong=False (default), truncation=True."""
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+
+    captured_kwargs = {}
+
+    class CapturingProcessor:
+        tokenizer = DummyTokenizer()
+
+        def apply_chat_template(self, conv_list, **kwargs):
+            if kwargs.get("tokenize", False):
+                captured_kwargs.update(kwargs)
+                batch_size = len(conv_list)
+                input_ids = torch.arange(1, 5).unsqueeze(0).repeat(batch_size, 1)
+                pixel_values = torch.ones(batch_size, 3, 64, 64, dtype=torch.float32)
+                return {"input_ids": input_ids, "pixel_values": pixel_values}
+            else:
+                return ["short"]
+
+    processor = CapturingProcessor()
+    collate_mod.default_collate_fn(
+        [{"conversation": CONVERSATION}],
+        processor,
+        max_length=512,
+    )
+
+    assert captured_kwargs.get("truncation") is True
+    assert captured_kwargs.get("max_length") == 512
+    assert captured_kwargs.get("padding") == "max_length"
+
+
+def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_qwen_utils, monkeypatch):
+    """Verify that with max_length set and drop_overlong=True, truncation=False."""
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
 
     captured_kwargs = {}
@@ -2073,7 +2271,10 @@ def test_default_collate_fn_no_truncation(collate_mod, fake_qwen_utils, monkeypa
 
     processor = CapturingProcessor()
     collate_mod.default_collate_fn(
-        [{"conversation": CONVERSATION}], processor, max_length=512,
+        [{"conversation": CONVERSATION}],
+        processor,
+        max_length=512,
+        drop_overlong=True,
     )
 
     assert captured_kwargs.get("truncation") is False
@@ -2189,20 +2390,26 @@ def test_default_collate_fn_has_per_sample_image_counts(collate_mod, fake_qwen_u
     conv_with_images = [
         {
             "conversation": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": PILImage.new("RGB", (10, 10))},
-                    {"type": "image", "image": PILImage.new("RGB", (10, 10))},
-                    {"type": "text", "text": "describe"},
-                ]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PILImage.new("RGB", (10, 10))},
+                        {"type": "image", "image": PILImage.new("RGB", (10, 10))},
+                        {"type": "text", "text": "describe"},
+                    ],
+                },
                 {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
             ]
         },
         {
             "conversation": [
-                {"role": "user", "content": [
-                    {"type": "image", "image": PILImage.new("RGB", (10, 10))},
-                    {"type": "text", "text": "what"},
-                ]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": PILImage.new("RGB", (10, 10))},
+                        {"type": "text", "text": "what"},
+                    ],
+                },
                 {"role": "assistant", "content": [{"type": "text", "text": "yes"}]},
             ]
         },
