@@ -27,7 +27,10 @@ source /tmp/vllm_deploy_venv/bin/activate
 # Skip CUDA extension compilation — vLLM inference only needs triton ops from these packages
 export MAMBA_SKIP_CUDA_BUILD=TRUE
 export CAUSAL_CONV1D_SKIP_CUDA_BUILD=TRUE
-uv pip install --no-build-isolation --no-config -r tests/ci_tests/requirements_deploy.txt ${VLLM_EXTRA_DEPS:-}
+uv pip install --no-config -r tests/ci_tests/requirements_deploy.txt
+if [[ -n "${VLLM_EXTRA_DEPS:-}" ]]; then
+  uv pip install --no-build-isolation --no-config ${VLLM_EXTRA_DEPS}
+fi
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
 FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"
