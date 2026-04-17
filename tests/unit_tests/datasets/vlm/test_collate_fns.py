@@ -1801,6 +1801,171 @@ class TestBuildLabelsFromTemplate:
 
 
 # ---------------------------------------------------------------------------
+# Tests for _derive_turn_markers (Gemma4-style general path)
+# ---------------------------------------------------------------------------
+
+# Synthetic token IDs for a Gemma4-style tokenizer.
+_SOT = 2       # <start_of_turn>
+_USER_TK = 1645  # "user"
+_MODEL_TK = 2516  # "model"
+_NL = 108      # "\n"
+_EOT = 107     # <end_of_turn>
+_U_CONTENT = 506   # "u"
+# sentinel encoded as two distinct ids
+_SEN_A = 999
+_SEN_B = 888
+
+
+class _Gemma4StyleTokenizer:
+    """Minimal Gemma4-like tokenizer stub for _derive_turn_markers tests.
+
+    Template layout (ids):
+      user turn:      [SOT, USER, NL, <content>, EOT, NL]
+      assistant turn: [SOT, MODEL, NL, <content>, EOT]
+    """
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+        ids = []
+        for msg in messages:
+            if msg["role"] == "user":
+                ids += [_SOT, _USER_TK, _NL, _U_CONTENT, _EOT, _NL]
+            else:
+                # assistant
+                content = msg["content"]
+                if content == "XSENTINELMARKERX":
+                    content_ids = [_SEN_A, _SEN_B]
+                else:
+                    content_ids = [42]
+                ids += [_SOT, _MODEL_TK, _NL] + content_ids + [_EOT]
+        return ids
+
+    def encode(self, text, add_special_tokens=False):
+        if text == "XSENTINELMARKERX":
+            return [_SEN_A, _SEN_B]
+        return []
+
+
+class TestDeriveTurnMarkers:
+    """Unit tests for _derive_turn_markers."""
+
+    def test_extracts_correct_marker_and_eot(self, collate_mod):
+        """_derive_turn_markers returns the assistant prefix and EOT id."""
+        tokenizer = _Gemma4StyleTokenizer()
+        marker, eot = collate_mod._derive_turn_markers(tokenizer)
+
+        # assistant marker should be [SOT, MODEL, NL]
+        assert marker == [_SOT, _MODEL_TK, _NL]
+        # end-of-turn token should be EOT (token right after sentinel)
+        assert eot == _EOT
+
+    def test_raises_when_sentinel_absent(self, collate_mod):
+        """ValueError raised when the sentinel does not appear in template output."""
+
+        class _NoSentinelTokenizer:
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+                # Never includes sentinel
+                return [1, 2, 3, 4, 5]
+
+            def encode(self, text, add_special_tokens=False):
+                return [999, 888]  # sentinel ids that won't be found above
+
+        with pytest.raises(ValueError, match="not found"):
+            collate_mod._derive_turn_markers(_NoSentinelTokenizer())
+
+    def test_raises_when_marker_is_empty(self, collate_mod):
+        """ValueError raised when user and sentinel positions are adjacent (empty marker)."""
+
+        class _EmptyMarkerTokenizer:
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+                # user_ids == all_ids[:6], sentinel starts at position 6 → marker empty
+                user_ids = [1, 2, 3, 4, 5, 6]
+                sentinel_ids = [999, 888]
+                eot = [107]
+                msgs = messages
+                if len(msgs) == 1:
+                    return user_ids
+                return user_ids + sentinel_ids + eot
+
+            def encode(self, text, add_special_tokens=False):
+                return [999, 888]
+
+        with pytest.raises(ValueError, match="empty"):
+            collate_mod._derive_turn_markers(_EmptyMarkerTokenizer())
+
+
+class TestBuildLabelsFromTemplateGeneralPath:
+    """Tests for the general (non-Qwen) path of build_labels_from_template."""
+
+    def _make_gemma4_input_ids(self, *turns):
+        """Build input_ids matching _Gemma4StyleTokenizer layout."""
+        ids = []
+        for role, content_ids in turns:
+            if role == "user":
+                ids += [_SOT, _USER_TK, _NL, _U_CONTENT, _EOT, _NL]
+            else:
+                ids += [_SOT, _MODEL_TK, _NL] + content_ids + [_EOT]
+        return torch.tensor([ids], dtype=torch.long)
+
+    def test_general_path_labels_assistant_tokens(self, collate_mod):
+        """Non-Qwen processor with apply_chat_template uses general path and labels correctly."""
+        input_ids = self._make_gemma4_input_ids(
+            ("user", []),
+            ("assistant", [42, 43]),
+        )
+
+        class _Proc:
+            tokenizer = _Gemma4StyleTokenizer()
+
+        labels = collate_mod.build_labels_from_template(input_ids, [[]], _Proc())
+
+        # Labeled positions: content tokens [42, 43] + EOT
+        labeled = (labels[0] != -100).nonzero(as_tuple=True)[0].tolist()
+        labeled_vals = [input_ids[0, p].item() for p in labeled]
+        assert 42 in labeled_vals
+        assert 43 in labeled_vals
+        assert _EOT in labeled_vals
+        # User tokens must NOT be labeled
+        assert labels[0, 0].item() == -100  # SOT
+        assert labels[0, 1].item() == -100  # USER
+
+    def test_general_path_fallback_on_derive_failure(self, collate_mod):
+        """If _derive_turn_markers raises, falls back to build_labels without error."""
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+        conv = [
+            {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+        ]
+
+        class _BrokenTokenizer:
+            """Has apply_chat_template but sentinel never appears → derive fails."""
+
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
+                return [1, 2, 3]
+
+            def encode(self, text, add_special_tokens=False):
+                return [999, 888]
+
+            def __call__(self, text, **kwargs):
+                return {"input_ids": torch.tensor([[1, 2, 3, 4, 5]])}
+
+            def convert_tokens_to_ids(self, token):
+                return None
+
+            def decode(self, token):
+                return str(token)
+
+            pad_token_id = 0
+            eos_token = "<eos>"
+
+        class _BrokenProc:
+            tokenizer = _BrokenTokenizer()
+
+        # Must not raise; should return a tensor of correct shape
+        labels = collate_mod.build_labels_from_template(input_ids, [conv], _BrokenProc())
+        assert labels.shape == input_ids.shape
+
+
+# ---------------------------------------------------------------------------
 # Tests for _drop_overlong_samples / _estimate_media_tokens
 # ---------------------------------------------------------------------------
 
