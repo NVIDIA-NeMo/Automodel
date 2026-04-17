@@ -107,6 +107,7 @@ class NemotronV3Model(nn.Module):
             self.backend.rms_norm,
             config.hidden_size,
             eps=config.layer_norm_epsilon,
+            dtype=dtype,
         )
 
     def forward(

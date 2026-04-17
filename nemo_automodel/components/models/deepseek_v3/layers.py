@@ -32,6 +32,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb_qk,
     yarn_get_mscale,
 )
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class MLA(nn.Module):
@@ -55,6 +56,7 @@ class MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         if self.q_lora_rank is None:
             self.q_proj = initialize_linear_module(
@@ -62,19 +64,25 @@ class MLA(nn.Module):
                 in_features=hidden_size,
                 out_features=self.n_heads * self.qk_head_dim,
                 bias=False,
+                dtype=dtype,
             )
         else:
             self.q_a_proj = initialize_linear_module(
-                linear_impl=linear_impl, in_features=hidden_size, out_features=self.q_lora_rank, bias=False
+                linear_impl=linear_impl,
+                in_features=hidden_size,
+                out_features=self.q_lora_rank,
+                bias=False,
+                dtype=dtype,
             )
             self.q_a_layernorm = initialize_rms_norm_module(
-                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype
             )
             self.q_b_proj = initialize_linear_module(
                 linear_impl=linear_impl,
                 in_features=self.q_lora_rank,
                 out_features=self.n_heads * self.qk_head_dim,
                 bias=False,
+                dtype=dtype,
             )
 
         self.kv_a_proj_with_mqa = initialize_linear_module(
@@ -82,21 +90,24 @@ class MLA(nn.Module):
             in_features=hidden_size,
             out_features=self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
+            dtype=dtype,
         )
         self.kv_a_layernorm = initialize_rms_norm_module(
-            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps, dtype=dtype
         )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.kv_lora_rank,
             out_features=self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
+            dtype=dtype,
         )
         self.o_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.n_heads * self.v_head_dim,
             out_features=hidden_size,
             bias=False,
+            dtype=dtype,
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
