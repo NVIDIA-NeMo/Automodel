@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG VLLM_IMAGE=nvcr.io/nvidia/vllm:25.12-py3
-FROM ${VLLM_IMAGE}
+FROM ${VLLM_IMAGE} AS deploy
 
 # Build mamba-ssm and causal-conv1d CUDA extensions against the container's matching CUDA/torch
 RUN pip install --no-build-isolation mamba-ssm causal-conv1d
