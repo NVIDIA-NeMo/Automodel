@@ -174,6 +174,7 @@ def _build_moe_config(config, moe_overrides: dict | None = None) -> MoEConfig:
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0,
         norm_topk_prob=config.norm_topk_prob,
+        dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
     )
     if moe_overrides:
         moe_defaults.update(moe_overrides)
@@ -195,13 +196,19 @@ class Mistral4Model(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         self.moe_config = moe_config or _build_moe_config(config, moe_overrides=moe_overrides)
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Mistral4Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         self.max_seq_len = config.max_position_embeddings
         rope_theta, rope_scaling, _ = get_rope_config(config)
@@ -337,10 +344,13 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Mistral4StateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):
@@ -468,7 +478,13 @@ if _HF_MISTRAL3_AVAILABLE:
             self.moe_config = self.model.moe_config
             # lm_head lives inside language_model (like KimiVLLanguageModelBackend)
             # so the parallelizer wraps it as part of _model, matching the Kimi pattern.
-            self.lm_head = initialize_linear_module(backend.linear, config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = initialize_linear_module(
+                backend.linear,
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+            )
 
         @property
         def embed_tokens(self):
@@ -674,6 +690,18 @@ if _HF_MISTRAL3_AVAILABLE:
             num_hidden_layers = kwargs.pop("num_hidden_layers", None)
             if num_hidden_layers is not None:
                 config.text_config.num_hidden_layers = num_hidden_layers
+
+            # _init_model() only overrides the top-level hf_config.torch_dtype;
+            # for VL configs the nested text_config / vision_config keep their
+            # original dtype (typically bf16 from the checkpoint's
+            # config.json). Propagate the user-requested dtype to every nested
+            # sub-config that exposes a torch_dtype attribute, before building
+            # the vision tower / text backend.
+            top_dtype = getattr(config, "torch_dtype", None)
+            if top_dtype is not None:
+                for sub_cfg in vars(config).values():
+                    if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                        sub_cfg.torch_dtype = top_dtype
 
             self.config = config
             self.backend = backend
