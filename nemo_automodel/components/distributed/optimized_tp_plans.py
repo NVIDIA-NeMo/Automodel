@@ -42,6 +42,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -211,6 +212,41 @@ def _parallelize_gemma3(
         base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+def _parallelize_gemma4(
+    model: Gemma4ForConditionalGeneration,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a Gemma4ForConditionalGeneration model across tensor parallel dimensions.
+
+    Gemma4 VLM uses model.language_model.{embed_tokens, layers.*} for the text
+    backbone, identical to the Gemma3 VLM layout.
+    """
+    if sequence_parallel:
+        import warnings
+
+        warnings.warn(
+            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored. ",
+            stacklevel=2,
+        )
+
+    model_prefix = "model.language_model"
+
+    return cast(
+        dict[str, ParallelStyle],
+        {
+            f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+            f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
+            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+        },
+    )
 
 
 def get_llama_nemotron_super_tp_plan(
@@ -557,6 +593,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
+    _get_class_qualname(Gemma4ForConditionalGeneration): _parallelize_gemma4,
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,

@@ -22,6 +22,7 @@ import torch
 from nemo_automodel.components.distributed.mesh_utils import (
     _unflatten_compat,
     get_flat_mesh,
+    get_fsdp_dp_mesh,
     get_submesh,
 )
 
@@ -305,3 +306,154 @@ class TestGetSubmeshPT29Compat:
 
         result = get_submesh(mesh, ("dp_replicate", "dp_shard_cp"))
         assert result is unflatten_result
+
+
+# ---------------------------------------------------------------------------
+# get_fsdp_dp_mesh
+# ---------------------------------------------------------------------------
+
+
+class TestGetFsdpDpMesh:
+    """Tests for get_fsdp_dp_mesh covering all five code paths.
+
+    The central guarantee under test: when native mesh dimensions are
+    available, the function slices the *existing* DeviceMesh directly via
+    ``__getitem__`` (preserving the shared root mesh required by FSDP2).
+    Only when the fully-composed ``(dp_replicate, dp_shard_cp)`` mesh is
+    needed does it delegate to ``get_submesh``, which may build a fresh
+    DeviceMesh.
+    """
+
+    _ALL_NATIVE_DIMS = ("dp_replicate", "dp_shard", "cp", "tp")
+
+    def _make_mesh(self, dim_names, sizes):
+        """Return a mock DeviceMesh.
+
+        ``sizes`` maps dim-name → int (return value of ``.size()``).
+        ``__getitem__`` returns a distinct sentinel whose ``_key`` and
+        ``_mesh`` attributes let callers assert *which* slice was returned
+        and that it came from the original mesh object (not a freshly
+        constructed one).
+        """
+        mesh = Mock()
+        mesh.mesh_dim_names = dim_names
+        slices = {}
+
+        def getitem(key):
+            if key not in slices:
+                sentinel = Mock()
+                sentinel._key = key
+                sentinel._mesh = mesh
+                sentinel.size = Mock(return_value=sizes.get(key, 1))
+                slices[key] = sentinel
+            return slices[key]
+
+        mesh.__getitem__ = Mock(side_effect=getitem)
+        return mesh
+
+    # ------------------------------------------------------------------
+    # Branch 1 – all native dims present, dp_replicate=1 and cp=1
+    # ------------------------------------------------------------------
+
+    def test_no_replicate_no_cp_returns_dp_shard_slice(self):
+        """dp_replicate=1, cp=1 → device_mesh["dp_shard"] (fast path, shared root)."""
+        mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 1, "cp": 1})
+
+        result = get_fsdp_dp_mesh(mesh)
+
+        mesh.__getitem__.assert_called_once_with("dp_shard")
+        assert result._key == "dp_shard"
+        # Returned mesh is a slice of the original, not a freshly built one.
+        assert result._mesh is mesh
+
+    # ------------------------------------------------------------------
+    # Branch 2 – dp_replicate > 1, cp = 1
+    # ------------------------------------------------------------------
+
+    def test_replicate_only_returns_replicate_shard_tuple_slice(self):
+        """dp_replicate>1, cp=1 → device_mesh[("dp_replicate","dp_shard")]."""
+        mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 2, "cp": 1})
+
+        result = get_fsdp_dp_mesh(mesh)
+
+        mesh.__getitem__.assert_called_once_with(("dp_replicate", "dp_shard"))
+        assert result._key == ("dp_replicate", "dp_shard")
+        assert result._mesh is mesh
+
+    # ------------------------------------------------------------------
+    # Branch 3 – dp_replicate = 1, cp > 1
+    # ------------------------------------------------------------------
+
+    def test_cp_only_returns_shard_cp_tuple_slice(self):
+        """dp_replicate=1, cp>1 → device_mesh[("dp_shard","cp")]."""
+        mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 1, "cp": 4})
+
+        result = get_fsdp_dp_mesh(mesh)
+
+        mesh.__getitem__.assert_called_once_with(("dp_shard", "cp"))
+        assert result._key == ("dp_shard", "cp")
+        assert result._mesh is mesh
+
+    # ------------------------------------------------------------------
+    # Branch 4 – dp_replicate > 1 AND cp > 1 → get_submesh fallback
+    # ------------------------------------------------------------------
+
+    def test_replicate_and_cp_falls_back_to_get_submesh(self):
+        """dp_replicate>1 and cp>1 → get_submesh called (composed mesh needed)."""
+        mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 2, "cp": 2})
+        submesh_sentinel = Mock()
+
+        with patch(
+            "nemo_automodel.components.distributed.mesh_utils.get_submesh",
+            return_value=submesh_sentinel,
+        ) as mock_get_submesh:
+            result = get_fsdp_dp_mesh(mesh)
+
+        mock_get_submesh.assert_called_once_with(mesh, ("dp_replicate", "dp_shard_cp"))
+        assert result is submesh_sentinel
+        # __getitem__ must NOT have been called directly.
+        mesh.__getitem__.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Branch 5 – native dims not available → get_submesh fallback
+    # ------------------------------------------------------------------
+
+    def test_missing_native_dims_falls_back_to_get_submesh(self):
+        """When dp_shard/cp are absent from mesh, get_submesh is used."""
+        mesh = self._make_mesh(
+            ("dp_replicate", "dp_shard_cp", "tp"),
+            {"dp_replicate": 2},
+        )
+        submesh_sentinel = Mock()
+
+        with patch(
+            "nemo_automodel.components.distributed.mesh_utils.get_submesh",
+            return_value=submesh_sentinel,
+        ) as mock_get_submesh:
+            result = get_fsdp_dp_mesh(mesh)
+
+        mock_get_submesh.assert_called_once_with(mesh, ("dp_replicate", "dp_shard_cp"))
+        assert result is submesh_sentinel
+        mesh.__getitem__.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Custom dim-name parameters are forwarded correctly
+    # ------------------------------------------------------------------
+
+    def test_custom_dim_names_forwarded_to_get_submesh(self):
+        """Non-default dp_replicate_name / dp_shard_cp_name reach get_submesh."""
+        mesh = self._make_mesh(("my_rep", "my_shard_cp", "tp"), {"my_rep": 2})
+        submesh_sentinel = Mock()
+
+        with patch(
+            "nemo_automodel.components.distributed.mesh_utils.get_submesh",
+            return_value=submesh_sentinel,
+        ) as mock_get_submesh:
+            result = get_fsdp_dp_mesh(
+                mesh,
+                dp_replicate_name="my_rep",
+                dp_shard_cp_name="my_shard_cp",
+            )
+
+        mock_get_submesh.assert_called_once_with(mesh, ("my_rep", "my_shard_cp"))
+        assert result is submesh_sentinel

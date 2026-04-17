@@ -409,3 +409,49 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         f"No parent flattened mesh found for dims {names} with target size {target}. "
         f"Available: {set(root._flatten_mapping)}"
     )
+
+
+def get_fsdp_dp_mesh(
+    device_mesh: "DeviceMesh",
+    dp_replicate_name: str = MeshAxisName.DP_REPLICATE,
+    dp_shard_cp_name: str = MeshAxisName.DP_SHARD_CP,
+) -> "DeviceMesh":
+    """Return the DP mesh for FSDP2 without losing the original root mesh.
+
+    ``get_submesh()`` may rebuild a fresh DeviceMesh when asked to compose native
+    and flattened dims like ``("dp_replicate", "dp_shard_cp")``. That is fine
+    for many local operations, but FSDP2 expects its DP mesh to share the same
+    root mesh as TP/EP meshes. On multi-node TP runs this can break group
+    construction in non-obvious ways.
+
+    Prefer native dimensions whenever possible:
+    - cp=1, dp_replicate=1  -> ``device_mesh["dp_shard"]``
+    - cp=1, dp_replicate>1  -> ``device_mesh[("dp_replicate", "dp_shard")]``
+    - cp>1, dp_replicate=1  -> ``device_mesh[("dp_shard", "cp")]``
+
+    When both CP and replicated DP are active we fall back to ``get_submesh()``
+    because the composed mesh is genuinely multi-level.
+    """
+
+    dp_shard_name = MeshAxisName.DP_SHARD
+    cp_name = MeshAxisName.CP
+
+    native_dims_available = (
+        dp_replicate_name in device_mesh.mesh_dim_names
+        and dp_shard_name in device_mesh.mesh_dim_names
+        and cp_name in device_mesh.mesh_dim_names
+    )
+    if native_dims_available:
+        cp_size = device_mesh[cp_name].size()
+        dp_replicate_size = device_mesh[dp_replicate_name].size()
+
+        if dp_replicate_size > 1 and cp_size > 1:
+            pass
+        elif dp_replicate_size > 1:
+            return device_mesh[(dp_replicate_name, dp_shard_name)]
+        elif cp_size > 1:
+            return device_mesh[(dp_shard_name, cp_name)]
+        else:
+            return device_mesh[dp_shard_name]
+
+    return get_submesh(device_mesh, (dp_replicate_name, dp_shard_cp_name))
