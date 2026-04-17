@@ -24,12 +24,10 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeTextConfig,
 )
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-    Qwen3VLMoeForConditionalGeneration as HFQwen3VLMoeForConditionalGeneration,
-)
-from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
 )
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_vl_moe.model import (
     Fp32SafeQwen3VLMoeTextRotaryEmbedding,
     Fp32SafeQwen3VLMoeVisionRotaryEmbedding,
@@ -40,9 +38,8 @@ from nemo_automodel.components.models.qwen3_vl_moe.model import (
     Qwen3VLMoeTextModelBackend,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+_requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
 @pytest.fixture
@@ -131,6 +128,7 @@ def vl_config(text_config):
     return Qwen3VLMoeConfig(text_config=text_config.to_dict(), vision_config=vision_cfg)
 
 
+@_requires_cuda
 class TestFp32SafeRotaryEmbeddings:
     def test_text_rotary_inv_freq_remains_fp32(self, text_config):
         rotary = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=text_config)
@@ -151,6 +149,7 @@ class TestFp32SafeRotaryEmbeddings:
         torch.testing.assert_close(rotary.inv_freq.float(), original.float())
 
 
+@_requires_cuda
 class TestQwen3VLMoeBlock:
     """Tests for Qwen3VLMoeBlock position_embeddings to freqs_cis conversion."""
 
@@ -170,7 +169,6 @@ class TestQwen3VLMoeBlock:
 
         # Mock parent forward to capture freqs_cis
         captured_kwargs = {}
-        original_forward = block.__class__.__bases__[0].forward
 
         def mock_forward(self, x, freqs_cis, **kwargs):
             captured_kwargs["freqs_cis"] = freqs_cis
@@ -209,7 +207,9 @@ class TestQwen3VLMoeBlock:
         # Verify the same freqs_cis was passed through
         torch.testing.assert_close(captured_kwargs["freqs_cis"], freqs_cis)
 
-    def test_forward_raises_when_no_freqs_cis_or_position_embeddings(self, text_config, backend_config, moe_config, device):
+    def test_forward_raises_when_no_freqs_cis_or_position_embeddings(
+        self, text_config, backend_config, moe_config, device
+    ):
         """Test that ValueError is raised when neither freqs_cis nor position_embeddings provided."""
         block = Qwen3VLMoeBlock(0, text_config, moe_config, backend_config).to(device)
 
@@ -219,6 +219,7 @@ class TestQwen3VLMoeBlock:
             block.forward(x=x)
 
 
+@_requires_cuda
 class TestQwen3VLMoeTextModelBackendLayersDict:
     """Tests for layers being nn.ModuleDict instead of nn.ModuleList."""
 
@@ -238,6 +239,7 @@ class TestQwen3VLMoeTextModelBackendLayersDict:
             assert isinstance(layer, Qwen3VLMoeBlock)
 
 
+@_requires_cuda
 class TestQwen3VLMoeTextModelBackend:
     def test_initialization_sets_expected_components(self, text_config, backend_config, moe_config):
         model = Qwen3VLMoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config)
@@ -356,6 +358,7 @@ class TestQwen3VLMoeTextModelBackend:
         assert model.get_input_embeddings() is new_embed
 
 
+@_requires_cuda
 class TestQwen3VLMoeForConditionalGeneration:
     def test_initialization_configures_backend_components(self, vl_config, backend_config, moe_config):
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
@@ -405,7 +408,9 @@ class TestQwen3VLMoeForConditionalGeneration:
 
         with patch.object(model.model, "forward") as mock_model_forward:
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
+            )
             mock_model_forward.return_value = mock_output
 
             logits = model.forward(input_ids=input_ids)
@@ -454,7 +459,9 @@ class TestQwen3VLMoeForConditionalGeneration:
 
         with patch.object(model.model, "forward") as mock_model_forward:
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
+            )
             mock_model_forward.return_value = mock_output
 
             def capture_kwargs(*args, **kwargs):
@@ -488,7 +495,7 @@ class TestQwen3VLMoeForConditionalGeneration:
         squeezed_position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
         squeezed_padding_mask = torch.ones(batch, seq_len, dtype=torch.bool, device=device)
         squeezed_kwargs = {"foo": "bar"}
-        
+
         # Mock the model.model.forward to avoid internal tensor operations
         mock_hidden = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=model_dtype)
 
@@ -502,7 +509,7 @@ class TestQwen3VLMoeForConditionalGeneration:
             mock_output = MagicMock()
             mock_output.last_hidden_state = mock_hidden
             mock_model_forward.return_value = mock_output
-            
+
             result = model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -513,14 +520,14 @@ class TestQwen3VLMoeForConditionalGeneration:
 
             # Result should be logits from lm_head
             assert result.shape == (batch, seq_len, vl_config.text_config.vocab_size)
-            
+
             # Verify squeeze_input_for_thd was called with correct args
             squeeze_args = mock_squeeze.call_args[0]
             assert squeeze_args[0] is input_ids
             assert squeeze_args[1] is position_ids
             assert squeeze_args[2] is padding_mask
             assert squeeze_args[3]["qkv_format"] == "thd"
-            
+
             # Verify model.model.forward was called
             mock_model_forward.assert_called_once()
 
@@ -545,6 +552,7 @@ class TestQwen3VLMoeForConditionalGeneration:
         assert hasattr(model, "state_dict_adapter")
 
 
+@_requires_cuda
 class TestQwen3VLMoeModel:
     def test_property_accessors_delegate_to_language_model(self, vl_config, backend_config, moe_config):
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
@@ -555,7 +563,9 @@ class TestQwen3VLMoeModel:
         assert core.embed_tokens is core.language_model.embed_tokens
         assert core.norm is core.language_model.norm
 
-    def test_forward_uses_embed_tokens_when_inputs_embeds_not_provided(self, vl_config, backend_config, moe_config, device):
+    def test_forward_uses_embed_tokens_when_inputs_embeds_not_provided(
+        self, vl_config, backend_config, moe_config, device
+    ):
         """Test that forward() uses embed_tokens to create inputs_embeds from input_ids."""
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         core = model.model
@@ -565,7 +575,9 @@ class TestQwen3VLMoeModel:
 
         with patch.object(core.language_model, "forward") as mock_lang_forward:
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device
+            )
             mock_lang_forward.return_value = mock_output
 
             core.forward(input_ids=input_ids)
@@ -583,14 +595,18 @@ class TestQwen3VLMoeModel:
 
         batch, seq_len = 2, 3
         # Pass float tensor as input_ids (this is actually inputs_embeds from previous PP stage)
-        float_input = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        float_input = torch.randn(
+            batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=torch.bfloat16
+        )
 
         with (
             patch.object(core, "get_input_embeddings", return_value=None),
             patch.object(core.language_model, "forward") as mock_lang_forward,
         ):
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device
+            )
             mock_lang_forward.return_value = mock_output
 
             core.forward(input_ids=float_input)
@@ -614,6 +630,227 @@ class TestQwen3VLMoeModel:
                 core.forward(input_ids=input_ids)
 
 
+@_requires_cuda
+class TestQwen3VLMoeModelInlineVision:
+    """Tests for the inline vision processing path (replaces super().forward(input_ids=None))."""
+
+    def test_inline_vision_passes_input_ids_to_get_placeholder_mask(
+        self, vl_config, backend_config, moe_config, device
+    ):
+        """Test that inline vision path passes input_ids (not None) to get_placeholder_mask."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 1, 4
+        hidden_size = vl_config.text_config.hidden_size
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+        inputs_embeds = torch.randn(batch, seq_len, hidden_size, device=device)
+        pixel_values = torch.randn(1, 3, 4, 4, device=device)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
+
+        captured_input_ids = {}
+
+        mock_image_output = MagicMock()
+        mock_image_output.pooler_output = [torch.randn(2, hidden_size, device=device)]
+        mock_image_output.deepstack_features = [torch.randn(2, hidden_size, device=device)]
+
+        def capture_get_placeholder_mask(input_ids_arg, inputs_embeds=None, image_features=None, video_features=None):
+            captured_input_ids["input_ids"] = input_ids_arg
+            mask = torch.zeros(batch, seq_len, hidden_size, dtype=torch.bool, device=device)
+            return mask, mask
+
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden_size, device=device)
+
+        with (
+            patch.object(core, "get_image_features", return_value=mock_image_output),
+            patch.object(core, "get_placeholder_mask", side_effect=capture_get_placeholder_mask),
+            patch.object(
+                core,
+                "get_rope_index",
+                return_value=(torch.zeros(3, batch, seq_len, device=device), torch.zeros(batch, device=device)),
+            ),
+            patch.object(core.language_model, "forward", return_value=mock_lang_output),
+        ):
+            core.forward(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+
+        # input_ids should be passed (not None) for integer comparison
+        assert captured_input_ids["input_ids"] is not None
+        assert torch.equal(captured_input_ids["input_ids"], input_ids)
+
+    def test_inline_vision_calls_get_rope_index_with_keyword_args(self, vl_config, backend_config, moe_config, device):
+        """Test that get_rope_index is called with keyword args (not positional)."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 1, 4
+        hidden_size = vl_config.text_config.hidden_size
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+        inputs_embeds = torch.randn(batch, seq_len, hidden_size, device=device)
+        pixel_values = torch.randn(1, 3, 4, 4, device=device)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
+        mm_token_type_ids = torch.zeros(batch, seq_len, dtype=torch.int, device=device)
+
+        mock_image_output = MagicMock()
+        mock_image_output.pooler_output = [torch.randn(2, hidden_size, device=device)]
+        mock_image_output.deepstack_features = [torch.randn(2, hidden_size, device=device)]
+
+        mock_mask = torch.zeros(batch, seq_len, hidden_size, dtype=torch.bool, device=device)
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden_size, device=device)
+
+        with (
+            patch.object(core, "get_image_features", return_value=mock_image_output),
+            patch.object(core, "get_placeholder_mask", return_value=(mock_mask, mock_mask)),
+            patch.object(
+                core,
+                "get_rope_index",
+                return_value=(torch.zeros(3, batch, seq_len, device=device), torch.zeros(batch, device=device)),
+            ) as mock_rope,
+            patch.object(core.language_model, "forward", return_value=mock_lang_output),
+        ):
+            core.forward(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        # get_rope_index should be called with keyword args
+        call_kwargs = mock_rope.call_args.kwargs
+        assert "mm_token_type_ids" in call_kwargs
+        assert "image_grid_thw" in call_kwargs
+        assert "video_grid_thw" in call_kwargs
+        torch.testing.assert_close(call_kwargs["mm_token_type_ids"], mm_token_type_ids)
+
+    def test_inline_vision_returns_qwen3vlmoe_output(self, vl_config, backend_config, moe_config, device):
+        """Test that inline vision path returns Qwen3VLMoeModelOutputWithPast."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 1, 4
+        hidden_size = vl_config.text_config.hidden_size
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+        inputs_embeds = torch.randn(batch, seq_len, hidden_size, device=device)
+        pixel_values = torch.randn(1, 3, 4, 4, device=device)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=device)
+        position_ids = torch.zeros(3, batch, seq_len, dtype=torch.long, device=device)
+
+        mock_image_output = MagicMock()
+        mock_image_output.pooler_output = [torch.randn(2, hidden_size, device=device)]
+        mock_image_output.deepstack_features = [torch.randn(2, hidden_size, device=device)]
+
+        mock_mask = torch.zeros(batch, seq_len, hidden_size, dtype=torch.bool, device=device)
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden_size, device=device)
+
+        with (
+            patch.object(core, "get_image_features", return_value=mock_image_output),
+            patch.object(core, "get_placeholder_mask", return_value=(mock_mask, mock_mask)),
+            patch.object(core.language_model, "forward", return_value=mock_lang_output),
+        ):
+            result = core.forward(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                position_ids=position_ids,
+            )
+
+        assert isinstance(result, Qwen3VLMoeModelOutputWithPast)
+        assert result.last_hidden_state is not None
+
+    def test_inline_vision_skipped_when_no_pixel_values(self, vl_config, backend_config, moe_config, device):
+        """Test that text-only path is used when no pixel_values."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        core = model.model
+
+        batch, seq_len = 1, 4
+        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (batch, seq_len), device=device)
+
+        with (
+            patch.object(core, "get_image_features") as mock_img,
+            patch.object(core.language_model, "forward") as mock_lang,
+        ):
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device
+            )
+            mock_lang.return_value = mock_output
+
+            core.forward(input_ids=input_ids)
+
+        # get_image_features should NOT be called
+        mock_img.assert_not_called()
+        # language_model should be called directly
+        mock_lang.assert_called_once()
+
+
+@_requires_cuda
+class TestQwen3VLMoeForConditionalGenerationPPGuard:
+    """Tests for the PP attention mask size guard."""
+
+    def test_pp_attention_mask_dropped_on_size_mismatch(self, vl_config, backend_config, moe_config, device):
+        """Test that mismatched attention_mask is dropped for PP non-Stage-0 ranks."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        batch, seq_len_embeds, seq_len_mask = 1, 4, 8
+        inputs_embeds = torch.randn(
+            batch, seq_len_embeds, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
+        )
+        attention_mask = torch.ones(batch, seq_len_mask, device=device)
+
+        captured_kwargs = {}
+        with patch.object(model.model, "forward") as mock_forward:
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = inputs_embeds
+            mock_forward.return_value = mock_output
+
+            def capture(*, attention_mask=None, **kw):
+                captured_kwargs["attention_mask"] = attention_mask
+                return mock_output
+
+            mock_forward.side_effect = lambda *a, **kw: capture(**kw)
+            model.forward(input_ids=None, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+
+        # Mismatched mask should be dropped (set to None)
+        assert captured_kwargs["attention_mask"] is None
+
+    def test_video_token_id_is_151656(self, vl_config, backend_config, moe_config, device):
+        """Test that video token ID 151656 (not 151652) is used for media token detection."""
+        model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
+        model_dtype = next(model.parameters()).dtype
+
+        # input_ids with video token 151656
+        input_ids = torch.tensor([[1, 151656, 2, 3]], device=device)
+
+        pixel_values_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
+        image_grid_hws_chunk = torch.tensor([[2, 2]], device=device)
+        model._vlm_pixel_values_chunks = [pixel_values_chunk]
+        model._vlm_image_grid_hws_chunks = [image_grid_hws_chunk]
+        model._vlm_chunk_idx = 0
+
+        with patch.object(model.model, "forward") as mock_forward:
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = torch.randn(
+                1, 4, vl_config.text_config.hidden_size, device=device, dtype=model_dtype
+            )
+            mock_forward.return_value = mock_output
+
+            model.forward(input_ids=input_ids)
+
+        # Chunk should have been consumed (idx incremented)
+        assert model._vlm_chunk_idx == 1
+
+
+@_requires_cuda
 class TestQwen3VLMoeFromPretrainedAndModelClass:
     def test_from_pretrained_classmethod(self):
         cfg = Qwen3VLMoeConfig()
@@ -643,3 +880,361 @@ class TestQwen3VLMoeFromPretrainedAndModelClass:
 
     def test_modelclass_export_exists(self):
         assert ModelClass is Qwen3VLMoeForConditionalGeneration
+
+
+class TestQwen3VLMoeModelInlineVisionCpu:
+    """CPU-runnable coverage for the inline vision path.
+
+    Invokes `Qwen3VLMoeModel.forward` as an unbound method with a MagicMock `self`
+    so we exercise the new branches without instantiating the full CUDA model.
+    """
+
+    @staticmethod
+    def _mock_self(spatial_merge_size: int = 2, dtype: torch.dtype = torch.float32):
+        ms = MagicMock()
+        ms.visual = MagicMock()
+        ms.visual.dtype = dtype
+        ms.visual.spatial_merge_size = spatial_merge_size
+        ms.rope_deltas = None
+        ms.get_input_embeddings.return_value = None
+        return ms
+
+    @staticmethod
+    def _zero_mask(batch: int, seq_len: int, hidden: int):
+        return torch.zeros(batch, seq_len, hidden, dtype=torch.bool)
+
+    def test_images_only_path_passes_input_ids_and_returns_qwen3vlmoe_output(self):
+        ms = self._mock_self()
+        batch, seq_len, hidden = 1, 4, 8
+        input_ids = torch.tensor([[10, 20, 30, 40]])
+        inputs_embeds = torch.randn(batch, seq_len, hidden)
+        pixel_values = torch.randn(4, 3, 2, 2)
+        image_grid_thw = torch.tensor([[1, 2, 2]])
+        position_ids = torch.zeros(3, batch, seq_len, dtype=torch.long)
+
+        mock_image_output = MagicMock()
+        mock_image_output.pooler_output = [torch.randn(2, hidden)]
+        mock_image_output.deepstack_features = [torch.randn(2, hidden)]
+        ms.get_image_features.return_value = mock_image_output
+
+        zero_mask = self._zero_mask(batch, seq_len, hidden)
+        captured = {}
+
+        def capture_placeholder(ids, inputs_embeds=None, image_features=None, video_features=None):
+            captured["input_ids"] = ids
+            return zero_mask, zero_mask
+
+        ms.get_placeholder_mask.side_effect = capture_placeholder
+
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden)
+        ms.language_model.return_value = mock_lang_output
+
+        result = Qwen3VLMoeModel.forward(
+            ms,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            position_ids=position_ids,
+        )
+
+        assert captured["input_ids"] is not None
+        assert torch.equal(captured["input_ids"], input_ids)
+        ms.get_image_features.assert_called_once()
+        assert isinstance(result, Qwen3VLMoeModelOutputWithPast)
+        assert result.last_hidden_state is not None
+
+    def test_videos_only_path_computes_rope_when_position_ids_missing(self):
+        ms = self._mock_self()
+        batch, seq_len, hidden = 1, 4, 8
+        input_ids = torch.tensor([[10, 20, 30, 40]])
+        inputs_embeds = torch.randn(batch, seq_len, hidden)
+        pixel_values_videos = torch.randn(4, 3, 2, 2)
+        video_grid_thw = torch.tensor([[1, 2, 2]])
+        mm_token_type_ids = torch.zeros(batch, seq_len, dtype=torch.int)
+
+        mock_video_output = MagicMock()
+        mock_video_output.pooler_output = [torch.randn(2, hidden)]
+        mock_video_output.deepstack_features = [torch.randn(2, hidden)]
+        ms.get_video_features.return_value = mock_video_output
+
+        zero_mask = self._zero_mask(batch, seq_len, hidden)
+        ms.get_placeholder_mask.return_value = (zero_mask, zero_mask)
+
+        rope_pos = torch.zeros(3, batch, seq_len, dtype=torch.long)
+        rope_deltas = torch.zeros(batch, dtype=torch.long)
+        ms.get_rope_index.return_value = (rope_pos, rope_deltas)
+
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden)
+        ms.language_model.return_value = mock_lang_output
+
+        result = Qwen3VLMoeModel.forward(
+            ms,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+
+        ms.get_video_features.assert_called_once()
+        ms.get_rope_index.assert_called_once()
+        call_kwargs = ms.get_rope_index.call_args.kwargs
+        assert "mm_token_type_ids" in call_kwargs
+        assert "video_grid_thw" in call_kwargs
+        torch.testing.assert_close(call_kwargs["mm_token_type_ids"], mm_token_type_ids)
+        assert isinstance(result, Qwen3VLMoeModelOutputWithPast)
+
+    def test_images_and_videos_merged_visual_call(self):
+        ms = self._mock_self()
+        batch, seq_len, hidden = 1, 4, 8
+        input_ids = torch.tensor([[10, 20, 30, 40]])
+        inputs_embeds = torch.randn(batch, seq_len, hidden)
+        pixel_values = torch.randn(4, 3, 2, 2)
+        pixel_values_videos = torch.randn(4, 3, 2, 2)
+        image_grid_thw = torch.tensor([[1, 2, 2]])
+        video_grid_thw = torch.tensor([[1, 2, 2]])
+        position_ids = torch.zeros(3, batch, seq_len, dtype=torch.long)
+
+        merged_output = MagicMock()
+        merged_output.pooler_output = torch.randn(2, hidden)
+        merged_output.deepstack_features = [torch.randn(2, hidden)]
+        ms.visual.return_value = merged_output
+
+        image_mask = torch.zeros(batch, seq_len, hidden, dtype=torch.bool)
+        image_mask[0, 0, :] = True
+        video_mask = torch.zeros(batch, seq_len, hidden, dtype=torch.bool)
+        video_mask[0, 1, :] = True
+        ms.get_placeholder_mask.side_effect = [
+            (image_mask, image_mask),
+            (video_mask, video_mask),
+        ]
+
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden)
+        ms.language_model.return_value = mock_lang_output
+
+        result = Qwen3VLMoeModel.forward(
+            ms,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            position_ids=position_ids,
+        )
+
+        ms.visual.assert_called_once()
+        visual_kwargs = ms.visual.call_args.kwargs
+        assert "grid_thw" in visual_kwargs
+        assert visual_kwargs["grid_thw"].shape[0] == 2
+        ms.get_image_features.assert_not_called()
+        ms.get_video_features.assert_not_called()
+        lang_kwargs = ms.language_model.call_args.kwargs
+        assert lang_kwargs["visual_pos_masks"] is not None
+        assert lang_kwargs["deepstack_visual_embeds"] is not None
+        assert len(lang_kwargs["deepstack_visual_embeds"]) == 1
+        assert isinstance(result, Qwen3VLMoeModelOutputWithPast)
+
+    def test_text_only_path_skips_inline_vision(self):
+        ms = self._mock_self()
+        batch, seq_len, hidden = 1, 4, 8
+        inputs_embeds = torch.randn(batch, seq_len, hidden)
+
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden)
+        ms.language_model.return_value = mock_lang_output
+
+        Qwen3VLMoeModel.forward(ms, input_ids=None, inputs_embeds=inputs_embeds)
+
+        ms.get_image_features.assert_not_called()
+        ms.get_video_features.assert_not_called()
+        ms.visual.assert_not_called()
+        ms.language_model.assert_called_once()
+
+    def test_dict_attention_mask_unwrapped_for_rope(self):
+        ms = self._mock_self()
+        batch, seq_len, hidden = 1, 4, 8
+        input_ids = torch.tensor([[10, 20, 30, 40]])
+        inputs_embeds = torch.randn(batch, seq_len, hidden)
+        pixel_values = torch.randn(4, 3, 2, 2)
+        image_grid_thw = torch.tensor([[1, 2, 2]])
+        full_mask = torch.ones(batch, seq_len, dtype=torch.long)
+        attention_mask = {"full_attention": full_mask}
+
+        mock_image_output = MagicMock()
+        mock_image_output.pooler_output = [torch.randn(2, hidden)]
+        mock_image_output.deepstack_features = [torch.randn(2, hidden)]
+        ms.get_image_features.return_value = mock_image_output
+
+        zero_mask = self._zero_mask(batch, seq_len, hidden)
+        ms.get_placeholder_mask.return_value = (zero_mask, zero_mask)
+        ms.get_rope_index.return_value = (
+            torch.zeros(3, batch, seq_len, dtype=torch.long),
+            torch.zeros(batch, dtype=torch.long),
+        )
+
+        mock_lang_output = MagicMock()
+        mock_lang_output.last_hidden_state = torch.randn(batch, seq_len, hidden)
+        ms.language_model.return_value = mock_lang_output
+
+        Qwen3VLMoeModel.forward(
+            ms,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+        rope_kwargs = ms.get_rope_index.call_args.kwargs
+        torch.testing.assert_close(rope_kwargs["attention_mask"], full_mask)
+
+
+class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
+    """CPU-runnable coverage for the PP mask guard and chunked pixel_values dispatch."""
+
+    @staticmethod
+    def _mock_self():
+        ms = MagicMock()
+        ms._vlm_pixel_values_chunks = None
+        ms._vlm_image_grid_hws_chunks = None
+        ms._vlm_chunk_idx = 0
+        return ms
+
+    def test_pp_attention_mask_dropped_on_seq_len_mismatch(self):
+        ms = self._mock_self()
+        hidden = 8
+        inputs_embeds = torch.randn(1, 4, hidden)
+        attention_mask = torch.ones(1, 8, dtype=torch.long)
+
+        captured = {}
+
+        def capture(**kw):
+            captured["attention_mask"] = kw.get("attention_mask")
+            captured["padding_mask"] = kw.get("padding_mask")
+            out = MagicMock()
+            out.last_hidden_state = kw["inputs_embeds"]
+            return out
+
+        ms.model.side_effect = lambda **kw: capture(**kw)
+
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms,
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            padding_mask=torch.ones(1, 8, dtype=torch.long),
+        )
+
+        assert captured["attention_mask"] is None
+        assert captured["padding_mask"] is None
+
+    def test_pp_attention_mask_preserved_on_matching_seq_len(self):
+        ms = self._mock_self()
+        hidden = 8
+        inputs_embeds = torch.randn(1, 4, hidden)
+        attention_mask = torch.ones(1, 4, dtype=torch.long)
+
+        captured = {}
+
+        def capture(**kw):
+            captured["attention_mask"] = kw.get("attention_mask")
+            out = MagicMock()
+            out.last_hidden_state = kw["inputs_embeds"]
+            return out
+
+        ms.model.side_effect = lambda **kw: capture(**kw)
+
+        Qwen3VLMoeForConditionalGeneration.forward(
+            ms,
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        )
+
+        assert captured["attention_mask"] is not None
+        torch.testing.assert_close(captured["attention_mask"], attention_mask)
+
+    @pytest.mark.parametrize("media_token_id", [151655, 151656])
+    def test_chunked_pixel_values_consumed_for_media_tokens(self, media_token_id):
+        ms = self._mock_self()
+        pixel_chunk = torch.randn(4, 3, 2, 2)
+        grid_hws_chunk = torch.tensor([[2, 2]])
+        ms._vlm_pixel_values_chunks = [pixel_chunk]
+        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk]
+        ms._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[1, media_token_id, 2, 3]])
+
+        captured = {}
+
+        def capture(**kw):
+            captured["pixel_values"] = kw.get("pixel_values")
+            captured["image_grid_thw"] = kw.get("image_grid_thw")
+            out = MagicMock()
+            out.last_hidden_state = torch.randn(1, 4, 8)
+            return out
+
+        ms.model.side_effect = lambda **kw: capture(**kw)
+
+        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+
+        assert ms._vlm_chunk_idx == 1
+        assert captured["pixel_values"] is pixel_chunk
+        thw = captured["image_grid_thw"]
+        assert thw is not None and thw.shape == (1, 3)
+        assert torch.equal(thw[:, 0], torch.ones(1, dtype=thw.dtype))
+        assert torch.equal(thw[:, 1:], grid_hws_chunk)
+
+    def test_chunked_pixel_values_skipped_without_media_tokens(self):
+        ms = self._mock_self()
+        pixel_chunk = torch.randn(4, 3, 2, 2)
+        grid_hws_chunk = torch.tensor([[2, 2]])
+        ms._vlm_pixel_values_chunks = [pixel_chunk]
+        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk]
+        ms._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+
+        captured = {}
+
+        def capture(**kw):
+            captured["pixel_values"] = kw.get("pixel_values")
+            out = MagicMock()
+            out.last_hidden_state = torch.randn(1, 4, 8)
+            return out
+
+        ms.model.side_effect = lambda **kw: capture(**kw)
+
+        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+
+        assert ms._vlm_chunk_idx == 0
+        assert captured["pixel_values"] is None
+
+    def test_chunked_pixel_values_passthrough_when_already_3d_grid(self):
+        ms = self._mock_self()
+        pixel_chunk = torch.randn(4, 3, 2, 2)
+        grid_thw_chunk = torch.tensor([[1, 2, 2]])
+        ms._vlm_pixel_values_chunks = [pixel_chunk]
+        ms._vlm_image_grid_hws_chunks = [grid_thw_chunk]
+        ms._vlm_chunk_idx = 0
+
+        input_ids = torch.tensor([[1, 151655, 2, 3]])
+
+        captured = {}
+
+        def capture(**kw):
+            captured["image_grid_thw"] = kw.get("image_grid_thw")
+            out = MagicMock()
+            out.last_hidden_state = torch.randn(1, 4, 8)
+            return out
+
+        ms.model.side_effect = lambda **kw: capture(**kw)
+
+        Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
+
+        torch.testing.assert_close(captured["image_grid_thw"], grid_thw_chunk)

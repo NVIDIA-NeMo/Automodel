@@ -15,6 +15,12 @@
 # Example recipe to finetune Qwen/Qwen3-VL-30B-A3B-Instruct with Transformer Engine + DeePeep kernels.
 # Requires `qwen-vl-utils` for the collate function and vision preprocessing.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 1
@@ -60,12 +66,6 @@ distributed:
   ep_size: 8
 
   sequence_parallel: false
-
-freeze_config:
-  freeze_embeddings: false
-  freeze_vision_tower: false
-  freeze_audio_tower: true
-  freeze_language_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -113,3 +113,7 @@ freeze_config:
 #   save_dir: <your_wandb_save_dir>
 
 
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:30:00"

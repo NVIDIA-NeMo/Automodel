@@ -1,4 +1,4 @@
-# LLM Pre-Training with NeMo AutoModel
+# LLM Pre-Training
 
 This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
 
@@ -416,11 +416,10 @@ torchrun --standalone --nproc-per-node 8 \
 
 # Using the automodel CLI:
 # single-GPU
-automodel pretrain llm -c examples/llm_pretrain/nanogpt_pretrain.yaml
+automodel examples/llm_pretrain/nanogpt_pretrain.yaml
 
-# multi-GPU (automodel CLI + torchrun on 8 GPUs)
-automodel --nproc-per-node 8 pretrain llm \
-  -c examples/llm_pretrain/nanogpt_pretrain.yaml
+# multi-GPU (8 GPUs)
+automodel --nproc-per-node 8 examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
 :::{tip}
 Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.

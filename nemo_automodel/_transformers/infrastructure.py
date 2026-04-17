@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
+from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -59,6 +60,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
+    freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
 )
@@ -101,6 +103,14 @@ def _apply_peft_and_lower_precision(
         # Attach helpers for delayed fake-quant toggling if desired
         model._qat_mode = qat_mode  # type: ignore[attr-defined]
 
+    return model
+
+
+def _apply_runtime_compatibility_fixes(model):
+    """Apply targeted runtime workarounds after sharding/load completes."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    if should_fix_rotary_embeddings(model_parts):
+        fix_rotary_embeddings(model_parts)
     return model
 
 
@@ -426,6 +436,7 @@ def apply_model_infrastructure(
         autopipeline=autopipeline,
         tp_size=mesh.tp_size,
         ep_size=mesh.ep_size,
+        dp_shard_size=mesh.dp_shard_size,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         load_base_model=load_base_model,
         peft_config=peft_config,
@@ -460,6 +471,10 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config)
 
+    # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
+    # so the optimizer never tracks them and checkpoint save/resume stay consistent.
+    freeze_unused_kv_sharing_params(model)
+
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
         loss_fn = MaskedCrossEntropy()
@@ -472,8 +487,12 @@ def apply_model_infrastructure(
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
-        if compile_config is not None:
+        if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
+        if isinstance(model_wrapper, FSDP2Manager):
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                model_wrapper.maybe_compile(mp)
         if isinstance(model_wrapper, DDPManager):
             setattr(model.module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
@@ -526,25 +545,43 @@ def apply_model_infrastructure(
                     param.requires_grad_(False)
 
     if autopipeline is None:
-        # Ensure model is on the correct device; AutoPipeline takes care of it internally
-        try:
-            model.to(device, non_blocking=True)
-        except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e):
-                logger.warning("model.to(device) failed (meta tensors); using model.to_empty(device=device) instead.")
-                model.to_empty(device=device)
-            else:
-                raise
         print_trainable_parameters(model)  # Once model's been sharded
+        # Ensure model is on the correct device.
+        # Skip when checkpoint was loaded post-shard (params are already on the
+        # target device) to avoid triggering FSDP's reset_sharded_param which
+        # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
+        # See: https://github.com/pytorch/pytorch/issues/151085
+        if not should_load_checkpoint:
+            try:
+                model.to(device, non_blocking=True)
+            except NotImplementedError as e:
+                if "Cannot copy out of meta tensor" in str(e):
+                    logger.warning(
+                        "model.to(device) failed (meta tensors); using model.to_empty(device=device) instead."
+                    )
+                    model.to_empty(device=device)
+                else:
+                    raise
 
     # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     if mesh.cp_size > 1 and not _uses_te_attention(model):
-        from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+        from nemo_automodel.components.distributed.cp_utils import (
+            attach_context_parallel_hooks,
+            attach_cp_sdpa_hooks,
+            attach_linear_attn_position_hooks,
+        )
+
+        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
+            attach_linear_attn_position_hooks(mp)
+            if is_compile_enabled:
+                attach_cp_sdpa_hooks(mp, cp_mesh)
 
+    model = _apply_runtime_compatibility_fixes(model)
     return model

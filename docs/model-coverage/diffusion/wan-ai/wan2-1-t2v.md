@@ -1,0 +1,92 @@
+# Wan 2.1 T2V
+
+[Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) is a text-to-video diffusion model from Wan AI, trained with flow matching on a large-scale video dataset. It generates high-quality short video clips from text prompts.
+
+:::{card}
+| | |
+|---|---|
+| **Task** | Text-to-Video |
+| **Architecture** | DiT (Flow Matching) |
+| **Parameters** | 1.3B |
+| **HF Org** | [Wan-AI](https://huggingface.co/Wan-AI) |
+:::
+
+## Available Models
+
+- **Wan2.1-T2V-1.3B**: 1.3B parameters
+
+## Task
+
+- Text-to-Video (T2V)
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Wan 2.1 T2V 1.3B | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| {download}`wan2_1_t2v_flow.yaml <../../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml>` | Fine-tune — Wan 2.1 T2V with flow matching |
+| {download}`wan2_1_t2v_flow.yaml <../../../../examples/diffusion/pretrain/wan2_1_t2v_flow.yaml>` | Pretrain — Wan 2.1 T2V with flow matching |
+
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
+```bash
+torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
+```
+
+:::{dropdown} Run with Docker
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [Diffusion Fine-Tuning Guide](../../../guides/diffusion/finetune.md).
+
+## Training
+
+See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/finetune.md) and [Dataset Preparation](../../../guides/diffusion/dataset.md).
+
+## Hugging Face Model Cards
+
+- [Wan-AI/Wan2.1-T2V-1.3B-Diffusers](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers)

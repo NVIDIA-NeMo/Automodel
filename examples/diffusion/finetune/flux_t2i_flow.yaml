@@ -44,13 +44,15 @@ step_scheduler:
   global_batch_size: 8
   ckpt_every_steps: 500
   log_every: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
     _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
     cache_dir: PATH_TO_YOUR_DATA
     train_text_encoder: false
-    num_workers: 0
+    num_workers: 2
     # Supported resolutions include [256x256], [512x512], and [1024x1024].
     # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
     # the implementation is designed to support multiple aspect ratios.
@@ -62,8 +64,9 @@ data:
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: null
 
 wandb:

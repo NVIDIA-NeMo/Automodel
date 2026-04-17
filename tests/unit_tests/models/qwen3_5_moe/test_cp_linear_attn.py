@@ -79,6 +79,7 @@ def module(text_config, device):
 
 # -- helpers for mocking dist.all_gather in a CP world_size=2 scenario -------
 
+
 def _make_fake_all_gather(rank0_pos, rank1_pos, rank0_hidden, rank1_hidden, device):
     """Return a fake all_gather that fills gathered lists for a 2-rank CP setup."""
 
@@ -90,7 +91,9 @@ def _make_fake_all_gather(rank0_pos, rank1_pos, rank0_hidden, rank1_hidden, devi
         else:
             # hidden states (B, S, D)
             gathered[0].copy_(rank0_hidden.to(device) if tensor.shape == rank0_hidden.shape else tensor)
-            gathered[1].copy_(rank1_hidden.to(device) if tensor.shape == rank1_hidden.shape else torch.randn_like(tensor))
+            gathered[1].copy_(
+                rank1_hidden.to(device) if tensor.shape == rank1_hidden.shape else torch.randn_like(tensor)
+            )
 
     return fake_all_gather
 
@@ -102,7 +105,9 @@ import contextlib
 def _patch_dist_for_cp(rank=0, world_size=2):
     """Context manager that patches dist rank/world_size for CP testing."""
     with (
-        patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=world_size),
+        patch(
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_world_size", return_value=world_size
+        ),
         patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.get_rank", return_value=rank),
     ):
         yield
@@ -174,9 +179,7 @@ class TestUndoAttentionLoadBalancing:
             patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_ag),
             _patch_dist_for_cp(rank=0, world_size=2),
         ):
-            result_hidden, sorted_pos = module._undo_attention_load_balancing(
-                hidden, positions, MagicMock()
-            )
+            result_hidden, sorted_pos = module._undo_attention_load_balancing(hidden, positions, MagicMock())
 
         # sorted_pos should be 0..7
         assert torch.equal(sorted_pos, torch.arange(8, device=device, dtype=torch.long))
@@ -215,13 +218,20 @@ class TestRedoAttentionLoadBalancing:
         B, S_local, D = 1, 4, module.hidden_size
 
         # Dense-order output from the attention computation
-        output = torch.arange(S_local, device=device, dtype=torch.float).unsqueeze(0).unsqueeze(-1).expand(B, S_local, D)
+        output = (
+            torch.arange(S_local, device=device, dtype=torch.float).unsqueeze(0).unsqueeze(-1).expand(B, S_local, D)
+        )
 
         # Rank 0 originally held positions [0, 3, 4, 7]
         original_positions = torch.tensor([0, 3, 4, 7], device=device, dtype=torch.long)
         sorted_positions = torch.arange(8, device=device, dtype=torch.long)
 
-        rank1_output = torch.arange(S_local, S_local * 2, device=device, dtype=torch.float).unsqueeze(0).unsqueeze(-1).expand(B, S_local, D)
+        rank1_output = (
+            torch.arange(S_local, S_local * 2, device=device, dtype=torch.float)
+            .unsqueeze(0)
+            .unsqueeze(-1)
+            .expand(B, S_local, D)
+        )
 
         def fake_all_gather(gathered, tensor, group=None):
             gathered[0].copy_(tensor)
@@ -231,9 +241,7 @@ class TestRedoAttentionLoadBalancing:
             patch("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn.dist.all_gather", fake_all_gather),
             _patch_dist_for_cp(rank=0, world_size=2),
         ):
-            result = module._redo_attention_load_balancing(
-                output, original_positions, sorted_positions, MagicMock()
-            )
+            result = module._redo_attention_load_balancing(output, original_positions, sorted_positions, MagicMock())
 
         # Result should have the same shape as input
         assert result.shape == (B, S_local, D)
@@ -249,30 +257,37 @@ class TestRedoAttentionLoadBalancing:
 
 
 class TestForwardFastPath:
-    def test_no_cp_mesh_delegates_to_super(self, module, device):
-        """When _cp_mesh is None, forward should delegate to the HF parent class."""
+    def test_no_cp_mesh_delegates_to_forward_no_cp(self, module, device):
+        """When _cp_mesh is None, forward should delegate to _forward_no_cp."""
         assert module._cp_mesh is None
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
-        with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+        with patch.object(module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)) as mock_no_cp_fwd:
             module.forward(hidden)
-            mock_super_fwd.assert_called_once()
+            mock_no_cp_fwd.assert_called_once()
 
-    def test_cp_mesh_size_1_delegates_to_super(self, module, device):
-        """When _cp_mesh.size() == 1, forward should delegate to the HF parent class."""
+    def test_cp_mesh_size_1_delegates_to_forward_no_cp(self, module, device):
+        """When _cp_mesh.size() == 1, forward should delegate to _forward_no_cp."""
         mesh = MagicMock()
         mesh.size.return_value = 1
         module._cp_mesh = mesh
 
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
-        with patch.object(
-            type(module).__bases__[0], "forward", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_super_fwd:
+        with patch.object(module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)) as mock_no_cp_fwd:
             module.forward(hidden)
-            mock_super_fwd.assert_called_once()
+            mock_no_cp_fwd.assert_called_once()
+
+    def test_no_cp_does_not_forward_cache_position(self, module, device):
+        """cache_position should not be forwarded to _forward_no_cp (removed in transformers>=5.5)."""
+        assert module._cp_mesh is None
+        B, S, D = 1, 8, module.hidden_size
+        hidden = torch.randn(B, S, D, device=device)
+        with patch.object(module, "_forward_no_cp", return_value=torch.randn(B, S, D, device=device)) as mock_no_cp_fwd:
+            module.forward(hidden, cache_position=torch.arange(S, device=device))
+            mock_no_cp_fwd.assert_called_once()
+            _, kwargs = mock_no_cp_fwd.call_args
+            assert "cache_position" not in kwargs
 
     def test_cp_mesh_gt_1_calls_forward_with_cp(self, module, device):
         """When _cp_mesh.size() > 1, forward should call _forward_with_cp."""
@@ -282,9 +297,7 @@ class TestForwardFastPath:
 
         B, S, D = 1, 8, module.hidden_size
         hidden = torch.randn(B, S, D, device=device)
-        with patch.object(
-            module, "_forward_with_cp", return_value=torch.randn(B, S, D, device=device)
-        ) as mock_cp_fwd:
+        with patch.object(module, "_forward_with_cp", return_value=torch.randn(B, S, D, device=device)) as mock_cp_fwd:
             module.forward(hidden, position_ids=torch.arange(S, device=device).unsqueeze(0))
             mock_cp_fwd.assert_called_once()
 

@@ -39,6 +39,7 @@ from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
 
+import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
@@ -192,6 +193,11 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     if hf_config is None:
+        # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
+        # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
+        # with incomplete dicts, losing all other fields. These nested overrides are
+        # instead handled by _consume_config_overrides which deep-merges them.
+        nested_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if isinstance(kwargs[k], dict)}  # noqa: F841
         try:
             hf_config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
@@ -224,6 +230,12 @@ def get_is_hf_model(config, force_hf):
 
 def _download_model_weights(hf_config, pretrained_model_name_or_path):
     if not os.path.isdir(pretrained_model_name_or_path):
+        if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
+            logger.info(
+                "HF_HUB_OFFLINE=1: skipping weight download for %s (using cached weights)",
+                pretrained_model_name_or_path,
+            )
+            return
         num_nodes = (get_world_size_safe() % get_local_world_size_preinit()) + 1  # 1-indexed
         if num_nodes > 1:
             logger.info(
@@ -299,7 +311,7 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
             mod = model.get_submodule(parts[0]) if len(parts) == 2 else model
             param_map[name] = (mod, parts[-1], buf)
 
-    loaded = 0
+    loaded_keys: set[str] = set()
     device = torch.device(device) if not isinstance(device, torch.device) else device
 
     for shard_idx, shard_file in enumerate(shard_files):
@@ -346,12 +358,41 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
                     else:
                         mod._buffers[attr] = materialized
 
-                loaded += 1
+                loaded_keys.add(key)
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    logger.info("Streaming BnB load complete: %d tensors loaded", loaded)
+    # Tie weights before validating: safetensors typically stores only one copy
+    # of a tied pair (e.g. Llama's lm_head.weight tied to embed_tokens.weight),
+    # so the untied sibling is still on meta at this point. tie_weights()
+    # re-establishes the Python-level alias so both sides point at the loaded
+    # tensor.
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+
+    # Any param/buffer still on meta after load+tie is a real missing key —
+    # forward pass would silently produce NaN.  Fail loudly instead.
+    missing: list[str] = []
+    for name, (_, _, _) in param_map.items():
+        if name in loaded_keys:
+            continue
+        current = _get_model_tensor(model, name)
+        if current is None or (hasattr(current, "device") and current.device.type == "meta"):
+            missing.append(name)
+
+    if missing:
+        preview = ", ".join(missing[:10])
+        more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+        raise RuntimeError(
+            f"Streaming BnB load left {len(missing)} tensor(s) unmaterialized after tie_weights: {preview}{more}"
+        )
+
+    logger.info(
+        "Streaming BnB load complete: %d tensors loaded (%d additional tied after load)",
+        len(loaded_keys),
+        len(param_map) - len(loaded_keys),
+    )
 
 
 def _init_model_bnb_streaming(
@@ -424,7 +465,78 @@ def _init_model_bnb_streaming(
     return False, model
 
 
-def _init_model(
+def _get_model_tensor(model, name: str):
+    """Return a parameter or buffer by its fully-qualified state-dict key."""
+    try:
+        return model.get_parameter(name)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return model.get_buffer(name)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _restore_loaded_model_dtype(
+    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs
+) -> None:
+    """Restore each loaded tensor to the exact dtype stored in the checkpoint.
+
+    Some modules allocate parameters in a wider dtype than the checkpoint.
+    HuggingFace then copies the checkpoint tensor into that existing tensor,
+    which upcasts the loaded value. We fix that by re-inspecting checkpoint
+    tensor dtypes per key and restoring each loaded parameter/buffer to the
+    dtype that was actually stored in the file.
+    """
+    if quantization_config is not None or getattr(hf_config, "quantization_config", None) is not None:
+        return
+
+    try:
+        checkpoint_dtypes = checkpoint_utils._get_checkpoint_tensor_dtypes(
+            pretrained_model_name_or_path, hf_config, load_kwargs
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect checkpoint tensor dtypes for %s; leaving loaded dtypes unchanged: %s",
+            pretrained_model_name_or_path,
+            exc,
+        )
+        return
+
+    if not checkpoint_dtypes:
+        return
+
+    restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
+    restored_count = 0
+    for name, checkpoint_dtype in checkpoint_dtypes.items():
+        tensor = _get_model_tensor(model, name)
+        if tensor is None or tensor.dtype == checkpoint_dtype:
+            continue
+
+        seen_dtype = restored_dtype_by_tensor_id.get(id(tensor))
+        if seen_dtype is not None and seen_dtype != checkpoint_dtype:
+            logger.warning(
+                "Skipping conflicting checkpoint dtypes for aliased tensor %s: %s vs %s",
+                name,
+                seen_dtype,
+                checkpoint_dtype,
+            )
+            continue
+
+        try:
+            tensor.data = tensor.data.to(dtype=checkpoint_dtype)
+        except (RuntimeError, TypeError) as exc:
+            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, checkpoint_dtype, exc)
+            continue
+
+        restored_dtype_by_tensor_id[id(tensor)] = checkpoint_dtype
+        restored_count += 1
+
+    if restored_count > 0:
+        logger.info("Restored checkpoint dtypes for %d tensors from %s", restored_count, pretrained_model_name_or_path)
+
+
+def __init_model(
     cls,
     pretrained_model_name_or_path_or_config,
     attn_implementation,
@@ -444,6 +556,7 @@ def _init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    architectures = get_architectures(hf_config)
 
     # Streaming BnB loading: when quantization is requested and we're loading from a
     # pretrained checkpoint, use streaming quantization to avoid materializing the full
@@ -481,6 +594,7 @@ def _init_model(
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
+            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -490,15 +604,16 @@ def _init_model(
                 **kwargs,
             )
         # Get HF model class and wrap with mixin
+        hf_model_cls = type(model)
         try:
-            hf_model_cls = cls._model_mapping[type(hf_config)]
+            if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+                hf_model_cls = cls._model_mapping[type(hf_config)]
         except KeyError:
-            hf_model_cls = type(model)
+            pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
     # 2. If we have a custom model implementation available, we prioritize that over HF
-    architectures = get_architectures(hf_config)
     model_cls = _resolve_custom_model_cls_for_config(hf_config)
     if model_cls is not None:
         if quantization_config is not None:
@@ -522,6 +637,11 @@ def _init_model(
             init_param_names = _get_init_param_names(model_cls)
             _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
+            # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
+            if "backend" in kwargs and isinstance(kwargs["backend"], dict):
+                from nemo_automodel.components.models.common.utils import BackendConfig
+
+                kwargs["backend"] = BackendConfig(**kwargs["backend"])
             # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
             if torch_dtype != "auto":
                 hf_config.torch_dtype = torch_dtype
@@ -529,7 +649,6 @@ def _init_model(
                 return True, model_cls(hf_config, *model_args, **kwargs)
 
     # 3. fallback to HF model class wrapped with mixin
-
     model = None
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
@@ -543,6 +662,7 @@ def _init_model(
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
+        _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
     else:
         model = cls._from_config_parent_class(
             hf_config,
@@ -552,12 +672,66 @@ def _init_model(
             **kwargs,
         )
 
+    # Get HF model class and wrap with mixin
+    hf_model_cls = type(model)
     try:
-        hf_model_cls = cls._model_mapping[type(hf_config)]
+        if len(architectures) > 0 and architectures[0] != "NemotronHForCausalLM":
+            hf_model_cls = cls._model_mapping[type(hf_config)]
     except KeyError:
-        hf_model_cls = type(model)
+        pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
     return False, model
+
+
+def _tie_weights_nemo(model):
+    if not hasattr(model, "_nemo_tied_weights_keys"):
+        return
+
+    def get_module_by_fqn(model, fqn):
+        from functools import reduce
+
+        fqn = fqn.split(".")
+        if fqn[-1] == "weight":
+            fqn = fqn[:-1]
+        return reduce(getattr, fqn, model)
+
+    for k, v in model._nemo_tied_weights_keys.items():
+        get_module_by_fqn(model, k).weight = get_module_by_fqn(model, v).weight
+
+
+def _init_model(
+    cls,
+    pretrained_model_name_or_path_or_config,
+    attn_implementation,
+    torch_dtype,
+    quantization_config,
+    force_hf,
+    *model_args,
+    **kwargs,
+):
+    is_custom_model, model = __init_model(
+        cls,
+        pretrained_model_name_or_path_or_config,
+        attn_implementation,
+        torch_dtype,
+        quantization_config,
+        force_hf,
+        *model_args,
+        **kwargs,
+    )
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/a3a57176f68add7917faaa32f19228f49fcbb1ba/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml#L41
+    # this happens in nemotron_flash, where we load using force_hf, and the model is pre 5.x
+    #
+    # for safety, we tied weights after _model_init. We could do the tying in post_init, but it could be overwritten.
+    # So the sequence is roughly:
+    #   1. HF constructs NemotronFlashForCausalLM(config).
+    #   2. Inside that constructor, self.post_init() runs.
+    #   3. Only after construction returns does from_pretrained() finish loading/applying checkpoint weights.
+    #   4. That later load can assign lm_head.weight and model.embed_tokens.weight separately, which breaks any alias we create inside post_init().
+
+    if hasattr(model, "_nemo_tied_weights_keys"):
+        _tie_weights_nemo(model)
+    return is_custom_model, model
 
 
 def get_architectures(hf_config):
@@ -606,7 +780,17 @@ def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str
             continue
         # Otherwise, if it looks like a config field, apply it to config.
         if k in config_keys:
-            setattr(config, k, kwargs.pop(k))
+            val = kwargs.pop(k)
+            # Deep-merge dict overrides into existing sub-config objects (e.g.
+            # text_config={"router_aux_loss_coef": 0}) instead of replacing the
+            # entire sub-config, which would lose all other fields.
+            if isinstance(val, dict):
+                existing = getattr(config, k, None)
+                if existing is not None and hasattr(existing, "to_dict"):
+                    for sub_k, sub_v in val.items():
+                        setattr(existing, sub_k, sub_v)
+                    continue
+            setattr(config, k, val)
 
 
 def _filter_kwargs_for_init(model_cls, kwargs: dict) -> dict:

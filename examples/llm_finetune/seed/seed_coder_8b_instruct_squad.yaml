@@ -14,6 +14,12 @@
 
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 8
@@ -88,4 +94,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: adil-a

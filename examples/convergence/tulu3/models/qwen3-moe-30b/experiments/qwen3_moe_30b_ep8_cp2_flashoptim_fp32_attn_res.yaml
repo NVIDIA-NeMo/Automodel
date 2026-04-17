@@ -1,0 +1,109 @@
+# Qwen3 MoE 30B SFT on Tulu-3 with EP=8, CP=2, FSDP on 8 GPUs.
+# Uses ChatDataset with default collater.
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  gc_every_steps: 10
+  max_steps: 1000
+  val_every_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B-Base
+  router_aux_loss_coef: 0.00001
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_convergence/qwen3_moe_30b_flashoptim_cp2/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 2
+  pp_size: 1
+  ep_size: 8
+
+  sequence_parallel: false
+  activation_checkpointing: false  # AttnResBlock state flows across layers, incompatible with per-layer AC wrapping
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 4
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+autocast:
+  enabled: true
+  dtype: bfloat16
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  truncation: false
+  seq_length: 2048
+  padding: do_not_pad
+  shuffle_seed: 42
+  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 8
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: "train[:128]"
+  seq_length: 2048
+  padding: do_not_pad
+  shuffle_seed: 42
+  chat_template: examples/convergence/tulu3/models/qwen3-moe-30b/chat_template.jinja
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 8
+
+optimizer:
+  _target_: flashoptim.FlashAdamW
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  weight_decay: 0
+  master_weight_bits: 32
+  compress_state_dict: false

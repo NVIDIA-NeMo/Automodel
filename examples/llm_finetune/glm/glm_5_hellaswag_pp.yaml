@@ -14,6 +14,8 @@
 
 # Recipe validated using 256 H100 GPUs (32 nodes x 8)
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 seed: 1234
 
 step_scheduler:
@@ -109,3 +111,7 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
+
+ci:
+  recipe_owner: hemildesai
+  nodes: 32

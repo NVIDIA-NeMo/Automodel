@@ -36,10 +36,12 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.phi.modeling_phi import PhiForCausalLM
 from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -267,6 +269,27 @@ def get_decilm_nemotron_tp_plan(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_baichuan(
+    model: BaichuanForCausalLM | None,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a BaichuanForCausalLM model (MLP-only).
+
+    Only the MLP is sharded. The attention path stays fully replicated
+    because W_pack uses a non-interleaved [Q|K|V] layout (ColwiseParallel
+    would split it incorrectly) and NormHead (lm_head) is not nn.Linear
+    (ColwiseParallel is unsupported).
+    """
+    return cast(
+        dict[str, ParallelStyle],
+        {
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        },
+    )
+
+
 def _parallelize_llama(
     model: LlamaForCausalLM | None,
     sequence_parallel: bool = False,
@@ -417,6 +440,44 @@ def _parallelize_qwen_classification(
     return plan
 
 
+def _parallelize_phi(
+    model: PhiForCausalLM,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a PhiForCausalLM (Phi-2) model across tensor parallel dimensions.
+
+    Phi-2 uses ``self_attn.dense`` instead of ``self_attn.o_proj`` and
+    ``mlp.fc1``/``mlp.fc2`` instead of ``mlp.gate_proj``/``mlp.up_proj``/``mlp.down_proj``.
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.dense": RowwiseParallel(),
+        "model.layers.*.mlp.fc1": ColwiseParallel(),
+        "model.layers.*.mlp.fc2": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    if sequence_parallel:
+        base_model_sp_plan: dict[str, ParallelStyle] = {
+            "model.embed_tokens": VocabParallelEmbedding(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+                use_local_output=False,
+            ),
+            "model.final_layernorm": SequenceParallel(),
+            "model.layers.*.input_layernorm": SequenceParallel(),
+            "model.layers.*.self_attn.dense": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "model.layers.*.mlp.fc2": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+        }
+        base_model_tp_plan.update(base_model_sp_plan)
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 # Phi3: fused attention cannot be sharded; shard MLP as in HF guidance
 def _parallelize_phi3(
     model: Phi3ForCausalLM,
@@ -486,6 +547,7 @@ def _get_class_qualname(cls: type) -> str:
 
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
+    _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
     _get_class_qualname(Qwen2ForCausalLM): _parallelize_qwen,
     _get_class_qualname(Qwen3ForCausalLM): _parallelize_qwen,
     _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
@@ -495,6 +557,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
+    _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,

@@ -28,6 +28,7 @@ HF_TRANSFORMER_QWEN3_MOE_LORA_CKPT_RESUME_FILENAME = "L2_HF_Transformer_Qwen3_Mo
 HF_TRANSFORMER_LLAMA3_CUSTOM_FILENAME = "L2_HF_Transformer_PEFT_Benchmark_Llama_custom.sh"
 HF_TRANSFORMER_QWEN2_CUSTOM_FILENAME = "L2_HF_Transformer_PEFT_Benchmark_qwen2_custom.sh"
 HF_TRANSFORMER_NEMOTRON_NANO_V3_4LAYER_CUSTOM_FILENAME = "L2_HF_Transformer_Nemotron_Nano_v3_MoE_custom.sh"
+HF_TRANSFORMER_PP_DYNAMIC_SEQLEN_SFT_FILENAME = "L2_HF_Transformer_w_PP_Dynamic_SeqLen_SFT.sh"
 
 class TestHFTransformerFinetune:
     def test_hf_transformer_sft(self):
@@ -101,10 +102,16 @@ class TestHFTransformerFinetune:
         finally:
             # remove the checkpoint directory
             shutil.rmtree("checkpoints/", ignore_errors=True)
-    
+
     def test_hf_transformer_nemotron_nano_v3_4layer_custom(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_NEMOTRON_NANO_V3_4LAYER_CUSTOM_FILENAME)
         finally:
             # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_transformer_pp_dynamic_seqlen_sft(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_PP_DYNAMIC_SEQLEN_SFT_FILENAME)
+        finally:
             shutil.rmtree("checkpoints/", ignore_errors=True)

@@ -727,8 +727,13 @@ class TestApplyFsdpShardingRecursively:
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList."""
-        # Set up mock return values
-        mock_fully_shard.side_effect = lambda x, **kwargs: x  # Return the module unchanged
+        # Set up mock return values - add FSDP2 prefetch methods that fully_shard normally provides
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
 
         # Call the function
         apply_fsdp2_sharding_recursively(
@@ -756,8 +761,13 @@ class TestApplyFsdpShardingRecursively:
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy
     ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList and no offload policy."""
-        # Set up mock return values
-        mock_fully_shard.side_effect = lambda x, **kwargs: x
+        # Set up mock return values - add FSDP2 prefetch methods that fully_shard normally provides
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
 
         # Call the function without offload_policy
         apply_fsdp2_sharding_recursively(module=mock_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy)
@@ -1027,11 +1037,11 @@ class TestUpdateAttentionHeadCountsForTP:
         assert model.config.num_attention_heads == 64
         assert model.config.num_key_value_heads == 8
 
-    def test_updates_config_and_layer_attrs(self):
+    def test_preserves_config_and_updates_layer_attrs(self):
         model = self._make_model(num_heads=64, num_kv_heads=8, hidden_size=8192)
         _update_attention_head_counts_for_tp(model, tp_size=2)
-        assert model.config.num_attention_heads == 32
-        assert model.config.num_key_value_heads == 4
+        assert model.config.num_attention_heads == 64
+        assert model.config.num_key_value_heads == 8
         assert model.config.head_dim == 128
         for layer in model.model.layers:
             assert layer.self_attn.num_heads == 32
@@ -1169,3 +1179,339 @@ class TestAttentionIsHeadSharded:
 
     def test_empty_plan_is_not_sharded(self):
         assert _attention_is_head_sharded({}) is False
+
+
+# ---------------------------------------------------------------------------
+# Activation checkpointing + KV-sharing tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeLayer(nn.Module):
+    """Minimal transformer layer with mlp, self_attn, and layernorms."""
+
+    def __init__(self, dim: int = 16):
+        super().__init__()
+        self.mlp = nn.Linear(dim, dim)
+        self.self_attn = nn.Linear(dim, dim)
+        self.input_layernorm = nn.Linear(dim, dim)
+        self.post_attention_layernorm = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        return x
+
+
+def _make_model_for_ac(
+    num_layers: int = 2,
+    dim: int = 16,
+    use_cache: bool = True,
+    num_kv_shared_layers: int = 0,
+    text_config_nested: bool = True,
+):
+    """Build a minimal model with configurable KV-sharing for activation-checkpointing tests.
+
+    Args:
+        text_config_nested: If True, place ``num_kv_shared_layers`` under
+            ``config.text_config`` (VLM pattern).  If False, place it directly
+            on ``config`` (flat LLM pattern).
+    """
+
+    class _Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_FakeLayer(dim) for _ in range(num_layers)])
+
+    model = nn.Module()
+    model.model = _Inner()  # type: ignore[attr-defined]
+
+    if text_config_nested:
+        text_cfg = SimpleNamespace(num_kv_shared_layers=num_kv_shared_layers)
+        model.config = SimpleNamespace(use_cache=use_cache, text_config=text_cfg)  # type: ignore[attr-defined]
+    else:
+        model.config = SimpleNamespace(  # type: ignore[attr-defined]
+            use_cache=use_cache,
+            num_kv_shared_layers=num_kv_shared_layers,
+        )
+    model.forward = lambda x: x  # type: ignore[attr-defined]
+    return model
+
+
+class TestActivationCheckpointingKVSharing:
+    """Tests for the KV-sharing–aware activation-checkpointing guards
+    in ``DefaultParallelizationStrategy.parallelize``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _patch_parallelizer(self, monkeypatch):
+        """Patch heavy distributed primitives so we can call ``parallelize``
+        without a real GPU mesh.  ``checkpoint_wrapper`` is replaced with a
+        lightweight wrapper that records which module was wrapped.
+        """
+
+        class _Wrapped(nn.Module):
+            """Sentinel wrapper so we can assert which sub-modules were checkpointed.
+
+            Must inherit from ``nn.Module`` because PyTorch's ``__setattr__``
+            rejects non-Module values when replacing a registered child module.
+            """
+
+            def __init__(self, inner):
+                super().__init__()
+                self._inner = inner
+
+            def forward(self, x):
+                return self._inner(x)
+
+        self._Wrapped = _Wrapped
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            _Wrapped,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.fully_shard",
+            lambda model, **kw: model,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.get_submesh",
+            lambda mesh, names: MagicMock(),
+        )
+
+    def _run_parallelize(self, model, activation_checkpointing=True):
+        """Invoke the strategy under test and return the model."""
+        from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+
+        strategy = DefaultParallelizationStrategy()
+        mesh = MagicMock(spec=DeviceMesh)
+        tp_mesh = MagicMock()
+        tp_mesh.size.return_value = 1  # no TP
+        mesh.__getitem__ = lambda self_, key: tp_mesh
+        return strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            activation_checkpointing=activation_checkpointing,
+        )
+
+    # ------------------------------------------------------------------ #
+    # use_cache preservation / disabling
+    # ------------------------------------------------------------------ #
+
+    def test_use_cache_preserved_when_kv_sharing(self):
+        """Models with num_kv_shared_layers > 0 must keep use_cache=True."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=20)
+        self._run_parallelize(model)
+        assert model.config.use_cache is True
+
+    def test_use_cache_disabled_without_kv_sharing(self):
+        """Standard models (num_kv_shared_layers=0) get use_cache=False."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0)
+        self._run_parallelize(model)
+        assert model.config.use_cache is False
+
+    def test_use_cache_preserved_flat_config(self):
+        """KV-sharing detected through a flat config (no text_config nesting)."""
+        model = _make_model_for_ac(
+            use_cache=True, num_kv_shared_layers=10, text_config_nested=False
+        )
+        self._run_parallelize(model)
+        assert model.config.use_cache is True
+
+    def test_use_cache_disabled_flat_config_no_sharing(self):
+        """Flat config without KV sharing still disables cache."""
+        model = _make_model_for_ac(
+            use_cache=True, num_kv_shared_layers=0, text_config_nested=False
+        )
+        self._run_parallelize(model)
+        assert model.config.use_cache is False
+
+    def test_use_cache_noop_when_already_false(self):
+        """If use_cache is already False and no KV sharing, code path is a no-op."""
+        model = _make_model_for_ac(use_cache=False, num_kv_shared_layers=0)
+        self._run_parallelize(model)
+        assert model.config.use_cache is False
+
+    def test_no_config_does_not_crash(self, monkeypatch):
+        """Model without a config attribute must not raise."""
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer._extract_model_layers",
+            lambda m: [],
+        )
+        model = nn.Module()
+        model.forward = lambda x: x  # type: ignore[attr-defined]
+        # no model.config at all
+        self._run_parallelize(model)  # should not raise
+
+    # ------------------------------------------------------------------ #
+    # self_attn checkpoint wrapping
+    # ------------------------------------------------------------------ #
+
+    def test_self_attn_not_wrapped_when_kv_sharing(self):
+        """KV-shared models: self_attn must NOT be wrapped (would corrupt cache)."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=20)
+        self._run_parallelize(model)
+        for layer in model.model.layers:
+            assert not isinstance(layer.self_attn, self._Wrapped), (
+                "self_attn should NOT be checkpoint-wrapped for KV-shared models"
+            )
+
+    def test_self_attn_wrapped_without_kv_sharing(self):
+        """Standard models: self_attn IS wrapped."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0)
+        self._run_parallelize(model)
+        for layer in model.model.layers:
+            assert isinstance(layer.self_attn, self._Wrapped), (
+                "self_attn should be checkpoint-wrapped for standard models"
+            )
+
+    def test_mlp_always_wrapped(self):
+        """MLP is checkpoint-wrapped regardless of KV sharing."""
+        for kv_shared in (0, 20):
+            model = _make_model_for_ac(num_kv_shared_layers=kv_shared)
+            self._run_parallelize(model)
+            for layer in model.model.layers:
+                assert isinstance(layer.mlp, self._Wrapped), (
+                    f"mlp should always be wrapped (num_kv_shared_layers={kv_shared})"
+                )
+
+    def test_layernorms_always_wrapped(self):
+        """Layernorms are checkpoint-wrapped regardless of KV sharing."""
+        for kv_shared in (0, 20):
+            model = _make_model_for_ac(num_kv_shared_layers=kv_shared)
+            self._run_parallelize(model)
+            for layer in model.model.layers:
+                assert isinstance(layer.input_layernorm, self._Wrapped)
+                assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
+    def test_no_wrapping_without_activation_checkpointing(self):
+        """When activation_checkpointing=False, nothing is wrapped."""
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        self._run_parallelize(model, activation_checkpointing=False)
+        for layer in model.model.layers:
+            assert not isinstance(layer.mlp, self._Wrapped)
+            assert not isinstance(layer.self_attn, self._Wrapped)
+        assert model.config.use_cache is True  # untouched
+
+    # ------------------------------------------------------------------ #
+    # HF native gradient-checkpointing path
+    # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Exception / edge-case branches
+    # ------------------------------------------------------------------ #
+
+    def test_frozen_config_use_cache_except_branch(self):
+        """When ``model.config.use_cache = False`` raises, the except branch runs."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0)
+
+        class _FrozenConfig:
+            use_cache = True
+            text_config = SimpleNamespace(num_kv_shared_layers=0)
+
+            def __setattr__(self, name, value):
+                raise AttributeError("frozen")
+
+        model.config = _FrozenConfig()  # type: ignore[attr-defined]
+        self._run_parallelize(model)
+        # use_cache stays True because the assignment raised and was caught
+        assert model.config.use_cache is True
+
+    def test_no_config_with_layers_does_not_crash(self):
+        """Model without ``config`` but with extractable layers does not crash."""
+
+        class _Bare(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([_FakeLayer() for _ in range(2)])  # type: ignore[attr-defined]
+
+            def forward(self, x):
+                return x
+
+        model = _Bare()
+        # no model.config → hasattr(model, "config") is False
+        self._run_parallelize(model)
+        # mlp should still be wrapped (activation_checkpointing still applies)
+        for layer in model.model.layers:
+            assert isinstance(layer.mlp, self._Wrapped)
+
+    def test_layer_missing_self_attn(self):
+        """Layers without ``self_attn`` are skipped gracefully."""
+
+        class _MlpOnlyLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_MlpOnlyLayer() for _ in range(2)])
+        self._run_parallelize(model)
+        for layer in model.model.layers:
+            assert isinstance(layer.mlp, self._Wrapped)
+            assert not hasattr(layer, "self_attn")
+
+    def test_layer_missing_mlp(self):
+        """Layers without ``mlp`` are skipped gracefully."""
+
+        class _AttnOnlyLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_AttnOnlyLayer() for _ in range(2)])
+        self._run_parallelize(model)
+        for layer in model.model.layers:
+            assert isinstance(layer.self_attn, self._Wrapped)
+            assert not hasattr(layer, "mlp")
+
+    # ------------------------------------------------------------------ #
+    # HF native gradient-checkpointing path
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers):
+        """Helper: configure a model + fake transformers module for the HF native path."""
+        import types
+
+        class _FakeGradLayer(_FakeLayer):
+            pass
+
+        _FakeGradLayer.__module__ = "transformers.models.gemma4.modeling_gemma4"
+
+        fake_module = types.ModuleType("transformers.modeling_layers")
+        fake_module.GradientCheckpointingLayer = _FakeGradLayer  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "transformers.modeling_layers", fake_module)
+
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=num_kv_shared_layers)
+        for i in range(len(model.model.layers)):
+            model.model.layers[i] = _FakeGradLayer()
+        model.supports_gradient_checkpointing = True  # type: ignore[attr-defined]
+        model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
+        return model
+
+    def test_hf_native_grad_ckpt_preserves_use_cache_with_kv_sharing(self, monkeypatch):
+        """Even when the HF native path is taken, use_cache stays True for KV-shared models."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
+        self._run_parallelize(model)
+
+        assert model.config.use_cache is True
+        model.gradient_checkpointing_enable.assert_called_once()
+
+    def test_hf_native_grad_ckpt_disables_use_cache_without_kv_sharing(self, monkeypatch):
+        """HF native path + no KV sharing: use_cache is set to False."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
+        self._run_parallelize(model)
+
+        assert model.config.use_cache is False
+        model.gradient_checkpointing_enable.assert_called_once_with(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )

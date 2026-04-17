@@ -1,0 +1,94 @@
+# Falcon
+
+[Falcon](https://falconllm.tii.ae/) is a series of open language models from the Technology Innovation Institute (TII) in Abu Dhabi, known for being trained on a high-quality curated web corpus (RefinedWeb).
+
+:::{card}
+| | |
+|---|---|
+| **Task** | Text Generation |
+| **Architecture** | `FalconForCausalLM` |
+| **Parameters** | 7B – 40B |
+| **HF Org** | [tiiuae](https://huggingface.co/tiiuae) |
+:::
+
+## Available Models
+
+- **Falcon-40B**, **Falcon-40B-Instruct**
+- **Falcon-7B**, **Falcon-7B-Instruct**
+- **Falcon-RW-7B**
+- **Falcon3-7B-Instruct**
+
+## Architecture
+
+- `FalconForCausalLM`
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Falcon 7B | [`tiiuae/falcon-7b`](https://huggingface.co/tiiuae/falcon-7b) |
+| Falcon 40B | [`tiiuae/falcon-40b`](https://huggingface.co/tiiuae/falcon-40b) |
+| Falcon RW 7B | [`tiiuae/falcon-rw-7b`](https://huggingface.co/tiiuae/falcon-rw-7b) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| {download}`falcon3_7b_instruct_squad.yaml <../../../../examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml>` | SFT — Falcon3 7B Instruct on SQuAD |
+| {download}`falcon3_7b_instruct_squad_peft.yaml <../../../../examples/llm_finetune/falcon/falcon3_7b_instruct_squad_peft.yaml>` | LoRA — Falcon3 7B Instruct on SQuAD |
+
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml
+```
+
+:::{dropdown} Run with Docker
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/falcon/falcon3_7b_instruct_squad.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
+## Fine-Tuning
+
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+
+## Hugging Face Model Cards
+
+- [tiiuae/falcon-7b](https://huggingface.co/tiiuae/falcon-7b)
+- [tiiuae/falcon-40b](https://huggingface.co/tiiuae/falcon-40b)

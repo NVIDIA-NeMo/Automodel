@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 32
   local_batch_size: 4
@@ -97,4 +99,8 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:15:00"

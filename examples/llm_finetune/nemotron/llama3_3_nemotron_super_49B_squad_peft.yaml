@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
 
+# To run this recipe:
+#   automodel examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 8
@@ -103,3 +106,17 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  time: "00:45:00"
+  vllm_deploy: true
+  recipe_owner: HuiyingLi
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    trust_remote_code: true
+    distributed.tp_size: 2
+    tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
+    check_fused_qkv_keys: true
+    hf_device_map_auto: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

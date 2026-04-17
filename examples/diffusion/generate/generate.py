@@ -186,10 +186,13 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
 def load_checkpoint_into_pipeline(pipe, cfg):
     """Load a training checkpoint into the pipeline's transformer.
 
-    Supports three checkpoint formats:
-    - EMA shadow weights (ema_shadow.pt)
-    - Consolidated model weights (consolidated_model.bin)
-    - Sharded FSDP/DCP checkpoints (model/*.distcp)
+    Expects a consolidated HF safetensors checkpoint produced by training
+    with model_save_format: safetensors, save_consolidated: true, and
+    diffusers_compatible: true. The checkpoint directory should contain
+    model/consolidated/ with diffusion_pytorch_model.safetensors.index.json
+    and the corresponding safetensors files.
+
+    Uses the standard diffusers from_pretrained() API for loading.
 
     Args:
         pipe: The diffusion pipeline with a `.transformer` attribute.
@@ -229,6 +232,37 @@ def load_checkpoint_into_pipeline(pipe, cfg):
         logger.info("Loaded sharded FSDP checkpoint")
     else:
         logger.warning("No recognized checkpoint format found in %s, using base model weights", checkpoint_dir)
+
+
+def load_lora_weights_into_pipeline(pipe, cfg):
+    """Load LoRA adapter weights into the pipeline's transformer.
+
+    Reads adapter_model.safetensors + adapter_config.json from the directory
+    specified by model.lora_weights. Does nothing if lora_weights is null/unset.
+
+    Args:
+        pipe: The diffusion pipeline with a `.transformer` attribute.
+        cfg: Config node with optional `model.lora_weights`, `model.lora_adapter_name`.
+    """
+    lora_weights = getattr(cfg.model, "lora_weights", None)
+    if not lora_weights:
+        return
+
+    import json
+
+    from safetensors.torch import load_file
+
+    from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+
+    lora_path = Path(lora_weights)
+    if not lora_path.exists():
+        raise FileNotFoundError(f"LoRA weights directory not found: {lora_path}")
+
+    with open(lora_path / "adapter_config.json") as f:
+        peft_config = PeftConfig.from_dict(json.load(f))
+    apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+    state_dict = load_file(lora_path / "adapter_model.safetensors", device="cuda")
+    pipe.transformer.load_state_dict(state_dict, strict=False)
 
 
 def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
@@ -364,6 +398,18 @@ def run_inference(pipe, cfg, is_rank0):
     if extra_kwargs is not None:
         pipe_kwargs.update(extra_kwargs.to_dict())
 
+    # LoRA scale: passed as attention_kwargs (newer diffusers) or
+    # cross_attention_kwargs (older diffusers) so the transformer forward()
+    # applies the correct contribution weight.
+    lora_weights = getattr(cfg.model, "lora_weights", None)
+    if lora_weights:
+        lora_scale = getattr(cfg.model, "lora_scale", 1.0)
+        call_sig = inspect.signature(pipe.__call__)
+        if "attention_kwargs" in call_sig.parameters:
+            pipe_kwargs["attention_kwargs"] = {"scale": lora_scale}
+        elif "cross_attention_kwargs" in call_sig.parameters:
+            pipe_kwargs["cross_attention_kwargs"] = {"scale": lora_scale}
+
     seed = getattr(cfg, "seed", 42)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -421,6 +467,9 @@ def main():
 
     # 3. Load checkpoint (if configured)
     load_checkpoint_into_pipeline(pipe, cfg)
+
+    # 3b. Load LoRA adapter weights (if configured)
+    load_lora_weights_into_pipeline(pipe, cfg)
 
     # 4. Apply VAE / memory optimizations
     apply_optimizations(pipe, cfg)
