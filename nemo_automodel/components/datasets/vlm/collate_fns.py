@@ -39,6 +39,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Default vision-tower patch merge kernel used by `_expand_image_tokens` and any
+# caller that needs to predict expanded image-token counts. Keep this as the
+# single source of truth so the two computations cannot silently drift apart.
+_DEFAULT_MERGE_KERNEL: Tuple[int, int] = (2, 2)
+
 # ---------------------------------------------------------------------------
 # Fake image fallback for FSDP / DeepSpeed Zero3
 # ---------------------------------------------------------------------------
@@ -769,7 +774,7 @@ def _expand_image_tokens(
     attention_mask: torch.Tensor,
     grid_thws: torch.Tensor,
     media_token_id: int,
-    merge_kernel_size: Tuple[int, int] = (2, 2),
+    merge_kernel_size: Tuple[int, int] = _DEFAULT_MERGE_KERNEL,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Expand single image placeholder tokens to the correct number based on grid_thws.
 
@@ -825,6 +830,7 @@ def kimi_k25_vl_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: Optional[int] = None,
+    drop_overlong: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
 
@@ -836,8 +842,8 @@ def kimi_k25_vl_collate_fn(
     """
     conversations = [example["conversation"] for example in examples]
 
-    # Pre-filter to avoid expensive processing of obviously overlong samples
-    if max_length is not None:
+    # Optionally drop overlong samples before processing
+    if max_length is not None and drop_overlong:
         conversations, _kept = _drop_overlong_samples(conversations, processor, max_length)
 
     # Get media token ID
@@ -874,6 +880,9 @@ def kimi_k25_vl_collate_fn(
         }
         if medias:
             processor_kwargs["medias"] = medias
+        if max_length is not None and not drop_overlong:
+            processor_kwargs["truncation"] = True
+            processor_kwargs["max_length"] = max_length
 
         sample_batch = processor(**processor_kwargs)
 
@@ -886,20 +895,35 @@ def kimi_k25_vl_collate_fn(
             grid_thws = sample_batch["grid_thws"]
             input_ids, attention_mask = _expand_image_tokens(input_ids, attention_mask, grid_thws, media_token_id)
 
-        # Drop overlong samples instead of truncating
+        # Handle overlong samples after expansion
         if max_length is not None and input_ids.shape[0] > max_length:
-            logger.warning(
-                "Dropping expanded sample with %d tokens (max_length=%d).",
-                input_ids.shape[0],
-                max_length,
-            )
-            continue
+            if drop_overlong:
+                logger.warning(
+                    "Dropping expanded sample with %d tokens (max_length=%d).",
+                    input_ids.shape[0],
+                    max_length,
+                )
+                continue
+            else:
+                input_ids = input_ids[:max_length]
+                attention_mask = attention_mask[:max_length]
 
         kept_conversations.append(conversation)
 
+        # Only include image data if all expanded image tokens survived truncation.
+        # Partial truncation into image regions would cause a mismatch in the model forward.
         if grid_thws is not None:
-            all_grid_thws.append(grid_thws)
-        if "pixel_values" in sample_batch:
+            merge_h, merge_w = _DEFAULT_MERGE_KERNEL
+            expected_image_tokens = sum(int((h // merge_h) * (w // merge_w)) for _, h, w in grid_thws.tolist())
+            actual_image_tokens = (input_ids == media_token_id).sum().item()
+            if actual_image_tokens == expected_image_tokens:
+                all_grid_thws.append(grid_thws)
+                if "pixel_values" in sample_batch:
+                    all_pixel_values.append(sample_batch["pixel_values"])
+            else:
+                # Replace orphaned image tokens so the model doesn't look for missing pixel data
+                input_ids = input_ids.masked_fill(input_ids == media_token_id, pad_token_id)
+        elif "pixel_values" in sample_batch:
             all_pixel_values.append(sample_batch["pixel_values"])
 
         all_expanded.append(
@@ -925,7 +949,7 @@ def kimi_k25_vl_collate_fn(
     else:
         target_len = batch_max
 
-    # Pad to target_len (overlong samples already dropped above)
+    # Pad or truncate to target_len
     padded_input_ids = []
     padded_attention_mask = []
 
@@ -1195,6 +1219,7 @@ def default_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: Optional[int] = None,
+    drop_overlong: bool = False,
     _post_tokenize_hook=None,
 ) -> Dict[str, torch.Tensor]:
     """Default collate function for multimodal VLM datasets.
@@ -1211,8 +1236,8 @@ def default_collate_fn(
 
     conversations = _ensure_rgb([example["conversation"] for example in examples])
 
-    # Drop overlong samples before processing
-    if max_length is not None:
+    # Optionally drop overlong samples before processing
+    if max_length is not None and drop_overlong:
         conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
         examples = [examples[i] for i in kept]
 
@@ -1226,7 +1251,8 @@ def default_collate_fn(
     if max_length is not None:
         processor_kwargs["max_length"] = max_length
         processor_kwargs["padding"] = "max_length"
-        processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
+        if drop_overlong:
+            processor_kwargs["truncation"] = False  # Pre-filtering guarantees samples fit
     batch = processor.apply_chat_template(conversations, **processor_kwargs)
 
     if _post_tokenize_hook is not None:
