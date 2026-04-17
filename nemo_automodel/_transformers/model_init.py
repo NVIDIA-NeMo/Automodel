@@ -395,6 +395,27 @@ def _stream_load_bnb_weights(model, model_dir, device, torch_dtype):
     )
 
 
+def _streaming_bnb_supported(cls, hf_config) -> bool:
+    """Whether streaming BnB can safely load HF safetensors directly into the target class.
+
+    The streaming loader maps safetensors keys 1:1 onto ``model.named_parameters()``.
+    Automodel's custom implementations often fuse projections (e.g. MoE
+    ``mlp.experts.gate_up_proj``) and rely on a ``state_dict_adapter`` to translate
+    HF-style keys on load — that translation is skipped by the streaming path, which
+    would leave fused params unmaterialized.  Detect those classes via the
+    ``HFCheckpointingMixin`` marker in the MRO and opt out.
+    """
+    try:
+        model_cls = cls._model_mapping[type(hf_config)]
+    except (KeyError, TypeError):
+        return False
+    try:
+        from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+    except ImportError:
+        return True
+    return not issubclass(model_cls, HFCheckpointingMixin)
+
+
 def _init_model_bnb_streaming(
     cls, pretrained_model_name_or_path, hf_config, attn_implementation, torch_dtype, quantization_config, **kwargs
 ):
@@ -563,7 +584,13 @@ def __init_model(
     # bf16 model in memory. This is critical for unified-memory systems (DGX Spark)
     # and large models (70B+). Can be disabled with AUTOMODEL_BNB_STREAMING=0.
     _bnb_streaming = os.environ.get("AUTOMODEL_BNB_STREAMING", "1") != "0"
-    if quantization_config is not None and is_pretrained_init and _bnb_streaming:
+    if (
+        quantization_config is not None
+        and is_pretrained_init
+        and not force_hf
+        and _bnb_streaming
+        and _streaming_bnb_supported(cls, hf_config)
+    ):
         try:
             logger.info("Using streaming BnB quantization for memory-efficient loading")
             return _init_model_bnb_streaming(

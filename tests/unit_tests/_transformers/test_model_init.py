@@ -28,6 +28,7 @@ from nemo_automodel._transformers.model_init import (
     _resolve_model_dir,
     _setup_bnb_loading_kwargs,
     _stream_load_bnb_weights,
+    _streaming_bnb_supported,
     get_hf_config,
 )
 from nemo_automodel.components.models.common.utils import BackendConfig
@@ -360,3 +361,40 @@ class TestStreamLoadBnbWeights:
         torch.testing.assert_close(model.running_scale, torch.arange(8, dtype=torch.float32))
         assert model.lin.weight.device.type == "cpu"
         assert model.lin.bias.device.type == "cpu"
+
+
+class TestStreamingBnbSupported:
+    """The streaming BnB path must skip custom Automodel classes that need a StateDictAdapter."""
+
+    def _make_cls(self, model_cls):
+        cfg_type = type("_Cfg", (), {})
+        config = cfg_type()
+
+        class _Cls:
+            _model_mapping = {cfg_type: model_cls}
+
+        return _Cls, config
+
+    def test_vanilla_hf_class_is_supported(self):
+        """A plain nn.Module (no HFCheckpointingMixin) resolves to supported."""
+        cls, config = self._make_cls(nn.Linear)  # any class not inheriting the mixin
+        assert _streaming_bnb_supported(cls, config) is True
+
+    def test_custom_automodel_class_is_unsupported(self):
+        """Classes that carry HFCheckpointingMixin rely on state_dict_adapter; skip streaming."""
+        from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+        class FakeCustomModel(HFCheckpointingMixin, nn.Module):
+            pass
+
+        cls, config = self._make_cls(FakeCustomModel)
+        assert _streaming_bnb_supported(cls, config) is False
+
+    def test_unknown_config_is_unsupported(self):
+        """Missing entry in _model_mapping → unsupported (caller falls back to HF)."""
+        cfg_type = type("_Cfg", (), {})
+
+        class _Cls:
+            _model_mapping: dict = {}
+
+        assert _streaming_bnb_supported(_Cls, cfg_type()) is False
