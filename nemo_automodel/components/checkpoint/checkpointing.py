@@ -558,7 +558,23 @@ class Checkpointer:
                     module._is_hf_initialized = False
 
             if hasattr(model, "initialize_weights"):
-                model.initialize_weights()
+                # Infer the target dtype from existing (floating-point)
+                # parameters so that a model constructed in fp32 (e.g. for fp32
+                # master weights under FSDP2) is not silently cast back to
+                # bf16 inside model.initialize_weights() -> cast_model_to_dtype().
+                param_dtype = None
+                for p in model.parameters():
+                    if p.is_floating_point():
+                        param_dtype = p.dtype
+                        break
+                try:
+                    if param_dtype is not None:
+                        model.initialize_weights(dtype=param_dtype)
+                    else:
+                        model.initialize_weights()
+                except TypeError:
+                    # Model's initialize_weights() does not accept a dtype kwarg.
+                    model.initialize_weights()
             else:
                 logging.warning(
                     "Warning: Model does not have initialize_weights method."
