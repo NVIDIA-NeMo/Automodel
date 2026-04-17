@@ -95,9 +95,12 @@ diffusion = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
-    "kernels",
     "opencv-python-headless",
     "torchvision",
+]
+diffusion_kernels = [
+    "nemo_automodel[diffusion]",
+    "kernels",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
@@ -385,6 +388,7 @@ modules = [
 ]
 ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
+    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)
