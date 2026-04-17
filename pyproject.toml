@@ -82,7 +82,7 @@ dependencies = [
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers>=5.3.0,<5.4.0",
+    "transformers==5.5.0",
     "wandb",
     "torchao",
     "mlflow",
@@ -95,9 +95,12 @@ diffusion = [
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
-    "kernels",
     "opencv-python-headless",
     "torchvision",
+]
+diffusion_kernels = [
+    "nemo_automodel[diffusion]",
+    "kernels",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
@@ -128,7 +131,7 @@ moe = [
 vlm = [
     "albumentations",
     "backoff",
-    "mistral_common[opencv]>=1.9.0",
+    "mistral_common[opencv]>=1.11.0",
     "numpy",
     "numba",
     "open-clip-torch",
@@ -385,6 +388,7 @@ modules = [
 ]
 ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
+    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)

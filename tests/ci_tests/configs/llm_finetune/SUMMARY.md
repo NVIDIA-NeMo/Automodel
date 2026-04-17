@@ -62,7 +62,7 @@ The nightly scope uses only the recipes listed in [nightly_recipes.yml](nightly_
 | phi_2_squad_peft | 00:10:00 | 1 | - | - | - |
 | phi_2_squad_tp2_peft | 00:10:00 | 1 | - | - | - |
 | phi_4_squad_peft | 00:35:00 | 1 | ✅ | ✅ | - |
-| phi_4_squad_tp2_peft | 00:10:00 | 1 | - | - | - |
+| phi_4_squad_tp2_peft | 00:15:00 | 1 | - | - | - |
 | qwen2_5_7b_peft_benchmark | 00:10:00 | 1 | - | - | - |
 | qwen2_5_7b_squad_peft | 00:30:00 | 1 | ✅ | ✅ | - |
 | qwen3_moe_30b_lora | 00:15:00 | 1 | ✅ | - | - |

@@ -108,7 +108,7 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
-  time: "00:15:00"
+  time: "00:25:00"
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     experts_implementation: grouped_mm

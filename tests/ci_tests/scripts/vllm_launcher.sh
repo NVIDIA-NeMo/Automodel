@@ -24,7 +24,7 @@ export CUDA_VISIBLE_DEVICES="0"
 cd /opt/Automodel
 uv venv /tmp/vllm_deploy_venv
 source /tmp/vllm_deploy_venv/bin/activate
-uv pip install -r tests/ci_tests/requirements_deploy.txt
+uv pip install --no-config -r tests/ci_tests/requirements_deploy.txt
 
 # Install extra model-specific dependencies
 if [[ -n "${VLLM_EXTRA_DEPS:-}" ]]; then

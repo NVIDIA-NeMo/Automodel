@@ -123,15 +123,23 @@ class MiniMaxM2StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
+        """Convert HF checkpoint to native format in-place.
+
+        Operates in-place on the input dict to avoid allocating a full copy,
+        reducing peak memory from 2x to ~1x model size.
+        """
         # Detect model prefix from key layout.
         for key in hf_state_dict.keys():
             if ".block_sparse_moe.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
                 break
 
-        dequantized = self._dequantize(dict(hf_state_dict))
-        remapped = {self._hf_key_to_native(k): v for k, v in dequantized.items()}
-        return self._from_hf_w_merged_experts(remapped, device_mesh)
+        self._dequantize(hf_state_dict)
+        for key in list(hf_state_dict.keys()):
+            new_key = self._hf_key_to_native(key)
+            if new_key != key:
+                hf_state_dict[new_key] = hf_state_dict.pop(key)
+        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         quantization = kwargs.get("quantization", False)

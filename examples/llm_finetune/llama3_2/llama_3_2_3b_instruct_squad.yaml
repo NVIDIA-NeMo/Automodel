@@ -85,7 +85,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  
+
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
