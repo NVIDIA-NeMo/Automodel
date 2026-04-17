@@ -259,6 +259,14 @@ class Gemma4MoETextModelBackend(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
+        # Resolve model dtype once from config.torch_dtype and thread it into
+        # MoEConfig so the MoE expert params stay aligned with the rest of the
+        # model (fp32 under fp32 master weights). HF-native submodules
+        # (attention, Gemma4MLP, Gemma4RMSNorm, Gemma4TextScaledWordEmbedding)
+        # inherit their dtype from torch.get_default_dtype() via the
+        # local_torch_dtype() context established by _init_model().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -277,12 +285,12 @@ class Gemma4MoETextModelBackend(nn.Module):
             norm_topk_prob=True,
             expert_activation="geglu",
             softmax_before_topk=False,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -448,6 +456,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             cfg_text.moe_intermediate_size = cfg_text.expert_intermediate_size
         if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
             cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
+
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # VL configs the nested text_config / vision_config keep their original
+        # dtype (typically bf16 from the checkpoint's config.json). Propagate
+        # the user-requested dtype to every nested sub-config that exposes a
+        # torch_dtype attribute, before constructing the HF parent and our
+        # text backend.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
