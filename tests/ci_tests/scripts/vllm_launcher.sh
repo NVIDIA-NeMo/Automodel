@@ -24,13 +24,7 @@ export CUDA_VISIBLE_DEVICES="0"
 cd /opt/Automodel
 uv venv /tmp/vllm_deploy_venv
 source /tmp/vllm_deploy_venv/bin/activate
-uv pip install --no-config -r tests/ci_tests/requirements_deploy.txt
-
-# Install extra model-specific dependencies
-if [[ -n "${VLLM_EXTRA_DEPS:-}" ]]; then
-  echo "[vllm] Installing extra deps: ${VLLM_EXTRA_DEPS}"
-  uv pip install ${VLLM_EXTRA_DEPS}
-fi
+uv pip install --no-config -r tests/ci_tests/requirements_deploy.txt ${VLLM_EXTRA_DEPS:-}
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
 FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"
