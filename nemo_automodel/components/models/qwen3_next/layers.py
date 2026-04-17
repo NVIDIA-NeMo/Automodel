@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -64,18 +65,24 @@ class Qwen3NextAttention(nn.Module):
         self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
+        # Thread dtype explicitly from config.torch_dtype so callers that do
+        # not wrap construction in local_torch_dtype() still get a dtype that
+        # matches the model's declared dtype (fp32 under fp32 master weights,
+        # bf16 otherwise).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # Query projection outputs 2x size for gating
         self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim * 2, False
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim * 2, False, dtype=dtype
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, False
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, False, dtype=dtype
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, False
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, False, dtype=dtype
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, False
+            backend.linear, self.num_heads * self.head_dim, config.hidden_size, False, dtype=dtype
         )
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
