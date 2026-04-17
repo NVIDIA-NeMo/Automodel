@@ -75,7 +75,8 @@ def stack_and_move_tensor_metrics_to_cpu(metric_vector: List[MetricsSample]) -> 
         # Write back the CPU tensors to each sample's metrics
         for pos, sample_index in enumerate(indices):
             for name in names_key:
-                metric_vector[sample_index].metrics[name] = stacked_by_name[name][pos].item()
+                t = stacked_by_name[name][pos]
+                metric_vector[sample_index].metrics[name] = t.item() if t.numel() == 1 else t.tolist()
 
     return metric_vector
 

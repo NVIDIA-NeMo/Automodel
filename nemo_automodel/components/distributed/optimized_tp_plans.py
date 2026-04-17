@@ -42,6 +42,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -214,7 +215,7 @@ def _parallelize_gemma3(
 
 
 def _parallelize_gemma4(
-    model,
+    model: Gemma4ForConditionalGeneration,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Gemma4ForConditionalGeneration model across tensor parallel dimensions.
@@ -226,7 +227,7 @@ def _parallelize_gemma4(
         import warnings
 
         warnings.warn(
-            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored.",
+            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored. ",
             stacklevel=2,
         )
 
