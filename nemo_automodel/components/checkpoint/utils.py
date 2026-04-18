@@ -59,6 +59,171 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     return bool(getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)))
 
 
+def _normalize_param_name(name: str) -> str:
+    """Strip wrapper-specific prefixes from a parameter name."""
+    return name.replace("_orig_mod.", "")
+
+
+def get_lm_head_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
+    """Return the first ``lm_head.weight`` parameter found on a model.
+
+    Args:
+        model: Model to inspect.
+
+    Returns:
+        Tuple of the parameter tensor and its normalized FQN, or ``(None, None)``
+        when the model has no LM head weight.
+    """
+    for name, param in model.named_parameters(remove_duplicate=False):
+        normalized_name = _normalize_param_name(name)
+        if "lm_head" in normalized_name and normalized_name.endswith(".weight"):
+            return param, normalized_name
+    return None, None
+
+
+def get_input_embeddings_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
+    """Return the input embedding weight and normalized name if present.
+
+    Args:
+        model: Model to inspect.
+
+    Returns:
+        Tuple of the embedding weight tensor and its normalized FQN, or
+        ``(None, None)`` when the current model partition does not own the input
+        embedding.
+    """
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if callable(get_input_embeddings):
+        try:
+            input_embeddings = get_input_embeddings()
+        except Exception:
+            input_embeddings = None
+        if input_embeddings is not None and hasattr(input_embeddings, "weight"):
+            for name, param in model.named_parameters(remove_duplicate=False):
+                if param is input_embeddings.weight:
+                    return param, _normalize_param_name(name)
+
+    candidate_suffixes = (
+        "embed_tokens.weight",
+        "language_model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+    )
+    for name, param in model.named_parameters(remove_duplicate=False):
+        normalized_name = _normalize_param_name(name)
+        if normalized_name.endswith(candidate_suffixes):
+            return param, normalized_name
+    return None, None
+
+
+def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:
+    """Return candidate checkpoint keys that can source a tied LM head.
+
+    Args:
+        model: Model or pipeline stage to inspect.
+        lm_head_param_name: Optional normalized LM head FQN.
+
+    Returns:
+        Ordered list of possible source FQNs.
+    """
+    candidate_source_names: list[str] = []
+    tied_keys = getattr(model, "_tied_weights_keys", None)
+    if isinstance(tied_keys, dict):
+        for target_name, source_name in tied_keys.items():
+            if not isinstance(target_name, str) or not isinstance(source_name, str):
+                continue
+            if lm_head_param_name is None or target_name == lm_head_param_name or target_name.endswith("lm_head.weight"):
+                candidate_source_names.append(source_name)
+
+    _, input_embeddings_param_name = get_input_embeddings_weight_and_name(model)
+    if input_embeddings_param_name is not None:
+        candidate_source_names.append(input_embeddings_param_name)
+
+    candidate_source_names.extend(
+        [
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+        ]
+    )
+
+    seen_source_names: set[str] = set()
+    deduped_source_names: list[str] = []
+    for source_name in candidate_source_names:
+        if source_name in seen_source_names:
+            continue
+        seen_source_names.add(source_name)
+        deduped_source_names.append(source_name)
+    return deduped_source_names
+
+
+def has_local_tied_lm_head(model: nn.Module) -> bool:
+    """Return whether the current model partition owns a truly tied LM head.
+
+    This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
+    stages often keep the config flag set to ``True`` even though ``lm_head`` and
+    ``embed_tokens`` live on different partitions and therefore cannot share the
+    same tensor object locally.
+
+    Args:
+        model: Model or pipeline stage to inspect.
+
+    Returns:
+        ``True`` only when both local weights exist and share the same tensor.
+    """
+    lm_head_weight, _ = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    return (
+        lm_head_weight is not None
+        and input_embeddings_weight is not None
+        and lm_head_weight is input_embeddings_weight
+    )
+
+
+def materialize_missing_tied_lm_head(
+    state_dict: dict[str, Any],
+    model: nn.Module,
+    *,
+    allow_current_lm_head_fallback: bool = False,
+) -> bool:
+    """Populate a missing tied ``lm_head.weight`` from its embedding source.
+
+    Hugging Face checkpoints for tied-embedding models often omit
+    ``lm_head.weight`` entirely. That is fine for unsplit models where
+    ``tie_weights()`` can restore the alias, but it breaks pipeline-parallel last
+    stages which own ``lm_head`` but not ``embed_tokens``.
+
+    Args:
+        state_dict: Checkpoint state dict to mutate in place.
+        model: Target model or pipeline stage.
+        allow_current_lm_head_fallback: If ``True``, fall back to the current
+            ``lm_head`` tensor when the tied source cannot be found in
+            ``state_dict``. This preserves legacy resume behavior for older
+            checkpoints that were saved without a local ``lm_head.weight``.
+
+    Returns:
+        ``True`` if a missing ``lm_head.weight`` was materialized, else ``False``.
+    """
+    if not is_tied_word_embeddings(model):
+        return False
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    if lm_head_weight is None or lm_head_param_name is None or lm_head_param_name in state_dict:
+        return False
+
+    for source_name in get_tied_lm_head_source_names(model, lm_head_param_name):
+        tensor = state_dict.get(source_name)
+        if isinstance(tensor, torch.Tensor):
+            state_dict[lm_head_param_name] = tensor.detach()
+            return True
+
+    if allow_current_lm_head_fallback:
+        state_dict[lm_head_param_name] = lm_head_weight.detach()
+        return True
+
+    return False
+
+
 def _get_checkpoint_tensor_dtypes(
     pretrained_model_name_or_path: str,
     hf_config: Any,
