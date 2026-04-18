@@ -342,9 +342,8 @@ class TestForwardNoCpV55CacheAPI:
             module._forward_no_cp(hidden, cache_params=cache)
         mock_update_conv.assert_called_once()
         # Written at the layer_idx owned by the module.
-        _, call_kwargs = mock_update_conv.call_args
-        args = mock_update_conv.call_args.args
-        assert (args + (call_kwargs.get("layer_idx"),))[1] == module.layer_idx
+        args, _ = mock_update_conv.call_args
+        assert args[1] == module.layer_idx
         mock_update_rec.assert_called_once()
 
     def test_has_previous_state_called_as_method_with_layer_idx(self, module, text_config, device):
