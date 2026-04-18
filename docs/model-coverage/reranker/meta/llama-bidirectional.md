@@ -1,6 +1,6 @@
 # Llama (Bidirectional)
 
-NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for reranking tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention** so the query and document can interact across the full sequence before a classification head produces a relevance score.
+NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for reranking tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention**, allowing the query and document to interact across the full sequence before a classification head produces a relevance score.
 
 For the bi-encoder variant, see [Llama (Bidirectional) for Embedding](../../embedding/meta/llama-bidirectional.md).
 
@@ -15,7 +15,7 @@ For the bi-encoder variant, see [Llama (Bidirectional) for Embedding](../../embe
 
 ## Available Models
 
-Any Llama checkpoint can be loaded as a bidirectional reranking backbone. Tested configurations:
+Any Llama checkpoint can be loaded as a bidirectional reranking backbone. The following configurations have been tested:
 
 - **Llama 3.2 1B** — fast iteration, fits on a single GPU
 - **Llama 3.1 8B** — higher-quality reranking for production use
@@ -43,7 +43,7 @@ The cross-encoder path is used for pairwise relevance scoring and reranking.
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install NeMo AutoModel**. Refer to the ([Installation Guide](../../../guides/installation.md)) for information:
 
 ```bash
 uv pip install nemo-automodel
@@ -72,7 +72,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
+**2. Navigate to the AutoModel directory** (where the recipes are):
 
 ```bash
 cd /opt/Automodel

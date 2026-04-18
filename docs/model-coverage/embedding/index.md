@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Embedding models convert text into dense vector representations for semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification. NeMo AutoModel supports optimized bidirectional Llama bi-encoders and falls back to HuggingFace `AutoModel` for other encoder backbones.
+Embedding models convert text into dense vector representations for semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification. NeMo AutoModel supports optimized bidirectional Llama bi-encoders and falls back to Hugging Face `AutoModel` for other encoder backbones.
 
 For cross-encoder pairwise scoring, see [Reranking Models](../reranker/index.md).
 
@@ -17,9 +17,9 @@ Embedding models use bi-encoders to produce dense representations for queries an
 | Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
 | NVIDIA | [Llama-Embed-Nemotron-8B](nvidia/llama-embed-nemotron-8b.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
 
-### HuggingFace Auto Backbones
+### Hugging Face Auto Backbones
 
-Any HuggingFace model loadable via `AutoModel` can be used as an embedding backbone. This fallback path uses the model's native attention — no bidirectional conversion is applied.
+Any Hugging Face model that can be loaded with `AutoModel` can be used as an embedding backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
 
 ## Example Recipes
 
@@ -32,7 +32,7 @@ Any HuggingFace model loadable via `AutoModel` can be used as an embedding backb
 
 - **Fine-tuning (Bi-Encoder):** Contrastive learning on query-document pairs to produce embedding models
 - **LoRA/PEFT:** Parameter-efficient fine-tuning for embedding backbones
-- **ONNX Export:** Export trained embedding models for deployment (case-by-case, model dependant)
+- **ONNX Export:** Export trained embedding models for deployment (case by case, model dependent)
 
 ## Dataset
 

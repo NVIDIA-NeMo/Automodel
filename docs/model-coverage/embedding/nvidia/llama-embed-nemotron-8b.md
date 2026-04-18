@@ -1,6 +1,6 @@
 # Llama-Embed-Nemotron-8B
 
-[Llama-Embed-Nemotron-8B](https://huggingface.co/nvidia/llama-embed-nemotron-8b) is NVIDIA's text embedding model for retrieval, semantic similarity, classification, and multilingual retrieval workloads. In NeMo AutoModel it is reproduced with the bidirectional Llama bi-encoder backbone.
+[Llama-Embed-Nemotron-8B](https://huggingface.co/nvidia/llama-embed-nemotron-8b) is NVIDIA's text embedding model for retrieval, semantic similarity, classification, and multilingual retrieval workloads. In NeMo AutoModel, it is reproduced with the bidirectional Llama bi-encoder backbone.
 
 For architecture-level details such as bidirectional attention and pooling strategies, see [Llama (Bidirectional)](../meta/llama-bidirectional.md).
 
@@ -35,7 +35,7 @@ For architecture-level details such as bidirectional attention and pooling strat
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install NeMo AutoModel**. Refer to the ([Installation Guide](../../../guides/installation.md)) for information:
 
 ```bash
 uv pip install nemo-automodel
@@ -66,7 +66,7 @@ See the [Installation Guide](../../../guides/installation.md).
 <!-- TODO: uncomment when finetune guide is published.
 ## Fine-Tuning
 
-See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA/PEFT configuration.
+See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA and PEFT configuration.
 -->
 
 ## Hugging Face Model Cards
