@@ -127,6 +127,14 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
     """
     candidate_source_names: list[str] = []
     tied_keys = getattr(model, "_tied_weights_keys", None)
+    # ``_tied_weights_keys`` has two shapes in practice:
+    #   - dict: NeMo custom models set an explicit target->source map
+    #     (e.g. ``{"lm_head.weight": "model.embed_tokens.weight"}``);
+    #   - list/tuple/set of str: HF upstream lists only the *target* FQNs
+    #     that are tied to the input embedding. The source is resolved via
+    #     ``get_input_embeddings()`` below, so for the list shape we only use
+    #     the dict for target-name matching and rely on the fallbacks to find
+    #     the source.
     if isinstance(tied_keys, dict):
         for target_name, source_name in tied_keys.items():
             if not isinstance(target_name, str) or not isinstance(source_name, str):

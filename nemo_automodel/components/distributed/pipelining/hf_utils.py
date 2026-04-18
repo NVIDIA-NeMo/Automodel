@@ -441,19 +441,43 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     return pipeline_forward_gemma4_vlm
 
 
+def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
+    """Return True only for Gemma4 VLM variants.
+
+    ``model.model.language_model`` alone is not enough to identify Gemma4 —
+    Kimi VL, Mistral4, Qwen3 VL MoE, Llava OneVision and others share that
+    structure. Gate the Gemma4-specific PP forward on the HF ``model_type``
+    so unrelated VLMs fall through to the generic CausalLM path instead of
+    receiving Gemma4's sliding/full-attention and softcapping logic.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return False
+    model_type = getattr(config, "model_type", None)
+    if model_type == "gemma4":
+        return True
+    # VLM configs usually nest the text backbone under ``text_config``.
+    text_config = getattr(config, "text_config", None)
+    return getattr(text_config, "model_type", None) == "gemma4"
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 
-    - If model has .model (e.g., LlamaForCausalLM), patch inner and outer.
-    - If model.model has .language_model (e.g., Gemma4 VLM), patch the text backbone
-      and outer with Gemma4-specific VLM-aware forwards.
-    - Else, patch the module itself.
+    - Gemma4 VLM (``config.model_type == 'gemma4'`` with a nested text
+      backbone at ``model.model.language_model``): patch the text backbone
+      and VLM outer with Gemma4-specific VLM-aware forwards.
+    - Other models with ``model.model`` (e.g., LlamaForCausalLM and most
+      other VLMs): patch inner and outer with the generic CausalLM
+      forwards.
+    - Else: patch the module itself with the generic inner forward.
     """
     inner_model = getattr(model, "model", None)
     text_backbone = getattr(inner_model, "language_model", None) if inner_model is not None else None
 
-    if inner_model is not None and text_backbone is not None:
-        # VLM with nested text backbone (e.g. Gemma4): patch text backbone and VLM outer
+    if inner_model is not None and text_backbone is not None and _is_gemma4_vlm(model):
+        # Gemma4 VLM: the text backbone needs sliding/full-attention RoPE
+        # dispatch and the VLM outer needs final_logit_softcapping.
         if patch_inner_model:
             text_backbone.forward = types.MethodType(create_pipeline_forward_gemma4_text(), text_backbone)
         if patch_causal_lm_model:

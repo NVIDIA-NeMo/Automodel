@@ -345,6 +345,78 @@ class TestPatchHfModelForPp:
         # Outer forward should still be patched
         assert model.forward != original_forward
 
+    def test_patch_gemma4_vlm_uses_gemma4_forward(self):
+        """Gemma4 VLM (config.model_type == 'gemma4') gets the Gemma4-specific forwards."""
+        class _Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+
+        class _Gemma4(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = Mock(model_type="gemma4")
+                self.model = _Inner()
+
+        model = _Gemma4()
+        original_outer = model.forward
+        original_text_backbone = model.model.language_model.forward
+
+        patch_hf_model_for_pp(model, patch_inner_model=True, patch_causal_lm_model=True)
+
+        # The text backbone is the one patched (not model.model itself).
+        assert model.model.language_model.forward is not original_text_backbone
+        assert model.forward is not original_outer
+        # Sanity: the Gemma4 forward is bound to the text backbone and outer VLM.
+        assert model.model.language_model.forward.__func__.__name__ == "pipeline_forward_gemma4_text"
+        assert model.forward.__func__.__name__ == "pipeline_forward_gemma4_vlm"
+
+    def test_patch_non_gemma4_vlm_falls_back_to_generic(self):
+        """VLMs that happen to expose model.language_model but are NOT Gemma4 use the generic path."""
+        class _Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Many HF VLMs (KimiVL / Mistral4 / Qwen3VL MoE / LlavaOneVision / ...)
+                # also expose language_model here. These must NOT hit Gemma4's forward.
+                self.language_model = nn.Module()
+
+        class _OtherVLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = Mock(model_type="llava_onevision", text_config=None)
+                self.model = _Inner()
+
+        model = _OtherVLM()
+        original_inner = model.model.forward
+        original_outer = model.forward
+
+        patch_hf_model_for_pp(model, patch_inner_model=True, patch_causal_lm_model=True)
+
+        # Generic path patches model.model (inner) directly, not language_model.
+        assert model.model.forward is not original_inner
+        assert model.forward is not original_outer
+        assert model.model.forward.__func__.__name__ == "pipeline_forward"
+        assert model.forward.__func__.__name__ == "pipeline_forward_causal_lm"
+
+    def test_patch_gemma4_vlm_via_text_config_model_type(self):
+        """Gemma4 detection also works when model_type is only in config.text_config."""
+        class _Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+
+        class _Gemma4(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = Mock(model_type="gemma4_vision", text_config=Mock(model_type="gemma4"))
+                self.model = _Inner()
+
+        model = _Gemma4()
+        patch_hf_model_for_pp(model, patch_inner_model=True, patch_causal_lm_model=True)
+
+        assert model.model.language_model.forward.__func__.__name__ == "pipeline_forward_gemma4_text"
+        assert model.forward.__func__.__name__ == "pipeline_forward_gemma4_vlm"
+
 
 class TestInitHfModelBuffers:
     """Test init_hf_model_buffers function."""
