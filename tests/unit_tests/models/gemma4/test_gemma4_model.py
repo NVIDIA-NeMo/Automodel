@@ -219,6 +219,64 @@ class TestGemma4MoE:
         moe = Gemma4MoE(moe_config, backend_config, text_config)
         assert moe.gate.num_experts == text_config.num_experts
 
+    def test_forward_routes_gate_input_to_gate(self, moe_config, backend_config, text_config, device):
+        # HF Gemma4 sends the raw residual to the router and the normalized
+        # input to the experts. When gate_input is provided, the gate must
+        # receive it (not the normalized x).
+        moe = Gemma4MoE(moe_config, backend_config, text_config).to(device).to(torch.bfloat16)
+
+        batch, seq = 2, 4
+        dim = text_config.hidden_size
+        num_tokens = batch * seq
+        topk = text_config.top_k_experts
+
+        weights = torch.ones(num_tokens, topk, device=device, dtype=torch.bfloat16)
+        indices = torch.zeros(num_tokens, topk, device=device, dtype=torch.long)
+        expert_out = torch.zeros(num_tokens, dim, device=device, dtype=torch.bfloat16)
+
+        normed = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+        raw = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+
+        # Patch .forward rather than the submodule itself — nn.Module blocks
+        # assigning a MagicMock as a child module.
+        with (
+            patch.object(moe.gate, "forward", return_value=(weights, indices, None)) as mock_gate,
+            patch.object(moe.experts, "forward", return_value=expert_out) as mock_experts,
+        ):
+            moe(normed, gate_input=raw)
+
+        # gate receives the raw residual (not the normed input)
+        gate_input_arg = mock_gate.call_args[0][0]
+        torch.testing.assert_close(gate_input_arg, raw.view(-1, dim))
+        # experts still receive the normed input
+        expert_input_arg = mock_experts.call_args[0][0]
+        torch.testing.assert_close(expert_input_arg, normed.view(-1, dim))
+
+    def test_forward_without_gate_input_preserves_prior_behavior(self, moe_config, backend_config, text_config, device):
+        # When gate_input is omitted, the gate must receive x — preserving
+        # the original single-input contract for any non-Gemma4 caller.
+        moe = Gemma4MoE(moe_config, backend_config, text_config).to(device).to(torch.bfloat16)
+
+        batch, seq = 2, 4
+        dim = text_config.hidden_size
+        num_tokens = batch * seq
+        topk = text_config.top_k_experts
+
+        weights = torch.ones(num_tokens, topk, device=device, dtype=torch.bfloat16)
+        indices = torch.zeros(num_tokens, topk, device=device, dtype=torch.long)
+        expert_out = torch.zeros(num_tokens, dim, device=device, dtype=torch.bfloat16)
+
+        x = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+
+        with (
+            patch.object(moe.gate, "forward", return_value=(weights, indices, None)) as mock_gate,
+            patch.object(moe.experts, "forward", return_value=expert_out),
+        ):
+            moe(x)
+
+        gate_input_arg = mock_gate.call_args[0][0]
+        torch.testing.assert_close(gate_input_arg, x.view(-1, dim))
+
 
 # ---------------------------------------------------------------------------
 # Gemma4MoEDecoderLayer tests
@@ -275,6 +333,41 @@ class TestGemma4MoEDecoderLayer:
             out = layer(x, position_embeddings=pos_emb)
 
         assert out.shape == x.shape
+
+    def test_moe_receives_unnormed_residual_as_gate_input(self, text_config, moe_config, backend_config, device):
+        # Regression guard for the Gemma4 MoE double-normalization bug:
+        # the decoder layer must pass the raw post-attention residual (not
+        # pre_feedforward_layernorm_2(x)) to the gate. See upstream issue
+        # #1852 — double-norm caused gen_kl_error 0.116 on
+        # Gemma4-26B-A4B-it GRPO; after the fix, 0.0011.
+        layer = Gemma4MoEDecoderLayer(text_config, layer_idx=0, moe_config=moe_config, backend=backend_config)
+        layer = layer.to(device).to(torch.bfloat16)
+
+        batch, seq = 2, 4
+        x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        pos_emb = (
+            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+        )
+        # Sentinel distinguishable by value — what pre_feedforward_layernorm_2 returns.
+        sentinel = torch.full_like(x, 7.0)
+
+        with (
+            patch.object(layer.self_attn, "forward", return_value=(torch.zeros_like(x), None)),
+            patch.object(layer.pre_feedforward_layernorm_2, "forward", return_value=sentinel),
+            patch.object(layer.moe, "forward", return_value=torch.zeros_like(x)) as mock_moe,
+        ):
+            layer(x, position_embeddings=pos_emb)
+
+        # Positional moe_input is the normalized sentinel from pre_feedforward_layernorm_2.
+        moe_input_arg = mock_moe.call_args[0][0]
+        torch.testing.assert_close(moe_input_arg, sentinel)
+
+        # gate_input kwarg must be passed AND differ from the normalized sentinel —
+        # i.e. it is the raw post-attention residual, not the layernormed moe_input.
+        assert "gate_input" in mock_moe.call_args.kwargs
+        gate_input = mock_moe.call_args.kwargs["gate_input"]
+        assert not torch.equal(gate_input, sentinel)
 
 
 # ---------------------------------------------------------------------------

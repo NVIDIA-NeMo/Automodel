@@ -137,6 +137,34 @@ class Gemma4MoE(MoE):
         # Replace the gate created by MoE.__init__ with Gemma4-specific gate
         self.gate = Gemma4Gate(text_config)
 
+    def forward(self, x, padding_mask=None, cp_mesh=None, *, gate_input=None):
+        """Forward with optional separate gate input.
+
+        HF Gemma4 passes unnormalized residual to the router and normalized
+        input to the experts.  The decoder layer calls this with
+        ``gate_input=x`` (raw residual) so the gate receives unnormalized
+        input while experts receive ``pre_feedforward_layernorm_2(x)``.
+        """
+        if cp_mesh is None:
+            cp_mesh = self.cp_mesh
+
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        if padding_mask is not None:
+            token_mask = (~padding_mask).flatten()
+        else:
+            token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
+
+        # Use separate gate_input for routing when provided (fixes double-norm)
+        g = gate_input.view(-1, self.dim) if gate_input is not None else x
+        weights, indices, aux_loss = self.gate(g, token_mask, cp_mesh)
+
+        x_latent = self.fc1_latent_proj(x) if self.fc1_latent_proj is not None else x
+        y = self.experts(x_latent, token_mask, weights, indices)
+        if self.fc2_latent_proj is not None:
+            y = self.fc2_latent_proj(y)
+        return y.view(shape)
+
 
 # ---------------------------------------------------------------------------
 # Custom decoder layer
@@ -220,7 +248,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
         dense_out = self.post_feedforward_layernorm_1(dense_out)
 
         moe_input = self.pre_feedforward_layernorm_2(x)
-        moe_out = self.moe(moe_input, padding_mask)
+        moe_out = self.moe(moe_input, padding_mask, gate_input=x)
         if isinstance(moe_out, tuple):
             moe_out = moe_out[0]
         moe_out = self.post_feedforward_layernorm_2(moe_out)
