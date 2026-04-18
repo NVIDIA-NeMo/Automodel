@@ -77,6 +77,12 @@ class PeftConfig:
         )
 
 
+def _extract_base_dtype(quantization_config, default_dtype=torch.bfloat16) -> torch.dtype:
+    if hasattr(quantization_config, "bnb_4bit_compute_dtype"):
+        return quantization_config.bnb_4bit_compute_dtype
+    return default_dtype
+
+
 class LinearLoRA(nn.Linear):
     """
     Linear + LoRA, maintains ckpts structure (i.e. Linear's weight/bias remain at the same FQN).
@@ -543,7 +549,7 @@ def apply_lora_to_linear_modules(
                 num_modules_matched += 1
                 lora_dtype = peft_config.lora_dtype
                 if quantization_config is not None and lora_dtype is None:
-                    lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+                    lora_dtype = _extract_base_dtype(quantization_config, torch.bfloat16)
 
                 # Compute effective LoRA rank for MoE modules
                 moe_dim = peft_config.dim
@@ -588,7 +594,7 @@ def apply_lora_to_linear_modules(
                 # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
                 lora_dtype = peft_config.lora_dtype
                 if quantization_config is not None and lora_dtype is None:
-                    lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+                    lora_dtype = _extract_base_dtype(quantization_config, torch.bfloat16)
 
                 patch_linear_module(
                     module,
