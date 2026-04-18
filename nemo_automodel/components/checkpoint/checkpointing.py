@@ -916,7 +916,10 @@ class Checkpointer:
                 # buffer keys are not saved during checkpointing
                 # The `_pre_shard_hf_state_dict_keys` attribute is set in the `apply_model_infrastructure` in auto_model.py
                 keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(pre_shard_hf_state_dict_keys))
-                if model_state.is_tied_lm_head:
+                # Only drop lm_head from the save map when it is actually an alias
+                # of the embedding (e.g. single-rank tied case). PP last stages have
+                # `uses_tied_lm_head=True` but must still persist their own lm_head.
+                if getattr(model_state, "has_local_tied_lm_head", False):
                     keys_to_remove.append(model_state.lm_head_param_name)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)

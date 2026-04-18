@@ -170,24 +170,35 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
 
 
 def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition owns a truly tied LM head.
+    """Return whether the current model partition can locally satisfy a tied LM head.
 
     This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
     stages often keep the config flag set to ``True`` even though ``lm_head`` and
-    ``embed_tokens`` live on different partitions and therefore cannot share the
-    same tensor object locally.
+    ``embed_tokens`` live on different partitions and therefore cannot be
+    reconstructed from each other locally.
+
+    Note: we purposefully do NOT check ``lm_head.weight is embed_tokens.weight``.
+    After FSDP/TP sharding both are wrapped into separate ``DTensor``s and the
+    ``is``-identity is broken, but HF's ``tie_weights()`` can still relink them
+    locally on load. The only case we actually need to distinguish is "is the
+    embedding source present on this partition at all?", which answers "can we
+    safely omit ``lm_head.weight`` during save and rematerialize on load?".
 
     Args:
         model: Model or pipeline stage to inspect.
 
     Returns:
-        ``True`` only when both local weights exist and share the same tensor.
+        ``True`` when the model is configured with tied word embeddings AND
+        both the local ``lm_head`` and the input embedding live on this
+        partition. ``False`` when the config isn't tied, or when the local
+        partition is missing one of the two (typical for PP non-last / non-first
+        stages).
     """
+    if not is_tied_word_embeddings(model):
+        return False
     lm_head_weight, _ = get_lm_head_weight_and_name(model)
     input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    return (
-        lm_head_weight is not None and input_embeddings_weight is not None and lm_head_weight is input_embeddings_weight
-    )
+    return lm_head_weight is not None and input_embeddings_weight is not None
 
 
 def materialize_missing_tied_lm_head(
