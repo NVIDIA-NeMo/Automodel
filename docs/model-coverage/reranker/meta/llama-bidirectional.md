@@ -1,4 +1,4 @@
-# Llama (Bidirectional)
+# Llama (Bidirectional) for Reranking
 
 NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for reranking tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses **bidirectional attention**, allowing the query and document to interact across the full sequence before a classification head produces a relevance score.
 
