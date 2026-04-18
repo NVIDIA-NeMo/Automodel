@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and falls back to HuggingFace `AutoModelForSequenceClassification` for other architectures.
+Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
 
 For first-stage dense retrieval, see [Embedding Models](../embedding/index.md).
 
@@ -14,9 +14,9 @@ For first-stage dense retrieval, see [Embedding Models](../embedding/index.md).
 |---|---|---|---|---|
 | Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
 
-## HuggingFace Auto Backbones
+## Hugging Face Auto Backbones
 
-Any HuggingFace model loadable via `AutoModelForSequenceClassification` can be used as a reranking backbone. This fallback path uses the model's native attention -- no bidirectional conversion is applied.
+Any Hugging Face model loadable using `AutoModelForSequenceClassification` can be used as a reranking backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
 
 ## Supported Workflows
 

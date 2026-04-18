@@ -1,6 +1,6 @@
 # Llama (Bidirectional)
 
-NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses non-causal **bidirectional attention**, so each token can attend to all (future or past) tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
+NeMo AutoModel provides a bidirectional variant of [Meta's Llama](https://www.llama.com/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Llama used for text generation, this variant uses non-causal **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
 
 For the cross-encoder variant, see [Llama (Bidirectional) for Reranking](../../reranker/meta/llama-bidirectional.md).
 For the NVIDIA model page, see [Llama-Embed-Nemotron-8B](../nvidia/llama-embed-nemotron-8b.md).
@@ -16,7 +16,7 @@ For the NVIDIA model page, see [Llama-Embed-Nemotron-8B](../nvidia/llama-embed-n
 
 ## Available Models
 
-Any Llama checkpoint can be loaded as a bidirectional backbone. Tested configurations:
+Any Llama checkpoint can be loaded as a bidirectional backbone. The following configurations are tested:
 
 - **Llama 3.2 1B** — fast iteration, fits on a single GPU
 - **Llama 3.1 8B** — higher-quality embeddings for production use
@@ -31,14 +31,14 @@ The bidirectional bi-encoder path is used for embedding generation and dense ret
 
 ## Pooling Strategies
 
-The bi-encoder supports multiple pooling strategies to aggregate token representations into a single vector:
+The bi-encoder supports multiple pooling strategies to aggregate token representations into a single embedding vector:
 
 | Strategy | Description |
 |---|---|
 | `avg` | Average of all token hidden states (default) |
 | `cls` | First token hidden state |
 | `last` | Last non-padding token hidden state |
-| `weighted_avg` | Sum of token hidden states |
+| `weighted_avg` | Weighted average of token hidden states |
 | `colbert` | No pooling — token-level embeddings (ColBERT-style) |
 
 ## Example HF Models
@@ -56,7 +56,7 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install NeMo AutoModel**. Refer to the ([Installation Guide](../../../guides/installation.md)) for information:
 
 ```bash
 uv pip install nemo-automodel
@@ -85,7 +85,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
+**2. Navigate** to the AutoModel directory (where the recipes are):
 
 ```bash
 cd /opt/Automodel
@@ -103,7 +103,7 @@ See the [Installation Guide](../../../guides/installation.md).
 <!-- TODO: uncomment when finetune guide is published.
 ## Fine-Tuning
 
-See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA/PEFT configuration.
+See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA and PEFT configuration.
 -->
 
 ## Hugging Face Model Cards
