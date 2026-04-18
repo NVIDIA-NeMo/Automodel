@@ -239,16 +239,240 @@ def create_pipeline_forward_causal_lm() -> Callable:
     return pipeline_forward_causal_lm
 
 
+def create_pipeline_forward_gemma4_text() -> Callable:
+    """Pipeline-compatible forward for the Gemma4 text decoder backbone.
+
+    Works for both HF Gemma4TextModel (dense path) and Gemma4MoETextModelBackend (MoE path).
+    Handles:
+    - Optional embed_tokens (None on non-first PP stages; hidden states arrive in input_ids slot)
+    - Both full_attention and sliding_attention causal masks (Gemma4 uses mixed layer types)
+    - Per-layer-type position embeddings: Gemma4RotaryEmbedding.forward(x, pos_ids, layer_type)
+    """
+
+    def pipeline_forward_gemma4_text(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+                if input_ids is None:
+                    raise ValueError("input_ids or inputs_embeds must be provided")
+                inputs_embeds = self.embed_tokens(input_ids)
+            else:
+                # Non-first PP stage: previous stage output arrives as a float tensor in input_ids
+                if input_ids is not None and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    inputs_embeds = input_ids
+                else:
+                    raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
+
+        if cache_position is None:
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        if padding_mask is None and attention_mask is not None:
+            padding_mask = attention_mask.bool().logical_not()
+
+        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+        mask_kwargs = {
+            "config": self.config,
+            "input_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": None,
+            "position_ids": position_ids,
+        }
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+        }
+
+        # Per-layer-type rotary embeddings: Gemma4RotaryEmbedding takes (x, pos_ids, layer_type)
+        position_embeddings_map: dict = {}
+        if hasattr(self, "rotary_emb") and self.rotary_emb is not None:
+            for lt in set(getattr(self.config, "layer_types", ["full_attention"])):
+                try:
+                    position_embeddings_map[lt] = self.rotary_emb(inputs_embeds, position_ids, lt)
+                except TypeError:
+                    position_embeddings_map[lt] = self.rotary_emb(inputs_embeds, position_ids)
+
+        hidden_states = inputs_embeds
+        config_layer_types = getattr(self.config, "layer_types", None)
+        if hasattr(self, "layers") and self.layers is not None:
+            layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            for decoder_layer in layer_iter:
+                # Prefer config.layer_types[layer_idx] over decoder_layer attribute — the
+                # attribute lookup defaults to "full_attention" and mis-assigns position
+                # embeddings (wrong head_dim) to sliding-window layers.
+                if config_layer_types is not None and hasattr(decoder_layer, "layer_idx"):
+                    idx = decoder_layer.layer_idx
+                    layer_type = config_layer_types[idx] if idx < len(config_layer_types) else "full_attention"
+                else:
+                    layer_type = getattr(decoder_layer, "attention_type", "full_attention")
+                layer_attention_mask = causal_mask_mapping.get(
+                    layer_type, causal_mask_mapping.get("full_attention")
+                )
+                position_embeddings = position_embeddings_map.get(
+                    layer_type, position_embeddings_map.get("full_attention")
+                )
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=layer_attention_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    padding_mask=padding_mask,
+                )
+                hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
+
+        if hasattr(self, "norm") and self.norm is not None:
+            hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+
+    return pipeline_forward_gemma4_text
+
+
+def create_pipeline_forward_gemma4_vlm() -> Callable:
+    """Pipeline-compatible forward for Gemma4ForConditionalGeneration (VLM top-level).
+
+    Stage 0: embeds text tokens, merges image features from vision tower (if pixel_values
+    provided or stored in _vlm_pixel_values_chunks), then calls the patched language model.
+    Non-first stages: passes hidden states straight to the patched language model.
+    Last stage: applies lm_head and final-logit softcapping.
+    """
+
+    def pipeline_forward_gemma4_vlm(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        image_position_ids: Optional[torch.LongTensor] = None,
+        mm_token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        lang_model = self.model.language_model
+        embed_tokens = getattr(lang_model, "embed_tokens", None)
+        is_first_stage = embed_tokens is not None
+
+        # PP VLM: retrieve pixel_values from chunks stored by the training loop
+        if (
+            pixel_values is None
+            and is_first_stage
+            and getattr(self, "_vlm_pixel_values_chunks", None) is not None
+        ):
+            has_media_tokens = (
+                input_ids is not None
+                and hasattr(self.config, "image_token_id")
+                and (input_ids == self.config.image_token_id).any()
+            )
+            if has_media_tokens:
+                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                if chunk_idx < len(self._vlm_pixel_values_chunks):
+                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
+                    image_grid_chunk = (
+                        self._vlm_image_grid_hws_chunks[chunk_idx]
+                        if getattr(self, "_vlm_image_grid_hws_chunks", None) is not None
+                        else None
+                    )
+                    if image_grid_chunk is not None:
+                        image_position_ids = image_grid_chunk
+                    self._vlm_chunk_idx = chunk_idx + 1
+
+        if is_first_stage:
+            if inputs_embeds is None:
+                inputs_embeds = embed_tokens(input_ids)
+
+            vision_tower = getattr(self.model, "vision_tower", None)
+            if vision_tower is not None and pixel_values is not None:
+                image_features = self.model.get_image_features(
+                    pixel_values, image_position_ids=image_position_ids, return_dict=True
+                ).pooler_output
+                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+                if mm_token_type_ids is not None:
+                    special_image_mask = mm_token_type_ids == 1
+                elif input_ids is not None:
+                    special_image_mask = input_ids == self.config.image_token_id
+                else:
+                    special_image_mask = torch.zeros(
+                        inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device
+                    )
+                image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+        else:
+            # Non-first stage: input_ids carries hidden states from the previous PP stage
+            if inputs_embeds is None:
+                if input_ids is not None and input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    inputs_embeds = input_ids
+                else:
+                    raise ValueError("Expected float hidden states for non-first PP stage")
+
+        if cache_position is None and inputs_embeds is not None:
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        hidden_states = lang_model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        if not isinstance(hidden_states, torch.Tensor):
+            hidden_states = hidden_states.last_hidden_state
+
+        if hasattr(self, "lm_head") and self.lm_head is not None:
+            logits = self.lm_head(hidden_states)
+            text_config = getattr(self.config, "text_config", self.config)
+            final_logit_softcapping = getattr(text_config, "final_logit_softcapping", None)
+            if final_logit_softcapping is not None:
+                logits = logits / final_logit_softcapping
+                logits = torch.tanh(logits)
+                logits = logits * final_logit_softcapping
+            return logits
+        return hidden_states
+
+    return pipeline_forward_gemma4_vlm
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 
     - If model has .model (e.g., LlamaForCausalLM), patch inner and outer.
+    - If model.model has .language_model (e.g., Gemma4 VLM), patch the text backbone
+      and outer with Gemma4-specific VLM-aware forwards.
     - Else, patch the module itself.
     """
-    if hasattr(model, "model"):
-        if patch_inner_model and getattr(model, "model", None) is not None:
-            model.model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model.model)
+    inner_model = getattr(model, "model", None)
+    text_backbone = (
+        getattr(inner_model, "language_model", None)
+        if inner_model is not None
+        else None
+    )
 
+    if inner_model is not None and text_backbone is not None:
+        # VLM with nested text backbone (e.g. Gemma4): patch text backbone and VLM outer
+        if patch_inner_model:
+            text_backbone.forward = types.MethodType(
+                create_pipeline_forward_gemma4_text(), text_backbone
+            )
+        if patch_causal_lm_model:
+            model.forward = types.MethodType(create_pipeline_forward_gemma4_vlm(), model)
+    elif inner_model is not None:
+        if patch_inner_model:
+            inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
     else:
@@ -272,10 +496,28 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
     issues: list[str] = []
 
     if config is not None:
-        if getattr(config, "tie_word_embeddings", False):
-            issues.append(
-                "tie_word_embeddings=True is not supported for pipelining. Use separate input/output embeddings."
+        # For VLMs, check text_config (the outer VLM config tie flag is irrelevant for PP)
+        check_config = getattr(config, "text_config", config)
+        if getattr(check_config, "tie_word_embeddings", False):
+            # Only a real problem if lm_head and embed_tokens share the same weight tensor
+            lm_head = getattr(model, "lm_head", None)
+            inner = getattr(model, "model", model)
+            embed_tokens = getattr(inner, "embed_tokens", None)
+            if embed_tokens is None:
+                lang = getattr(inner, "language_model", None)
+                if lang is not None:
+                    embed_tokens = getattr(lang, "embed_tokens", None)
+            weights_tied = (
+                lm_head is not None
+                and embed_tokens is not None
+                and hasattr(lm_head, "weight")
+                and hasattr(embed_tokens, "weight")
+                and lm_head.weight is embed_tokens.weight
             )
+            if weights_tied:
+                issues.append(
+                    "tie_word_embeddings=True is not supported for pipelining. Use separate input/output embeddings."
+                )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")
 
