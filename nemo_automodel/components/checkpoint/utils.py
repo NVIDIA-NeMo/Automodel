@@ -131,7 +131,11 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
         for target_name, source_name in tied_keys.items():
             if not isinstance(target_name, str) or not isinstance(source_name, str):
                 continue
-            if lm_head_param_name is None or target_name == lm_head_param_name or target_name.endswith("lm_head.weight"):
+            if (
+                lm_head_param_name is None
+                or target_name == lm_head_param_name
+                or target_name.endswith("lm_head.weight")
+            ):
                 candidate_source_names.append(source_name)
 
     _, input_embeddings_param_name = get_input_embeddings_weight_and_name(model)
@@ -174,9 +178,7 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
     lm_head_weight, _ = get_lm_head_weight_and_name(model)
     input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
     return (
-        lm_head_weight is not None
-        and input_embeddings_weight is not None
-        and lm_head_weight is input_embeddings_weight
+        lm_head_weight is not None and input_embeddings_weight is not None and lm_head_weight is input_embeddings_weight
     )
 
 

@@ -46,7 +46,9 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
-from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4ForConditionalGeneration,
+)
 
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 

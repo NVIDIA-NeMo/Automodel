@@ -39,8 +39,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
-from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
-from nemo_automodel.components.checkpoint._backports.filesystem import FileSystemReader
+from nemo_automodel.components.checkpoint._backports.filesystem import FileSystemReader, SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,

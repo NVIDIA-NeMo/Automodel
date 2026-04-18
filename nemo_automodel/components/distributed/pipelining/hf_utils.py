@@ -317,9 +317,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
                     layer_type = config_layer_types[idx] if idx < len(config_layer_types) else "full_attention"
                 else:
                     layer_type = getattr(decoder_layer, "attention_type", "full_attention")
-                layer_attention_mask = causal_mask_mapping.get(
-                    layer_type, causal_mask_mapping.get("full_attention")
-                )
+                layer_attention_mask = causal_mask_mapping.get(layer_type, causal_mask_mapping.get("full_attention"))
                 position_embeddings = position_embeddings_map.get(
                     layer_type, position_embeddings_map.get("full_attention")
                 )
@@ -367,11 +365,7 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
         is_first_stage = embed_tokens is not None
 
         # PP VLM: retrieve pixel_values from chunks stored by the training loop
-        if (
-            pixel_values is None
-            and is_first_stage
-            and getattr(self, "_vlm_pixel_values_chunks", None) is not None
-        ):
+        if pixel_values is None and is_first_stage and getattr(self, "_vlm_pixel_values_chunks", None) is not None:
             has_media_tokens = (
                 input_ids is not None
                 and hasattr(self.config, "image_token_id")
@@ -456,18 +450,12 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
     - Else, patch the module itself.
     """
     inner_model = getattr(model, "model", None)
-    text_backbone = (
-        getattr(inner_model, "language_model", None)
-        if inner_model is not None
-        else None
-    )
+    text_backbone = getattr(inner_model, "language_model", None) if inner_model is not None else None
 
     if inner_model is not None and text_backbone is not None:
         # VLM with nested text backbone (e.g. Gemma4): patch text backbone and VLM outer
         if patch_inner_model:
-            text_backbone.forward = types.MethodType(
-                create_pipeline_forward_gemma4_text(), text_backbone
-            )
+            text_backbone.forward = types.MethodType(create_pipeline_forward_gemma4_text(), text_backbone)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_gemma4_vlm(), model)
     elif inner_model is not None:

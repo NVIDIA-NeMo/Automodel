@@ -438,16 +438,25 @@ class TestValidateHfModelForPipelineSupport:
         validate_hf_model_for_pipeline_support(model)
 
     def test_validate_model_with_tied_embeddings(self):
-        """Test validation fails for model with tied embeddings."""
+        """Validation fails only when lm_head and embed_tokens actually share storage."""
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
-            tie_word_embeddings = True  # This should cause validation to fail
+            tie_word_embeddings = True  # Needed to enable the tied-weights check
             is_encoder_decoder = False
+
+        class _Inner(nn.Module):
+            def __init__(self, shared_embed):
+                super().__init__()
+                self.embed_tokens = shared_embed
 
         class MockModel(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.config = MockConfig()
+                self.lm_head = nn.Linear(4, 4, bias=False)
+                self.model = _Inner(nn.Embedding(4, 4))
+                # Actually tie the weights so the validator's stricter check triggers.
+                self.model.embed_tokens.weight = self.lm_head.weight
 
         model = MockModel()
 
@@ -475,13 +484,21 @@ class TestValidateHfModelForPipelineSupport:
         """Test validation with multiple issues."""
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
-            tie_word_embeddings = True  # Issue 1
+            tie_word_embeddings = True  # Issue 1 (only fires when weights are actually tied)
             is_encoder_decoder = True   # Issue 2
+
+        class _Inner(nn.Module):
+            def __init__(self, shared_embed):
+                super().__init__()
+                self.embed_tokens = shared_embed
 
         class MockModel(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.config = MockConfig()
+                self.lm_head = nn.Linear(4, 4, bias=False)
+                self.model = _Inner(nn.Embedding(4, 4))
+                self.model.embed_tokens.weight = self.lm_head.weight
 
         model = MockModel()
 
