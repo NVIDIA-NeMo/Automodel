@@ -345,6 +345,8 @@ class Gemma4MoETextModelBackend(nn.Module):
         position_ids: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
         past_key_values=None,
         use_cache: bool | None = None,
         **kwargs: Any,
@@ -366,21 +368,39 @@ class Gemma4MoETextModelBackend(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Build causal masks and position embeddings per attention type
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        # Build causal masks. When use_bidirectional_attention == "vision" (e.g.
+        # gemma-4-26B-A4B, gemma-4-31B), HF uses create_causal_mask_mapping to
+        # build a vision-aware mask where tokens inside the same vision group
+        # attend to each other bidirectionally (not just causally). Missing this
+        # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+        if getattr(self.config, "use_bidirectional_attention", None) == "vision":
+            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
 
-        mask_kwargs = {
-            "config": self.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-        }
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
+            causal_mask_mapping = create_causal_mask_mapping(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                pixel_values=pixel_values,
+                is_training=self.training,
+            )
+        else:
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
 
         position_embeddings = {}
         for layer_type in set(self.config.layer_types):
@@ -596,6 +616,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             position_ids=position_ids,
             cache_position=cache_position,
             padding_mask=padding_mask,
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=pixel_values,
             **kwargs,
         )
 
