@@ -191,7 +191,7 @@ def test_build_parser_accepts_config(tmp_path):
     cfg = tmp_path / "test.yaml"
     cfg.write_text("foo: bar")
     parser = module.build_parser()
-    args, extra = parser.parse_known_args([str(cfg)])
+    args, _ = parser.parse_known_args([str(cfg)])
     assert args.config == cfg
     assert args.nproc_per_node is None
 
@@ -256,6 +256,43 @@ def test_main_dispatches_to_nemo_run(monkeypatch, nemo_run_yaml):
     result = module.main()
     assert result == 0
     assert launched["launcher_config"]["executor"] == "local"
+
+
+def test_main_resolves_skypilot_env_vars(monkeypatch, tmp_path):
+    cfg = tmp_path / "skypilot.yaml"
+    cfg.write_text(
+        yaml.dump(
+            {
+                "recipe": {
+                    "_target_": "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+                },
+                "skypilot": {
+                    "cloud": "kubernetes",
+                    "hf_token": "${HF_TOKEN}",
+                    "env_vars": {"WANDB_API_KEY": "${WANDB_API_KEY,}"},
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("HF_TOKEN", "hf_test_token")
+    monkeypatch.setenv("WANDB_API_KEY", "wandb_test_key")
+    monkeypatch.setattr("sys.argv", ["automodel", str(cfg)])
+
+    launched = {}
+
+    class FakeSkyPilotLauncher:
+        def launch(self, config, config_path, recipe_target, launcher_config, extra):
+            launched["launcher_config"] = launcher_config
+            return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.skypilot.launcher.SkyPilotLauncher",
+        FakeSkyPilotLauncher,
+    )
+    result = module.main()
+    assert result == 0
+    assert launched["launcher_config"]["hf_token"] == "hf_test_token"
+    assert launched["launcher_config"]["env_vars"]["WANDB_API_KEY"] == "wandb_test_key"
 
 
 def test_main_passes_extra_args(monkeypatch, recipe_yaml):
