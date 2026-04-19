@@ -28,8 +28,13 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _is_custom_model,
     _model_has_dtensors,
     _reinit_non_persistent_buffers,
+    _summarize_state_dict_key_diff,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.utils import (
+    has_local_tied_lm_head,
+    materialize_missing_tied_lm_head,
+)
 
 
 def _make_keys(count: int) -> list[str]:
@@ -76,6 +81,31 @@ def test_equally_divide_layers_num_shards_one():
 
     assert len(mapping) == len(keys)
     assert set(mapping.values()) == {1}
+
+
+def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
+    summary = _summarize_state_dict_key_diff(
+        {"a.weight", "b.bias", "c.weight"},
+        {"a.weight", "c.weight", "extra.weight"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 1
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["b.bias"]
+    assert summary["unexpected_examples"] == ["extra.weight"]
+
+
+def test_summarize_state_dict_key_diff_limits_examples():
+    summary = _summarize_state_dict_key_diff(
+        {"a", "b", "c", "d"},
+        {"x"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 4
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["a", "b"]
 
 
 # =============================================================================
@@ -134,6 +164,43 @@ class TestGetLmHeadWeightAndName:
 
         assert name == "lm_head.weight"
         assert "_orig_mod" not in name
+
+
+class _PipelineLastStageLikeModel(torch.nn.Module):
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=True)
+        self.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+
+def test_has_local_tied_lm_head_is_false_for_pp_last_stage_like_partition():
+    model = _PipelineLastStageLikeModel()
+
+    assert has_local_tied_lm_head(model) is False
+
+
+def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
+    model = _PipelineLastStageLikeModel()
+    embed_weight = torch.full_like(model.lm_head.weight, 3.0)
+    state_dict = {"model.language_model.embed_tokens.weight": embed_weight}
+
+    materialized = materialize_missing_tied_lm_head(state_dict, model, allow_current_lm_head_fallback=False)
+
+    assert materialized is True
+    assert "lm_head.weight" in state_dict
+    assert torch.equal(state_dict["lm_head.weight"], embed_weight)
+    assert not torch.equal(state_dict["lm_head.weight"], model.lm_head.weight.detach())
+
+
+def test_model_state_keeps_pp_last_stage_lm_head_in_saved_state_dict():
+    model = _PipelineLastStageLikeModel()
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert "lm_head.weight" in saved_state_dict
 
 
 # =============================================================================

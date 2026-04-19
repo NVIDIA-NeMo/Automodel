@@ -1218,6 +1218,11 @@ class _MockAutoPipeline:
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
 
+    def update_seq_len(self, seq_len: int) -> None:
+        # Dynamic seq-len hook is a no-op in tests; AutoPipeline exposes this for
+        # variable-length VLM batches.
+        return None
+
 
 def _create_pp_recipe(model=None):
     """Helper to create a PP recipe bypassing BaseRecipe tracking."""
