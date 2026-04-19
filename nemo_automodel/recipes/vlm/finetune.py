@@ -256,19 +256,34 @@ def _chunk_vlm_media(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Split VLM pixel_values and image_grid into PP microbatch chunks.
 
-    Handles three layouts:
+    Handles four layouts:
     1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
-    2. Flat patches ``[total_patches, D]`` with per-sample image counts from
+    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
+    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
        ``n_images_per_sample`` (general case, works for packed sequences too).
-    3. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
+    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
     """
     n_images = image_grid.shape[0]
     pixel_values_chunks: list[torch.Tensor] = []
     image_grid_chunks: list[torch.Tensor] = []
 
-    if pixel_values.dim() == 4 and pixel_values.shape[0] == batch_size:
+    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
+        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
+        # Both are indexed by image along dim 0, one entry per sample.
         pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
         image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
+        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
+        # All images are padded to the same max_patches, so split by image count directly.
+        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
+        samples_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            s_start = mb_idx * samples_per_mb
+            s_end = min(s_start + samples_per_mb, batch_size)
+            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
+            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[img_start:img_end])
+            image_grid_chunks.append(image_grid[img_start:img_end])
     elif n_images_per_sample is not None:
         # General case: use per-sample image counts to associate images with
         # batch items.  Works for packed sequences (multiple images per item).
@@ -387,7 +402,11 @@ def build_dataloader(
                 processor.chat_template = _resolve_chat_template(chat_template_raw)
                 processor.tokenizer.chat_template = processor.chat_template
 
-            ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
+            _path_or_ds = getattr(cfg_ds, "path_or_dataset", None) or cfg_ds.get("path_or_dataset", None)
+            if _path_or_ds is not None:
+                ds = cfg_ds.instantiate(path_or_dataset=_path_or_ds)
+            else:
+                ds = cfg_ds.instantiate()
 
         # Resolve packing config: top-level packed_sequence (LLM-style) takes
         # precedence over legacy dataset.packing (backward compat).
@@ -400,15 +419,16 @@ def build_dataloader(
             _legacy = cfg_ds.get("packing", None)
             _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
             packing_cfg = _legacy if _ps_enabled else None
-            pretokenize = cfg_ds.get("pretokenize", False)
             max_length = cfg_ds.get("max_length", None)
+            pretokenize = cfg_ds.get("pretokenize", max_length is not None)
 
         if pretokenize:
             from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
             from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
             ds_raw = ds
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length)
+            truncate = cfg_ds.get("truncate", max_length is not None)
+            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -917,6 +937,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # VLM: Custom chunking for pixel_values and image_grid
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
@@ -925,11 +946,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
                 image_sizes = batch.pop("image_sizes", None)
+                image_position_ids = batch.pop("image_position_ids", None)
                 n_images_per_sample = batch.pop("n_images_per_sample", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
                 if image_grid is None and image_sizes is not None:
                     image_grid = image_sizes
+                if image_grid is None and image_position_ids is not None:
+                    image_grid = image_position_ids
 
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
