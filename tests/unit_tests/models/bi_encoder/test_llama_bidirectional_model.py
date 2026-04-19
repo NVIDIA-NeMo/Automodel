@@ -17,23 +17,23 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaModel
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
     CrossEncoderModel,
-    configure_encoder_metadata,
     _init_encoder_common,
+    configure_encoder_metadata,
     pool,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
-from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
@@ -548,3 +548,67 @@ def test_init_encoder_common_name_or_path_for_generic():
     _init_encoder_common(encoder, fake)
 
     assert encoder.name_or_path == "Qwen/Qwen3-1.7B"
+
+
+# ---------------------------------------------------------------------------
+# is_causal=False refactor: config, forward delegation, encode kwarg,
+# extract_submodel, and generic-path is_causal flags
+# ---------------------------------------------------------------------------
+
+
+def _tiny_bidirec_config(**overrides):
+    defaults = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        pad_token_id=0,
+    )
+    defaults.update(overrides)
+    return LlamaBidirectionalConfig(**defaults)
+
+
+def test_config_is_causal_set_to_false():
+    """config.is_causal must be False after init — required for create_causal_mask
+    to redirect to create_bidirectional_mask in the parent forward()."""
+    cfg = _tiny_bidirec_config()
+    model = LlamaBidirectionalModel(cfg)
+    assert model.config.is_causal is False
+
+
+def test_no_forward_override():
+    """LlamaBidirectionalModel must NOT define its own forward().
+    It relies on the parent LlamaModel.forward() which calls create_causal_mask
+    and respects config.is_causal = False."""
+    assert "forward" not in LlamaBidirectionalModel.__dict__
+    assert LlamaBidirectionalModel.forward is LlamaModel.forward
+
+
+def test_bidirectional_output_via_parent_forward():
+    """Parent forward() should produce bidirectional attention when
+    config.is_causal = False — changing a later token must affect
+    an earlier token's hidden state."""
+    cfg = _tiny_bidirec_config()
+    model = LlamaBidirectionalModel(cfg)
+    model.eval()
+
+    ids_a = torch.tensor([[1, 2, 3, 4]])
+    ids_b = torch.tensor([[1, 2, 3, 5]])  # only last token differs
+    mask = torch.ones_like(ids_a)
+
+    with torch.no_grad():
+        out_a = model(input_ids=ids_a, attention_mask=mask)
+        out_b = model(input_ids=ids_b, attention_mask=mask)
+
+    # In bidirectional attention, changing token 4 affects ALL positions,
+    # including position 0. In causal attention, position 0 would be identical.
+    hidden_a = out_a.last_hidden_state[0, 0]
+    hidden_b = out_b.last_hidden_state[0, 0]
+    assert not torch.allclose(hidden_a, hidden_b, atol=1e-5), (
+        "Position 0 hidden state should differ when a later token changes "
+        "(bidirectional attention). If identical, attention is still causal."
+    )
+
+

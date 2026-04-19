@@ -152,10 +152,20 @@ def build_encoder_backbone(
     # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
     logger.info(f"Model type '{model_type}' not in SUPPORTED_BACKBONES; falling back to HuggingFace Auto classes")
     if task == "score":
-        return AutoModelForSequenceClassification.from_pretrained(
+        model = AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    else:
+        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+
+    # Make the backbone bidirectional: config flag for mask generation,
+    # module flag for SDPA/FA2 kernel fallback.
+    model.config.is_causal = False
+    for layer in getattr(model, "layers", []):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.is_causal = False
+
+    return model
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
@@ -268,6 +278,7 @@ class BiEncoderModel(nn.Module):
 
         outputs = self.model(
             **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
+            is_causal=False,
             return_dict=True,
             output_hidden_states=True,
         )
