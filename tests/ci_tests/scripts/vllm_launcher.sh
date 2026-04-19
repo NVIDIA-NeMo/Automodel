@@ -22,9 +22,6 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
 cd /opt/Automodel
-uv venv /tmp/vllm_deploy_venv
-source /tmp/vllm_deploy_venv/bin/activate
-uv pip install -r tests/ci_tests/requirements_deploy.txt
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
 FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"
