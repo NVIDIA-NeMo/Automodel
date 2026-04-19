@@ -32,7 +32,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     is_cloud_path,
     _ensure_msc_available,
     _ensure_dirs,
-    save_config
+    save_config,
     _summarize_state_dict_key_diff,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
