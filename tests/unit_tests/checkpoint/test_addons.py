@@ -96,7 +96,8 @@ def test_model_state_disables_tied_embeddings_for_non_tied_models():
     model = _DummyModel()
     state = ModelState([model])
 
-    assert state.is_tied_lm_head is False
+    assert state.uses_tied_lm_head is False
+    assert state.has_local_tied_lm_head is False
     assert not hasattr(state, "lm_head_param_name")
 
     state_dict = state.state_dict()
