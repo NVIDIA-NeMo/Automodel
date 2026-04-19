@@ -136,6 +136,51 @@ def _patch_liger_kernel(model):
         raise RuntimeError("Failed to patch model")
 
 
+def _patch_legacy_flash_attn_flag():
+    """Bridge the legacy ``_supports_flash_attn_2`` class flag to v5.5's
+    ``_supports_flash_attn``.
+
+    transformers v5.5 renamed the FA2-support attribute from
+    ``_supports_flash_attn_2`` to ``_supports_flash_attn`` and switched the
+    dispatch check at ``_flash_attn_can_dispatch`` to the new name only.
+    Remote-code models pinned against <=v5.3 (e.g. microsoft/Phi-4-multimodal-instruct
+    sets ``_supports_flash_attn_2 = True`` in its modeling file) are not aware
+    of the rename, so their FA2 support is invisible to v5.5 and
+    ``attn_implementation="flash_attention_2"`` raises ``ValueError``.
+
+    Install a property on ``PreTrainedModel._supports_flash_attn`` that falls
+    back to the legacy flag when a subclass has not set the new one. Subclasses
+    that set ``_supports_flash_attn = True`` directly still shadow the property
+    via normal MRO lookup, so native models are unaffected.
+    """
+    import transformers.modeling_utils as mu
+
+    base = mu.PreTrainedModel
+    if getattr(base, "_nemo_fa2_flag_bridged", False):
+        return
+
+    # Capture the base-class default (``False`` on v5.5) so the fallback
+    # preserves original behavior when no flag is set anywhere.
+    _base_default = base.__dict__.get("_supports_flash_attn", False)
+
+    def _supports_flash_attn_fget(self):
+        cls = type(self)
+        for klass in cls.__mro__:
+            # Stop at the base — the property lives here; anything below is
+            # just the captured default.
+            if klass is base:
+                break
+            d = klass.__dict__
+            if "_supports_flash_attn" in d:
+                return d["_supports_flash_attn"]
+            if d.get("_supports_flash_attn_2") is True:
+                return True
+        return _base_default
+
+    base._supports_flash_attn = property(_supports_flash_attn_fget)
+    base._nemo_fa2_flag_bridged = True  # type: ignore[attr-defined]
+
+
 def _get_next_fallback_attn(attn_implementation: str) -> str:
     """
     Get the next attention implementation in the priority list, in reverse order.

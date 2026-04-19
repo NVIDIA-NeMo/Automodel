@@ -97,8 +97,11 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     ):
         """HF GatedDeltaNet forward with FSDP-safe fp32 gate computation.
 
-        Copied from transformers==5.3.0 Qwen3_5GatedDeltaNet.forward
-        with gate computation replaced by self._compute_gate(a).
+        Mirrors transformers==5.5 Qwen3_5GatedDeltaNet.forward (uses the
+        per-layer cache API: ``has_previous_state(layer_idx)``,
+        ``cache_params.layers[layer_idx].{conv,recurrent}_states``, and the
+        ``update_{conv,recurrent}_state`` methods) with the gate computation
+        replaced by ``self._compute_gate(a)``.
         """
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
@@ -106,12 +109,12 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         batch_size, seq_len, _ = hidden_states.shape
 
         use_precomputed_states = (
-            cache_params is not None and cache_params.has_previous_state and seq_len == 1 and cache_position is not None
+            cache_params is not None and cache_params.has_previous_state(self.layer_idx) and seq_len == 1
         )
 
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
         mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -133,7 +136,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         else:
             if cache_params is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                cache_params.conv_states[self.layer_idx] = conv_state
+                cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
@@ -183,7 +186,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             )
 
         if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

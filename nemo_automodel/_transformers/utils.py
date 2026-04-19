@@ -236,6 +236,10 @@ def apply_cache_compatibility_patches():
     _patch_phi4mm_processor()
     _patch_peft_prepare_inputs()
 
+    from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+    _patch_legacy_flash_attn_flag()
+
 
 def _patch_phi4mm_processor():
     """Patch AutoProcessor.from_pretrained to fall back to the remote
