@@ -434,9 +434,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
         def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
-            if isinstance(module, nn.ModuleList):
-                for layer_id, child in enumerate(module):
-                    if isinstance(child, nn.ModuleList):
+            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
+                for layer_id, child in items:
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
                         _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
                     else:
                         parallelizer_utils.fully_shard_by_dtype(
@@ -1245,7 +1246,13 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ans = []
         for fqn in fqns:
             parts = fqn.split(".")
-            ans.append(reduce(getattr, parts, model))
+            obj = model
+            for part in parts:
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                ans.append(obj)
         return ans
 
     # Gemma3 layer paths depend on transformers version
@@ -1272,7 +1279,7 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
-        Qwen3_5ForConditionalGeneration: ["model.language_model.layers", "model.visual.blocks"],
+        "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],

@@ -949,6 +949,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
                     stage0_model._vlm_chunk_idx = 0
 
+                # Precompute stage shapes analytically for this batch's sequence length.
+                # Required for models with custom ops (e.g. GatedDeltaNet) that don't
+                # support meta-tensor shape inference, and for VLM variable-length batches.
+                self.pp.update_seq_len(input_ids.shape[1])
+
                 if self.pp.info.has_first_stage:
                     self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
                 else:
