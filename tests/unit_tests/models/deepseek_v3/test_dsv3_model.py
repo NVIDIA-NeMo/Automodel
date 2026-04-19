@@ -55,7 +55,7 @@ class TestDeepseekV3ModelUpdates:
 
 class TestDeepseekV3ModelInputsEmbeds:
     """Tests for inputs_embeds support in DeepseekV3Model.
-    
+
     These tests verify the API changes without running actual forward passes
     that would trigger CUDA code in MoE layers.
     """

@@ -46,8 +46,11 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4ForConditionalGeneration,
+)
 
-from nemo_automodel.components.distributed.mesh_utils import get_submesh
+from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
 
 def _is_transformers_v5_or_higher() -> bool:
@@ -156,8 +159,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
-        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
+        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
         # Extract layers from the model for parallelization
         layers = _extract_model_layers(model)
@@ -388,8 +390,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 if layers[i].block_type == "mamba":
                     layers[i] = checkpoint_wrapper(layers[i])
 
-        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
+        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
@@ -492,8 +493,7 @@ class WanParallelizationStrategy(ParallelizationStrategy):
     ) -> nn.Module:
         # Not using custom tp_shard_plan; apply Wan-specific plan
         tp_mesh = device_mesh[tp_mesh_name]
-        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
+        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
         # Apply TP only when TP group size > 1
         if tp_mesh.size() > 1:
@@ -583,8 +583,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         tp_mesh_name: str = "tp",
         **kwargs,
     ) -> nn.Module:
-        dp_mesh_dim_names = (dp_replicate_mesh_name, dp_shard_cp_mesh_name)
-        dp_mesh = get_submesh(device_mesh, dp_mesh_dim_names)
+        dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
         # Mixed precision default like Default strategy
         if not mp_policy:
@@ -1152,7 +1151,7 @@ def validate_tp_mesh(model, tp_mesh):
         num_attention_heads = model.language_model.model.config.num_attention_heads
         num_key_value_heads = model.language_model.model.config.num_key_value_heads
 
-    elif model_cls == Gemma3ForConditionalGeneration:
+    elif model_cls in [Gemma3ForConditionalGeneration, Gemma4ForConditionalGeneration]:
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
     elif model_arch == "DeciLMForCausalLM" and getattr(model.config, "model_type", None) == "nemotron-nas":
@@ -1269,6 +1268,9 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+        Gemma4ForConditionalGeneration: ["model.language_model.layers"],
+        # String fallback in case of class identity mismatch across imports
+        "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],
