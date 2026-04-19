@@ -13,23 +13,90 @@
 # limitations under the License.
 
 import logging
+import os
 import sys
+import time as _time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
+
 from nemo_automodel.components.launcher.base import Launcher
-from nemo_automodel.components.launcher.interactive import resolve_recipe_cls
 from nemo_automodel.components.launcher.nemo_run.config import NemoRunConfig
+from nemo_automodel.components.launcher.nemo_run.utils import (
+    apply_overrides,
+    load_executor_from_file,
+    submit_nemo_run_job,
+)
 
 logger = logging.getLogger(__name__)
+
+# Config filename and its path inside the container (/nemo_run/code/).
+_CONFIG_FILENAME = "automodel_config.yaml"
+_REMOTE_CONFIG_PATH = f"/nemo_run/code/{_CONFIG_FILENAME}"
 
 
 class NemoRunLauncher(Launcher):
     """Launch a recipe via NeMo-Run's executor API.
 
-    Supports ``local``, ``slurm``, and ``k8s`` executor backends.
-    Requires the optional ``nemo-run`` package to be installed.
+    Supports loading pre-configured executors from ``$NEMORUN_HOME/executors.py``
+    (or a custom path) and submitting jobs as ``nemo_run.Script`` objects.
+    Works with any NeMo-Run executor backend (Slurm, Kubernetes, Docker, local).
+
+    Uses NeMo-Run's native ``Torchrun`` launcher so that distributed training
+    arguments (rendezvous, node rank, nproc-per-node) are managed automatically.
+    The training config YAML is packaged via ``PatternPackager`` so it is
+    available at ``/nemo_run/code/automodel_config.yaml`` inside the container.
     """
+
+    def _resolve_executor(self, nr_config: NemoRunConfig) -> Any:
+        """Load a named executor or build a local one."""
+        try:
+            import nemo_run as run
+        except ImportError:
+            logger.error("nemo-run is not installed. Install with: pip install nemo-run")
+            sys.exit(1)
+
+        if nr_config.executor == "local":
+            executor = run.LocalExecutor()
+            apply_overrides(executor, nr_config.overrides)
+            return executor
+
+        # Named executor from executors file
+        executor = load_executor_from_file(nr_config.executor, nr_config.executors_file)
+        apply_overrides(executor, nr_config.overrides)
+        return executor
+
+    @staticmethod
+    def _configure_torchrun(executor: Any, devices: int) -> None:
+        """Enable the native NeMo-Run Torchrun launcher on *executor*.
+
+        Sets ``executor.launcher = "torchrun"`` and
+        ``torchrun_nproc_per_node`` so NeMo-Run generates the correct
+        ``torchrun --nproc-per-node=<N>`` invocation in the sbatch script.
+        """
+        executor.launcher = "torchrun"
+        if hasattr(executor, "torchrun_nproc_per_node"):
+            executor.torchrun_nproc_per_node = devices
+
+    @staticmethod
+    def _setup_packager(executor: Any, config_path: str) -> None:
+        """Configure a ``PatternPackager`` that ships the config YAML.
+
+        The packager tars the config file and NeMo-Run extracts it into
+        ``{job_dir}/code/``, which is mounted at ``/nemo_run/code/`` inside
+        the container.
+        """
+        try:
+            import nemo_run as run
+        except ImportError:
+            return
+
+        config_dir = os.path.dirname(config_path)
+        executor.packager = run.PatternPackager(
+            include_pattern=config_path,
+            relative_path=config_dir,
+        )
 
     def launch(
         self,
@@ -45,42 +112,57 @@ class NemoRunLauncher(Launcher):
             logger.error("nemo-run is not installed. Install with: pip install nemo-run")
             sys.exit(1)
 
-        nr_config = NemoRunConfig(**launcher_config)
-        executor = self._build_executor(run, nr_config)
+        nr_config = NemoRunConfig.from_dict(launcher_config)
+        executor = self._resolve_executor(nr_config)
 
-        recipe_cls = resolve_recipe_cls(recipe_target)
+        # Determine devices (GPUs per node) via the executor's standard
+        # nproc_per_node() method (defined on the base Executor class and
+        # implemented by every backend).
+        try:
+            devices = executor.nproc_per_node()
+        except (NotImplementedError, AttributeError):
+            devices = 1
 
-        recipe = run.Partial(recipe_cls, cfg=config)
+        # Enable native Torchrun launcher (must be set *before* experiment.run
+        # because NeMo-Run reads it during the packaging phase).
+        self._configure_torchrun(executor, devices)
 
-        with run.Experiment("automodel_job") as exp:
-            exp.add(recipe, executor=executor, name="automodel")
-            exp.run(sequential=True)
+        # -- Write the training config for both local record and packaging. --
+        job_dir = os.path.join(
+            nr_config.job_dir or os.path.join(os.getcwd(), "nemo_run_jobs"),
+            str(int(_time.time())),
+        )
+        os.makedirs(job_dir, exist_ok=True)
+        config_yaml = yaml.dump(config, default_flow_style=False, sort_keys=False)
 
-        return 0
+        # Local record.
+        local_config_path = os.path.join(job_dir, _CONFIG_FILENAME)
+        with open(local_config_path, "w") as fp:
+            fp.write(config_yaml)
+        logger.info("NeMo-Run job artifacts in: %s", job_dir)
 
-    @staticmethod
-    def _build_executor(run, nr_config: NemoRunConfig):
-        if nr_config.executor == "local":
-            return run.LocalExecutor(
-                ntasks_per_node=nr_config.num_gpus_per_node,
-                **nr_config.executor_kwargs,
-            )
-        elif nr_config.executor == "slurm":
-            return run.SlurmExecutor(
-                account=nr_config.account,
-                partition=nr_config.partition,
-                time=nr_config.time,
-                nodes=nr_config.num_nodes,
-                ntasks_per_node=nr_config.num_gpus_per_node,
-                container_image=nr_config.container_image,
-                **nr_config.executor_kwargs,
-            )
-        elif nr_config.executor == "k8s":
-            return run.K8sExecutor(
-                num_nodes=nr_config.num_nodes,
-                num_gpus_per_node=nr_config.num_gpus_per_node,
-                container_image=nr_config.container_image,
-                **nr_config.executor_kwargs,
-            )
-        else:
-            raise ValueError(f"Unknown nemo_run executor: {nr_config.executor!r}. Supported: local, slurm, k8s")
+        # Set up PatternPackager so the config is shipped to the remote.
+        self._setup_packager(executor, local_config_path)
+
+        # Build the Script: use ``python -m <module>`` so the recipe is resolved
+        # from the installed package, not a relative file path.
+        module_path = recipe_target.rsplit(".", 1)[0]
+        args = ["-c", _REMOTE_CONFIG_PATH]
+        if extra_args:
+            args.extend(extra_args)
+
+        script = run.Script(
+            path=module_path,
+            m=True,
+            entrypoint="python",
+            args=args,
+        )
+        job_name = nr_config.job_name or f"{recipe_target.rsplit('.', 1)[-1]}"
+
+        return submit_nemo_run_job(
+            script=script,
+            executor=executor,
+            job_name=job_name,
+            detach=nr_config.detach,
+            tail_logs=nr_config.tail_logs,
+        )
