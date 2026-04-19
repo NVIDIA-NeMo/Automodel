@@ -332,9 +332,7 @@ class TestGroupedExpertsZeroActiveExperts:
         x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         # Use small weights to ensure minimal contribution
-        weights = torch.full(
-            (num_tokens, moe_config.n_activated_experts), 0.01, dtype=torch.bfloat16, device=device
-        )
+        weights = torch.full((num_tokens, moe_config.n_activated_experts), 0.01, dtype=torch.bfloat16, device=device)
 
         # Non-existent expert indices
         indices = torch.full(
@@ -411,9 +409,7 @@ class TestGroupedExpertsZeroActiveExperts:
             text=True,
             timeout=60,
         )
-        assert result.returncode == 0, (
-            f"Subprocess test failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        assert result.returncode == 0, f"Subprocess test failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         assert "SUCCESS" in result.stdout, (
             f"Test did not complete successfully:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
@@ -544,9 +540,7 @@ class TestGroupedExpertsForwardLoopDTensorBias:
             experts.down_proj_bias.fill_(1.0)
         output_nonzero_bias = experts(x, token_mask, weights, indices)
 
-        assert not torch.allclose(output_zero_bias, output_nonzero_bias), (
-            "Bias should change the output"
-        )
+        assert not torch.allclose(output_zero_bias, output_nonzero_bias), "Bias should change the output"
 
     def test_forward_loop_dtensor_bias_converted_to_local(self, moe_config, device, monkeypatch):
         """Verify that isinstance(bias, DTensor) triggers .to_local() in forward.
@@ -599,9 +593,7 @@ class TestGroupedExpertsForwardLoopDTensorBias:
             monkeypatch.undo()
 
         assert output.shape == x.shape
-        assert len(to_local_calls) >= 2, (
-            f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
-        )
+        assert len(to_local_calls) >= 2, f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
 
 
 class TestGroupedExpertsDeepEP:
@@ -674,9 +666,7 @@ class TestGroupedExpertsDeepEP:
         # But looking at the code, it seems like permuted_probs should be per-token, not per-feature
         permuted_probs = torch.randn(4, 8)  # 4 tokens, 8 features each to match bias shape
 
-        result = _apply_bias(
-            value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs
-        )
+        result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs)
 
         assert result.shape == value.shape
 
@@ -898,9 +888,15 @@ class TestNonGatedActivations:
             swiglu_config.moe_inter_dim * 2,
         )
 
+
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
 class TestGroupedExpertsTE:
     """Test GroupedExpertsTE module using Transformer Engine's GroupedLinear."""
+
+    def _grouped_weight(self, linear):
+        weight = getattr(linear, "weight", None)
+        assert weight is not None
+        return weight
 
     @pytest.fixture
     def te_moe_config(self):
@@ -960,7 +956,6 @@ class TestGroupedExpertsTE:
 
         config = experts.config
         gate_up_out_features = config.moe_inter_dim * 2 if experts.is_gated else config.moe_inter_dim
-        # Re-create on actual device
         experts.gate_up_linear = GroupedLinear(
             num_gemms=experts.num_local_experts,
             in_features=config.dim,
@@ -968,6 +963,7 @@ class TestGroupedExpertsTE:
             bias=experts.expert_bias,
             params_dtype=config.dtype,
             device=device,
+            single_grouped_parameter=True,
         )
         experts.down_linear = GroupedLinear(
             num_gemms=experts.num_local_experts,
@@ -976,6 +972,7 @@ class TestGroupedExpertsTE:
             bias=experts.expert_bias,
             params_dtype=config.dtype,
             device=device,
+            single_grouped_parameter=True,
         )
 
     def test_grouped_experts_te_init(self, te_moe_config):
@@ -1156,7 +1153,10 @@ class TestGroupedExpertsTE:
         assert "down_proj_bias" in state
 
         # Check bias shapes
-        expected_gate_up_bias_shape = (te_moe_config_with_bias.n_routed_experts, te_moe_config_with_bias.moe_inter_dim * 2)
+        expected_gate_up_bias_shape = (
+            te_moe_config_with_bias.n_routed_experts,
+            te_moe_config_with_bias.moe_inter_dim * 2,
+        )
         expected_down_bias_shape = (te_moe_config_with_bias.n_routed_experts, te_moe_config_with_bias.dim)
 
         assert state["gate_up_proj_bias"].shape == expected_gate_up_bias_shape
@@ -1209,9 +1209,7 @@ class TestGroupedExpertsTE:
         unexpected_keys = []
         error_msgs = []
 
-        experts._load_from_state_dict(
-            state_dict, "", None, True, missing_keys, unexpected_keys, error_msgs
-        )
+        experts._load_from_state_dict(state_dict, "", None, True, missing_keys, unexpected_keys, error_msgs)
 
         assert len(missing_keys) == 0
         assert len(error_msgs) == 0
@@ -1356,9 +1354,8 @@ class TestGroupedExpertsTE:
 
         # Initialize weights with specific values
         with torch.no_grad():
-            for i in range(experts1.gate_up_linear.num_gemms):
-                getattr(experts1.gate_up_linear, f"weight{i}").normal_(0, 0.02)
-                getattr(experts1.down_linear, f"weight{i}").normal_(0, 0.02)
+            self._grouped_weight(experts1.gate_up_linear).normal_(0, 0.02)
+            self._grouped_weight(experts1.down_linear).normal_(0, 0.02)
 
         # Get state dict
         state = experts1.state_dict()
@@ -1373,12 +1370,8 @@ class TestGroupedExpertsTE:
         assert len(missing_keys) == 0
 
         # Compare weights
-        torch.testing.assert_close(
-            experts1.gate_and_up_projs, experts2.gate_and_up_projs, rtol=1e-4, atol=1e-4
-        )
-        torch.testing.assert_close(
-            experts1.down_projs, experts2.down_projs, rtol=1e-4, atol=1e-4
-        )
+        torch.testing.assert_close(experts1.gate_and_up_projs, experts2.gate_and_up_projs, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(experts1.down_projs, experts2.down_projs, rtol=1e-4, atol=1e-4)
 
     def test_grouped_experts_te_weight_setter_with_none(self, te_moe_config):
         """Test weight setters handle None gracefully."""
@@ -1585,9 +1578,8 @@ class TestGroupedExpertsTE:
         experts1 = GroupedExpertsTE(config)
         self._materialize_weights(experts1, device)
         with torch.no_grad():
-            for i in range(experts1.gate_up_linear.num_gemms):
-                getattr(experts1.gate_up_linear, f"weight{i}").normal_(0, 0.02)
-                getattr(experts1.down_linear, f"weight{i}").normal_(0, 0.02)
+            self._grouped_weight(experts1.gate_up_linear).normal_(0, 0.02)
+            self._grouped_weight(experts1.down_linear).normal_(0, 0.02)
 
         state = experts1.state_dict()
 
@@ -1814,7 +1806,7 @@ class TestTorchGroupedMM:
             if inner is not fn.func:
                 return partial(inner, *fn.args, **fn.keywords)
             return fn
-        if hasattr(fn, '_torchdynamo_orig_callable'):
+        if hasattr(fn, "_torchdynamo_orig_callable"):
             return fn._torchdynamo_orig_callable
         return fn
 
@@ -1852,7 +1844,9 @@ class TestTorchGroupedMM:
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -1867,8 +1861,15 @@ class TestTorchGroupedMM:
         num_tokens = 16
         x = torch.randn(num_tokens, torch_mm_config_with_bias.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-        weights = torch.rand(num_tokens, torch_mm_config_with_bias.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, torch_mm_config_with_bias.n_routed_experts, (num_tokens, torch_mm_config_with_bias.n_activated_experts), device=device)
+        weights = torch.rand(
+            num_tokens, torch_mm_config_with_bias.n_activated_experts, dtype=torch.bfloat16, device=device
+        )
+        indices = torch.randint(
+            0,
+            torch_mm_config_with_bias.n_routed_experts,
+            (num_tokens, torch_mm_config_with_bias.n_activated_experts),
+            device=device,
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -1891,7 +1892,9 @@ class TestTorchGroupedMM:
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         out_mm = experts_mm(x, token_mask, weights, indices)
         out_loop = experts_loop(x, token_mask, weights, indices)
@@ -1907,7 +1910,9 @@ class TestTorchGroupedMM:
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device, requires_grad=True)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
         loss = output.sum()
@@ -1951,9 +1956,11 @@ class TestTorchGroupedMM:
         num_tokens = 16
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-        token_mask[:num_tokens // 2] = True
+        token_mask[: num_tokens // 2] = True
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -2079,7 +2086,7 @@ class TestGroupedExpertsConvergenceFixes:
             if inner is not fn.func:
                 return partial(inner, *fn.args, **fn.keywords)
             return fn
-        if hasattr(fn, '_torchdynamo_orig_callable'):
+        if hasattr(fn, "_torchdynamo_orig_callable"):
             return fn._torchdynamo_orig_callable
         return fn
 
@@ -2221,9 +2228,7 @@ class TestGroupedExpertsConvergenceFixes:
         torch.testing.assert_close(
             experts_mm.gate_and_up_projs.grad, experts_loop.gate_and_up_projs.grad, rtol=1e-3, atol=1e-3
         )
-        torch.testing.assert_close(
-            experts_mm.down_projs.grad, experts_loop.down_projs.grad, rtol=1e-3, atol=1e-3
-        )
+        torch.testing.assert_close(experts_mm.down_projs.grad, experts_loop.down_projs.grad, rtol=1e-3, atol=1e-3)
 
     # --- Test 5: Loop path with bias ---
 

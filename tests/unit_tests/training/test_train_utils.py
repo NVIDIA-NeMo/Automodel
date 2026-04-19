@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock, patch
-
-import pytest
-import torch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -165,9 +162,7 @@ def test_clip_grad_norm_actually_clips():
     model.weight.grad = torch.ones_like(model.weight) * 10.0
     model.bias.grad = torch.ones_like(model.bias) * 10.0
 
-    initial_norm = torch.nn.utils.clip_grad_norm_(
-        [model.weight, model.bias], float("inf")
-    ).item()
+    initial_norm = torch.nn.utils.clip_grad_norm_([model.weight, model.bias], float("inf")).item()
 
     # Reset gradients
     model.weight.grad = torch.ones_like(model.weight) * 10.0
@@ -323,31 +318,28 @@ def test_scoped_offloading_enabled_moves_and_reraises():
 
 
 class _TEGroupedLinearMock(nn.Module):
-    """Mock TE GroupedLinear with weight0 parameter naming."""
+    """Mock TE GroupedLinear with the grouped weight parameter."""
 
     def __init__(self):
         super().__init__()
-        # Parameter name matches TE GroupedLinear pattern (weight0, weight1, etc.)
-        self.weight0 = nn.Parameter(torch.randn(4, 2))
+        self.weight = nn.Parameter(torch.randn(2, 4, 2))
 
 
 class _ExpertsModule(nn.Module):
     """Mock experts module with parameters matching GroupedExpertsTE pattern."""
 
-    def __init__(self):
+    def __init__(self, linear_cls=_TEGroupedLinearMock):
         super().__init__()
-        # Submodule names match GroupedExpertsTE: gate_up_linear, down_linear
-        self.gate_up_linear = _TEGroupedLinearMock()
+        self.gate_up_linear = linear_cls()
 
 
 class _MoEModule(nn.Module):
     """Mock MoE module with expert parameters for testing EP scaling."""
 
-    def __init__(self):
+    def __init__(self, linear_cls=_TEGroupedLinearMock):
         super().__init__()
         self.gate = nn.Linear(4, 2, bias=False)
-        # FQN will be mlp.experts.gate_up_linear.weight0, matching _EXPERT_PARAM_PATTERN
-        self.mlp = nn.ModuleDict({"experts": _ExpertsModule()})
+        self.mlp = nn.ModuleDict({"experts": _ExpertsModule(linear_cls)})
 
 
 class TestScaleGradsAndClipGradNorm:
@@ -356,7 +348,7 @@ class TestScaleGradsAndClipGradNorm:
     def test_ep_scaling_for_expert_params_by_name(self):
         """Test that expert params are scaled by EP ratio based on param name."""
         model = _MoEModule()
-        expert_param = model.mlp["experts"].gate_up_linear.weight0
+        expert_param = model.mlp["experts"].gate_up_linear.weight
         model.gate.weight.grad = torch.ones_like(model.gate.weight) * 2.0
         expert_param.grad = torch.ones_like(expert_param) * 2.0
 
@@ -374,7 +366,7 @@ class TestScaleGradsAndClipGradNorm:
         )
 
         # ep_ratio = dp_group_size / ep_shard_size = 4 / 2 = 2
-        # Expert params (mlp.experts.gate_up_linear.weight0) should be scaled by 1/2
+        # Expert params (mlp.experts.gate_up_linear.weight) should be scaled by 1/2
         # Non-expert params (gate) should NOT be scaled
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 2.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 1.0)
@@ -382,7 +374,7 @@ class TestScaleGradsAndClipGradNorm:
     def test_no_ep_scaling_without_moe_mesh(self):
         """Test that no EP scaling occurs when moe_mesh is None."""
         model = _MoEModule()
-        expert_param = model.mlp["experts"].gate_up_linear.weight0
+        expert_param = model.mlp["experts"].gate_up_linear.weight
         model.gate.weight.grad = torch.ones_like(model.gate.weight) * 2.0
         expert_param.grad = torch.ones_like(expert_param) * 2.0
 
@@ -401,7 +393,7 @@ class TestScaleGradsAndClipGradNorm:
     def test_ep_scaling_combined_with_pp_scaling(self):
         """Test that PP and EP scaling work together correctly."""
         model = _MoEModule()
-        expert_param = model.mlp["experts"].gate_up_linear.weight0
+        expert_param = model.mlp["experts"].gate_up_linear.weight
         model.gate.weight.grad = torch.ones_like(model.gate.weight) * 8.0
         expert_param.grad = torch.ones_like(expert_param) * 8.0
 
