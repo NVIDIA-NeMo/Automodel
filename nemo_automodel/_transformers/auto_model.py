@@ -367,10 +367,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
-            _meta_err_msgs = ("Cannot copy out of meta tensor", "cannot be called on meta tensors")
-            if any(msg in str(e) for msg in _meta_err_msgs) and is_meta_device:
+            _meta_err_msgs = (
+                "Cannot copy out of meta tensor",
+                "cannot be called on meta tensors",
+                "aten::equal: attempted to run this operator with Meta tensors",
+            )
+            # if the error message contains any of the meta-tensor error messages, retry without meta-device init
+            # When force_hf is True, we may still encounter the error, even tho is_meta_device is False
+            # automodel /opt/Automodel/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml is a good example
+            if any(msg in str(e) for msg in _meta_err_msgs):
                 logger.warning(
-                    "Model init hit meta-tensor error (%s); retrying without meta device.",
+                    "Model init hit meta-tensor error (%s); retrying without meta-device init.",
                     type(e).__name__,
                 )
                 del model

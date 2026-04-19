@@ -14,6 +14,17 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
 import logging
 import pathlib
 import time
@@ -376,7 +387,11 @@ def build_dataloader(
                 processor.chat_template = _resolve_chat_template(chat_template_raw)
                 processor.tokenizer.chat_template = processor.chat_template
 
-            ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
+            _path_or_ds = getattr(cfg_ds, "path_or_dataset", None) or cfg_ds.get("path_or_dataset", None)
+            if _path_or_ds is not None:
+                ds = cfg_ds.instantiate(path_or_dataset=_path_or_ds)
+            else:
+                ds = cfg_ds.instantiate()
 
         # Resolve packing config: top-level packed_sequence (LLM-style) takes
         # precedence over legacy dataset.packing (backward compat).
@@ -389,15 +404,16 @@ def build_dataloader(
             _legacy = cfg_ds.get("packing", None)
             _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
             packing_cfg = _legacy if _ps_enabled else None
-            pretokenize = cfg_ds.get("pretokenize", False)
             max_length = cfg_ds.get("max_length", None)
+            pretokenize = cfg_ds.get("pretokenize", max_length is not None)
 
         if pretokenize:
             from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
             from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
             ds_raw = ds
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length)
+            truncate = cfg_ds.get("truncate", max_length is not None)
+            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater

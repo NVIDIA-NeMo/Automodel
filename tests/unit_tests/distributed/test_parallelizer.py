@@ -727,8 +727,14 @@ class TestApplyFsdpShardingRecursively:
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
     ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList."""
-        # Set up mock return values
-        mock_fully_shard.side_effect = lambda x, **kwargs: x  # Return the module unchanged
+
+        # Set up mock return values - add FSDP2 prefetch methods that fully_shard normally provides
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
 
         # Call the function
         apply_fsdp2_sharding_recursively(
@@ -756,8 +762,14 @@ class TestApplyFsdpShardingRecursively:
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy
     ):
         """Test apply_fsdp2_sharding_recursively with a ModuleList and no offload policy."""
-        # Set up mock return values
-        mock_fully_shard.side_effect = lambda x, **kwargs: x
+
+        # Set up mock return values - add FSDP2 prefetch methods that fully_shard normally provides
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
 
         # Call the function without offload_policy
         apply_fsdp2_sharding_recursively(module=mock_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy)
@@ -959,11 +971,15 @@ class TestGetParallelPlanClassNameFallback:
 
         # Simulate _get_mixin_wrapped_class: create a *new* class object that copies
         # __module__ and __qualname__ from the original (same qualname, different object)
-        WrappedCls = type(original_cls.__name__, (nn.Module,), {
-            "forward": lambda self, x: x,
-            "__module__": original_cls.__module__,
-            "__qualname__": original_cls.__qualname__,
-        })
+        WrappedCls = type(
+            original_cls.__name__,
+            (nn.Module,),
+            {
+                "forward": lambda self, x: x,
+                "__module__": original_cls.__module__,
+                "__qualname__": original_cls.__qualname__,
+            },
+        )
         assert WrappedCls is not original_cls
         assert _get_class_qualname(WrappedCls) == _get_class_qualname(original_cls)
 
@@ -1266,8 +1282,8 @@ class TestActivationCheckpointingKVSharing:
             lambda *a, **kw: None,
         )
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer.get_submesh",
-            lambda mesh, names: MagicMock(),
+            "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+            lambda mesh, *a, **kw: MagicMock(),
         )
 
     def _run_parallelize(self, model, activation_checkpointing=True):
@@ -1303,17 +1319,13 @@ class TestActivationCheckpointingKVSharing:
 
     def test_use_cache_preserved_flat_config(self):
         """KV-sharing detected through a flat config (no text_config nesting)."""
-        model = _make_model_for_ac(
-            use_cache=True, num_kv_shared_layers=10, text_config_nested=False
-        )
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=10, text_config_nested=False)
         self._run_parallelize(model)
         assert model.config.use_cache is True
 
     def test_use_cache_disabled_flat_config_no_sharing(self):
         """Flat config without KV sharing still disables cache."""
-        model = _make_model_for_ac(
-            use_cache=True, num_kv_shared_layers=0, text_config_nested=False
-        )
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0, text_config_nested=False)
         self._run_parallelize(model)
         assert model.config.use_cache is False
 
