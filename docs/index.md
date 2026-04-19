@@ -276,6 +276,7 @@ Local Workstation <launcher/local-workstation.md>
 SLURM Cluster <launcher/slurm.md>
 NeMo-Run <launcher/nemo-run.md>
 SkyPilot <launcher/skypilot.md>
+SkyPilot k8s <launcher/skypilot-kubernetes.md>
 ::::
 
 ::::{toctree}
