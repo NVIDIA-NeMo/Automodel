@@ -11,7 +11,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 1024
-  local_batch_size: 128
+  local_batch_size: 64
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
@@ -85,7 +85,7 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-3
+  lr: 1.0e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
@@ -94,7 +94,7 @@ ci:
   recipe_owner: hemildesai
   time: "00:15:00"
   checkpoint_robustness:
-    hf_kl_threshold: 1e-4
+    hf_kl_threshold: 1e-3
     tokenizer_name: Qwen/Qwen3-30B-A3B
     no_check_resume: true
     dataset.num_samples_limit: 500

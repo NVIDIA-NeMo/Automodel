@@ -103,3 +103,4 @@ optimizer:
 
 ci:
   recipe_owner: akoumpa
+  time: "00:15:00"

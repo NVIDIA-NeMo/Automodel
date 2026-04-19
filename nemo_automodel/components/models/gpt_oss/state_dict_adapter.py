@@ -181,17 +181,18 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         out = out.transpose(1, 2).contiguous()
         # Restore desired DTensor sharding: shard experts (dim 0) by 'ep' and hidden dim (dim 2) by 'ep_shard'.
         if isinstance(out, torch.distributed.tensor.DTensor):
-            placements = []
             mesh_dim_names = out.device_mesh.mesh_dim_names
-            for dim_name in mesh_dim_names:
-                if dim_name == "ep":
-                    placements.append(torch.distributed.tensor.Shard(0))
-                elif dim_name == "ep_shard":
-                    placements.append(torch.distributed.tensor.Shard(2))
-                else:
-                    raise ValueError(f"Unexpected dimension name: {dim_name}")
-            if placements != out.placements:
-                out = out.redistribute(placements=tuple(placements))
+            if "ep" in mesh_dim_names or "ep_shard" in mesh_dim_names:
+                placements = []
+                for dim_name in mesh_dim_names:
+                    if dim_name == "ep":
+                        placements.append(torch.distributed.tensor.Shard(0))
+                    elif dim_name == "ep_shard":
+                        placements.append(torch.distributed.tensor.Shard(2))
+                    else:
+                        placements.append(torch.distributed.tensor.Replicate())
+                if placements != out.placements:
+                    out = out.redistribute(placements=tuple(placements))
         return out
 
     def to_hf(

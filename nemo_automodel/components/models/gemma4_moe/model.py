@@ -137,6 +137,34 @@ class Gemma4MoE(MoE):
         # Replace the gate created by MoE.__init__ with Gemma4-specific gate
         self.gate = Gemma4Gate(text_config)
 
+    def forward(self, x, padding_mask=None, cp_mesh=None, *, gate_input=None):
+        """Forward with optional separate gate input.
+
+        HF Gemma4 passes unnormalized residual to the router and normalized
+        input to the experts.  The decoder layer calls this with
+        ``gate_input=x`` (raw residual) so the gate receives unnormalized
+        input while experts receive ``pre_feedforward_layernorm_2(x)``.
+        """
+        if cp_mesh is None:
+            cp_mesh = self.cp_mesh
+
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        if padding_mask is not None:
+            token_mask = (~padding_mask).flatten()
+        else:
+            token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
+
+        # Use separate gate_input for routing when provided (fixes double-norm)
+        g = gate_input.view(-1, self.dim) if gate_input is not None else x
+        weights, indices, aux_loss = self.gate(g, token_mask, cp_mesh)
+
+        x_latent = self.fc1_latent_proj(x) if self.fc1_latent_proj is not None else x
+        y = self.experts(x_latent, token_mask, weights, indices)
+        if self.fc2_latent_proj is not None:
+            y = self.fc2_latent_proj(y)
+        return y.view(shape)
+
 
 # ---------------------------------------------------------------------------
 # Custom decoder layer
@@ -220,7 +248,7 @@ class Gemma4MoEDecoderLayer(nn.Module):
         dense_out = self.post_feedforward_layernorm_1(dense_out)
 
         moe_input = self.pre_feedforward_layernorm_2(x)
-        moe_out = self.moe(moe_input, padding_mask)
+        moe_out = self.moe(moe_input, padding_mask, gate_input=x)
         if isinstance(moe_out, tuple):
             moe_out = moe_out[0]
         moe_out = self.post_feedforward_layernorm_2(moe_out)
@@ -259,7 +287,8 @@ class Gemma4MoETextModelBackend(nn.Module):
         self.moe_config = moe_config or MoEConfig(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
-            moe_inter_dim=config.expert_intermediate_size or getattr(config, "moe_intermediate_size", None),
+            moe_inter_dim=getattr(config, "moe_intermediate_size", None)
+            or getattr(config, "expert_intermediate_size", None),
             n_routed_experts=config.num_experts,
             n_shared_experts=0,
             n_activated_experts=config.top_k_experts,
@@ -302,6 +331,8 @@ class Gemma4MoETextModelBackend(nn.Module):
         position_ids: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
         past_key_values=None,
         use_cache: bool | None = None,
         **kwargs: Any,
@@ -323,21 +354,39 @@ class Gemma4MoETextModelBackend(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Build causal masks and position embeddings per attention type
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+        # Build causal masks. When use_bidirectional_attention == "vision" (e.g.
+        # gemma-4-26B-A4B, gemma-4-31B), HF uses create_causal_mask_mapping to
+        # build a vision-aware mask where tokens inside the same vision group
+        # attend to each other bidirectionally (not just causally). Missing this
+        # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+        if getattr(self.config, "use_bidirectional_attention", None) == "vision":
+            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
 
-        mask_kwargs = {
-            "config": self.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-        }
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
+            causal_mask_mapping = create_causal_mask_mapping(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                pixel_values=pixel_values,
+                is_training=self.training,
+            )
+        else:
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
 
         position_embeddings = {}
         for layer_type in set(self.config.layer_types):
@@ -391,6 +440,7 @@ class Gemma4MoEModel(HFGemma4Model):
 # Top-level conditional-generation model
 # ---------------------------------------------------------------------------
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
+    supports_gradient_checkpointing = True
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
@@ -434,8 +484,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             for k, v in text_config.items():
                 setattr(cfg_text, k, v)
 
-        # Compat: checkpoints renamed expert_intermediate_size → moe_intermediate_size.
+        # Compat: older checkpoints used expert_intermediate_size, v5.5+ uses moe_intermediate_size.
         cfg_text = config.text_config if hasattr(config, "text_config") else config
+        if not getattr(cfg_text, "moe_intermediate_size", None) and getattr(cfg_text, "expert_intermediate_size", None):
+            cfg_text.moe_intermediate_size = cfg_text.expert_intermediate_size
         if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
             cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
 
@@ -536,6 +588,8 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             position_ids=position_ids,
             cache_position=cache_position,
             padding_mask=padding_mask,
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=pixel_values,
             **kwargs,
         )
 
