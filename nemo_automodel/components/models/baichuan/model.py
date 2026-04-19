@@ -42,6 +42,7 @@ from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.activations import ACT2FN
+from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.utils import logging
 
@@ -365,6 +366,12 @@ class BaichuanModel(BaichuanPreTrainedModel):
         seq_length_with_past = seq_length
         past_key_values_length = 0
         if past_key_values is not None:
+            if isinstance(past_key_values, DynamicCache):
+                if past_key_values.get_seq_length() > 0:
+                    past_key_values = tuple((layer.keys, layer.values) for layer in past_key_values.layers)
+                else:
+                    past_key_values = None
+        if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
@@ -558,6 +565,9 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         inputs_embeds=None,
         **kwargs,
     ):
+        # Treat empty DynamicCache as no cache so inputs stay consistent with forward()
+        if isinstance(past_key_values, DynamicCache) and past_key_values.get_seq_length() == 0:
+            past_key_values = None
         if past_key_values:
             input_ids = input_ids[:, -1:]
 
@@ -565,8 +575,8 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
         if attention_mask is not None and position_ids is None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
+        if past_key_values and position_ids is not None:
+            position_ids = position_ids[:, -1].unsqueeze(-1)
 
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}

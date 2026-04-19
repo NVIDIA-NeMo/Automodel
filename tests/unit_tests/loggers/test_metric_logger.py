@@ -169,5 +169,3 @@ def test_metric_logger_dist_nonzero_noop(tmp_path, monkeypatch):
     else:
         # If file was not created, that's also acceptable
         assert True
-
-

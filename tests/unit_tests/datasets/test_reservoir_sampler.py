@@ -82,4 +82,3 @@ def test_reservoir_sampler_invalid_buffer_size_raises(buffer_size: int) -> None:
 def test_reservoir_sampler_missing_iterator_raises() -> None:
     with pytest.raises(ValueError, match="iterator must be provided"):
         _ = ReservoirSampler(None, buffer_size=3, seed=0)  # type: ignore[arg-type]
-

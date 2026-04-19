@@ -82,7 +82,7 @@ dependencies = [
     "pyyaml",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers>=5.3.0,<5.4.0",
+    "transformers==5.5.0",
     "wandb",
     "torchao",
     "mlflow",
@@ -91,13 +91,16 @@ dependencies = [
 
 [project.optional-dependencies]
 diffusion = [
-    "diffusers>=0.36.0",
+    "diffusers>=0.37.0",
     "ftfy",
     "imageio",
     "imageio-ffmpeg",
-    "kernels",
     "opencv-python-headless",
     "torchvision",
+]
+diffusion_kernels = [
+    "nemo_automodel[diffusion]",
+    "kernels",
 ]
 # nvidia-cudnn-cu12 pin: This is required for GPTOSS TE support + faster cudnn attention (only on Linux where CUDA is available)
 # "nvidia-cudnn-cu12>=9.18.0.0; sys_platform == 'linux'",
@@ -128,7 +131,7 @@ moe = [
 vlm = [
     "albumentations",
     "backoff",
-    "mistral_common[opencv]>=1.9.0",
+    "mistral_common[opencv]>=1.11.0",
     "numpy",
     "numba",
     "open-clip-torch",
@@ -198,17 +201,22 @@ no-build-isolation-package = [
 ]
 constraint-dependencies = [
     "aiohttp>=3.13.3", # Address CVE GHSA-6mq8-rvhq-8wgg
-    "cryptography>=46.0.5", # Address CVE GHSA-r6ph-v2qm-q3c2
+    "cryptography>=46.0.7",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
     "pillow>=12.1.1", # Address CVE GHSA-cfh3-3jmp-rvhc
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
-    "pyasn1>=0.6.2", # Address CVE GHSA-63vm-454h-vhhq
+    "pyasn1>=0.6.3",
     "starlette>=0.49.1", # Address CVE GHSA-7f5h-v6xp-fcq8
     "setuptools>=80.10.2",
     "urllib3>=2.6.3", # Address CVE GHSA-gm62-xv2j-4w53
     "wheel>=0.46.2", # Address CVE GHSA-8rrh-rw8j-w5fx
     "fonttools>=4.60.2", # Address CVE-2025-66034
-    "mlflow>=3.10.0rc0", # Address CVE
+    "mlflow>=3.11.1", # Address CVE (no fix available, pinning to latest)
+    "tornado>=6.5.5",
+    "onnx>=1.21.0",
+    "pyjwt>=2.12.0",
+    "pytest>=8.4.3",
+    "pygments>=2.20.0",
 ]
 override-dependencies = [
     "nvidia-cudnn-cu12==9.19.0.56; sys_platform == 'linux'"
@@ -380,6 +388,7 @@ modules = [
 ]
 ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
+    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)

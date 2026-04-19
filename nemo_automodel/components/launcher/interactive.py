@@ -74,12 +74,16 @@ class InteractiveLauncher(Launcher):
     def _is_torchrun_worker() -> bool:
         """Return True when this process was already spawned by torchrun.
 
-        torchrun (``torch.distributed.run``) sets ``LOCAL_RANK`` in the
-        environment of every worker it spawns.  When the user launches the CLI
-        via ``torchrun --nproc-per-node N -m nemo_automodel.cli.app config.yaml``,
+        torchrun (``torch.distributed.run``) sets both ``LOCAL_RANK`` and
+        ``TORCHELASTIC_RUN_ID`` in the environment of every worker it spawns.
+        We check for both to avoid false positives from environments (e.g.
+        SLURM) that may set ``LOCAL_RANK`` without an active torchrun session.
+
+        When the user launches the CLI via
+        ``torchrun --nproc-per-node N -m nemo_automodel.cli.app config.yaml``,
         each worker must run the recipe in-process instead of re-launching torchrun.
         """
-        return "LOCAL_RANK" in os.environ
+        return "LOCAL_RANK" in os.environ and "TORCHELASTIC_RUN_ID" in os.environ
 
     def _run_recipe_in_process(self, recipe_target: str, config: Dict[str, Any]) -> int:
         """Instantiate and run a recipe in the current process."""

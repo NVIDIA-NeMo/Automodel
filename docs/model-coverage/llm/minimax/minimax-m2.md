@@ -15,7 +15,7 @@
 
 - **MiniMax-M2.1**
 - **MiniMax-M2.5**
-
+- **MiniMax-M2.7**
 ## Architecture
 
 - `MiniMaxM2ForCausalLM`
@@ -26,6 +26,7 @@
 |---|---|
 | MiniMax M2.1 | [`MiniMaxAI/MiniMax-M2.1`](https://huggingface.co/MiniMaxAI/MiniMax-M2.1) |
 | MiniMax M2.5 | [`MiniMaxAI/MiniMax-M2.5`](https://huggingface.co/MiniMaxAI/MiniMax-M2.5) |
+| MiniMax M2.7 | [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) |
 
 ## Example Recipes
 
@@ -33,6 +34,7 @@
 |---|---|
 | {download}`minimax_m2.1_hellaswag_pp.yaml <../../../../examples/llm_finetune/minimax_m2/minimax_m2.1_hellaswag_pp.yaml>` | SFT — MiniMax-M2.1 on HellaSwag with pipeline parallelism |
 | {download}`minimax_m2.5_hellaswag_pp.yaml <../../../../examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml>` | SFT — MiniMax-M2.5 on HellaSwag with pipeline parallelism |
+| {download}`minimax_m2.7_hellaswag_pp.yaml <../../../../examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml>` | SFT — MiniMax-M2.7 on HellaSwag with pipeline parallelism |
 
 
 ## Try with NeMo AutoModel
@@ -87,8 +89,10 @@ See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuni
 
 ## Fine-Tuning
 
-See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large_moe_finetune.md).
+See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
 
 ## Hugging Face Model Cards
 
 - [MiniMaxAI/MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1)
+- [MiniMaxAI/MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5)
+- [MiniMaxAI/MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
