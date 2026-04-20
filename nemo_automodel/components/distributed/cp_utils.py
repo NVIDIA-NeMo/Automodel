@@ -263,8 +263,24 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 block_mask=_block_mask,
                 scale=scale,
             )
-        except Exception:
-            pass  # fall through to SDPA fallback
+        except Exception as _flex_err:
+            # Surface the failure once per process so we know *why* we fell back
+            # to the O(N^2) SDPA path (which OOMs on long sequences).  Without
+            # this the primary path fails silently and the only visible symptom
+            # is an unrelated-looking OOM deep inside _original_sdpa.
+            if not getattr(_cp_sdpa, "_flex_err_logged", False):
+                import logging, traceback
+                _log = logging.getLogger(__name__)
+                _log.warning(
+                    "CP flex_attention path failed; falling back to SDPA. "
+                    "shapes: Q=%s K_full=%s V_full=%s scale=%s head_dim_pad=%s->%s "
+                    "cp_rank=%s S_local=%s S_full=%s | %s: %s",
+                    tuple(query.shape), tuple(key_full.shape), tuple(val_full.shape),
+                    scale, orig_head_dim, pad_to, cp_rank, S_local, S_full,
+                    type(_flex_err).__name__, _flex_err,
+                )
+                _log.warning("CP flex_attention traceback:\n%s", traceback.format_exc())
+                _cp_sdpa._flex_err_logged = True
 
         if out is None:
             # Fallback: SDPA with explicit per-rank causal float mask.
