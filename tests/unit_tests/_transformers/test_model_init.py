@@ -14,11 +14,21 @@
 
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
+import os
 from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+import torch.nn as nn
 
 from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
+    _has_safetensors,
     _init_model,
+    _resolve_model_dir,
+    _setup_bnb_loading_kwargs,
+    _stream_load_bnb_weights,
+    _streaming_bnb_supported,
     get_hf_config,
 )
 from nemo_automodel.components.models.common.utils import BackendConfig
@@ -145,3 +155,261 @@ class TestGetHfConfigNestedKwargs:
         call_kwargs = mock_from_pretrained.call_args[1]
         assert "text_config" not in call_kwargs
         assert call_kwargs["output_hidden_states"] is True
+
+
+class TestSetupBnbLoadingKwargs:
+    """_setup_bnb_loading_kwargs sets a per-GPU device_map and disables HF async weight loading."""
+
+    def test_sets_device_map_default_when_missing(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+        monkeypatch.delenv("HF_DEACTIVATE_ASYNC_LOAD", raising=False)
+
+        kwargs: dict = {}
+        _setup_bnb_loading_kwargs(kwargs)
+
+        assert kwargs["device_map"] == {"": 3}
+        assert os.environ["HF_DEACTIVATE_ASYNC_LOAD"] == "1"
+
+    def test_respects_existing_device_map(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.delenv("HF_DEACTIVATE_ASYNC_LOAD", raising=False)
+
+        kwargs = {"device_map": "auto"}
+        _setup_bnb_loading_kwargs(kwargs)
+
+        assert kwargs["device_map"] == "auto"
+
+    def test_respects_explicit_env_var_even_when_zero(self, monkeypatch):
+        """If the user explicitly set HF_DEACTIVATE_ASYNC_LOAD=0, don't silently flip it to 1."""
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setenv("HF_DEACTIVATE_ASYNC_LOAD", "0")
+
+        _setup_bnb_loading_kwargs({})
+
+        assert os.environ["HF_DEACTIVATE_ASYNC_LOAD"] == "0"
+
+
+class TestHasSafetensors:
+    """_has_safetensors detects either a sharded index or a single safetensors file."""
+
+    def test_index_file_present(self, tmp_path):
+        (tmp_path / "model.safetensors.index.json").write_text("{}")
+        assert _has_safetensors(str(tmp_path)) is True
+
+    def test_single_safetensors_file_present(self, tmp_path):
+        (tmp_path / "model.safetensors").write_bytes(b"")
+        assert _has_safetensors(str(tmp_path)) is True
+
+    def test_neither_present(self, tmp_path):
+        (tmp_path / "pytorch_model.bin").write_bytes(b"")
+        assert _has_safetensors(str(tmp_path)) is False
+
+
+class TestResolveModelDir:
+    """_resolve_model_dir passes local dirs through and falls back to offline snapshot_download."""
+
+    def test_local_dir_passthrough(self, tmp_path):
+        assert _resolve_model_dir(str(tmp_path)) == str(tmp_path)
+
+    def test_repo_id_triggers_offline_snapshot_download(self, tmp_path):
+        with patch("nemo_automodel._transformers.model_init.snapshot_download") as mock_sd:
+            mock_sd.return_value = str(tmp_path)
+            result = _resolve_model_dir("some/repo-id")
+
+        mock_sd.assert_called_once_with("some/repo-id", local_files_only=True)
+        assert result == str(tmp_path)
+
+
+class _TinyModelOnMeta(nn.Module):
+    """Minimal module used to exercise _stream_load_bnb_weights without bnb.
+
+    Construction happens under ``with torch.device("meta")`` so all params/buffers
+    start on meta device, mirroring the skeleton produced by _init_model_bnb_streaming.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(4, 8, bias=True)
+        self.register_buffer("running_scale", torch.zeros(8))
+
+
+class _TiedHeadModel(nn.Module):
+    """Mimics HF tied-input/output-embedding layout where safetensors stores only one side."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(16, 8)
+        self.head = nn.Linear(8, 16, bias=False)
+
+    def tie_weights(self):
+        self.head.weight = self.embed.weight
+
+
+def _save_safetensors(path, tensors: dict):
+    from safetensors.torch import save_file
+
+    save_file(tensors, str(path))
+
+
+class TestStreamLoadBnbWeights:
+    """_stream_load_bnb_weights loads plain tensors, ties shared weights, and flags missing keys."""
+
+    def test_loads_plain_params_and_buffers_from_meta(self, tmp_path):
+        with torch.device("meta"):
+            model = _TinyModelOnMeta()
+
+        _save_safetensors(
+            tmp_path / "model.safetensors",
+            {
+                "lin.weight": torch.randn(8, 4),
+                "lin.bias": torch.randn(8),
+                "running_scale": torch.arange(8, dtype=torch.float32),
+            },
+        )
+
+        _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32)
+
+        assert model.lin.weight.device.type == "cpu"
+        assert model.lin.bias.device.type == "cpu"
+        assert model.running_scale.device.type == "cpu"
+        assert model.lin.weight.dtype == torch.float32
+        torch.testing.assert_close(model.running_scale, torch.arange(8, dtype=torch.float32))
+
+    def test_missing_key_raises_runtime_error(self, tmp_path):
+        with torch.device("meta"):
+            model = _TinyModelOnMeta()
+
+        # Omit "lin.bias" from the shard — it should be flagged as unmaterialized.
+        _save_safetensors(
+            tmp_path / "model.safetensors",
+            {
+                "lin.weight": torch.randn(8, 4),
+                "running_scale": torch.zeros(8),
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="lin.bias"):
+            _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32)
+
+    def test_tied_weights_pass_missing_check_after_tie(self, tmp_path):
+        """Only embed.weight is in safetensors; head.weight must be tied post-load, not raise."""
+        with torch.device("meta"):
+            model = _TiedHeadModel()
+
+        embed_weight = torch.randn(16, 8)
+        _save_safetensors(tmp_path / "model.safetensors", {"embed.weight": embed_weight})
+
+        _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32)
+
+        assert model.embed.weight.device.type == "cpu"
+        assert model.head.weight.device.type == "cpu"
+        # The whole point of the tie: both sides must share storage.
+        assert model.head.weight.data_ptr() == model.embed.weight.data_ptr()
+        torch.testing.assert_close(model.embed.weight.detach(), embed_weight)
+
+    def test_extra_safetensors_key_is_ignored(self, tmp_path):
+        with torch.device("meta"):
+            model = _TinyModelOnMeta()
+
+        _save_safetensors(
+            tmp_path / "model.safetensors",
+            {
+                "lin.weight": torch.randn(8, 4),
+                "lin.bias": torch.randn(8),
+                "running_scale": torch.zeros(8),
+                "unused_stats.mean": torch.zeros(4),  # not in the model
+            },
+        )
+
+        # Should complete without raising despite the extra key.
+        _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32)
+        assert model.lin.weight.device.type == "cpu"
+
+    def test_sharded_index_is_followed(self, tmp_path):
+        """With a safetensors.index.json, _stream_load_bnb_weights should visit each unique shard."""
+        import json
+
+        with torch.device("meta"):
+            model = _TinyModelOnMeta()
+
+        _save_safetensors(
+            tmp_path / "model-00001-of-00002.safetensors",
+            {
+                "lin.weight": torch.randn(8, 4),
+                "lin.bias": torch.randn(8),
+            },
+        )
+        _save_safetensors(
+            tmp_path / "model-00002-of-00002.safetensors",
+            {"running_scale": torch.arange(8, dtype=torch.float32)},
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {},
+                    "weight_map": {
+                        "lin.weight": "model-00001-of-00002.safetensors",
+                        "lin.bias": "model-00001-of-00002.safetensors",
+                        "running_scale": "model-00002-of-00002.safetensors",
+                    },
+                }
+            )
+        )
+
+        _stream_load_bnb_weights(model, str(tmp_path), torch.device("cpu"), torch.float32)
+
+        torch.testing.assert_close(model.running_scale, torch.arange(8, dtype=torch.float32))
+        assert model.lin.weight.device.type == "cpu"
+        assert model.lin.bias.device.type == "cpu"
+
+
+class TestStreamingBnbSupported:
+    """The streaming BnB path must skip custom Automodel classes that need a StateDictAdapter."""
+
+    def _make_cls(self, model_cls):
+        cfg_type = type("_Cfg", (), {})
+        config = cfg_type()
+
+        class _Cls:
+            _model_mapping = {cfg_type: model_cls}
+
+        return _Cls, config
+
+    def test_vanilla_hf_class_is_supported(self):
+        """A plain nn.Module (no HFCheckpointingMixin) resolves to supported."""
+        cls, config = self._make_cls(nn.Linear)  # any class not inheriting the mixin
+        assert _streaming_bnb_supported(cls, config) is True
+
+    def test_custom_automodel_class_is_unsupported(self):
+        """Classes that carry HFCheckpointingMixin rely on state_dict_adapter; skip streaming."""
+        from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+        class FakeCustomModel(HFCheckpointingMixin, nn.Module):
+            pass
+
+        cls, config = self._make_cls(FakeCustomModel)
+        assert _streaming_bnb_supported(cls, config) is False
+
+    def test_unknown_config_is_unsupported(self):
+        """Missing entry in _model_mapping → unsupported (caller falls back to HF)."""
+        cfg_type = type("_Cfg", (), {})
+
+        class _Cls:
+            _model_mapping: dict = {}
+
+        assert _streaming_bnb_supported(_Cls, cfg_type()) is False
+
+    def test_model_with_hf_conversion_mapping_is_unsupported(self):
+        """HF conversion rules (Mixtral, Qwen MoE, …) reshape legacy safetensors at load
+        time. The streaming path can't replay those ops, so it must opt out."""
+        cfg_type = type("_Cfg", (), {"model_type": "mixtral"})
+        cls, config = self._make_cls(nn.Linear)
+        cls._model_mapping = {cfg_type: nn.Linear}
+        assert _streaming_bnb_supported(cls, cfg_type()) is False
+
+    def test_model_without_hf_conversion_mapping_is_supported(self):
+        """Plain dense models (no MoE reshape, no mixin) should still use streaming."""
+        cfg_type = type("_Cfg", (), {"model_type": "llama"})
+        cls, config = self._make_cls(nn.Linear)
+        cls._model_mapping = {cfg_type: nn.Linear}
+        assert _streaming_bnb_supported(cls, cfg_type()) is True
