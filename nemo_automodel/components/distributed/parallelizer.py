@@ -894,6 +894,10 @@ def get_hf_tp_shard_plan(model):
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
 
+    elif model_cls == Qwen3_5ForConditionalGeneration:
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+
     else:
         inner_model = model.model
         model_prefix = "model"
@@ -945,7 +949,13 @@ def get_hf_tp_shard_plan(model):
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            translated_plan[k] = translate_to_torch_parallel_style(v)
+            style = translate_to_torch_parallel_style(v)
+            # Translator returns None for styles that should be skipped (e.g.
+            # "replicated_with_grad_allreduce" under FSDP where leaving the
+            # param un-wrapped is equivalent).
+            if style is None:
+                continue
+            translated_plan[k] = style
 
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
@@ -1006,6 +1016,13 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
         return SequenceParallel()
+    elif style == "replicated_with_grad_allreduce":
+        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
+        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
+        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
+        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
+        # the TP mesh, no TP-level collective is needed in forward.
+        return None
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 

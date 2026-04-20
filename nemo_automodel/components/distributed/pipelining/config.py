@@ -73,6 +73,10 @@ class PipelineConfig:
         patch_stage_backward_maybe_with_nosync (bool): Patch stage backward to
             use no_sync context for gradient accumulation efficiency. Useful
             when combining PP with FSDP.
+        reduce_grad_per_microbatch (bool): Reduce-scatter grads every microbatch
+            instead of accumulating full-size grads and reducing once. Saves
+            ~stage_trainable * 2 bytes per rank at the cost of N extra
+            reduce-scatters per step. Requires PP; auto-enables the patch.
         dtype (Optional[torch.dtype]): Data type for pipeline computation.
             If None, uses the model's default dtype.
         scale_grads_in_schedule (bool): Scale gradients within the pipeline
@@ -95,6 +99,7 @@ class PipelineConfig:
     patch_inner_model: bool = True
     patch_causal_lm_model: bool = True
     patch_stage_backward_maybe_with_nosync: bool = False
+    reduce_grad_per_microbatch: bool = False
     dtype: Optional[torch.dtype] = None
     scale_grads_in_schedule: bool = False
     loss_fn: Optional[Callable] = None
@@ -113,6 +118,7 @@ class PipelineConfig:
             "patch_inner_model": self.patch_inner_model,
             "patch_causal_lm_model": self.patch_causal_lm_model,
             "patch_stage_backward_maybe_with_nosync": self.patch_stage_backward_maybe_with_nosync,
+            "reduce_grad_per_microbatch": self.reduce_grad_per_microbatch,
             "dtype": self.dtype,
             "scale_grads_in_schedule": self.scale_grads_in_schedule,
             "loss_fn": self.loss_fn,

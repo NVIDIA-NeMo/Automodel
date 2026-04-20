@@ -40,6 +40,7 @@ from transformers.models.phi.modeling_phi import PhiForCausalLM
 from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
@@ -581,12 +582,28 @@ def _get_class_qualname(cls: type) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+def _parallelize_qwen3_5_vlm(
+    model: "Qwen3_5ForConditionalGeneration",
+    sequence_parallel: bool = False,
+) -> Dict[str, ParallelStyle]:
+    """Parallelize Qwen3.5 VLM by reusing transformers' base_model_tp_plan.
+
+    Qwen3.5 has mixed attention: full self_attn (every 4th layer) + linear_attn
+    (GatedDeltaNet). The transformers-provided base_model_tp_plan covers only
+    self_attn + MLP — linear_attn is not TP-shardable with stock kernels.
+    """
+    from nemo_automodel.components.distributed.parallelizer import get_hf_tp_shard_plan
+
+    return get_hf_tp_shard_plan(model)
+
+
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
     _get_class_qualname(Qwen2ForCausalLM): _parallelize_qwen,
     _get_class_qualname(Qwen3ForCausalLM): _parallelize_qwen,
     _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
+    _get_class_qualname(Qwen3_5ForConditionalGeneration): _parallelize_qwen3_5_vlm,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
