@@ -196,17 +196,24 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         val_full = _all_gather_seq(value)  # [B, nH, S_full, D]
         S_full = key_full.shape[2]
 
-        # Use is_causal=True so Flash Attention can handle the non-square Q/K without
-        # materialising the full attention-weight matrix (avoids OOM for long sequences).
-        # Flash applies a lower-right causal mask: Q[i] attends to K[j] for
-        # j <= S_full - S_local + i.  For sequential CP split this is correct only for
-        # the last rank; earlier ranks see a slightly wider attention window (up to
-        # S_local extra tokens).  This is acceptable for a smoke-test; a full
-        # correctness run requires load-balanced split or per-rank explicit masking.
-        # Prefer Efficient Attention (O(n) memory, handles any head_dim including
-        # non-power-of-2 like Gemma4's 168/192).  Flash is tried first but rejects
-        # non-standard head dims; Efficient is the correct fallback.  MATH is last
-        # resort and OOMs for long sequences because it materialises the full matrix.
+        # Pad head_dim to the nearest power of 2 so Flash Attention accepts it.
+        # Models like Gemma4 26B-A4B and 31B use non-power-of-2 head_dim (e.g. 168)
+        # which Flash rejects, causing fallback to MATH backend that materialises the
+        # full [B, nKVH, S_local, S_full] float32 attention matrix and OOMs on long
+        # sequences.  Padding to the next power of 2 (e.g. 256) forces Flash; we pass
+        # the original scale so attention scores are unaffected by the padded zeros.
+        orig_head_dim = query.shape[-1]
+        pad_to = 1 << (orig_head_dim - 1).bit_length()  # next power of 2
+        if pad_to != orig_head_dim:
+            import torch.nn.functional as _F
+            import math as _math
+            pad_len = pad_to - orig_head_dim
+            query    = _F.pad(query,    (0, pad_len))
+            key_full = _F.pad(key_full, (0, pad_len))
+            val_full = _F.pad(val_full, (0, pad_len))
+            if scale is None:
+                scale = 1.0 / _math.sqrt(orig_head_dim)
+
         from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
         _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
         try:
@@ -215,7 +222,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             pass
         _backends.append(SDPBackend.MATH)
         with _sdpa_kernel(_backends):
-            return _original_sdpa(
+            out = _original_sdpa(
                 query, key_full, val_full,
                 attn_mask=None,
                 dropout_p=dropout_p,
@@ -224,6 +231,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 enable_gqa=enable_gqa,
                 **kwargs,
             )
+
+        if pad_to != orig_head_dim:
+            out = out[..., :orig_head_dim]
+        return out
 
     def _pre_hook(module, args, kwargs):
         F_module.scaled_dot_product_attention = _cp_sdpa
