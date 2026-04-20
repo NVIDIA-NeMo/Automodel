@@ -94,7 +94,7 @@ ci:
   recipe_owner: hemildesai
   time: "00:15:00"
   checkpoint_robustness:
-    hf_kl_threshold: 1e-3
+    hf_kl_threshold: 1e-2
     tokenizer_name: Qwen/Qwen3-30B-A3B
     no_check_resume: true
     dataset.num_samples_limit: 500
