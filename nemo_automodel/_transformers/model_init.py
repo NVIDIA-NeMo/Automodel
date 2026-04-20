@@ -399,11 +399,16 @@ def _streaming_bnb_supported(cls, hf_config) -> bool:
     """Whether streaming BnB can safely load HF safetensors directly into the target class.
 
     The streaming loader maps safetensors keys 1:1 onto ``model.named_parameters()``.
-    Automodel's custom implementations often fuse projections (e.g. MoE
-    ``mlp.experts.gate_up_proj``) and rely on a ``state_dict_adapter`` to translate
-    HF-style keys on load — that translation is skipped by the streaming path, which
-    would leave fused params unmaterialized.  Detect those classes via the
-    ``HFCheckpointingMixin`` marker in the MRO and opt out.
+    Two cases break that 1:1 assumption and must fall back to the standard HF loader:
+
+    1. Automodel's custom implementations fuse projections (e.g. MoE
+       ``mlp.experts.gate_up_proj``) and rely on a ``state_dict_adapter`` to translate
+       HF-style keys on load. Detected via the ``HFCheckpointingMixin`` marker.
+    2. Vanilla HF classes whose safetensors use a legacy layout that HF's loader
+       reshapes/renames at load time (e.g. Mixtral ``block_sparse_moe.experts.*.w1`` →
+       fused ``mlp.experts.gate_up_proj``). Detected via HF's per-model-type
+       ``get_checkpoint_conversion_mapping`` — any non-empty mapping means the streaming
+       path would leave fused tensors on meta device.
     """
     try:
         model_cls = cls._model_mapping[type(hf_config)]
@@ -411,9 +416,19 @@ def _streaming_bnb_supported(cls, hf_config) -> bool:
         return False
     try:
         from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+        if issubclass(model_cls, HFCheckpointingMixin):
+            return False
+    except ImportError:
+        pass
+    try:
+        from transformers.conversion_mapping import get_checkpoint_conversion_mapping
     except ImportError:
         return True
-    return not issubclass(model_cls, HFCheckpointingMixin)
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type and get_checkpoint_conversion_mapping(model_type):
+        return False
+    return True
 
 
 def _init_model_bnb_streaming(

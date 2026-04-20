@@ -398,3 +398,18 @@ class TestStreamingBnbSupported:
             _model_mapping: dict = {}
 
         assert _streaming_bnb_supported(_Cls, cfg_type()) is False
+
+    def test_model_with_hf_conversion_mapping_is_unsupported(self):
+        """HF conversion rules (Mixtral, Qwen MoE, …) reshape legacy safetensors at load
+        time. The streaming path can't replay those ops, so it must opt out."""
+        cfg_type = type("_Cfg", (), {"model_type": "mixtral"})
+        cls, config = self._make_cls(nn.Linear)
+        cls._model_mapping = {cfg_type: nn.Linear}
+        assert _streaming_bnb_supported(cls, cfg_type()) is False
+
+    def test_model_without_hf_conversion_mapping_is_supported(self):
+        """Plain dense models (no MoE reshape, no mixin) should still use streaming."""
+        cfg_type = type("_Cfg", (), {"model_type": "llama"})
+        cls, config = self._make_cls(nn.Linear)
+        cls._model_mapping = {cfg_type: nn.Linear}
+        assert _streaming_bnb_supported(cls, cfg_type()) is True
