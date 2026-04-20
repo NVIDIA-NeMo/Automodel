@@ -284,6 +284,28 @@ def make_cp_batch_and_ctx(
 
     labels = batch["labels"]
 
+    # PyTorch CP load balancer requires seq_length % (cp_size * 2) == 0.
+    # The autoregressive shift in pad_collate_fn reduces seq_length by 1, so
+    # a max_length that is a power-of-2 (e.g. 8192) becomes 8191 which may
+    # not satisfy the constraint.  Pad to the next valid multiple here so the
+    # caller does not need to worry about alignment.
+    _cp_size = cp_mesh.size()
+    _required = _cp_size * 2
+    _pad_len = (-input_ids.shape[1]) % _required
+    if _pad_len:
+        import torch.nn.functional as _F
+        input_ids = _F.pad(input_ids, (0, _pad_len), value=0)
+        batch["input_ids"] = input_ids
+        labels = _F.pad(labels, (0, _pad_len), value=-100)
+        batch["labels"] = labels
+        if pos_seq_dim == 1:
+            _extra = position_ids[:, -1:] + torch.arange(1, _pad_len + 1, device=position_ids.device)
+            position_ids = torch.cat([position_ids, _extra], dim=1)
+        else:
+            _extra = position_ids[:, :, -1:] + torch.arange(1, _pad_len + 1, device=position_ids.device).view(1, 1, -1)
+            position_ids = torch.cat([position_ids, _extra], dim=2)
+        batch["position_ids"] = position_ids
+
     # Collect all available tensors for context parallel
     cp_buffers = [input_ids, labels, position_ids]
     cp_seq_dims = [1, 1, pos_seq_dim]
