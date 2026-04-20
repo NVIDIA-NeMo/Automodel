@@ -219,6 +219,21 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         if query.shape[1] != key_full.shape[1]:
             enable_gqa = True
 
+        # Build an explicit per-rank causal float mask instead of is_causal=True.
+        # is_causal=True with S_q != S_kv is rejected by Flash Attention in many PyTorch
+        # versions, causing fallback to MATH which OOMs.  The explicit mask is also
+        # correct for all CP ranks: rank r holds global tokens [r*S_local, (r+1)*S_local),
+        # so token q_i can attend to any key k where k <= r*S_local + q_i.
+        query = query.contiguous()
+        q_offset = cp_rank * S_local
+        q_idx = torch.arange(S_local, device=query.device) + q_offset  # [S_local]
+        k_idx = torch.arange(S_full, device=query.device)               # [S_full]
+        bool_mask = q_idx.unsqueeze(1) >= k_idx.unsqueeze(0)            # [S_local, S_full]
+        cp_causal_mask = torch.zeros(
+            1, 1, S_local, S_full, dtype=query.dtype, device=query.device
+        )
+        cp_causal_mask.masked_fill_(~bool_mask, float("-inf"))
+
         from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
         _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
         try:
@@ -229,9 +244,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         with _sdpa_kernel(_backends):
             out = _original_sdpa(
                 query, key_full, val_full,
-                attn_mask=None,
+                attn_mask=cp_causal_mask,
                 dropout_p=dropout_p,
-                is_causal=True,
+                is_causal=False,
                 scale=scale,
                 enable_gqa=enable_gqa,
                 **kwargs,
