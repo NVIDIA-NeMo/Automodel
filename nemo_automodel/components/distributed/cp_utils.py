@@ -54,9 +54,18 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
             if cp_context is not None:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-                # currently we only support these two SDP backends.
-                # SDPBackend.MATH is not currently compatible with DTensor
-                stack.enter_context(sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]))
+                # Prefer Flash/Efficient for performance; fall back to cuDNN (supports
+                # non-power-of-2 head dims such as Gemma's 144/256) and finally MATH.
+                # SDPBackend.MATH works here because inside the CP allgather wrapper
+                # the tensors passed to the actual SDPA call are local plain tensors,
+                # not DTensors.
+                _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+                try:
+                    _backends.append(SDPBackend.CUDNN_ATTENTION)
+                except AttributeError:
+                    pass
+                _backends.append(SDPBackend.MATH)
+                stack.enter_context(sdpa_kernel(_backends))
                 stack.enter_context(cp_context)
 
             yield
