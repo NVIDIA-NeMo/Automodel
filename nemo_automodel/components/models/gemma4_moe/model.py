@@ -616,6 +616,23 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                         )
             except ImportError:
                 pass
+
+            # HF's create_causal_mask_mapping raises ValueError when mm_token_type_ids
+            # is None during training.  Synthesize all-zeros (= no image tokens =
+            # standard causal mask) when the caller did not provide one (text-only
+            # data) or when we nulled it above for CP consistency.
+            if _mm_token_type_ids is None:
+                _ref = input_ids if input_ids is not None else inputs_embeds
+                try:
+                    from torch.distributed.tensor import DTensor
+
+                    if isinstance(_ref, DTensor):
+                        _ref = _ref.to_local()
+                except ImportError:
+                    pass
+                _seq_shape = _ref.shape if _ref.dim() == 2 else _ref.shape[:2]
+                _mm_token_type_ids = torch.zeros(_seq_shape, dtype=torch.long, device=_ref.device)
+
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
