@@ -271,6 +271,25 @@ def make_cp_batch_and_ctx(
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
+    # Under CP the sequence dimension is scattered to local shards via
+    # context_parallel (plain tensors, not DTensors).  Vision keys such as
+    # pixel_values remain un-sharded and full-size on every rank, but the
+    # image-token positions in input_ids only live on one shard, causing HF's
+    # "image features and image tokens do not match" check to fail on other
+    # ranks.  Remove all vision keys here; correct VLM+CP support requires
+    # pre-computing inputs_embeds (with image features merged) before CP
+    # sharding and passing inputs_embeds instead.
+    for _vk in (
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "image_position_ids",
+        "mm_token_type_ids",
+        "n_images_per_sample",
+    ):
+        batch.pop(_vk, None)
+
     # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
         batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
