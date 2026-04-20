@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning LLaVA-OneVision-1.5 4B with LLaVA-Instruct-150K
+# Full fine-tune of LLaVA-OneVision-1.5-4B-Instruct on the RDR image-description dataset.
 #
 # To run this recipe:
 #   automodel examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 4
-  max_steps: 1000
-  ckpt_every_steps: 500
-  val_every_steps: 500
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 50
+  num_epochs: 3
 
 dist_env:
   backend: nccl
@@ -40,6 +39,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: lmms-lab/LLaVA-OneVision-1.5-4B-Instruct
   attn_implementation: flash_attention_2
+  # The hub config.json carries an auto_map for the remote reference impl;
+  # NeMo routes to its own custom class via config.architectures[0], but HF's
+  # AutoConfig still demands trust_remote_code=True when auto_map is present.
+  trust_remote_code: true
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
@@ -48,7 +51,7 @@ processor:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: vlm_checkpoints/llava_ov_4b/
+  checkpoint_dir: checkpoints/
   model_save_format: torch_save
 
 distributed:
@@ -62,13 +65,13 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_llava_onevision_dataset
-  path_or_dataset: liuhaotian/LLaVA-Instruct-150K
-  split: train[:1000]
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_rdr_dataset
+  path_or_dataset: quintend/rdr-items
+  split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.llava_onevision_collate_fn
@@ -91,4 +94,4 @@ freeze_config:
 #   save_dir:
 
 ci:
-  recipe_owner: <owner>
+  recipe_owner: akoumpa
