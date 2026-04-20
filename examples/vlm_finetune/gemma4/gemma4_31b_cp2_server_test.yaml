@@ -1,0 +1,100 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Server-side CP=2 correctness test for Gemma4 31B dense, text-only mock data.
+# Topology: CP2 x DP4 = 8 GPUs.
+#
+# WARNING: 31B with CP=2 is memory-intensive on 8x A100-80GB.
+# FSDP shards over DP=4 only (not CP), so each GPU holds ~2x more parameters
+# than the CP=1 / DP=8 baseline.  If you hit OOM, switch to gemma4_4b_cp2_mock.yaml.
+#
+# Loss parity check (run both, compare step losses):
+#   CP=1:  torchrun --nproc-per-node=8 ... --distributed.cp_size 1
+#   CP=2:  torchrun --nproc-per-node=8 ... --distributed.cp_size 2
+#
+# torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py \
+#   -c examples/vlm_finetune/gemma4/gemma4_31b_cp2_server_test.yaml
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 9999
+  val_every_steps: 9999
+  max_steps: 10
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-31B-it
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  attn_implementation: sdpa
+  text_config:
+    use_cache: false
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 2
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Text-only mock dataset — no pixel_values, so CP image-token insertion
+# limitation does not apply. 8k sequence length to exercise the CP path.
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 100
+  num_images_per_sample: 0
+  max_length: 8192
+  seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
