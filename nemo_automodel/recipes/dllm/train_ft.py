@@ -338,7 +338,11 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             norm_type=2.0,
             pp_enabled=self.pp_enabled,
             device_mesh=self.device_mesh,
-            ep_axis_name="ep" if getattr(self, 'dist_setup', None) is not None and self.dist_setup.moe_mesh is not None and "ep" in self.dist_setup.moe_mesh.mesh_dim_names else None,
+            ep_axis_name="ep"
+            if getattr(self, "dist_setup", None) is not None
+            and self.dist_setup.moe_mesh is not None
+            and "ep" in self.dist_setup.moe_mesh.mesh_dim_names
+            else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
             num_label_tokens=num_diffusion_tokens,

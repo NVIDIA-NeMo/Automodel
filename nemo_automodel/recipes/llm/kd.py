@@ -637,7 +637,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             norm_type=2.0,
             pp_enabled=True,
             device_mesh=self.device_mesh,
-            ep_axis_name="ep" if getattr(self, 'dist_setup', None) is not None and self.dist_setup.moe_mesh is not None and "ep" in self.dist_setup.moe_mesh.mesh_dim_names else None,
+            ep_axis_name="ep"
+            if getattr(self, "dist_setup", None) is not None
+            and self.dist_setup.moe_mesh is not None
+            and "ep" in self.dist_setup.moe_mesh.mesh_dim_names
+            else None,
             pp_axis_name="pp",
             foreach=True,
             num_label_tokens=num_label_tokens,

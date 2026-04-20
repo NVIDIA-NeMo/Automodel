@@ -213,6 +213,7 @@ class MeshContext:
             device_mesh=device_mesh,
         )
 
+
 def _derive_moe_mesh(device_mesh: "DeviceMesh") -> "Optional[DeviceMesh]":
     """Derive the MoE EP mesh from device_mesh when EP dims are present."""
     if device_mesh is None:
@@ -224,7 +225,8 @@ def _derive_moe_mesh(device_mesh: "DeviceMesh") -> "Optional[DeviceMesh]":
     if MeshAxisName.EP in getattr(device_mesh, "mesh_dim_names", ()):
         return device_mesh
     return None
-    
+
+
 # misc utils
 def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> Optional[int]:
     """Return the size of *axis* if present in *mesh*, else *default*."""
@@ -240,7 +242,6 @@ def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) 
     if hasattr(root, "_flatten_mapping") and axis in root._flatten_mapping:
         return root._flatten_mapping[axis].size()
     return default
-
 
 
 def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> Optional[str]:
