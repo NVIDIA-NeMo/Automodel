@@ -920,6 +920,31 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
+        # When CP is active, pre-compute inputs_embeds (text embed + image
+        # feature merge) on the full unsharded sequence before CP scatters
+        # input_ids to local shards.  Without this, image-token positions land
+        # on only one CP rank while pixel_values stays full-size on all ranks,
+        # causing HF's token-count check to fail.
+        _cp_mesh = self.device_mesh["cp"] if (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", {})
+        ) else None
+        _cp_active = _cp_mesh is not None and _cp_mesh.size() > 1
+        if _cp_active and "pixel_values" in batch:
+            _model = self.model_parts[0]
+            if hasattr(_model, "prepare_inputs_embeds_for_cp"):
+                _input_ids = batch.pop("input_ids")
+                _pixel_values = batch.pop("pixel_values", None)
+                _image_position_ids = batch.pop("image_position_ids", None)
+                _mm_token_type_ids = batch.pop("mm_token_type_ids", None)
+                batch.pop("pixel_values_videos", None)
+                batch.pop("image_grid_thw", None)
+                batch.pop("video_grid_thw", None)
+                batch.pop("n_images_per_sample", None)
+                batch["inputs_embeds"] = _model.prepare_inputs_embeds_for_cp(
+                    _input_ids, _pixel_values, _image_position_ids, _mm_token_type_ids
+                )
+
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
