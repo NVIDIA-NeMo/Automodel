@@ -453,8 +453,8 @@ def build_dataloader(
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
 
-                collate_fn = (
-                    lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: neat_packed_vlm_collater(
+                collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: (
+                    neat_packed_vlm_collater(
                         examples,
                         padding_idx=_pi,
                         max_length=_ml,
