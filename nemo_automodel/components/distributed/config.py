@@ -105,7 +105,7 @@ class FSDP2Config:
     offload_policy: Optional[CPUOffloadPolicy] = None
     autocast_dtype: Optional[torch.dtype] = None
     activation_checkpointing: bool = False
-    defer_fsdp_grad_sync: bool = False
+    defer_fsdp_grad_sync: bool = True
     backend: str = "nccl"
     enable_async_tensor_parallel: bool = False
     enable_compile: bool = False
