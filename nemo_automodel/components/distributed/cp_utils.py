@@ -203,15 +203,27 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         # the last rank; earlier ranks see a slightly wider attention window (up to
         # S_local extra tokens).  This is acceptable for a smoke-test; a full
         # correctness run requires load-balanced split or per-rank explicit masking.
-        return _original_sdpa(
-            query, key_full, val_full,
-            attn_mask=None,
-            dropout_p=dropout_p,
-            is_causal=True,
-            scale=scale,
-            enable_gqa=enable_gqa,
-            **kwargs,
-        )
+        # Prefer Efficient Attention (O(n) memory, handles any head_dim including
+        # non-power-of-2 like Gemma4's 168/192).  Flash is tried first but rejects
+        # non-standard head dims; Efficient is the correct fallback.  MATH is last
+        # resort and OOMs for long sequences because it materialises the full matrix.
+        from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
+        _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+        try:
+            _backends.append(SDPBackend.CUDNN_ATTENTION)
+        except AttributeError:
+            pass
+        _backends.append(SDPBackend.MATH)
+        with _sdpa_kernel(_backends):
+            return _original_sdpa(
+                query, key_full, val_full,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                **kwargs,
+            )
 
     def _pre_hook(module, args, kwargs):
         F_module.scaled_dot_product_attention = _cp_sdpa

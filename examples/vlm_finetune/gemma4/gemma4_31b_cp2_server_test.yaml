@@ -78,7 +78,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
   num_samples: 100
   num_images_per_sample: 0
-  max_length: 8192
+  max_length: 2048
   seed: 42
 
 dataloader:
