@@ -257,11 +257,15 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 Q_LEN=S_local, KV_LEN=S_full,
                 device=query.device,
             )
-            # flex_attention handles GQA automatically from tensor shapes.
+            # flex_attention requires enable_gqa=True when Q and KV head counts
+            # differ (e.g. Gemma4 31B: 32 Q heads, 16 KV heads).  Our _cp_sdpa
+            # already sets this flag above for the SDPA fallback; pass the same
+            # value through here.
             out = _get_compiled_flex_attn()(
                 query, key_full, val_full,
                 block_mask=_block_mask,
                 scale=scale,
+                enable_gqa=enable_gqa,
             )
         except Exception as _flex_err:
             # Surface the failure once per process so we know *why* we fell back
