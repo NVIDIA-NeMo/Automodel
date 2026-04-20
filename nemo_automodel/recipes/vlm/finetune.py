@@ -933,6 +933,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if _cp_active and "pixel_values" in batch:
             _model = self.model_parts[0]
             if hasattr(_model, "prepare_inputs_embeds_for_cp"):
+                # Call through model.__call__ so FSDP2 pre-forward hook fires and
+                # all-gathers sharded parameters (embed_tokens weight) to Replicate
+                # placement before the embedding lookup.  Calling the method directly
+                # bypasses the hook and causes a mixed DTensor/plain-tensor error.
                 _input_ids = batch.pop("input_ids")
                 _pixel_values = batch.pop("pixel_values", None)
                 _image_position_ids = batch.pop("image_position_ids", None)
@@ -941,8 +945,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch.pop("image_grid_thw", None)
                 batch.pop("video_grid_thw", None)
                 batch.pop("n_images_per_sample", None)
-                batch["inputs_embeds"] = _model.prepare_inputs_embeds_for_cp(
-                    _input_ids, _pixel_values, _image_position_ids, _mm_token_type_ids
+                batch["inputs_embeds"] = _model(
+                    input_ids=_input_ids,
+                    pixel_values=_pixel_values,
+                    image_position_ids=_image_position_ids,
+                    mm_token_type_ids=_mm_token_type_ids,
+                    _pre_embed_only=True,
                 )
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)

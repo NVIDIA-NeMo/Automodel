@@ -565,8 +565,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        _pre_embed_only: bool = False,
         **kwargs: Any,
     ):
+        if _pre_embed_only:
+            return self.prepare_inputs_embeds_for_cp(
+                input_ids, pixel_values, image_position_ids, mm_token_type_ids
+            )
+
         if cache_position is None:
             if input_ids is not None:
                 seq_len = input_ids.shape[-1]
