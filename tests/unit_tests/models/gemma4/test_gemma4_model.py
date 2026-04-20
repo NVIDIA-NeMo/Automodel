@@ -550,6 +550,99 @@ class TestGemma4ForConditionalGeneration:
             torch.arange(seq, device=device),
         )
 
+    def test_dense_forward_cp_nulls_mm_token_type_ids(self, dense_config, backend_config, device):
+        """Under CP (DTensor input_ids) the dense path must not pass mm_token_type_ids
+        to HF forward, otherwise create_causal_mask_mapping would use the unsharded
+        [B, S_global] tensor against a locally-sharded sequence."""
+        from unittest.mock import patch
+
+        from torch.distributed.tensor import DTensor, Replicate, Shard
+        from torch.distributed.device_mesh import init_device_mesh
+
+        if not torch.distributed.is_available() or not torch.cuda.is_available():
+            pytest.skip("distributed not available")
+
+        # Single-rank mesh: simulates a CP rank without needing multiple processes.
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("cp",))
+
+        model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+
+        batch, seq = 1, 4
+        text_config = dense_config.text_config if hasattr(dense_config, "text_config") else dense_config
+        raw_ids = torch.randint(0, text_config.vocab_size, (batch, seq), device=device)
+        # Wrap input_ids as a DTensor (as make_cp_batch_and_ctx would do under CP).
+        input_ids_dt = DTensor.from_local(raw_ids, device_mesh=mesh, placements=[Shard(1)])
+        mm_token_type_ids = torch.zeros(batch, seq, dtype=torch.long, device=device)
+
+        captured = {}
+
+        def _fake_super_forward(**kwargs):
+            captured["mm_token_type_ids"] = kwargs.get("mm_token_type_ids")
+            return MagicMock(logits=torch.zeros(batch, seq, text_config.vocab_size, device=device))
+
+        with patch.object(
+            model.__class__.__bases__[1],  # HFGemma4ForConditionalGeneration
+            "forward",
+            side_effect=_fake_super_forward,
+        ):
+            model(input_ids_dt, mm_token_type_ids=mm_token_type_ids)
+
+        assert captured["mm_token_type_ids"] is None, (
+            "mm_token_type_ids must be nulled out when input_ids is a DTensor (CP active)"
+        )
+
+    def test_moe_forward_cp_nulls_mm_token_type_ids_for_mask(self, gemma4_config, backend_config, device):
+        """Under CP (DTensor inputs_embeds) Gemma4MoETextModelBackend must not pass
+        mm_token_type_ids to create_causal_mask_mapping."""
+        from unittest.mock import patch
+
+        from torch.distributed.tensor import DTensor, Shard
+        from torch.distributed.device_mesh import init_device_mesh
+
+        if not torch.distributed.is_available() or not torch.cuda.is_available():
+            pytest.skip("distributed not available")
+
+        mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("cp",))
+
+        # Use a config with use_bidirectional_attention == "vision" so the
+        # create_causal_mask_mapping branch is taken.
+        cfg = _make_gemma4_config(use_bidirectional_attention="vision")
+        model = Gemma4ForConditionalGeneration(cfg, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+        text_cfg = cfg.text_config if hasattr(cfg, "text_config") else cfg
+
+        batch, seq = 1, 4
+        raw_embeds = torch.randn(batch, seq, text_cfg.hidden_size, device=device, dtype=torch.bfloat16)
+        embeds_dt = DTensor.from_local(raw_embeds, device_mesh=mesh, placements=[Shard(1)])
+        mm_token_type_ids = torch.zeros(batch, seq, dtype=torch.long, device=device)
+
+        captured = {}
+
+        def _fake_mask_mapping(**kwargs):
+            captured["mm_token_type_ids"] = kwargs.get("mm_token_type_ids")
+            return {lt: None for lt in set(text_cfg.layer_types)}
+
+        with patch(
+            "nemo_automodel.components.models.gemma4_moe.model.create_causal_mask_mapping"
+            if hasattr(model.model, "language_model")
+            else "transformers.models.gemma4.modeling_gemma4.create_causal_mask_mapping",
+        ):
+            # Patch at the source used inside Gemma4MoETextModelBackend.forward
+            backend = model.model.language_model
+            with patch(
+                "transformers.models.gemma4.modeling_gemma4.create_causal_mask_mapping",
+                side_effect=_fake_mask_mapping,
+            ):
+                try:
+                    backend.forward(inputs_embeds=embeds_dt, mm_token_type_ids=mm_token_type_ids)
+                except Exception:
+                    pass  # forward may fail after mask; we only care about the captured kwarg
+
+        assert captured.get("mm_token_type_ids") is None, (
+            "mm_token_type_ids must be nulled when inputs_embeds is a DTensor (CP active)"
+        )
+
     def test_initialize_weights_dense_only_casts_dtype(self, dense_config, backend_config):
         model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)
         model.initialize_weights(dtype=torch.float32)

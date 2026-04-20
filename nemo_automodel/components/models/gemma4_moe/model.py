@@ -365,6 +365,24 @@ class Gemma4MoETextModelBackend(nn.Module):
         # build a vision-aware mask where tokens inside the same vision group
         # attend to each other bidirectionally (not just causally). Missing this
         # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+        #
+        # Under context parallelism inputs_embeds is a DTensor with the sequence
+        # dimension sharded across CP ranks.  mm_token_type_ids is NOT sharded
+        # (shape [B, S_global]), so passing it to create_causal_mask_mapping would
+        # produce a bidirectional mask that is inconsistent across ranks.  We null
+        # it out to force a standard causal mask; the self_attn forward pre-hook
+        # (registered by attach_context_parallel_hooks in infrastructure.py) will
+        # strip that mask and set is_causal=True so SDPA uses the DTensor
+        # ring-attention path.
+        _mm_token_type_ids_for_mask = mm_token_type_ids
+        try:
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(inputs_embeds, DTensor):
+                _mm_token_type_ids_for_mask = None
+        except ImportError:
+            pass
+
         if getattr(self.config, "use_bidirectional_attention", None) == "vision":
             from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
 
@@ -374,7 +392,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
+                mm_token_type_ids=_mm_token_type_ids_for_mask,
                 pixel_values=pixel_values,
                 is_training=self.training,
             )
@@ -555,7 +573,39 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            # Dense path — delegate to HF forward
+            # Dense path — delegate to HF forward.
+            # Under context parallelism the sequence dimension of input_ids is
+            # sharded as a DTensor.  Two CP-specific adjustments are needed:
+            #
+            # 1. mm_token_type_ids: HF's create_causal_mask_mapping uses this
+            #    (shape [B, S_global]) to build a bidirectional vision mask, but
+            #    hidden_states only covers the local S/cp shard, making the mask
+            #    inconsistent across ranks.  Nulling it forces a standard causal
+            #    mask; the self_attn hook set is_causal=True for SDPA.
+            #
+            # 2. pixel_values: HF will call masked_scatter to insert image
+            #    features into the DTensor inputs_embeds.  After CP sharding each
+            #    rank holds a different slice of the sequence, so the number of
+            #    image-token slots per rank is unknown at this point and
+            #    masked_scatter cannot redistribute image features correctly.
+            #    CP with pixel_values is not yet supported for the dense path;
+            #    pre-compute inputs_embeds before CP sharding at the recipe level.
+            _mm_token_type_ids = mm_token_type_ids
+            try:
+                from torch.distributed.tensor import DTensor
+
+                _under_cp = isinstance(input_ids, DTensor) or isinstance(inputs_embeds, DTensor)
+                if _under_cp:
+                    _mm_token_type_ids = None
+                    if pixel_values is not None:
+                        raise NotImplementedError(
+                            "Context parallelism with pixel_values is not yet supported for the "
+                            "dense Gemma4 path.  Pre-compute inputs_embeds (with image features "
+                            "merged) before CP sharding and pass inputs_embeds instead of "
+                            "input_ids + pixel_values."
+                        )
+            except ImportError:
+                pass
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -564,7 +614,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 cache_position=cache_position,
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
-                mm_token_type_ids=mm_token_type_ids,
+                mm_token_type_ids=_mm_token_type_ids,
                 **kwargs,
             )
 
@@ -572,7 +622,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if input_ids is not None and inputs_embeds is None:
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
 
-        # Handle vision tokens
+        # Handle vision tokens.
+        # Under CP inputs_embeds is a sequence-sharded DTensor.  masked_scatter
+        # cannot correctly redistribute image features across ranks because each
+        # rank's shard may contain a different number of image-token slots.
+        # Raise early rather than producing silently wrong embeddings.
         if pixel_values is not None:
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
@@ -586,6 +640,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             else:
                 special_image_mask = torch.zeros(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
 
+            try:
+                from torch.distributed.tensor import DTensor
+
+                if isinstance(inputs_embeds, DTensor):
+                    raise NotImplementedError(
+                        "Context parallelism with pixel_values is not yet supported for the "
+                        "MoE Gemma4 path.  Pre-compute inputs_embeds (with image features "
+                        "merged) before CP sharding and pass inputs_embeds instead of "
+                        "input_ids + pixel_values."
+                    )
+            except ImportError:
+                pass
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
