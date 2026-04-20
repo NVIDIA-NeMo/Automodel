@@ -945,13 +945,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch.pop("image_grid_thw", None)
                 batch.pop("video_grid_thw", None)
                 batch.pop("n_images_per_sample", None)
-                batch["inputs_embeds"] = _model(
-                    input_ids=_input_ids,
-                    pixel_values=_pixel_values,
-                    image_position_ids=_image_position_ids,
-                    mm_token_type_ids=_mm_token_type_ids,
-                    _pre_embed_only=True,
-                )
+                with torch.no_grad():
+                    batch["inputs_embeds"] = _model(
+                        input_ids=_input_ids,
+                        pixel_values=_pixel_values,
+                        image_position_ids=_image_position_ids,
+                        mm_token_type_ids=_mm_token_type_ids,
+                        _pre_embed_only=True,
+                    )
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
