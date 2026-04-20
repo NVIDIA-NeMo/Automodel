@@ -219,38 +219,74 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         if query.shape[1] != key_full.shape[1]:
             enable_gqa = True
 
-        # Build an explicit per-rank causal float mask instead of is_causal=True.
-        # is_causal=True with S_q != S_kv is rejected by Flash Attention in many PyTorch
-        # versions, causing fallback to MATH which OOMs.  The explicit mask is also
-        # correct for all CP ranks: rank r holds global tokens [r*S_local, (r+1)*S_local),
-        # so token q_i can attend to any key k where k <= r*S_local + q_i.
         query = query.contiguous()
-        q_offset = cp_rank * S_local
-        q_idx = torch.arange(S_local, device=query.device) + q_offset  # [S_local]
-        k_idx = torch.arange(S_full, device=query.device)               # [S_full]
-        bool_mask = q_idx.unsqueeze(1) >= k_idx.unsqueeze(0)            # [S_local, S_full]
-        cp_causal_mask = torch.zeros(
-            1, 1, S_local, S_full, dtype=query.dtype, device=query.device
-        )
-        cp_causal_mask.masked_fill_(~bool_mask, float("-inf"))
 
-        from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
-        _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+        # Primary path: flex_attention (PyTorch 2.5+).
+        # flex_attention uses a Flash-Attention-style tiled algorithm — O(N) memory, no
+        # O(N²) materialisation — and accepts arbitrary per-rank causal block masks.
+        # This avoids the Flash/Efficient rejection that forces fallback to MATH (OOM).
+        out = None
         try:
-            _backends.append(SDPBackend.CUDNN_ATTENTION)
-        except AttributeError:
-            pass
-        _backends.append(SDPBackend.MATH)
-        with _sdpa_kernel(_backends):
-            out = _original_sdpa(
-                query, key_full, val_full,
-                attn_mask=cp_causal_mask,
-                dropout_p=dropout_p,
-                is_causal=False,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                **kwargs,
+            from torch.nn.attention.flex_attention import (
+                flex_attention as _flex_attn,
+                create_block_mask as _create_block_mask,
             )
+            _r = cp_rank
+            _sl = S_local
+
+            def _cp_causal_mask(b, h, q_idx, kv_idx):
+                # rank r holds global tokens [r*S_local, (r+1)*S_local).
+                # Token q_i (local) = global token r*S_local + q_i, which can attend to
+                # any key position k where k <= r*S_local + q_i.
+                return q_idx + _r * _sl >= kv_idx
+
+            _block_mask = _create_block_mask(
+                _cp_causal_mask,
+                B=None, H=None,
+                Q_LEN=S_local, KV_LEN=S_full,
+                device=query.device,
+            )
+            # flex_attention handles GQA automatically from tensor shapes.
+            out = _flex_attn(
+                query, key_full, val_full,
+                block_mask=_block_mask,
+                scale=scale,
+            )
+        except Exception:
+            pass  # fall through to SDPA fallback
+
+        if out is None:
+            # Fallback: SDPA with explicit per-rank causal float mask.
+            # Flash rejects float masks; Efficient Attention rejects float mask + GQA.
+            # This falls back to MATH which needs ~1 GiB contiguous memory.
+            # If MATH OOMs due to fragmentation, set:
+            #   PYTORCH_ALLOC_CONF=expandable_segments:True
+            q_offset = cp_rank * S_local
+            q_idx = torch.arange(S_local, device=query.device) + q_offset
+            k_idx = torch.arange(S_full, device=query.device)
+            bool_mask = q_idx.unsqueeze(1) >= k_idx.unsqueeze(0)
+            cp_causal_mask = torch.zeros(
+                1, 1, S_local, S_full, dtype=query.dtype, device=query.device
+            )
+            cp_causal_mask.masked_fill_(~bool_mask, float("-inf"))
+
+            from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
+            _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+            try:
+                _backends.append(SDPBackend.CUDNN_ATTENTION)
+            except AttributeError:
+                pass
+            _backends.append(SDPBackend.MATH)
+            with _sdpa_kernel(_backends):
+                out = _original_sdpa(
+                    query, key_full, val_full,
+                    attn_mask=cp_causal_mask,
+                    dropout_p=dropout_p,
+                    is_causal=False,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                    **kwargs,
+                )
 
         if pad_to != orig_head_dim:
             out = out[..., :orig_head_dim]
