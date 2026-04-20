@@ -271,30 +271,19 @@ def make_cp_batch_and_ctx(
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
-    # Under CP the sequence dimension is scattered to local shards via
-    # context_parallel (plain tensors, not DTensors).  Vision keys such as
-    # pixel_values remain un-sharded and full-size on every rank, but the
-    # image-token positions in input_ids only live on one shard, causing HF's
-    # "image features and image tokens do not match" check to fail on other
-    # ranks.  Remove all vision keys here; correct VLM+CP support requires
-    # pre-computing inputs_embeds (with image features merged) before CP
-    # sharding and passing inputs_embeds instead.
-    for _vk in (
-        "pixel_values",
-        "pixel_values_videos",
-        "image_grid_thw",
-        "video_grid_thw",
-        "image_position_ids",
-        "mm_token_type_ids",
-        "n_images_per_sample",
-    ):
-        batch.pop(_vk, None)
+    # Determine whether the caller pre-computed inputs_embeds (CP+VLM path)
+    # or is passing raw input_ids.  inputs_embeds has shape [B, S, H];
+    # input_ids has shape [B, S].
+    _has_embeds = "inputs_embeds" in batch
+    _seq_key = "inputs_embeds" if _has_embeds else "input_ids"
 
     # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
+        _ref = batch[_seq_key]
+        _seq_len = _ref.shape[1]
+        batch["position_ids"] = torch.arange(0, _seq_len).unsqueeze(0).to(_ref.device)
 
-    input_ids = batch["input_ids"]
+    seq_tensor = batch[_seq_key]
     position_ids = batch["position_ids"]
 
     # Determine correct seq dim for CP sharding
@@ -310,11 +299,15 @@ def make_cp_batch_and_ctx(
     # caller does not need to worry about alignment.
     _cp_size = cp_mesh.size()
     _required = _cp_size * 2
-    _pad_len = (-input_ids.shape[1]) % _required
+    _pad_len = (-seq_tensor.shape[1]) % _required
     if _pad_len:
         import torch.nn.functional as _F
-        input_ids = _F.pad(input_ids, (0, _pad_len), value=0)
-        batch["input_ids"] = input_ids
+        if _has_embeds:
+            # inputs_embeds: [B, S, H] → pad seq dim (second-to-last)
+            seq_tensor = _F.pad(seq_tensor, (0, 0, 0, _pad_len))
+        else:
+            seq_tensor = _F.pad(seq_tensor, (0, _pad_len), value=0)
+        batch[_seq_key] = seq_tensor
         labels = _F.pad(labels, (0, _pad_len), value=-100)
         batch["labels"] = labels
         if pos_seq_dim == 1:
@@ -326,9 +319,9 @@ def make_cp_batch_and_ctx(
         batch["position_ids"] = position_ids
 
     # Collect all available tensors for context parallel
-    cp_buffers = [input_ids, labels, position_ids]
+    cp_buffers = [seq_tensor, labels, position_ids]
     cp_seq_dims = [1, 1, pos_seq_dim]
-    cp_no_restore_buffers = {input_ids, labels}
+    cp_no_restore_buffers = {seq_tensor, labels}
 
     # Add loss_mask if available
     if loss_mask is not None:

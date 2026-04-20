@@ -567,9 +567,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         mm_token_type_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ):
-        if cache_position is None and input_ids is not None:
-            seq_len = input_ids.shape[-1]
-            cache_position = torch.arange(seq_len, device=input_ids.device)
+        if cache_position is None:
+            if input_ids is not None:
+                seq_len = input_ids.shape[-1]
+                cache_position = torch.arange(seq_len, device=input_ids.device)
+            elif inputs_embeds is not None:
+                seq_len = inputs_embeds.shape[1]
+                cache_position = torch.arange(seq_len, device=inputs_embeds.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
@@ -680,6 +684,40 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             logits = logits * final_logit_softcapping
 
         return logits
+
+    def prepare_inputs_embeds_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Merge image features into text embeddings before CP sequence sharding.
+
+        When CP is active the sequence dimension of input_ids is scattered to
+        local shards.  Image-token positions are concentrated near the start of
+        the sequence so only rank 0 sees them; masked_scatter cannot redistribute
+        image features across shards and produces wrong results.  Call this on
+        the full unsharded batch before make_cp_batch_and_ctx, then pass
+        inputs_embeds to the model instead of input_ids + pixel_values.
+        """
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            image_features = self.model.get_image_features(
+                pixel_values, image_position_ids=image_position_ids, return_dict=True
+            ).pooler_output
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+            if mm_token_type_ids is not None:
+                special_image_mask = mm_token_type_ids == 1
+            else:
+                special_image_mask = input_ids == self.config.image_token_id
+
+            image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+
+        return inputs_embeds
 
     @torch.no_grad()
     def initialize_weights(
