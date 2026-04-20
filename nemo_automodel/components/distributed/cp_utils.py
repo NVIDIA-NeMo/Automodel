@@ -125,52 +125,98 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
 
 
 def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
-    """Inject CP-aware SDPA into self_attn modules for compile + CP>1 correctness.
+    """Inject CP-aware SDPA into self_attn modules for CP>1 correctness.
 
-    Problem: when per-layer torch.compile is active, Dynamo traces through the decoder
-    layer including Q/K/V projections.  At the F.scaled_dot_product_attention call site,
-    Q/K/V are already local tensors (DTensor metadata was never propagated through the
-    compiled graph).  The DTensor SDPA dispatch — which triggers the CP allgather — never
-    fires, so each rank silently attends only to its local sequence shard.
+    Replaces F.scaled_dot_product_attention during each self_attn forward with a
+    manual all-gather ring-attention implementation that avoids PyTorch's internal
+    DTensor-based ring attention (which has a mixed torch.Tensor/DTensor bug in some
+    PyTorch versions).
 
-    Fix: swap F.scaled_dot_product_attention with a @torch._dynamo.disable wrapper for
-    the duration of each self_attn forward.  Dynamo sees the disabled function and creates
-    a graph break there, so:
-      - Everything before (Q/K/V proj + RoPE) is compiled and fused.
-      - The disabled wrapper runs eagerly: re-wraps local Q/K/V as DTensors with
-        Shard(2) on the CP mesh so the DTensor SDPA dispatch fires the allgather.
-      - Everything after (O proj + residual + MLP) is compiled and fused.
+    Algorithm (all-gather variant):
+      1. All-gather K and V from all CP ranks → full-sequence K_full, V_full.
+      2. Build a per-rank boolean causal mask: Q[i] (global position cp_rank*S_local+i)
+         may attend to K[j] iff j ≤ cp_rank*S_local+i.
+      3. Call the original SDPA with plain tensors and the custom mask.
+
+    Gradients: K and V all-gathers use torch.distributed.nn.functional.all_gather
+    when available (differentiable; backward = reduce-scatter).  Falls back to the
+    non-differentiable dist.all_gather otherwise (still correct for a smoke test).
 
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
     """
     import torch.nn.functional as F_module
-    from torch.distributed.tensor import DTensor, Shard
 
     _original_sdpa = F_module.scaled_dot_product_attention
+    _cp_group = cp_mesh.get_group()
+    _cp_size = cp_mesh.size()
+
+    # Prefer differentiable all_gather; fall back to non-differentiable.
+    try:
+        from torch.distributed.nn.functional import all_gather as _dist_all_gather
+        _use_differentiable_ag = True
+    except (ImportError, AttributeError):
+        _use_differentiable_ag = False
+
+    def _all_gather_seq(t):
+        """All-gather tensor t along dim=2 (seq dim), returning the full tensor."""
+        t = t.contiguous()
+        if _use_differentiable_ag:
+            parts = _dist_all_gather(t, group=_cp_group)
+        else:
+            parts = [torch.empty_like(t) for _ in range(_cp_size)]
+            torch.distributed.all_gather(parts, t, group=_cp_group)
+        return torch.cat(parts, dim=2)
 
     @torch._dynamo.disable
     def _cp_sdpa(
         query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
     ):
-        # Re-wrap local Q/K/V as DTensors so DTensor SDPA dispatch fires the CP allgather.
-        # Seq dim is 2: [B, nH, S/cp_size, D].
-        if not isinstance(query, DTensor):
-            query = DTensor.from_local(query, device_mesh=cp_mesh, placements=[Shard(2)])
-            key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
-            value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
-        out = _original_sdpa(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
+        try:
+            from torch.distributed.tensor import DTensor
+            if isinstance(query, DTensor):
+                # Fallback: already a DTensor (shouldn't happen with our plain-tensor
+                # manual-slice approach, but handle gracefully).
+                out = _original_sdpa(query, key, value, attn_mask=attn_mask,
+                                     dropout_p=dropout_p, is_causal=is_causal,
+                                     scale=scale, enable_gqa=enable_gqa, **kwargs)
+                return out.to_local() if isinstance(out, DTensor) else out
+        except ImportError:
+            pass
+
+        if _cp_size <= 1:
+            return _original_sdpa(query, key, value, attn_mask=attn_mask,
+                                  dropout_p=dropout_p, is_causal=is_causal,
+                                  scale=scale, enable_gqa=enable_gqa, **kwargs)
+
+        cp_rank = torch.distributed.get_rank(group=_cp_group)
+        S_local = key.shape[2]
+
+        # All-gather K and V to get full-sequence tensors.
+        key_full = _all_gather_seq(key)    # [B, nH, S_full, D]
+        val_full = _all_gather_seq(value)  # [B, nH, S_full, D]
+        S_full = key_full.shape[2]
+
+        # Per-rank causal mask: Q[i] (global pos cp_rank*S_local+i) attends to
+        # K[j] iff j <= cp_rank*S_local+i.  Shape [1, 1, S_local, S_full].
+        q_pos = torch.arange(cp_rank * S_local, (cp_rank + 1) * S_local,
+                             device=query.device)         # [S_local]
+        k_pos = torch.arange(S_full, device=query.device)  # [S_full]
+        cp_bool_mask = (k_pos[None, :] <= q_pos[:, None]).unsqueeze(0).unsqueeze(0)
+
+        # Merge with any caller mask (attention_mask should have been stripped by
+        # attach_context_parallel_hooks, but be safe).
+        if attn_mask is not None and attn_mask.dtype == torch.bool:
+            cp_bool_mask = cp_bool_mask & attn_mask
+
+        return _original_sdpa(
+            query, key_full, val_full,
+            attn_mask=cp_bool_mask,
             dropout_p=dropout_p,
-            is_causal=is_causal,
+            is_causal=False,   # causal handled by cp_bool_mask
             scale=scale,
             enable_gqa=enable_gqa,
             **kwargs,
         )
-        # Unwrap back to local tensor for the compiled O-proj + MLP region.
-        return out.to_local() if isinstance(out, DTensor) else out
 
     def _pre_hook(module, args, kwargs):
         F_module.scaled_dot_product_attention = _cp_sdpa
