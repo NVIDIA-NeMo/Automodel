@@ -157,6 +157,19 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     except (ImportError, AttributeError):
         _use_differentiable_ag = False
 
+    # Lazily compile flex_attention once per process. Without torch.compile(),
+    # flex_attention runs an eager path that materialises the full
+    # [B, nH, S_local, S_full] scores matrix — which defeats its purpose and
+    # OOMs on long sequences. torch.compile() generates the fused tiled kernel
+    # that gives O(N) memory.
+    _flex_attn_compiled = {"fn": None}
+
+    def _get_compiled_flex_attn():
+        if _flex_attn_compiled["fn"] is None:
+            from torch.nn.attention.flex_attention import flex_attention as _flex_attn
+            _flex_attn_compiled["fn"] = torch.compile(_flex_attn, dynamic=False)
+        return _flex_attn_compiled["fn"]
+
     def _all_gather_seq(t):
         """All-gather tensor t along dim=2 (seq dim), returning the full tensor."""
         t = t.contiguous()
@@ -221,16 +234,14 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
         query = query.contiguous()
 
-        # Primary path: flex_attention (PyTorch 2.5+).
+        # Primary path: flex_attention (PyTorch 2.5+), compiled.
         # flex_attention uses a Flash-Attention-style tiled algorithm — O(N) memory, no
         # O(N²) materialisation — and accepts arbitrary per-rank causal block masks.
-        # This avoids the Flash/Efficient rejection that forces fallback to MATH (OOM).
+        # MUST be run via torch.compile(): the eager path materialises the full scores
+        # matrix and OOMs on long sequences.
         out = None
         try:
-            from torch.nn.attention.flex_attention import (
-                flex_attention as _flex_attn,
-                create_block_mask as _create_block_mask,
-            )
+            from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
             _r = cp_rank
             _sl = S_local
 
@@ -247,7 +258,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 device=query.device,
             )
             # flex_attention handles GQA automatically from tensor shapes.
-            out = _flex_attn(
+            out = _get_compiled_flex_attn()(
                 query, key_full, val_full,
                 block_mask=_block_mask,
                 scale=scale,
