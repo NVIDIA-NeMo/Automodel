@@ -135,7 +135,6 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
         parallelize_fn(
             model,
             world_mesh=mesh.device_mesh,
-            moe_mesh=mesh.moe_mesh,
             **mesh.parallelize_axis_kwargs(),
         )
     elif callable(getattr(model_wrapper, "parallelize", None)):
@@ -155,7 +154,6 @@ def _instantiate_distributed(
 
     Args:
         config: Distributed config (FSDP2Config, MegatronFSDPConfig, or DDPConfig).
-        mesh: MeshContext holding device_mesh and moe_mesh references.
 
     Returns:
         The instantiated manager, or None if config is None.
@@ -169,7 +167,7 @@ def _instantiate_distributed(
     if isinstance(config, FSDP2Config):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for FSDP2Config")
-        return FSDP2Manager(config, device_mesh=mesh.device_mesh, moe_mesh=mesh.moe_mesh)
+        return FSDP2Manager(config, device_mesh=mesh.device_mesh)
     elif isinstance(config, MegatronFSDPConfig):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for MegatronFSDPConfig")
@@ -189,7 +187,6 @@ def _instantiate_pipeline(
 
     Args:
         config: Pipeline config. If None or pp_size <= 1, returns None.
-        mesh: MeshContext holding device_mesh, moe_mesh, and axis names.
         device: Target device for pipeline computation.
 
     Returns:
@@ -203,7 +200,6 @@ def _instantiate_pipeline(
 
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
-        moe_mesh=mesh.moe_mesh,
         device=device,
         **mesh.pipeline_axis_kwargs(),
         **config_dict,
@@ -232,7 +228,7 @@ def parallelize_for_pp(
     Args:
         model: The model to parallelize.
         model_wrapper: Distributed manager instance.
-        **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
+        **kwargs: Additional arguments (world_mesh, axis names) passed by
             AutoPipeline but unused for non-MoE parallelization.
 
     Returns:
@@ -255,7 +251,6 @@ def instantiate_infrastructure(
     mesh: Optional[MeshContext] = None,
     # Deprecated -- prefer passing ``mesh`` directly
     device_mesh: Optional["DeviceMesh"] = None,
-    moe_mesh: Optional["DeviceMesh"] = None,
     ep_size: int = 1,
 ) -> tuple:
     """Instantiate infrastructure objects from config classes.
@@ -273,10 +268,7 @@ def instantiate_infrastructure(
         activation_checkpointing: Enable activation checkpointing for transformer blocks.
             Defaults to False.
         device: Target device for model.
-        mesh: MeshContext holding device meshes, sizes, and axis names.
-            If None, built from the legacy ``device_mesh`` / ``moe_mesh`` params.
         device_mesh: (deprecated) Device mesh for distributed operations.
-        moe_mesh: (deprecated) Optional MOE mesh for expert parallelism.
         ep_size: (deprecated) Expert parallelism size. Ignored when ``mesh`` is provided.
 
     Returns:
@@ -288,7 +280,7 @@ def instantiate_infrastructure(
             - qat_quantizer: QAT quantizer instance (or None)
     """
     if mesh is None:
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        mesh = MeshContext.from_meshes(device_mesh)
 
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 
@@ -400,7 +392,7 @@ def apply_model_infrastructure(
         0,
         0,
         0,
-        getattr(model_wrapper, "moe_mesh", None),
+        mesh.moe_mesh,
     )
 
     # Handle checkpointer config updates if checkpointer is provided

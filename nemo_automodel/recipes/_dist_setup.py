@@ -201,7 +201,7 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
 
     This is the main entry-point called by recipes.  It converts the
     config section into a fully-initialised :class:`MeshContext`
-    (including ``device_mesh`` and ``moe_mesh``).
+    (including ``device_mesh``).
 
     Args:
         cfg: Top-level config (must have a ``distributed`` key).
@@ -215,7 +215,7 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
     cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
     parsed = parse_distributed_section(cfg_dict)
 
-    device_mesh, moe_mesh = create_device_mesh(
+    device_mesh, _ = create_device_mesh(
         parsed["strategy_config"],
         dp_size=parsed["dp_size"],
         dp_replicate_size=parsed["dp_replicate_size"],
@@ -232,5 +232,4 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
         moe_config=parsed["moe_config"],
         activation_checkpointing=parsed["activation_checkpointing"],
         device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
     )
