@@ -214,6 +214,11 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             if scale is None:
                 scale = 1.0 / _math.sqrt(orig_head_dim)
 
+        # Auto-enable GQA when Q and KV head counts differ (e.g. Gemma4 26B MoE: 32 vs 8).
+        # Flash Attention rejects mismatched head counts unless enable_gqa=True.
+        if query.shape[1] != key_full.shape[1]:
+            enable_gqa = True
+
         from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
         _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
         try:
