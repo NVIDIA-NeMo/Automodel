@@ -23,8 +23,8 @@ Usage:
     python tests/integration/test_llava_onevision_cpu.py
 """
 
-import sys
 import logging
+import sys
 from pathlib import Path
 
 import torch
@@ -44,8 +44,8 @@ def test_model_config():
     logger.info("=" * 80)
 
     from nemo_automodel.components.models.llava_onevision.model import (
-        LlavaOneVisionConfig,
-        LlavaOneVisionForConditionalGeneration,
+        LLaVAOneVision1_5_ForConditionalGeneration,
+        Llavaonevision1_5Config,
         RiceConfig,
     )
 
@@ -60,18 +60,19 @@ def test_model_config():
         text_hidden_size=64,
     )
 
-    from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-
-    text_config = Qwen2Config(
+    text_config = dict(
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
+        head_dim=16,
         vocab_size=1000,
+        rope_theta=1e6,
+        max_position_embeddings=128,
     )
 
-    config = LlavaOneVisionConfig(
+    config = Llavaonevision1_5Config(
         vision_config=vision_config,
         text_config=text_config,
         image_token_id=100,
@@ -80,7 +81,7 @@ def test_model_config():
         vision_end_token_id=99,
     )
 
-    logger.info(f"  ✓ LlavaOneVisionConfig created")
+    logger.info("  ✓ Llavaonevision1_5Config created")
     logger.info(f"    - Vision depth: {config.vision_config.depth}")
     logger.info(f"    - Vision hidden size: {config.vision_config.hidden_size}")
     logger.info(f"    - Text hidden size: {config.text_config.hidden_size}")
@@ -88,7 +89,7 @@ def test_model_config():
     logger.info(f"    - Image token ID: {config.image_token_id}")
 
     # Instantiate model
-    model = LlavaOneVisionForConditionalGeneration(config)
+    model = LLaVAOneVision1_5_ForConditionalGeneration(config, attn_implementation="eager")
     model.eval()
 
     param_count = sum(p.numel() for p in model.parameters())
@@ -120,10 +121,11 @@ def test_forward_pass_shape(config, model):
         )
 
     # Verify output shapes
-    assert outputs.logits.shape == (batch_size, seq_len, config.text_config.vocab_size), \
+    assert outputs.logits.shape == (batch_size, seq_len, config.text_config.vocab_size), (
         f"Expected logits shape {(batch_size, seq_len, config.text_config.vocab_size)}, got {outputs.logits.shape}"
+    )
 
-    logger.info(f"  ✓ Forward pass successful")
+    logger.info("  ✓ Forward pass successful")
     logger.info(f"    - Input IDs shape: {input_ids.shape}")
     logger.info(f"    - Logits shape: {outputs.logits.shape}")
     logger.info(f"    - Loss: {outputs.loss.item():.4f}" if outputs.loss is not None else "    - Loss: None")
@@ -165,10 +167,11 @@ def test_forward_pass_with_image(config, model):
             return_dict=True,
         )
 
-    assert outputs.logits.shape == (batch_size, seq_len, config.text_config.vocab_size), \
+    assert outputs.logits.shape == (batch_size, seq_len, config.text_config.vocab_size), (
         f"Expected logits shape {(batch_size, seq_len, config.text_config.vocab_size)}, got {outputs.logits.shape}"
+    )
 
-    logger.info(f"  ✓ Forward pass with image features successful")
+    logger.info("  ✓ Forward pass with image features successful")
     logger.info(f"    - Input IDs shape: {input_ids.shape}")
     logger.info(f"    - Pixel values shape: {pixel_values.shape}")
     logger.info(f"    - Image grid THW: {image_grid_thw}")
@@ -213,12 +216,13 @@ def test_collate_function():
         },
     ]
 
-    logger.info(f"  ✓ Collate function imported successfully")
+    logger.info("  ✓ Collate function imported successfully")
     logger.info(f"    - Created {len(examples)} mock examples")
 
     # Note: We can't fully test the collate function without a real processor
     # This test verifies the function can be imported and has correct signature
     import inspect
+
     sig = inspect.signature(llava_onevision_collate_fn)
     params = list(sig.parameters.keys())
     assert "examples" in params, "Missing 'examples' parameter"
@@ -236,18 +240,19 @@ def test_dataset_builder():
     logger.info("Test 5: Dataset Builder")
     logger.info("=" * 80)
 
+    import inspect
+
     from nemo_automodel.components.datasets.vlm.datasets import make_llava_onevision_dataset
 
-    import inspect
     sig = inspect.signature(make_llava_onevision_dataset)
     params = list(sig.parameters.keys())
 
     assert "path_or_dataset" in params, "Missing 'path_or_dataset' parameter"
     assert "split" in params, "Missing 'split' parameter"
 
-    logger.info(f"  ✓ Dataset builder imported successfully")
+    logger.info("  ✓ Dataset builder imported successfully")
     logger.info(f"    - Function signature: {params}")
-    logger.info(f"    - Default dataset: liuhaotian/LLaVA-Instruct-150K")
+    logger.info("    - Default dataset: liuhaotian/LLaVA-Instruct-150K")
 
     return True
 
@@ -261,13 +266,12 @@ def test_registry_registration():
 
     from nemo_automodel._transformers.registry import ModelRegistry
 
-    arch_name = "LlavaOneVisionForConditionalGeneration"
+    arch_name = "LLaVAOneVision1_5_ForConditionalGeneration"
 
-    assert arch_name in ModelRegistry.model_arch_name_to_cls, \
-        f"{arch_name} not found in MODEL_ARCH_MAPPING"
+    assert arch_name in ModelRegistry.model_arch_name_to_cls, f"{arch_name} not found in MODEL_ARCH_MAPPING"
 
     model_cls = ModelRegistry.model_arch_name_to_cls[arch_name]
-    logger.info(f"  ✓ Model registered in MODEL_ARCH_MAPPING")
+    logger.info("  ✓ Model registered in MODEL_ARCH_MAPPING")
     logger.info(f"    - Architecture name: {arch_name}")
     logger.info(f"    - Model class: {model_cls.__name__}")
     logger.info(f"    - Module: {model_cls.__module__}")
@@ -308,6 +312,7 @@ def main():
     except Exception as e:
         logger.error(f"Test failed with exception: {e}")
         import traceback
+
         traceback.print_exc()
         results["Overall"] = False
 
