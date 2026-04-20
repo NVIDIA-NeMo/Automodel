@@ -261,11 +261,32 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             # differ (e.g. Gemma4 31B: 32 Q heads, 16 KV heads).  Our _cp_sdpa
             # already sets this flag above for the SDPA fallback; pass the same
             # value through here.
+            #
+            # Gemma4 31B has a decoder layer variant with head_dim=512.  The
+            # Triton flex_attention template picks block sizes (BLOCK_M/BLOCK_N)
+            # based on defaults tuned for head_dim <= 128; with head_dim=512 the
+            # required shared memory (~200 KB) exceeds A100's 163 KB limit and
+            # the kernel refuses to compile ("No valid triton configs").  Shrink
+            # the blocks and the pipeline depth when head_dim is large so the
+            # kernel fits.  Leave defaults for small head_dim (faster).
+            _kernel_options = None
+            if query.shape[-1] >= 256:
+                _kernel_options = {
+                    "BLOCK_M": 32,
+                    "BLOCK_N": 32,
+                    "BLOCK_M1": 32,
+                    "BLOCK_N1": 32,
+                    "BLOCK_M2": 32,
+                    "BLOCK_N2": 32,
+                    "num_stages": 1,
+                    "num_warps": 4,
+                }
             out = _get_compiled_flex_attn()(
                 query, key_full, val_full,
                 block_mask=_block_mask,
                 scale=scale,
                 enable_gqa=enable_gqa,
+                kernel_options=_kernel_options,
             )
         except Exception as _flex_err:
             # Surface the failure once per process so we know *why* we fell back
