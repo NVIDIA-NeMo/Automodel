@@ -140,19 +140,123 @@ class Qwen3VLMoeModel(HFQwen3VLMoeModel):
             else:
                 raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
 
-        if pixel_values is not None and self.visual is not None:
-            return super().forward(
+        if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
+            # Process vision features inline instead of delegating to
+            # super().forward(input_ids=None).  This ensures get_placeholder_mask
+            # receives the original input_ids so it can locate placeholder tokens
+            # via fast integer comparison rather than the fragile bfloat16
+            # embedding comparison path.
+            image_mask = None
+            video_mask = None
+
+            has_images = pixel_values is not None
+            has_videos = pixel_values_videos is not None
+
+            if has_images and has_videos:
+                # Merged visual forward to avoid two separate FSDP-synchronized calls
+                pixel_values = pixel_values.type(self.visual.dtype)
+                pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+                merged_pixel_values = torch.cat([pixel_values, pixel_values_videos], dim=0)
+                merged_grid_thw = torch.cat([image_grid_thw, video_grid_thw], dim=0)
+
+                merged_output = self.visual(merged_pixel_values, grid_thw=merged_grid_thw, return_dict=True)
+                merged_embeds = merged_output.pooler_output
+                merged_deepstack = merged_output.deepstack_features
+
+                spatial_merge_size_sq = self.visual.spatial_merge_size**2
+                total_image_tokens = (image_grid_thw.prod(-1) // spatial_merge_size_sq).sum().item()
+
+                image_embeds = merged_embeds[:total_image_tokens].to(inputs_embeds.device, inputs_embeds.dtype)
+                video_embeds = merged_embeds[total_image_tokens:].to(inputs_embeds.device, inputs_embeds.dtype)
+
+                deepstack_image_embeds = [ds[:total_image_tokens] for ds in merged_deepstack]
+                deepstack_video_embeds = [ds[total_image_tokens:] for ds in merged_deepstack]
+
+                image_mask, _ = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+                _, video_mask = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            elif has_images:
+                image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+                image_embeds = image_outputs.pooler_output
+                deepstack_image_embeds = image_outputs.deepstack_features
+                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                image_mask, _ = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            else:  # has_videos only
+                video_outputs = self.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+                video_embeds = video_outputs.pooler_output
+                deepstack_video_embeds = video_outputs.deepstack_features
+                video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                _, video_mask = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            # Build deepstack visual masks (same logic as HF model)
+            visual_pos_masks = None
+            deepstack_visual_embeds = None
+            if image_mask is not None and video_mask is not None:
+                image_mask = image_mask[..., 0]
+                video_mask = video_mask[..., 0]
+                visual_pos_masks = image_mask | video_mask
+                deepstack_visual_embeds = []
+                image_mask_joint = image_mask[visual_pos_masks]
+                video_mask_joint = video_mask[visual_pos_masks]
+                for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+                    embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+                    embed_joint[image_mask_joint, :] = img_embed
+                    embed_joint[video_mask_joint, :] = vid_embed
+                    deepstack_visual_embeds.append(embed_joint)
+            elif image_mask is not None:
+                image_mask = image_mask[..., 0]
+                visual_pos_masks = image_mask
+                deepstack_visual_embeds = deepstack_image_embeds
+            elif video_mask is not None:
+                video_mask = video_mask[..., 0]
+                visual_pos_masks = video_mask
+                deepstack_visual_embeds = deepstack_video_embeds
+
+            # Compute mRoPE position_ids if not pre-computed
+            if position_ids is None:
+                mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
+                attention_mask_tensor = (
+                    attention_mask if not isinstance(attention_mask, dict) else attention_mask.get("full_attention")
+                )
+                position_ids, rope_deltas = self.get_rope_index(
+                    input_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask_tensor,
+                )
+                self.rope_deltas = rope_deltas
+
+            outputs = self.language_model(
                 input_ids=None,
+                inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
                 cache_position=cache_position,
+                visual_pos_masks=visual_pos_masks,
+                deepstack_visual_embeds=deepstack_visual_embeds,
                 **kwargs,
+            )
+
+            return Qwen3VLMoeModelOutputWithPast(
+                last_hidden_state=outputs.last_hidden_state,
+                past_key_values=None,
+                rope_deltas=getattr(self, "rope_deltas", None),
             )
 
         outputs = self.language_model(
@@ -413,8 +517,9 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             and hasattr(self, "_vlm_pixel_values_chunks")
             and self._vlm_pixel_values_chunks is not None
         ):
-            # Check if we have media tokens in input_ids (151655/151652)
-            has_media_tokens = input_ids is not None and ((input_ids == 151655).any() or (input_ids == 151652).any())
+            # Check if we have media tokens in input_ids
+            # 151655 = <|image_pad|>, 151656 = <|video_pad|>
+            has_media_tokens = input_ids is not None and ((input_ids == 151655).any() or (input_ids == 151656).any())
 
             if has_media_tokens:
                 chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
@@ -433,6 +538,14 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                     kwargs["pixel_values"] = pixel_values
                     kwargs["image_grid_thw"] = image_grid_thw
                     self._vlm_chunk_idx = chunk_idx + 1
+
+        # With pipeline parallelism, attention_mask (from batch kwargs) can have a
+        # different sequence length than inputs_embeds (hidden states from prev stage).
+        # Drop mismatched masks to avoid size errors in MoE token routing.
+        if inputs_embeds is not None and attention_mask is not None:
+            if attention_mask.shape[-1] != inputs_embeds.shape[1]:
+                attention_mask = None
+                padding_mask = None
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
