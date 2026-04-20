@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# QLora configuration for Llama-3.1-8B on SQuAD dataset
+# QLoRA configuration for Llama-3.3-70B-Instruct on SQuAD dataset (DGX Spark)
 # Uses 4-bit quantization with LoRA adapters
-# 
-# To run this recipe:
-#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+#
+# To run this recipe, please use the following command:
+# torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
+  local_batch_size: 1
   ckpt_every_steps: 100
   val_every_steps: 600
-  max_steps: 500
+  max_steps: 500   # adjust this as necessary
 
 dist_env:
   backend: nccl
@@ -39,7 +38,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bfloat16
 
 peft:
@@ -66,7 +65,7 @@ quantization:
   bnb_4bit_quant_storage: bfloat16
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
@@ -74,7 +73,7 @@ dataset:
   split: train
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -102,8 +101,5 @@ optimizer:
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
-#   name: llama3_1_8b_squad_qlora
-#   save_dir: <your_wandb_save_dir>
-
-ci:
-  recipe_owner: adil-a
+#   name: llama3_3_70b_instruct_squad_qlora_spark
+#   save_dir: <your_wandb_save_dir> 
