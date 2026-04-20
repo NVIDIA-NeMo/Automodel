@@ -90,5 +90,3 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-ci:
-  recipe_owner: khazic
