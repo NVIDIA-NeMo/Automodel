@@ -54,18 +54,9 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
             if cp_context is not None:
                 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-                # Prefer Flash/Efficient for performance; fall back to cuDNN (supports
-                # non-power-of-2 head dims such as Gemma's 144/256) and finally MATH.
-                # SDPBackend.MATH works here because inside the CP allgather wrapper
-                # the tensors passed to the actual SDPA call are local plain tensors,
-                # not DTensors.
-                _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-                try:
-                    _backends.append(SDPBackend.CUDNN_ATTENTION)
-                except AttributeError:
-                    pass
-                _backends.append(SDPBackend.MATH)
-                stack.enter_context(sdpa_kernel(_backends))
+                # currently we only support these two SDP backends.
+                # SDPBackend.MATH is not currently compatible with DTensor
+                stack.enter_context(sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]))
                 stack.enter_context(cp_context)
 
             yield
@@ -327,35 +318,38 @@ def make_cp_batch_and_ctx(
             position_ids = torch.cat([position_ids, _extra], dim=2)
         batch["position_ids"] = position_ids
 
-    # Collect all available tensors for context parallel
-    cp_buffers = [seq_tensor, labels, position_ids]
-    cp_seq_dims = [1, 1, pos_seq_dim]
-    cp_no_restore_buffers = {seq_tensor, labels}
+    # Manual sequence slicing: each CP rank takes its contiguous shard.
+    # This avoids the "mixed torch.Tensor and DTensor" crash that occurs when
+    # context_parallel propagates DTensor activations through the full model
+    # and PyTorch's CP attention inner_fn ends up with mixed types (DTensor Q
+    # from the propagated hidden-states vs plain K/V after allgather).
+    # Ring attention is still performed correctly because attach_cp_sdpa_hooks
+    # (registered in infrastructure.py for all CP>1 cases) wraps Q/K/V as
+    # sequence-sharded DTensors at the SDPA call site; the DTensor SDPA
+    # dispatch then handles the ring communication.  All activations outside
+    # the SDPA call remain plain tensors.
+    cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
+    S_total = seq_tensor.shape[1]
+    S_local = S_total // _cp_size
+    _s = cp_rank * S_local
+    _e = _s + S_local
 
-    # Add loss_mask if available
+    batch[_seq_key] = seq_tensor[:, _s:_e].contiguous()
+    batch["labels"] = labels[:, _s:_e].contiguous()
+    if pos_seq_dim == 1:
+        batch["position_ids"] = position_ids[:, _s:_e].contiguous()
+    else:
+        batch["position_ids"] = position_ids[:, :, _s:_e].contiguous()
+
     if loss_mask is not None:
-        cp_buffers.append(loss_mask)
-        cp_seq_dims.append(1)
-        cp_no_restore_buffers.add(loss_mask)
+        loss_mask = loss_mask[:, _s:_e].contiguous()
 
-    # Add padding_mask if available in batch
     if "padding_mask" in batch:
-        padding_mask = batch["padding_mask"]
-        cp_buffers.append(padding_mask)
-        cp_seq_dims.append(1)
-        cp_no_restore_buffers.add(padding_mask)
+        batch["padding_mask"] = batch["padding_mask"][:, _s:_e].contiguous()
 
-    cp_ctx = create_context_parallel_ctx(
-        cp_mesh=cp_mesh,
-        cp_buffers=cp_buffers,
-        cp_seq_dims=cp_seq_dims,
-        cp_no_restore_buffers=cp_no_restore_buffers,
-        cp_rotate_method="allgather",  # TODO: expose through cfg
-    )
-    # TODO(@akoumparouli): surface these in the future.
-    enable_loss_parallel: bool = False
-    enable_compiled_autograd: bool = False
-    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
+    # No CP context manager needed: ring attention fires via DTensor dispatch
+    # inside attach_cp_sdpa_hooks.
+    return nullcontext, batch
 
 
 def make_cp_batch_for_te(

@@ -574,14 +574,17 @@ def apply_model_infrastructure(
         )
 
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
-        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
+        # cp_mesh is needed by attach_cp_sdpa_hooks for both compiled and non-compiled
+        # CP.  We now use manual sequence slicing + attach_cp_sdpa_hooks for all CP>1
+        # cases; context_parallel (DTensor-throughout) is no longer used because it
+        # causes "mixed DTensor/plain tensor" errors in PyTorch's CP attention inner_fn.
+        cp_mesh_for_sdpa = mesh.device_mesh["cp"]
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
             attach_linear_attn_position_hooks(mp)
-            if is_compile_enabled:
-                attach_cp_sdpa_hooks(mp, cp_mesh)
+            attach_cp_sdpa_hooks(mp, cp_mesh_for_sdpa)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model
