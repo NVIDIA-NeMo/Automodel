@@ -31,6 +31,7 @@ MULTIMODAL_SUFFIXES = (
     "visual",
     "image_encoder",
     "vision_encoder",
+    "embed_vision",
     "audio_tower",
     "audio_encoder",
     "audio_model",
