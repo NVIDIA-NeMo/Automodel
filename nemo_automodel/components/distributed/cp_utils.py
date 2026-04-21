@@ -104,11 +104,11 @@ def create_context_parallel_ctx(
 def attach_context_parallel_hooks(model: torch.nn.Module):
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 
-    Context parallelism shards Q/K/V on the sequence dimension as DTensors,
-    so explicit 4D attention masks would have mismatched shapes.  This function
-    registers a hook on every ``self_attn`` sub-module that strips the
-    ``attention_mask`` kwarg and sets ``is_causal=True`` instead, letting
-    SDPA handle causal masking internally.
+    Context parallelism shards the sequence across ranks via manual slicing;
+    each rank sees a local sub-sequence, so explicit 4D attention masks would
+    have mismatched shapes.  This function registers a hook on every
+    ``self_attn`` sub-module that strips the ``attention_mask`` kwarg and sets
+    ``is_causal=True`` instead, letting SDPA handle causal masking internally.
 
     Based on ``accelerate.big_modeling._attach_context_parallel_hooks``.
     """
@@ -296,6 +296,13 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     out = _get_compiled_flex_attn()(query, key_full, val_full, **_flex_kw)
                 else:
                     raise
+            if not getattr(_cp_sdpa, "_flex_ok_logged", False):
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "CP using flex_attention (compiled). shapes: Q=%s K_full=%s head_dim=%s->%s cp_rank=%s",
+                    tuple(query.shape), tuple(key_full.shape), orig_head_dim, pad_to, cp_rank,
+                )
+                _cp_sdpa._flex_ok_logged = True
         except Exception as _flex_err:
             # Surface the failure once per process so we know *why* we fell back.
             if not getattr(_cp_sdpa, "_flex_err_logged", False):
