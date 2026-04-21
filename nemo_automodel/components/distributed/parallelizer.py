@@ -1377,36 +1377,44 @@ def _get_parallel_plan(
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:
-        base_model_tp_plan = {
-            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-            "lm_head": ColwiseParallel(output_layouts=Replicate()),
-        }
-        if sequence_parallel:
-            base_model_sp_plan = {
-                "model.embed_tokens": VocabParallelEmbedding(
-                    input_layouts=Replicate(),
-                    output_layouts=Shard(1),
-                    use_local_output=False,
-                ),
-                "model.norm": SequenceParallel(),
-                "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+        # Try HF's per-model _tp_plan first — it correctly handles multimodal
+        # architectures like Mistral3ForConditionalGeneration whose text layers
+        # live under model.language_model.layers.* and would be missed by the
+        # hardcoded llama-style wildcards below.
+        try:
+            model_parallel_plan = get_hf_tp_shard_plan(model)
+            logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
+        except (AssertionError, AttributeError):
+            base_model_tp_plan = {
+                "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+                "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
+                "model.layers.*.mlp.up_proj": ColwiseParallel(),
+                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                "lm_head": ColwiseParallel(output_layouts=Replicate()),
             }
-            base_model_tp_plan.update(base_model_sp_plan)
-        model_parallel_plan = base_model_tp_plan
-        logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
+            if sequence_parallel:
+                base_model_sp_plan = {
+                    "model.embed_tokens": VocabParallelEmbedding(
+                        input_layouts=Replicate(),
+                        output_layouts=Shard(1),
+                        use_local_output=False,
+                    ),
+                    "model.norm": SequenceParallel(),
+                    "model.layers.*.input_layernorm": SequenceParallel(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+                    "model.layers.*.post_attention_layernorm": SequenceParallel(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+                    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+                }
+                base_model_tp_plan.update(base_model_sp_plan)
+            model_parallel_plan = base_model_tp_plan
+            logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
 
     return model_parallel_plan
 
