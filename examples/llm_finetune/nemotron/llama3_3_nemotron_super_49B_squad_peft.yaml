@@ -29,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 20
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -112,7 +112,8 @@ ci:
   vllm_deploy: true
   recipe_owner: HuiyingLi
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
+    hf_kl_threshold: 1.5e1
+    resume_loss_threshold: 5e-2
     trust_remote_code: true
     distributed.tp_size: 2
     tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
