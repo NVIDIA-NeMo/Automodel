@@ -765,11 +765,16 @@ class TestValidateHfModelForPipelineSupport:
         mock_model.norm = None
         mock_model.layers = None
 
-        # Create a mock text module with rotary_emb
+        # Create a mock text module with rotary_emb. The pipeline_forward now
+        # routes embed_tokens / layers / norm through the text module too, so
+        # explicitly stub them out to None to skip those branches.
         mock_text_module = Mock()
         mock_rotary = Mock()
         mock_rotary.return_value = (torch.randn(1, 10, 64), torch.randn(1, 10, 64))
         mock_text_module.rotary_emb = mock_rotary
+        mock_text_module.embed_tokens = None
+        mock_text_module.layers = None
+        mock_text_module.norm = None
 
         mock_get_text_module.return_value = mock_text_module
 
@@ -795,9 +800,14 @@ class TestValidateHfModelForPipelineSupport:
         mock_model.norm = None
         mock_model.layers = None
 
-        # Create a mock text module with None rotary_emb
+        # Create a mock text module with None rotary_emb. Stub out the text
+        # module's embed_tokens / layers / norm too (now routed through text
+        # module by pipeline_forward).
         mock_text_module = Mock()
         mock_text_module.rotary_emb = None
+        mock_text_module.embed_tokens = None
+        mock_text_module.layers = None
+        mock_text_module.norm = None
 
         mock_get_text_module.return_value = mock_text_module
 

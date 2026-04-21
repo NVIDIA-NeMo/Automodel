@@ -49,7 +49,9 @@ def get_text_module(model: nn.Module) -> nn.Module:
     for attr_name in TEXT_MODULE_ATTRS:
         if hasattr(model, attr_name):
             nested = getattr(model, attr_name)
-            if nested is not None:
+            # Only descend into a real submodule; Mock-only attrs from tests
+            # (which hasattr() accepts) are not nn.Module and should be skipped.
+            if nested is not None and isinstance(nested, nn.Module):
                 return nested
     return model
 
