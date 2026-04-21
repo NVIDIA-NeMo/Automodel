@@ -925,10 +925,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # input_ids to local shards.  Without this, image-token positions land
         # on only one CP rank while pixel_values stays full-size on all ranks,
         # causing HF's token-count check to fail.
-        _cp_mesh = self.device_mesh["cp"] if (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", {})
-        ) else None
+        _cp_mesh = (
+            self.device_mesh["cp"]
+            if (self.device_mesh is not None and "cp" in getattr(self.device_mesh, "mesh_dim_names", {}))
+            else None
+        )
         _cp_active = _cp_mesh is not None and _cp_mesh.size() > 1
         if _cp_active and "pixel_values" in batch:
             _model = self.model_parts[0]
