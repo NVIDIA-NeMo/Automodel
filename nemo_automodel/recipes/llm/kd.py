@@ -198,7 +198,6 @@ def _build_teacher_model_with_pp(
         patch_inner_model=pipeline_config.patch_inner_model,
         patch_causal_lm_model=pipeline_config.patch_causal_lm_model,
         patch_stage_backward_maybe_with_nosync=pipeline_config.patch_stage_backward_maybe_with_nosync,
-        reduce_grad_per_microbatch=pipeline_config.reduce_grad_per_microbatch,
         dtype=pipeline_config.dtype,
         scale_grads_in_schedule=pipeline_config.scale_grads_in_schedule,
         loss_fn=_teacher_capture_loss_fn,

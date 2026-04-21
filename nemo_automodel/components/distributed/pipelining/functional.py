@@ -716,8 +716,10 @@ def pipeline_model(
         scale_grads=scale_grads,
     )
 
-    # Patch FSDP backward for MoE models, or when reduce_grad_per_microbatch is
-    # requested (the patch is where that knob is read).
+    # Patch FSDP backward for MoE models, or when per-microbatch grad reduce-scatter
+    # is requested (mapped from surface-level defer_fsdp_grad_sync=False for memory
+    # savings). The patched function's FSDP branch is generic (non-MoE-specific)
+    # and reads the per-stage flag set below.
     if patch_stage_backward_maybe_with_nosync or reduce_grad_per_microbatch:
         from nemo_automodel.components.moe.fsdp_mixin import patched_backward_maybe_with_nosync
 
@@ -726,7 +728,7 @@ def pipeline_model(
             stage._reduce_grad_per_microbatch = reduce_grad_per_microbatch
 
         logger.info(
-            "Patched pipeline stages with MoE-aware FSDP backward logic "
+            "Patched pipeline stages with backward_maybe_with_nosync "
             f"(reduce_grad_per_microbatch={reduce_grad_per_microbatch})"
         )
 

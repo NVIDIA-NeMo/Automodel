@@ -1296,6 +1296,8 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         Qwen3_5ForConditionalGeneration: ["model.language_model.layers", "model.visual.blocks"],
+        # String fallback in case of class identity mismatch across imports
+        "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
