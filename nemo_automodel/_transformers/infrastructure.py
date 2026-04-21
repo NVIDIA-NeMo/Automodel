@@ -106,45 +106,8 @@ def _apply_peft_and_lower_precision(
     return model
 
 
-def _patch_gemma4_per_layer_inputs():
-    """Patch Gemma4TextModel.get_per_layer_inputs to avoid the 640 GiB OOM.
-
-    Older transformers versions call get_per_layer_inputs(input_ids=None, inputs_embeds=...)
-    even when input_ids are available.  The fallback path broadcasts
-    [B, S, 1, H] == [1, 1, vocab_size, H] producing a [B, S, vocab_size, H] bool tensor
-    (e.g. [1, 1024, 262144, 2560] = 640 GiB for Gemma4-E4B).
-    This patch replaces the broadcast with an O(B*S*vocab) matmul argmax (~1 GiB),
-    which recovers the same input_ids when inputs_embeds = embed_tokens(ids) * sqrt(H).
-    """
-    try:
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel
-    except ImportError:
-        return
-
-    def _efficient_get_per_layer_inputs(self, input_ids, inputs_embeds):
-        if not getattr(self, "hidden_size_per_layer_input", None):
-            raise RuntimeError(
-                "Attempting to call get_per_layer_inputs() from a model initialized with a config"
-                f" that does not support per-layer embeddings. {self.config}"
-            )
-        if input_ids is None:
-            # Efficient reverse-lookup: [B, S, H] @ [H, vocab] -> [B, S, vocab] argmax
-            # instead of [B, S, vocab, H] broadcast comparison (OOM for large vocab/hidden).
-            with torch.no_grad():
-                scale = self.config.hidden_size ** 0.5
-                input_ids = (inputs_embeds @ (self.embed_tokens.weight * scale).T).argmax(dim=-1)
-        return self.embed_tokens_per_layer(input_ids).reshape(
-            *input_ids.shape,
-            self.config.num_hidden_layers,
-            self.hidden_size_per_layer_input,
-        )
-
-    Gemma4TextModel.get_per_layer_inputs = _efficient_get_per_layer_inputs
-
-
 def _apply_runtime_compatibility_fixes(model):
     """Apply targeted runtime workarounds after sharding/load completes."""
-    _patch_gemma4_per_layer_inputs()
     model_parts = model.parts if hasattr(model, "parts") else [model]
     if should_fix_rotary_embeddings(model_parts):
         fix_rotary_embeddings(model_parts)

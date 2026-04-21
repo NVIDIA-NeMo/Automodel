@@ -932,33 +932,29 @@ class FinetuneRecipeForVLM(BaseRecipe):
         _cp_active = _cp_mesh is not None and _cp_mesh.size() > 1
         if _cp_active and "pixel_values" in batch:
             _model = self.model_parts[0]
-            if hasattr(_model, "prepare_inputs_embeds_for_cp"):
+            if hasattr(_model, "prepare_model_inputs_for_cp") or hasattr(_model, "prepare_inputs_embeds_for_cp"):
                 # Call through model.__call__ so FSDP2 pre-forward hook fires and
                 # all-gathers sharded parameters (embed_tokens weight) to Replicate
                 # placement before the embedding lookup.  Calling the method directly
                 # bypasses the hook and causes a mixed DTensor/plain-tensor error.
-                _input_ids = batch.pop("input_ids")
-                _pixel_values = batch.pop("pixel_values", None)
-                _image_position_ids = batch.pop("image_position_ids", None)
-                _mm_token_type_ids = batch.pop("mm_token_type_ids", None)
+                prepared_inputs = _model(
+                    input_ids=batch["input_ids"],
+                    pixel_values=batch.get("pixel_values"),
+                    image_position_ids=batch.get("image_position_ids"),
+                    mm_token_type_ids=batch.get("mm_token_type_ids"),
+                    _pre_embed_only=True,
+                )
+                if isinstance(prepared_inputs, torch.Tensor):
+                    prepared_inputs = {"inputs_embeds": prepared_inputs}
+
+                batch.pop("input_ids", None)
+                batch.pop("pixel_values", None)
+                batch.pop("image_position_ids", None)
                 batch.pop("pixel_values_videos", None)
                 batch.pop("image_grid_thw", None)
                 batch.pop("video_grid_thw", None)
                 batch.pop("n_images_per_sample", None)
-                # NOTE: we wrap the pre-embed in no_grad because this recipe
-                # only trains the language model; `freeze_embeddings: true` is
-                # set in every CP example config we ship.  If a future config
-                # unfreezes `embed_tokens` or the vision tower, this no_grad
-                # will silently drop gradients for those params — remove the
-                # context manager in that case.
-                with torch.no_grad():
-                    batch["inputs_embeds"] = _model(
-                        input_ids=_input_ids,
-                        pixel_values=_pixel_values,
-                        image_position_ids=_image_position_ids,
-                        mm_token_type_ids=_mm_token_type_ids,
-                        _pre_embed_only=True,
-                    )
+                batch.update(prepared_inputs)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
