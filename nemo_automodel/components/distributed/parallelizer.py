@@ -17,7 +17,7 @@ import logging
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import lru_cache, reduce
+from functools import lru_cache
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
