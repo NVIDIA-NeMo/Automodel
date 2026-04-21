@@ -948,7 +948,13 @@ class TestNemotronV3MambaCacheGPU:
     # @skip_if_no_mamba
     @pytest.mark.skip
     def test_hybrid_model_generate_with_inputs_embeds_matches_manual_decode(self, config, backend):
-        """Cached generate(inputs_embeds=...) should match full-recompute decoding."""
+        """Cached generate(inputs_embeds=...) should match full-recompute decoding.
+
+        Flash-attention is disabled so that both the cached inference path
+        (direct F.scaled_dot_product_attention) and the uncached training path
+        (backend attn_func) use the deterministic math SDPA kernel.
+        """
+        from torch.nn.attention import SDPBackend, sdpa_kernel
         from transformers import PretrainedConfig
 
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
@@ -966,21 +972,22 @@ class TestNemotronV3MambaCacheGPU:
         inputs_embeds = model.model.embed_tokens(input_ids).to(torch.bfloat16)
         attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device="cuda")
 
-        output_cached = model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+        with sdpa_kernel(SDPBackend.MATH):
+            output_cached = model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
 
-        generated = input_ids.clone()
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                out = model(generated, use_cache=False)
-                next_token = out.logits[:, -1:, :].argmax(dim=-1)
-                generated = torch.cat([generated, next_token], dim=1)
-                if next_token.item() == hf_config.eos_token_id:
-                    break
+            generated = input_ids.clone()
+            with torch.no_grad():
+                for _ in range(max_new_tokens):
+                    out = model(generated, use_cache=False)
+                    next_token = out.logits[:, -1:, :].argmax(dim=-1)
+                    generated = torch.cat([generated, next_token], dim=1)
+                    if next_token.item() == hf_config.eos_token_id:
+                        break
 
         expected_new_tokens = generated[:, prompt_len:]
         min_len = min(output_cached.shape[1], expected_new_tokens.shape[1])
