@@ -312,6 +312,11 @@ class GroupedExperts(nn.Module):
             else None
         )
 
+        # Match activation dtype for grouped_mm; covers the case where FSDP2's
+        # MixedPrecisionPolicy does not reach EP DTensors.
+        gate_and_up_projs = gate_and_up_projs.to(x.dtype)
+        down_projs = down_projs.to(x.dtype)
+
         # EP variable-length all-gather
         if ep_size > 1:
             ep_group = ep_mesh.get_group()
@@ -687,6 +692,10 @@ class GroupedExpertsDeepEP(nn.Module):
 
         gate_and_up_projs = self.gate_and_up_projs.to_local()
         down_projs = self.down_projs.to_local()
+
+        # Match activation dtype for grouped_mm; see GroupedExperts.forward.
+        gate_and_up_projs = gate_and_up_projs.to(permuted_local_hidden_states.dtype)
+        down_projs = down_projs.to(permuted_local_hidden_states.dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
