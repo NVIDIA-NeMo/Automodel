@@ -31,6 +31,10 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
+from nemo_automodel._transformers.v4_patches.nemotron_flash_lm_head_norm import (
+    fix_lm_head_norm,
+    should_fix_lm_head_norm,
+)
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -111,6 +115,8 @@ def _apply_runtime_compatibility_fixes(model):
     model_parts = model.parts if hasattr(model, "parts") else [model]
     if should_fix_rotary_embeddings(model_parts):
         fix_rotary_embeddings(model_parts)
+    if should_fix_lm_head_norm(model_parts):
+        fix_lm_head_norm(model_parts)
     return model
 
 

@@ -35,9 +35,14 @@ from transformers.modeling_utils import PreTrainedModel
 if not hasattr(PretrainedConfig, "pad_token_id"):
     PretrainedConfig.pad_token_id = None
 
-from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
+from nemo_automodel._transformers.utils import _patch_layer_types_validator, apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
+# Relax transformers v5 strict ``layer_types`` validation early so that
+# remote-code configs (e.g. nvidia/Nemotron-Flash-1B) with non-canonical
+# taxonomies can be loaded by ``AutoConfig`` / ``AutoTokenizer`` before the
+# recipe gets a chance to call ``apply_cache_compatibility_patches``.
+_patch_layer_types_validator()
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
@@ -74,11 +79,22 @@ def _filter_meta_device_from_init_context(contexts):
     return [c for c in contexts if not (isinstance(c, torch.device) and getattr(c, "type", None) == "meta")]
 
 
+def _is_remote_code_class(cls) -> bool:
+    """Return True if ``cls`` is a dynamically-loaded ``trust_remote_code`` class.
+
+    Such classes live under ``transformers_modules.*`` (the HF module cache)
+    and commonly perform ``.to(device)`` on meta tensors during ``__init__``,
+    which explodes when HF wraps init with ``torch.device("meta")``.
+    """
+    mod = getattr(cls, "__module__", "") or ""
+    return mod.startswith("transformers_modules.") or ".transformers_modules." in mod
+
+
 def _patched_get_init_context(cls, *args, **kwargs):
     """Wrapper around PreTrainedModel.get_init_context that strips meta device when requested."""
     original = _patched_get_init_context.__wrapped__
     contexts = original(cls, *args, **kwargs)
-    if _get_hf_meta_device_disabled():
+    if _get_hf_meta_device_disabled() or _is_remote_code_class(cls):
         return _filter_meta_device_from_init_context(contexts)
     return contexts
 
