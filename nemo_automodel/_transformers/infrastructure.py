@@ -201,6 +201,12 @@ def _instantiate_pipeline(
     config_dict = config.to_dict()
     config_dict.pop("loss_fn", None)
 
+    # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
+    # the same knob controls grad-sync behavior under PP.
+    strategy_config = getattr(mesh, "strategy_config", None)
+    if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
+        config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
+
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
         moe_mesh=mesh.moe_mesh,
