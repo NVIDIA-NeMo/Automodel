@@ -63,7 +63,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
         self.distributed_config = self.dist_setup.strategy_config
         self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
@@ -104,7 +103,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh,
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
@@ -116,7 +114,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )

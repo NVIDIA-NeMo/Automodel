@@ -119,6 +119,8 @@ class MeshContext:
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.moe_mesh is None and self.device_mesh is not None:
+            self.moe_mesh = _derive_moe_mesh(self.device_mesh)
         _validate_mesh_dim_names(self)
         _validate_distributed_setup(self)
 
@@ -197,27 +199,32 @@ class MeshContext:
     def from_meshes(
         cls,
         device_mesh: Optional["DeviceMesh"],
-        moe_mesh: Optional["DeviceMesh"] = None,
         *,
         strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None,
         pipeline_config: Optional["PipelineConfig"] = None,
         moe_config: Optional["MoEParallelizerConfig"] = None,
         activation_checkpointing: bool = False,
     ) -> "MeshContext":
-        """Build a :class:`MeshContext` from ``DeviceMesh`` objects.
-
-        This is the entry-point used by ``NeMoAutoModel.from_pretrained`` /
-        ``from_config`` where the caller has raw meshes rather than a parsed
-        YAML config.
-        """
         return cls(
             strategy_config=strategy_config,
             pipeline_config=pipeline_config,
             moe_config=moe_config,
             activation_checkpointing=activation_checkpointing,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
         )
+
+
+def _derive_moe_mesh(device_mesh: "DeviceMesh") -> "Optional[DeviceMesh]":
+    """Derive the MoE EP mesh from device_mesh when EP dims are present."""
+    if device_mesh is None:
+        return None
+    root = device_mesh._get_root_mesh() if hasattr(device_mesh, "_get_root_mesh") else device_mesh
+    fm = getattr(root, "_flatten_mapping", {})
+    if MeshAxisName.EP in fm:
+        return fm[MeshAxisName.EP]
+    if MeshAxisName.EP in getattr(device_mesh, "mesh_dim_names", ()):
+        return device_mesh
+    return None
 
 
 # misc utils

@@ -156,7 +156,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
         self.distributed_config = self.dist_setup.strategy_config
         self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
@@ -193,13 +192,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh,
         )
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate(
                 device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
                 peft_config=self.peft_config,
             )
@@ -366,8 +363,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
             norm_type=2.0,
             pp_enabled=self.pp_enabled,
             device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            ep_axis_name="ep"
+            if getattr(self, "dist_setup", None) is not None
+            and self.dist_setup.moe_mesh is not None
+            and "ep" in self.dist_setup.moe_mesh.mesh_dim_names
+            else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
             num_label_tokens=None,  # Not applicable for encoder
