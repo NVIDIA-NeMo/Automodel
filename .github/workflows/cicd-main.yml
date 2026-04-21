@@ -213,7 +213,7 @@ jobs:
           REGISTRY_GCP: ${{ env.container-registry-gb200 }}
           IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
         run: |
-          AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "${RUNNER_PREFIX}-gpu-x2" \
+          AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "${RUNNER_PREFIX}" \
             '{"cloud": "aws", "registry": $registry, "runner": $runner}')
           if [[ "$IS_MEMBER" == "true" ]]; then
             GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "nemo-ci-gcp-gpu-x2" \
