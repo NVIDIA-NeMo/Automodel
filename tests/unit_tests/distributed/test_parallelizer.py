@@ -1566,8 +1566,7 @@ class TestExtractModelLayers:
 
         assert len(result) == 3, f"expected 3 flat layers, got {len(result)}"
         assert all(r is layers[i] for i, r in enumerate(result)), (
-            "result should be the individual decoder layer objects, not a "
-            "ModuleList container"
+            "result should be the individual decoder layer objects, not a ModuleList container"
         )
         assert not any(isinstance(r, nn.ModuleList) for r in result)
 
@@ -1613,8 +1612,8 @@ class TestExtractModelLayers:
         result = _extract_model_layers(model)
 
         assert len(result) == 7
-        assert [id(r) for r in result[:5]] == [id(l) for l in lang]
-        assert [id(r) for r in result[5:]] == [id(b) for b in vis]
+        assert [id(r) for r in result[:5]] == [id(item) for item in lang]
+        assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
 
     def test_non_modulelist_element_appended_as_single_entry(self):
