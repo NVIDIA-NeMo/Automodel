@@ -29,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 20
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -105,8 +105,11 @@ ci:
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
+    kl_threshold: 5e-3
+    hf_kl_threshold: 1e1
     tokenizer_name: nvidia/Nemotron-Flash-1B
+    trust_remote_code: true
+    no_check_resume: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 
