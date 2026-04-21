@@ -30,6 +30,9 @@ cd /opt/Automodel
 echo "============================================"
 echo "[data] Downloading dissolve dataset..."
 echo "============================================"
+echo "HF_TOKEN is set: $([ -n "$HF_TOKEN" ] && echo yes || echo no)"
+echo "HF_HOME=$HF_HOME"
+echo "HF_HUB_OFFLINE=$HF_HUB_OFFLINE"
 uv run --extra diffusion python -c "
 from huggingface_hub import snapshot_download
 snapshot_download('modal-labs/dissolve', repo_type='dataset', local_dir='$DATA_DIR/raw')
