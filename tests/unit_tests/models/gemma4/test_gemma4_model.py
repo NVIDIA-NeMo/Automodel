@@ -550,10 +550,8 @@ class TestGemma4ForConditionalGeneration:
             torch.arange(seq, device=device),
         )
 
-    def test_dense_forward_cp_nulls_mm_token_type_ids(self, dense_config, backend_config, device):
-        """Under CP (DTensor input_ids) the dense path must not pass mm_token_type_ids
-        to HF forward, otherwise create_causal_mask_mapping would use the unsharded
-        [B, S_global] tensor against a locally-sharded sequence."""
+    def test_dense_forward_cp_preserves_mm_token_type_ids(self, dense_config, backend_config, device):
+        """Dense Gemma4 should preserve caller-provided mm_token_type_ids."""
         from unittest.mock import patch
 
         if not (torch.distributed.is_available() and torch.cuda.is_available()
@@ -589,9 +587,7 @@ class TestGemma4ForConditionalGeneration:
         ):
             model(input_ids_dt, mm_token_type_ids=mm_token_type_ids)
 
-        assert captured["mm_token_type_ids"] is None, (
-            "mm_token_type_ids must be nulled out when input_ids is a DTensor (CP active)"
-        )
+        torch.testing.assert_close(captured["mm_token_type_ids"], mm_token_type_ids)
 
     def test_moe_forward_cp_nulls_mm_token_type_ids_for_mask(self, gemma4_config, backend_config, device):
         """Under CP (DTensor inputs_embeds) Gemma4MoETextModelBackend must not pass
@@ -729,6 +725,59 @@ class TestGemma4ForConditionalGeneration:
         torch.testing.assert_close(embeds[0, :n_image_tokens], sentinel)
         plain = model.get_input_embeddings()(input_ids)
         torch.testing.assert_close(embeds[0, n_image_tokens:], plain[0, n_image_tokens:])
+
+    def test_prepare_model_inputs_for_cp_builds_per_layer_inputs(self, backend_config, device):
+        """CP pre-processing must build per-layer inputs from pad-masked token ids."""
+        cfg = _make_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=256,
+            pad_token_id=0,
+        )
+        model = Gemma4ForConditionalGeneration(cfg, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+        text_config = cfg.text_config
+
+        batch, seq, n_image_tokens = 1, 6, 2
+        input_ids = torch.randint(4, text_config.vocab_size, (batch, seq), device=device)
+        mm_token_type_ids = torch.zeros(batch, seq, dtype=torch.long, device=device)
+        mm_token_type_ids[:, :n_image_tokens] = 1
+
+        sentinel = torch.full(
+            (n_image_tokens, text_config.hidden_size),
+            3.5,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        fake_vision_output = MagicMock()
+        fake_vision_output.pooler_output = sentinel
+        pixel_values = torch.randn(batch, 3, 32, 32, device=device, dtype=torch.bfloat16)
+
+        with patch.object(model.model, "get_image_features", return_value=fake_vision_output):
+            prepared = model.prepare_model_inputs_for_cp(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        assert set(prepared) == {"inputs_embeds", "per_layer_inputs"}
+        assert prepared["inputs_embeds"].shape == (batch, seq, text_config.hidden_size)
+        assert prepared["per_layer_inputs"].shape == (
+            batch,
+            seq,
+            text_config.num_hidden_layers,
+            text_config.hidden_size_per_layer_input,
+        )
+
+        llm_input_ids = input_ids.masked_fill(mm_token_type_ids == 1, model.pad_token_id)
+        expected_per_layer_inputs = model.model.language_model.embed_tokens_per_layer(llm_input_ids).reshape(
+            batch,
+            seq,
+            text_config.num_hidden_layers,
+            text_config.hidden_size_per_layer_input,
+        )
+        torch.testing.assert_close(prepared["per_layer_inputs"], expected_per_layer_inputs)
+        torch.testing.assert_close(prepared["inputs_embeds"][0, :n_image_tokens], sentinel)
 
 
 # ---------------------------------------------------------------------------

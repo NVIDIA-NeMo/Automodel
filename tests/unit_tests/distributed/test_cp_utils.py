@@ -107,84 +107,46 @@ def test_make_cp_batch_and_ctx_no_mesh():
 
 
 def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
-    """Verify correct interaction when Context-Parallelism *is* enabled."""
-
-    dummy_cp_ctx = object()
-
-    def _fake_create_ctx(**kwargs):  # noqa: D401
-        """Return a sentinel object so we can verify it was passed through."""
-        return dummy_cp_ctx
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-
-    def _fake_get_train_ctx(enable_loss_parallel, enable_compiled_autograd, cp_ctx):  # noqa: D401
-        assert cp_ctx is dummy_cp_ctx, "create_context_parallel_ctx output should feed into get_train_context"
-        return "dummy_train_ctx"
-
-    monkeypatch.setattr(_cu, "get_train_context", _fake_get_train_ctx)
+    """CP should pad and slice the batch locally, then return nullcontext."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
-    labels = torch.tensor([[10, 20, 30]])
-    loss_mask = torch.tensor([[1, 1, 1]])
+    labels = torch.tensor([[10, 20, 30, 40, 50, 60]])
+    loss_mask = torch.tensor([[1, 1, 1, 1, 1, 1]])
     batch = {
-        "input_ids": torch.tensor([[10, 20, 30]]),
+        "input_ids": torch.tensor([[10, 20, 30, 40, 50, 60]]),
         "labels": labels,
     }
 
     ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask)
 
-    # We expect the stub training context to be returned
-    assert ctx_obj == "dummy_train_ctx"
-
-    # The function should have injected position_ids because CP>1
-    assert "position_ids" in new_batch, "position_ids should be added when CP is enabled"
-    expected_pos = torch.arange(batch["input_ids"].shape[1]).unsqueeze(0)
-    assert torch.equal(new_batch["position_ids"], expected_pos)
-
-    # Buffers inside *new_batch* should alias the originals (in-place modification)
+    assert ctx_obj is contextlib.nullcontext
     assert new_batch is batch
+    assert torch.equal(new_batch["input_ids"], torch.tensor([[50, 60, 0, 0]]))
+    assert torch.equal(new_batch["labels"], torch.tensor([[50, 60, -100, -100]]))
+    assert torch.equal(new_batch["position_ids"], torch.tensor([[4, 5, 6, 7]]))
 
 
 def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
-    """Verify that padding_mask is included in CP buffers when present in batch."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
+    """padding_mask should be sliced alongside the other sequence tensors."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    padding_mask = torch.tensor([[True, False, True]])
+    padding_mask = torch.tensor([[True, False, True, False, True, False]])
     batch = {
-        "input_ids": torch.tensor([[10, 20, 30]]),
-        "labels": torch.tensor([[10, 20, 30]]),
+        "input_ids": torch.tensor([[10, 20, 30, 40, 50, 60]]),
+        "labels": torch.tensor([[10, 20, 30, 40, 50, 60]]),
         "padding_mask": padding_mask,
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
 
-    # padding_mask should be in cp_buffers
-    assert any(
-        t is padding_mask for t in captured_kwargs["cp_buffers"]
-    ), "padding_mask must be included in cp_buffers"
-    assert padding_mask in captured_kwargs["cp_no_restore_buffers"]
+    assert torch.equal(new_batch["padding_mask"], torch.tensor([[True, False, True, False]]))
 
 
 def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
-    """Verify that 3D mRoPE position_ids [3, B, S] are sharded on dim 2 (sequence), not dim 1 (batch)."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
+    """3D mRoPE position_ids should shard on their sequence axis."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 6
@@ -196,28 +158,14 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
         "position_ids": position_ids_3d,
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
-    # position_ids should not have been overwritten (already present)
-    assert new_batch["position_ids"] is position_ids_3d
-
-    # The seq dims passed to create_context_parallel_ctx should shard position_ids on dim 2
-    assert "cp_seq_dims" in captured_kwargs
-    # input_ids dim=1, labels dim=1, position_ids dim=2
-    assert captured_kwargs["cp_seq_dims"] == [1, 1, 2]
+    assert torch.equal(new_batch["position_ids"], position_ids_3d.new_tensor([[[4, 5, 6, 7]], [[10, 11, 12, 13]], [[16, 17, 18, 19]]]))
 
 
 def test_make_cp_batch_and_ctx_2d_position_ids_seq_dim(monkeypatch):
-    """Verify that standard 2D position_ids [B, S] are still sharded on dim 1."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
+    """Standard 2D position_ids should shard on dim 1."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 6
@@ -227,23 +175,14 @@ def test_make_cp_batch_and_ctx_2d_position_ids_seq_dim(monkeypatch):
         "position_ids": torch.arange(seq_len).unsqueeze(0),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
-    # Standard 2D: all seq dims should be 1
-    assert captured_kwargs["cp_seq_dims"] == [1, 1, 1]
+    assert torch.equal(new_batch["position_ids"], torch.tensor([[0, 1, 2, 3]]))
 
 
 def test_make_cp_batch_and_ctx_3d_mrope_with_loss_mask(monkeypatch):
-    """Verify 3D mRoPE position_ids work correctly with loss_mask."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
+    """3D mRoPE should still work when loss_mask is provided."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 4
@@ -255,34 +194,45 @@ def test_make_cp_batch_and_ctx_3d_mrope_with_loss_mask(monkeypatch):
         "position_ids": position_ids_3d,
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=loss_mask)
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=loss_mask)
 
-    # input_ids dim=1, labels dim=1, position_ids dim=2, loss_mask dim=1
-    assert captured_kwargs["cp_seq_dims"] == [1, 1, 2, 1]
+    assert torch.equal(new_batch["position_ids"], position_ids_3d[:, :, :2])
 
 
 def test_make_cp_batch_and_ctx_pops_attention_mask_when_cp_enabled(monkeypatch):
     """When CP is enabled, attention_mask should be removed from the batch."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "labels": torch.tensor([[1, 2, 3]]),
-        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
     }
 
     _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
     assert "attention_mask" not in new_batch, "attention_mask should be removed when CP > 1"
+
+
+def test_make_cp_batch_and_ctx_slices_mm_token_type_ids_and_per_layer_inputs(monkeypatch):
+    """CP slicing must keep multimodal metadata aligned with the local shard."""
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    per_layer_inputs = torch.arange(1 * 6 * 2 * 3, dtype=torch.float32).view(1, 6, 2, 3)
+    batch = {
+        "inputs_embeds": torch.arange(1 * 6 * 4, dtype=torch.float32).view(1, 6, 4),
+        "labels": torch.arange(6).view(1, 6),
+        "mm_token_type_ids": torch.tensor([[1, 1, 0, 0, 0, 0]]),
+        "per_layer_inputs": per_layer_inputs,
+    }
+
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert torch.equal(new_batch["mm_token_type_ids"], torch.tensor([[0, 0, 0, 0]]))
+    expected_per_layer_inputs = torch.nn.functional.pad(per_layer_inputs, (0, 0, 0, 0, 0, 2))[:, 4:8]
+    assert torch.equal(new_batch["per_layer_inputs"], expected_per_layer_inputs)
 
 
 # ============================================================================

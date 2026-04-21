@@ -569,9 +569,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         **kwargs: Any,
     ):
         if _pre_embed_only:
-            return self.prepare_inputs_embeds_for_cp(
-                input_ids, pixel_values, image_position_ids, mm_token_type_ids
-            )
+            return self.prepare_model_inputs_for_cp(input_ids, pixel_values, image_position_ids, mm_token_type_ids)
 
         if cache_position is None:
             if input_ids is not None:
@@ -585,15 +583,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if not getattr(text_config, "enable_moe_block", False):
             # Dense path — delegate to HF forward.
             # Under context parallelism the sequence dimension of input_ids is
-            # sharded as a DTensor.  Two CP-specific adjustments are needed:
-            #
-            # 1. mm_token_type_ids: HF's create_causal_mask_mapping uses this
-            #    (shape [B, S_global]) to build a bidirectional vision mask, but
-            #    hidden_states only covers the local S/cp shard, making the mask
-            #    inconsistent across ranks.  Nulling it forces a standard causal
-            #    mask; the self_attn hook set is_causal=True for SDPA.
-            #
-            # 2. pixel_values: HF will call masked_scatter to insert image
+            # sharded as a DTensor. HF will call masked_scatter to insert image
             #    features into the DTensor inputs_embeds.  After CP sharding each
             #    rank holds a different slice of the sequence, so the number of
             #    image-token slots per rank is unknown at this point and
@@ -606,7 +596,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
                 _under_cp = isinstance(input_ids, DTensor) or isinstance(inputs_embeds, DTensor)
                 if _under_cp:
-                    _mm_token_type_ids = None
                     if pixel_values is not None:
                         raise NotImplementedError(
                             "Context parallelism with pixel_values is not yet supported for the "
@@ -617,21 +606,25 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             except ImportError:
                 pass
 
-            # HF's create_causal_mask_mapping raises ValueError when mm_token_type_ids
-            # is None during training.  Synthesize all-zeros (= no image tokens =
-            # standard causal mask) when the caller did not provide one (text-only
-            # data) or when we nulled it above for CP consistency.
             if _mm_token_type_ids is None:
-                _ref = input_ids if input_ids is not None else inputs_embeds
-                try:
-                    from torch.distributed.tensor import DTensor
+                if pixel_values is not None:
+                    if input_ids is None:
+                        raise ValueError(
+                            "mm_token_type_ids is required when pixel_values have already been merged into "
+                            "inputs_embeds."
+                        )
+                    _mm_token_type_ids = (input_ids == self.config.image_token_id).to(torch.long)
+                else:
+                    _ref = input_ids if input_ids is not None else inputs_embeds
+                    try:
+                        from torch.distributed.tensor import DTensor
 
-                    if isinstance(_ref, DTensor):
-                        _ref = _ref.to_local()
-                except ImportError:
-                    pass
-                _seq_shape = _ref.shape if _ref.dim() == 2 else _ref.shape[:2]
-                _mm_token_type_ids = torch.zeros(_seq_shape, dtype=torch.long, device=_ref.device)
+                        if isinstance(_ref, DTensor):
+                            _ref = _ref.to_local()
+                    except ImportError:
+                        pass
+                    _seq_shape = _ref.shape if _ref.dim() == 2 else _ref.shape[:2]
+                    _mm_token_type_ids = torch.zeros(_seq_shape, dtype=torch.long, device=_ref.device)
 
             return super().forward(
                 input_ids=input_ids,
@@ -708,6 +701,58 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         return logits
 
+    def _get_special_image_mask(
+        self,
+        input_ids: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if mm_token_type_ids is not None:
+            return mm_token_type_ids == 1
+        return input_ids == self.config.image_token_id
+
+    def _prepare_per_layer_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        special_image_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is None or not getattr(language_model, "hidden_size_per_layer_input", None):
+            return None
+
+        pad_token_id = getattr(self, "pad_token_id", None)
+        if pad_token_id is None or pad_token_id < 0:
+            raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
+
+        llm_input_ids = input_ids.masked_fill(special_image_mask, pad_token_id)
+        return language_model.get_per_layer_inputs(llm_input_ids, None)
+
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Prepare model inputs before CP sequence sharding."""
+        special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+        prepared_inputs = {"inputs_embeds": inputs_embeds}
+
+        per_layer_inputs = self._prepare_per_layer_inputs_for_cp(input_ids, special_image_mask)
+        if per_layer_inputs is not None:
+            prepared_inputs["per_layer_inputs"] = per_layer_inputs
+
+        if pixel_values is not None:
+            image_features = self.model.get_image_features(
+                pixel_values, image_position_ids=image_position_ids, return_dict=True
+            ).pooler_output
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+            image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            prepared_inputs["inputs_embeds"] = inputs_embeds.masked_scatter(image_mask, image_features)
+
+        return prepared_inputs
+
     def prepare_inputs_embeds_for_cp(
         self,
         input_ids: torch.Tensor,
@@ -724,23 +769,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         the full unsharded batch before make_cp_batch_and_ctx, then pass
         inputs_embeds to the model instead of input_ids + pixel_values.
         """
-        inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None:
-            image_features = self.model.get_image_features(
-                pixel_values, image_position_ids=image_position_ids, return_dict=True
-            ).pooler_output
-            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-
-            if mm_token_type_ids is not None:
-                special_image_mask = mm_token_type_ids == 1
-            else:
-                special_image_mask = input_ids == self.config.image_token_id
-
-            image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
-
-        return inputs_embeds
+        return self.prepare_model_inputs_for_cp(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
+            mm_token_type_ids=mm_token_type_ids,
+        )["inputs_embeds"]
 
     @torch.no_grad()
     def initialize_weights(
