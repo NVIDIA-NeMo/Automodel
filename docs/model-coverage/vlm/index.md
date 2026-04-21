@@ -24,6 +24,7 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 |---|---|---|
 | Moonshot AI | [Kimi-VL](moonshotai/kimi-vl.md) | `KimiVLForConditionalGeneration` |
 | Google | [Gemma 3 VL / Gemma 3n](google/gemma3-vl.md) | `Gemma3ForConditionalGeneration` |
+| Google | [Gemma 4](google/gemma4.md) | `Gemma4ForConditionalGeneration` |
 | Qwen / Alibaba Cloud | [Qwen2.5-VL](qwen/qwen2-5-vl.md) | `Qwen2VLForConditionalGeneration`, `Qwen2_5VLForConditionalGeneration` |
 | Qwen / Alibaba Cloud | [Qwen3-VL / Qwen3-VL-MoE](qwen/qwen3-vl.md) | `Qwen3VLForConditionalGeneration` |
 | Qwen / Alibaba Cloud | [Qwen3.5-VL](qwen/qwen3-5-vl.md) | `Qwen3_5VLForConditionalGeneration`, `Qwen3_5MoeVLForConditionalGeneration` |
@@ -34,6 +35,7 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 | Meta | [Llama 4](meta/llama4.md) | `Llama4ForConditionalGeneration` |
 | HuggingFace | [SmolVLM](huggingface/smolvlm.md) | `SmolVLMForConditionalGeneration` |
 | LLaVA | [LLaVA](llava-hf/llava.md) | `LlavaForConditionalGeneration`, `LlavaNextForConditionalGeneration`, `LlavaNextVideoForConditionalGeneration`, `LlavaOnevisionForConditionalGeneration` |
+| lmms-lab | [LLaVA-OneVision 1.5](lmms-lab/llava-onevision.md) | `LlavaOneVisionForConditionalGeneration` |
 
 ## Fine-Tuning
 
@@ -48,6 +50,7 @@ In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` da
 
 moonshotai/kimi-vl
 google/gemma3-vl
+google/gemma4
 qwen/qwen2-5-vl
 qwen/qwen3-vl
 qwen/qwen3-5-vl
@@ -58,4 +61,5 @@ internlm/internvl
 meta/llama4
 huggingface/smolvlm
 llava-hf/llava
+lmms-lab/llava-onevision
 ```
