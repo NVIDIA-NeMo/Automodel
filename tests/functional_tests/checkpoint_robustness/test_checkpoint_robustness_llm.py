@@ -234,6 +234,48 @@ def _fix_meta_rotary_embeddings(model):
     return model
 
 
+def _prepopulate_hf_dynamic_modules_cache(local_dir: Path | str) -> None:
+    """Copy every ``.py`` from ``local_dir`` into HF's dynamic-modules cache.
+
+    Works around a transformers<=5.5.x bug in the local-dir branch of
+    ``dynamic_module_utils.get_cached_module_file``: it only copies the
+    modeling file's *direct* relative imports into
+    ``HF_MODULES_CACHE/transformers_modules/<submodule>/``. Transitive
+    imports (e.g. ``fused_mha_with_cache.py`` imports ``.triton_attention``)
+    are later discovered by ``get_relative_import_files`` at module-load
+    time and fail with ``FileNotFoundError`` because they never got copied.
+
+    Pre-seeding the cache dir with all ``.py`` files from the consolidated
+    dir makes the filecmp-gated copies no-ops and ensures every transitive
+    import is resolvable.
+    """
+    import shutil
+
+    try:
+        from transformers.dynamic_module_utils import (
+            HF_MODULES_CACHE,
+            TRANSFORMERS_DYNAMIC_MODULE_NAME,
+            _sanitize_module_name,
+        )
+    except ImportError:
+        return
+
+    local_dir = Path(local_dir)
+    if not local_dir.is_dir():
+        return
+    submodule = _sanitize_module_name(local_dir.name)
+    dst = Path(HF_MODULES_CACHE) / TRANSFORMERS_DYNAMIC_MODULE_NAME / submodule
+    dst.mkdir(parents=True, exist_ok=True)
+    for src_py in local_dir.rglob("*.py"):
+        if src_py.name == "__init__.py":
+            continue
+        rel = src_py.relative_to(local_dir)
+        dst_py = dst / rel
+        dst_py.parent.mkdir(parents=True, exist_ok=True)
+        if not dst_py.exists():
+            shutil.copy2(src_py, dst_py)
+
+
 def _rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -316,11 +358,15 @@ def test_checkpoint_robustness():
     # Pre-populate HF dynamic module cache on rank 0 to prevent filesystem races
     # when all ranks simultaneously load trust_remote_code models from local paths.
     # On shared filesystems (e.g. Lustre), concurrent shutil.copy2 calls from
-    # multiple ranks cause PermissionError.
+    # multiple ranks cause PermissionError. Also seed all transitive .py
+    # imports so transformers' local-dir branch (which only copies direct
+    # imports of the modeling file) doesn't fail on files imported
+    # indirectly (e.g. Nemotron-Flash's triton_attention.py).
     if not is_peft:
         if _rank0():
             from transformers import AutoConfig
 
+            _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
             try:
                 AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
             except Exception:
@@ -390,6 +436,7 @@ def test_checkpoint_robustness():
 
             del peft_model, base_model
         else:
+            _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
             if hf_device_map_auto:
                 hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
             else:
