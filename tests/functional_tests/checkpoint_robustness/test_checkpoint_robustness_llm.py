@@ -58,7 +58,13 @@ def _extract_custom_args(argv):
         "--max_cpu_gb",
         "--resume_loss_threshold",
     }
-    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume", "--hf_device_map_auto"}
+    boolean_keys = {
+        "--trust_remote_code",
+        "--check_fused_qkv_keys",
+        "--check_phantom_keys",
+        "--check_resume",
+        "--hf_device_map_auto",
+    }
     custom = {}
     remaining = []
     i = 0
@@ -164,6 +170,36 @@ def _fix_meta_rotary_embeddings(model):
     return model
 
 
+def _tp_size_from_argv(argv) -> int:
+    """Peek at --distributed.tp_size / --config YAML without constructing the cfg.
+
+    Returns 1 if no TP setting is found. Used before cfg parsing to pick a
+    reasonable default kl_threshold.
+    """
+    for i, a in enumerate(argv):
+        if a == "--distributed.tp_size" and i + 1 < len(argv):
+            try:
+                return int(argv[i + 1])
+            except (TypeError, ValueError):
+                return 1
+    config_path = None
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            config_path = argv[i + 1]
+            break
+    if config_path:
+        try:
+            import yaml
+
+            with open(config_path) as f:
+                raw_cfg = yaml.safe_load(f) or {}
+            tp = (raw_cfg.get("distributed") or {}).get("tp_size", 1)
+            return int(tp) if tp is not None else 1
+        except Exception:
+            pass
+    return 1
+
+
 def _rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -177,7 +213,15 @@ def test_checkpoint_robustness():
     """Train -> checkpoint -> reload automodel from consolidated -> reload vanilla HF, compare logits."""
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
-    kl_threshold = float(custom_args.get("kl_threshold", "0"))
+    # When tensor parallelism is active the forward pass uses row-parallel
+    # all-reduces and cuBLASLt plan caches whose order of accumulation is
+    # process-dependent; this produces ULP-level bf16 drift between the
+    # trainer's and restored model's logits even with bit-identical weights.
+    # Use a small tolerance when TP>1; keep strict 0 otherwise so real
+    # save/load regressions in non-TP setups still fail.
+    _tp_size = _tp_size_from_argv(config_argv)
+    _default_kl_threshold = "1e-5" if _tp_size > 1 else "0"
+    kl_threshold = float(custom_args.get("kl_threshold", _default_kl_threshold))
     hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
@@ -207,13 +251,9 @@ def test_checkpoint_robustness():
     if _rank0():
         print(f"\n[Memory] Peak VRAM: {peak_vram_gb:.2f} GB, Peak CPU RSS: {peak_cpu_gb:.2f} GB")
     if max_vram_gb > 0:
-        assert peak_vram_gb <= max_vram_gb, (
-            f"Peak VRAM {peak_vram_gb:.2f} GB exceeds threshold {max_vram_gb:.2f} GB"
-        )
+        assert peak_vram_gb <= max_vram_gb, f"Peak VRAM {peak_vram_gb:.2f} GB exceeds threshold {max_vram_gb:.2f} GB"
     if max_cpu_gb > 0:
-        assert peak_cpu_gb <= max_cpu_gb, (
-            f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
-        )
+        assert peak_cpu_gb <= max_cpu_gb, f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
 
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
@@ -441,9 +481,7 @@ def test_checkpoint_robustness():
                     bl = baseline_losses[step]
                     rl = resume_losses[step]
                     diff = abs(bl - rl)
-                    print(
-                        f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}"
-                    )
+                    print(f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}")
                     if not is_peft:
                         assert diff < resume_loss_threshold, (
                             f"SFT loss mismatch after resume at step {step}: "
