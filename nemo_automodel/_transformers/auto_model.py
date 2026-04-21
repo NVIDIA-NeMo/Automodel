@@ -321,6 +321,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 has_packed_sequence,
                 attn_implementation,
                 use_liger_kernel,
+                model_name_or_path=(
+                    pretrained_model_name_or_path_or_config
+                    if isinstance(pretrained_model_name_or_path_or_config, str)
+                    else None
+                ),
             )
         device = torch.cuda.current_device()
 

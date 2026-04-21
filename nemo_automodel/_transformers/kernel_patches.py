@@ -209,7 +209,15 @@ def _get_next_fallback_attn(attn_implementation: str) -> str:
         return priorities[0]
 
 
-def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_implementation, use_liger_kernel):
+def _apply_preload_overrides(
+    tp_size,
+    cp_size,
+    has_packed_sequence,
+    attn_implementation,
+    use_liger_kernel,
+    *,
+    model_name_or_path=None,
+):
     """
     Compute final attention implementation and liger-kernel flag based on TP/CP and packed sequence constraints.
     """
@@ -224,6 +232,18 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
     if has_packed_sequence:
         if cp_size == 1:
             assert HAS_FA, "Flash Attention is not available"
+            # If we reach here on a retry (the fallback cascade already picked a non-FA
+            # backend because the model's FA2 init raised), forcing FA2 again would re-enter
+            # the same failure and exhaust retries. Fail fast with an actionable message.
+            if attn_implementation not in (None, "flash_attention_2", "flash_attention_3"):
+                model_str = f" ({model_name_or_path!r})" if model_name_or_path else ""
+                raise ValueError(
+                    f"Packed sequences require Flash Attention, but the model{model_str} "
+                    f"does not support Flash Attention 2 or 3 "
+                    f"(fallback picked attn_implementation={attn_implementation!r}). "
+                    f"Disable packed sequences (set packed_sequence.packed_sequence_size=0 "
+                    f"or remove the packed_sequence block) or use a model with FA2/FA3 support."
+                )
             attn_implementation = "flash_attention_2"
             logger.warning(
                 "Packed sequence is supported only with Flash Attention. "
