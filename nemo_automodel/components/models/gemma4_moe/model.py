@@ -542,6 +542,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         self.vocab_size = text_config.vocab_size
         pad_token_id = getattr(text_config, "pad_token_id", None)
+        if pad_token_id is None:
+            eos = getattr(text_config, "eos_token_id", None)
+            if isinstance(eos, (list, tuple)):
+                eos = eos[0]
+            pad_token_id = eos
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         # State dict adapter for HF ↔ NeMo weight conversion
