@@ -1111,6 +1111,7 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
             attn = layer.self_attn
             if hasattr(attn, "num_heads"):
                 attn.num_heads = local_num_attention_heads
+            layer_num_kv_heads = None
             if hasattr(attn, "num_key_value_heads"):
                 # Use config's value if set, else derive from local num_heads and num_key_value_groups (e.g. DeciLM)
                 if local_num_key_value_heads is not None:
@@ -1119,6 +1120,44 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
                     attn.num_key_value_heads = local_num_attention_heads // attn.num_key_value_groups
                 else:
                     attn.num_key_value_heads = local_num_attention_heads
+                layer_num_kv_heads = attn.num_key_value_heads
+            _update_te_attn_module_for_tp(
+                getattr(attn, "attn_module", None),
+                local_num_attention_heads=local_num_attention_heads,
+                local_num_kv_heads=layer_num_kv_heads if layer_num_kv_heads is not None else local_num_attention_heads,
+                head_dim=config.head_dim,
+            )
+
+
+def _update_te_attn_module_for_tp(
+    attn_module,
+    local_num_attention_heads: int,
+    local_num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Update TE ``DotProductAttention`` internals to per-rank counts post-TP.
+
+    TE's DPA caches ``num_attention_heads_per_partition`` / ``num_gqa_groups_per_partition``
+    from init, and asserts K/V has that many heads at forward time. Our attention layers
+    initialize TE with the global (pre-TP) counts; after ColwiseParallel shards q/k/v_proj,
+    the per-rank K/V head count no longer matches the cached value and TE asserts
+    ``Keys and values must have num_gqa_group = N heads!``. Overwrite the cached fields
+    so the forward-time asserts line up with the actual sharded shapes.
+    """
+    if attn_module is None:
+        return
+    try:
+        from transformer_engine.pytorch.attention import DotProductAttention
+    except ImportError:
+        return
+    if not isinstance(attn_module, DotProductAttention):
+        return
+    attn_module.num_attention_heads_per_partition = local_num_attention_heads
+    attn_module.num_gqa_groups_per_partition = local_num_kv_heads
+    if hasattr(attn_module, "num_gqa_groups"):
+        attn_module.num_gqa_groups = local_num_kv_heads
+    if hasattr(attn_module, "hidden_size_per_partition"):
+        attn_module.hidden_size_per_partition = local_num_attention_heads * head_dim
 
 
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):

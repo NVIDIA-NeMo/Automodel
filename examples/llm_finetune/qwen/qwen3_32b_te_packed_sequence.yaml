@@ -101,3 +101,4 @@ optimizer:
 
 ci:
   recipe_owner: akoumparouli
+  nodes: 2  # tp=4 * cp=2 = 8 GPUs; GB200 runners expose 4 GPUs/node.
