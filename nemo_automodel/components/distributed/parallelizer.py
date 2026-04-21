@@ -17,7 +17,7 @@ import logging
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import lru_cache, reduce
+from functools import lru_cache
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
@@ -432,9 +432,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
         def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
-            if isinstance(module, nn.ModuleList):
-                for layer_id, child in enumerate(module):
-                    if isinstance(child, nn.ModuleList):
+            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
+                for layer_id, child in items:
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
                         _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
                     else:
                         parallelizer_utils.fully_shard_by_dtype(
@@ -890,6 +891,10 @@ def get_hf_tp_shard_plan(model):
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
 
+    elif model_cls.__name__ == "Qwen3_5ForConditionalGeneration":
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+
     else:
         inner_model = model.model
         model_prefix = "model"
@@ -941,7 +946,13 @@ def get_hf_tp_shard_plan(model):
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            translated_plan[k] = translate_to_torch_parallel_style(v)
+            style = translate_to_torch_parallel_style(v)
+            # Translator returns None for styles that should be skipped (e.g.
+            # "replicated_with_grad_allreduce" under FSDP where leaving the
+            # param un-wrapped is equivalent).
+            if style is None:
+                continue
+            translated_plan[k] = style
 
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
@@ -1002,6 +1013,13 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
         return SequenceParallel()
+    elif style == "replicated_with_grad_allreduce":
+        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
+        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
+        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
+        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
+        # the TP mesh, no TP-level collective is needed in forward.
+        return None
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
@@ -1241,7 +1259,13 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ans = []
         for fqn in fqns:
             parts = fqn.split(".")
-            ans.append(reduce(getattr, parts, model))
+            obj = model
+            for part in parts:
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                ans.append(obj)
         return ans
 
     # Gemma3 layer paths depend on transformers version
@@ -1268,6 +1292,10 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+        # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
+        # module load (which would defeat test monkeypatches that stub the
+        # module before first import).
+        "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
