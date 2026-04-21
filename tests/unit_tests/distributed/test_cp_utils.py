@@ -401,7 +401,8 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
             return torch.arange(total_tokens)
 
     import sys
-    sys.modules['transformer_engine_torch'] = MockTex
+
+    sys.modules["transformer_engine_torch"] = MockTex
 
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
 
