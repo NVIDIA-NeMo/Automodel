@@ -631,6 +631,37 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     _seq_shape = _ref.shape if _ref.dim() == 2 else _ref.shape[:2]
                     _mm_token_type_ids = torch.zeros(_seq_shape, dtype=torch.long, device=_ref.device)
 
+            # Pop pre-computed per_layer_inputs before any forward call.
+            # Gemma4Model.forward does NOT accept per_layer_inputs and passes **kwargs
+            # straight into language_model(..., **kwargs), which would cause
+            # "got multiple values for argument 'per_layer_inputs'" if we left it in.
+            _per_layer_inputs = kwargs.pop("per_layer_inputs", None)
+
+            # CP fast-path: when inputs_embeds is provided without input_ids and
+            # per_layer_inputs is already pre-computed by prepare_model_inputs_for_cp,
+            # bypass Gemma4Model.forward entirely.  That function always recomputes
+            # per_layer_inputs via get_per_layer_inputs(input_ids=None, inputs_embeds)
+            # which — because input_ids is None — reverse-engineers token ids by
+            # broadcasting inputs_embeds against the full vocab embedding matrix
+            # ([B, S, vocab_size, H]), allocating ~1280 GiB and OOM-ing.
+            if _per_layer_inputs is not None and inputs_embeds is not None and input_ids is None:
+                _text_outputs = self.model.language_model(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds,
+                    per_layer_inputs=_per_layer_inputs,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+                hidden_states = _text_outputs.last_hidden_state
+                logits = self.lm_head(hidden_states)
+                if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
+                    logits = logits / final_logit_softcapping
+                    logits = torch.tanh(logits)
+                    logits = logits * final_logit_softcapping
+                return logits
+
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
