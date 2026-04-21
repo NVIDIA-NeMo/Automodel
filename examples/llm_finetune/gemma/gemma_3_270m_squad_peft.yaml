@@ -103,7 +103,17 @@ ci:
   recipe_owner: HuiyingLi
   time: "00:20:00"
   checkpoint_robustness:
-    hf_kl_threshold: 8e-3
+    # Bumped from 8e-3 to 3.5e-2 after the transformers v5.5 upgrade (#1734).
+    # Same root cause as the non-PEFT sibling (#1932): with v5.5's Gemma3 text-only
+    # stack, the training-time forward (FSDP2 + kernel patches) and the vanilla HF
+    # eager forward diverge numerically even when saved weights match bit-for-bit
+    # (Phase 3 automodel-from-consolidated KL is still 0). For the PEFT variant
+    # Phase 4 additionally composes a LoRA adapter on top of a freshly-loaded HF
+    # base, which amplifies the drift further when the YAML runs with its
+    # example-level max_steps=100 (observed ~2.8e-2 on cw-dfw). Under the CI
+    # launcher's robustness override (max_steps=5) observed Phase 4 KL is
+    # 8.44e-3; keep enough headroom to cover both use cases.
+    hf_kl_threshold: 3.5e-2
     tokenizer_name: google/gemma-3-270m
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
