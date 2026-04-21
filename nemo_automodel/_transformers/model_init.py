@@ -244,7 +244,7 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
     config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
     n = config_dict.get("num_hidden_layers")
     lt = config_dict.get("layer_types")
-    if isinstance(n, int) and isinstance(lt, list) and len(lt) != n:
+    if isinstance(n, int) and isinstance(lt, list) and len(lt) > n:
         logger.warning(
             "Truncating layer_types (len=%d) to num_hidden_layers=%d for %s",
             len(lt),
