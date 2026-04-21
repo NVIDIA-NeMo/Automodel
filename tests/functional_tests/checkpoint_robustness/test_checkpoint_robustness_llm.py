@@ -268,6 +268,12 @@ def test_checkpoint_robustness():
 
     is_peft = hasattr(cfg, "peft")
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
+    # Some FP8-quantized checkpoints (e.g. ministral3) require dequantize=True
+    # at load time to avoid a Triton-only FP8 matmul kernel dispatch in the
+    # vanilla HF forward pass (Phase 4).  Forward the config's quantization
+    # block to hf_kwargs below so the Phase-4 HF load takes the same
+    # FP8->bf16 path as Phase 1/3.
+    original_quantization_config = getattr(cfg.model, "quantization_config", None)
 
     del trainer
     gc.collect()
@@ -334,6 +340,8 @@ def test_checkpoint_robustness():
             hf_kwargs["trust_remote_code"] = False
         if hf_device_map_auto:
             hf_kwargs["device_map"] = "auto"
+        if original_quantization_config is not None:
+            hf_kwargs["quantization_config"] = original_quantization_config
 
         if is_peft:
             from peft import PeftModel
