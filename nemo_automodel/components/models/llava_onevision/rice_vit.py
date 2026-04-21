@@ -370,11 +370,17 @@ class RiceTransformer(nn.Module):
         for blk in self.blocks:
             hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
 
-        # Strip the per-segment CLS tokens before merging
+        # Strip the per-segment CLS tokens before merging. ``hidden_states`` is
+        # laid out as [CLS, p_0, p_1, ..., p_{k-1}] per segment in the post-CLS
+        # packed sequence, so source indices must come from ``cu_seqlens`` (which
+        # includes the +1 per segment). Using ``cu`` as the source would land on
+        # the next segment's CLS for any image after the first.
         stripped = hidden_states.new_empty((img_feats, D))
         for i in range(1, num_segments + 1):
-            seg_start = cu[i - 1].item()
-            seg_end = cu[i].item()
-            stripped[seg_start:seg_end] = hidden_states[seg_start + 1 : seg_end + 1]
+            orig_start = cu[i - 1].item()
+            orig_end = cu[i].item()
+            new_start = cu_seqlens[i - 1].item()
+            new_end = cu_seqlens[i].item()
+            stripped[orig_start:orig_end] = hidden_states[new_start + 1 : new_end]
 
         return self.merger(stripped)

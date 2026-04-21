@@ -180,6 +180,55 @@ def test_forward_pass_with_image(config, model):
     return True
 
 
+def test_forward_pass_with_multiple_images(config, model):
+    """Test 3b: Multi-image forward pass exercises the per-segment CLS-strip path.
+
+    With a single image the strip loop only runs once, so ``hidden_states[s+1:e+1]``
+    happens to be correct. With >=2 images, reading the source slice from the
+    pre-CLS ``cu`` instead of the post-CLS ``cu_seqlens`` drops the tail patch of
+    each later segment and pulls in the next segment's CLS.
+    """
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("Test 3b: Forward Pass with Multiple Image Features")
+    logger.info("=" * 80)
+
+    batch_size = 1
+    seq_len = 32
+    # Two images: 4 patches each pre-merge, 1 token each post spatial_merge_size=2.
+    image_grid_thw = torch.tensor([[1, 2, 2], [1, 2, 2]])
+    total_patches = int((image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]).sum().item())
+    pixel_values = torch.randn(total_patches, 3 * 14 * 14)
+
+    input_ids = torch.randint(0, config.text_config.vocab_size, (batch_size, seq_len))
+    input_ids[0, 5] = config.image_token_id  # first image placeholder
+    input_ids[0, 15] = config.image_token_id  # second image placeholder
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            return_dict=True,
+        )
+
+    assert outputs.logits.shape == (batch_size, seq_len, config.text_config.vocab_size), (
+        f"Expected logits shape {(batch_size, seq_len, config.text_config.vocab_size)}, got {outputs.logits.shape}"
+    )
+    assert torch.isfinite(outputs.logits).all().item(), "Non-finite logits with multi-image input."
+
+    logger.info("  ✓ Multi-image forward pass successful")
+    logger.info(f"    - Grid THW: {image_grid_thw.tolist()}")
+    logger.info(f"    - Pixel patches: {total_patches}")
+    logger.info(f"    - Logits shape: {outputs.logits.shape}")
+
+    return True
+
+
 def test_collate_function():
     """Test 4: Verify collate function works correctly."""
     logger.info("")
@@ -299,6 +348,9 @@ def main():
 
         # Test 3: Forward pass with image
         results["Forward Pass (Image)"] = test_forward_pass_with_image(config, model)
+
+        # Test 3b: multi-image regression — covers the per-segment CLS-strip path.
+        results["Forward Pass (Multi-Image)"] = test_forward_pass_with_multiple_images(config, model)
 
         # Test 4: Collate function
         results["Collate Function"] = test_collate_function()
