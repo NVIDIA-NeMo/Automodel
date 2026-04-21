@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma4-cp4-test
+  namespace: default          # 改成你自己的 namespace
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed     # 每个 Pod 自动获得 JOB_COMPLETION_INDEX=0/1/2/3
+  backoffLimit: 0             # 任意一个 Pod 失败就停整个 Job
+  template:
+    spec:
+      restartPolicy: Never
+      hostNetwork: true       # Pod 直接用宿主机网络，节点间可互通
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # ---- 把 rank-0 固定到主节点 ----
+      # 先查主节点名：kubectl get node -o wide | grep 10.178.157.101
+      # 然后把 <master-node-name> 替换成实际值
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                job-name: gemma4-cp4-test
+            topologyKey: kubernetes.io/hostname  # 每个节点最多1个Pod
+
+      containers:
+      - name: trainer
+        # ---- 替换成你们集群的训练镜像 ----
+        image: nvcr.io/nvidia/nemo:25.04          # 示例，改成实际镜像
+        imagePullPolicy: IfNotPresent
+
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+          requests:
+            nvidia.com/gpu: "8"
+
+        env:
+        - name: MASTER_ADDR
+          value: "10.178.157.101"
+        - name: MASTER_PORT
+          value: "29500"
+        - name: WORLD_SIZE
+          value: "32"
+        - name: NODE_RANK                        # 从 Indexed Job 注入
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        # 常见 NCCL 调优
+        - name: NCCL_DEBUG
+          value: "WARN"
+        - name: NCCL_IB_DISABLE
+          value: "0"
+        - name: NCCL_NET_GDR_LEVEL
+          value: "5"
+        - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+          value: "1"
+
+        command:
+        - bash
+        - -c
+        - |
+          set -e
+          # JOB_COMPLETION_INDEX 是字符串，赋值给 NODE_RANK
+          export NODE_RANK=${JOB_COMPLETION_INDEX}
+
+          torchrun \
+            --nnodes=4 \
+            --nproc-per-node=8 \
+            --node-rank=${NODE_RANK} \
+            --rdzv-backend=c10d \
+            --rdzv-endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+            nemo_automodel/recipes/vlm/finetune.py \
+            -c examples/vlm_finetune/gemma4/gemma4_E4B_cp4_mock_image.yaml
+
+        workingDir: /workspace/Automodel   # 改成代码在容器里的路径
+
+        volumeMounts:
+        - name: model-store
+          mountPath: /llm-align              # 挂载模型目录
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: model-store
+        # 改成你们集群实际的 PVC 或 hostPath
+        persistentVolumeClaim:
+          claimName: llm-align-pvc          # 或换成 hostPath: { path: /llm-align }
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi                   # H100 节点给大一点
