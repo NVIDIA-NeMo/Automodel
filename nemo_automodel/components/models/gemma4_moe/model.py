@@ -523,6 +523,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         text_config = config.text_config if hasattr(config, "text_config") else config
         enable_moe = getattr(text_config, "enable_moe_block", False)
 
+        pad_token_id = getattr(text_config, "pad_token_id", None)
+        if pad_token_id is None:
+            eos = getattr(text_config, "eos_token_id", None)
+            if isinstance(eos, (list, tuple)):
+                eos = eos[0]
+            pad_token_id = eos
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
+
         if not enable_moe:
             # Dense Gemma4 — keep vanilla HF model, nothing else to do.
             return
@@ -541,13 +549,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         self.model.moe_config = self.model.language_model.moe_config
 
         self.vocab_size = text_config.vocab_size
-        pad_token_id = getattr(text_config, "pad_token_id", None)
-        if pad_token_id is None:
-            eos = getattr(text_config, "eos_token_id", None)
-            if isinstance(eos, (list, tuple)):
-                eos = eos[0]
-            pad_token_id = eos
-        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         # State dict adapter for HF ↔ NeMo weight conversion
         if self.backend.enable_hf_state_dict_adapter:
