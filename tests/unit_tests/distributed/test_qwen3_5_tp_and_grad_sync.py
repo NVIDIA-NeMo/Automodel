@@ -133,18 +133,18 @@ class TestExtractModelLayersStringFallbackAndNoneSafe:
     def test_string_fallback_recovers_both_paths(self):
         model = self._make_fake_qwen35(visual_is_none=False)
         layers = parallelizer._extract_model_layers(model)
-        # layers list should contain both the language_model.layers and the
-        # visual.blocks ModuleLists (2 container objects).
+        # After #1941 each ModuleList is flattened into its per-layer modules,
+        # so the single-element ModuleLists from each FQN yield one Linear each.
         assert len(layers) == 2
-        assert all(isinstance(x, nn.ModuleList) for x in layers)
+        assert all(isinstance(x, nn.Linear) for x in layers)
 
     def test_none_intermediate_attribute_skipped_gracefully(self):
         model = self._make_fake_qwen35(visual_is_none=True)
         # Should not raise even though model.model.visual is None
         layers = parallelizer._extract_model_layers(model)
-        # Only the language_model.layers path survives
+        # Only the language_model.layers path survives; flattened to its one Linear.
         assert len(layers) == 1
-        assert isinstance(layers[0], nn.ModuleList)
+        assert isinstance(layers[0], nn.Linear)
 
 
 class TestAutoPipelineDeferFsdpGradSyncConversion:
