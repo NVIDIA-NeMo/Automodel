@@ -74,6 +74,26 @@ def test_normalize_messages_supports_reasoning_and_tool_call_fields():
     assert none_reasoning[0]["reasoning_content"] == ""
 
 
+def test_normalize_tool_calls_autofills_missing_id_and_type():
+    msgs = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "fn_a", "arguments": {"x": 1}}},
+                {"id": "", "type": "", "function": {"name": "fn_b", "arguments": "{}"}},
+            ],
+        }
+    ]
+    norm = tcd._normalize_messages(msgs)
+    calls = norm[0]["tool_calls"]
+    assert calls[0]["id"] == "call_0"
+    assert calls[0]["type"] == "function"
+    assert calls[0]["function"]["arguments"] == '{"x": 1}'
+    assert calls[1]["id"] == "call_1"
+    assert calls[1]["type"] == "function"
+
+
 @pytest.mark.parametrize(
     ("message", "error_pattern"),
     [
@@ -90,7 +110,7 @@ def test_normalize_messages_supports_reasoning_and_tool_call_fields():
                 {
                     "role": "assistant",
                     "content": "",
-                    "tool_calls": [{"type": "function", "function": {"name": "fn", "arguments": "{}"}}],
+                    "tool_calls": [{"id": 123, "type": "function", "function": {"name": "fn", "arguments": "{}"}}],
                 }
             ],
             "tool_calls\\[0\\]\\.id",
@@ -100,7 +120,7 @@ def test_normalize_messages_supports_reasoning_and_tool_call_fields():
                 {
                     "role": "assistant",
                     "content": "",
-                    "tool_calls": [{"id": "call_1", "function": {"name": "fn", "arguments": "{}"}}],
+                    "tool_calls": [{"id": "call_1", "type": 1, "function": {"name": "fn", "arguments": "{}"}}],
                 }
             ],
             "tool_calls\\[0\\]\\.type",
@@ -140,19 +160,23 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
     # Create local files: JSONL and JSON
     jsonl = tmp_path / "data.jsonl"
     jsonl.write_text(
-        "\n".join([
-            json.dumps({"messages": [{"role": "user", "content": "u1"}]}),
-            json.dumps({"messages": [{"role": "assistant", "content": "a1"}]}),
-        ]),
+        "\n".join(
+            [
+                json.dumps({"messages": [{"role": "user", "content": "u1"}]}),
+                json.dumps({"messages": [{"role": "assistant", "content": "a1"}]}),
+            ]
+        ),
         encoding="utf-8",
     )
 
     json_file = tmp_path / "data.json"
     json_file.write_text(
-        json.dumps([
-            {"messages": [{"role": "user", "content": "u2"}]},
-            {"messages": [{"role": "assistant", "content": "a2"}]},
-        ]),
+        json.dumps(
+            [
+                {"messages": [{"role": "user", "content": "u2"}]},
+                {"messages": [{"role": "assistant", "content": "a2"}]},
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -260,12 +284,14 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     calls = []
 
     def fake_format(tokenizer, normalized, eos_id, pad_id, **kwargs):
-        calls.append({
-            "normalized": normalized,
-            "eos": eos_id,
-            "pad": pad_id,
-            "kwargs": kwargs,
-        })
+        calls.append(
+            {
+                "normalized": normalized,
+                "eos": eos_id,
+                "pad": pad_id,
+                "kwargs": kwargs,
+            }
+        )
         return {"input_ids": [1, 2], "labels": [0, 1], "attention_mask": [1, 1]}
 
     monkeypatch.setattr(tcd, "format_chat_template", fake_format)
@@ -323,6 +349,7 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
 
 def test_chat_dataset_skip_invalid_samples_does_not_filter_structured_bad_rows(monkeypatch):
     """skip_invalid_samples only affects JSONL parse errors, not invalid message rows after load."""
+
     class Tok:
         eos_token_id = 1
         chat_template = "{{ default }}"
@@ -330,7 +357,9 @@ def test_chat_dataset_skip_invalid_samples_does_not_filter_structured_bad_rows(m
     tok = Tok()
     monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: True)
     monkeypatch.setattr(tcd, "_add_pad_token", lambda _tok: 3)
-    monkeypatch.setattr(tcd, "format_chat_template", lambda *a, **k: {"input_ids": [1], "labels": [1], "attention_mask": [1]})
+    monkeypatch.setattr(
+        tcd, "format_chat_template", lambda *a, **k: {"input_ids": [1], "labels": [1], "attention_mask": [1]}
+    )
 
     dataset_rows = [
         {"messages": [{"role": "user", "content": "ok"}]},

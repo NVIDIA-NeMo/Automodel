@@ -208,12 +208,16 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 raise ValueError(f"assistant message `tool_calls[{idx}]` must be a dict")
 
             tool_call_id = tool_call.get("id")
-            if not isinstance(tool_call_id, str) or not tool_call_id:
-                raise ValueError(f"assistant message `tool_calls[{idx}].id` must be a non-empty string")
+            if tool_call_id is None or tool_call_id == "":
+                tool_call_id = f"call_{idx}"
+            elif not isinstance(tool_call_id, str):
+                raise ValueError(f"assistant message `tool_calls[{idx}].id` must be a string when provided")
 
             tool_call_type = tool_call.get("type")
-            if not isinstance(tool_call_type, str) or not tool_call_type:
-                raise ValueError(f"assistant message `tool_calls[{idx}].type` must be a non-empty string")
+            if tool_call_type is None or tool_call_type == "":
+                tool_call_type = "function"
+            elif not isinstance(tool_call_type, str):
+                raise ValueError(f"assistant message `tool_calls[{idx}].type` must be a string when provided")
 
             function = tool_call.get("function")
             if not isinstance(function, dict):
@@ -232,6 +236,8 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 normalized_function["arguments"] = json.dumps(function_arguments)
 
             normalized_tool_call = dict(tool_call)
+            normalized_tool_call["id"] = tool_call_id
+            normalized_tool_call["type"] = tool_call_type
             normalized_tool_call["function"] = normalized_function
             normalized_tool_calls.append(normalized_tool_call)
 
