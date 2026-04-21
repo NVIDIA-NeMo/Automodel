@@ -27,7 +27,7 @@ The bidirectional bi-encoder path is used for embedding generation and dense ret
 
 | Architecture | Task | Auto Class | Description |
 |---|---|---|---|
-| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Bidirectional Llama with pooling for dense embeddings |
+| `LlamaBidirectionalModel` | Embedding | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Bidirectional Llama with mean pooling for dense embeddings |
 
 ## Pooling Strategies
 
