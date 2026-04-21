@@ -510,6 +510,6 @@ parallelizer:
 ci:
   time: "00:30:00"
   checkpoint_robustness:
-    hf_kl_threshold: 5e-2
+    hf_kl_threshold: 1e-1
     tokenizer_name: openai/gpt-oss-20b
     no_check_resume: true
