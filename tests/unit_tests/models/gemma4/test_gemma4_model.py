@@ -554,8 +554,7 @@ class TestGemma4ForConditionalGeneration:
         """Dense Gemma4 should preserve caller-provided mm_token_type_ids."""
         from unittest.mock import patch
 
-        if not (torch.distributed.is_available() and torch.cuda.is_available()
-                and torch.distributed.is_initialized()):
+        if not (torch.distributed.is_available() and torch.cuda.is_available() and torch.distributed.is_initialized()):
             pytest.skip("distributed process group not initialized")
 
         from torch.distributed.device_mesh import init_device_mesh
@@ -594,8 +593,7 @@ class TestGemma4ForConditionalGeneration:
         mm_token_type_ids to create_causal_mask_mapping."""
         from unittest.mock import patch
 
-        if not (torch.distributed.is_available() and torch.cuda.is_available()
-                and torch.distributed.is_initialized()):
+        if not (torch.distributed.is_available() and torch.cuda.is_available() and torch.distributed.is_initialized()):
             pytest.skip("distributed process group not initialized")
 
         from torch.distributed.device_mesh import init_device_mesh

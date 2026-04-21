@@ -937,6 +937,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # all-gathers sharded parameters (embed_tokens weight) to Replicate
                 # placement before the embedding lookup.  Calling the method directly
                 # bypasses the hook and causes a mixed DTensor/plain-tensor error.
+                # NOTE: gradients from image encoding are NOT tracked here — the
+                # vision encoder weights receive no gradient updates via this path.
+                # If the vision encoder must be trainable, image encoding must be
+                # moved inside the per-rank CP forward pass instead.
                 prepared_inputs = _model(
                     input_ids=batch["input_ids"],
                     pixel_values=batch.get("pixel_values"),

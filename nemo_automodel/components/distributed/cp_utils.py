@@ -412,18 +412,29 @@ def make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
 ):
     """
-    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
-    of the context_parallel submesh is 1, this function is effectively a no-op.
+    Build a CP context manager and shard a batch across CP ranks.
+
+    If the input device_mesh is None or the CP submesh size is 1, this is a no-op.
+
+    Sequence tensors (input_ids / inputs_embeds, labels, position_ids, etc.) are
+    sliced into contiguous per-rank shards along the sequence dimension.  No DTensor
+    wrapping is performed; all CP communication happens inside ``_cp_sdpa`` via an
+    explicit all-gather of K/V followed by a compiled flex_attention call with a
+    per-rank causal block mask.
 
     Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
-        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
+        device_mesh: The global device mesh; a ``"cp"`` sub-mesh is extracted from it.
+        batch (dict[str, torch.Tensor]): Input batch.  Modified in-place and returned.
+        loss_mask (torch.Tensor or None): Optional loss mask; if provided it is sliced
+            and written back to ``batch["loss_mask"]``.
+        use_te (bool): If True, delegate to ``make_cp_batch_for_te`` (THD format).
+        padding_token_id (int): Token id used for sequence-length padding.
+        num_chunks (int): Number of chunks for TE path.
+        seq_lens_padding_value (int): Padding value for ``seq_lens`` in TE path.
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
-        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
-        returned by `create_context_parallel_ctx`. The batch has also been passed to
-        `create_context_parallel_ctx` and is accordingly sharded.
+        tuple(contextmanager, dict[str, torch.Tensor]): A ``nullcontext`` (no CP
+        context manager is required with this approach) and the sharded batch.
     """
     from contextlib import nullcontext
 
@@ -540,6 +551,7 @@ def make_cp_batch_and_ctx(
 
     if loss_mask is not None:
         loss_mask = loss_mask[:, _s:_e].contiguous()
+        batch["loss_mask"] = loss_mask
 
     if "padding_mask" in batch:
         batch["padding_mask"] = batch["padding_mask"][:, _s:_e].contiguous()
