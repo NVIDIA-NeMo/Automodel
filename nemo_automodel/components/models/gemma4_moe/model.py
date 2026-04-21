@@ -726,6 +726,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         pad_token_id = getattr(self, "pad_token_id", None)
         if pad_token_id is None or pad_token_id < 0:
+            cfg = getattr(self, "config", None)
+            cfg_text = getattr(cfg, "text_config", cfg)
+            pad_token_id = getattr(cfg_text, "pad_token_id", None)
+        if pad_token_id is None or pad_token_id < 0:
+            eos = getattr(getattr(self, "config", None), "eos_token_id", None)
+            if eos is None:
+                cfg_text = getattr(getattr(self, "config", None), "text_config", None)
+                eos = getattr(cfg_text, "eos_token_id", None) if cfg_text else None
+            if isinstance(eos, (list, tuple)):
+                eos = eos[0]
+            pad_token_id = eos
+        if pad_token_id is None or pad_token_id < 0:
             raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
 
         llm_input_ids = input_ids.masked_fill(special_image_mask, pad_token_id)
