@@ -697,6 +697,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
+            if num_steps == 0:
+                logging.info(f"[INFO] Epoch {epoch + 1} skipped (already completed in previous run)")
+                continue
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
 
