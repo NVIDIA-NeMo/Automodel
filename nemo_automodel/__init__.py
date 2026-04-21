@@ -116,6 +116,23 @@ class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, _ModelsAliasFinder())
 
 
+# ---------------------------------------------------------------------------
+# Register a lightweight import hook that widens ``ALLOWED_LAYER_TYPES`` the
+# moment ``transformers.configuration_utils`` is loaded. The hook module imports
+# only stdlib + logging, so it does NOT force a transformers import at
+# ``import nemo_automodel`` time — preserving the lightweight-import promise.
+# ---------------------------------------------------------------------------
+try:
+    from nemo_automodel._transformers.v4_patches.layer_types import (
+        install_layer_types_patch_hook as _install_layer_types_patch_hook,
+    )
+
+    _install_layer_types_patch_hook()
+except Exception:
+    # Never let a hook failure break ``import nemo_automodel``.
+    pass
+
+
 def __getattr__(name: str) -> ModuleType | Any:
     """
     Lazily import and cache selected submodules / exported symbols when accessed.
