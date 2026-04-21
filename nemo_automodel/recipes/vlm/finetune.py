@@ -945,6 +945,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch.pop("image_grid_thw", None)
                 batch.pop("video_grid_thw", None)
                 batch.pop("n_images_per_sample", None)
+                # NOTE: we wrap the pre-embed in no_grad because this recipe
+                # only trains the language model; `freeze_embeddings: true` is
+                # set in every CP example config we ship.  If a future config
+                # unfreezes `embed_tokens` or the vision tower, this no_grad
+                # will silently drop gradients for those params — remove the
+                # context manager in that case.
                 with torch.no_grad():
                     batch["inputs_embeds"] = _model(
                         input_ids=_input_ids,

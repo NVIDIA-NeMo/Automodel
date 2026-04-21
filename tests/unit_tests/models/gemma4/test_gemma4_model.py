@@ -556,11 +556,12 @@ class TestGemma4ForConditionalGeneration:
         [B, S_global] tensor against a locally-sharded sequence."""
         from unittest.mock import patch
 
-        from torch.distributed.tensor import DTensor, Replicate, Shard
-        from torch.distributed.device_mesh import init_device_mesh
+        if not (torch.distributed.is_available() and torch.cuda.is_available()
+                and torch.distributed.is_initialized()):
+            pytest.skip("distributed process group not initialized")
 
-        if not torch.distributed.is_available() or not torch.cuda.is_available():
-            pytest.skip("distributed not available")
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Shard
 
         # Single-rank mesh: simulates a CP rank without needing multiple processes.
         mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("cp",))
@@ -597,11 +598,12 @@ class TestGemma4ForConditionalGeneration:
         mm_token_type_ids to create_causal_mask_mapping."""
         from unittest.mock import patch
 
-        from torch.distributed.tensor import DTensor, Shard
-        from torch.distributed.device_mesh import init_device_mesh
+        if not (torch.distributed.is_available() and torch.cuda.is_available()
+                and torch.distributed.is_initialized()):
+            pytest.skip("distributed process group not initialized")
 
-        if not torch.distributed.is_available() or not torch.cuda.is_available():
-            pytest.skip("distributed not available")
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Shard
 
         mesh = init_device_mesh("cuda", (1,), mesh_dim_names=("cp",))
 
@@ -623,21 +625,15 @@ class TestGemma4ForConditionalGeneration:
             captured["mm_token_type_ids"] = kwargs.get("mm_token_type_ids")
             return {lt: None for lt in set(text_cfg.layer_types)}
 
+        backend = model.model.language_model
         with patch(
-            "nemo_automodel.components.models.gemma4_moe.model.create_causal_mask_mapping"
-            if hasattr(model.model, "language_model")
-            else "transformers.models.gemma4.modeling_gemma4.create_causal_mask_mapping",
+            "transformers.models.gemma4.modeling_gemma4.create_causal_mask_mapping",
+            side_effect=_fake_mask_mapping,
         ):
-            # Patch at the source used inside Gemma4MoETextModelBackend.forward
-            backend = model.model.language_model
-            with patch(
-                "transformers.models.gemma4.modeling_gemma4.create_causal_mask_mapping",
-                side_effect=_fake_mask_mapping,
-            ):
-                try:
-                    backend.forward(inputs_embeds=embeds_dt, mm_token_type_ids=mm_token_type_ids)
-                except Exception:
-                    pass  # forward may fail after mask; we only care about the captured kwarg
+            try:
+                backend.forward(inputs_embeds=embeds_dt, mm_token_type_ids=mm_token_type_ids)
+            except Exception:
+                pass  # forward may fail after mask; we only care about the captured kwarg
 
         assert captured.get("mm_token_type_ids") is None, (
             "mm_token_type_ids must be nulled when inputs_embeds is a DTensor (CP active)"
@@ -674,6 +670,65 @@ class TestGemma4ForConditionalGeneration:
         model.initialize_weights(buffer_device=device, dtype=torch.float32)
         for p in model.parameters():
             assert p.dtype == torch.float32
+
+    def test_prepare_inputs_embeds_for_cp_text_only(self, gemma4_config, backend_config, device):
+        """prepare_inputs_embeds_for_cp with pixel_values=None must return plain
+        text embeddings with no image-feature merge path taken."""
+        model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+
+        text_config = gemma4_config.text_config
+        batch, seq = 2, 6
+        input_ids = torch.randint(0, text_config.vocab_size, (batch, seq), device=device)
+
+        embeds = model.prepare_inputs_embeds_for_cp(input_ids, pixel_values=None)
+
+        assert embeds.shape == (batch, seq, text_config.hidden_size)
+        assert embeds.dtype == torch.bfloat16
+        # With no pixel_values the function should be equivalent to the raw
+        # embed_tokens lookup (no masked_scatter path).
+        expected = model.get_input_embeddings()(input_ids)
+        torch.testing.assert_close(embeds, expected)
+
+    def test_prepare_inputs_embeds_for_cp_scatters_image_features(self, gemma4_config, backend_config, device):
+        """prepare_inputs_embeds_for_cp with pixel_values must masked_scatter
+        image features into positions marked by mm_token_type_ids == 1."""
+        from unittest.mock import MagicMock, patch
+
+        model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
+        model = model.to(device).to(torch.bfloat16)
+        text_config = gemma4_config.text_config
+
+        batch, seq, n_image_tokens = 1, 8, 3
+        input_ids = torch.randint(0, text_config.vocab_size, (batch, seq), device=device)
+        # Mark the first three positions as image tokens.
+        mm_token_type_ids = torch.zeros(batch, seq, dtype=torch.long, device=device)
+        mm_token_type_ids[:, :n_image_tokens] = 1
+
+        # Sentinel image features we can identify after the scatter.
+        sentinel = torch.full(
+            (n_image_tokens, text_config.hidden_size),
+            7.5,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        fake_vision_output = MagicMock()
+        fake_vision_output.pooler_output = sentinel
+        pixel_values = torch.randn(batch, 3, 32, 32, device=device, dtype=torch.bfloat16)
+
+        with patch.object(model.model, "get_image_features", return_value=fake_vision_output):
+            embeds = model.prepare_inputs_embeds_for_cp(
+                input_ids,
+                pixel_values=pixel_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        assert embeds.shape == (batch, seq, text_config.hidden_size)
+        # Image-token slots should carry the sentinel; the rest should equal
+        # the plain text embedding of those positions.
+        torch.testing.assert_close(embeds[0, :n_image_tokens], sentinel)
+        plain = model.get_input_embeddings()(input_ids)
+        torch.testing.assert_close(embeds[0, n_image_tokens:], plain[0, n_image_tokens:])
 
 
 # ---------------------------------------------------------------------------
