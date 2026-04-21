@@ -137,8 +137,72 @@ def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits:
     return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
 
 
-def _get_logits(model, input_ids, device) -> torch.Tensor:
+def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
+    """Run forward through the PP schedule and return logits on every rank.
+
+    The raw ``model_parts[0].forward`` can't be called directly on non-first PP
+    stages (they expect float hidden states, not int token IDs). Mirror the
+    KD recipe's trick: swap the schedule's loss_fn for a capture closure, run
+    ``schedule.eval`` on the first stage, then broadcast the captured last-stage
+    logits along the PP group.
+    """
+    schedule = trainer.pp.info.schedule
+    pp_batch_size = trainer.pipeline_config.pp_batch_size
+    seq_len = len(input_ids)
+
+    # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
+    ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
+    attention_mask = torch.ones_like(ids)
+    targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
+
+    trainer.pp.update_seq_len(seq_len)
+
+    captured = [None]
+
+    def _capture_loss_fn(logits, target, **_):
+        captured[0] = logits.detach().float().clone()
+        return logits.new_tensor(0.0, dtype=logits.dtype)
+
+    saved_loss_fn = schedule._loss_fn
+    schedule._loss_fn = _capture_loss_fn
+    try:
+        for m in trainer.model_parts:
+            m.eval()
+        # Use no_grad rather than inference_mode: FSDP2's wait_for_unshard reads
+        # tensor._version on unsharded params, which is not available for
+        # inference-mode tensors ("Inference tensors do not track version counter").
+        with torch.no_grad():
+            losses = [] if trainer.pp.info.has_last_stage else None
+            if trainer.pp.info.has_first_stage:
+                schedule.eval(ids, target=targets, losses=losses, attention_mask=attention_mask)
+            else:
+                schedule.eval(target=targets, losses=losses, attention_mask=attention_mask)
+    finally:
+        schedule._loss_fn = saved_loss_fn
+
+    config = trainer.model_parts[0].config
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
+    assert vocab_size is not None, "could not resolve vocab_size from model config"
+
+    buf = torch.zeros((1, seq_len, vocab_size), device=device, dtype=torch.float32)
+    if trainer.pp.info.has_last_stage and captured[0] is not None:
+        buf.copy_(captured[0][:1])
+
+    pp_mesh = trainer.device_mesh["pp"]
+    pp_group = pp_mesh.get_group()
+    src = dist.get_global_rank(pp_group, pp_mesh.size() - 1)
+    dist.broadcast(buf, src=src, group=pp_group)
+
+    return buf.cpu()
+
+
+def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
     """Forward pass returning float32 logits on CPU."""
+    if trainer is not None and getattr(trainer, "pp_enabled", False):
+        return _get_logits_pp(trainer, input_ids, device)
+
     model.eval()
     ids = torch.tensor([input_ids], device=device)
     attention_mask = torch.ones_like(ids)
@@ -257,7 +321,7 @@ def test_checkpoint_robustness():
 
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
-    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device)
+    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
 
     # Phase 3: Reload automodel from consolidated checkpoint
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
@@ -323,7 +387,7 @@ def test_checkpoint_robustness():
     restored_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_trainer.setup()
 
-    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device)
+    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
     max_kl_restored = kl_restored.max().item()
@@ -410,7 +474,7 @@ def test_checkpoint_robustness():
         cross_tp_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         cross_tp_trainer.setup()
 
-        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device)
+        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
 
         kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
         max_kl_cross_tp = kl_cross_tp.max().item()

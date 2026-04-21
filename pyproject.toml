@@ -80,6 +80,7 @@ dependencies = [
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
+    "tiktoken",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
     "transformers==5.5.0",
@@ -120,12 +121,16 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
+fla = [
+    "flash-linear-attention>=0.4.2",
+]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
 ]
 moe = [
     "nemo_automodel[cuda]",
+    "nemo_automodel[fla]",
     "deep_ep",
 ]
 vlm = [
@@ -149,6 +154,7 @@ all = [
     "nemo_automodel[delta-databricks]",
     "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
+    "nemo_automodel[fla]",
     "nemo_automodel[vlm]",
 ]
 
@@ -179,10 +185,8 @@ linting = [
     "ty>=0.0.20",
 ]
 test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
-# CP for linear attention (fla.ops.cp) requires fla > 0.4.1; pin to main until a release includes it.
 dev = [
     "cut-cross-entropy",
-    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7cbe461b10bde60180c32c5f9381a04d41887514",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
