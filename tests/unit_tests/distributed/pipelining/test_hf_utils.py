@@ -17,16 +17,16 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 import torch.nn as nn
-from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
-    create_pipeline_forward_inner,
     create_pipeline_forward_causal_lm,
-    patch_hf_model_for_pp,
+    create_pipeline_forward_inner,
     init_hf_model_buffers,
+    patch_hf_model_for_pp,
     validate_hf_model_for_pipeline_support,
 )
+
 
 class TestCreatePipelineForwardInner:
     """Test create_pipeline_forward_inner function."""
@@ -825,9 +825,9 @@ class TestValidateHfModelForPipelineSupport:
 # -----------------------------------------------------------------------------
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
-    get_text_module,
-    TEXT_MODULE_ATTRS,
     MULTIMODAL_SUFFIXES,
+    TEXT_MODULE_ATTRS,
+    get_text_module,
 )
 
 

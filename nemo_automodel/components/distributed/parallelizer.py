@@ -81,9 +81,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
 )
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5ForConditionalGeneration,
-)
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
 from nemo_automodel.components.distributed.optimized_tp_plans import (
@@ -894,7 +891,7 @@ def get_hf_tp_shard_plan(model):
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
 
-    elif model_cls == Qwen3_5ForConditionalGeneration:
+    elif model_cls.__name__ == "Qwen3_5ForConditionalGeneration":
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
 
@@ -1295,8 +1292,9 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
-        Qwen3_5ForConditionalGeneration: ["model.language_model.layers", "model.visual.blocks"],
-        # String fallback in case of class identity mismatch across imports
+        # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
+        # module load (which would defeat test monkeypatches that stub the
+        # module before first import).
         "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
