@@ -201,6 +201,12 @@ def _instantiate_pipeline(
     config_dict = config.to_dict()
     config_dict.pop("loss_fn", None)
 
+    # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
+    # the same knob controls grad-sync behavior under PP.
+    strategy_config = getattr(mesh, "strategy_config", None)
+    if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
+        config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
+
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
         moe_mesh=mesh.moe_mesh,
@@ -346,6 +352,7 @@ def apply_model_infrastructure(
     load_base_model=False,
     cache_dir=None,
     pretrained_model_name_or_path="",
+    weights_already_loaded=False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -377,6 +384,10 @@ def apply_model_infrastructure(
         pretrained_model_name_or_path: Model name or path for checkpoint loading. Default: ""
         load_base_model: Whether to load base model weights (True for from_pretrained). Default: False
         cache_dir: Cache directory for model weights. Default: None
+        weights_already_loaded: Whether pretrained weights were already loaded during
+            model init (e.g., by HF's from_pretrained on a real device, which also
+            handles BnB quantization atomically). When True, checkpoint loading in
+            this function is skipped. Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -497,7 +508,7 @@ def apply_model_infrastructure(
     # This is needed for both from_pretrained (before checkpoint loading overwrites)
     # and from_config (where this is the only weight initialization).
     # Skipped when load_before_shard already handled materialization + init.
-    need_post_shard_init = (
+    need_materialize = (
         is_meta_device
         and not load_before_shard
         and any(
@@ -508,14 +519,17 @@ def apply_model_infrastructure(
             ]
         )
     )
-    if need_post_shard_init:
+    if need_materialize:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
             checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
 
-    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
-    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
+    # Load the checkpoint if pretrained weights are needed and weren't already loaded
+    # (e.g., by HF's from_pretrained on a real device, which also handles BnB
+    # quantization atomically).  Decoupled from the meta-device materialization
+    # decision so that changes to the meta-device policy cannot silently skip loading.
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:

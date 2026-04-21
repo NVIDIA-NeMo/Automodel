@@ -38,10 +38,10 @@ jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
-      default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
-      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
-      default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
-      non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
+      default_runner_prefix: nemo-ci-aws-gpu-x2
+      non_nvidia_runner_prefix: nemo-ci-aws-gpu-x2-ephemeral
+      default_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
+      non_nvidia_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
       sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
@@ -379,10 +379,10 @@ jobs:
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
-            runner: linux-amd64-cpu16
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
           - test-name: L0_Unit_Tests_GPU
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
             timeout: 30
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
@@ -418,52 +418,52 @@ jobs:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
             timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_LLM
             test-folder: hf_transformer_llm
             timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             timeout: 60
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Datasets
             test-folder: data
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
@@ -669,3 +669,20 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  cleanup-taint-node:
+    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}
+    needs:
+      - pre-flight
+      - Nemo_CICD_Test
+      - Coverage
+      - Coverage_Fake
+    if: |
+      always()
+      && !cancelled()
+      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
+    steps:
+      - name: Taint node for cleanup
+        if: contains(runner.name, 'ephemeral')
+        shell: bash
+        run: taint-node.sh
