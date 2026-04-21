@@ -58,7 +58,13 @@ def _extract_custom_args(argv):
         "--max_cpu_gb",
         "--resume_loss_threshold",
     }
-    boolean_keys = {"--trust_remote_code", "--check_fused_qkv_keys", "--check_phantom_keys", "--check_resume", "--hf_device_map_auto"}
+    boolean_keys = {
+        "--trust_remote_code",
+        "--check_fused_qkv_keys",
+        "--check_phantom_keys",
+        "--check_resume",
+        "--hf_device_map_auto",
+    }
     custom = {}
     remaining = []
     i = 0
@@ -131,8 +137,72 @@ def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits:
     return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
 
 
-def _get_logits(model, input_ids, device) -> torch.Tensor:
+def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
+    """Run forward through the PP schedule and return logits on every rank.
+
+    The raw ``model_parts[0].forward`` can't be called directly on non-first PP
+    stages (they expect float hidden states, not int token IDs). Mirror the
+    KD recipe's trick: swap the schedule's loss_fn for a capture closure, run
+    ``schedule.eval`` on the first stage, then broadcast the captured last-stage
+    logits along the PP group.
+    """
+    schedule = trainer.pp.info.schedule
+    pp_batch_size = trainer.pipeline_config.pp_batch_size
+    seq_len = len(input_ids)
+
+    # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
+    ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
+    attention_mask = torch.ones_like(ids)
+    targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
+
+    trainer.pp.update_seq_len(seq_len)
+
+    captured = [None]
+
+    def _capture_loss_fn(logits, target, **_):
+        captured[0] = logits.detach().float().clone()
+        return logits.new_tensor(0.0, dtype=logits.dtype)
+
+    saved_loss_fn = schedule._loss_fn
+    schedule._loss_fn = _capture_loss_fn
+    try:
+        for m in trainer.model_parts:
+            m.eval()
+        # Use no_grad rather than inference_mode: FSDP2's wait_for_unshard reads
+        # tensor._version on unsharded params, which is not available for
+        # inference-mode tensors ("Inference tensors do not track version counter").
+        with torch.no_grad():
+            losses = [] if trainer.pp.info.has_last_stage else None
+            if trainer.pp.info.has_first_stage:
+                schedule.eval(ids, target=targets, losses=losses, attention_mask=attention_mask)
+            else:
+                schedule.eval(target=targets, losses=losses, attention_mask=attention_mask)
+    finally:
+        schedule._loss_fn = saved_loss_fn
+
+    config = trainer.model_parts[0].config
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
+    assert vocab_size is not None, "could not resolve vocab_size from model config"
+
+    buf = torch.zeros((1, seq_len, vocab_size), device=device, dtype=torch.float32)
+    if trainer.pp.info.has_last_stage and captured[0] is not None:
+        buf.copy_(captured[0][:1])
+
+    pp_mesh = trainer.device_mesh["pp"]
+    pp_group = pp_mesh.get_group()
+    src = dist.get_global_rank(pp_group, pp_mesh.size() - 1)
+    dist.broadcast(buf, src=src, group=pp_group)
+
+    return buf.cpu()
+
+
+def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
     """Forward pass returning float32 logits on CPU."""
+    if trainer is not None and getattr(trainer, "pp_enabled", False):
+        return _get_logits_pp(trainer, input_ids, device)
+
     model.eval()
     ids = torch.tensor([input_ids], device=device)
     attention_mask = torch.ones_like(ids)
@@ -207,17 +277,13 @@ def test_checkpoint_robustness():
     if _rank0():
         print(f"\n[Memory] Peak VRAM: {peak_vram_gb:.2f} GB, Peak CPU RSS: {peak_cpu_gb:.2f} GB")
     if max_vram_gb > 0:
-        assert peak_vram_gb <= max_vram_gb, (
-            f"Peak VRAM {peak_vram_gb:.2f} GB exceeds threshold {max_vram_gb:.2f} GB"
-        )
+        assert peak_vram_gb <= max_vram_gb, f"Peak VRAM {peak_vram_gb:.2f} GB exceeds threshold {max_vram_gb:.2f} GB"
     if max_cpu_gb > 0:
-        assert peak_cpu_gb <= max_cpu_gb, (
-            f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
-        )
+        assert peak_cpu_gb <= max_cpu_gb, f"Peak CPU RSS {peak_cpu_gb:.2f} GB exceeds threshold {max_cpu_gb:.2f} GB"
 
     # Phase 2: Capture reference logits before teardown
     device = next(trainer.model_parts[0].parameters()).device
-    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device)
+    reference_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
 
     # Phase 3: Reload automodel from consolidated checkpoint
     checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
@@ -247,6 +313,20 @@ def test_checkpoint_robustness():
                     assert "_scales" not in key, f"Phantom mxfp4 key leaked: {key} in {sf_path.name}"
         print(f"[Phantom keys] Scanned {len(sf_files)} files, no _blocks/_scales keys ✓")
 
+    # Pre-populate HF dynamic module cache on rank 0 to prevent filesystem races
+    # when all ranks simultaneously load trust_remote_code models from local paths.
+    # On shared filesystems (e.g. Lustre), concurrent shutil.copy2 calls from
+    # multiple ranks cause PermissionError.
+    if not is_peft:
+        if _rank0():
+            from transformers import AutoConfig
+
+            try:
+                AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
+            except Exception:
+                pass
+        _barrier()
+
     cfg = parse_args_and_load_config()
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
@@ -254,7 +334,7 @@ def test_checkpoint_robustness():
     restored_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     restored_trainer.setup()
 
-    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device)
+    restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
 
     kl_restored = _kl_divergence_from_logits(reference_logits, restored_logits)
     max_kl_restored = kl_restored.max().item()
@@ -275,7 +355,7 @@ def test_checkpoint_robustness():
         from transformers import AutoModelForCausalLM
 
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
-        if experts_implementation:
+        if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
         if hf_device_map_auto:
@@ -339,7 +419,7 @@ def test_checkpoint_robustness():
         cross_tp_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         cross_tp_trainer.setup()
 
-        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device)
+        cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
 
         kl_cross_tp = _kl_divergence_from_logits(reference_logits, cross_tp_logits)
         max_kl_cross_tp = kl_cross_tp.max().item()
@@ -375,6 +455,12 @@ def test_checkpoint_robustness():
         cfg.step_scheduler.max_steps = resume_max_steps
         cfg.checkpoint.checkpoint_dir = baseline_dir
         cfg.checkpoint.enabled = False
+        # Phase 1 computed lr_decay_steps = min(total_epoch_steps, original_max_steps).
+        # With resume_max_steps the baseline would compute a *different* lr_decay_steps,
+        # causing the LR curve (and thus model weights) at step N to diverge from
+        # Phase 1's checkpoint.  Pin lr_decay_steps to match Phase 1.
+        if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
+            cfg.lr_scheduler.lr_decay_steps = original_max_steps
         baseline_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
         baseline_trainer.setup()
         baseline_trainer.run_train_validation_loop()
@@ -393,7 +479,7 @@ def test_checkpoint_robustness():
         torch.cuda.empty_cache()
         shutil.rmtree(baseline_dir, ignore_errors=True)
 
-        # Resume: reload from Phase 1 checkpoint and train to resume_max_steps
+        # Resume: reload from Phase 1 checkpoint and train to resume_max_steps.
         cfg = parse_args_and_load_config()
         cfg.checkpoint.restore_from = str(ckpt_step_dir)
         cfg.step_scheduler.max_steps = resume_max_steps
@@ -421,9 +507,7 @@ def test_checkpoint_robustness():
                     bl = baseline_losses[step]
                     rl = resume_losses[step]
                     diff = abs(bl - rl)
-                    print(
-                        f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}"
-                    )
+                    print(f"[Phase 6] Step {step}: baseline_loss={bl:.6f}, resume_loss={rl:.6f}, diff={diff:.6e}")
                     if not is_peft:
                         assert diff < resume_loss_threshold, (
                             f"SFT loss mismatch after resume at step {step}: "

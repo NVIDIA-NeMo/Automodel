@@ -38,13 +38,14 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973
-RUN apt-get update && apt install -y --only-upgrade gnupg && \
+# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
-ENV UV_VERSION="0.8.22"
+ENV UV_VERSION="0.10.11"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
@@ -128,10 +129,13 @@ RUN pip install "aiohttp>=3.13.3" \
         "black>=26.3.1" \
         "jaraco-context>=6.1.0" \
         "nbconvert>=7.17.0" \
+        "onnx>=1.21.0" \
         "pillow>=12.1.1" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
-        "urllib3>=2.6.0"
+        "tornado>=6.5.5" \
+        "urllib3>=2.6.0" && \
+    rm -rf /opt/pytorch/pytorch/third_party/onnx
 
 FROM automodel_dep as automodel_final
 
@@ -146,19 +150,21 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    --mount=type=cache,target=/root/.cache/uv \
-    if [ "$BASE_IMAGE" = "pytorch" ]; then \
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    uv cache prune --ci
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
 
-# Patch wandb-core: bump google.golang.org/grpc (CVE fix)
+# Rebuild torchcodec from source to match the container's PyTorch ABI
+RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+    pip install --no-build-isolation --force-reinstall --no-deps \
+        git+https://github.com/pytorch/torchcodec.git@v0.8.0
+
+# Patch wandb-core: bump vulnerable Go deps (CVE fixes)
 ARG TARGETARCH
 RUN if python3 -c "import wandb" 2>/dev/null; then \
         GRPC_VERSION=1.79.3 && \
+        OTEL_VERSION=1.43.0 && \
         GO_VERSION=1.26.1 && \
         WANDB_VERSION=$(python3 -c "import wandb; print(wandb.__version__)") && \
         WANDB_CORE_BIN=/opt/venv/lib/python3.12/site-packages/wandb/bin/wandb-core && \
@@ -168,6 +174,8 @@ RUN if python3 -c "import wandb" 2>/dev/null; then \
         git clone --depth 1 --branch "v${WANDB_VERSION}" https://github.com/wandb/wandb.git /tmp/wandb-src && \
         cd /tmp/wandb-src/core && \
         go get google.golang.org/grpc@v${GRPC_VERSION} && \
+        go get go.opentelemetry.io/otel/sdk@v${OTEL_VERSION} && \
+        go get github.com/go-jose/go-jose/v4@v4.1.4 && \
         go mod tidy && \
         go mod vendor && \
         CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
@@ -178,6 +186,11 @@ RUN if python3 -c "import wandb" 2>/dev/null; then \
     fi
 
 COPY . /opt/Automodel
+
+# Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi
 
 WORKDIR /opt/Automodel
 
