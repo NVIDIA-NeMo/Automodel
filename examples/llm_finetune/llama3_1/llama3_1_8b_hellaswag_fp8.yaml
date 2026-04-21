@@ -53,7 +53,7 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
-
+  defer_fsdp_grad_sync: false
   sequence_parallel: false
 
 compile:
