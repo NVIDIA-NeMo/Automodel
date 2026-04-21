@@ -56,7 +56,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_pretrain/megatron_pretrain_gpt2.yaml
 ```
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Pretraining Guide](../../../guides/llm/pretrain.md).
+See the [Installation Guide](../../../guides/installation.md) and [LLM Pretraining Guide](../../../guides/llm/pretraining.md).
 
 ## Hugging Face Model Cards
 
