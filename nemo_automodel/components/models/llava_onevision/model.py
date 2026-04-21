@@ -214,7 +214,7 @@ class LLaVAOneVision1_5_Model(nn.Module):
         if attn_implementation is not None:
             try:
                 self.text_config._attn_implementation = attn_implementation
-            except Exception:
+            except AttributeError:
                 pass
 
         self.visual = RiceTransformer(self.vision_config, attn_implementation=attn_implementation or "eager")
