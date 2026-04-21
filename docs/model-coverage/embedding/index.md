@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Embedding models convert text into dense vector representations for semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification. NeMo AutoModel supports optimized bidirectional Llama bi-encoders and falls back to Hugging Face `AutoModel` for other encoder backbones.
+Text embedding models transform text into dense vector representations that power semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification tasks. NeMo AutoModel includes a training recipe for converting Llama decoder-only models into encoder architectures with bidirectional attention, and falls back to Hugging Face AutoModel for other encoder backbones.
 
 For cross-encoder pairwise scoring, see [Reranking Models](../reranker/index.md).
 
