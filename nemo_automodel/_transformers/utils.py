@@ -245,6 +245,51 @@ def _patch_layer_types_validator():
     cu.PreTrainedConfig.validate_layer_type = _patched_validate_layer_type
 
 
+def _patch_attn_implementation_validator():
+    """Relax ``PreTrainedModel.get_correct_attn_implementation`` whitelist check.
+
+    Transformers v5 validates ``attn_implementation`` against a fixed set
+    (``["eager"] + ALL_ATTENTION_FUNCTIONS.valid_keys()``) in
+    ``get_correct_attn_implementation`` and raises ``ValueError`` before the
+    remote-code class's own ``_set_attn_implementation`` / ``_supports_*``
+    hooks get a chance to run. Remote-code models (``trust_remote_code=True``)
+    such as ``nvidia/Nemotron-Flash-1B`` pin custom values like
+    ``"fused_mha"`` in their hub config, so vanilla HF rejects them at load
+    time and the model never instantiates.
+
+    We downgrade the value check to a warning for remote-code classes
+    (class ``__module__`` starts with ``transformers_modules.``) so the
+    custom class's own dispatch logic can take over. Canonical classes are
+    unaffected.
+    """
+    from transformers import modeling_utils as mu
+
+    _orig = mu.PreTrainedModel.get_correct_attn_implementation
+    if getattr(_orig, "_nemo_attn_patched", False):
+        return
+
+    def _patched_get_correct_attn_implementation(self, requested_attention, is_init_check: bool = False):
+        applicable_attention = "sdpa" if requested_attention is None else requested_attention
+        valid = ["eager"] + list(mu.ALL_ATTENTION_FUNCTIONS.valid_keys())
+        if applicable_attention not in valid:
+            cls_module = getattr(type(self), "__module__", "") or ""
+            is_remote_code = cls_module.startswith("transformers_modules.")
+            if is_remote_code:
+                logger.warning(
+                    "attn_implementation=%r is not in the canonical whitelist %s; "
+                    "remote-code class %s.%s will handle dispatch itself.",
+                    applicable_attention,
+                    valid,
+                    cls_module,
+                    type(self).__name__,
+                )
+                return applicable_attention
+        return _orig(self, requested_attention, is_init_check)
+
+    _patched_get_correct_attn_implementation._nemo_attn_patched = True  # type: ignore[attr-defined]
+    mu.PreTrainedModel.get_correct_attn_implementation = _patched_get_correct_attn_implementation
+
+
 def apply_cache_compatibility_patches():
     """Apply compatibility patches for transformers cache utilities.
 
@@ -254,6 +299,7 @@ def apply_cache_compatibility_patches():
     _patch_bytes_to_unicode()
     _patch_special_tokens_pattern()
     _patch_layer_types_validator()
+    _patch_attn_implementation_validator()
     _patch_dynamic_module_local_copy()
 
     import transformers.cache_utils as cache_utils

@@ -45,16 +45,25 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
-def _is_nemotron_flash_causallm(module: nn.Module) -> bool:
-    # ``fully_shard`` dynamically subclasses the module class and prefixes its
-    # ``__name__`` with ``"FSDP"`` (e.g. ``FSDPNemotronFlashForCausalLM``); walk
-    # the MRO so both the pre- and post-FSDP types are recognised.
+def _find_nemotron_flash_causallm_class(module: nn.Module):
+    """Walk ``type(module).__mro__`` and return the original
+    ``NemotronFlashForCausalLM`` class shipped by the remote-code module,
+    or ``None`` if the module isn't a Nemotron-Flash causal LM.
+
+    ``fully_shard`` dynamically subclasses the module class and prefixes its
+    ``__name__`` with ``"FSDP"`` (e.g. ``FSDPNemotronFlashForCausalLM``); walk
+    the MRO so both the pre- and post-FSDP types are recognised.
+    """
     for cls in type(module).__mro__:
         name = getattr(cls, "__name__", "")
         mod = getattr(cls, "__module__", "") or ""
         if name == "NemotronFlashForCausalLM" and "transformers_modules" in mod:
-            return True
-    return False
+            return cls
+    return None
+
+
+def _is_nemotron_flash_causallm(module: nn.Module) -> bool:
+    return _find_nemotron_flash_causallm_class(module) is not None
 
 
 def _patched_forward(
@@ -155,37 +164,120 @@ def _patched_forward(
     )
 
 
+def _is_nemotron_flash_config(cfg) -> bool:
+    if cfg is None:
+        return False
+    if getattr(cfg, "model_type", None) == "nemotron_flash":
+        return True
+    architectures = getattr(cfg, "architectures", None) or ()
+    if "NemotronFlashForCausalLM" in architectures:
+        return True
+    name_or_path = getattr(cfg, "name_or_path", "") or ""
+    return "nemotron-flash" in name_or_path.lower()
+
+
 def should_fix_lm_head_norm(model_parts) -> bool:
     for mp in model_parts:
         if isinstance(mp, nn.Module):
             if _is_nemotron_flash_causallm(mp):
                 return True
+            if _is_nemotron_flash_config(getattr(mp, "config", None)):
+                return True
             for _, module in mp.named_modules():
                 if _is_nemotron_flash_causallm(module):
                     return True
+                if _is_nemotron_flash_config(getattr(module, "config", None)):
+                    return True
+        elif _is_nemotron_flash_config(getattr(mp, "config", None)):
+            return True
     return False
 
 
+def _patch_class_forward(cls) -> bool:
+    """Patch the class's ``forward`` attribute in-place. Idempotent."""
+    if getattr(cls.forward, "_nemo_lm_head_norm_patched", False):
+        return False
+    _patched_forward._nemo_lm_head_norm_patched = True  # type: ignore[attr-defined]
+    cls.forward = _patched_forward
+    logger.info(
+        "[fix_lm_head_norm] patched class forward on %s.%s",
+        cls.__module__,
+        cls.__name__,
+    )
+    return True
+
+
+def _find_nemotron_flash_classes_in_sys_modules():
+    """Scan ``sys.modules`` for the remote-code ``NemotronFlashForCausalLM`` class.
+
+    Remote-code modules live under ``transformers_modules.<repo>.<hash>.modeling_nemotron_flash``
+    after transformers dynamic module loading.
+    """
+    import sys
+
+    classes = []
+    for mod_name, mod in list(sys.modules.items()):
+        if not mod_name.startswith("transformers_modules."):
+            continue
+        if "modeling_nemotron_flash" not in mod_name and mod is not None:
+            continue
+        cls = getattr(mod, "NemotronFlashForCausalLM", None) if mod is not None else None
+        if cls is not None:
+            classes.append(cls)
+    return classes
+
+
 def fix_lm_head_norm(model_parts) -> int:
-    """Monkey-patch ``NemotronFlashForCausalLM.forward`` to DTensor-safe version."""
+    """Monkey-patch ``NemotronFlashForCausalLM.forward`` to DTensor-safe version.
+
+    Prefers patching at the class level (via MRO + ``sys.modules`` scan) so that
+    all current and future instances — including vanilla-HF loaded models in
+    the checkpoint robustness Phase 4 — use the DTensor-safe forward. Also
+    patches per-instance as a fallback (FSDP2's dynamic subclass shadows the
+    base ``forward`` on the instance).
+    """
     fixed = 0
+    patched_classes = set()
+
+    # Pass 1: scan sys.modules for the remote-code class(es) and patch them at
+    # class level. This covers ALL instances (training FSDP-wrapped + Phase 4
+    # vanilla HF) without having to find the exact module on each one.
+    for cls in _find_nemotron_flash_classes_in_sys_modules():
+        if cls not in patched_classes and _patch_class_forward(cls):
+            patched_classes.add(cls)
+            fixed += 1
+
+    # Pass 2: for any module parts that are the Nemotron-Flash causal LM
+    # (NOT arbitrary submodules sharing the same config), patch class-level
+    # via MRO (in case the sys.modules scan missed) and bind per-instance
+    # as a belt-and-suspenders safeguard against FSDP2 dynamic-subclass
+    # shadowing of the base ``forward``.
     for mp in model_parts:
         if not isinstance(mp, nn.Module):
             continue
-        candidates = [mp] if _is_nemotron_flash_causallm(mp) else []
+        candidates = []
+        if _is_nemotron_flash_causallm(mp):
+            candidates.append(mp)
         for _, module in mp.named_modules():
             if _is_nemotron_flash_causallm(module):
                 candidates.append(module)
         for module in candidates:
-            if getattr(module.forward, "_nemo_lm_head_norm_patched", False):
-                continue
-            module.forward = types.MethodType(_patched_forward, module)
-            module.forward.__func__._nemo_lm_head_norm_patched = True  # type: ignore[attr-defined]
-            logger.info(
-                "[fix_lm_head_norm] patched NemotronFlashForCausalLM.forward on %s",
-                type(module).__name__,
-            )
-            fixed += 1
+            cls = _find_nemotron_flash_causallm_class(module)
+            if cls is not None and cls not in patched_classes:
+                if _patch_class_forward(cls):
+                    patched_classes.add(cls)
+                    fixed += 1
+            if not getattr(module.forward, "_nemo_lm_head_norm_patched", False):
+                module.forward = types.MethodType(_patched_forward, module)
+                try:
+                    module.forward.__func__._nemo_lm_head_norm_patched = True  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+                logger.info(
+                    "[fix_lm_head_norm] patched instance forward on %s",
+                    type(module).__name__,
+                )
+                fixed += 1
     return fixed
 
 
