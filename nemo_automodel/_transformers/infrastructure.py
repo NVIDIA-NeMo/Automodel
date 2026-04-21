@@ -610,7 +610,6 @@ def apply_model_infrastructure(
             attach_linear_attn_position_hooks,
         )
 
-        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
         # cp_mesh is needed by attach_cp_sdpa_hooks for both compiled and non-compiled
         # CP.  We now use manual sequence slicing + attach_cp_sdpa_hooks for all CP>1
         # cases; context_parallel (DTensor-throughout) is no longer used because it

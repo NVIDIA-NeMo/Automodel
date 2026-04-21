@@ -218,8 +218,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         orig_head_dim = query.shape[-1]
         pad_to = 1 << (orig_head_dim - 1).bit_length()  # next power of 2
         if pad_to != orig_head_dim:
-            import torch.nn.functional as _F
             import math as _math
+
+            import torch.nn.functional as _F
             pad_len = pad_to - orig_head_dim
             query    = _F.pad(query,    (0, pad_len))
             key_full = _F.pad(key_full, (0, pad_len))
@@ -294,7 +295,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             # this the primary path fails silently and the only visible symptom
             # is an unrelated-looking OOM deep inside _original_sdpa.
             if not getattr(_cp_sdpa, "_flex_err_logged", False):
-                import logging, traceback
+                import logging
+                import traceback
+
                 _log = logging.getLogger(__name__)
                 _log.warning(
                     "CP flex_attention path failed; falling back to SDPA. "
@@ -322,7 +325,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             )
             cp_causal_mask.masked_fill_(~bool_mask, float("-inf"))
 
-            from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
+            from torch.nn.attention import SDPBackend
+            from torch.nn.attention import sdpa_kernel as _sdpa_kernel
+
             _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
             try:
                 _backends.append(SDPBackend.CUDNN_ATTENTION)
@@ -495,11 +500,11 @@ def make_cp_batch_and_ctx(
     # context_parallel propagates DTensor activations through the full model
     # and PyTorch's CP attention inner_fn ends up with mixed types (DTensor Q
     # from the propagated hidden-states vs plain K/V after allgather).
-    # Ring attention is still performed correctly because attach_cp_sdpa_hooks
-    # (registered in infrastructure.py for all CP>1 cases) wraps Q/K/V as
-    # sequence-sharded DTensors at the SDPA call site; the DTensor SDPA
-    # dispatch then handles the ring communication.  All activations outside
-    # the SDPA call remain plain tensors.
+    # All activations outside the SDPA call remain plain tensors; the CP
+    # communication is done entirely inside _cp_sdpa (see
+    # attach_cp_sdpa_hooks) via an explicit all-gather of K/V across the CP
+    # group followed by a single compiled flex_attention call with a
+    # per-rank causal block mask.  No DTensor dispatch is involved.
     cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
     S_total = seq_tensor.shape[1]
     S_local = S_total // _cp_size
@@ -519,8 +524,8 @@ def make_cp_batch_and_ctx(
     if "padding_mask" in batch:
         batch["padding_mask"] = batch["padding_mask"][:, _s:_e].contiguous()
 
-    # No CP context manager needed: ring attention fires via DTensor dispatch
-    # inside attach_cp_sdpa_hooks.
+    # No CP context manager needed: the CP all-gather + masked attention is
+    # performed inline inside attach_cp_sdpa_hooks' _cp_sdpa wrapper.
     return nullcontext, batch
 
 
