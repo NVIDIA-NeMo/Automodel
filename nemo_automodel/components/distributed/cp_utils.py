@@ -153,6 +153,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     # Prefer differentiable all_gather; fall back to non-differentiable.
     try:
         from torch.distributed.nn.functional import all_gather as _dist_all_gather
+
         _use_differentiable_ag = True
     except (ImportError, AttributeError):
         _use_differentiable_ag = False
@@ -167,6 +168,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     def _get_compiled_flex_attn():
         if _flex_attn_compiled["fn"] is None:
             from torch.nn.attention.flex_attention import flex_attention as _flex_attn
+
             _flex_attn_compiled["fn"] = torch.compile(_flex_attn, dynamic=False)
         return _flex_attn_compiled["fn"]
 
@@ -186,26 +188,43 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
     ):
         try:
             from torch.distributed.tensor import DTensor
+
             if isinstance(query, DTensor):
                 # Fallback: already a DTensor (shouldn't happen with our plain-tensor
                 # manual-slice approach, but handle gracefully).
-                out = _original_sdpa(query, key, value, attn_mask=attn_mask,
-                                     dropout_p=dropout_p, is_causal=is_causal,
-                                     scale=scale, enable_gqa=enable_gqa, **kwargs)
+                out = _original_sdpa(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                    **kwargs,
+                )
                 return out.to_local() if isinstance(out, DTensor) else out
         except ImportError:
             pass
 
         if _cp_size <= 1:
-            return _original_sdpa(query, key, value, attn_mask=attn_mask,
-                                  dropout_p=dropout_p, is_causal=is_causal,
-                                  scale=scale, enable_gqa=enable_gqa, **kwargs)
+            return _original_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                **kwargs,
+            )
 
         cp_rank = torch.distributed.get_rank(group=_cp_group)
         S_local = key.shape[2]
 
         # All-gather K and V to get full-sequence tensors.
-        key_full = _all_gather_seq(key)    # [B, nH, S_full, D]
+        key_full = _all_gather_seq(key)  # [B, nH, S_full, D]
         val_full = _all_gather_seq(value)  # [B, nH, S_full, D]
         S_full = key_full.shape[2]
 
@@ -221,8 +240,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             import math as _math
 
             import torch.nn.functional as _F
+
             pad_len = pad_to - orig_head_dim
-            query    = _F.pad(query,    (0, pad_len))
+            query = _F.pad(query, (0, pad_len))
             key_full = _F.pad(key_full, (0, pad_len))
             val_full = _F.pad(val_full, (0, pad_len))
             if scale is None:
@@ -243,6 +263,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         out = None
         try:
             from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
+
             _r = cp_rank
             _sl = S_local
 
@@ -254,8 +275,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
             _block_mask = _create_block_mask(
                 _cp_causal_mask,
-                B=None, H=None,
-                Q_LEN=S_local, KV_LEN=S_full,
+                B=None,
+                H=None,
+                Q_LEN=S_local,
+                KV_LEN=S_full,
                 device=query.device,
             )
             # flex_attention requires enable_gqa=True when Q and KV head counts
@@ -298,9 +321,14 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     raise
             if not getattr(_cp_sdpa, "_flex_ok_logged", False):
                 import logging as _logging
+
                 _logging.getLogger(__name__).info(
                     "CP using flex_attention (compiled). shapes: Q=%s K_full=%s head_dim=%s->%s cp_rank=%s",
-                    tuple(query.shape), tuple(key_full.shape), orig_head_dim, pad_to, cp_rank,
+                    tuple(query.shape),
+                    tuple(key_full.shape),
+                    orig_head_dim,
+                    pad_to,
+                    cp_rank,
                 )
                 _cp_sdpa._flex_ok_logged = True
         except Exception as _flex_err:
@@ -314,9 +342,17 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     "CP flex_attention path failed; falling back to chunked O(N) attention. "
                     "shapes: Q=%s K_full=%s V_full=%s scale=%s head_dim_pad=%s->%s "
                     "cp_rank=%s S_local=%s S_full=%s | %s: %s",
-                    tuple(query.shape), tuple(key_full.shape), tuple(val_full.shape),
-                    scale, orig_head_dim, pad_to, cp_rank, S_local, S_full,
-                    type(_flex_err).__name__, _flex_err,
+                    tuple(query.shape),
+                    tuple(key_full.shape),
+                    tuple(val_full.shape),
+                    scale,
+                    orig_head_dim,
+                    pad_to,
+                    cp_rank,
+                    S_local,
+                    S_full,
+                    type(_flex_err).__name__,
+                    _flex_err,
                 )
                 _log.warning("CP flex_attention traceback:\n%s", _tb.format_exc())
                 _cp_sdpa._flex_err_logged = True
@@ -330,6 +366,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             # on long sequences.  Slower than flex_attention (no fused kernel)
             # but correct and memory-safe.
             import math as _math
+
             _D = query.shape[-1]
             _sc = scale if scale is not None else 1.0 / _math.sqrt(_D)
             _nH = query.shape[1]
@@ -343,7 +380,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             _k_f = _k_exp.float()
             _v_f = _v_exp.float()
             _out_acc = torch.zeros(_B, _nH, S_local, _D, dtype=torch.float32, device=query.device)
-            _lse = torch.full((_B, _nH, S_local), float('-inf'), dtype=torch.float32, device=query.device)
+            _lse = torch.full((_B, _nH, S_local), float("-inf"), dtype=torch.float32, device=query.device)
             for _kvs in range(0, S_full, _KV_CHUNK):
                 _kve = min(_kvs + _KV_CHUNK, S_full)
                 _kc = _k_f[:, :, _kvs:_kve, :]
@@ -351,9 +388,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 _sc_mat = torch.matmul(_q_f, _kc.transpose(-2, -1)) * _sc
                 _qi = torch.arange(S_local, device=query.device) + _q_global_start
                 _ki = torch.arange(_kvs, _kve, device=query.device)
-                _sc_mat = _sc_mat.masked_fill(
-                    ~(_qi.unsqueeze(1) >= _ki.unsqueeze(0))[None, None], float('-inf')
-                )
+                _sc_mat = _sc_mat.masked_fill(~(_qi.unsqueeze(1) >= _ki.unsqueeze(0))[None, None], float("-inf"))
                 _cmax = _sc_mat.amax(dim=-1)
                 _exp = torch.exp(_sc_mat - _cmax.unsqueeze(-1))
                 _clse = _cmax + torch.log(_exp.sum(-1).clamp(min=1e-9))
@@ -509,6 +544,7 @@ def make_cp_batch_and_ctx(
     _pad_len = (-seq_tensor.shape[1]) % _required
     if _pad_len:
         import torch.nn.functional as _F
+
         if _has_embeds:
             # inputs_embeds: [B, S, H] → pad seq dim (second-to-last)
             seq_tensor = _F.pad(seq_tensor, (0, 0, 0, _pad_len))
