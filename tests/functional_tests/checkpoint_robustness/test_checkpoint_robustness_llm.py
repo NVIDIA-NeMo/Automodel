@@ -270,10 +270,19 @@ def test_checkpoint_robustness():
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
     # Some FP8-quantized checkpoints (e.g. ministral3) require dequantize=True
     # at load time to avoid a Triton-only FP8 matmul kernel dispatch in the
-    # vanilla HF forward pass (Phase 4).  Forward the config's quantization
-    # block to hf_kwargs below so the Phase-4 HF load takes the same
-    # FP8->bf16 path as Phase 1/3.
-    original_quantization_config = getattr(cfg.model, "quantization_config", None)
+    # vanilla HF forward pass (Phase 4).  Materialise the yaml quantization
+    # sub-tree into an HF config object here so Phase 4 can forward it
+    # to `from_pretrained` — passing the raw ConfigNode directly would
+    # trip transformers' internal deepcopy (triggers ConfigNode.__getattr__
+    # on `__setstate__`, which then fails recursively).
+    _raw_qc = getattr(cfg.model, "quantization_config", None)
+    if _raw_qc is not None and hasattr(_raw_qc, "instantiate"):
+        try:
+            original_quantization_config = _raw_qc.instantiate()
+        except Exception:
+            original_quantization_config = None
+    else:
+        original_quantization_config = _raw_qc
 
     del trainer
     gc.collect()
