@@ -106,3 +106,4 @@ lr_scheduler:
 ci:
   recipe_owner: HuiyingLi
   nodes: 2
+  time: "00:25:00"
