@@ -107,6 +107,7 @@ ci:
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     tokenizer_name: nvidia/Nemotron-Flash-1B
+    trust_remote_code: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 
