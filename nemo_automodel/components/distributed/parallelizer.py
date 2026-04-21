@@ -1275,12 +1275,19 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
 
     MODEL_CLS_TO_LAYERS = VLM_MODEL_CLS_TO_LAYERS | LLM_MODEL_CLS_TO_LAYERS
 
+    def _extend_layers(layers, modules):
+        for m in modules:
+            if isinstance(m, nn.ModuleList):
+                layers.extend(m)
+            else:
+                layers.append(m)
+
     model_cls = type(model)
     layers: List[nn.Module] = []
     if model_cls in MODEL_CLS_TO_LAYERS:
-        layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
     elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
-        layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM)
         if isinstance(model.model.layers, nn.ModuleDict):
