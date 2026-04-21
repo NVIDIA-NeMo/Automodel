@@ -14,23 +14,14 @@
 
 configs:
   - gemma4/gemma4_26b_a4b_moe.yaml
-  - gemma4/gemma4_26b_a4b_moe_mock.yaml
   - gemma4/gemma4_26b_a4b_moe_peft.yaml
   - gemma4/gemma4_2b.yaml
   - gemma4/gemma4_2b_peft.yaml
   - gemma4/gemma4_31b.yaml
   - gemma4/gemma4_31b_peft.yaml
-  - gemma4/gemma4_31b_tp4.yaml
-  - gemma4/gemma4_31b_tp4_pp2.yaml
-  - gemma4/gemma4_31b_tp4_pp4.yaml
   - gemma4/gemma4_4b.yaml
-  - gemma4/gemma4_4b_mock.yaml
   - gemma4/gemma4_4b_peft.yaml
   - kimi/kimi25vl_medpix.yaml
-  - llava_onevision/llava_ov_1_5_4b_finetune.yaml
-  - llava_onevision/llava_ov_1_5_8b_lora.yaml
-  - nemotron/nemotron_parse_v1_1.yaml
   - qwen3_5/qwen3_5_4b_neat_packing.yaml
   - qwen3_5_moe/qwen3_5_35b_neat_packing.yaml
   - qwen3_5_moe/qwen3_5_moe_medpix.yaml
-  - qwen3_5_moe/qwen3_6_35b.yaml
