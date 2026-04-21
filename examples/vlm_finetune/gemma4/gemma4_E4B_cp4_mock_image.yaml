@@ -35,12 +35,11 @@ recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   # GBS=32, local_batch_size=1 → 1 micro-batch per DP rank per step.
-  # 20 steps is enough to see a clean loss curve and catch any NaN.
   global_batch_size: 32
   local_batch_size: 1
   ckpt_every_steps: 9999
   val_every_steps: 9999
-  max_steps: 20
+  max_steps: 300
   num_epochs: 1
 
 dist_env:
@@ -84,7 +83,7 @@ loss_fn:
 # max_length=8192: sequence is divisible by cp_size=4 (2048 per rank).
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
-  num_samples: 200
+  num_samples: 10000
   num_images_per_sample: 1
   image_size: [256, 256]
   max_length: 8192
