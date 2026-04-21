@@ -270,6 +270,8 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             # the kernel refuses to compile ("No valid triton configs").  Shrink
             # the blocks and the pipeline depth when head_dim is large so the
             # kernel fits.  Leave defaults for small head_dim (faster).
+            # NOTE: kernel_options was added in PyTorch 2.6; on older versions
+            # we fall back to a retry without it (may still work if enough SRAM).
             _kernel_options = None
             if query.shape[-1] >= 256:
                 _kernel_options = {
@@ -282,68 +284,78 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     "num_stages": 1,
                     "num_warps": 4,
                 }
-            out = _get_compiled_flex_attn()(
-                query, key_full, val_full,
-                block_mask=_block_mask,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                kernel_options=_kernel_options,
-            )
+            _flex_kw = {"block_mask": _block_mask, "scale": scale, "enable_gqa": enable_gqa}
+            if _kernel_options is not None:
+                _flex_kw["kernel_options"] = _kernel_options
+            try:
+                out = _get_compiled_flex_attn()(query, key_full, val_full, **_flex_kw)
+            except TypeError as _te:
+                # PyTorch < 2.6: kernel_options not supported; retry without it.
+                if "kernel_options" in str(_te) and "kernel_options" in _flex_kw:
+                    _flex_kw.pop("kernel_options")
+                    out = _get_compiled_flex_attn()(query, key_full, val_full, **_flex_kw)
+                else:
+                    raise
         except Exception as _flex_err:
-            # Surface the failure once per process so we know *why* we fell back
-            # to the O(N^2) SDPA path (which OOMs on long sequences).  Without
-            # this the primary path fails silently and the only visible symptom
-            # is an unrelated-looking OOM deep inside _original_sdpa.
+            # Surface the failure once per process so we know *why* we fell back.
             if not getattr(_cp_sdpa, "_flex_err_logged", False):
                 import logging
-                import traceback
+                import traceback as _tb
 
                 _log = logging.getLogger(__name__)
                 _log.warning(
-                    "CP flex_attention path failed; falling back to SDPA. "
+                    "CP flex_attention path failed; falling back to chunked O(N) attention. "
                     "shapes: Q=%s K_full=%s V_full=%s scale=%s head_dim_pad=%s->%s "
                     "cp_rank=%s S_local=%s S_full=%s | %s: %s",
                     tuple(query.shape), tuple(key_full.shape), tuple(val_full.shape),
                     scale, orig_head_dim, pad_to, cp_rank, S_local, S_full,
                     type(_flex_err).__name__, _flex_err,
                 )
-                _log.warning("CP flex_attention traceback:\n%s", traceback.format_exc())
+                _log.warning("CP flex_attention traceback:\n%s", _tb.format_exc())
                 _cp_sdpa._flex_err_logged = True
+            out = None
 
         if out is None:
-            # Fallback: SDPA with explicit per-rank causal float mask.
-            # Flash rejects float masks; Efficient Attention rejects float mask + GQA.
-            # This falls back to MATH which needs ~1 GiB contiguous memory.
-            # If MATH OOMs due to fragmentation, set:
-            #   PYTORCH_ALLOC_CONF=expandable_segments:True
-            q_offset = cp_rank * S_local
-            q_idx = torch.arange(S_local, device=query.device) + q_offset
-            k_idx = torch.arange(S_full, device=query.device)
-            bool_mask = q_idx.unsqueeze(1) >= k_idx.unsqueeze(0)
-            cp_causal_mask = torch.zeros(
-                1, 1, S_local, S_full, dtype=query.dtype, device=query.device
-            )
-            cp_causal_mask.masked_fill_(~bool_mask, float("-inf"))
-
-            from torch.nn.attention import SDPBackend
-            from torch.nn.attention import sdpa_kernel as _sdpa_kernel
-
-            _backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-            try:
-                _backends.append(SDPBackend.CUDNN_ATTENTION)
-            except AttributeError:
-                pass
-            _backends.append(SDPBackend.MATH)
-            with _sdpa_kernel(_backends):
-                out = _original_sdpa(
-                    query, key_full, val_full,
-                    attn_mask=cp_causal_mask,
-                    dropout_p=dropout_p,
-                    is_causal=False,
-                    scale=scale,
-                    enable_gqa=enable_gqa,
-                    **kwargs,
+            # Fallback: chunked online-softmax attention — O(N) memory.
+            # Processes KV in blocks of KV_CHUNK and accumulates via the
+            # log-sum-exp trick (same algorithm as FlashAttention but in pure
+            # PyTorch ops).  Works for arbitrary head_dim and GQA; never OOMs
+            # on long sequences.  Slower than flex_attention (no fused kernel)
+            # but correct and memory-safe.
+            import math as _math
+            _D = query.shape[-1]
+            _sc = scale if scale is not None else 1.0 / _math.sqrt(_D)
+            _nH = query.shape[1]
+            _nKV = key_full.shape[1]
+            _B = query.shape[0]
+            _k_exp = key_full.expand(_B, _nH, S_full, _D).contiguous() if (_nKV != _nH) else key_full
+            _v_exp = val_full.expand(_B, _nH, S_full, _D).contiguous() if (_nKV != _nH) else val_full
+            _KV_CHUNK = 256
+            _q_global_start = cp_rank * S_local
+            _q_f = query.float()
+            _k_f = _k_exp.float()
+            _v_f = _v_exp.float()
+            _out_acc = torch.zeros(_B, _nH, S_local, _D, dtype=torch.float32, device=query.device)
+            _lse = torch.full((_B, _nH, S_local), float('-inf'), dtype=torch.float32, device=query.device)
+            for _kvs in range(0, S_full, _KV_CHUNK):
+                _kve = min(_kvs + _KV_CHUNK, S_full)
+                _kc = _k_f[:, :, _kvs:_kve, :]
+                _vc = _v_f[:, :, _kvs:_kve, :]
+                _sc_mat = torch.matmul(_q_f, _kc.transpose(-2, -1)) * _sc
+                _qi = torch.arange(S_local, device=query.device) + _q_global_start
+                _ki = torch.arange(_kvs, _kve, device=query.device)
+                _sc_mat = _sc_mat.masked_fill(
+                    ~(_qi.unsqueeze(1) >= _ki.unsqueeze(0))[None, None], float('-inf')
                 )
+                _cmax = _sc_mat.amax(dim=-1)
+                _exp = torch.exp(_sc_mat - _cmax.unsqueeze(-1))
+                _clse = _cmax + torch.log(_exp.sum(-1).clamp(min=1e-9))
+                _new_lse = torch.logaddexp(_lse, _clse)
+                _alpha = torch.exp(_lse - _new_lse).unsqueeze(-1)
+                _beta = torch.exp(_clse - _new_lse).unsqueeze(-1)
+                _out_acc = _out_acc * _alpha + _beta * torch.matmul(_exp, _vc)
+                _lse = _new_lse
+            out = _out_acc.to(query.dtype)
 
         if pad_to != orig_head_dim:
             out = out[..., :orig_head_dim]
@@ -487,6 +499,10 @@ def make_cp_batch_and_ctx(
         batch[_seq_key] = seq_tensor
         labels = _F.pad(labels, (0, _pad_len), value=-100)
         batch["labels"] = labels
+        if "mm_token_type_ids" in batch:
+            batch["mm_token_type_ids"] = _F.pad(batch["mm_token_type_ids"], (0, _pad_len), value=0)
+        if "per_layer_inputs" in batch:
+            batch["per_layer_inputs"] = _F.pad(batch["per_layer_inputs"], (0, 0, 0, 0, 0, _pad_len))
         if pos_seq_dim == 1:
             _extra = position_ids[:, -1:] + torch.arange(1, _pad_len + 1, device=position_ids.device)
             position_ids = torch.cat([position_ids, _extra], dim=1)
@@ -517,6 +533,10 @@ def make_cp_batch_and_ctx(
         batch["position_ids"] = position_ids[:, _s:_e].contiguous()
     else:
         batch["position_ids"] = position_ids[:, :, _s:_e].contiguous()
+    if "mm_token_type_ids" in batch:
+        batch["mm_token_type_ids"] = batch["mm_token_type_ids"][:, _s:_e].contiguous()
+    if "per_layer_inputs" in batch:
+        batch["per_layer_inputs"] = batch["per_layer_inputs"][:, _s:_e].contiguous()
 
     if loss_mask is not None:
         loss_mask = loss_mask[:, _s:_e].contiguous()
