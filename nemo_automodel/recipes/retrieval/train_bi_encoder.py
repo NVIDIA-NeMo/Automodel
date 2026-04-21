@@ -290,6 +290,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         for epoch in self.step_scheduler.epochs:
             self.step_scheduler.set_epoch(epoch)
+
+            if hasattr(self.dataloader.dataset, "set_epoch"):
+                self.dataloader.dataset.set_epoch(epoch)
+
             # The step scheduler yields a list of batches for gradient accumulation
             for batches in self.step_scheduler:
                 train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
