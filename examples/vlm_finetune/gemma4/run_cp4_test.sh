@@ -9,6 +9,7 @@ NODE_RANK=${1:-0}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../../.."
 
+export PYTHONPATH="$(pwd):${PYTHONPATH}"
 export NCCL_SOCKET_IFNAME=eth0   # 屏蔽 IPv6，只用 eth0；如果网卡名不同改这里
 export NCCL_IB_DISABLE=0
 
