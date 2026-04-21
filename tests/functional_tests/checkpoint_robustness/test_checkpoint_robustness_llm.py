@@ -398,9 +398,31 @@ def test_checkpoint_robustness():
     _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
     if _rank0():
+        from contextlib import nullcontext
+
         from transformers import AutoModelForCausalLM
 
+        # Nemotron-Flash's custom ``LlamaRotaryEmbedding.__init__`` does
+        # ``torch.arange(...).to(device)`` which blows up under transformers 5.x's
+        # unconditional ``torch.device("meta")`` init context. Wrap HF loads in
+        # ``no_hf_meta_device`` so the model is built on a real device; we rely on
+        # this only for trust_remote_code models since standard HF models init
+        # correctly under meta.
+        try:
+            from nemo_automodel._transformers.model_init import no_hf_meta_device
+
+            _no_meta = no_hf_meta_device() if trust_remote_code else nullcontext()
+        except ImportError:
+            _no_meta = nullcontext()
+
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
+        # Nemotron-Flash's config ships ``attn_implementation="fused_mha"`` which
+        # transformers 5.x rejects in ``_check_and_adjust_attn_implementation``
+        # (only ``eager`` + registered ALL_ATTENTION_FUNCTIONS keys are accepted).
+        # Force a universally accepted impl; Nemotron-Flash routes
+        # ``flash_attention_2`` through its own fused path internally.
+        if trust_remote_code and "attn_implementation" not in hf_kwargs:
+            hf_kwargs["attn_implementation"] = "flash_attention_2"
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
@@ -410,12 +432,13 @@ def test_checkpoint_robustness():
         if is_peft:
             from peft import PeftModel
 
-            if hf_device_map_auto:
-                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
-            else:
-                base_model = _fix_meta_rotary_embeddings(
-                    AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
-                ).to(device)
+            with _no_meta:
+                if hf_device_map_auto:
+                    base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                else:
+                    base_model = _fix_meta_rotary_embeddings(
+                        AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                    ).to(device)
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
@@ -437,12 +460,13 @@ def test_checkpoint_robustness():
             del peft_model, base_model
         else:
             _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
-            if hf_device_map_auto:
-                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
-            else:
-                hf_model = _fix_meta_rotary_embeddings(
-                    AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
-                ).to(device)
+            with _no_meta:
+                if hf_device_map_auto:
+                    hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                else:
+                    hf_model = _fix_meta_rotary_embeddings(
+                        AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                    ).to(device)
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
