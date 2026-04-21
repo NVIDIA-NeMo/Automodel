@@ -345,13 +345,23 @@ class ConfigNode:
         self.raise_on_missing_attr = raise_on_missing_attr
 
     def __getattr__(self, key: str) -> Any:
+        # Dunder methods must raise AttributeError so that Python's
+        # copy/pickle/repr protocols (which call
+        # getattr(obj, "__setstate__", None), etc.) treat them as absent
+        # rather than as missing regular attributes — returning None here
+        # would break copy.deepcopy and isinstance checks.
+        if key.startswith("__") and key.endswith("__"):
+            raise AttributeError(key)
         try:
             return self.__dict__[key]
-        except:
-            if self.raise_on_missing_attr:
-                raise AttributeError
-            else:
-                return None
+        except KeyError:
+            # Read the flag safely: on a partially-constructed node
+            # (e.g. a deepcopy target that has not yet had __setstate__
+            # called) raise_on_missing_attr may itself be missing, which
+            # would recurse back into __getattr__.  Default to True.
+            if self.__dict__.get("raise_on_missing_attr", True):
+                raise AttributeError(key)
+            return None
 
     def _wrap(self, k: str, v: Any) -> Any:
         """Wrap a configuration value based on its type.
