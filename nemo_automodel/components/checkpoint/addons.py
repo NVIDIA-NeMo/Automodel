@@ -386,30 +386,44 @@ def _ensure_model_type_and_auto_map(config_path: str, config_obj, original_model
         with open(config_path) as f:
             config_dict = json.load(f)
     except (OSError, ValueError):
-        return
+        config_dict = {}
+
+    # Load the original pretrained config.json once (source of truth for trust_remote_code
+    # models whose ``config_obj`` may have lost ``auto_map`` on the NeMo code path).
+    original: dict = {}
+    if original_model_path and os.path.isdir(original_model_path):
+        src = os.path.join(original_model_path, "config.json")
+        if os.path.isfile(src):
+            try:
+                with open(src) as f:
+                    original = json.load(f)
+            except (OSError, ValueError):
+                original = {}
 
     changed = False
 
     if not config_dict.get("model_type"):
-        model_type = getattr(type(config_obj), "model_type", None) or getattr(config_obj, "model_type", None)
+        model_type = (
+            getattr(type(config_obj), "model_type", None)
+            or getattr(config_obj, "model_type", None)
+            or original.get("model_type")
+        )
         if model_type:
             config_dict["model_type"] = model_type
             changed = True
 
     if not config_dict.get("auto_map"):
-        auto_map = getattr(config_obj, "auto_map", None)
-        if not auto_map and original_model_path and os.path.isdir(original_model_path):
-            src = os.path.join(original_model_path, "config.json")
-            if os.path.isfile(src):
-                try:
-                    with open(src) as f:
-                        original = json.load(f)
-                except (OSError, ValueError):
-                    original = {}
-                auto_map = original.get("auto_map")
+        auto_map = getattr(config_obj, "auto_map", None) or original.get("auto_map")
         if auto_map:
             config_dict["auto_map"] = auto_map
             changed = True
+
+    # Also preserve ``architectures`` from the original if missing; some transformers
+    # versions drop it when serializing custom configs registered via
+    # ``register_for_auto_class``.
+    if not config_dict.get("architectures") and original.get("architectures"):
+        config_dict["architectures"] = original["architectures"]
+        changed = True
 
     if changed:
         with open(config_path, "w") as f:
