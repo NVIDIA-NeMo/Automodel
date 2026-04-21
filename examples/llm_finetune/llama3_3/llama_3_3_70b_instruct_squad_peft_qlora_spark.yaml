@@ -12,19 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# single node 8xh200
-# To run this recipe:
-#   automodel examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# QLoRA configuration for Llama-3.3-70B-Instruct on SQuAD dataset (DGX Spark)
+# Uses 4-bit quantization with LoRA adapters
+#
+# To run this recipe, please use the following command:
+# torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 4
-  ckpt_every_steps: 50
-  val_every_steps: 1000
-  max_steps: 100
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 600
+  max_steps: 500   # adjust this as necessary
 
 dist_env:
   backend: nccl
@@ -32,78 +33,73 @@ dist_env:
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1111
+  seed: 42
   ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: mistralai/Mixtral-8x7B-Instruct-v0.1
-  torch_dtype: bf16
-  trust_remote_code: true
-
-checkpoint:
-  enabled: true
-  checkpoint_dir: checkpoints/
-  model_save_format: safetensors
-  save_consolidated: false
-
+  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  torch_dtype: bfloat16
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
-  dim: 8
+  match_all_linear: true
+  dim: 16
   alpha: 32
-  use_triton: True
-
+  dropout: 0.1
 
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 4
+  tp_size: 1
   cp_size: 1
-  pp_size: 1
 
   sequence_parallel: false
 
-loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+quantization:
+  load_in_4bit: True
+  load_in_8bit: False
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_use_double_quant: True
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_quant_storage: bfloat16
 
-# SQuAD instruction tuning dataset (5% train split for quick runs)
+loss_fn:
+  _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
+
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: train
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
 
-# StatefulDataLoader with default collate
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: true
+  shuffle: false
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
+  limit_dataset_samples: 100
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 1.0e-5
-  weight_decay: 0
+  weight_decay: 0.01
 
-lr_scheduler:
-  lr_decay_style: cosine
-  min_lr: 1.0e-6
-
-ci:
-  recipe_owner: HuiyingLi
-  nodes: 2
-  time: "00:25:00"
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: llama3_3_70b_instruct_squad_qlora_spark
+#   save_dir: <your_wandb_save_dir> 

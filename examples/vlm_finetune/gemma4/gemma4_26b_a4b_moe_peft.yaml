@@ -129,5 +129,5 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
-  recipe_owner: hemildesai
+  recipe_owner: athitten
   time: "00:20:00"
