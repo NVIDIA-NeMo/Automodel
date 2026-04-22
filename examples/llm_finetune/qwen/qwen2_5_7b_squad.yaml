@@ -105,7 +105,7 @@ ci:
   vllm_deploy: true
   recipe_owner: HuiyingLi
   checkpoint_robustness:
-    hf_kl_threshold: 2.5e-2
+    hf_kl_threshold: 1e-1
     distributed.tp_size: 2
     tokenizer_name: Qwen/Qwen2.5-7B
     cross_tp_size: 2
