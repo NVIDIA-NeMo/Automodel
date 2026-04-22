@@ -150,8 +150,12 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
             else:
                 job["variables"][ci_var] = value
 
-    has_robustness = bool(ci_config.get("checkpoint_robustness"))
-    job["variables"]["HAS_ROBUSTNESS"] = str(has_robustness).lower()
+    # Pass through env_vars as CI variables (exported to container via --export=ALL)
+    for key, value in ci_config.get('env_vars', {}).items():
+        job['variables'][key] = str(value)
+
+    has_robustness = bool(ci_config.get('checkpoint_robustness'))
+    job['variables']['HAS_ROBUSTNESS'] = str(has_robustness).lower()
 
     # Configure test stage based on recipe type and robustness config
     if "benchmark" in test_folder:
