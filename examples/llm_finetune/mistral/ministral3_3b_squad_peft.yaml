@@ -117,9 +117,7 @@ ci:
   recipe_owner: akoumpa
   time: "00:15:00"
   checkpoint_robustness:
-    kl_threshold: 5e-3
     hf_kl_threshold: 5e-3
-    no_check_resume: true
     distributed.tp_size: 2
     tokenizer_name: mistralai/Ministral-3-3B-Instruct-2512
     dataset.limit_dataset_samples: 500
