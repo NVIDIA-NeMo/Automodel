@@ -138,7 +138,6 @@ sys.argv = _remaining_argv
 
 def test_vllm_greedy_matches_hf():
     """Load a checkpoint with HF and vLLM, then verify greedy outputs match token-for-token."""
-    pytest.importorskip("vllm")
 
     args = _resolve_args(_custom_args)
     model_path = args["model_path"]
