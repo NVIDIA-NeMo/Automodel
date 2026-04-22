@@ -291,6 +291,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
 
+                    # Stop nsys profiling after the last GA step (not after optimizer)
+                    if i == nsys_end and ga_step_idx == ga_steps - 1 and rank in nsys_ranks:
+                        logger.info(f"Rank {rank} | Stopping nsys profiling")
+                        torch.cuda.cudart().cudaProfilerStop()
+
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
@@ -333,11 +338,6 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Calculate and log MFU
             self._log_iteration_metrics(iter_timer, ga_steps, peak_tflops, rank, i)
-
-            # Stop nsys profiling if configured
-            if i == nsys_end and rank in nsys_ranks:
-                logger.info(f"Rank {rank} | Stopping nsys profiling")
-                torch.cuda.cudart().cudaProfilerStop()
 
             self._maybe_collect_garbage()
 

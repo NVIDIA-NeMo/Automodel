@@ -1,0 +1,91 @@
+# Llama-3.1-70B pretrain benchmark: 8 nodes (64xH100)
+# Parallelism: tp1 cp1 pp1 dp64 (pure FSDP2, no CP)
+# Combined projections DISABLED — separate q/k/v and gate/up (HF-style)
+# Matches MFSDP EOS run: same nodes/GPUs, seqlen, GBS for fair comparison
+
+seed: 42
+
+benchmark:
+  warmup_steps: 5
+  peak_tflops: 989  # H100: 989, A100: 312
+  nsys_start: 8
+  nsys_end: 9
+  nsys_ranks: [0]
+  num_nodes: 8
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1   # dp=64: grad_acc=2 steps per rank
+  ckpt_every_steps: 2000
+  num_epochs: 1
+  max_steps: 12
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
+  torch_dtype: bf16
+  trust_remote_code: True
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: te
+    rope_fusion: True
+    attn: te  # cuDNN WGMMA SDPA — valid with cp=1
+
+checkpoint:
+  enabled: False
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 100
+  seq_len: 4096
+  num_samples: 1000000
+  batch_size: 1  # Must match step_scheduler.local_batch_size
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  lr: 0.00015
+  weight_decay: 0.1
+  master_weights: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+distributed:
+  strategy: fsdp2
+  dp_size: null     # auto: 64 / (tp1 * cp1 * pp1) = 64
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: False
+  activation_checkpointing: True
+  enable_async_tensor_parallel: False
+  enable_fsdp2_prefetch: True
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
+  enable_compile: False
+  defer_fsdp_grad_sync: False
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+
+nvtx: true
+
+wandb:
+  project: automodel-dev-zhiyul
+  entity: nvidia
+  name: llama-3-1-70b-pretrain-tp1cp1pp1dp64-8nodes-bf16-reduce
