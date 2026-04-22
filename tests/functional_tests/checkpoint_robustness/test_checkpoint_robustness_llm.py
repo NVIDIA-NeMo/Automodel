@@ -149,7 +149,15 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     """
     schedule = trainer.pp.info.schedule
     pp_batch_size = trainer.pipeline_config.pp_batch_size
-    seq_len = len(input_ids)
+    orig_seq_len = len(input_ids)
+
+    # PP recv buffer shapes are locked to pp_seq_len at build time. r0.4.0
+    # lacks AutoPipeline.update_seq_len (added in #1689) to resize on the fly,
+    # so pad input_ids to pp_seq_len for the forward pass and slice the
+    # captured logits back to the real prompt length.
+    pp_seq_len = getattr(trainer.pp, "pp_seq_len", None) or orig_seq_len
+    if orig_seq_len < pp_seq_len:
+        input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
     ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
@@ -185,9 +193,9 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
     assert vocab_size is not None, "could not resolve vocab_size from model config"
 
-    buf = torch.zeros((1, seq_len, vocab_size), device=device, dtype=torch.float32)
+    buf = torch.zeros((1, orig_seq_len, vocab_size), device=device, dtype=torch.float32)
     if trainer.pp.info.has_last_stage and captured[0] is not None:
-        buf.copy_(captured[0][:1])
+        buf.copy_(captured[0][:1, :orig_seq_len, :])
 
     pp_mesh = trainer.device_mesh["pp"]
     pp_group = pp_mesh.get_group()
