@@ -33,7 +33,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 1000
-  max_steps: 10
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -116,4 +116,9 @@ lr_scheduler:
 
 ci:
   recipe_owner: akoumparouli
-  time: "00:15:00"  # 49B + PEFT + CP loads slowly and runs ~21s/step; default 10min is too tight.
+  # Note: finetune_launcher.sh overrides `step_scheduler.max_steps` via the
+  # `MAX_STEPS` env var (default 50 per line 42). ci.max_steps is wired into
+  # that env var by generate_ci_tests.py. At ~21s/step on 4xGB200, 50 steps
+  # don't fit in the default 10min; 10 steps + ~3min setup fits comfortably.
+  max_steps: 10
+  time: "00:10:00"
