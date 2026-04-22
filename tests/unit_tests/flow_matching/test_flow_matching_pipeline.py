@@ -463,6 +463,68 @@ class TestLossComputation:
 
         assert torch.allclose(average_unweighted_loss, expected_mse, atol=1e-6)
 
+    def test_bsmntw_weights_shape_and_sum(self, simple_adapter):
+        """Test that BSMNTW weights have correct shape and sum to num_train_timesteps."""
+        num_timesteps = 1000
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=3.0,
+            use_loss_weighting=True,
+            loss_weighting_scheme="bsmntw",
+            num_train_timesteps=num_timesteps,
+        )
+
+        weights = pipeline._bsmntw_weights
+        assert weights.shape == (num_timesteps,), f"Expected shape ({num_timesteps},), got {weights.shape}"
+        assert abs(weights.sum().item() - num_timesteps) < 1e-3, "Weights should sum to num_train_timesteps"
+
+    def test_bsmntw_weights_peak_at_midpoint(self, simple_adapter):
+        """Test that BSMNTW weights peak at the midpoint timestep."""
+        num_timesteps = 1000
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=3.0,
+            use_loss_weighting=True,
+            loss_weighting_scheme="bsmntw",
+            num_train_timesteps=num_timesteps,
+        )
+
+        weights = pipeline._bsmntw_weights
+        peak_idx = weights.argmax().item()
+        assert peak_idx == num_timesteps // 2, f"Peak should be at midpoint ({num_timesteps // 2}), got {peak_idx}"
+
+    def test_bsmntw_loss_weighting(self, simple_adapter):
+        """Test that BSMNTW applies correct per-sigma weights in compute_loss."""
+        num_timesteps = 1000
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=3.0,
+            use_loss_weighting=True,
+            loss_weighting_scheme="bsmntw",
+            num_train_timesteps=num_timesteps,
+        )
+
+        model_pred = torch.zeros(2, 16, 4, 8, 8)
+        target = torch.ones_like(model_pred)
+        sigma = torch.tensor([0.5, 0.1])  # midpoint and edge
+        batch = {}
+
+        _, _, _, _, loss_weight, _ = pipeline.compute_loss(model_pred, target, sigma, batch)
+
+        # Weight at sigma=0.5 (midpoint) should be higher than at sigma=0.1 (edge)
+        w_mid = loss_weight[0, 0, 0, 0, 0].item()
+        w_edge = loss_weight[1, 0, 0, 0, 0].item()
+        assert w_mid > w_edge, f"Midpoint weight ({w_mid}) should be > edge weight ({w_edge})"
+
+    def test_invalid_loss_weighting_scheme_raises(self, simple_adapter):
+        """Test that an invalid loss_weighting_scheme raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown loss_weighting_scheme"):
+            FlowMatchingPipeline(
+                model_adapter=simple_adapter,
+                use_loss_weighting=True,
+                loss_weighting_scheme="invalid_scheme",
+            )
+
 
 class TestFullTrainingStep:
     """Test the complete training step."""
