@@ -156,8 +156,6 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     attention_mask = torch.ones_like(ids)
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
 
-    trainer.pp.update_seq_len(seq_len)
-
     captured = [None]
 
     def _capture_loss_fn(logits, target, **_):
@@ -276,7 +274,6 @@ def _prepopulate_hf_dynamic_modules_cache(local_dir: Path | str) -> None:
         if not dst_py.exists():
             shutil.copy2(src_py, dst_py)
 
-            
 
 def _tp_size_from_argv(argv) -> int:
     """Peek at --distributed.tp_size / --config YAML without constructing the cfg.
