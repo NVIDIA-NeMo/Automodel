@@ -25,6 +25,14 @@ import torch
 import torch.distributed.checkpoint as dcp
 import yaml
 
+try:
+    import multistorageclient as msc
+
+    MSC_AVAILABLE = True
+except ImportError:
+    msc = None
+    MSC_AVAILABLE = False
+
 # Safe import of HF_HUB_CACHE from huggingface_hub.constants
 try:
     from huggingface_hub.constants import HF_HUB_CACHE
@@ -32,6 +40,7 @@ except ImportError:
     HF_HUB_CACHE = None
 
 from packaging.version import parse
+from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -61,6 +70,21 @@ from nemo_automodel.components.checkpoint.utils import (
 if TYPE_CHECKING:
     from peft import PeftConfig
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+
+def is_cloud_path(path: str) -> bool:
+    """Check if path is a cloud storage path (MSC)."""
+    return path.startswith("msc://")
+
+
+def _ensure_msc_available() -> None:
+    """Raise an error if MSC is not installed but a cloud path is used."""
+    if not MSC_AVAILABLE:
+        raise ImportError(
+            "multistorageclient is required for cloud storage paths. "
+            "Install it with: pip install multi-storage-client "
+            "--index-url https://pypi.nvidia.com"
+        )
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -404,7 +428,7 @@ class Checkpointer:
             key_mapping: Optional key remapping when reading from HF checkpoints.
         """
         # Validate checkpoint directory
-        if not os.path.exists(model_path):
+        if not os.path.exists(model_path) and not is_cloud_path(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist")
         model_state = ModelState(
             model,
@@ -807,8 +831,18 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            if is_cloud_path(path):
+                _ensure_msc_available()
+                adapter_path = path.rstrip("/") + "/adapter_model.safetensors"
+                with msc.open(adapter_path, "rb") as f:
+                    data = f.read()
+                state_dict = safetensors_load(data)
+            else:
+                state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
+            if is_cloud_path(path) and storage_reader is None:
+                _ensure_msc_available()
+                storage_reader = msc.torch.MultiStorageFileSystemReader(path)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -834,13 +868,25 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                if is_cloud_path(path):
+                    _ensure_msc_available()
+                    adapter_path = path.rstrip("/") + "/adapter_model.safetensors"
+                    with msc.open(adapter_path, "wb") as f:
+                        save_file(state_dict, f)
+                else:
+                    save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return
 
         ret = None
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+
+        # Routes to MSC storage write for cloud paths
+        if is_cloud_path(path) and storage_writer is None:
+            _ensure_msc_available()
+            storage_writer = msc.torch.MultiStorageFileSystemWriter(path)
+
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
@@ -1107,8 +1153,14 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
         config: Config to save
         weights_path: Path to save config
     """
-    with open(os.path.join(weights_path, "config.yaml"), "w") as f:
-        yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    config_path = os.path.join(weights_path, "config.yaml")
+    if is_cloud_path(weights_path):
+        _ensure_msc_available()
+        with msc.open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
+    else:
+        with open(config_path, "w") as f:
+            yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
 def _ensure_dirs(*dirs: Optional[str]) -> None:
@@ -1120,7 +1172,8 @@ def _ensure_dirs(*dirs: Optional[str]) -> None:
     """
     for d in dirs:
         if d:
-            os.makedirs(d, exist_ok=True)
+            if not is_cloud_path(d):
+                os.makedirs(d, exist_ok=True)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
