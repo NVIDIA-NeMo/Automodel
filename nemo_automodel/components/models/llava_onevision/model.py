@@ -310,10 +310,6 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         self.image_token_id = getattr(config, "image_token_id", 151655)
         self.video_token_id = getattr(config, "video_token_id", 151656)
 
-        # Lazy-initialized on first state_dict IO
-        self.state_dict_adapter = None
-
-        # Initialize adapter lazily — import is cheap but keeps module import clean
         from nemo_automodel.components.models.llava_onevision.state_dict_adapter import (
             LlavaOneVisionStateDictAdapter,
         )
