@@ -1416,10 +1416,16 @@ def _get_parallel_plan(
         # architectures like Mistral3ForConditionalGeneration whose text layers
         # live under model.language_model.layers.* and would be missed by the
         # hardcoded llama-style wildcards below.
+        hf_plan = None
         try:
-            model_parallel_plan = get_hf_tp_shard_plan(model)
+            hf_plan = get_hf_tp_shard_plan(model)
+        except Exception as e:
+            logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
+
+        if hf_plan:
+            model_parallel_plan = hf_plan
             logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
-        except (AssertionError, AttributeError):
+        else:
             base_model_tp_plan = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
