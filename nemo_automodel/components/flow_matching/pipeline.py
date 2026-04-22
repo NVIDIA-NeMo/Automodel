@@ -161,7 +161,7 @@ class FlowMatchingPipeline:
             loss_weighting_scheme: Weighting strategy when use_loss_weighting is True:
                 - "linear": w = 1 + flow_shift * sigma
                 - "bsmntw": Bell-Shaped Midpoint Noise Timestep Weighting (Gaussian
-                  centered at t=500)
+                  centered at t=num_train_timesteps/2)
             log_interval: Steps between detailed logs
             summary_log_interval: Steps between summary logs
             device: Device to use for computations
