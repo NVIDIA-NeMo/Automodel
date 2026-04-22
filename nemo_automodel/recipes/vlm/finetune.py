@@ -866,33 +866,39 @@ class FinetuneRecipeForVLM(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batch_idx, batches in enumerate(self.step_scheduler):
-                log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # log
-                self.log_train_metrics(log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batch_idx, batches in enumerate(self.step_scheduler):
+                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # log
+                    self.log_train_metrics(log_data)
+                    self._update_progress_bar(pbar, log_data.metrics)
 
-                val_loss = {}
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        val_log_data = self._run_validation_epoch(self.val_dataloader)
-                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_log_data)
-                    for mp in self.model_parts:
-                        mp.train()
+                    val_loss = {}
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        if self.pp_enabled:
+                            logger.warning("Validation is not supported for pipeline parallelism")
+                        else:
+                            val_log_data = self._run_validation_epoch(self.val_dataloader)
+                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_log_data)
+                        for mp in self.model_parts:
+                            mp.train()
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        log_data.metrics["loss"],
-                        val_loss,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            log_data.metrics["loss"],
+                            val_loss,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()

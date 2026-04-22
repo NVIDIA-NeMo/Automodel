@@ -1270,40 +1270,46 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            # The step scheduler yields a list of batches with the following properties:
-            # 1. len(batches) == grad_acc_steps
-            # 2. len(batches[0]) == batch_size
-            for batches in self.step_scheduler:
-                # If QAT delayed fake-quant is configured, enable after threshold
-                self._enable_qat_if_delayed(self.step_scheduler.step)
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # Collect MoE load balance metrics (all ranks participate in all-reduce)
-                self._collect_moe_load_balance()
-                # log
-                self.log_train_metrics(train_log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                # The step scheduler yields a list of batches with the following properties:
+                # 1. len(batches) == grad_acc_steps
+                # 2. len(batches[0]) == batch_size
+                for batches in self.step_scheduler:
+                    # If QAT delayed fake-quant is configured, enable after threshold
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                    self._collect_moe_load_balance()
+                    # log
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
-                # Run validation every val_every_steps
-                val_losses = {}
-                if self.step_scheduler.is_val_step:
-                    for val_name, val_dataloader in self.val_dataloaders.items():
-                        val_log_data = self._run_validation_epoch(val_dataloader)
-                        val_losses[val_name] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-                    for mp in self.model_parts:
-                        mp.train()
+                    # Run validation every val_every_steps
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                        for mp in self.model_parts:
+                            mp.train()
 
-                # Save the checkpoint every ckpt_every_steps
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
-                        val_losses,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    # Save the checkpoint every ckpt_every_steps
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_losses,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
