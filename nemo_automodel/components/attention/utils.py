@@ -44,21 +44,6 @@ def initialize_attn_module_and_func(
             num_gqa_groups=num_gqa_groups,
             **kwargs,
         )
-
-        # Suppress TE's _extra_state from the model state dict.
-        # TE DotProductAttention.get_extra_state() returns a non-None FP8
-        # placeholder even when FP8 is disabled.  This causes PyTorch DCP to
-        # look for "*.attn_module._extra_state" in the checkpoint, but HF
-        # checkpoints never have this key, raising:
-        #   RuntimeError: Missing key in checkpoint state_dict: ...attn_module._extra_state.
-        # Patching get_extra_state to return None tells PyTorch not to include
-        # _extra_state in the model's state dict at all.  Applied once at the
-        # class level so all DotProductAttention instances behave consistently.
-        if not getattr(DotProductAttention, "_nemo_extra_state_suppressed", False):
-            DotProductAttention.get_extra_state = lambda self: None
-            DotProductAttention.set_extra_state = lambda self, state: None
-            DotProductAttention._nemo_extra_state_suppressed = True
-
         attn_func = attn_module.__call__
         return attn_module, attn_func
     elif attn_impl == "sdpa":
