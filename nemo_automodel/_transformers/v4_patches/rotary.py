@@ -141,9 +141,6 @@ def fix_rotary_embeddings(model_parts):
                 continue
 
             cfg = getattr(module, "config", None)
-            if not _is_nemotron_flash_config(cfg):
-                continue
-
             iv = _to_local(inv)
             # ``inv_freq`` has ``dim/2`` elements → dim = 2 * iv.shape[-1].
             # Verified against ``LlamaRotaryEmbedding.__init__`` which uses
