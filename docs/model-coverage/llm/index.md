@@ -49,6 +49,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Allen AI | [OLMo2](allenai/olmo2.md) | `OLMo2ForCausalLM` |
 | Allen AI | [OLMoE](allenai/olmoe.md) | `OLMoEForCausalLM` |
 | OpenAI | [GPT-OSS](openai/gpt-oss.md) | `GptOssForCausalLM` |
+| OpenAI | [GPT-2](openai/gpt2.md) | `GPT2LMHeadModel` |
 | EleutherAI | [GPT-J](eleutherai/gpt-j.md) | `GPTJForCausalLM` |
 | EleutherAI | [GPT-NeoX / Pythia](eleutherai/gpt-neox.md) | `GPTNeoXForCausalLM` |
 | BigCode | [StarCoder](bigcode/starcoder.md) | `GPTBigCodeForCausalLM` |
@@ -116,6 +117,7 @@ allenai/olmo
 allenai/olmo2
 allenai/olmoe
 openai/gpt-oss
+openai/gpt2
 eleutherai/gpt-j
 eleutherai/gpt-neox
 bigcode/starcoder

@@ -12,24 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-# To run this recipe:
-#   automodel examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
-
-recipe: FinetuneRecipeForVLM
+# LoRA fine-tuning recipe for Qwen3.6-35B-A3B (MOE VLM) on single node (8 GPUs)
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b_lora.yaml
 
 step_scheduler:
-  global_batch_size: 512
-  local_batch_size: 8
-  ckpt_every_steps: 500
-  val_every_steps: 50
+  global_batch_size: 16
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 100
   num_epochs: 2
-  max_steps: 100
+  max_steps: 50
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 60
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -38,24 +34,39 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.5-397B-A17B
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: false
+    dispatcher: deepep
+    experts: gmm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3.5-397B-A17B
+  pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: False
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision*"
+    - "*visual*"
+    - "*image_encoder*"
+    - "*lm_head*"
+    - "*audio*"
+  dim: 8
+  alpha: 32
+  use_triton: True
 
 checkpoint:
   enabled: false
-  checkpoint_dir: /tmp/checkpoints/
+  checkpoint_dir: checkpoints/qwen3_6_35b_lora/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -63,22 +74,13 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 8
+  pp_size: 1
   dp_replicate_size: 1
-  ep_size: 32
-
+  ep_size: 8
   sequence_parallel: false
 
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    round_virtual_stages_to_pp_multiple: down
-    scale_grads_in_schedule: false
-    layers_per_stage: 2
-    patch_inner_model: false
-    patch_causal_lm_model: false
-
 freeze_config:
+  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -96,7 +98,7 @@ dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 2048
+    max_length: 1024
   drop_last: true
 
 validation_dataset:
@@ -109,25 +111,17 @@ validation_dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 2048
-  drop_last: true
+    max_length: 1024
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
-  eps: 1e-7
+  eps: 1e-8
   lr: 1.0e-4
-  weight_decay: 0.0
-
-
-ci:
-  recipe_owner: HuiyingLi
-  nodes: 32
-  time: "00:45:00"
+  weight_decay: 0.01
 
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_name>
-#   save_dir: <your_wandb_save_dir>

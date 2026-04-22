@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Recipe validated using 256 H100 GPUs (32 nodes x 8)
-
-recipe: TrainFinetuneRecipeForNextTokenPrediction
+# LoRA fine-tuning recipe for MiniMax-M2.7 on HellaSwag
+# Estimated: 4 nodes (ep=32, pp=1 -> 32/8=4 nodes)
 
 seed: 1234
 
@@ -23,27 +22,16 @@ step_scheduler:
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
-  gc_every_steps: 10
-  num_epochs: 2
+  max_steps: 100
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4
-  ep_size: 64
-
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 32
   sequence_parallel: false
-  activation_checkpointing: true
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    round_virtual_stages_to_pp_multiple: down
-    scale_grads_in_schedule: false
-    patch_inner_model: false
-    patch_causal_lm_model: false
-    layers_per_stage: 2
 
   moe:
     reshard_after_forward: false
@@ -55,21 +43,29 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: zai-org/GLM-5
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/copper-meadow_vv0-hf
+  trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa # TE requires the latest cudnn version so disabling by default
-    linear: te
+    attn: te
+    linear: torch
     rms_norm: torch_fp32
-    rope_fusion: false
-    enable_deepep: true
+    rope_fusion: true
+    dispatcher: deepep
+    experts: gmm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: True
+  dim: 8
+  alpha: 32
+  use_triton: True
+
 checkpoint:
   enabled: false
-  dequantize_base_checkpoint: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -111,8 +107,3 @@ optimizer:
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0
-
-ci:
-  recipe_owner: hemildesai
-  nodes: 32
-  time: "00:45:00"
