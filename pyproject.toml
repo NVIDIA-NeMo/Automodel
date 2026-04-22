@@ -393,6 +393,8 @@ modules = [
 ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
+    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.decilm.model",
+    "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.qwen3.model",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)
