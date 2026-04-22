@@ -69,9 +69,7 @@ def _compute_flash_inv_freq(cfg, device, dim):
         orig_max = getattr(cfg, "orig_max_position_embeddings", None)
         if max_pos is not None and orig_max is not None and orig_max > 0:
             factor = 2
-            base = base * (
-                (factor * max_pos / orig_max) - (factor - 1)
-            ) ** (dim / (dim - 2))
+            base = base * ((factor * max_pos / orig_max) - (factor - 1)) ** (dim / (dim - 2))
     # default / dynamic_ntk / unknown: use (possibly unscaled) ``base``.
     indices = torch.arange(0, dim, 2, dtype=torch.int64, device=device).float()
     return 1.0 / (base ** (indices / dim))
@@ -156,9 +154,7 @@ def fix_rotary_embeddings(model_parts):
             module.forward = types.MethodType(_safe_rope_forward, module)
 
             rope_type = getattr(cfg, "rope_type", None) or "default"
-            logger.info(
-                f"[fix_rope] {fqn}: installed Flash NTK inv_freq (rope_type={rope_type}, dim={dim})"
-            )
+            logger.info(f"[fix_rope] {fqn}: installed Flash NTK inv_freq (rope_type={rope_type}, dim={dim})")
             fixed += 1
 
     logger.info(f"[fix_rope] repaired {fixed} rotary embeddings.")
