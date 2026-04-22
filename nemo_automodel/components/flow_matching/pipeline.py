@@ -161,7 +161,7 @@ class FlowMatchingPipeline:
             loss_weighting_scheme: Weighting strategy when use_loss_weighting is True:
                 - "linear": w = 1 + flow_shift * sigma
                 - "bsmntw": Bell-Shaped Midpoint Noise Timestep Weighting (Gaussian
-                  centered at t=500, matching DiffSynth-Studio reference)
+                  centered at t=500)
             log_interval: Steps between detailed logs
             summary_log_interval: Steps between summary logs
             device: Device to use for computations
@@ -181,6 +181,10 @@ class FlowMatchingPipeline:
         self.use_loss_weighting = use_loss_weighting
         self.loss_weighting_scheme = loss_weighting_scheme
 
+        _VALID_SCHEMES = ("linear", "bsmntw")
+        if loss_weighting_scheme not in _VALID_SCHEMES:
+            raise ValueError(f"Unknown loss_weighting_scheme: {loss_weighting_scheme!r}. Must be one of {_VALID_SCHEMES}")
+
         # Precompute BSMNTW weight table if needed
         if use_loss_weighting and loss_weighting_scheme == "bsmntw":
             self._bsmntw_weights = self._build_bsmntw_weights()
@@ -197,7 +201,6 @@ class FlowMatchingPipeline:
 
         Returns a 1D tensor of length num_train_timesteps with weights
         following a Gaussian bell curve centered at the midpoint (t=500).
-        Matches the DiffSynth-Studio reference implementation.
         """
         steps = self.num_train_timesteps
         t = torch.arange(steps, dtype=torch.float32)
@@ -334,7 +337,7 @@ class FlowMatchingPipeline:
                 timestep_indices = (sigma * self.num_train_timesteps).long().clamp(0, self.num_train_timesteps - 1)
                 loss_weight = self._bsmntw_weights.to(model_pred.device)[timestep_indices]
                 loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
-            else:
+            elif self.loss_weighting_scheme == "linear":
                 loss_weight = 1.0 + self.flow_shift * sigma
                 loss_weight = loss_weight.view(-1, *([1] * (loss.ndim - 1)))
         else:
