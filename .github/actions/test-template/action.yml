@@ -134,6 +134,7 @@ runs:
     - name: Run main script
       uses: nick-fields/retry@v3
       id: run-main-script
+      continue-on-error: ${{ inputs.is-optional == 'true' }}
       with:
         timeout_seconds: ${{ steps.create.outputs.timeout_in_seconds }}
         max_attempts: 3
