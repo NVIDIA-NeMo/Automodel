@@ -12,7 +12,7 @@ inference:
   dtype: "bfloat16"
   max_samples: 10
   prompts:
-    - "Bill Gates with a hoodie"
+    - "A cat sitting on a windowsill watching the rain"
   pipeline_kwargs: {}
 
 output:
