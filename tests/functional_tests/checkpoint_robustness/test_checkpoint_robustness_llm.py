@@ -500,6 +500,17 @@ def test_checkpoint_robustness():
                     base_model = _fix_meta_rotary_embeddings(
                         AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
                     ).to(device)
+            # See comment in the ``else`` branch below: Nemotron-Flash's native
+            # rotary init produces garbage ``inv_freq`` under HF load, so
+            # re-apply the Automodel-side rope fix to the freshly-loaded base
+            # model before the LoRA adapter is attached.
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+                if should_fix_rotary_embeddings([base_model]):
+                    fix_rotary_embeddings([base_model])
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
@@ -528,6 +539,20 @@ def test_checkpoint_robustness():
                     hf_model = _fix_meta_rotary_embeddings(
                         AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
                     ).to(device)
+            # Nemotron-Flash's native ``LlamaRotaryEmbedding.__init__`` produces
+            # garbage ``inv_freq`` (~1e-26, effectively zero) under HF's init
+            # path even inside ``no_hf_meta_device``. Automodel's infrastructure
+            # patches this at training time via ``fix_rotary_embeddings`` but
+            # that hook doesn't run through vanilla HF load, so Phase 4's
+            # rotary silently ends up with wrong values → KL divergence.
+            # Re-apply the same patch here for trust_remote_code models.
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+                if should_fix_rotary_embeddings([hf_model]):
+                    fix_rotary_embeddings([hf_model])
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
