@@ -15,3 +15,4 @@
 examples_dir: diffusion/finetune
 configs:
   - wan2_1_t2v_flow.yaml
+  - hunyuan_t2v_flow.yaml
