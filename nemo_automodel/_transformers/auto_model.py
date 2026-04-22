@@ -372,9 +372,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 "cannot be called on meta tensors",
                 "aten::equal: attempted to run this operator with Meta tensors",
             )
-            if any(msg in str(e) for msg in _meta_err_msgs) and is_meta_device:
+            # if the error message contains any of the meta-tensor error messages, retry without meta-device init
+            # When force_hf is True, we may still encounter the error, even tho is_meta_device is False
+            # automodel /opt/Automodel/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml is a good example
+            if any(msg in str(e) for msg in _meta_err_msgs):
                 logger.warning(
-                    "Model init hit meta-tensor error (%s); retrying without meta device.",
+                    "Model init hit meta-tensor error (%s); retrying without meta-device init.",
                     type(e).__name__,
                 )
                 del model
@@ -430,6 +433,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if is_hf_model:
             _verify_sdpa_support(model, mesh.cp_size)
 
+        # HF from_pretrained on a real device loads (and potentially quantizes) weights
+        # during init.  Custom models and meta-device initialization do not load weights
+        # here; they rely on apply_model_infrastructure to load the checkpoint later.
+        weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
+
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
         attach_capabilities_and_validate(model, mesh)
@@ -452,6 +460,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             load_base_model=load_base_model,
             cache_dir=cache_dir,
             freeze_config=freeze_config,
+            weights_already_loaded=weights_already_loaded,
         )
 
         return model

@@ -663,6 +663,7 @@ def pipeline_model(
     scale_grads: bool = False,
     round_to_pp_multiple: str | None = None,
     patch_stage_backward_maybe_with_nosync: bool = False,
+    reduce_grad_per_microbatch: bool = False,
     seq_len: int | None = None,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
@@ -715,14 +716,21 @@ def pipeline_model(
         scale_grads=scale_grads,
     )
 
-    # Patch FSDP backward for MoE models if requested
-    if patch_stage_backward_maybe_with_nosync:
+    # Patch FSDP backward for MoE models, or when per-microbatch grad reduce-scatter
+    # is requested (mapped from surface-level defer_fsdp_grad_sync=False for memory
+    # savings). The patched function's FSDP branch is generic (non-MoE-specific)
+    # and reads the per-stage flag set below.
+    if patch_stage_backward_maybe_with_nosync or reduce_grad_per_microbatch:
         from nemo_automodel.components.moe.fsdp_mixin import patched_backward_maybe_with_nosync
 
         for stage in stages:
             stage.backward_maybe_with_nosync = types.MethodType(patched_backward_maybe_with_nosync, stage)
+            stage._reduce_grad_per_microbatch = reduce_grad_per_microbatch
 
-        logger.info("Patched pipeline stages with MoE-aware FSDP backward logic")
+        logger.info(
+            "Patched pipeline stages with backward_maybe_with_nosync "
+            f"(reduce_grad_per_microbatch={reduce_grad_per_microbatch})"
+        )
 
     # Determine if this rank has first/last stage
     has_first_stage = False

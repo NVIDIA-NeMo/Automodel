@@ -40,6 +40,9 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   torch_dtype: bf16
+  quantization_config:
+    _target_: transformers.FineGrainedFP8Config
+    dequantize: true
 
 checkpoint:
   enabled: true
@@ -49,12 +52,12 @@ checkpoint:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
   dim: 8
-  alpha: 32
-  use_triton: True
-  # dtype needs a fix to resolve to type instead of string
-  # lora_dtype: torch.bfloat16
+  alpha: 16
+  use_triton: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*multi_modal_projector*"
 
 # torch.compile configuration
 compile:
@@ -119,6 +122,10 @@ ci:
     tokenizer_name: mistralai/Ministral-3-3B-Instruct-2512
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+    # vision_tower params receive no grads from text-only batches, so Adam
+    # never materialises per-param `step` state for them; DCP resume load is
+    # strict and fails with `Missing key ... optim.state.model.vision_tower.*`.
+    no_check_resume: true
 
 # Uncomment and configure for W&B logging
 # wandb:

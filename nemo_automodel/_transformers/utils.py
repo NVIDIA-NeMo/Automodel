@@ -214,20 +214,31 @@ def apply_cache_compatibility_patches():
             for name, module in model.named_modules():
                 if isinstance(module, torch.nn.Embedding):
                     return f"{name}.weight"
-            return "model.embed_tokens.weight"
+            return None
 
         def _patched_post_init(self):
             tied = getattr(self, "_tied_weights_keys", None)
+            # if tied is list -> model is pre 5.x -> we will tie the weights after _model_init.
+            # between post_init and returned value of _model_init, there's code we don't control or can test for regressions,
+            # thus seems safer to tie weights after _model_init.
             if isinstance(tied, list):
                 source = _find_embedding_source(self)
-                self._tied_weights_keys = {k: source for k in tied}
-            return _orig_post_init(self)
+                if source is None:
+                    raise ValueError("Could not find the source of the embedding layer")
+                self._nemo_tied_weights_keys = {k: source for k in tied}
+                self._tied_weights_keys = {}
+            # call orig post init
+            _orig_post_init(self)
 
         mu.PreTrainedModel.post_init = _patched_post_init
         mu.PreTrainedModel.post_init._nemo_tied_keys_patched = True  # type: ignore[attr-defined]
 
     _patch_phi4mm_processor()
     _patch_peft_prepare_inputs()
+
+    from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+    _patch_legacy_flash_attn_flag()
 
 
 def _patch_phi4mm_processor():

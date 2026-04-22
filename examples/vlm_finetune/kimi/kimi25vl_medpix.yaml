@@ -104,7 +104,11 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.kimi_k25_vl_collate_fn
+    max_length: 1024
+  drop_last: true
 
 optimizer:
   _target_: torch.optim.AdamW
