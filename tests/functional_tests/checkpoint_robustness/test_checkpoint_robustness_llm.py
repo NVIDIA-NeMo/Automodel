@@ -276,6 +276,37 @@ def _prepopulate_hf_dynamic_modules_cache(local_dir: Path | str) -> None:
         if not dst_py.exists():
             shutil.copy2(src_py, dst_py)
 
+            
+
+def _tp_size_from_argv(argv) -> int:
+    """Peek at --distributed.tp_size / --config YAML without constructing the cfg.
+
+    Returns 1 if no TP setting is found. Used before cfg parsing to pick a
+    reasonable default kl_threshold.
+    """
+    for i, a in enumerate(argv):
+        if a == "--distributed.tp_size" and i + 1 < len(argv):
+            try:
+                return int(argv[i + 1])
+            except (TypeError, ValueError):
+                return 1
+    config_path = None
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            config_path = argv[i + 1]
+            break
+    if config_path:
+        try:
+            import yaml
+
+            with open(config_path) as f:
+                raw_cfg = yaml.safe_load(f) or {}
+            tp = (raw_cfg.get("distributed") or {}).get("tp_size", 1)
+            return int(tp) if tp is not None else 1
+        except Exception:
+            pass
+    return 1
+
 
 def _rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -290,7 +321,15 @@ def test_checkpoint_robustness():
     """Train -> checkpoint -> reload automodel from consolidated -> reload vanilla HF, compare logits."""
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
-    kl_threshold = float(custom_args.get("kl_threshold", "0"))
+    # When tensor parallelism is active the forward pass uses row-parallel
+    # all-reduces and cuBLASLt plan caches whose order of accumulation is
+    # process-dependent; this produces ULP-level bf16 drift between the
+    # trainer's and restored model's logits even with bit-identical weights.
+    # Use a small tolerance when TP>1; keep strict 0 otherwise so real
+    # save/load regressions in non-TP setups still fail.
+    _tp_size = _tp_size_from_argv(config_argv)
+    _default_kl_threshold = "1e-5" if _tp_size > 1 else "0"
+    kl_threshold = float(custom_args.get("kl_threshold", _default_kl_threshold))
     hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
@@ -338,6 +377,21 @@ def test_checkpoint_robustness():
 
     is_peft = hasattr(cfg, "peft")
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
+    # Some FP8-quantized checkpoints (e.g. ministral3) require dequantize=True
+    # at load time to avoid a Triton-only FP8 matmul kernel dispatch in the
+    # vanilla HF forward pass (Phase 4).  Materialise the yaml quantization
+    # sub-tree into an HF config object here so Phase 4 can forward it
+    # to `from_pretrained` — passing the raw ConfigNode directly would
+    # trip transformers' internal deepcopy (triggers ConfigNode.__getattr__
+    # on `__setstate__`, which then fails recursively).
+    _raw_qc = getattr(cfg.model, "quantization_config", None)
+    if _raw_qc is not None and hasattr(_raw_qc, "instantiate"):
+        try:
+            original_quantization_config = _raw_qc.instantiate()
+        except Exception:
+            original_quantization_config = None
+    else:
+        original_quantization_config = _raw_qc
 
     del trainer
     gc.collect()
@@ -433,6 +487,8 @@ def test_checkpoint_robustness():
             hf_kwargs["trust_remote_code"] = False
         if hf_device_map_auto:
             hf_kwargs["device_map"] = "auto"
+        if original_quantization_config is not None:
+            hf_kwargs["quantization_config"] = original_quantization_config
 
         if is_peft:
             from peft import PeftModel
