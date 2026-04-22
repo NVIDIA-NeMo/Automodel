@@ -471,21 +471,7 @@ def split_model_into_stages(
     ) -> tuple[PipelineStage, nn.Module]:
         """Build a pipeline stage from specified module names."""
         # Deep copy the model
-        import time as _time
-
-        _params = list(model.parameters())
-        _first_param = _params[0] if _params else None
-        _n_b_params = sum(x.numel() for x in _params) / 1e9 if _params else 0.0
-        _t0 = _time.time()
-        logger.info(
-            f"[PP build] stage {stage_idx}: deepcopy START "
-            f"param_device={_first_param.device if _first_param is not None else 'n/a'} "
-            f"dtype={_first_param.dtype if _first_param is not None else 'n/a'} "
-            f"total_params={_n_b_params:.2f}B"
-        )
         stage_model = copy.deepcopy(model)
-        _t1 = _time.time()
-        logger.info(f"[PP build] stage {stage_idx}: deepcopy END elapsed={(_t1 - _t0):.2f}s")
         patch_hf_model_for_pp(
             stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
         )
