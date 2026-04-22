@@ -78,6 +78,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
+from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
@@ -1424,6 +1425,16 @@ def _get_parallel_plan(
                 base_model_tp_plan.update(base_model_sp_plan)
             model_parallel_plan = base_model_tp_plan
             logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
+
+    # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
+    # Under TP, sharding lm_head turns the weight into a DTensor while `logits` is a
+    # plain tensor (output_layouts=Replicate), and the mixed-operand division raises
+    # "aten.div.Tensor got mixed torch.Tensor and DTensor". Drop lm_head from the plan
+    # so its weight stays replicated and the division stays in plain-tensor space.
+    if _is_nemotron_flash_config(getattr(model, "config", None)):
+        for k in ("lm_head", "language_model.lm_head"):
+            if model_parallel_plan.pop(k, None) is not None:
+                logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
 
     return model_parallel_plan
 
