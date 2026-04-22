@@ -389,7 +389,7 @@ class TestApplyCacheCompatibilityPatchesIntegration:
         assert isinstance(tied, dict)
         assert "lm_head.weight" in tied
         assert tied["lm_head.weight"] == "model.embed_tokens.weight"
-        assert model._tied_weights_keys == {}
+        assert model._tied_weights_keys == tied
 
     def test_tied_weights_keys_patch_converts_any_model(self):
         """The post_init patch should convert _tied_weights_keys for any model, not just phi4mm."""
@@ -418,7 +418,7 @@ class TestApplyCacheCompatibilityPatchesIntegration:
         assert isinstance(tied, dict)
         assert "lm_head.weight" in model._nemo_tied_weights_keys
         assert tied["lm_head.weight"] == "model.embed_tokens.weight"
-        assert model._tied_weights_keys == {}
+        assert model._tied_weights_keys == tied
 
     def test_tied_weights_keys_patch_resolves_top_level_embed_tokens(self):
         """The post_init patch resolves embed_tokens at the top level via get_input_embeddings."""
