@@ -122,6 +122,7 @@ ci:
   vllm_deploy: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
+    resume_loss_threshold: 5e-2
     distributed.tp_size: 8
     tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
     hf_device_map_auto: true
