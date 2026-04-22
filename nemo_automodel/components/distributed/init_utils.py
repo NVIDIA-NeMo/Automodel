@@ -89,7 +89,7 @@ class DistInfo:
 
 def initialize_distributed(
     backend,
-    timeout_minutes=5,
+    timeout_minutes=1,
 ):
     """Initialize the torch.distributed environment and core model parallel infrastructure.
 

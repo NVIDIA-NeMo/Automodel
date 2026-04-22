@@ -564,11 +564,7 @@ class BaseRecipe:
         model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
 
         self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
-        optim_dir = os.path.join(ckpt_dir, "optim")
-        if os.path.isdir(optim_dir) and os.listdir(optim_dir):
-            self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
-        elif is_rank_0:
-            logging.warning("Optimizer state not found in %s — reinitializing optimizer.", optim_dir)
+        self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
 
     def _log_experiment_details(self):
         """Log metadata and config on main rank using YAML markers."""
