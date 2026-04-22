@@ -763,8 +763,8 @@ class BaseRecipe:
         from tqdm import tqdm
 
         return tqdm(
-            total=self.step_scheduler.max_steps,
-            initial=self.step_scheduler.step,
+            total=getattr(self.step_scheduler, "max_steps", None),
+            initial=getattr(self.step_scheduler, "step", 0),
             desc="Training",
             unit="step",
             dynamic_ncols=True,
