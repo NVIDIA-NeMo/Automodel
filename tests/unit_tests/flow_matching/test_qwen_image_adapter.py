@@ -91,39 +91,6 @@ class TestQwenImageAdapterUnpackLatents:
 
 
 # =============================================================================
-# TestPrepareLatentImageIds
-# =============================================================================
-
-
-class TestPrepareLatentImageIds:
-    """Tests for QwenImageAdapter._prepare_latent_image_ids."""
-
-    def test_shape(self):
-        adapter = QwenImageAdapter()
-        ids = adapter._prepare_latent_image_ids(2, 8, 8, torch.device("cpu"), torch.float32)
-        expected_patches = (8 // 2) * (8 // 2)
-        assert ids.shape == (expected_patches, 3)
-
-    def test_positional_values(self):
-        adapter = QwenImageAdapter()
-        ids = adapter._prepare_latent_image_ids(1, 4, 6, torch.device("cpu"), torch.float32)
-        # Height: 4//2=2, Width: 6//2=3 -> 6 patches
-        assert ids.shape == (6, 3)
-        assert (ids[:, 0] == 0).all()
-        assert ids[0, 1] == 0.0
-        assert ids[3, 1] == 1.0
-        assert ids[0, 2] == 0.0
-        assert ids[1, 2] == 1.0
-        assert ids[2, 2] == 2.0
-
-    def test_dtype_and_device(self):
-        adapter = QwenImageAdapter()
-        ids = adapter._prepare_latent_image_ids(1, 8, 8, torch.device("cpu"), torch.float64)
-        assert ids.dtype == torch.float64
-        assert ids.device == torch.device("cpu")
-
-
-# =============================================================================
 # TestPrepareInputs
 # =============================================================================
 
@@ -156,8 +123,9 @@ class TestPrepareInputs:
         assert "hidden_states" in inputs
         assert "encoder_hidden_states" in inputs
         assert "timestep" in inputs
-        assert "img_ids" in inputs
-        assert "txt_ids" in inputs
+        assert "img_shapes" in inputs
+        assert "guidance" in inputs
+        assert "encoder_hidden_states_mask" in inputs
 
     def test_5d_latent_raises(self):
         adapter = QwenImageAdapter()
@@ -211,25 +179,40 @@ class TestPrepareInputs:
         inputs = adapter.prepare_inputs(ctx)
         assert (inputs["encoder_hidden_states"] == 0).all()
 
-    def test_img_ids_shape(self):
+    def test_img_shapes_value(self):
         adapter = QwenImageAdapter()
         b, c, h, w = 2, 16, 8, 8
         noisy = torch.randn(b, c, h, w)
         batch = {"text_embeddings": torch.randn(b, 77, 2048)}
         ctx = self._make_context(noisy, batch)
         inputs = adapter.prepare_inputs(ctx)
-        expected_patches = (h // 2) * (w // 2)
-        assert inputs["img_ids"].shape == (expected_patches, 3)
+        assert inputs["img_shapes"] == [[(1, h // 2, w // 2)]] * b
 
-    def test_txt_ids_shape(self):
+    def test_encoder_hidden_states_mask_is_none(self):
         adapter = QwenImageAdapter()
         b, c, h, w = 2, 16, 8, 8
-        seq_len = 77
         noisy = torch.randn(b, c, h, w)
-        batch = {"text_embeddings": torch.randn(b, seq_len, 2048)}
+        batch = {"text_embeddings": torch.randn(b, 77, 2048)}
         ctx = self._make_context(noisy, batch)
         inputs = adapter.prepare_inputs(ctx)
-        assert inputs["txt_ids"].shape == (b, seq_len, 3)
+        assert inputs["encoder_hidden_states_mask"] is None
+
+    def test_guidance_none_when_disabled(self):
+        adapter = QwenImageAdapter(use_guidance_embeds=False)
+        noisy = torch.randn(2, 16, 8, 8)
+        batch = {"text_embeddings": torch.randn(2, 77, 2048)}
+        ctx = self._make_context(noisy, batch)
+        inputs = adapter.prepare_inputs(ctx)
+        assert inputs["guidance"] is None
+
+    def test_guidance_embedding_when_enabled(self):
+        adapter = QwenImageAdapter(guidance_scale=7.5, use_guidance_embeds=True)
+        noisy = torch.randn(2, 16, 8, 8)
+        batch = {"text_embeddings": torch.randn(2, 77, 2048)}
+        ctx = self._make_context(noisy, batch)
+        inputs = adapter.prepare_inputs(ctx)
+        assert inputs["guidance"].shape == (2,)
+        assert torch.allclose(inputs["guidance"], torch.tensor([7.5, 7.5]))
 
 
 # =============================================================================
@@ -252,9 +235,10 @@ class TestForward:
         inputs = {
             "hidden_states": torch.randn(b, packed_patches, packed_channels),
             "encoder_hidden_states": torch.randn(b, 77, 2048),
+            "encoder_hidden_states_mask": None,
             "timestep": torch.tensor([0.5, 0.5]),
-            "img_ids": torch.zeros(packed_patches, 3),
-            "txt_ids": torch.zeros(b, 77, 3),
+            "img_shapes": [[(1, h // 2, w // 2)]] * b,
+            "guidance": None,
             "_original_shape": (b, c, h, w),
         }
 
@@ -276,9 +260,10 @@ class TestForward:
         inputs = {
             "hidden_states": torch.randn(b, packed_patches, packed_channels),
             "encoder_hidden_states": torch.randn(b, 10, 2048),
+            "encoder_hidden_states_mask": None,
             "timestep": torch.tensor([0.5]),
-            "img_ids": torch.zeros(packed_patches, 3),
-            "txt_ids": torch.zeros(b, 10, 3),
+            "img_shapes": [[(1, h // 2, w // 2)]] * b,
+            "guidance": None,
             "_original_shape": (b, c, h, w),
         }
 
@@ -297,9 +282,10 @@ class TestForward:
         inputs = {
             "hidden_states": torch.randn(b, packed_patches, packed_channels),
             "encoder_hidden_states": torch.randn(b, 10, 2048),
+            "encoder_hidden_states_mask": None,
             "timestep": torch.tensor([0.5]),
-            "img_ids": torch.zeros(packed_patches, 3),
-            "txt_ids": torch.zeros(b, 10, 3),
+            "img_shapes": [[(1, h // 2, w // 2)]] * b,
+            "guidance": None,
             "_original_shape": (b, c, h, w),
         }
 
@@ -308,9 +294,10 @@ class TestForward:
         call_kwargs = mock_model.call_args[1]
         assert "hidden_states" in call_kwargs
         assert "encoder_hidden_states" in call_kwargs
+        assert "encoder_hidden_states_mask" in call_kwargs
         assert "timestep" in call_kwargs
-        assert "img_ids" in call_kwargs
-        assert "txt_ids" in call_kwargs
+        assert "img_shapes" in call_kwargs
+        assert "guidance" in call_kwargs
         assert "return_dict" in call_kwargs
         assert call_kwargs["return_dict"] is False
 

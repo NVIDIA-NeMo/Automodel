@@ -402,6 +402,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.i2v_prob = fm_cfg.get("i2v_prob", 0.3)
         self.cfg_dropout_prob = fm_cfg.get("cfg_dropout_prob", 0.1)
         self.use_loss_weighting = fm_cfg.get("use_loss_weighting", True)
+        self.loss_weighting_scheme = fm_cfg.get("loss_weighting_scheme", "linear")
         self.log_interval = fm_cfg.get("log_interval", 100)
         self.summary_log_interval = fm_cfg.get("summary_log_interval", 10)
 
@@ -419,6 +420,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
         logging.info(f"[INFO]   - CFG dropout prob: {self.cfg_dropout_prob}")
         logging.info(f"[INFO]   - Use loss weighting: {self.use_loss_weighting}")
+        logging.info(f"[INFO]   - Loss weighting scheme: {self.loss_weighting_scheme}")
 
         # Get pipeline_spec for pretraining mode (required when mode != "finetune")
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
@@ -586,6 +588,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             use_loss_weighting=self.use_loss_weighting,
+            loss_weighting_scheme=self.loss_weighting_scheme,
             log_interval=self.log_interval,
             summary_log_interval=self.summary_log_interval,
             device=self.device,
@@ -697,6 +700,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
+            if num_steps == 0:
+                logging.info(f"[INFO] Epoch {epoch + 1} skipped (already completed in previous run)")
+                continue
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
 
