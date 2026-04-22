@@ -268,32 +268,6 @@ jobs:
         with:
           python-version: 3.12
 
-      - name: Install Azure CLI
-        shell: bash
-        if: ${{ contains(matrix.registry, 'azure') }}
-        run: |
-          echo "::group::Install Azure CLI"
-          for i in 1 2 3; do
-            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
-            echo "Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-          echo "::endgroup::"
-
-      - name: Azure Login
-        uses: azure/login@v2
-        if: ${{ contains(matrix.registry, 'azure') }}
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Azure ACR Login
-        if: ${{ contains(matrix.registry, 'azure') }}
-        shell: bash
-        run: |
-          az acr login --name nemoci
-
       - name: Install GH CLI
         shell: bash
         run: |
