@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NOTE: This recipe list has been temporarily narrowed to only the three
-# new CP/packed-sequence configs introduced by this PR, so CI runs only
-# those while validating the qwen3/llama3.3 packed-sequence + CP fix.
-# Revert before merging.
+from nemo_automodel.components.models.decilm.model import DeciLMForCausalLM
 
-configs:
-  - nemotron/llama3_3_nemotron_super_49B_cp_packed_peft.yaml
-  - qwen/qwen3_32b_cp_packed.yaml
-  - qwen/qwen3_32b_te_packed_sequence.yaml
+__all__ = ["DeciLMForCausalLM"]

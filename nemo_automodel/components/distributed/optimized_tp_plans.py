@@ -42,10 +42,12 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel.components.models.decilm.model import DeciLMForCausalLM as CustomDeciLMForCausalLM
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
+from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 
 
 class SequenceParallelAllGatherActivation(SequenceParallel):
@@ -555,6 +557,94 @@ def _parallelize_phi3(
     )
 
 
+def _parallelize_custom_qwen3(
+    model: CustomQwen3ForCausalLM,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes our custom Qwen3ForCausalLM (dense, THD/CP/TP).
+
+    Uses separate q/k/v projections (no fused qkv_proj) and separate
+    gate/up projections (no fused gate_up_proj), mirroring the internal
+    model structure defined in nemo_automodel.components.models.qwen3.model.
+
+    q_norm / k_norm are NOT included in the plan: they operate on the
+    head-sharded outputs of q_proj/k_proj and do not need TP wrapping.
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    if sequence_parallel:
+        base_model_sp_plan: dict[str, ParallelStyle] = {
+            "model.embed_tokens": VocabParallelEmbedding(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+                use_local_output=False,
+            ),
+            "model.norm": SequenceParallel(),
+            "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+        }
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+def _parallelize_custom_decilm(
+    model: CustomDeciLMForCausalLM,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes our custom DeciLMForCausalLM (THD/CP/TP).
+
+    Uses separate q/k/v projections (no fused qkv_proj) and separate
+    gate/up projections (no fused gate_up_proj), mirroring the internal
+    model structure defined in nemo_automodel.components.models.decilm.model.
+
+    Layers with no-op attention/FFN or linear replacements simply don't
+    match the wildcard patterns and stay replicated, which is correct.
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    if sequence_parallel:
+        base_model_sp_plan: dict[str, ParallelStyle] = {
+            "model.embed_tokens": VocabParallelEmbedding(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+                use_local_output=False,
+            ),
+            "model.norm": SequenceParallel(),
+            "model.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "model.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+            "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+        }
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 # Named TP plan for use with tp_shard_plan="llama_nemotron_super_tp_plan" in parallelizer
 LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME = "llama_nemotron_super_tp_plan"
 
@@ -615,4 +705,6 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
+    _get_class_qualname(CustomQwen3ForCausalLM): _parallelize_custom_qwen3,
+    _get_class_qualname(CustomDeciLMForCausalLM): _parallelize_custom_decilm,
 }
