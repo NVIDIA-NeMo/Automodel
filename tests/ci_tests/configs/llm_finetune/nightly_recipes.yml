@@ -123,7 +123,6 @@ configs:
   - phi/phi_4_squad_tp2_peft.yaml
 
   # -- qwen --
-  - qwen/qwen2_5_7b_peft_benchmark.yaml
   - qwen/qwen2_5_7b_squad_peft.yaml
   - qwen/qwen3_moe_30b_lora.yaml
 
