@@ -1,6 +1,8 @@
 # LoRA fine-tuning recipe for GLM-5.1 on HellaSwag
 # Estimated: 16 nodes (ep=64, pp=2 -> 64*2/8=16 nodes)
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 8
