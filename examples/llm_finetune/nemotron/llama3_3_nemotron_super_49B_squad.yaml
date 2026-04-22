@@ -125,5 +125,6 @@ ci:
     distributed.tp_size: 8
     tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
     hf_device_map_auto: true
+    trust_remote_code: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
