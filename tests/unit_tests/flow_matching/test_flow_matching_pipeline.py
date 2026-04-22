@@ -463,7 +463,6 @@ class TestLossComputation:
 
         assert torch.allclose(average_unweighted_loss, expected_mse, atol=1e-6)
 
-
     def test_bsmntw_weights_shape_and_sum(self, simple_adapter):
         """Test that BSMNTW weights have correct shape and sum to num_train_timesteps."""
         num_timesteps = 1000

@@ -183,7 +183,9 @@ class FlowMatchingPipeline:
 
         _VALID_SCHEMES = ("linear", "bsmntw")
         if loss_weighting_scheme not in _VALID_SCHEMES:
-            raise ValueError(f"Unknown loss_weighting_scheme: {loss_weighting_scheme!r}. Must be one of {_VALID_SCHEMES}")
+            raise ValueError(
+                f"Unknown loss_weighting_scheme: {loss_weighting_scheme!r}. Must be one of {_VALID_SCHEMES}"
+            )
 
         # Precompute BSMNTW weight table if needed
         if use_loss_weighting and loss_weighting_scheme == "bsmntw":
@@ -200,7 +202,7 @@ class FlowMatchingPipeline:
         """Build Bell-Shaped Midpoint Noise Timestep Weighting table.
 
         Returns a 1D tensor of length num_train_timesteps with weights
-        following a Gaussian bell curve centered at the midpoint (t=500).
+        following a Gaussian bell curve centered at the midpoint (t=steps/2).
         """
         steps = self.num_train_timesteps
         t = torch.arange(steps, dtype=torch.float32)
