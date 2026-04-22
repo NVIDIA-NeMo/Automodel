@@ -326,7 +326,29 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except ValueError as e:
+            # Transformers 5.x disables the auto_map remote-code path for models listed in
+            # MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (e.g. deepseek_v3 — which Moonlight
+            # is built on). AutoTokenizer then falls back to TokenizersBackend, which under
+            # HF_HUB_OFFLINE=1 cannot resolve the custom vocab file and raises the
+            # "Couldn't instantiate the backend tokenizer" ValueError. When the repo ships a
+            # valid auto_map and the caller passed trust_remote_code=True, load the remote
+            # class directly to bypass the auto-disable.
+            if "Couldn't instantiate the backend tokenizer" not in str(e) or not kwargs.get("trust_remote_code"):
+                raise
+            tok_cfg = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs) or {}
+            auto_map = tok_cfg.get("auto_map")
+            if isinstance(auto_map, dict):
+                auto_map = auto_map.get("AutoTokenizer")
+            if not auto_map:
+                raise
+            class_ref = auto_map[1] if (len(auto_map) > 1 and auto_map[1]) else auto_map[0]
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+            remote_cls = get_class_from_dynamic_module(class_ref, str(pretrained_model_name_or_path), **kwargs)
+            tokenizer = remote_cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
