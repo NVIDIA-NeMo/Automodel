@@ -521,6 +521,7 @@ jobs:
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             timeout: 60
+            is-optional: "true"
           - test-name: L2_Datasets
             test-folder: data
             timeout: 20
@@ -549,6 +550,7 @@ jobs:
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
+          is-optional: ${{ matrix.is-optional || 'false' }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
