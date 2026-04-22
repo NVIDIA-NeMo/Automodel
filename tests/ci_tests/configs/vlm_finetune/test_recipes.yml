@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility patches for legacy v4-style transformer models."""
-
-from nemo_automodel._transformers.v4_patches.layer_types import (
-    install_layer_types_patch_hook,
-    patch_allowed_layer_types,
-)
-from nemo_automodel._transformers.v4_patches.rotary import (
-    fix_rotary_embeddings,
-    should_fix_rotary_embeddings,
-)
-
-__all__ = [
-    "fix_rotary_embeddings",
-    "install_layer_types_patch_hook",
-    "patch_allowed_layer_types",
-    "should_fix_rotary_embeddings",
-]
+configs:
+  - gemma4/gemma4_26b_a4b_moe.yaml
+  - gemma4/gemma4_26b_a4b_moe_peft.yaml
+  - gemma4/gemma4_2b.yaml
+  - gemma4/gemma4_2b_peft.yaml
+  - gemma4/gemma4_31b.yaml
+  - gemma4/gemma4_31b_peft.yaml
+  - gemma4/gemma4_4b.yaml
+  - gemma4/gemma4_4b_peft.yaml
+  - kimi/kimi25vl_medpix.yaml
+  - qwen3_5/qwen3_5_4b_neat_packing.yaml
+  - qwen3_5_moe/qwen3_5_35b_neat_packing.yaml
+  - qwen3_5_moe/qwen3_5_moe_medpix.yaml
