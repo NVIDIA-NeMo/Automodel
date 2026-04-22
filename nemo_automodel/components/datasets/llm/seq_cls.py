@@ -18,6 +18,7 @@ from typing import Optional
 
 from datasets import load_dataset
 
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 
 class GLUE_MRPC:
     """GLUE MRPC dataset (sentence pair classification).
@@ -54,7 +55,7 @@ class GLUE_MRPC:
             return out
 
         remove_cols = [c for c in raw.column_names if c not in ("sentence1", "sentence2", "label")]
-        self.dataset = raw.map(_tokenize, batched=True, remove_columns=remove_cols)
+        self.dataset = raw.map(_tokenize, LazyMappedDataset(dataset, fmt_fn), remove_columns=remove_cols)
         self.tokenizer = tokenizer
 
     def __len__(self):

@@ -20,6 +20,8 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     format_chat_template,
     format_prompt_completion,
 )
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
+    
 
 
 def _formatting_prompts_func(
@@ -132,8 +134,4 @@ def make_squad_dataset(
         )  # noqa: E731
 
     # map the dataset
-    return dataset.map(
-        fmt_fn,
-        batched=False,
-        remove_columns=["id", "title", "context", "question", "answers"],
-    )
+    return LazyMappedDataset(dataset, fmt_fn)

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 from datasets import load_dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token, format_chat_template
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +193,4 @@ def make_xlam_dataset(
         truncation,
     )
 
-    return dataset.map(
-        fmt_fn,
-        batched=False,
-        remove_columns=["id", "query", "answers", "tools"],
-    )
+    return LazyMappedDataset(dataset, fmt_fn)
