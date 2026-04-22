@@ -16,11 +16,9 @@ from __future__ import annotations
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.diffusion.train import TrainDiffusionRecipe
-from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
 
 
 def main(default_config_path="examples/diffusion/finetune/wan2_1_t2v_flow.yaml"):
-    patch_t5_layer_norm()
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainDiffusionRecipe(cfg)
     recipe.setup()
