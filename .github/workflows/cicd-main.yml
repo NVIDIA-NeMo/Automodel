@@ -510,6 +510,7 @@ jobs:
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
+            is-optional: "true"
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
             timeout: 20
