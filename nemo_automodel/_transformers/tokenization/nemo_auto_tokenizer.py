@@ -22,6 +22,8 @@ from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
+
 try:
     from huggingface_hub.errors import StrictDataclassClassValidationError
 except ImportError:
@@ -331,21 +333,41 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        try:
-            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        except (ValueError, StrictDataclassClassValidationError) as e:
-            # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
-            # so configs whose layer_types length differs from num_hidden_layers (e.g.
-            # stepfun-ai/Step-3.5-Flash) trip validate_layer_type before the tokenizer
-            # is built. The tokenizer itself doesn't depend on layer_types, so relax
-            # the validator globally and retry.
-            err = str(e)
-            if "num_hidden_layers" not in err or ("layer_types" not in err and "layer types" not in err):
-                raise
-            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+        # Serialize concurrent trust_remote_code downloads across ranks. HF copies
+        # tokenization_*.py / configuration_*.py into ~/.cache/huggingface/modules
+        # via shutil.copy2, which races on shared filesystems (e.g. Lustre) and
+        # surfaces as opaque tokenizer errors (see #1840 for the same fix in the
+        # robustness test).
+        with FirstRankPerNode():
+            try:
+                tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            except (ValueError, StrictDataclassClassValidationError) as e:
+                err = str(e)
+                if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                    # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
+                    # so configs whose layer_types length differs from num_hidden_layers (e.g.
+                    # stepfun-ai/Step-3.5-Flash) trip validate_layer_type before the tokenizer
+                    # is built. The tokenizer itself doesn't depend on layer_types, so relax
+                    # the validator globally and retry.
+                    from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
 
-            relax_layer_types_validator()
-            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+                    relax_layer_types_validator()
+                    tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+                elif "Couldn't instantiate the backend tokenizer" in err and kwargs.get("use_fast") is not False:
+                    # transformers 5.5's PreTrainedTokenizerFast.__init__ can fail when no
+                    # tokenizer.json is present and no slow-to-fast conversion path is
+                    # viable. Fall back to the slow tokenizer; _try_convert_tiktoken_to_native
+                    # below will still promote it to fast when vocab_file + pat_str are set.
+                    logger.warning(
+                        "Fast tokenizer init failed for %s (%s); retrying with use_fast=False.",
+                        pretrained_model_name_or_path,
+                        type(e).__name__,
+                    )
+                    tokenizer = super().from_pretrained(
+                        pretrained_model_name_or_path, *args, **{**kwargs, "use_fast": False}
+                    )
+                else:
+                    raise
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
