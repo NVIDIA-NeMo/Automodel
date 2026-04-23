@@ -81,7 +81,7 @@ dependencies = [
     "pybind11",
     "pyyaml",
     "tiktoken",
-    "torch>=2.6.0,<=2.10.0",
+    "torch>=2.6.0",
     "torchdata",
     "transformers==5.5.0",
     "wandb",

@@ -153,14 +153,31 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     """
     schedule = trainer.pp.info.schedule
     pp_batch_size = trainer.pipeline_config.pp_batch_size
-    seq_len = len(input_ids)
+    orig_seq_len = len(input_ids)
+
+    # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
+    # AutoPipeline.update_seq_len (added in #1689) to resize on the fly, so
+    # discover the locked seq_len from the stages and pad input_ids to match
+    # for the forward pass. Captured logits are sliced back to orig_seq_len.
+    def _discover_pp_seq_len() -> int:
+        pp_seq_len = getattr(trainer.pp, "pp_seq_len", None)
+        if pp_seq_len:
+            return pp_seq_len
+        for stage in getattr(trainer.pp.info, "stages", None) or ():
+            for meta in getattr(stage, "inputs_meta", None) or ():
+                if meta.ndim >= 2 and meta.shape[1] > 0:
+                    return meta.shape[1]
+        ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
+        return ds_seq_length or orig_seq_len
+
+    pp_seq_len = _discover_pp_seq_len()
+    if orig_seq_len < pp_seq_len:
+        input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
     ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
     attention_mask = torch.ones_like(ids)
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
-
-    trainer.pp.update_seq_len(seq_len)
 
     captured = [None]
 
@@ -191,9 +208,9 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
     assert vocab_size is not None, "could not resolve vocab_size from model config"
 
-    buf = torch.zeros((1, seq_len, vocab_size), device=device, dtype=torch.float32)
+    buf = torch.zeros((1, orig_seq_len, vocab_size), device=device, dtype=torch.float32)
     if trainer.pp.info.has_last_stage and captured[0] is not None:
-        buf.copy_(captured[0][:1])
+        buf.copy_(captured[0][:1, :orig_seq_len, :])
 
     pp_mesh = trainer.device_mesh["pp"]
     pp_group = pp_mesh.get_group()
@@ -305,7 +322,6 @@ def _prepopulate_hf_dynamic_modules_cache(local_dir: Path | str) -> None:
         if not dst_py.exists():
             shutil.copy2(src_py, dst_py)
 
-            
 
 def _tp_size_from_argv(argv) -> int:
     """Peek at --distributed.tp_size / --config YAML without constructing the cfg.
@@ -545,6 +561,7 @@ def test_checkpoint_robustness():
                     fix_rotary_embeddings,
                     should_fix_rotary_embeddings,
                 )
+
                 if should_fix_rotary_embeddings([base_model]):
                     fix_rotary_embeddings([base_model])
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
@@ -585,6 +602,7 @@ def test_checkpoint_robustness():
                     fix_rotary_embeddings,
                     should_fix_rotary_embeddings,
                 )
+
                 if should_fix_rotary_embeddings([hf_model]):
                     fix_rotary_embeddings([hf_model])
             hf_logits = _get_logits(hf_model, input_ids, device)
