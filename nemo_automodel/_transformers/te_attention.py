@@ -234,7 +234,7 @@ def _make_te_sdpa(
 
         # Non-trivial masks are not yet converted; fall back to native SDPA.
         if attn_mask is not None:
-            logger.info("TE attention: non-None attn_mask — falling back to native SDPA.")
+            logger.debug("TE attention: non-None attn_mask — falling back to native SDPA.")
             return original_sdpa(
                 query,
                 key,
