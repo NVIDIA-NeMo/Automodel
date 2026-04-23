@@ -83,7 +83,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0,<=2.10.0",
     "torchdata",
-    "transformers==5.5.0",
+    "transformers==5.6.0",
     "wandb",
     "torchao",
     "mlflow",
@@ -365,7 +365,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "transformers", "wandb"]
+known-third-party = ["datasets", "transformers==5.6.0", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
