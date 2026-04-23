@@ -30,6 +30,7 @@ cd /opt/Automodel
 RECIPE_NAME=$(basename "$CONFIG_PATH" .yaml)
 case "$RECIPE_NAME" in
     wan2_1_t2v_flow*)
+        MEDIA_TYPE="video"
         PROCESSOR="wan"
         GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan.yaml"
         MODEL_NAME="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -37,44 +38,92 @@ case "$RECIPE_NAME" in
         PREPROCESS_EXTRA_ARGS=""
         ;;
     hunyuan_t2v_flow*)
+        MEDIA_TYPE="video"
         PROCESSOR="hunyuan"
         GENERATE_CONFIG="examples/diffusion/generate/configs/generate_hunyuan.yaml"
         MODEL_NAME="hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
         INFER_NUM_FRAMES=5
         PREPROCESS_EXTRA_ARGS="--target_frames 13"
         ;;
+    flux_t2i_flow*)
+        MEDIA_TYPE="image"
+        PROCESSOR="flux"
+        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_flux.yaml"
+        MODEL_NAME="black-forest-labs/FLUX.1-dev"
+        PREPROCESS_EXTRA_ARGS=""
+        ;;
+    qwen_image_t2i_flow*)
+        MEDIA_TYPE="image"
+        PROCESSOR="qwen_image"
+        GENERATE_CONFIG="examples/diffusion/generate/configs/generate_qwen_image.yaml"
+        MODEL_NAME="Qwen/Qwen-Image"
+        PREPROCESS_EXTRA_ARGS=""
+        ;;
     *)
         echo "ERROR: Unknown recipe '$RECIPE_NAME'. Add a case to diffusion_finetune_launcher.sh."
         exit 1
         ;;
 esac
-echo "[config] Recipe=$RECIPE_NAME  Processor=$PROCESSOR  Model=$MODEL_NAME"
+echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME"
 
 # ============================================
-# Stage 1: Download dissolve dataset
+# Stage 1: Download dataset
 # ============================================
 echo "============================================"
-echo "[data] Downloading dissolve dataset..."
+echo "[data] Downloading dataset..."
 echo "============================================"
-uv run --extra diffusion python -c "
+if [ "$MEDIA_TYPE" = "image" ]; then
+    uv run --extra diffusion python -c "
+from datasets import load_dataset
+from pathlib import Path
+import json
+
+ds = load_dataset('diffusers/tuxemon', split='train')
+out_dir = Path('$DATA_DIR/raw')
+out_dir.mkdir(parents=True, exist_ok=True)
+
+jsonl_entries = []
+for i, row in enumerate(ds):
+    fname = f'tuxemon_sample_{i:04d}.png'
+    row['image'].save(out_dir / fname)
+    jsonl_entries.append({'file_name': fname, 'internvl': row['gpt4_turbo_caption']})
+
+jsonl_path = out_dir / 'tuxemon_internvl.json'
+with open(jsonl_path, 'w') as jf:
+    for entry in jsonl_entries:
+        jf.write(json.dumps(entry) + '\n')
+
+print(f'Extracted {len(ds)} images to {out_dir}')
+"
+else
+    uv run --extra diffusion python -c "
 from huggingface_hub import snapshot_download
 snapshot_download('modal-labs/dissolve', repo_type='dataset', local_dir='$DATA_DIR/raw')
 print('Dataset downloaded successfully')
 "
+fi
 
 # ============================================
-# Stage 2: Preprocess videos to latents
+# Stage 2: Preprocess to latents
 # ============================================
 echo "============================================"
-echo "[preprocess] Converting videos to latents..."
+echo "[preprocess] Converting ${MEDIA_TYPE}s to latents..."
 echo "============================================"
-uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess video \
-    --video_dir "$DATA_DIR/raw" \
-    --output_dir "$DATA_DIR/cache" \
-    --processor "$PROCESSOR" \
-    --resolution_preset 512p \
-    --caption_format sidecar \
-    $PREPROCESS_EXTRA_ARGS
+if [ "$MEDIA_TYPE" = "image" ]; then
+    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess image \
+        --image_dir "$DATA_DIR/raw" \
+        --output_dir "$DATA_DIR/cache" \
+        --processor "$PROCESSOR" \
+        $PREPROCESS_EXTRA_ARGS
+else
+    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess video \
+        --video_dir "$DATA_DIR/raw" \
+        --output_dir "$DATA_DIR/cache" \
+        --processor "$PROCESSOR" \
+        --resolution_preset 512p \
+        --caption_format sidecar \
+        $PREPROCESS_EXTRA_ARGS
+fi
 
 # ============================================
 # Stage 3: Finetune
@@ -107,20 +156,37 @@ echo "[inference] Running inference smoke test..."
 echo "============================================"
 CKPT_STEP_DIR=$(ls -d $CKPT_DIR/epoch_*_step_* | sort -t_ -k4 -n | tail -1)
 
-uv run --extra diffusion python examples/diffusion/generate/generate.py \
-    --config "$GENERATE_CONFIG" \
-    --model.pretrained_model_name_or_path "$MODEL_NAME" \
-    --model.checkpoint "$CKPT_STEP_DIR" \
-    --inference.num_inference_steps 5 \
-    --inference.pipeline_kwargs.num_frames "$INFER_NUM_FRAMES" \
-    --output.output_dir "$INFER_DIR" \
-    --vae.enable_slicing true \
-    --vae.enable_tiling true
+if [ "$MEDIA_TYPE" = "image" ]; then
+    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+        --config "$GENERATE_CONFIG" \
+        --model.pretrained_model_name_or_path "$MODEL_NAME" \
+        --model.checkpoint "$CKPT_STEP_DIR" \
+        --inference.num_inference_steps 5 \
+        --output.output_dir "$INFER_DIR" \
+        --vae.enable_slicing true \
+        --vae.enable_tiling true
 
-# Verify output
-if ls $INFER_DIR/sample_*.mp4 1>/dev/null 2>&1; then
-    echo "[inference] SUCCESS: Output video(s) generated"
+    if ls $INFER_DIR/sample_*.png 1>/dev/null 2>&1; then
+        echo "[inference] SUCCESS: Output image(s) generated"
+    else
+        echo "[inference] FAILURE: No output images found"
+        exit 1
+    fi
 else
-    echo "[inference] FAILURE: No output videos found"
-    exit 1
+    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+        --config "$GENERATE_CONFIG" \
+        --model.pretrained_model_name_or_path "$MODEL_NAME" \
+        --model.checkpoint "$CKPT_STEP_DIR" \
+        --inference.num_inference_steps 5 \
+        --inference.pipeline_kwargs.num_frames "$INFER_NUM_FRAMES" \
+        --output.output_dir "$INFER_DIR" \
+        --vae.enable_slicing true \
+        --vae.enable_tiling true
+
+    if ls $INFER_DIR/sample_*.mp4 1>/dev/null 2>&1; then
+        echo "[inference] SUCCESS: Output video(s) generated"
+    else
+        echo "[inference] FAILURE: No output videos found"
+        exit 1
+    fi
 fi
