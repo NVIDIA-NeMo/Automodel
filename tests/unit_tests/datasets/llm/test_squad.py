@@ -16,6 +16,7 @@ import pytest
 from datasets import Dataset
 
 import nemo_automodel.components.datasets.llm.squad as mqd
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 
 make_squad_dataset = mqd.make_squad_dataset
 
@@ -143,7 +144,7 @@ def test_plain_tokenizer_basic():
     assert "labels" in sample
     assert "___PAD_TOKEN_IDS___" in sample
     # loss_mask correct length
-    if 'loss_mask' in sample:
+    if "loss_mask" in sample:
         assert len(sample["input_ids"]) == len(sample["loss_mask"]) == len(sample["labels"])
         # Verify at least one 1 exists in loss_mask (answer tokens)
         assert 1 in sample["loss_mask"]
@@ -171,7 +172,7 @@ def test_sequence_padding():
         non_padded_labels = list(filter(lambda x: x != -100, row["labels"]))
         assert len(non_padded_labels) > 0, "There should be at least one non-padded label"
         assert non_padded_labels[-1] == 0, f"Last non-padded label should be eos (0), got {non_padded_labels[-1]}"
-        if 'loss_mask' in row:
+        if "loss_mask" in row:
             # loss mask padding must be zeros
             assert row["loss_mask"][-1] == 0
 
@@ -204,9 +205,10 @@ def test_chat_template_path():
         seq_length=None,  # no padding
     )
     row = ds[0]
-    n = len(row['input_ids'])
+    n = len(row["input_ids"])
     for k, v in row.items():
-        if k == '___PAD_TOKEN_IDS___': continue
+        if k == "___PAD_TOKEN_IDS___":
+            continue
         assert len(v) == n, f"{k} has length {len(v)} but should have length {n}"
     sot_id = tok(start_token, add_special_tokens=False)["input_ids"][0]
 
@@ -217,7 +219,7 @@ def test_chat_template_path():
     # therefore, it is defined as `response_start = idx_second`.
     # However, here, the returned labels are already shifted by 1, so we can use `response_start = idx_second - 1`.
     response_start = idx_second - 1
-    if 'loss_mask' in row:
+    if "loss_mask" in row:
         assert sum(row["loss_mask"][:response_start]) == 0
         assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
 
@@ -230,5 +232,5 @@ def test_fp8_flag_is_noop():
     tok = DummyTokenizer()
     ds = make_squad_dataset(tok, fp8=True)
     # still returns a dataset
-    assert isinstance(ds, Dataset)
+    assert isinstance(ds, LazyMappedDataset)
     assert len(ds) == 2
