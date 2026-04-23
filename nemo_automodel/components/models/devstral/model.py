@@ -12,36 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Devstral-Small-2-24B and Devstral-2-123B FP8 checkpoint loaders.
+"""FP8-native Mistral3 / Ministral3 custom model.
 
-HF's ``FineGrainedFP8Config(dequantize=True)`` loader inside
-``transformers.PreTrainedModel.from_pretrained`` materializes the full
-dequantized BF16 model on every rank *before* PP split, OOM-ing on 80 GB H100
-at TP=2 PP=2 (~77 GB/rank). We avoid that by:
+Covers three checkpoint variants, all of which ship as FP8 safetensors with
+per-tensor scalar `weight_scale_inv`:
 
-  1. Constructing the model on meta via the standard nemo_automodel
-     custom-model path — no GPU allocation, no HF quant loader.
-  2. Attaching a ``state_dict_adapter`` (see ./state_dict_adapter.py,
-     modelled on ``deepseek_v3/state_dict_adapter.py``) that handles both
-     (a) key remapping between HF's on-disk layout and our text-only layout,
-     and (b) FP8 → BF16 dequantization during the standard
-     ``Checkpointer.load_model`` DCP load.
+  * mistralai/Devstral-Small-2-24B-Instruct-2512 — VLM wrapper
+    (``Mistral3ForConditionalGeneration``) with ``language_model.`` prefix.
+  * mistralai/Devstral-2-123B-Instruct-2512 — dense text-only
+    (``Ministral3ForCausalLM``), no prefix.
+  * dawn-ridge-medium-3p5-128b (codenamed Mistral-3.5 128B) — VLM wrapper
+    with ``model.language_model.`` infix.
 
-Routing: ``__init__.py`` installs a resolver hook on
-``_resolve_custom_model_cls_for_config`` so Devstral FP8 configs dispatch
-to these classes *without* overwriting the existing Mistral3 / Mistral4
-registry entries (non-FP8 users keep the stock path).
+HF's ``FineGrainedFP8Config`` loader materializes the full dequantized BF16
+model on every rank before PP split, OOM-ing under TP+PP on 80 GB H100. We
+avoid it by (a) registering a resolver hook that routes these configs to
+this class and (b) attaching a ``Mistral3FP8StateDictAdapter`` that runs
+FP8 dequant inside the standard Checkpointer DCP load path.
+
+Layout detection is automatic: at ``__init__`` we peek at the checkpoint's
+``model.safetensors.index.json`` to tell the three variants apart by their
+top-level key prefix. Fallbacks choose the safest layout that still loads.
 """
 
 from __future__ import annotations
 
+import glob
+import json
 import logging
+import os
+from typing import Optional
 
 import torch
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.models.devstral.state_dict_adapter import (
-    DevstralFP8StateDictAdapter,
+    Mistral3FP8StateDictAdapter,
 )
 from nemo_automodel.components.models.mistral3.model import (
     Ministral3Config,
@@ -51,113 +57,160 @@ from nemo_automodel.components.models.mistral3.model import (
 logger = logging.getLogger(__name__)
 
 
-class Devstral24BFP8TextForCausalLM(Ministral3ForCausalLM):
-    """Text-only Devstral-Small-2-24B (FP8 VLM checkpoint).
+def _resolve_snapshot_dir(name_or_path: str) -> Optional[str]:
+    """Return a local dir containing ``model.safetensors.index.json`` if findable.
 
-    The underlying HF architecture is ``Mistral3ForConditionalGeneration``
-    (a VLM wrapping a ``ministral3`` text decoder). We only train the text
-    stack, so the config is unwrapped to its inner ``Ministral3Config`` and
-    the state-dict adapter strips the ``language_model.`` prefix during load.
+    Accepts either an absolute path or an HF repo id. For repo ids, scans the
+    HF hub cache for a matching snapshot; returns None if nothing looks right.
+    """
+    if not name_or_path:
+        return None
+    if os.path.isdir(name_or_path):
+        return name_or_path if os.path.exists(
+            os.path.join(name_or_path, "model.safetensors.index.json")
+        ) else None
+    # HF repo id: scan cache. Try the env-exported HF_HOME first.
+    hf_home = os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE")
+    roots = [os.path.join(hf_home, "hub")] if hf_home else []
+    roots.append(os.path.expanduser("~/.cache/huggingface/hub"))
+    safe = name_or_path.replace("/", "--")
+    for root in roots:
+        for snap in glob.glob(os.path.join(root, f"models--{safe}", "snapshots", "*")):
+            if os.path.exists(os.path.join(snap, "model.safetensors.index.json")):
+                return snap
+    return None
+
+
+def _detect_layout(name_or_path: str) -> str:
+    """Sample the safetensors weight map to choose the adapter layout.
+
+    Returns one of ``"devstral_vlm"``, ``"dawn_ridge_vlm"``, ``"dense"``.
+    If the checkpoint can't be located we default to ``"dense"`` — this is
+    the safest fallback for ``Ministral3ForCausalLM`` archs (no remapping).
+    """
+    snap = _resolve_snapshot_dir(name_or_path)
+    if snap is None:
+        logger.info(
+            "Mistral3FP8: could not resolve snapshot dir for %r — defaulting "
+            "to 'dense' layout (no key remapping)",
+            name_or_path,
+        )
+        return "dense"
+    idx_path = os.path.join(snap, "model.safetensors.index.json")
+    weight_map = json.load(open(idx_path))["weight_map"]
+    # Sample some representative keys.
+    sample = []
+    for k in weight_map:
+        if ".layers.0." in k or k.endswith("embed_tokens.weight"):
+            sample.append(k)
+            if len(sample) >= 4:
+                break
+    if not sample:
+        # Fall back to the first 4 keys.
+        sample = list(weight_map.keys())[:4]
+    # Decide.
+    if any(k.startswith("language_model.") for k in sample):
+        layout = "devstral_vlm"
+    elif any(k.startswith("model.language_model.") for k in sample):
+        layout = "dawn_ridge_vlm"
+    else:
+        layout = "dense"
+    logger.info(
+        "Mistral3FP8: detected checkpoint layout=%r from %s (sample=%s)",
+        layout,
+        snap,
+        sample[:2],
+    )
+    return layout
+
+
+class Mistral3FP8ForCausalLM(Ministral3ForCausalLM):
+    """Unified FP8 loader for the Mistral3 / Ministral3 family.
+
+    Accepts:
+      - ``Mistral3Config`` (VLM — `text_config` is extracted and coerced to
+        a ``Ministral3Config``), or
+      - ``Ministral3Config`` directly (dense text-only).
+
+    In either case the outer ``quantization_config`` is preserved so that
+    ``apply_model_infrastructure`` (infrastructure.py:419-422) sets
+    ``dequantize_base_checkpoint=True`` on the Checkpointer — that's the
+    signal for ``_maybe_adapt_state_dict_to_hf`` to call ``adapter.to_hf``
+    with ``quantization=True`` and emit the ``_scale_inv`` placeholder keys
+    that DCP reads from disk alongside the FP8 weights.
     """
 
-    # See checkpointing.py:initialize_model_weights — gate on this class
-    # attribute to skip HF's `initialize_weights()` since the state-dict
-    # adapter path will populate every tensor anyway. Skipping also avoids
-    # a stage-divergent DTensor collective inside HF's init on PP setups.
+    # See checkpointing.py:initialize_model_weights — gate on this attribute
+    # to skip HF's `initialize_weights()` (the upcoming adapter load will
+    # populate every tensor anyway, and skipping avoids a stage-divergent
+    # DTensor collective inside HF's init on PP setups).
     _skip_init_weights_on_load = True
 
     def __init__(self, config: PretrainedConfig):
-        ministral_cfg = self._coerce_to_ministral_config(config)
+        ministral_cfg, orig_name_or_path = self._coerce_to_ministral_config(config)
         super().__init__(ministral_cfg)
-        # The adapter runs inside Checkpointer.load_model via
-        # _maybe_adapt_state_dict_{to,from}_hf.  24B VLM keys all carry the
-        # `language_model.` prefix on disk.
-        self.state_dict_adapter = DevstralFP8StateDictAdapter(key_prefix="language_model.")
+        layout = _detect_layout(orig_name_or_path)
+        if layout == "devstral_vlm":
+            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_devstral_vlm()
+        elif layout == "dawn_ridge_vlm":
+            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_dawn_ridge_vlm()
+        else:
+            self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_dense()
 
     @staticmethod
-    def _coerce_to_ministral_config(config: PretrainedConfig) -> Ministral3Config:
-        """Return a Ministral3Config; unwrap `text_config` if a VLM config was passed.
+    def _coerce_to_ministral_config(config: PretrainedConfig) -> tuple[Ministral3Config, str]:
+        """Return ``(Ministral3Config, name_or_path)``.
 
-        We deliberately keep ``quantization_config`` on the returned config so
-        that ``apply_model_infrastructure`` (infrastructure.py:419-422) sets
-        ``dequantize_base_checkpoint=True`` on the Checkpointer, which in turn
-        causes ``_maybe_adapt_state_dict_to_hf`` to call ``adapter.to_hf`` with
-        ``quantization=True`` — that's how our adapter knows to emit the
-        ``_scale_inv`` placeholder keys that DCP will populate from disk.
-        HF's ``from_pretrained`` is never invoked for this class (custom
-        model path), so the lingering ``quantization_config`` never reaches
-        HF's FineGrainedFP8 loader.
+        If ``config`` is a VLM wrapper (has ``text_config``), unwrap it and
+        carry the outer ``quantization_config`` across (Ministral3Config would
+        otherwise drop it — it's not part of the ministral3 schema, but
+        ``apply_model_infrastructure`` reads ``hasattr(config,
+        'quantization_config')`` as a signal).
         """
-        if isinstance(config, Ministral3Config):
-            return config
-        text_config = getattr(config, "text_config", None)
-        if text_config is None:
-            raise TypeError(
-                f"{Devstral24BFP8TextForCausalLM.__name__} expected a Ministral3Config "
-                f"or a config with .text_config, got {type(config).__name__}."
-            )
-        # Copy the outer VLM's quantization_config dict onto the text config —
-        # otherwise the Ministral3Config constructor drops it (it's not part of
-        # the ministral3 schema). Setting it post-init keeps `hasattr` True,
-        # which is all apply_model_infrastructure checks.
-        ministral_cfg = Ministral3Config(**text_config.to_dict())
-        ministral_cfg.name_or_path = getattr(config, "name_or_path", "") or getattr(
+        name_or_path = getattr(config, "name_or_path", "") or getattr(
             config, "_name_or_path", ""
         )
-        outer_qc = getattr(config, "quantization_config", None)
-        if outer_qc is not None:
-            ministral_cfg.quantization_config = outer_qc
-        return ministral_cfg
-
-    @classmethod
-    def supports_config(cls, config: PretrainedConfig) -> bool:
-        """Activate only on FP8-native Mistral3 VLMs (Devstral-Small-2-24B)."""
+        if isinstance(config, Ministral3Config):
+            return config, name_or_path
         text_config = getattr(config, "text_config", None)
-        if text_config is None or getattr(text_config, "model_type", None) != "ministral3":
-            return False
-        qc = getattr(config, "quantization_config", None)
-        if qc is None:
-            return False
-        method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
-        return method == "fp8"
-
-
-class Devstral123BFP8ForCausalLM(Ministral3ForCausalLM):
-    """Dense text-only Devstral-2-123B (FP8 Ministral3 checkpoint).
-
-    Differences vs the 24B variant:
-      - Underlying arch is ``Ministral3ForCausalLM`` (not a VLM) — no prefix
-        to strip, no vision modules.
-      - Config is a ``Ministral3Config`` directly; no ``text_config`` unwrap.
-    """
-
-    _skip_init_weights_on_load = True
-
-    def __init__(self, config: PretrainedConfig):
-        if not isinstance(config, Ministral3Config):
+        if text_config is None:
             if getattr(config, "model_type", None) != "ministral3":
                 raise TypeError(
-                    f"{type(self).__name__} expects a ministral3 config, got "
-                    f"{type(config).__name__} with model_type={getattr(config, 'model_type', None)!r}."
+                    f"{Mistral3FP8ForCausalLM.__name__} expects a Ministral3Config "
+                    f"or a VLM config with .text_config, got {type(config).__name__}."
                 )
-            # Preserve quantization_config across the Ministral3Config coercion —
-            # see Devstral24BFP8TextForCausalLM._coerce_to_ministral_config for
-            # the rationale (apply_model_infrastructure uses it as a signal).
             outer_qc = getattr(config, "quantization_config", None)
-            config = Ministral3Config(**config.to_dict())
+            new_cfg = Ministral3Config(**config.to_dict())
             if outer_qc is not None:
-                config.quantization_config = outer_qc
-        super().__init__(config)
-        # Pass-through on keys; only the dequant part of the adapter is active.
-        self.state_dict_adapter = DevstralFP8StateDictAdapter(key_prefix="")
+                new_cfg.quantization_config = outer_qc
+            new_cfg.name_or_path = name_or_path
+            return new_cfg, name_or_path
+        # VLM: unwrap text_config, preserve quant_config on new cfg.
+        new_cfg = Ministral3Config(**text_config.to_dict())
+        new_cfg.name_or_path = name_or_path
+        outer_qc = getattr(config, "quantization_config", None)
+        if outer_qc is not None:
+            new_cfg.quantization_config = outer_qc
+        return new_cfg, name_or_path
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:
-        """Activate only on FP8-native Ministral3 configs (Devstral-2-123B)."""
-        if getattr(config, "model_type", None) != "ministral3":
+        """Claim any FP8-native config whose (inner or outer) model_type is ministral3."""
+        # VLM wrapper with a ministral3 text backbone.
+        text_config = getattr(config, "text_config", None)
+        is_family = (
+            (text_config is not None and getattr(text_config, "model_type", None) == "ministral3")
+            or getattr(config, "model_type", None) == "ministral3"
+        )
+        if not is_family:
             return False
         qc = getattr(config, "quantization_config", None)
         if qc is None:
             return False
         method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
         return method == "fp8"
+
+
+# Backwards-compat aliases — older code referenced size-specific names.
+Devstral24BFP8TextForCausalLM = Mistral3FP8ForCausalLM
+Devstral123BFP8ForCausalLM = Mistral3FP8ForCausalLM

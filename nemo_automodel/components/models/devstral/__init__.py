@@ -1,15 +1,19 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-"""Devstral model wrappers with streaming FP8 dequantize load support.
+"""FP8-native Mistral3 / Ministral3 custom model registration.
 
-Importing this module installs a tiny resolver hook that prepends a check
-for FP8-native Devstral configs to
+Importing this module installs a resolver hook on
 ``_resolve_custom_model_cls_for_config`` (nemo_automodel/_transformers/
-model_init.py). When the check matches, our streaming-FP8 custom class is
-returned; otherwise the original resolver runs unchanged, preserving the
-standard mistral4/Ministral3 paths.
+model_init.py) that routes FP8-native Mistral3 / Ministral3 configs to
+``Mistral3FP8ForCausalLM``. The model registry is **not** overwritten — so
+non-FP8 Mistral3 VLMs keep the stock mistral4.model path and there is no
+regression for other users.
 
-This avoids overwriting the model registry (which has only one class per
-architecture name) and therefore does not regress non-FP8 users.
+Covers:
+  * mistralai/Devstral-Small-2-24B-Instruct-2512 (VLM, language_model. prefix)
+  * mistralai/Devstral-2-123B-Instruct-2512     (dense, no prefix)
+  * dawn-ridge-medium-3p5-128b                  (VLM, model.language_model. infix)
+
+Layout is auto-detected from the safetensors weight map at model init time.
 """
 
 from __future__ import annotations
@@ -18,34 +22,31 @@ import logging
 
 from nemo_automodel._transformers import model_init as _mi
 from nemo_automodel.components.models.devstral.model import (
-    Devstral24BFP8TextForCausalLM,
-    Devstral123BFP8ForCausalLM,
+    Devstral24BFP8TextForCausalLM,  # noqa: F401 — backwards-compat alias
+    Devstral123BFP8ForCausalLM,  # noqa: F401 — backwards-compat alias
+    Mistral3FP8ForCausalLM,
 )
 
 logger = logging.getLogger(__name__)
 
 
-_FP8_CLASSES = (Devstral24BFP8TextForCausalLM, Devstral123BFP8ForCausalLM)
-
-
-def _install_resolver_hook():
-    """Prepend an FP8-Devstral check to _resolve_custom_model_cls_for_config."""
+def _install_resolver_hook() -> None:
+    """Prepend an FP8-Mistral3 check to _resolve_custom_model_cls_for_config."""
     if getattr(_mi._resolve_custom_model_cls_for_config, "_devstral_hook_installed", False):
         return
     _orig_resolve = _mi._resolve_custom_model_cls_for_config
 
     def _patched(config):
-        for cls in _FP8_CLASSES:
-            try:
-                if cls.supports_config(config):
-                    logger.info(
-                        "Devstral FP8 resolver claiming config %s for %s",
-                        type(config).__name__,
-                        cls.__name__,
-                    )
-                    return cls
-            except Exception:  # pragma: no cover — defensive
-                logger.debug("supports_config raised for %s", cls.__name__, exc_info=True)
+        try:
+            if Mistral3FP8ForCausalLM.supports_config(config):
+                logger.info(
+                    "Mistral3 FP8 resolver claiming config %s for %s",
+                    type(config).__name__,
+                    Mistral3FP8ForCausalLM.__name__,
+                )
+                return Mistral3FP8ForCausalLM
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("supports_config raised for Mistral3FP8ForCausalLM", exc_info=True)
         return _orig_resolve(config)
 
     _patched._devstral_hook_installed = True  # type: ignore[attr-defined]
@@ -56,6 +57,7 @@ _install_resolver_hook()
 
 
 __all__ = [
+    "Mistral3FP8ForCausalLM",
     "Devstral24BFP8TextForCausalLM",
     "Devstral123BFP8ForCausalLM",
 ]

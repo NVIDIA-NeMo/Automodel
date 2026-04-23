@@ -1,0 +1,118 @@
+# Mistral-3.5 medium (128B, codename "dawn-ridge") on HellaSwag, full FT.
+# Multi-node: 8 nodes x 8 H100-80GB = 64 GPUs, TP=8 PP=8, DP=1.
+#
+# Checkpoint: local safetensors at
+#   /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/dawn-ridge-medium-3p5-128b-hf_vv1
+# Architecture: Mistral3ForConditionalGeneration (VLM wrapper) with a
+# ministral3 text backbone of 88 layers / 12288 hidden / 96 attn heads /
+# 8 KV / 28672 intermediate / vocab 131072 — dimensionally identical to
+# Devstral-2-123B but wrapped as a VLM with a different prefix convention:
+#   disk keys:   model.language_model.layers.N.*   and   lm_head.weight
+#   24B Devstral: language_model.model.layers.N.*  and   language_model.lm_head.weight
+#
+# The layout is auto-detected by
+# nemo_automodel/components/models/devstral/model.py (_detect_layout samples
+# model.safetensors.index.json) → the adapter picks
+# Mistral3FP8StateDictAdapter.for_dawn_ridge_vlm() at init. No per-model
+# knobs in this yaml.
+#
+# Launch:
+#   sbatch /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/Automodel/mistral3p5_128b.sub
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 256
+  # Must be >= pp_size * pp_microbatch_size = 8 * 1 = 8. Each grad-accumulation
+  # step submits local_batch_size / pp_microbatch_size = 8 microbatches into
+  # the 1f1b pipeline — the minimum to fill all 8 PP stages. With DP=1,
+  # grad_acc = global_batch_size / local_batch_size = 256 / 8 = 32.
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: 20
+  max_steps: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  # Standard NeMoAutoModel entry point. A resolver hook in
+  # nemo_automodel/components/models/devstral/__init__.py claims FP8-native
+  # Mistral3 / Ministral3 configs and routes them to Mistral3FP8ForCausalLM,
+  # which attaches a Mistral3FP8StateDictAdapter that the Checkpointer DCP
+  # load path uses to dequantize FP8 → BF16 on the fly. No quantization_config
+  # here — if one were passed, _init_model would fall through to HF's
+  # FineGrainedFP8 loader (which OOMs under PP).
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/dawn-ridge-medium-3p5-128b-hf_vv1
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: logs/tier2_mistral3p5_128b_hellaswag/ckpt
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 8
+  cp_size: 1
+  pp_size: 8
+  # sequence_parallel MUST be false when combining TP with PP — SP shards
+  # activations on the sequence dim as DTensors, but PyTorch's 1f1b schedule
+  # sends activations between PP stages via plain c10d::send which fails
+  # with "found no DeviceMesh from dtensor args for c10d::send".
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+  pipeline:
+    # Non-interleaved 1f1b with auto layer split. Ministral3 text backbone
+    # has 88 layers → 88/8 = 11 layers per stage.
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
