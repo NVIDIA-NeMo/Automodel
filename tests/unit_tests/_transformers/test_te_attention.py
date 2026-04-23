@@ -22,10 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel._transformers.te_attention import (
+    _detect_causal_mask,
     _infer_attn_params,
     _make_te_sdpa,
+    _proj_out_features,
+    get_te_attention_stats,
     inject_te_attention,
     inject_te_attention_into_module,
+    reset_te_attention_stats,
 )
 
 # ---------------------------------------------------------------------------
@@ -389,3 +393,150 @@ class TestForwardPatch:
             module.forward(torch.randn(1, 4, 2, 16))
 
         assert F.scaled_dot_product_attention is original_sdpa, "SDPA must be restored after exception"
+
+
+# ---------------------------------------------------------------------------
+# _detect_causal_mask
+# ---------------------------------------------------------------------------
+
+
+def _causal_float_mask(B, S, dtype=torch.float32):
+    """HF-style additive causal mask: 0 on/below diagonal, large-negative above."""
+    mask = torch.zeros(B, 1, S, S, dtype=dtype)
+    neg = torch.finfo(dtype).min
+    mask.masked_fill_(torch.triu(torch.ones(S, S, dtype=torch.bool), diagonal=1), neg)
+    return mask
+
+
+def _causal_bool_mask(B, S):
+    """Bool causal mask (True = visible, False = masked), newer transformers style."""
+    return torch.tril(torch.ones(B, 1, S, S, dtype=torch.bool))
+
+
+class TestDetectCausalMask:
+    def test_float_causal_no_window(self):
+        m = _causal_float_mask(2, 16)
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+
+    def test_bfloat16_causal(self):
+        m = _causal_float_mask(2, 16, dtype=torch.bfloat16)
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+
+    def test_bool_causal(self):
+        m = _causal_bool_mask(2, 16)
+        assert _detect_causal_mask(m, (-1, 0)) == ("causal", (-1, 0))
+
+    def test_sliding_window(self):
+        S, W = 16, 8
+        base = _causal_float_mask(2, S)
+        neg = torch.finfo(base.dtype).min
+        # Zero out entries farther than (W-1) to the left of each query → sliding mask.
+        rows = torch.arange(S).unsqueeze(1)
+        cols = torch.arange(S).unsqueeze(0)
+        sliding_mask = (rows - cols) >= W  # True where out-of-window
+        base.masked_fill_(sliding_mask.unsqueeze(0).unsqueeze(0), neg)
+        assert _detect_causal_mask(base, (W - 1, 0)) == ("causal", (W - 1, 0))
+
+    def test_sliding_window_bool(self):
+        S, W = 16, 8
+        m = _causal_bool_mask(2, S)
+        rows = torch.arange(S).unsqueeze(1)
+        cols = torch.arange(S).unsqueeze(0)
+        sliding_mask = (rows - cols) >= W
+        m.masked_fill_(sliding_mask.unsqueeze(0).unsqueeze(0), False)
+        assert _detect_causal_mask(m, (W - 1, 0)) == ("causal", (W - 1, 0))
+
+    def test_unsupported_dtype(self):
+        m = _causal_float_mask(1, 8).to(torch.int32)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_wrong_ndim(self):
+        m = _causal_float_mask(1, 8)[0]  # strip batch -> 3D
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_non_square(self):
+        m = torch.zeros(1, 1, 4, 8)
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_upper_right_unmasked(self):
+        """Non-causal mask (upper-right visible) must return None."""
+        m = torch.zeros(1, 1, 8, 8)  # all visible → bidirectional
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_diagonal_masked(self):
+        """If the diagonal itself is masked, bail out."""
+        m = _causal_float_mask(1, 8)
+        m[0, 0, 0, 0] = torch.finfo(m.dtype).min
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_padded_batch_fails(self):
+        """Per-sample right padding breaks visible_last check → None."""
+        S = 16
+        m = _causal_float_mask(2, S)
+        neg = torch.finfo(m.dtype).min
+        # Sample 0: last 4 keys are padded (fewer visible in last row)
+        m[0, 0, :, S - 4 :] = neg
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_first_row_unexpected(self):
+        """If the first row sees > 1 key, that's not canonical causal."""
+        S = 16
+        m = _causal_float_mask(1, S)
+        m[0, 0, 0, 1] = 0.0  # first query attends to itself AND position 1
+        assert _detect_causal_mask(m, (-1, 0)) is None
+
+    def test_sliding_window_mismatch(self):
+        """Sliding window requested but mask has more visible keys."""
+        S = 16
+        m = _causal_float_mask(1, S)  # full causal
+        # Request window of 4 but mask shows full S visible → mismatch
+        assert _detect_causal_mask(m, (3, 0)) is None
+
+
+# ---------------------------------------------------------------------------
+# _proj_out_features
+# ---------------------------------------------------------------------------
+
+
+class TestProjOutFeatures:
+    def test_none(self):
+        assert _proj_out_features(None) is None
+
+    def test_standard_linear(self):
+        assert _proj_out_features(nn.Linear(16, 32)) == 32
+
+    def test_weight_only(self):
+        """Custom module with a .weight attribute but no out_features."""
+        mod = nn.Module()
+        mod.weight = nn.Parameter(torch.empty(64, 32))
+        assert _proj_out_features(mod) == 64
+
+    def test_wrapped_linear(self):
+        """Gemma4ClippableLinear-style wrapper exposes .linear."""
+        mod = nn.Module()
+        mod.linear = nn.Linear(16, 48)
+        assert _proj_out_features(mod) == 48
+
+    def test_unknown_module(self):
+        """Module with none of the expected attributes returns None."""
+        assert _proj_out_features(nn.Module()) is None
+
+
+# ---------------------------------------------------------------------------
+# Stats API
+# ---------------------------------------------------------------------------
+
+
+class TestStatsAPI:
+    def test_reset_and_get(self):
+        reset_te_attention_stats()
+        stats = get_te_attention_stats()
+        assert isinstance(stats, dict)
+        assert all(v == 0 for v in stats.values())
+
+    def test_get_returns_copy(self):
+        reset_te_attention_stats()
+        s1 = get_te_attention_stats()
+        s1["te_hits"] = 999  # mutate the returned dict
+        s2 = get_te_attention_stats()
+        assert s2["te_hits"] == 0, "get_te_attention_stats must return an independent copy"
