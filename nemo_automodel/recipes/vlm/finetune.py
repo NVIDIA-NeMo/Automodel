@@ -404,14 +404,11 @@ def build_dataloader(
 
                         relax_layer_types_validator()
                         try:
-                            processor = AutoProcessor.from_pretrained(
-                                pretrained_model_name_or_path, **processor_kwargs
-                            )
+                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
                         except Exception as retry_exc:
                             processor = None
                             logging.warning(
-                                f"AutoProcessor not available for {pretrained_model_name_or_path} "
-                                f"({retry_exc}). "
+                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
                             )
                     else:
                         # Some models do not provide an AutoProcessor
