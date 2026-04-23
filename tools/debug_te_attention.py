@@ -44,10 +44,10 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModel
 
     model = (
-        AutoModelForCausalLM.from_pretrained(
+        AutoModel.from_pretrained(
             args.model,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
@@ -60,7 +60,12 @@ def main() -> None:
     reset_te_attention_stats()
 
     torch.manual_seed(0)
-    vocab = model.config.vocab_size
+    # vocab_size may live under text_config for VLMs (e.g. Gemma4).
+    vocab = getattr(model.config, "vocab_size", None) or getattr(
+        getattr(model.config, "text_config", None), "vocab_size", None
+    )
+    if vocab is None:
+        raise RuntimeError("Cannot infer vocab_size from model.config. Check model config structure.")
     input_ids = torch.randint(0, vocab, (args.batch, args.seq_len), device="cuda")
     attn_mask = torch.ones_like(input_ids) if args.with_mask else None
 
