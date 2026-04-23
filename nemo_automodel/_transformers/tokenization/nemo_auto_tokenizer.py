@@ -22,6 +22,11 @@ from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
+
 logger = logging.getLogger(__name__)
 
 
@@ -326,7 +331,25 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except (ValueError, StrictDataclassClassValidationError) as e:
+            # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained
+            # to resolve the tokenizer class. Some upstream configs (e.g.
+            # stepfun-ai/Step-3.5-Flash) ship layer_types longer than num_hidden_layers,
+            # which newer transformers reject. Work around by preloading a fixed config
+            # via get_hf_config (which truncates layer_types) and passing it explicitly.
+            err = str(e)
+            if "num_hidden_layers" not in err or ("layer_types" not in err and "layer types" not in err):
+                raise
+            from nemo_automodel._transformers.model_init import get_hf_config
+
+            fixed_config = get_hf_config(
+                pretrained_model_name_or_path,
+                attn_implementation="sdpa",
+                trust_remote_code=kwargs.get("trust_remote_code", False),
+            )
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, config=fixed_config, **kwargs)
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.
