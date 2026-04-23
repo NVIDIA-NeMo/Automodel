@@ -435,6 +435,48 @@ def test_autoprocessor_exception_handling(caplog):
         mock_from_pretrained.assert_called_once_with("test/model")
 
 
+def test_autoprocessor_retries_on_layer_types_mismatch():
+    """On StrictDataclassClassValidationError from validate_layer_type,
+    relax the validator globally and retry AutoProcessor.from_pretrained once."""
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    stub_processor = MagicMock()
+    calls = {"n": 0}
+
+    def fake_from_pretrained(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
+            raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
+        return stub_processor
+
+    with patch('transformers.AutoProcessor.from_pretrained', side_effect=fake_from_pretrained), \
+         patch('nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator',
+               return_value=True) as mock_relax, \
+         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
+         patch('torch.utils.data.distributed.DistributedSampler'), \
+         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'MagicMock': MagicMock()}):
+
+        cfg_ds = MagicMock()
+        cfg_ds.instantiate.return_value = []
+        cfg_ds.path_or_dataset = "test/dataset"
+        cfg_ds.get.side_effect = lambda key, default=None: {
+            "pretokenize": False, "packing": None, "max_length": None,
+            "chat_template": None, "preload_media": False,
+        }.get(key, default)
+
+        cfg_dl = MagicMock()
+        cfg_dl.get.return_value = None
+        cfg_dl.instantiate.return_value = MagicMock()
+
+        dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "stepfun-ai/Step-3.5-Flash", None, None, 123, 1)
+
+        assert processor is stub_processor
+        assert calls["n"] == 2
+        mock_relax.assert_called_once()
+
 
 def test_autoprocessor_loads_inside_first_rank_per_node():
     """Test that processor instantiation happens inside the FirstRankPerNode context."""

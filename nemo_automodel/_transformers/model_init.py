@@ -29,6 +29,11 @@ from contextlib import contextmanager
 import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, PretrainedConfig
+
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
 from transformers.modeling_utils import PreTrainedModel
 
 # For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
@@ -205,7 +210,7 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
-        except ValueError as e:
+        except (ValueError, StrictDataclassClassValidationError) as e:
             err = str(e)
             if "does not recognize this architecture" in err:
                 raise ValueError(
@@ -220,7 +225,9 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
                 ) from e
             # Some upstream configs (e.g. stepfun-ai/Step-3.5-Flash) ship
             # layer_types longer than num_hidden_layers, which newer transformers
-            # versions reject during config instantiation. Fix the raw dict and retry.
+            # versions reject during config instantiation. huggingface_hub wraps
+            # the validator's ValueError in StrictDataclassClassValidationError
+            # (not a ValueError subclass), so both exception types must be caught.
             if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
                 hf_config = _load_config_with_layer_types_fix(
                     pretrained_model_name_or_path,
