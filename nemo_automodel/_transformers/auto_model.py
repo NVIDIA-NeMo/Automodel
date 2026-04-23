@@ -318,10 +318,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # for model init and inject TE DotProductAttention post-init.
         inject_te_attention = attn_implementation == "te"
         if inject_te_attention:
-            logger.info(
-                "attn_implementation='te' requested: "
-                "using 'sdpa' for model init and will inject TE post-init."
-            )
+            logger.info("attn_implementation='te' requested: using 'sdpa' for model init and will inject TE post-init.")
             attn_implementation = "sdpa"
 
         if is_hf_model:
