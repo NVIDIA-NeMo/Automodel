@@ -115,4 +115,7 @@ ci:
   recipe_owner: hemildesai
   local_batch_size: 16
   nodes: 4
-  time: "01:00:00"
+  time: "00:20:00"
+  env_vars:
+    TORCH_NCCL_TRACE_BUFFER_SIZE: 20000
+    TORCH_NCCL_DUMP_ON_TIMEOUT: 1
