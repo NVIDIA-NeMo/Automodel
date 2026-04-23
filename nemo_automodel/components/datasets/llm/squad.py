@@ -15,12 +15,12 @@ import logging
 
 from datasets import load_dataset
 
+from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     format_chat_template,
     format_prompt_completion,
 )
-from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 
 
 def _formatting_prompts_func(
