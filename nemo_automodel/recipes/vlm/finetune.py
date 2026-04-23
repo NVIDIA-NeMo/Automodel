@@ -439,7 +439,7 @@ def build_dataloader(
                     ds,
                     pack_size=packing_cfg.get("pack_size", max_length),
                     padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
-                    drop_long_samples=packing_cfg.get("drop_long_samples", False),
+                    drop_long_samples=packing_cfg.get("drop_long_samples", True),
                     max_packs=packing_cfg.get("max_packs", None),
                     ds_raw=ds_raw,
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
