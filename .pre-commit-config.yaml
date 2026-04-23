@@ -27,11 +27,10 @@ repos:
     rev: "v0.9.9" # Use the appropriate version
     hooks:
     - id: ruff
-      args: ["--fix", "--force-exclude"]
+      args: ["--fix"]
     - id: ruff
-      args: ["check", "--select", "I", "--fix", "--force-exclude"]
+      args: ["check", "--select", "I", "--fix"]
     - id: ruff-format
-      args: ["--force-exclude"]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
     # Use the latest version
