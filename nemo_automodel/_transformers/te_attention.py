@@ -216,6 +216,81 @@ def _create_te_dot_product_attention(
 
 
 # ---------------------------------------------------------------------------
+# Mask detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_causal_mask(
+    attn_mask: torch.Tensor,
+    window_size: tuple[int, int],
+) -> tuple[str, tuple[int, int]] | None:
+    """Map a 4D HF additive attention mask to a TE (attn_mask_type, window_size) pair.
+
+    HF's ``create_causal_mask`` and ``create_sliding_window_causal_mask`` always
+    emit a 4D float mask even when the batch has no padding.  This causes the
+    generic ``attn_mask is not None`` guard to fire for every sliding/full-attention
+    layer and route every call to native SDPA instead of TE.
+
+    This function detects the two structurally trivial cases:
+    - Pure causal (lower-triangular 0 / -inf): returns ``("causal", (-1, 0))``.
+    - Sliding-window causal: returns ``("causal", window_size)``.
+
+    Returns ``None`` when the mask cannot be safely converted — e.g. it encodes
+    per-sample padding, has an unexpected shape, or is not a float additive mask.
+    The caller should fall back to native SDPA in that case.
+
+    Detection is O(S) per call (two row reductions of length S_k):
+    1. Upper-right corner scalar check: must be < -1e4 (causal-like).
+    2. First-row visible-key count across all batch items must equal 1
+       (each first query token can only attend to itself).
+    3. Last-row visible-key count across all batch items must equal ``S``
+       (full causal) or ``min(S, window_size[0]+1)`` (sliding window).
+    Any deviation indicates padding or a non-standard mask structure.
+    """
+    if attn_mask.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+    if attn_mask.ndim != 4:
+        return None
+
+    sq, sk = attn_mask.shape[2], attn_mask.shape[3]
+    if sq != sk:
+        return None
+
+    S = sq
+
+    # Scalar guard: upper-right corner must be -inf (causal structure).
+    if attn_mask[0, 0, 0, -1].item() > -1e4:
+        return None
+    # First query must be able to see itself.
+    if attn_mask[0, 0, 0, 0].item() < -1e4:
+        return None
+
+    # Check all batch items' first and last query rows.
+    # Shape: (B, S_k) for first-row and last-row slices.
+    first_row = attn_mask[:, 0, 0, :]
+    last_row = attn_mask[:, 0, -1, :]
+
+    visible_first = (first_row > -1e4).sum(dim=-1)  # (B,)
+    visible_last = (last_row > -1e4).sum(dim=-1)  # (B,)
+
+    if not (visible_first == 1).all().item():
+        return None
+
+    if window_size[0] < 0:
+        # Full causal: every last-row query must see all S keys.
+        if not (visible_last == S).all().item():
+            return None
+        return "causal", (-1, 0)
+    else:
+        # Sliding-window causal: last-row visible count = min(S, W).
+        W = window_size[0] + 1
+        expected = min(S, W)
+        if not (visible_last == expected).all().item():
+            return None
+        return "causal", window_size
+
+
+# ---------------------------------------------------------------------------
 # SDPA replacement
 # ---------------------------------------------------------------------------
 
@@ -297,21 +372,37 @@ def _make_te_sdpa(
                 enable_gqa=enable_gqa,
             )
 
-        # Non-trivial masks are not yet converted; fall back to native SDPA.
+        # Try to convert HF's explicit causal / sliding-window mask to TE parameters
+        # so we can run the TE kernel instead of falling back to native SDPA.
+        # _detect_causal_mask returns None when the mask encodes padding or is
+        # otherwise non-trivial; in that case we fall back as before.
         if attn_mask is not None:
-            logger.debug("TE attention: non-None attn_mask — falling back to native SDPA.")
-            _TE_STATS["fallback_mask"] += 1
-            _maybe_log_stats()
-            return original_sdpa(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
-                enable_gqa=enable_gqa,
+            converted = _detect_causal_mask(attn_mask, window_size)
+            if converted is None:
+                logger.debug("TE attention: non-trivial attn_mask — falling back to native SDPA.")
+                _TE_STATS["fallback_mask"] += 1
+                _maybe_log_stats()
+                return original_sdpa(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                )
+            mask_type, effective_window = converted
+            logger.debug(
+                "te_sdpa: converted attn_mask → mask_type=%s window=%s q_shape=%s",
+                mask_type,
+                effective_window,
+                query.shape,
             )
+        else:
+            mask_type = "causal" if is_causal else "no_mask"
+            # TE requires window_size=(-1, -1) for no_mask; sliding window only applies to causal.
+            effective_window = window_size if mask_type == "causal" else (-1, -1)
 
         # HF passes Q/K/V in [B, H, S, D]; TE expects [B, S, H, D].
         q = query.transpose(1, 2).contiguous()
@@ -326,15 +417,12 @@ def _make_te_sdpa(
             v = v[:, :, ::step, :].contiguous()
 
         logger.debug(
-            "te_sdpa: is_causal=%s attn_mask=None q=%s k=%s",
-            is_causal,
+            "te_sdpa: mask_type=%s effective_window=%s q=%s k=%s",
+            mask_type,
+            effective_window,
             q.shape,
             k.shape,
         )
-
-        mask_type = "causal" if is_causal else "no_mask"
-        # TE requires window_size=(-1, -1) for no_mask; sliding window only applies to causal.
-        effective_window = window_size if mask_type == "causal" else (-1, -1)
         # Set the current CUDA device to match the inputs so that any internal
         # scratch allocations inside TE land on the correct GPU (device_map="auto").
         with torch.cuda.device(q.device):
