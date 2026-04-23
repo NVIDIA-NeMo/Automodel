@@ -304,8 +304,12 @@ def inject_te_attention_into_module(module: torch.nn.Module) -> bool:
     )
     _patch_module_forward(module, te_sdpa)
 
-    # Expose ``attn_module`` so ``_uses_te_attention`` detects this module.
-    setattr(module, _TE_MODULE_ATTR, te_module)
+    # Store as a plain instance attribute (bypass nn.Module.__setattr__) so
+    # that the TE module is NOT registered as a child submodule.  This keeps
+    # attn_module._extra_state out of the model's state_dict, preventing DCP
+    # from demanding it when loading a pretrained HF checkpoint.
+    # hasattr / getattr still work because the attribute lives in __dict__.
+    object.__setattr__(module, _TE_MODULE_ATTR, te_module)
     return True
 
 
