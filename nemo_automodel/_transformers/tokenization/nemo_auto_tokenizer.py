@@ -315,6 +315,40 @@ def _try_convert_tiktoken_to_native(tokenizer):
         return tokenizer
 
 
+def _prefetch_tokenizer_assets(pretrained_model_name_or_path, **kwargs):
+    """Best-effort pre-fetch of tokenizer assets into the HF cache.
+
+    When transformers' cached_file lookup fails silently (e.g. transient Hub
+    outage or rate-limit), PreTrainedTokenizerFast.__init__ raises an opaque
+    "Couldn't instantiate the backend tokenizer" error. Running snapshot_download
+    first populates the cache so the subsequent AutoTokenizer.from_pretrained
+    call finds tokenizer.json locally. No-op for local paths.
+    """
+    path = str(pretrained_model_name_or_path)
+    if os.path.isdir(path):
+        return
+    try:
+        from huggingface_hub import snapshot_download
+
+        hub_kwargs = {k: kwargs[k] for k in ("cache_dir", "revision", "token") if k in kwargs}
+        snapshot_download(
+            path,
+            allow_patterns=[
+                "tokenizer*",
+                "vocab*",
+                "merges*",
+                "spiece.model",
+                "tiktoken.model",
+                "special_tokens_map.json",
+                "added_tokens.json",
+                "chat_template*",
+            ],
+            **hub_kwargs,
+        )
+    except Exception as e:
+        logger.debug("Tokenizer asset pre-fetch failed (non-fatal): %s", e)
+
+
 class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
     A wrapper around HuggingFace's AutoTokenizer that ensures consistent BOS/EOS token handling.
@@ -333,12 +367,21 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        # Serialize concurrent trust_remote_code downloads across ranks. HF copies
-        # tokenization_*.py / configuration_*.py into ~/.cache/huggingface/modules
-        # via shutil.copy2, which races on shared filesystems (e.g. Lustre) and
-        # surfaces as opaque tokenizer errors (see #1840 for the same fix in the
-        # robustness test).
+        # Serialize concurrent downloads across ranks + pre-fetch tokenizer assets.
+        #
+        # transformers 5.5 silently swallows list_repo_files failures (try/except in
+        # tokenization_utils_base.py:_from_pretrained) and cached_file returns None
+        # when called with _raise_exceptions_for_missing_entries=False. The combo
+        # produces an opaque "Couldn't instantiate the backend tokenizer" ValueError
+        # from PreTrainedTokenizerFast.__init__ — seen on CI nodes where HF Hub
+        # isn't reliably reachable and the tokenizer isn't in the shared cache.
+        #
+        # We pre-populate the cache on rank 0 via snapshot_download with tokenizer-
+        # only patterns so subsequent cached_file lookups hit the cache regardless
+        # of later list_repo_files behavior. FirstRankPerNode also guards the
+        # remote-code copy race on shared filesystems (see #1840).
         with FirstRankPerNode():
+            _prefetch_tokenizer_assets(pretrained_model_name_or_path, **kwargs)
             try:
                 tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
             except (ValueError, StrictDataclassClassValidationError) as e:
