@@ -201,10 +201,6 @@ def _make_te_sdpa(
     - Transposes the TE output back to ``[B, H, S, D]`` before returning.
     """
 
-    # Cache the last device the te_module was moved to so we only call .to()
-    # when the device changes (e.g. multi-GPU with device_map="auto").
-    _device_cache: list[torch.device | None] = [None]
-
     def te_sdpa(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -220,12 +216,6 @@ def _make_te_sdpa(
         q = query.transpose(1, 2).contiguous()
         k = key.transpose(1, 2).contiguous()
         v = value.transpose(1, 2).contiguous()
-
-        # Lazily move te_module to the same device as the inputs.
-        # This handles device_map="auto" where different layers land on different GPUs.
-        if q.device != _device_cache[0]:
-            te_module.to(q.device)
-            _device_cache[0] = q.device
 
         # If repeat_kv was applied (enable_gqa=False with a GQA model), undo it:
         # after transpose k/v are [B, S, H, D] but TE needs [B, S, Hkv, D].
@@ -251,7 +241,10 @@ def _make_te_sdpa(
         mask_type = "causal" if is_causal else "no_mask"
         # TE requires window_size=(-1, -1) for no_mask; sliding window only applies to causal.
         effective_window = window_size if mask_type == "causal" else (-1, -1)
-        out = te_module(q, k, v, attn_mask_type=mask_type, window_size=effective_window)
+        # Set the current CUDA device to match the inputs so that any internal
+        # scratch allocations inside TE land on the correct GPU (device_map="auto").
+        with torch.cuda.device(q.device):
+            out = te_module(q, k, v, attn_mask_type=mask_type, window_size=effective_window)
 
         # TE returns [B, S, H, D]; transpose back to HF's [B, H, S, D].
         return out.transpose(1, 2).contiguous()
