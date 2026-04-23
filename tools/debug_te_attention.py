@@ -44,10 +44,10 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    from transformers import AutoModel
+    from transformers import AutoModelForImageTextToText
 
     model = (
-        AutoModel.from_pretrained(
+        AutoModelForImageTextToText.from_pretrained(
             args.model,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa",
