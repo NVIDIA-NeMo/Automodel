@@ -67,6 +67,29 @@ _TE_MODEL_FLAG = "_te_attention_injected"
 # ---------------------------------------------------------------------------
 
 
+def _proj_out_features(proj: torch.nn.Module | None) -> int | None:
+    """Return the output feature count of a projection module.
+
+    Handles three layouts:
+    - Standard ``nn.Linear``: reads ``proj.out_features`` directly.
+    - Weight-only: reads ``proj.weight.shape[0]`` (works on meta device).
+    - Wrapped linear (e.g. ``Gemma4ClippableLinear``): recurses into the
+      ``proj.linear`` child module.
+    """
+    if proj is None:
+        return None
+    out = getattr(proj, "out_features", None)
+    if out is not None:
+        return int(out)
+    w = getattr(proj, "weight", None)
+    if w is not None:
+        return int(w.shape[0])
+    inner = getattr(proj, "linear", None)
+    if inner is not None:
+        return _proj_out_features(inner)
+    return None
+
+
 def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
     """Infer attention hyper-parameters from a HF ``self_attn`` module.
 
@@ -90,10 +113,7 @@ def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
         # Fall back to weight.shape[0] for custom linears lacking out_features
         # (e.g. Gemma4ClippableLinear).
         q_proj = getattr(module, "q_proj", None)
-        q_out = getattr(q_proj, "out_features", None)
-        if q_out is None:
-            w = getattr(q_proj, "weight", None)
-            q_out = w.shape[0] if w is not None else None
+        q_out = _proj_out_features(q_proj)
         if q_out is None:
             return None
         num_heads = q_out // head_dim
@@ -102,10 +122,7 @@ def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
     num_kv_heads = getattr(module, "num_key_value_heads", None)
     if num_kv_heads is None:
         k_proj = getattr(module, "k_proj", None)
-        k_out = getattr(k_proj, "out_features", None)
-        if k_out is None:
-            w = getattr(k_proj, "weight", None)
-            k_out = w.shape[0] if w is not None else None
+        k_out = _proj_out_features(k_proj)
         num_kv_heads = (k_out // head_dim) if k_out is not None else num_heads
     num_kv_heads = int(num_kv_heads)
 
