@@ -32,6 +32,8 @@ from nemo_automodel._transformers.te_attention import (
     reset_te_attention_stats,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -87,19 +89,20 @@ def main() -> None:
 
     stats = get_te_attention_stats()
     total = sum(stats.values())
-    print("=" * 60)
-    print(f"model={args.model}  with_mask={args.with_mask}  steps={args.steps}")
-    print(f"te_sdpa calls: {total}")
+    sep = "=" * 60
+    logger.info(sep)
+    logger.info("model=%s  with_mask=%s  steps=%d", args.model, args.with_mask, args.steps)
+    logger.info("te_sdpa calls: %d", total)
     for k, v in stats.items():
         pct = 100.0 * v / total if total else 0.0
-        print(f"  {k:<28s} {v:>6d}  ({pct:5.1f}%)")
-    print("=" * 60)
+        logger.info("  %-28s %6d  (%5.1f%%)", k, v, pct)
+    logger.info(sep)
     if stats["te_hits"] == 0:
-        print("[!] TE kernel NEVER ran. Check fallback_mask / fallback_scale_mismatch.")
+        logger.warning("TE kernel NEVER ran. Check fallback_mask / fallback_scale_mismatch.")
     elif stats["fallback_mask"] > stats["te_hits"]:
-        print("[!] Fallback dominates — block-causal mask conversion not implemented.")
+        logger.warning("Fallback dominates — block-causal mask conversion not implemented.")
     else:
-        print("[OK] TE path is running.")
+        logger.info("TE path is running.")
 
 
 if __name__ == "__main__":
