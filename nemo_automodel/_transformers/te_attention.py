@@ -247,22 +247,37 @@ def _detect_causal_mask(
        (full causal) or ``min(S, window_size[0]+1)`` (sliding window).
     Any deviation indicates padding or a non-standard mask structure.
     """
+    # Log mask properties once so we can diagnose unexpected formats.
+    logger.debug(
+        "_detect_causal_mask: dtype=%s shape=%s ndim=%d",
+        attn_mask.dtype,
+        tuple(attn_mask.shape),
+        attn_mask.ndim,
+    )
+
     if attn_mask.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        logger.debug("_detect_causal_mask: unsupported dtype %s → None", attn_mask.dtype)
         return None
     if attn_mask.ndim != 4:
+        logger.debug("_detect_causal_mask: ndim=%d (need 4) → None", attn_mask.ndim)
         return None
 
     sq, sk = attn_mask.shape[2], attn_mask.shape[3]
     if sq != sk:
+        logger.debug("_detect_causal_mask: sq=%d != sk=%d → None", sq, sk)
         return None
 
     S = sq
 
     # Scalar guard: upper-right corner must be -inf (causal structure).
-    if attn_mask[0, 0, 0, -1].item() > -1e4:
+    corner_val = attn_mask[0, 0, 0, -1].item()
+    if corner_val > -1e4:
+        logger.debug("_detect_causal_mask: upper-right corner=%.1f (not -inf) → None", corner_val)
         return None
     # First query must be able to see itself.
-    if attn_mask[0, 0, 0, 0].item() < -1e4:
+    diag_val = attn_mask[0, 0, 0, 0].item()
+    if diag_val < -1e4:
+        logger.debug("_detect_causal_mask: diagonal=%.1f (masked) → None", diag_val)
         return None
 
     # Check all batch items' first and last query rows.
@@ -273,12 +288,22 @@ def _detect_causal_mask(
     visible_first = (first_row > -1e4).sum(dim=-1)  # (B,)
     visible_last = (last_row > -1e4).sum(dim=-1)  # (B,)
 
+    logger.debug(
+        "_detect_causal_mask: S=%d visible_first=%s visible_last=%s window_size=%s",
+        S,
+        visible_first.tolist(),
+        visible_last.tolist(),
+        window_size,
+    )
+
     if not (visible_first == 1).all().item():
+        logger.debug("_detect_causal_mask: visible_first check failed → None")
         return None
 
     if window_size[0] < 0:
         # Full causal: every last-row query must see all S keys.
         if not (visible_last == S).all().item():
+            logger.debug("_detect_causal_mask: visible_last %s != S=%d → None", visible_last.tolist(), S)
             return None
         return "causal", (-1, 0)
     else:
@@ -286,6 +311,11 @@ def _detect_causal_mask(
         W = window_size[0] + 1
         expected = min(S, W)
         if not (visible_last == expected).all().item():
+            logger.debug(
+                "_detect_causal_mask: visible_last %s != expected=%d → None",
+                visible_last.tolist(),
+                expected,
+            )
             return None
         return "causal", window_size
 
