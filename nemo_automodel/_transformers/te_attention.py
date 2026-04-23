@@ -47,6 +47,7 @@ Limitations (v1)
   skipped with a warning.
 """
 
+import contextlib
 import logging
 import os
 import types
@@ -463,7 +464,9 @@ def _make_te_sdpa(
         )
         # Set the current CUDA device to match the inputs so that any internal
         # scratch allocations inside TE land on the correct GPU (device_map="auto").
-        with torch.cuda.device(q.device):
+        # Skip the context manager on CPU (torch.cuda.device raises for non-CUDA devices).
+        ctx = torch.cuda.device(q.device) if q.device.type == "cuda" else contextlib.nullcontext()
+        with ctx:
             out = te_module(q, k, v, attn_mask_type=mask_type, window_size=effective_window)
 
         _TE_STATS["te_hits"] += 1

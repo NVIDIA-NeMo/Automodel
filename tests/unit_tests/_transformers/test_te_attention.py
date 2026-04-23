@@ -71,7 +71,13 @@ class TestInferAttnParams:
     def test_standard_layout(self):
         module = _make_mock_self_attn(num_heads=16, num_kv_heads=8, head_dim=128)
         params = _infer_attn_params(module)
-        assert params == {"num_heads": 16, "num_kv_heads": 8, "head_dim": 128, "window_size": (-1, 0)}
+        assert params == {
+            "num_heads": 16,
+            "num_kv_heads": 8,
+            "head_dim": 128,
+            "window_size": (-1, 0),
+            "softmax_scale": 128**-0.5,
+        }
 
     def test_mha_layout(self):
         """MHA: num_kv_heads defaults to num_heads."""
