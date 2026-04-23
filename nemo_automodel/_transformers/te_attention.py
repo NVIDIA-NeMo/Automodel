@@ -136,11 +136,18 @@ def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
     else:
         te_window_size = (-1, 0)
 
+    # Some models (e.g. Gemma4) store a pre-computed softmax scale as
+    # ``module.scaling`` instead of using the standard head_dim**-0.5.
+    softmax_scale = getattr(module, "scaling", None)
+    if softmax_scale is None:
+        softmax_scale = head_dim**-0.5
+
     return {
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
         "window_size": te_window_size,
+        "softmax_scale": float(softmax_scale),
     }
 
 
