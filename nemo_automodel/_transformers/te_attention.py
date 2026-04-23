@@ -71,21 +71,49 @@ def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
     """Infer attention hyper-parameters from a HF ``self_attn`` module.
 
     Returns ``None`` when the module does not match the expected layout.
+
+    Head counts are read from module attributes when present (standard HF),
+    or inferred from projection ``out_features`` when absent (e.g.
+    ``Gemma4TextAttention`` which stores head count only in the config).
     """
     if not (hasattr(module, "q_proj") and hasattr(module, "k_proj") and hasattr(module, "v_proj")):
         return None
 
-    num_heads = getattr(module, "num_heads", None) or getattr(module, "num_attention_heads", None)
     head_dim = getattr(module, "head_dim", None)
-    if num_heads is None or head_dim is None:
+    if head_dim is None:
         return None
+    head_dim = int(head_dim)
 
-    num_kv_heads = getattr(module, "num_key_value_heads", num_heads)
+    num_heads = getattr(module, "num_heads", None) or getattr(module, "num_attention_heads", None)
+    if num_heads is None:
+        # Infer from q_proj output dimension (works even on meta device).
+        q_out = getattr(getattr(module, "q_proj", None), "out_features", None)
+        if q_out is None:
+            return None
+        num_heads = q_out // head_dim
+    num_heads = int(num_heads)
+
+    num_kv_heads = getattr(module, "num_key_value_heads", None)
+    if num_kv_heads is None:
+        k_out = getattr(getattr(module, "k_proj", None), "out_features", None)
+        num_kv_heads = (k_out // head_dim) if k_out is not None else num_heads
+    num_kv_heads = int(num_kv_heads)
+
+    # Sliding-window attention: convert HF's window token count to TE's
+    # (left_tokens, right_tokens) convention.  (-1, 0) = unbounded / global.
+    sliding_window = getattr(module, "sliding_window", None)
+    if sliding_window is not None and sliding_window > 0:
+        # TE window_size[0] = number of tokens to the LEFT of current position.
+        # A window of W tokens (inclusive of current) → W-1 to the left.
+        te_window_size = (int(sliding_window) - 1, 0)
+    else:
+        te_window_size = (-1, 0)
 
     return {
-        "num_heads": int(num_heads),
-        "num_kv_heads": int(num_kv_heads),
-        "head_dim": int(head_dim),
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "window_size": te_window_size,
     }
 
 
@@ -98,6 +126,7 @@ def _create_te_dot_product_attention(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    window_size: tuple[int, int] = (-1, 0),
     softmax_scale: float | None = None,
 ) -> "transformer_engine.pytorch.attention.DotProductAttention":  # noqa: F821
     """Instantiate a TE ``DotProductAttention`` for the given attention shape."""
@@ -113,6 +142,7 @@ def _create_te_dot_product_attention(
         qkv_format="bshd",
         softmax_scale=softmax_scale,
         num_gqa_groups=num_kv_heads,
+        window_size=window_size,
     )
 
 
@@ -126,6 +156,7 @@ def _make_te_sdpa(
     num_heads: int,
     num_kv_heads: int,
     original_sdpa,
+    window_size: tuple[int, int] = (-1, 0),
 ) -> Any:
     """Return a callable that replaces ``F.scaled_dot_product_attention``.
 
@@ -176,7 +207,7 @@ def _make_te_sdpa(
             )
 
         mask_type = "causal" if is_causal else "no_mask"
-        out = te_module(q, k, v, attn_mask_type=mask_type, window_size=(-1, 0))
+        out = te_module(q, k, v, attn_mask_type=mask_type, window_size=window_size)
 
         # TE returns [B, S, H, D]; transpose back to HF's [B, H, S, D].
         return out.transpose(1, 2).contiguous()
@@ -232,6 +263,7 @@ def inject_te_attention_into_module(module: torch.nn.Module) -> bool:
         num_heads=params["num_heads"],
         num_kv_heads=params["num_kv_heads"],
         original_sdpa=original_sdpa,
+        window_size=params["window_size"],
     )
     _patch_module_forward(module, te_sdpa)
 

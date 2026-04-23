@@ -71,7 +71,7 @@ class TestInferAttnParams:
     def test_standard_layout(self):
         module = _make_mock_self_attn(num_heads=16, num_kv_heads=8, head_dim=128)
         params = _infer_attn_params(module)
-        assert params == {"num_heads": 16, "num_kv_heads": 8, "head_dim": 128}
+        assert params == {"num_heads": 16, "num_kv_heads": 8, "head_dim": 128, "window_size": (-1, 0)}
 
     def test_mha_layout(self):
         """MHA: num_kv_heads defaults to num_heads."""
@@ -85,13 +85,17 @@ class TestInferAttnParams:
         module.head_dim = 64
         assert _infer_attn_params(module) is None
 
-    def test_missing_num_heads_returns_none(self):
+    def test_infers_num_heads_from_proj_when_attr_missing(self):
+        """When num_heads attribute is absent, infer from q_proj.out_features // head_dim."""
         module = nn.Module()
         module.q_proj = nn.Linear(512, 512, bias=False)
-        module.k_proj = nn.Linear(512, 512, bias=False)
-        module.v_proj = nn.Linear(512, 512, bias=False)
+        module.k_proj = nn.Linear(512, 256, bias=False)
+        module.v_proj = nn.Linear(512, 256, bias=False)
         module.head_dim = 64
-        assert _infer_attn_params(module) is None
+        params = _infer_attn_params(module)
+        assert params is not None
+        assert params["num_heads"] == 8  # 512 // 64
+        assert params["num_kv_heads"] == 4  # 256 // 64
 
     def test_missing_head_dim_returns_none(self):
         module = nn.Module()
@@ -112,6 +116,21 @@ class TestInferAttnParams:
         params = _infer_attn_params(module)
         assert params is not None
         assert params["num_heads"] == 8
+
+    def test_sliding_window_sets_te_window_size(self):
+        """sliding_window=512 should yield window_size=(511, 0) for TE."""
+        module = _make_mock_self_attn(num_heads=8, num_kv_heads=4, head_dim=64)
+        module.sliding_window = 512
+        params = _infer_attn_params(module)
+        assert params is not None
+        assert params["window_size"] == (511, 0)
+
+    def test_no_sliding_window_gives_unbounded(self):
+        """No sliding_window attribute means unbounded context: (-1, 0)."""
+        module = _make_mock_self_attn(num_heads=8, num_kv_heads=4, head_dim=64)
+        params = _infer_attn_params(module)
+        assert params is not None
+        assert params["window_size"] == (-1, 0)
 
 
 # ---------------------------------------------------------------------------
