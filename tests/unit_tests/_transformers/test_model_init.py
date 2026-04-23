@@ -26,6 +26,7 @@ from nemo_automodel._transformers.model_init import (
     _has_safetensors,
     _init_model,
     _load_config_with_layer_types_fix,
+    _propagate_torch_dtype_to_subconfigs,
     _resolve_model_dir,
     _setup_bnb_loading_kwargs,
     _stream_load_bnb_weights,
@@ -72,6 +73,61 @@ class TestConsumeConfigOverridesNestedDict:
 
         assert config.some_field == {"key": "val"}
         assert "some_field" not in kwargs
+
+
+class TestPropagateTorchDtypeToSubconfigs:
+    """Nested PretrainedConfig sub-configs must receive the requested torch_dtype."""
+
+    def test_propagates_to_nested_multimodal_subconfigs(self):
+        """Gemma4-style VLM configs expose text/vision/audio sub-configs that all need updating."""
+        from transformers import PretrainedConfig
+
+        text_config = PretrainedConfig()
+        text_config.torch_dtype = torch.bfloat16
+        vision_config = PretrainedConfig()
+        vision_config.torch_dtype = torch.bfloat16
+        audio_config = PretrainedConfig()
+        audio_config.torch_dtype = torch.bfloat16
+
+        top = PretrainedConfig()
+        top.torch_dtype = torch.bfloat16
+        top.text_config = text_config
+        top.vision_config = vision_config
+        top.audio_config = audio_config
+
+        _propagate_torch_dtype_to_subconfigs(top, torch.float32)
+
+        assert top.torch_dtype == torch.float32
+        assert text_config.torch_dtype == torch.float32
+        assert vision_config.torch_dtype == torch.float32
+        assert audio_config.torch_dtype == torch.float32
+
+    def test_ignores_non_config_attributes(self):
+        """Non-config attributes (e.g. plain dicts, ints) must not be traversed or mutated."""
+        from transformers import PretrainedConfig
+
+        top = PretrainedConfig()
+        top.torch_dtype = torch.bfloat16
+        top.some_dict = {"not": "a_config"}
+        top.hidden_size = 4096
+
+        _propagate_torch_dtype_to_subconfigs(top, torch.float32)
+
+        assert top.torch_dtype == torch.float32
+        assert top.some_dict == {"not": "a_config"}
+        assert top.hidden_size == 4096
+
+    def test_handles_cycles(self):
+        """Self-referencing configs must not cause infinite recursion."""
+        from transformers import PretrainedConfig
+
+        top = PretrainedConfig()
+        top.torch_dtype = torch.bfloat16
+        top.self_ref = top
+
+        _propagate_torch_dtype_to_subconfigs(top, torch.float32)
+
+        assert top.torch_dtype == torch.float32
 
 
 class TestBackendDictCoercion:
