@@ -523,7 +523,7 @@ def build_dataloader(
                     pack_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
                     padding_idx=getattr(tokenizer, "pad_token_id", 0),
-                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", False),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
                 _attn_impl = get_attn_implementation(cfg_model)
                 configure_packing(attn_implementation=_attn_impl)
