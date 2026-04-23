@@ -201,6 +201,10 @@ def _make_te_sdpa(
     - Transposes the TE output back to ``[B, H, S, D]`` before returning.
     """
 
+    # Cache the last device the te_module was moved to so we only call .to()
+    # when the device changes (e.g. multi-GPU with device_map="auto").
+    _device_cache: list[torch.device | None] = [None]
+
     def te_sdpa(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -216,6 +220,12 @@ def _make_te_sdpa(
         q = query.transpose(1, 2).contiguous()
         k = key.transpose(1, 2).contiguous()
         v = value.transpose(1, 2).contiguous()
+
+        # Lazily move te_module to the same device as the inputs.
+        # This handles device_map="auto" where different layers land on different GPUs.
+        if q.device != _device_cache[0]:
+            te_module.to(q.device)
+            _device_cache[0] = q.device
 
         # If repeat_kv was applied (enable_gqa=False with a GQA model), undo it:
         # after transpose k/v are [B, S, H, D] but TE needs [B, S, Hkv, D].
