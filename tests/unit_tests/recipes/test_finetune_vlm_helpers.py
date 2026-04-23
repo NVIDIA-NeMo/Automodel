@@ -379,6 +379,98 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     assert recipe.optimizer[0].zero_grad_called
 
 
+def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
+    """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=False)
+    # No "pp" in dim_names -> src_rank = mesh.reshape(-1)[-1].item(). With rank != src_rank
+    # and is_main=False, neither distributed send nor recv branch fires.
+    recipe.device_mesh = SimpleNamespace(mesh=torch.tensor([1]), mesh_dim_names=("dp",))
+    recipe.moe_mesh = None
+    recipe.loss_fn = object()
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = True
+    recipe.optimizer = [_DummyOptimizer()]
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+    recipe.cfg = _Cfg(fp8=None)
+    recipe.lr_scheduler = None
+    recipe.timestamp = 0.0
+    recipe.distributed_config = None
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    recipe._get_cp_group_size = lambda: 1
+
+    # Build a batch whose (labels != -100).sum() == num_label_tokens_in_batch.
+    seq = [1] * num_label_tokens_in_batch + [-100] * (4 - num_label_tokens_in_batch)
+    batches = [
+        {
+            "labels": torch.tensor([seq]),
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        }
+    ]
+    return recipe, batches
+
+
+def _patch_pp_optim_step_dependencies(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: None,
+    )
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_pp_zero_label_tokens_no_nan(monkeypatch):
+    """Regression for PR #1985: PP reporting loss must be 0.0 (not NaN) when num_label_tokens=0.
+
+    With pipeline parallelism enabled, _run_train_optim_step divides reporting_loss by
+    num_label_tokens. If every label in the batch is the ignore_index (-100), the divisor
+    is zero and the reported metric would be NaN without the guard at finetune.py:1136.
+    """
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=0)
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        # Mirror the PP path: append a finite per-microbatch sum loss. With the guard,
+        # this must still yield reporting_loss == 0.0.
+        loss_buffer.append(torch.tensor(5.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert isinstance(metrics, MetricsSample)
+    assert metrics.metrics["num_label_tokens"] == 0
+    loss = metrics.metrics["loss"]
+    assert loss == loss, f"reporting loss must not be NaN, got {loss}"
+    assert loss == 0.0, f"reporting loss must be 0.0 when num_label_tokens=0, got {loss}"
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
+    """PP reporting loss is the summed microbatch loss divided by num_label_tokens."""
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=4)
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        loss_buffer.append(torch.tensor(8.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert metrics.metrics["num_label_tokens"] == 4
+    assert metrics.metrics["loss"] == pytest.approx(8.0 / 4)
+
+
 # -----------------------------------------------------------------------------
 # AutoProcessor exception handling test
 # -----------------------------------------------------------------------------
