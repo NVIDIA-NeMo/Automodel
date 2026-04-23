@@ -1,11 +1,11 @@
 model:
-  pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  pretrained_model_name_or_path: "Qwen/Qwen-Image"
   mode: "finetune"
   cache_dir: null
   attention_backend: "flash"
 
 optim:
-  learning_rate: 2e-5
+  learning_rate: 1e-5
 
   optimizer:
     weight_decay: 0.01
@@ -21,29 +21,32 @@ fsdp:
   cpu_offload: false
 
 flow_matching:
-  adapter_type: "flux"
+  adapter_type: "qwen_image"
   adapter_kwargs:
-    guidance_scale: 1
+    guidance_scale: 3.5
     use_guidance_embeds: false
   timestep_sampling: "logit_normal"
   logit_mean: 0.0
   logit_std: 1.0
-  flow_shift: 1.0
+  flow_shift: 2.23
   mix_uniform_ratio: 0.0
-  sigma_min: 0.0
+  sigma_min: 0.02
   sigma_max: 1.0
   num_train_timesteps: 1000
   i2v_prob: 0.0
-  use_loss_weighting: false
+  use_loss_weighting: true
+  loss_weighting_scheme: "bsmntw"
   log_interval: 100
   summary_log_interval: 10
 
 step_scheduler:
-  num_epochs: 5000
+  num_epochs: 10
   local_batch_size: 1
   global_batch_size: 8
   ckpt_every_steps: 500
+  save_checkpoint_every_epoch: false
   log_every: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
 
 data:
   dataloader:
@@ -52,8 +55,6 @@ data:
     train_text_encoder: false
     num_workers: 2
     # Supported resolutions include [256x256], [512x512], and [1024x1024].
-    # While a 1:1 aspect ratio is currently used as a proxy for the closest image size,
-    # the implementation is designed to support multiple aspect ratios.
     base_resolution: [512, 512]
     dynamic_batch_size: false
     shuffle: true
@@ -68,9 +69,9 @@ checkpoint:
   restore_from: null
 
 wandb:
-  project: flux-finetuning
+  project: qwen-image-finetuning
   mode: online
-  name: flux_pretrain_ddp_test_run_1
+  name: qwen_image_finetune_run_1
 
 dist_env:
   backend: "nccl"
