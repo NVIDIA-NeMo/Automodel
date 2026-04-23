@@ -315,12 +315,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             )
 
         # ``attn_implementation="te"`` is a NeMo extension: route through SDPA
-        # for HF model init and inject TE DotProductAttention post-init.
-        inject_te_attention = is_hf_model and attn_implementation == "te"
+        # for model init and inject TE DotProductAttention post-init.
+        inject_te_attention = attn_implementation == "te"
         if inject_te_attention:
             logger.info(
-                "attn_implementation='te' requested for HF model: "
-                "using 'sdpa' for HF init and will inject TE post-init."
+                "attn_implementation='te' requested: "
+                "using 'sdpa' for model init and will inject TE post-init."
             )
             attn_implementation = "sdpa"
 
