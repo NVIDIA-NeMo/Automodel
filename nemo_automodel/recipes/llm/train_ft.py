@@ -112,6 +112,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_DEBUG_MEM = bool(int(__import__("os").environ.get("AUTOMODEL_DEBUG_MEM", "0")))
+
+
+def _mem_mark(label: str) -> None:
+    """Log GPU memory at a training-lifecycle checkpoint.
+
+    Enabled via AUTOMODEL_DEBUG_MEM=1. Prints current / peak / reserved on the
+    local rank. Peak is reset after each mark so "peak" reflects the delta since
+    the previous call — useful for attributing transients to specific stages.
+    """
+    if not _DEBUG_MEM or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    cur = torch.cuda.memory_allocated() / 1024**3
+    peak = torch.cuda.max_memory_allocated() / 1024**3
+    res = torch.cuda.memory_reserved() / 1024**3
+    rank = __import__("os").environ.get("RANK", "0")
+    logger.info(
+        "MEM[rank=%s] %-34s cur=%6.2f GB  peak_since_last=%6.2f GB  reserved=%6.2f GB",
+        rank, label, cur, peak, res,
+    )
+    torch.cuda.reset_peak_memory_stats()
+
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
@@ -245,6 +269,14 @@ def build_model(
             from nemo_automodel.components.quantization.qlora import create_bnb_config
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+
+        # Ensure opt-in custom model registrations take effect before the
+        # registry is queried (the Devstral FP8 wrapper registers itself for
+        # Mistral3ForConditionalGeneration on import).
+        try:
+            import nemo_automodel.components.models.devstral  # noqa: F401
+        except ImportError:
+            pass
 
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
@@ -1032,6 +1064,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
+        _mem_mark("before build_model")
         model = build_model(
             self.cfg.model,
             self.peft_config,
@@ -1049,7 +1082,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
+        _mem_mark("after build_model (load+FSDP shard)")
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        _mem_mark("after build_optimizer (Adam states)")
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -1475,6 +1510,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
+        _first_step = not getattr(self, "_mem_first_step_done", False)
+        if _first_step:
+            _mem_mark("before first fwd/bwd")
+
         for i, batch in enumerate(batches):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
@@ -1482,6 +1521,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if _first_step and i == 0:
+                _mem_mark("after first fwd+bwd microbatch")
 
             if i == 0:
                 prepare_after_first_microbatch()
@@ -1504,9 +1546,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # self.model_parts[0].finish_grad_sync()
 
         self.checkpointer.maybe_wait_for_staging()
+        if _first_step:
+            _mem_mark("after grad clip, before opt.step")
         for opt in self.optimizer:
             opt.step()
             opt.zero_grad()
+        if _first_step:
+            _mem_mark("after first opt.step + zero_grad")
+            self._mem_first_step_done = True
 
         if hasattr(self.model_parts[0], "update_moe_gate_bias"):
             for mp in self.model_parts:

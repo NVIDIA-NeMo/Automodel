@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# =============================================================================
+# Tier-2: Devstral-2-123B-Instruct-2512 full-FT HellaSwag on
+# 8 nodes x 8 H100-80GB = 64 GPUs, TP=8 PP=8 (DP=1).
+#
+# Uses the custom FP8 state-dict adapter registered for
+# Ministral3ForCausalLM (see nemo_automodel/components/models/devstral/).
+# No HF FineGrainedFP8 allocation path is invoked.
+#
+# Only submit after tier-1 (24B TP=2 PP=2, devstral_24b_tp_pp_2node.sub) has
+# produced a real loss-decreasing run.
+# =============================================================================
+
+# Parameters
+#SBATCH --account=coreai_dlalgo_genai
+#SBATCH --dependency=singleton
+#SBATCH --exclusive
+#SBATCH --job-name=coreai_dlalgo_genai-devstral_123b_tp8pp8
+#SBATCH --mem=0
+#SBATCH --nodes=8
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=8
+#SBATCH --time=00:30:00
+#SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dev123/Automodel/slurm/devstral_123b_tp8pp8_%j.out
+#SBATCH --error=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dev123/Automodel/slurm/devstral_123b_tp8pp8_%j.err
+
+# setup
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export HF_HOME=/lustre/fsw/portfolios/coreai/users/huiyingl/hf_cache
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export NCCL_NVLS_ENABLE=0
+export TORCH_FR_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export WANDB_API_KEY=70ce214ec4036cffa29729bf4dbc2e299eac4921
+
+srun --container-image /lustre/fsw/portfolios/coreai/users/huiyingl/container_images/48758702.sqsh --container-mounts /lustre/:/lustre/ --no-container-mount-home bash -c "
+  cd /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dev123/Automodel;
+  export PYTHONPATH=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dev123/Automodel;
+  export WANDB_API_KEY=70ce214ec4036cffa29729bf4dbc2e299eac4921;
+  export TRANSFORMERS_OFFLINE=1;
+  export HF_DATASETS_OFFLINE=1;
+  export HF_HUB_OFFLINE=1;
+  export HF_HOME=/lustre/fsw/portfolios/coreai/users/huiyingl/hf_cache;
+  export TORCH_FR_BUFFER_SIZE=2000;
+  export TORCH_NCCL_DUMP_ON_TIMEOUT=1;
+  export TORCH_FR_DUMP_TEMP_FILE=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dev123/Automodel/slurm/nccl/nccl_dump_%j.json;
+  export AUTOMODEL_DEBUG_MEM=1;
+  CUDA_DEVICE_MAX_CONNECTIONS=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 examples/llm_finetune/finetune.py \
+  -c examples/llm_finetune/devstral/devstral2_123b_hellaswag_tp_pp.yaml \
+  --step_scheduler.max_steps=50 \
+  --wandb.project=huiyingl_workspace \
+  --wandb.name=devstral_123b_tp8pp8_8node \
+  --wandb.entity=Nemo-automodel \
+  --checkpoint.enabled=false "
