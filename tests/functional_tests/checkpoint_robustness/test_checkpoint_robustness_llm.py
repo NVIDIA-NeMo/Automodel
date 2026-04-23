@@ -151,11 +151,22 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     pp_batch_size = trainer.pipeline_config.pp_batch_size
     orig_seq_len = len(input_ids)
 
-    # PP recv buffer shapes are locked to pp_seq_len at build time. r0.4.0
-    # lacks AutoPipeline.update_seq_len (added in #1689) to resize on the fly,
-    # so pad input_ids to pp_seq_len for the forward pass and slice the
-    # captured logits back to the real prompt length.
-    pp_seq_len = getattr(trainer.pp, "pp_seq_len", None) or orig_seq_len
+    # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
+    # AutoPipeline.update_seq_len (added in #1689) to resize on the fly, so
+    # discover the locked seq_len from the stages and pad input_ids to match
+    # for the forward pass. Captured logits are sliced back to orig_seq_len.
+    def _discover_pp_seq_len() -> int:
+        pp_seq_len = getattr(trainer.pp, "pp_seq_len", None)
+        if pp_seq_len:
+            return pp_seq_len
+        for stage in getattr(trainer.pp.info, "stages", None) or ():
+            for meta in getattr(stage, "inputs_meta", None) or ():
+                if meta.ndim >= 2 and meta.shape[1] > 0:
+                    return meta.shape[1]
+        ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
+        return ds_seq_length or orig_seq_len
+
+    pp_seq_len = _discover_pp_seq_len()
     if orig_seq_len < pp_seq_len:
         input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
 
