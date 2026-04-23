@@ -5,16 +5,20 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Single-GPU TE attention injection smoke test.
+"""TE attention injection smoke test (single-GPU or multi-GPU via device_map).
 
-Loads a small HF model with ``attn_implementation="te"``, runs a few forward
-passes on random input, then prints the dispatch counters so you can see how
-often the TE kernel actually ran versus falling back to native SDPA.
+Loads a HF model with ``attn_implementation="te"``, runs a few forward passes
+on random input, then prints the dispatch counters so you can see how often the
+TE kernel actually ran versus falling back to native SDPA.
 
 Works on A100 (TE falls back to FA2 / cuDNN FMHA); use this to validate the
 injection logic independent of the FA3 kernel.
 
+Single GPU:
     python tools/debug_te_attention.py --model meta-llama/Llama-3.2-1B
+
+Multi-GPU (e.g. 31B across 8×A100):
+    python tools/debug_te_attention.py --model /path/to/gemma-4-31B-it --device-map auto
 """
 
 import argparse
@@ -36,6 +40,11 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--steps", type=int, default=4)
     p.add_argument(
+        "--device-map",
+        default=None,
+        help="HF device_map for multi-GPU loading (e.g. 'auto'). Default: load on cuda:0.",
+    )
+    p.add_argument(
         "--with-mask",
         action="store_true",
         help="Pass an explicit attention_mask (reproduces the VLM/Gemma4 fallback case).",
@@ -46,18 +55,21 @@ def main() -> None:
 
     from transformers import AutoModelForImageTextToText
 
-    model = (
-        AutoModelForImageTextToText.from_pretrained(
-            args.model,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-        )
-        .cuda()
-        .eval()
-    )
+    load_kwargs: dict = {"torch_dtype": torch.bfloat16, "attn_implementation": "sdpa"}
+    if args.device_map is not None:
+        load_kwargs["device_map"] = args.device_map
+
+    model = AutoModelForImageTextToText.from_pretrained(args.model, **load_kwargs)
+    if args.device_map is None:
+        model = model.cuda()
+    model = model.eval()
 
     inject_te_attention(model)
     reset_te_attention_stats()
+
+    # Determine which device to create input tensors on.
+    # With device_map="auto" the first layer is on cuda:0.
+    input_device = next(model.parameters()).device
 
     torch.manual_seed(0)
     # vocab_size may live under text_config for VLMs (e.g. Gemma4).
@@ -66,7 +78,7 @@ def main() -> None:
     )
     if vocab is None:
         raise RuntimeError("Cannot infer vocab_size from model.config. Check model config structure.")
-    input_ids = torch.randint(0, vocab, (args.batch, args.seq_len), device="cuda")
+    input_ids = torch.randint(0, vocab, (args.batch, args.seq_len), device=input_device)
     attn_mask = torch.ones_like(input_ids) if args.with_mask else None
 
     with torch.no_grad():
