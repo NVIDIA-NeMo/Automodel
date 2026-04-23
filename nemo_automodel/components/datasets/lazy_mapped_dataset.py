@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from torch.utils.data import Dataset
 
@@ -33,8 +33,8 @@ class LazyMappedDataset(Dataset):
             (e.g. a Hugging Face ``datasets.Dataset``).
         map_fn: A callable that accepts a single example and returns the
             transformed example.
-        cache_size: Number of processed items to cache. Set to 0 to disable
-        caching (default).
+        cache_size: Number of processed items to cache. Defaults to the full
+            dataset size. Set to 0 to disable caching.
 
     Returns:
         A map-style dataset that applies map_fn lazily on each item access.
@@ -44,10 +44,13 @@ class LazyMappedDataset(Dataset):
         self,
         dataset: Any,
         map_fn: Callable[[Any], Any],
-        cache_size: int = 0,
+        cache_size: Optional[int] = None,
     ) -> None:
         self._dataset = dataset
         self._map_fn = map_fn
+
+        if cache_size is None:
+            cache_size = len(dataset)
 
         if cache_size > 0:
 

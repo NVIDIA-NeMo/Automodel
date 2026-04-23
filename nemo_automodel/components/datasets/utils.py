@@ -17,7 +17,6 @@ from typing import Optional
 
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
@@ -546,7 +545,7 @@ class SFTSingleTurnPreprocessor:
         # 1. tokenise
         tokenized = raw_dataset.map(
             lambda x: self._tokenize_function(x, dataset=ds),
-            LazyMappedDataset(dataset, fn),
+            batched=True,
             num_proc=self.preprocessing_num_workers,
             remove_columns=raw_dataset.column_names,
             load_from_cache_file=not self.overwrite_cache,
@@ -562,7 +561,7 @@ class SFTSingleTurnPreprocessor:
             pad_fn = self._pad_function(max_len)
             tokenized = tokenized.map(
                 pad_fn,
-                LazyMappedDataset(dataset, fn),
+                batched=True,
                 num_proc=self.preprocessing_num_workers,
                 load_from_cache_file=not self.overwrite_cache,
                 desc=f"Padding dataset to max length {max_len}",

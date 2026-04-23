@@ -136,6 +136,9 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
         def __getitem__(self, idx):
             return self.items[idx]
 
+        def __len__(self):
+            return len(self.items)
+
         def map(self, fn, batched=False, remove_columns=None):
             self.map_calls.append({"batched": batched, "remove_columns": remove_columns})
             return [fn(item) for item in self.items]
