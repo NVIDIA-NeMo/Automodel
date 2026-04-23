@@ -37,11 +37,25 @@ Supported patterns
   GQA via ``repeat_kv`` (``enable_gqa=False``) or ``enable_gqa=True``.
   Covers Llama, Gemma, Qwen2, Mistral, and most popular HF causal LMs.
 
-Limitations (v1)
-----------------
-- Only causal (``is_causal=True``) and no-mask attention are supported.
-  Non-trivial ``attn_mask`` tensors fall back to native SDPA with a debug log.
-- Sliding-window attention is not yet handled (uses unbounded left window).
+Mask handling
+-------------
+- ``is_causal=True`` with ``attn_mask=None`` → TE ``"causal"``.
+- ``is_causal=False`` with ``attn_mask=None`` → TE ``"no_mask"``.
+- A 4D ``attn_mask`` matching HF's canonical causal or causal+sliding pattern
+  is detected by :func:`_detect_causal_mask` in O(S) and converted to
+  ``("causal", window_size)``, so HF's always-present mask doesn't force a
+  fallback. Per-sample padded batches or non-canonical mask patterns still
+  fall back to native SDPA.
+
+Sliding window
+--------------
+- The per-layer ``module.sliding_window`` attribute is read at injection time
+  and converted to TE's ``(window_size[0], 0)`` convention
+  (``sliding_window - 1`` tokens to the left). Both the runtime mask detector
+  and the ``attn_mask=None`` path pass this to TE as ``window_size``.
+
+Limitations
+-----------
 - Models using ``from torch.nn.functional import scaled_dot_product_attention``
   (a local import) will not pick up the runtime patch; affected modules are
   skipped with a warning.
