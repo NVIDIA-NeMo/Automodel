@@ -22,6 +22,11 @@ from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
+
 logger = logging.getLogger(__name__)
 
 
@@ -326,7 +331,21 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except (ValueError, StrictDataclassClassValidationError) as e:
+            # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
+            # so configs whose layer_types length differs from num_hidden_layers (e.g.
+            # stepfun-ai/Step-3.5-Flash) trip validate_layer_type before the tokenizer
+            # is built. The tokenizer itself doesn't depend on layer_types, so relax
+            # the validator globally and retry.
+            err = str(e)
+            if "num_hidden_layers" not in err or ("layer_types" not in err and "layer types" not in err):
+                raise
+            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+            relax_layer_types_validator()
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.

@@ -131,6 +131,47 @@ class TestNeMoAutoTokenizerFromPretrained:
             tok = NeMoAutoTokenizer.from_pretrained("dummy/model")
             assert tok.special_tokens_pattern == "cls_sep"
 
+    def test_retry_on_layer_types_mismatch(self):
+        """When AutoTokenizer fails because the underlying config has
+        layer_types longer than num_hidden_layers (e.g. stepfun-ai/Step-3.5-Flash),
+        the wrapper should relax the validator globally and retry."""
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+
+        stub = _StubHFTokenizer()
+        calls = {"n": 0}
+
+        def fake_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
+                raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
+            return stub
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", side_effect=fake_from_pretrained),
+            patch(
+                "nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator",
+                return_value=True,
+            ) as mock_relax,
+        ):
+            tok = NeMoAutoTokenizer.from_pretrained("stepfun-ai/Step-3.5-Flash", trust_remote_code=True)
+            assert tok is not None
+            assert calls["n"] == 2
+            mock_relax.assert_called_once()
+
+    def test_unrelated_value_error_is_not_retried(self):
+        """Unrelated ValueErrors should propagate without triggering the fix path."""
+        with (
+            patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                side_effect=ValueError("totally unrelated tokenizer failure"),
+            ),
+            patch("nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator") as mock_relax,
+        ):
+            with pytest.raises(ValueError, match="totally unrelated"):
+                NeMoAutoTokenizer.from_pretrained("dummy/model")
+            mock_relax.assert_not_called()
+
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
         with patch("transformers.AutoTokenizer.from_pretrained", return_value=stub):
@@ -841,9 +882,7 @@ class TestTryConvertTikTokenToNative:
         mock_fast_tokenizer.is_fast = True
 
         with (
-            patch(
-                "transformers.convert_slow_tokenizer.TikTokenConverter"
-            ) as mock_converter_cls,
+            patch("transformers.convert_slow_tokenizer.TikTokenConverter") as mock_converter_cls,
             patch(
                 "transformers.tokenization_utils_tokenizers.TokenizersBackend",
                 return_value=mock_fast_tokenizer,
