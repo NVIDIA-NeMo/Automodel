@@ -31,16 +31,16 @@ permissions:
   pull-requests: read
 
 env:
-  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+  container-registry: ${{ vars.DEFAULT_CONTAINER_REGISTRY }}
 
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
-      default_runner_prefix: nemo-ci-aws-gpu-x2
-      non_nvidia_runner_prefix: nemo-ci-aws-gpu-x2-ephemeral
-      default_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
-      non_nvidia_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
+      default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
+      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
+      default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
+      non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
       sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
@@ -207,6 +207,7 @@ jobs:
       - name: main
         uses: ./.github/actions/build-container
         with:
+          container-registry: ${{ vars.DEFAULT_CONTAINER_REGISTRY }}
           dockerfile-path: "./docker/Dockerfile"
           PAT: ${{ secrets.PAT }}
           repo-name: ${{ vars.CI_REPO_NAME || 'Automodel' }}
