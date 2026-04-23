@@ -77,7 +77,21 @@ class ConsolidatedHFAddon:
                 _maybe_strip_quantization_config(model_part)
                 with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
                     if hasattr(model_part.config, "to_json_string"):
-                        f.write(model_part.config.to_json_string())
+                        # Use ``use_diff=False`` so the full config (not the
+                        # diff against class defaults) is serialized. For
+                        # remote-code configs registered via
+                        # ``register_for_auto_class`` (e.g. DeciLM /
+                        # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
+                        # ``to_diff_dict`` sees the class-level ``model_type``
+                        # attribute as equal to the class default and drops
+                        # it from the serialized JSON. Reloading via
+                        # ``AutoConfig.from_pretrained`` on the resulting
+                        # consolidated directory then raises
+                        # ``Unrecognized model ... Should have a 'model_type'
+                        # key``. Writing the full dict guarantees
+                        # ``model_type``, ``architectures`` and ``auto_map``
+                        # land in the saved config regardless of class defaults.
+                        f.write(model_part.config.to_json_string(use_diff=False))
                     else:
                         # Diffusers models use FrozenDict for config instead of PretrainedConfig
                         json.dump(dict(model_part.config), f, indent=2, default=str)

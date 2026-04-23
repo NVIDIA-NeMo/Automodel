@@ -35,6 +35,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _MODELS_REQUIRING_BUFFER_REINIT,
+    _reinit_non_persistent_buffers,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -213,6 +217,31 @@ def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
         if isinstance(logits, DTensor):
             logits = logits.full_tensor()
         return logits.float().cpu()
+
+
+def _reinit_rotary_per_module(model, default_device):
+    """Recompute DeciLM / Gemma3 style non-persistent rotary buffers on each
+    module's own device.
+
+    HF `from_pretrained` in transformers 5.x leaves ``inv_freq`` uninitialized
+    for models whose rotary buffers are computed in ``__init__`` and never
+    saved to the state dict (e.g. nemotron-nas, gemma3). With
+    ``device_map='auto'`` each rotary module can live on a different GPU, so
+    we drive the recompute per-module using its own inv_freq device rather
+    than a single fixed device.
+    """
+    model_type = getattr(model.config, "model_type", None)
+    if model_type not in _MODELS_REQUIRING_BUFFER_REINIT:
+        return model
+    for mod in model.modules():
+        inv = getattr(mod, "inv_freq", None)
+        if inv is None:
+            continue
+        mod_device = inv.device
+        if mod_device.type == "meta":
+            mod_device = next((p.device for p in mod.parameters()), default_device)
+        _reinit_non_persistent_buffers(mod, mod_device, model_type=model_type)
+    return model
 
 
 def _fix_meta_rotary_embeddings(model):
@@ -500,6 +529,24 @@ def test_checkpoint_robustness():
                     base_model = _fix_meta_rotary_embeddings(
                         AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
                     ).to(device)
+            # Re-init non-persistent rotary buffers for ``model_type`` values
+            # in ``_MODELS_REQUIRING_BUFFER_REINIT`` (``nemotron-nas``,
+            # ``gemma3``) — their ``inv_freq`` is computed in ``__init__`` and
+            # never written to the checkpoint; meta-device init leaves
+            # garbage values after ``from_pretrained``.
+            _reinit_rotary_per_module(base_model, device)
+            # For Nemotron-Flash (``model_type=="nemotron_flash"``) the
+            # ``inv_freq`` buffer also lands garbage under HF load but its
+            # NTK formula is non-standard, so route through the dedicated
+            # ``fix_rotary_embeddings`` patch which installs Flash's own NTK
+            # formula and mirrors Flash's native forward.
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+                if should_fix_rotary_embeddings([base_model]):
+                    fix_rotary_embeddings([base_model])
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
@@ -528,6 +575,18 @@ def test_checkpoint_robustness():
                     hf_model = _fix_meta_rotary_embeddings(
                         AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
                     ).to(device)
+            # Re-init non-persistent rotary buffers for nemotron-nas / gemma3
+            # (``_MODELS_REQUIRING_BUFFER_REINIT`` allow-list). See PEFT branch
+            # above for details.
+            _reinit_rotary_per_module(hf_model, device)
+            # For Nemotron-Flash: install NTK inv_freq via dedicated patch.
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+                if should_fix_rotary_embeddings([hf_model]):
+                    fix_rotary_embeddings([hf_model])
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 
