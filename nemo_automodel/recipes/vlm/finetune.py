@@ -392,9 +392,28 @@ def build_dataloader(
                 try:
                     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
                 except Exception as e:
-                    # Some models do not provide an AutoProcessor
-                    processor = None
-                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+                    # AutoProcessor.from_pretrained internally loads AutoConfig. Configs
+                    # whose layer_types length differs from num_hidden_layers trip
+                    # validate_layer_type. The processor itself doesn't depend on
+                    # layer_types, so relax the validator and retry once before giving up.
+                    err = str(e)
+                    if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                        from nemo_automodel._transformers.v4_patches.layer_types import (
+                            relax_layer_types_validator,
+                        )
+
+                        relax_layer_types_validator()
+                        try:
+                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                        except Exception as retry_exc:
+                            processor = None
+                            logging.warning(
+                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
+                            )
+                    else:
+                        # Some models do not provide an AutoProcessor
+                        processor = None
+                        logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
             chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
             # Update chat_template if chat_template is given
@@ -439,7 +458,7 @@ def build_dataloader(
                     ds,
                     pack_size=packing_cfg.get("pack_size", max_length),
                     padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
-                    drop_long_samples=packing_cfg.get("drop_long_samples", False),
+                    drop_long_samples=packing_cfg.get("drop_long_samples", True),
                     max_packs=packing_cfg.get("max_packs", None),
                     ds_raw=ds_raw,
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
@@ -1139,7 +1158,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
             reporting_loss = reporting_loss.float().to(self.dist_env.device)
             # Send loss to first rank from the last PP stage of rank0's mesh coords.
             # This avoids picking a global-rank sender from a different EP/PP group.

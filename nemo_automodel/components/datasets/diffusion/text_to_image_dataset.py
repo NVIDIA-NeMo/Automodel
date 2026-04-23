@@ -61,8 +61,12 @@ class TextToImageDataset(BaseMultiresolutionDataset):
             output["clip_tokens"] = data["clip_tokens"].squeeze(0)
             output["t5_tokens"] = data["t5_tokens"].squeeze(0)
         else:
-            output["clip_hidden"] = data["clip_hidden"].squeeze(0)
-            output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
-            output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
+            # Model-agnostic: include whichever text embedding keys the cache provides
+            if "clip_hidden" in data:
+                output["clip_hidden"] = data["clip_hidden"].squeeze(0)
+            if "pooled_prompt_embeds" in data:
+                output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
+            if "prompt_embeds" in data:
+                output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
 
         return output
