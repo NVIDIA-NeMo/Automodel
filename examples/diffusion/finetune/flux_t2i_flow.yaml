@@ -77,3 +77,7 @@ dist_env:
   init_method: "env://"
 
 seed: 42
+
+ci:
+  recipe_owner: pthombre
+  time: "00:30:00"
