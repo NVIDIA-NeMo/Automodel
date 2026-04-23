@@ -79,7 +79,7 @@ peft:
   dim: 16
   alpha: 32
   dropout: 0.0
-  match_all_linear: true
+  target_modules: '*_proj'
   use_triton: true
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

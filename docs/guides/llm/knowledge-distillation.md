@@ -87,7 +87,7 @@ distributed:
 # PEFT can be enabled by uncommenting below – student weights will remain small
 # peft:
 #   _target_: nemo_automodel.components._peft.lora.PeftConfig
-#   match_all_linear: true
+#   target_modules: '*_proj'
 #   dim: 16
 #   alpha: 32
 #   use_triton: true
