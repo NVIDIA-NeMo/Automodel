@@ -317,8 +317,10 @@ class MoonVisionPatchEmbed(nn.Module):
         return self.pos_emb(x, grid_hws)
 
 
-def patch_merger(x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: List[int] = [2, 2]) -> List[torch.Tensor]:
+def patch_merger(x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: List[int] = None) -> List[torch.Tensor]:
     """Merge patches."""
+    if merge_kernel_size is None:
+        merge_kernel_size = []
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0

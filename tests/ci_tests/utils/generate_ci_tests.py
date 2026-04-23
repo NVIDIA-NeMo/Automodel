@@ -90,7 +90,7 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str):
     else:
         config_path = f"{automodel_dir}/tests/ci_tests/configs/{test_folder}/{scope}_recipes.yml"
         with open(config_path, "r", encoding="utf-8") as f:
-            test_configs = yaml.load(f)
+            test_configs = yaml.safe_load(f)
             yml_configs = [Path(f"examples/{test_folder}/{c}") for c in test_configs['configs']]
 
     return yml_configs
@@ -128,7 +128,7 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     # Apply resource overrides (time, nodes, etc.) from the recipe's top-level ci: section
     recipe_path = f"{automodel_dir}/{config}"
     with open(recipe_path, "r", encoding="utf-8") as rf:
-        recipe = yaml.load(rf)
+        recipe = yaml.safe_load(rf)
 
     ci_config = recipe.get('ci') or {}
     ci_key_map = {
@@ -211,7 +211,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
 
     override_path = f"{automodel_dir}/tests/ci_tests/configs/{test_folder}/override_recipes.yml"
     with open(override_path, "r", encoding="utf-8") as f:
-        config_override = yaml.load(f)
+        config_override = yaml.safe_load(f)
     yml_configs = detect_yml_configurations(automodel_dir, scope, test_folder)
 
     if not yml_configs:
