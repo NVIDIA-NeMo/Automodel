@@ -120,6 +120,9 @@ ci:
   nodes: 2
   time: "00:45:00"
   vllm_deploy: true
+  env_vars:
+    TORCH_NCCL_TRACE_BUFFER_SIZE: 20000
+    TORCH_NCCL_DUMP_ON_TIMEOUT: 1
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 8
