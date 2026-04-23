@@ -50,6 +50,7 @@ distributed:
   ep_size: 1
 
   sequence_parallel: false
+  activation_checkpointing: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy
@@ -98,3 +99,4 @@ optimizer:
 ci:
   recipe_owner: akoumpa
   nproc_per_node: 1
+  local_batch_size: 1
