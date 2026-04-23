@@ -87,7 +87,13 @@ def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
     num_heads = getattr(module, "num_heads", None) or getattr(module, "num_attention_heads", None)
     if num_heads is None:
         # Infer from q_proj output dimension (works even on meta device).
-        q_out = getattr(getattr(module, "q_proj", None), "out_features", None)
+        # Fall back to weight.shape[0] for custom linears lacking out_features
+        # (e.g. Gemma4ClippableLinear).
+        q_proj = getattr(module, "q_proj", None)
+        q_out = getattr(q_proj, "out_features", None)
+        if q_out is None:
+            w = getattr(q_proj, "weight", None)
+            q_out = w.shape[0] if w is not None else None
         if q_out is None:
             return None
         num_heads = q_out // head_dim
@@ -95,7 +101,11 @@ def _infer_attn_params(module: torch.nn.Module) -> dict[str, Any] | None:
 
     num_kv_heads = getattr(module, "num_key_value_heads", None)
     if num_kv_heads is None:
-        k_out = getattr(getattr(module, "k_proj", None), "out_features", None)
+        k_proj = getattr(module, "k_proj", None)
+        k_out = getattr(k_proj, "out_features", None)
+        if k_out is None:
+            w = getattr(k_proj, "weight", None)
+            k_out = w.shape[0] if w is not None else None
         num_kv_heads = (k_out // head_dim) if k_out is not None else num_heads
     num_kv_heads = int(num_kv_heads)
 
