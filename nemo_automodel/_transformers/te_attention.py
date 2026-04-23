@@ -224,9 +224,17 @@ def _make_te_sdpa(
             k = k[:, :, ::step, :].contiguous()
             v = v[:, :, ::step, :].contiguous()
 
+        logger.debug(
+            "te_sdpa: is_causal=%s attn_mask=%s q=%s k=%s",
+            is_causal,
+            None if attn_mask is None else attn_mask.shape,
+            q.shape,
+            k.shape,
+        )
+
         # Non-trivial masks are not yet converted; fall back to native SDPA.
         if attn_mask is not None:
-            logger.debug("TE attention: non-None attn_mask encountered; falling back to native SDPA for this call.")
+            logger.debug("TE attention: non-None attn_mask — falling back to native SDPA.")
             return original_sdpa(
                 query,
                 key,
