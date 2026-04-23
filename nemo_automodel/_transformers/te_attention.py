@@ -48,6 +48,7 @@ Limitations (v1)
 """
 
 import logging
+import os
 import types
 from typing import Any
 
@@ -60,6 +61,40 @@ logger = logging.getLogger(__name__)
 # and on the top-level model to signal that injection was performed.
 _TE_MODULE_ATTR = "attn_module"
 _TE_MODEL_FLAG = "_te_attention_injected"
+
+# Dispatch counters for diagnosing how often the TE path actually runs versus
+# falling back to native SDPA.  Incremented inside ``te_sdpa``; exposed via
+# :func:`get_te_attention_stats` / :func:`reset_te_attention_stats`.
+_TE_STATS: dict[str, int] = {
+    "te_hits": 0,
+    "fallback_mask": 0,
+    "fallback_scale_mismatch": 0,
+}
+
+# How often to auto-log the dispatch counters (call count).  Override with
+# ``AUTOMODEL_TE_STATS_EVERY=<int>``; 0 disables auto-logging entirely.
+_STATS_LOG_EVERY = int(os.environ.get("AUTOMODEL_TE_STATS_EVERY", "500"))
+
+# One-shot flag so we warn at most once when the runtime ``scale`` disagrees
+# with the ``softmax_scale`` captured at TE-module creation time.
+_SCALE_MISMATCH_WARNED = False
+
+
+def get_te_attention_stats() -> dict[str, int]:
+    """Return a snapshot of the TE dispatch counters.
+
+    Keys: ``te_hits`` (ran the real TE kernel), ``fallback_mask`` (fell back
+    because ``attn_mask`` was non-None), ``fallback_scale_mismatch`` (fell
+    back because the runtime ``scale`` argument disagreed with the TE
+    module's fixed ``softmax_scale``).
+    """
+    return dict(_TE_STATS)
+
+
+def reset_te_attention_stats() -> None:
+    """Zero out the TE dispatch counters (test / benchmarking helper)."""
+    for k in _TE_STATS:
+        _TE_STATS[k] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +220,28 @@ def _create_te_dot_product_attention(
 # ---------------------------------------------------------------------------
 
 
+def _maybe_log_stats() -> None:
+    """Periodically emit the dispatch counters when auto-logging is enabled."""
+    if _STATS_LOG_EVERY <= 0:
+        return
+    total = _TE_STATS["te_hits"] + _TE_STATS["fallback_mask"] + _TE_STATS["fallback_scale_mismatch"]
+    if total > 0 and total % _STATS_LOG_EVERY == 0:
+        logger.info(
+            "te_sdpa dispatch stats (first %d calls): te_hits=%d fallback_mask=%d fallback_scale_mismatch=%d",
+            total,
+            _TE_STATS["te_hits"],
+            _TE_STATS["fallback_mask"],
+            _TE_STATS["fallback_scale_mismatch"],
+        )
+
+
 def _make_te_sdpa(
     te_module: torch.nn.Module,
     num_heads: int,
     num_kv_heads: int,
     original_sdpa,
     window_size: tuple[int, int] = (-1, 0),
+    softmax_scale: float | None = None,
 ) -> Any:
     """Return a callable that replaces ``F.scaled_dot_product_attention``.
 
@@ -198,6 +249,10 @@ def _make_te_sdpa(
     - Transposes Q/K/V from HF's ``[B, H, S, D]`` to TE's ``[B, S, H, D]``.
     - Undoes ``repeat_kv`` when TE can handle GQA natively.
     - Falls back to ``original_sdpa`` for non-trivial ``attn_mask`` inputs.
+    - Falls back when the caller passes an explicit ``scale`` that disagrees
+      with the ``softmax_scale`` captured at TE-module creation time (TE
+      freezes that value at construction; trying to override it silently
+      would change numerics).
     - Transposes the TE output back to ``[B, H, S, D]`` before returning.
     """
 
@@ -212,6 +267,52 @@ def _make_te_sdpa(
         enable_gqa: bool = False,
         **_unused: Any,
     ) -> torch.Tensor:
+        global _SCALE_MISMATCH_WARNED
+
+        # Runtime ``scale`` must match the value baked into ``te_module``;
+        # otherwise TE would silently use the baked-in one and produce wrong
+        # numerics.  Tolerate tiny float drift.
+        scale_mismatch = (
+            scale is not None and softmax_scale is not None and abs(float(scale) - float(softmax_scale)) > 1e-6
+        )
+        if scale_mismatch:
+            if not _SCALE_MISMATCH_WARNED:
+                logger.warning(
+                    "te_sdpa: caller passed scale=%s but TE module was built with softmax_scale=%s; "
+                    "falling back to native SDPA to preserve numerics. (This warning is emitted once.)",
+                    scale,
+                    softmax_scale,
+                )
+                _SCALE_MISMATCH_WARNED = True
+            _TE_STATS["fallback_scale_mismatch"] += 1
+            _maybe_log_stats()
+            return original_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+
+        # Non-trivial masks are not yet converted; fall back to native SDPA.
+        if attn_mask is not None:
+            logger.debug("TE attention: non-None attn_mask — falling back to native SDPA.")
+            _TE_STATS["fallback_mask"] += 1
+            _maybe_log_stats()
+            return original_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+
         # HF passes Q/K/V in [B, H, S, D]; TE expects [B, S, H, D].
         q = query.transpose(1, 2).contiguous()
         k = key.transpose(1, 2).contiguous()
@@ -224,27 +325,12 @@ def _make_te_sdpa(
             k = k[:, :, ::step, :].contiguous()
             v = v[:, :, ::step, :].contiguous()
 
-        logger.info(
-            "te_sdpa: is_causal=%s attn_mask=%s q=%s k=%s",
+        logger.debug(
+            "te_sdpa: is_causal=%s attn_mask=None q=%s k=%s",
             is_causal,
-            None if attn_mask is None else attn_mask.shape,
             q.shape,
             k.shape,
         )
-
-        # Non-trivial masks are not yet converted; fall back to native SDPA.
-        if attn_mask is not None:
-            logger.debug("TE attention: non-None attn_mask — falling back to native SDPA.")
-            return original_sdpa(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
-                enable_gqa=enable_gqa,
-            )
 
         mask_type = "causal" if is_causal else "no_mask"
         # TE requires window_size=(-1, -1) for no_mask; sliding window only applies to causal.
@@ -253,6 +339,9 @@ def _make_te_sdpa(
         # scratch allocations inside TE land on the correct GPU (device_map="auto").
         with torch.cuda.device(q.device):
             out = te_module(q, k, v, attn_mask_type=mask_type, window_size=effective_window)
+
+        _TE_STATS["te_hits"] += 1
+        _maybe_log_stats()
 
         # TE returns [B, S, H, D]; transpose back to HF's [B, H, S, D].
         return out.transpose(1, 2).contiguous()
@@ -309,6 +398,7 @@ def inject_te_attention_into_module(module: torch.nn.Module) -> bool:
         num_kv_heads=params["num_kv_heads"],
         original_sdpa=original_sdpa,
         window_size=params["window_size"],
+        softmax_scale=params["softmax_scale"],
     )
     _patch_module_forward(module, te_sdpa)
 
