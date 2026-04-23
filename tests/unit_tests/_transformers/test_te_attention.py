@@ -540,3 +540,91 @@ class TestStatsAPI:
         s1["te_hits"] = 999  # mutate the returned dict
         s2 = get_te_attention_stats()
         assert s2["te_hits"] == 0, "get_te_attention_stats must return an independent copy"
+
+
+# ---------------------------------------------------------------------------
+# Scale-mismatch fallback
+# ---------------------------------------------------------------------------
+
+
+class TestScaleMismatchFallback:
+    """When the caller's ``scale`` kwarg disagrees with the ``softmax_scale``
+    baked into the TE module, ``te_sdpa`` must fall back to native SDPA (since
+    TE would otherwise silently use its baked-in scale and produce wrong
+    numerics). Verify (1) ``original_sdpa`` is called, (2) the TE module is
+    NOT called, and (3) the ``fallback_scale_mismatch`` counter increments.
+    """
+
+    def _build(self, module_scale=0.125):
+        te_module = mock.MagicMock()
+        te_module.return_value = torch.zeros(1, 4, 8, 16)
+        original_sdpa = mock.MagicMock(return_value=torch.zeros(1, 8, 4, 16))
+        te_sdpa = _make_te_sdpa(
+            te_module,
+            num_heads=8,
+            num_kv_heads=8,
+            original_sdpa=original_sdpa,
+            softmax_scale=module_scale,
+        )
+        return te_sdpa, te_module, original_sdpa
+
+    def _qkv(self):
+        return (torch.randn(1, 8, 4, 16),) * 3
+
+    def _reset(self):
+        """Reset both the counter and the one-shot warning flag so tests are
+        independent of ordering."""
+        import nemo_automodel._transformers.te_attention as te_mod
+        reset_te_attention_stats()
+        te_mod._SCALE_MISMATCH_WARNED = False
+
+    def test_mismatch_falls_back(self):
+        self._reset()
+        te_sdpa, te_module, original_sdpa = self._build(module_scale=0.125)
+        q, k, v = self._qkv()
+        te_sdpa(q, k, v, is_causal=True, scale=0.5)  # 0.5 ≠ 0.125
+        te_module.assert_not_called()
+        original_sdpa.assert_called_once()
+        assert get_te_attention_stats()["fallback_scale_mismatch"] == 1
+
+    def test_matching_scale_uses_te(self):
+        self._reset()
+        te_sdpa, te_module, original_sdpa = self._build(module_scale=0.125)
+        q, k, v = self._qkv()
+        te_sdpa(q, k, v, is_causal=True, scale=0.125)
+        te_module.assert_called_once()
+        original_sdpa.assert_not_called()
+        assert get_te_attention_stats()["fallback_scale_mismatch"] == 0
+
+    def test_tolerance(self):
+        """Float drift below 1e-6 must not trigger fallback."""
+        self._reset()
+        te_sdpa, te_module, original_sdpa = self._build(module_scale=0.125)
+        q, k, v = self._qkv()
+        te_sdpa(q, k, v, is_causal=True, scale=0.125 + 1e-9)
+        te_module.assert_called_once()
+        assert get_te_attention_stats()["fallback_scale_mismatch"] == 0
+
+    def test_none_scale_is_tolerated(self):
+        """When caller passes ``scale=None`` (PyTorch default), no mismatch."""
+        self._reset()
+        te_sdpa, te_module, original_sdpa = self._build(module_scale=0.125)
+        q, k, v = self._qkv()
+        te_sdpa(q, k, v, is_causal=True, scale=None)
+        te_module.assert_called_once()
+        assert get_te_attention_stats()["fallback_scale_mismatch"] == 0
+
+    def test_warning_emitted_once(self):
+        """The warning is gated by a module-level flag; after the first
+        mismatch, subsequent mismatches still fall back but do not re-warn."""
+        import nemo_automodel._transformers.te_attention as te_mod
+        self._reset()
+        te_sdpa, _, original_sdpa = self._build(module_scale=0.125)
+        q, k, v = self._qkv()
+        te_sdpa(q, k, v, is_causal=True, scale=0.5)
+        first_flag = te_mod._SCALE_MISMATCH_WARNED
+        te_sdpa(q, k, v, is_causal=True, scale=0.5)
+        assert first_flag is True
+        assert te_mod._SCALE_MISMATCH_WARNED is True
+        assert get_te_attention_stats()["fallback_scale_mismatch"] == 2
+        assert original_sdpa.call_count == 2
