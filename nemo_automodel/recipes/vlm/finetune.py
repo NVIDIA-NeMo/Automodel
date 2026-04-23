@@ -1139,7 +1139,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
             reporting_loss = reporting_loss.float().to(self.dist_env.device)
             # Send loss to first rank from the last PP stage of rank0's mesh coords.
             # This avoids picking a global-rank sender from a different EP/PP group.
