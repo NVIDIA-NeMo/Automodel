@@ -132,13 +132,12 @@ class TestNeMoAutoTokenizerFromPretrained:
             assert tok.special_tokens_pattern == "cls_sep"
 
     def test_retry_on_layer_types_mismatch(self):
-        """AutoTokenizer may fail when the underlying config has
-        layer_types longer than num_hidden_layers (e.g. stepfun-ai/Step-3.5-Flash).
-        The wrapper should preload a fixed config via get_hf_config and retry."""
+        """When AutoTokenizer fails because the underlying config has
+        layer_types longer than num_hidden_layers (e.g. stepfun-ai/Step-3.5-Flash),
+        the wrapper should relax the validator globally and retry."""
         from huggingface_hub.errors import StrictDataclassClassValidationError
 
         stub = _StubHFTokenizer()
-        fixed_config = _StubConfig()
         calls = {"n": 0}
 
         def fake_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
@@ -146,22 +145,19 @@ class TestNeMoAutoTokenizerFromPretrained:
             if calls["n"] == 1:
                 cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
                 raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
-            assert kwargs.get("config") is fixed_config
             return stub
 
         with (
             patch("transformers.AutoTokenizer.from_pretrained", side_effect=fake_from_pretrained),
             patch(
-                "nemo_automodel._transformers.model_init.get_hf_config",
-                return_value=fixed_config,
-            ) as mock_get_hf_config,
+                "nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator",
+                return_value=True,
+            ) as mock_relax,
         ):
             tok = NeMoAutoTokenizer.from_pretrained("stepfun-ai/Step-3.5-Flash", trust_remote_code=True)
             assert tok is not None
             assert calls["n"] == 2
-            mock_get_hf_config.assert_called_once()
-            call_kwargs = mock_get_hf_config.call_args[1]
-            assert call_kwargs["trust_remote_code"] is True
+            mock_relax.assert_called_once()
 
     def test_unrelated_value_error_is_not_retried(self):
         """Unrelated ValueErrors should propagate without triggering the fix path."""
@@ -170,11 +166,11 @@ class TestNeMoAutoTokenizerFromPretrained:
                 "transformers.AutoTokenizer.from_pretrained",
                 side_effect=ValueError("totally unrelated tokenizer failure"),
             ),
-            patch("nemo_automodel._transformers.model_init.get_hf_config") as mock_get_hf_config,
+            patch("nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator") as mock_relax,
         ):
             with pytest.raises(ValueError, match="totally unrelated"):
                 NeMoAutoTokenizer.from_pretrained("dummy/model")
-            mock_get_hf_config.assert_not_called()
+            mock_relax.assert_not_called()
 
     def test_force_hf_passthrough(self):
         stub = _StubHFTokenizer()
