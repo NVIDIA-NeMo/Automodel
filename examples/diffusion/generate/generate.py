@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Pipeline class name -> output type mapping
 _PIPELINE_OUTPUT_TYPES = {
     "FluxPipeline": "image",
+    "QwenImagePipeline": "image",
     "WanPipeline": "video",
     "HunyuanVideoPipeline": "video",
     "HunyuanVideo15Pipeline": "video",
