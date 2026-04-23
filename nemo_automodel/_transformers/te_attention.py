@@ -247,15 +247,15 @@ def _detect_causal_mask(
        (full causal) or ``min(S, window_size[0]+1)`` (sliding window).
     Any deviation indicates padding or a non-standard mask structure.
     """
-    # Log mask properties once so we can diagnose unexpected formats.
     logger.debug(
-        "_detect_causal_mask: dtype=%s shape=%s ndim=%d",
+        "_detect_causal_mask: dtype=%s shape=%s",
         attn_mask.dtype,
         tuple(attn_mask.shape),
-        attn_mask.ndim,
     )
 
-    if attn_mask.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+    is_bool = attn_mask.dtype == torch.bool
+    is_float = attn_mask.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    if not (is_bool or is_float):
         logger.debug("_detect_causal_mask: unsupported dtype %s → None", attn_mask.dtype)
         return None
     if attn_mask.ndim != 4:
@@ -269,24 +269,34 @@ def _detect_causal_mask(
 
     S = sq
 
-    # Scalar guard: upper-right corner must be -inf (causal structure).
-    corner_val = attn_mask[0, 0, 0, -1].item()
-    if corner_val > -1e4:
-        logger.debug("_detect_causal_mask: upper-right corner=%.1f (not -inf) → None", corner_val)
+    # Scalar guard: upper-right corner must indicate "masked" (causal structure).
+    # bool mask: False = masked; float mask: < -1e4 = masked.
+    corner = attn_mask[0, 0, 0, -1]
+    diag = attn_mask[0, 0, 0, 0]
+    if is_bool:
+        corner_masked = not corner.item()
+        diag_visible = diag.item()
+    else:
+        corner_masked = corner.item() < -1e4
+        diag_visible = diag.item() > -1e4
+
+    if not corner_masked:
+        logger.debug("_detect_causal_mask: upper-right corner not masked → None")
         return None
-    # First query must be able to see itself.
-    diag_val = attn_mask[0, 0, 0, 0].item()
-    if diag_val < -1e4:
-        logger.debug("_detect_causal_mask: diagonal=%.1f (masked) → None", diag_val)
+    if not diag_visible:
+        logger.debug("_detect_causal_mask: diagonal masked → None")
         return None
 
-    # Check all batch items' first and last query rows.
-    # Shape: (B, S_k) for first-row and last-row slices.
+    # Count visible keys per row for all batch items.
+    # bool: True = visible; float: > -1e4 = visible.
     first_row = attn_mask[:, 0, 0, :]
     last_row = attn_mask[:, 0, -1, :]
-
-    visible_first = (first_row > -1e4).sum(dim=-1)  # (B,)
-    visible_last = (last_row > -1e4).sum(dim=-1)  # (B,)
+    if is_bool:
+        visible_first = first_row.sum(dim=-1)
+        visible_last = last_row.sum(dim=-1)
+    else:
+        visible_first = (first_row > -1e4).sum(dim=-1)
+        visible_last = (last_row > -1e4).sum(dim=-1)
 
     logger.debug(
         "_detect_causal_mask: S=%d visible_first=%s visible_last=%s window_size=%s",
@@ -301,13 +311,11 @@ def _detect_causal_mask(
         return None
 
     if window_size[0] < 0:
-        # Full causal: every last-row query must see all S keys.
         if not (visible_last == S).all().item():
             logger.debug("_detect_causal_mask: visible_last %s != S=%d → None", visible_last.tolist(), S)
             return None
         return "causal", (-1, 0)
     else:
-        # Sliding-window causal: last-row visible count = min(S, W).
         W = window_size[0] + 1
         expected = min(S, W)
         if not (visible_last == expected).all().item():
