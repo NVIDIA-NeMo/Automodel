@@ -26,7 +26,7 @@ content_type: index
 
 # NeMo AutoModel Documentation
 
-PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
+PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
 **Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md)
 
 ::::{grid} 2 2 2 2
@@ -84,12 +84,12 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 ## Recipes & Guides
 
-Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
+Find the right guide for your task: fine-tuning, pretraining, distillation, diffusion, and more.
 
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
 | **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](guides/llm/finetune.md)               |
-| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)        |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)     |
 | **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.md)             |
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
 | **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                 |
@@ -120,7 +120,7 @@ See the [full benchmark results](performance-summary.md) for configuration detai
 
 ## Advanced Topics
 
-Parallelism, precision, checkpointing strategies and experiment tracking.
+Parallelism, precision, checkpointing strategies, and experiment tracking.
 
 ::::{grid} 1 2 2 3
 :gutter: 1 1 1 2
@@ -231,9 +231,11 @@ performance-summary.md
 Overview <model-coverage/overview.md>
 Release Log <model-coverage/latest-models.md>
 Large Language Models <model-coverage/llm/index.md>
-Vison Language Models <model-coverage/vlm/index.md>
+Vision Language Models <model-coverage/vlm/index.md>
 Omni <model-coverage/omni/index.md>
 Diffusion <model-coverage/diffusion/index.md>
+Embedding Models <model-coverage/embedding/index.md>
+Reranking Models <model-coverage/reranker/index.md>
 ::::
 
 ::::{toctree}
