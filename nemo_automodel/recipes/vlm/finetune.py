@@ -363,9 +363,28 @@ def build_dataloader(
                 try:
                     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
                 except Exception as e:
-                    # Some models do not provide an AutoProcessor
-                    processor = None
-                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+                    # AutoProcessor.from_pretrained internally loads AutoConfig. Configs
+                    # whose layer_types length differs from num_hidden_layers trip
+                    # validate_layer_type. The processor itself doesn't depend on
+                    # layer_types, so relax the validator and retry once before giving up.
+                    err = str(e)
+                    if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                        from nemo_automodel._transformers.v4_patches.layer_types import (
+                            relax_layer_types_validator,
+                        )
+
+                        relax_layer_types_validator()
+                        try:
+                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                        except Exception as retry_exc:
+                            processor = None
+                            logging.warning(
+                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
+                            )
+                    else:
+                        # Some models do not provide an AutoProcessor
+                        processor = None
+                        logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
             chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
             # Update chat_template if chat_template is given

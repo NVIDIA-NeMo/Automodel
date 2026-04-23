@@ -514,6 +514,25 @@ class TestGetHfConfigLayerTypesRetry:
         assert call_kwargs["trust_remote_code"] is True
 
     @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
+    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=True)
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
+    def test_retry_on_strict_dataclass_validation_error(self, mock_from_pretrained, _mock_trust, mock_fix):
+        """huggingface_hub wraps the validator ValueError in a non-ValueError error type."""
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+
+        cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
+        mock_from_pretrained.side_effect = StrictDataclassClassValidationError(
+            validator="validate_layer_type", cause=cause
+        )
+        fixed_cfg = MagicMock()
+        mock_fix.return_value = fixed_cfg
+
+        result = get_hf_config("stepfun-ai/Step-3.5-Flash", "sdpa")
+
+        assert result is fixed_cfg
+        mock_fix.assert_called_once()
+
+    @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
     @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
     def test_unrelated_value_error_is_reraised(self, mock_from_pretrained, _mock_trust, mock_fix):
