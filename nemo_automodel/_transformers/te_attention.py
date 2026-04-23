@@ -239,7 +239,9 @@ def _make_te_sdpa(
             )
 
         mask_type = "causal" if is_causal else "no_mask"
-        out = te_module(q, k, v, attn_mask_type=mask_type, window_size=window_size)
+        # TE requires window_size=(-1, -1) for no_mask; sliding window only applies to causal.
+        effective_window = window_size if mask_type == "causal" else (-1, -1)
+        out = te_module(q, k, v, attn_mask_type=mask_type, window_size=effective_window)
 
         # TE returns [B, S, H, D]; transpose back to HF's [B, H, S, D].
         return out.transpose(1, 2).contiguous()
