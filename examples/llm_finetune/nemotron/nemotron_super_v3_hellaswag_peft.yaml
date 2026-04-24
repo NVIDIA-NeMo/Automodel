@@ -111,6 +111,9 @@ ci:
   vllm_smoke_test: true
   recipe_owner: adil-a
   time: "00:25:00"
+  env_vars:
+    TORCH_NCCL_TRACE_BUFFER_SIZE: 20000
+    TORCH_NCCL_DUMP_ON_TIMEOUT: 1
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     experts_implementation: grouped_mm

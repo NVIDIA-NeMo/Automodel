@@ -118,3 +118,6 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  env_vars:
+    TORCH_NCCL_TRACE_BUFFER_SIZE: 20000
+    TORCH_NCCL_DUMP_ON_TIMEOUT: 1
