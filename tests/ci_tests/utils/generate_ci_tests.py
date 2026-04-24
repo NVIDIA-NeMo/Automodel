@@ -173,6 +173,8 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         job["stage"] = "benchmark"
     elif test_folder.startswith("diffusion"):
         job["stage"] = "diffusion_peft" if ("lora" in config.stem or "peft" in config.stem) else "diffusion_sft"
+    elif test_folder.startswith("retrieval"):
+        job["stage"] = "retrieval"
     elif "peft" in config.stem or "lora" in config.stem:
         job["stage"] = "peft_ckpt_robustness" if has_robustness else "peft"
     else:
@@ -214,7 +216,24 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         if known_issue_id:
             vllm_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
 
-    return job, vllm_job
+    # Generate retrieval eval job if recipe opts in
+    retrieval_eval_job = None
+    if ci_config.get("retrieval_eval"):
+        retrieval_eval_job = {
+            "extends": f".{test_folder}_eval_test",
+            "stage": "retrieval_eval",
+            "variables": {
+                "CONFIG_PATH": f"{config}",
+                "TEST_LEVEL": f"{scope}",
+                "FINETUNE_TEST_NAME": f"{config.stem}",
+            },
+        }
+        if recipe_allow_failure:
+            retrieval_eval_job['allow_failure'] = True
+        if known_issue_id:
+            retrieval_eval_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
+
+    return job, vllm_job, retrieval_eval_job
 
 
 def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
@@ -262,12 +281,14 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         if model_name in exempt_models_list or config_name in exempt_configs_list:
             continue
 
-        job, vllm_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        job, vllm_job, retrieval_eval_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
         if job is None:
             continue  # skipped via ci.known_issue_id (no allow_failure)
         pipeline[f'{config_name}'] = job
         if vllm_job:
             pipeline[f"{config_name}_vllm_deploy"] = vllm_job
+        if retrieval_eval_job:
+            pipeline[f"{config_name}_retrieval_eval"] = retrieval_eval_job
 
     return pipeline
 
