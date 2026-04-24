@@ -109,7 +109,9 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     # See checkpointing.py:initialize_model_weights — gate on this attribute
     # to skip HF's ``initialize_weights()``. The upcoming adapter load will
     # populate every tensor, and skipping avoids a stage-divergent DTensor
-    # collective inside HF's init on PP setups.
+    # collective inside HF's init on PP setups that otherwise hangs
+    # indefinitely (empirically verified: without this attribute the 4-layer
+    # smoke never reaches the adapter load stage within 300s).
     _skip_init_weights_on_load = True
 
     def __init__(self, config: PretrainedConfig):

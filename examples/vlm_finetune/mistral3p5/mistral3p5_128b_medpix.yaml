@@ -1,0 +1,129 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# =============================================================================
+# Mistral-3.5 medium 128B (codename "dawn-ridge") VLM fine-tune on MedPix.
+# Multi-node: 8 nodes x 8 H100-80GB = 64 GPUs, TP=8 PP=8, DP=1.
+# Vision tower + multi_modal_projector are frozen; language_model is trained.
+# =============================================================================
+#
+# Uses the full VLM (vision + text). Routing:
+#   NeMoAutoModelForImageTextToText.from_pretrained  (below `_target_`)
+#     ↓
+#   _resolve_custom_model_cls_for_config(config, entry_cls=...)
+#     ↓
+#   Our Devstral hook sees entry_cls is ImageTextToText + FP8 Mistral3 config →
+#   returns Mistral3FP8VLMForConditionalGeneration
+#     ↓
+#   Mistral3FP8VLMForConditionalGeneration extends HF's full Mistral3ForConditionalGeneration
+#   (vision_tower + multi_modal_projector + language_model intact) and attaches
+#   Mistral3FP8StateDictAdapter.for_vlm_full(). The adapter's `not_fp8_prefixes`
+#   gate (model.vision_tower, model.multi_modal_projector) ensures only
+#   language_model FP8 weights get `_scale_inv` placeholders on to_hf and get
+#   dequantized on from_hf; vision/mm_projector/lm_head are BF16 on disk and
+#   pass through unchanged.
+#
+# No `force_hf: true`, no explicit `quantization_config` — the adapter owns FP8.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8              # must be >= pp_size * pp_microbatch_size = 8
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/dawn-ridge-medium-3p5-128b-hf_vv1
+  torch_dtype: torch.bfloat16
+  attn_implementation: eager
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/dawn-ridge-medium-3p5-128b-hf_vv1
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: vlm_checkpoints/mistral3p5_128b_medpix/
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 8
+  cp_size: 1
+  pp_size: 8
+  ep_size: 1
+
+  # SP disabled — SP-sharded activations crossing PP boundaries fail c10d::send.
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+
+  pipeline:
+    # Non-interleaved 1f1b, auto layer split (88 ministral3 text layers / 8 = 11).
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+
+# Freeze vision + projector; train only the language_model (standard MedPix setup).
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 1024
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 1024
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+wandb:
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: mistral3p5_128b_medpix
