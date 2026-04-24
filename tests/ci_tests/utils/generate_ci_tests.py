@@ -131,6 +131,14 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         recipe = yaml.load(rf)
 
     ci_config = recipe.get('ci') or {}
+
+    # allow_failure wins over known_issue_id.
+    # known_issue_id alone skips the job (and its vllm_deploy variant).
+    known_issue_id = ci_config.get('known_issue_id')
+    recipe_allow_failure = bool(ci_config.get('allow_failure'))
+    if known_issue_id and not recipe_allow_failure:
+        return None, None
+
     ci_key_map = {
         'time': 'TIME',
         'nodes': 'TEST_NODE_COUNT',
@@ -171,6 +179,12 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     if config.stem in known_issue_config_list:
         job['allow_failure'] = True
 
+    # Recipe-level allow_failure + known_issue_id (skip case handled earlier).
+    if recipe_allow_failure:
+        job['allow_failure'] = True
+    if known_issue_id:
+        job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
+
     # Double time allocation as tests run for 2 epoch
     if scope == "convergence":
         slurm_time = job['variables'].get('TIME', '00:10:00')
@@ -188,6 +202,10 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
                 'TEST_LEVEL': f'{scope}',
             }
         }
+        if recipe_allow_failure:
+            vllm_job['allow_failure'] = True
+        if known_issue_id:
+            vllm_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
 
     return job, vllm_job
 
@@ -232,6 +250,8 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
             continue
 
         job, vllm_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        if job is None:
+            continue  # skipped via ci.known_issue_id (no allow_failure)
         pipeline[f'{config_name}'] = job
         if vllm_job:
             pipeline[f'{config_name}_vllm_deploy'] = vllm_job

@@ -105,6 +105,7 @@ ci:
   vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:25:00"
+  known_issue_id: AM-156
   checkpoint_robustness:
     kl_threshold: 5e-3
     hf_kl_threshold: 5e-3
