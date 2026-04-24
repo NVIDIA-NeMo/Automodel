@@ -122,4 +122,3 @@ optimizer:
 
 ci:
   recipe_owner: hemildesai
-  known_issue_id: AM-153

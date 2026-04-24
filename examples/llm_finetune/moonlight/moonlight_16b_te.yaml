@@ -132,4 +132,3 @@ optimizer:
 ci:
   recipe_owner: hemildesai
   node_multiplier: true
-  known_issue_id: AM-153
