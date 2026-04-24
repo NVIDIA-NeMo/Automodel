@@ -18,6 +18,11 @@
 
 recipe: TrainBiEncoderRecipe
 
+ci:
+  time: "00:20:00"
+  nodes: 1
+  embed_eval: true
+
 seed: 42
 
 temperature: 0.02
