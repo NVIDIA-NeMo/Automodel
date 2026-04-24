@@ -78,9 +78,17 @@ def _has_backend(model: "nn.Module") -> bool:
 
 
 def _uses_te_attention(model: "nn.Module") -> bool:
-    """True when the model was constructed with the TE attention backend."""
+    """True when the model uses the TE attention backend.
+
+    Covers two cases:
+    - Custom models built with ``BackendConfig(attn='te')``.
+    - HF models that had TE injected via :func:`inject_te_attention`
+      (flagged by ``model._te_attention_injected``).
+    """
     backend = getattr(model, "backend", None)
-    return getattr(backend, "attn", None) == "te"
+    if getattr(backend, "attn", None) == "te":
+        return True
+    return getattr(model, "_te_attention_injected", False)
 
 
 def _is_hybrid(model: "nn.Module") -> bool:
