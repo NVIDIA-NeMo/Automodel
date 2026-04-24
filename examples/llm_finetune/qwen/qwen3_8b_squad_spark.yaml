@@ -98,3 +98,6 @@ lr_scheduler:
 
 ci:
   recipe_owner: akoumpa
+  env_vars:
+    TORCH_NCCL_TRACE_BUFFER_SIZE: 20000
+    TORCH_NCCL_DUMP_ON_TIMEOUT: 1
