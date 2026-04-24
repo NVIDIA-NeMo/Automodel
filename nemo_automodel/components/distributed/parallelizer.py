@@ -1292,9 +1292,6 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
             "vision_tower.vision_model.encoder.layers",
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
-        # String fallback — class identity can mismatch when transformers is reimported
-        # (e.g. via Automodel's AutoModelForCausalLM.register of Mistral3ForConditionalGeneration).
-        "Mistral3ForConditionalGeneration": ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
         # module load (which would defeat test monkeypatches that stub the

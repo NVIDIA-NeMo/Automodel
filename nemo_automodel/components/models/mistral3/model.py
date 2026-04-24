@@ -206,11 +206,6 @@ class Ministral3RotaryEmbedding(nn.Module):
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = inv_freq
-        # Exposed so the checkpointer's _reinit_non_persistent_buffers path can
-        # recompute inv_freq after meta-materialization (when we skip the usual
-        # HF initialize_weights() call to avoid DTensor-unfriendly inits).
-        self.rope_init_fn = rope_init_fn
-        self.rope_kwargs: dict = {}
 
     @staticmethod
     def compute_default_rope_parameters(

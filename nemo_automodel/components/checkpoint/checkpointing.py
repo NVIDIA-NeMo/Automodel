@@ -1159,12 +1159,6 @@ _MODELS_REQUIRING_BUFFER_REINIT: frozenset[str] = frozenset(
     {
         "gemma3",
         "nemotron-nas",
-        # Ministral3 (Devstral) uses the standard RoPE pattern: Ministral3RotaryEmbedding
-        # registers non-persistent `inv_freq` in __init__, computed via rope_init_fn.
-        # Under init_empty_weights it becomes meta; skip_initialize_weights leaves it
-        # uninitialized. Reinit explicitly for both Devstral 24B (text backbone of a
-        # VLM) and 123B (dense text-only).
-        "ministral3",
     }
 )
 
