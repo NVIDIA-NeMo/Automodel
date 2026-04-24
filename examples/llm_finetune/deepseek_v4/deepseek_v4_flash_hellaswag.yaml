@@ -1,0 +1,128 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Finetuning config for DeepSeek V4 Flash on HellaSwag
+# Replace /path/to/deepseek-v4-flash with the path to your local model checkpoint.
+#
+# Limitations vs. the paper:
+#   - HC (Hyper-Connections) uses mean-pool/broadcast-add approximation
+#     (hc_split_sinkhorn kernel not yet available)
+#   - Hash-clustering gate (first 3 layers) falls back to score-based routing
+#   - Compress-ratio sliding-window attention is not implemented; all layers
+#     use full causal attention
+#   - MTP (multi-token prediction) layer is not trained
+#
+# Single-node 8×A100-80G run (few-layer validation):
+#   automodel examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
+#
+# Two-node 16×A100-80G full model (requires EP=64 or EP=32 + more nodes):
+#   Set ep_size and num_hidden_layers in the model config accordingly.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 2
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 1
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v4-flash
+    name_or_path: /path/to/deepseek-v4-flash
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    enable_deepep: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v4-flash
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/deepseek-v4-flash
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.1
