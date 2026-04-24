@@ -15,7 +15,7 @@ model:
   # for model-specific setup (no pre-inject hook needed for Hunyuan).
   model_type: "hunyuan"
   mode: "finetune"
-  attention_backend: "flash"
+  attention_backend: null
 
 # ── LoRA / PEFT configuration ─────────────────────────────────────────────────
 # Remove this section for full fine-tune.
