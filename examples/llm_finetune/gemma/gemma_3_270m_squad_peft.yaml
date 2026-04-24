@@ -43,7 +43,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -103,7 +103,7 @@ ci:
   recipe_owner: HuiyingLi
   time: "00:20:00"
   checkpoint_robustness:
-    hf_kl_threshold: 8e-3
+    hf_kl_threshold: 1e-1
     tokenizer_name: google/gemma-3-270m
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

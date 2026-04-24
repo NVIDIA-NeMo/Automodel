@@ -14,9 +14,18 @@
 
 """Compatibility patches for legacy v4-style transformer models."""
 
+from nemo_automodel._transformers.v4_patches.layer_types import (
+    install_layer_types_patch_hook,
+    patch_allowed_layer_types,
+)
 from nemo_automodel._transformers.v4_patches.rotary import (
     fix_rotary_embeddings,
     should_fix_rotary_embeddings,
 )
 
-__all__ = ["fix_rotary_embeddings", "should_fix_rotary_embeddings"]
+__all__ = [
+    "fix_rotary_embeddings",
+    "install_layer_types_patch_hook",
+    "patch_allowed_layer_types",
+    "should_fix_rotary_embeddings",
+]

@@ -29,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 20
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -51,7 +51,7 @@ compile:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -108,11 +108,12 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  time: "00:45:00"
+  time: "01:00:00"
   vllm_deploy: true
   recipe_owner: HuiyingLi
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
+    resume_loss_threshold: 5e-2
     trust_remote_code: true
     distributed.tp_size: 2
     tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5

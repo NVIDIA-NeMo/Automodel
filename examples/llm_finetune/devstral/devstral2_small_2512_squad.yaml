@@ -37,7 +37,10 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: akoumpa/Devstral-Small-2-24B-Instruct-2512-BF16
+  pretrained_model_name_or_path: mistralai/Devstral-Small-2-24B-Instruct-2512
+  quantization_config:
+    _target_: transformers.FineGrainedFP8Config
+    dequantize: true
 
 checkpoint:
   enabled: true
@@ -50,8 +53,8 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
-
   sequence_parallel: false
+  defer_fsdp_grad_sync: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
