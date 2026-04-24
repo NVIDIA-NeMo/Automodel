@@ -107,3 +107,4 @@ optimizer:
 ci:
   time: "00:30:00"
   nodes: 16
+  known_issue_id: AM-173

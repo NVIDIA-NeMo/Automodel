@@ -116,5 +116,6 @@ optimizer:
 ci:
   time: "00:15:00"
   nodes: 1
+  known_issue_id: AM-150
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
