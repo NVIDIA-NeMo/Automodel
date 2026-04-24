@@ -534,6 +534,9 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
+        # input_ids is only available on the first PP stage; later stages pass
+        # None (hash-routing layers should be packed onto stage 0 to receive it).
+        stage_input_ids = input_ids if has_embed else None
         layers = getattr(self, "layers", None)
         if layers is not None:
             layer_iter = layers.values() if hasattr(layers, "values") else layers
@@ -545,6 +548,7 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
                     freqs_cis=freqs_cis,
                     attention_mask=attention_mask,
                     padding_mask=padding_mask,
+                    input_ids=stage_input_ids,
                 )
 
         # Last inner stage: collapse the hc_mult axis and apply the final norm.

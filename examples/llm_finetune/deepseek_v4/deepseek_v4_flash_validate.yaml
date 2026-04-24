@@ -70,7 +70,10 @@ model:
     # Override to use only 4 layers for fast infra validation.
     # Layers 4-42 are simply not created; checkpoint keys for them are ignored (strict=False).
     num_hidden_layers: 4
-    num_hash_layers: 0
+    # P2 smoke: make layers 0 and 1 hash-routing (DeepseekV4HashGate with
+    # tid2eid lookup).  With pp_size=2, stage 0 owns layers [0, 1] so all
+    # hash layers live where input_ids is available.
+    num_hash_layers: 2
     compress_ratios: [0, 0, 0, 0]
     num_nextn_predict_layers: 0
   trust_remote_code: false

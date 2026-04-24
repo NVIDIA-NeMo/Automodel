@@ -111,6 +111,13 @@ class DeepseekV4Block(nn.Module):
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV4Attention(config, backend)
         self.mlp = MoE(moe_config, backend)
+        # Hash routing: the first ``num_hash_layers`` layers use a fixed
+        # tid2eid lookup table instead of the score-based generic Gate.
+        # Swap after MoE construction so the rest of MoE (experts, shared
+        # experts, etc.) keeps its standard layout.
+        self.is_hash_routing_layer = layer_idx < int(getattr(config, "num_hash_layers", 0) or 0)
+        if self.is_hash_routing_layer:
+            self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
@@ -131,6 +138,7 @@ class DeepseekV4Block(nn.Module):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         # x: [bsz, seq, hc_mult, dim] (HC multi-copy state)
@@ -151,6 +159,10 @@ class DeepseekV4Block(nn.Module):
         # FFN sub-block
         residual = x
         x_reduced, post, comb = hc_pre_approx(x, eps=self.hc_eps)
+        # Hash-routing layers need the current batch's input_ids to do the
+        # tid2eid lookup; stash it on the gate just before the MoE call.
+        if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
+            self.mlp.gate.set_input_ids(input_ids)
         ffn_out = self.mlp(self.post_attention_layernorm(x_reduced), padding_mask)
         x = hc_post_approx(ffn_out, residual, post, comb)
 
@@ -172,6 +184,12 @@ class DeepseekV4HashGate(nn.Module):
     gate weight but the *selection* is deterministic per token id.
 
     tid2eid shape: [vocab_size, n_activated_experts]  (int32, non-trainable)
+
+    Signature matches ``components.moe.layers.Gate`` — ``forward(x, token_mask,
+    cp_mesh)`` returning ``(weights, indices, aux_loss)`` — so the generic MoE
+    module can call it interchangeably.  The per-forward ``input_ids`` needed
+    for the tid2eid lookup is stashed on the module by the enclosing Block via
+    :meth:`set_input_ids` immediately before the MoE call.
     """
 
     def __init__(self, config: DeepseekV4Config, moe_config: MoEConfig):
@@ -192,14 +210,37 @@ class DeepseekV4HashGate(nn.Module):
                 requires_grad=False,
             ),
         )
-        # No correction bias for hash layers (per official impl)
+        # Kept for API compat with the generic Gate (e.g. optimizer sync paths
+        # that probe for .bias) — hash layers have no learnable bias.
+        self.bias = None
+        # Ephemeral per-forward input_ids set by the Block (not a parameter /
+        # buffer; cleared after each forward to avoid holding references).
+        self._pending_input_ids: torch.Tensor | None = None
+
+    def set_input_ids(self, input_ids: torch.Tensor | None) -> None:
+        """Stash the current batch's input_ids for the next ``forward`` call."""
+        self._pending_input_ids = input_ids
+
+    def update_bias(self) -> None:
+        """No-op for compat with callers that walk MoE gates and call update_bias."""
+
+    def init_weights(self, buffer_device: torch.device | None = None) -> None:
+        nn.init.zeros_(self.weight)
+        with torch.no_grad():
+            self.tid2eid.zero_()
 
     def forward(
         self,
         x: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_mask: torch.Tensor | None = None,
+        cp_mesh: "DeviceMesh | None" = None,  # noqa: F821 — MoE passes it but we do not need it
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         import torch.nn.functional as F
+
+        input_ids = self._pending_input_ids
+        # Clear immediately so a stale cached tensor cannot leak to a later
+        # forward that forgets to set it.
+        self._pending_input_ids = None
 
         scores = F.linear(x.float(), self.weight.float())
         if self.score_func == "sqrtsoftplus":
@@ -210,8 +251,10 @@ class DeepseekV4HashGate(nn.Module):
             scores = scores.softmax(dim=-1)
 
         if input_ids is not None:
-            indices = self.tid2eid[input_ids.flatten()]
+            indices = self.tid2eid[input_ids.flatten().to(torch.int64)]
         else:
+            # Fallback to score-based topk — keeps the module usable in tests or
+            # PP stages where input_ids is not threaded through.
             indices = scores.topk(self.topk, dim=-1)[1]
 
         weights = scores.gather(1, indices.long())
@@ -219,7 +262,7 @@ class DeepseekV4HashGate(nn.Module):
             denom = weights.sum(dim=-1, keepdim=True) + 1e-20
             weights = weights / denom
         weights = weights * self.route_scale
-        return weights.type_as(x), indices
+        return weights.type_as(x), indices, None
 
 
 class DeepseekV4Model(nn.Module):
@@ -326,6 +369,7 @@ class DeepseekV4Model(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                input_ids=input_ids,
                 **attn_kwargs,
             )
 
