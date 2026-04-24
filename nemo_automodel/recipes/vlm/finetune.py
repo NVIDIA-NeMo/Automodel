@@ -155,7 +155,7 @@ def build_model(
         # registry is queried (the Mistral-3.5 128B FP8 VLM wrapper registers
         # itself for Mistral3ForConditionalGeneration on import).
         try:
-            import nemo_automodel.components.models.mistral3_vlm_fp8  # noqa: F401
+            import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
         except ImportError:
             pass
 

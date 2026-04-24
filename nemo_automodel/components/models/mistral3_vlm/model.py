@@ -38,7 +38,7 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.mistral3_vlm_fp8.state_dict_adapter import (
+from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
 

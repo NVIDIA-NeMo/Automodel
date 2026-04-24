@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 
 from nemo_automodel._transformers import model_init as _mi
-from nemo_automodel.components.models.mistral3_vlm_fp8.model import (
+from nemo_automodel.components.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
 )
 
@@ -39,7 +39,7 @@ def _is_image_text_to_text_entry(entry_cls) -> bool:
 
 def _install_resolver_hook() -> None:
     """Prepend an FP8-Mistral3 VLM check to _resolve_custom_model_cls_for_config."""
-    if getattr(_mi._resolve_custom_model_cls_for_config, "_mistral3_vlm_fp8_hook_installed", False):
+    if getattr(_mi._resolve_custom_model_cls_for_config, "_mistral3_vlm_hook_installed", False):
         return
     _orig_resolve = _mi._resolve_custom_model_cls_for_config
 
@@ -56,7 +56,7 @@ def _install_resolver_hook() -> None:
             logger.debug("Mistral3 VLM FP8 resolver raised", exc_info=True)
         return _orig_resolve(config, entry_cls=entry_cls)
 
-    _patched._mistral3_vlm_fp8_hook_installed = True  # type: ignore[attr-defined]
+    _patched._mistral3_vlm_hook_installed = True  # type: ignore[attr-defined]
     _mi._resolve_custom_model_cls_for_config = _patched
 
 
