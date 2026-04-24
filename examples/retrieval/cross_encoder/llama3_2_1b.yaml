@@ -18,6 +18,11 @@
 
 recipe: TrainCrossEncoderRecipe
 
+ci:
+  time: "00:20:00"
+  nodes: 1
+  rerank_eval: true
+
 seed: 42
 
 step_scheduler:

@@ -21,7 +21,7 @@ recipe: TrainBiEncoderRecipe
 ci:
   time: "00:20:00"
   nodes: 1
-  retrieval_eval: true
+  embed_eval: true
 
 seed: 42
 
