@@ -202,13 +202,14 @@ class DeepseekV4HashGate(nn.Module):
 
         # Routing score weight (used to compute weights, not for selection)
         self.weight = nn.Parameter(torch.zeros(self.n_experts, config.hidden_size))
-        # Token-id -> expert-id lookup table (non-trainable)
-        self.register_parameter(
+        # Token-id -> expert-id lookup table.  Registered as a persistent
+        # buffer (not a Parameter) because FSDP's param-sharding path rejects
+        # int tensors via .requires_grad_(), and the table is non-trainable
+        # anyway.  Dtype matches the V4 Flash checkpoint on-disk layout (I64).
+        self.register_buffer(
             "tid2eid",
-            nn.Parameter(
-                torch.zeros(config.vocab_size, self.topk, dtype=torch.int32),
-                requires_grad=False,
-            ),
+            torch.zeros(config.vocab_size, self.topk, dtype=torch.int64),
+            persistent=True,
         )
         # Kept for API compat with the generic Gate (e.g. optimizer sync paths
         # that probe for .bias) — hash layers have no learnable bias.
