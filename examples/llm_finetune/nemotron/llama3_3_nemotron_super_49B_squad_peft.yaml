@@ -110,6 +110,7 @@ lr_scheduler:
 ci:
   time: "01:00:00"
   vllm_deploy: true
+  vllm_deploy_known_issue_id: AM-176
   recipe_owner: HuiyingLi
   checkpoint_robustness:
     hf_kl_threshold: 5e-3

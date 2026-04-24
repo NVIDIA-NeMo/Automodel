@@ -193,9 +193,12 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         slurm_time = job["variables"].get("TIME", "00:10:00")
         job["variables"]["TIME"] = DQ(slurm_time_multiplier(slurm_time, 2))
 
-    # Generate vLLM deploy job if recipe opts in
+    # Generate vLLM deploy job if recipe opts in.
+    # `ci.vllm_deploy_known_issue_id` suppresses just the vllm_deploy variant
+    # (base job still runs) -- use for bugs that only manifest in vllm deploy.
     vllm_job = None
-    if ci_config.get("vllm_deploy"):
+    vllm_deploy_known_issue_id = ci_config.get("vllm_deploy_known_issue_id")
+    if ci_config.get("vllm_deploy") and not vllm_deploy_known_issue_id:
         vllm_stage = "peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy"
         vllm_job = {
             "extends": ".vllm_deploy_test",
