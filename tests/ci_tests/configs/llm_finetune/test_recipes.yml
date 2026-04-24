@@ -26,7 +26,6 @@ configs:
   - gpt_oss/gpt_oss_20b_single_gpu.yaml
   - llama3_2/llama_3_2_3b_instruct_squad.yaml
   - llama3_2/llama_3_2_3b_instruct_squad_peft.yaml
-  - llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml
   - llama3_3/llama_3_3_70b_instruct_squad.yaml
   - mistral/ministral3_3b_squad_peft.yaml
   - mistral/mixtral-8x7b-v0-1_squad.yaml

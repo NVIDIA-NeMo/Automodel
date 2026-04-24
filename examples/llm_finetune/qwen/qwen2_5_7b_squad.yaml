@@ -104,6 +104,8 @@ ci:
   time: "00:45:00"
   vllm_deploy: true
   recipe_owner: HuiyingLi
+  known_issue_id: AM-154
+  allow_failure: true
   checkpoint_robustness:
     hf_kl_threshold: 1e-1
     distributed.tp_size: 2

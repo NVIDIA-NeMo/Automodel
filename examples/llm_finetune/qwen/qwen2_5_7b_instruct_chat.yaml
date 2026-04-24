@@ -116,3 +116,4 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
+  known_issue_id: AM-151
