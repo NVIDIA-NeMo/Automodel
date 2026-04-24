@@ -202,6 +202,47 @@ class TestBenchmarkingRecipeInitialization:
             mock_module.CustomConfig.from_pretrained.assert_called_once_with("some-model")
             assert vocab_size == 131072
 
+    def test_infer_vocab_size_trust_remote_code_at_model_level(self, mock_config):
+        """trust_remote_code at model level (not nested under config) must flow to AutoConfig."""
+        mock_model_config = MagicMock(spec=["vocab_size"])
+        mock_model_config.vocab_size = 163840
+
+        model_cfg = ConfigNamespace(
+            trust_remote_code=True,
+            config=ConfigNamespace(
+                _target_="transformers.AutoConfig.from_pretrained",
+                pretrained_model_name_or_path="moonshotai/Kimi-K2-Base",
+            ),
+        )
+
+        with patch(
+            "transformers.AutoConfig.from_pretrained", return_value=mock_model_config
+        ) as mock_autoconfig:
+            vocab_size = _infer_vocab_size(model_cfg)
+            assert vocab_size == 163840
+            mock_autoconfig.assert_called_once_with(
+                "moonshotai/Kimi-K2-Base", trust_remote_code=True
+            )
+
+    def test_infer_vocab_size_method_target(self, mock_config):
+        """`_target_` resolved to a classmethod (e.g. `Class.from_pretrained`) should be invoked directly."""
+        mock_model_config = MagicMock(spec=["vocab_size"])
+        mock_model_config.vocab_size = 129280
+
+        def factory(path):
+            assert path == "deepseek-ai/DeepSeek-V3.2"
+            return mock_model_config
+
+        model_cfg = ConfigNamespace(
+            config=ConfigNamespace(
+                _target_=factory,
+                pretrained_model_name_or_path="deepseek-ai/DeepSeek-V3.2",
+            )
+        )
+
+        vocab_size = _infer_vocab_size(model_cfg)
+        assert vocab_size == 129280
+
     def test_infer_vocab_size_vl_text_config(self, mock_config):
         """Test _infer_vocab_size falls back to text_config.vocab_size for VL models."""
         mock_model_config = MagicMock(spec=[])
