@@ -92,3 +92,7 @@ checkpoint:
   model_save_format: torch_save
   save_consolidated: false
   restore_from: null
+
+ci:
+  recipe_owner: pthombre
+  time: "00:30:00"

@@ -17,3 +17,6 @@ configs:
   - wan2_1_t2v_flow.yaml
   - hunyuan_t2v_flow.yaml
   - flux_t2i_flow.yaml
+  - wan2_1_t2v_flow_lora.yaml
+  - hunyuan_t2v_flow_lora.yaml
+  - flux_t2i_flow_lora.yaml
