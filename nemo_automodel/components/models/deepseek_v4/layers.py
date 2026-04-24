@@ -69,7 +69,6 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb_qk,
-    yarn_get_mscale,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -240,17 +239,13 @@ class DeepseekV4Attention(nn.Module):
             nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32), requires_grad=False),
         )
 
-        # Softmax scale with YaRN correction (V4 rope_scaling uses type="yarn" without explicit mscale)
+        # V4 uses the plain head_dim^-0.5 scale — unlike V3, the reference
+        # model.py line 464 does NOT fold in a YaRN mscale correction.  Applying
+        # mscale*mscale here (as V3 does) makes attention scores ~1.6x sharper
+        # than the trained model expects and shifts every layer's output
+        # distribution, which at step 0 shows up as logits std=3.5 and
+        # argmax_match=0% despite correctly loaded weights.
         self.softmax_scale = self.head_dim**-0.5
-        rope_params = getattr(config, "rope_scaling", None)
-        if rope_params and "factor" in rope_params and "original_max_position_embeddings" in rope_params:
-            factor = rope_params["factor"]
-            original_seq_len = rope_params["original_max_position_embeddings"]
-            if config.max_position_embeddings > original_seq_len:
-                # mscale defaults to 1 when not explicitly provided (V4 YaRN config)
-                mscale_cfg = rope_params.get("mscale", 1)
-                mscale = yarn_get_mscale(factor, mscale_cfg)
-                self.softmax_scale = self.softmax_scale * mscale * mscale
 
         # V4 uses 1 KV head (K=V=kv), so num_gqa_groups = n_heads for standard GQA path
         self.attn_module, self.attn_func = initialize_attn_module_and_func(
