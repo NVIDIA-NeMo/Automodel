@@ -262,7 +262,14 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
         the full PEFT configuration.
     """
     PEFT_KEYS = {"dim", "alpha"}
-    return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
+    result = {}
+    for k, v in peft_config.to_dict().items():
+        if k in PEFT_KEYS:
+            continue
+        if isinstance(v, torch.dtype):
+            v = str(v)
+        result[k] = v
+    return result
 
 
 def _is_qwen3_moe(model: nn.Module) -> bool:
