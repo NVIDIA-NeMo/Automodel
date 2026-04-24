@@ -215,14 +215,10 @@ class TestBenchmarkingRecipeInitialization:
             ),
         )
 
-        with patch(
-            "transformers.AutoConfig.from_pretrained", return_value=mock_model_config
-        ) as mock_autoconfig:
+        with patch("transformers.AutoConfig.from_pretrained", return_value=mock_model_config) as mock_autoconfig:
             vocab_size = _infer_vocab_size(model_cfg)
             assert vocab_size == 163840
-            mock_autoconfig.assert_called_once_with(
-                "moonshotai/Kimi-K2-Base", trust_remote_code=True
-            )
+            mock_autoconfig.assert_called_once_with("moonshotai/Kimi-K2-Base", trust_remote_code=True)
 
     def test_infer_vocab_size_method_target(self, mock_config):
         """`_target_` resolved to a classmethod (e.g. `Class.from_pretrained`) should be invoked directly."""

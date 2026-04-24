@@ -45,9 +45,8 @@ def _infer_vocab_size(model_cfg):
     config_section = model_cfg.config
     # Recipes may set trust_remote_code either at the model level (nemo_automodel
     # convention) or nested under `config` -- accept either.
-    trust_remote_code = (
-        getattr(model_cfg, "trust_remote_code", False)
-        or getattr(config_section, "trust_remote_code", False)
+    trust_remote_code = getattr(model_cfg, "trust_remote_code", False) or getattr(
+        config_section, "trust_remote_code", False
     )
 
     # Use the config's _target_ if it's a custom config class (e.g. DeepseekV32Config)
