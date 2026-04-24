@@ -54,7 +54,15 @@ class HellaSwag:
         """
         if isinstance(num_samples_limit, int):
             split = f"{split}[:{num_samples_limit}]"
-        raw_datasets = load_dataset(path_or_dataset, split=split, trust_remote_code=trust_remote_code)
+        # `trust_remote_code` was removed in datasets>=4.0; pass it only when
+        # the installed version still accepts it.  HellaSwag now also ships a
+        # parquet export, so loading works fine either way.
+        import inspect as _inspect
+
+        kwargs = {}
+        if "trust_remote_code" in _inspect.signature(load_dataset).parameters:
+            kwargs["trust_remote_code"] = trust_remote_code
+        raw_datasets = load_dataset(path_or_dataset, split=split, **kwargs)
         processor = SFTSingleTurnPreprocessor(tokenizer)
         processor.pad_to_max_length = pad_to_max_length
         self.dataset = processor.process(raw_datasets, self)
