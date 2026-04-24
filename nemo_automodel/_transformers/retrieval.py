@@ -100,6 +100,7 @@ def build_encoder_backbone(
     task: str,
     trust_remote_code: bool = False,
     pooling: Optional[str] = None,
+    extract_submodel: Optional[str] = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -117,6 +118,8 @@ def build_encoder_backbone(
         pooling: Bi-encoder pooling strategy for registry backbones (e.g. Llama bidirectional)
             that accept it on ``from_pretrained``. Must not be forwarded to standard HF models
             (e.g. Qwen3) loaded via ``AutoModel``; those only receive ``**hf_kwargs``.
+        extract_submodel: Dotted attribute path to extract from the loaded model
+            (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -152,10 +155,23 @@ def build_encoder_backbone(
     # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
     logger.info(f"Model type '{model_type}' not in SUPPORTED_BACKBONES; falling back to HuggingFace Auto classes")
     if task == "score":
-        return AutoModelForSequenceClassification.from_pretrained(
+        model = AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    else:
+        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+
+    if extract_submodel is not None:
+        for attr in extract_submodel.split("."):
+            model = getattr(model, attr)
+        if not hasattr(model, "config"):
+            raise ValueError(
+                f"Extracted submodel at '{extract_submodel}' has no .config attribute. "
+                f"The submodel must be a PreTrainedModel for save/reload to work. "
+                f"Got {type(model).__name__}."
+            )
+
+    return model
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
