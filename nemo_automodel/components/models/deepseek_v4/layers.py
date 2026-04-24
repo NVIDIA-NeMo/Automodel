@@ -231,12 +231,14 @@ class DeepseekV4Attention(nn.Module):
             linear_impl, self.o_groups * self.o_lora_rank, hidden_size, bias=False, dtype=model_dtype
         )
 
-        # Attention sink: per-head learnable scalar (stored in float32 per official impl)
-        # Shape: [n_heads] — broadcast over the sink position in sparse_attn.
-        # requires_grad=False: sliding-window attn (where sink is used) not yet implemented.
+        # Attention sink: per-head learnable scalar (stored in float32 per official impl).
+        # Shape: [n_heads] — acts as an extra "sink" logit appended to the softmax
+        # denominator of every query row.  The sink column does not correspond to any
+        # token, so it contributes nothing to the output but lets probability mass
+        # drain away from real tokens for heads that should attend to "nothing".
         self.register_parameter(
             "attn_sink",
-            nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32), requires_grad=False),
+            nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32), requires_grad=True),
         )
 
         # V4 uses the plain head_dim^-0.5 scale — unlike V3, the reference
@@ -320,11 +322,37 @@ class DeepseekV4Attention(nn.Module):
             k = kv.unsqueeze(2).expand(bsz, seq_len, self.n_heads, self.head_dim)
             v = k  # K = V
 
-        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
-            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
+        # Manual scaled dot-product attention with per-head attn_sink.
+        # The default preprocess/attn_func path uses is_causal=True which skips the
+        # bias we need for the sink. Keep the attention math in fp32 for stability.
+        if qkv_format == "bshd":
+            # [B, S, H, D] -> [B, H, S, D]
+            q_a = q.transpose(1, 2)
+            k_a = k.transpose(1, 2)
+            v_a = v.transpose(1, 2)
+        else:
+            # thd (single packed sequence) -> [1, H, T, D]
+            q_a = q.unsqueeze(0).transpose(1, 2)
+            k_a = k.unsqueeze(0).transpose(1, 2)
+            v_a = v.unsqueeze(0).transpose(1, 2)
+
+        s_len = q_a.size(-2)
+        scores = torch.matmul(q_a.float(), k_a.float().transpose(-2, -1)) * self.softmax_scale
+        causal_mask = torch.triu(
+            torch.ones(s_len, s_len, dtype=torch.bool, device=scores.device), diagonal=1
         )
-        o = self.attn_func(q, k, v, **_attn_kwargs)
-        o = postprocess_output_for_attn(o, self.backend.attn)
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+        # Append per-head sink logit: attn_sink[h] acts as an extra softmax column
+        # whose value slot is zero (contributes nothing to the output).
+        sink = self.attn_sink.float().view(1, -1, 1, 1).expand(scores.size(0), -1, s_len, 1)
+        scores_ext = torch.cat([scores, sink], dim=-1)
+        probs = torch.softmax(scores_ext, dim=-1)[..., :-1]
+        o_a = torch.matmul(probs.to(v_a.dtype), v_a)  # [B, H, S, D]
+
+        if qkv_format == "bshd":
+            o = o_a.transpose(1, 2).contiguous()  # [B, S, H, D]
+        else:
+            o = o_a.squeeze(0).transpose(0, 1).contiguous()  # [T, H, D]
 
         # --- O path (grouped) ---
         # o: [bsz, seq, n_heads, head_dim] or [num_tokens, n_heads, head_dim]
