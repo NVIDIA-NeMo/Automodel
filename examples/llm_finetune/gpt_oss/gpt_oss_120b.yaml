@@ -116,4 +116,3 @@ ci:
   local_batch_size: 16
   nodes: 4
   time: "01:00:00"
-  known_issue_id: AM-157
