@@ -284,6 +284,14 @@ def _precompute_stage_shapes(
     """
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
+    # DeepSeek V4 preserves an extra hc_mult axis between blocks, so inter-stage
+    # hidden state is [mb, seq, hc_mult, dim] until the last (norm) stage folds
+    # it back to [mb, seq, dim].
+    is_v4 = getattr(model_config, "model_type", None) == "deepseek_v4" or getattr(
+        getattr(model_config, "text_config", None), "model_type", None
+    ) == "deepseek_v4"
+    hc_mult = int(getattr(model_config, "hc_mult", 1) or 1) if is_v4 else 1
+
     for stage in stages:
         # Infer the computation dtype from the stage's parameters
         try:
@@ -291,22 +299,42 @@ def _precompute_stage_shapes(
         except StopIteration:
             model_dtype = torch.bfloat16
 
+        inner_submod = getattr(stage.submod, "model", stage.submod)
+        stage_has_norm = getattr(inner_submod, "norm", None) is not None
+
         # --- inputs_meta ---
         if stage.is_first:
             # First stage receives input_ids: [mb, seq_len] int64
             stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            # Non-first stages receive hidden_states: [mb, seq_len, hidden_size]
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            if hc_mult > 1:
+                stage.inputs_meta = (
+                    torch.empty(
+                        microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype
+                    ),
+                )
+            else:
+                stage.inputs_meta = (
+                    torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),
+                )
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         if has_lm_head:
             # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
             outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype),)
+        elif hc_mult > 1 and not stage_has_norm:
+            # V4 mid-pipeline: tensor still carries the hc_mult axis.
+            outputs_meta = (
+                torch.empty(
+                    microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype
+                ),
+            )
         else:
-            # Intermediate stages produce hidden_states: [mb, seq_len, hidden_size]
-            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            # Standard intermediate stage (or V4 final-norm stage without lm_head).
+            outputs_meta = (
+                torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),
+            )
         stage._configure_outputs_meta(outputs_meta)
 
     logger.info(

@@ -449,6 +449,160 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     return pipeline_forward_gemma4_vlm
 
 
+def _is_deepseek_v4(model: torch.nn.Module) -> bool:
+    """Return True when ``model`` (or its text config) is a DeepSeek V4 variant."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return False
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        return True
+    text_config = getattr(config, "text_config", None)
+    return getattr(text_config, "model_type", None) == "deepseek_v4"
+
+
+def create_pipeline_forward_deepseek_v4() -> Callable:
+    """Pipeline-compatible forward for DeepSeek V4's inner model.
+
+    V4 diverges from HF-style decoders in several ways that the generic
+    ``pipeline_forward`` cannot handle:
+
+    * No ``rotary_emb`` module — rotary frequencies are derived from a
+      shared ``freqs_cis`` buffer on the model and applied inside each
+      attention block.
+    * Hidden state is expanded to ``hc_mult`` copies before the first
+      block (shape ``[B, S, hc_mult, dim]``); every block preserves that
+      shape; the final stage averages across ``hc_mult`` and applies the
+      final RMSNorm.
+    * Each block accepts ``(x, freqs_cis, attention_mask, padding_mask)``
+      rather than the HF ``(hidden_states, position_embeddings, ...)``
+      kwargs.
+    """
+
+    def pipeline_forward_deepseek_v4(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # Lazy-import to avoid pulling the deepseek_v3 module at PP registration time.
+        from nemo_automodel.components.models.deepseek_v3.rope_utils import (
+            freqs_cis_from_position_ids,
+        )
+
+        has_embed = getattr(self, "embed_tokens", None) is not None
+        has_norm = getattr(self, "norm", None) is not None
+
+        # Produce the [B, S, hc_mult, dim] hidden state for this stage.
+        if has_embed:
+            if inputs_embeds is None:
+                if input_ids is None:
+                    raise ValueError("V4 PP first stage requires input_ids or inputs_embeds")
+                inputs_embeds = self.embed_tokens(input_ids)
+            hc_mult = self.config.hc_mult
+            h = inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+        else:
+            # Later stages receive the previous stage's hidden state in the
+            # ``input_ids`` slot (as a float tensor) or via inputs_embeds.
+            if inputs_embeds is not None:
+                h = inputs_embeds
+            elif input_ids is not None and input_ids.dtype in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            ):
+                h = input_ids
+            else:
+                raise ValueError("V4 PP non-first stage expects a float tensor carrying hidden state")
+
+        # Per-stage rotary frequencies (freqs_cis buffer is replicated on every stage).
+        if position_ids is None:
+            seq_len = h.shape[1]
+            position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0).expand(h.shape[0], -1)
+        rope_fusion = getattr(getattr(self, "backend", None), "rope_fusion", False)
+        with torch.no_grad():
+            freqs_cis = freqs_cis_from_position_ids(
+                position_ids,
+                self.freqs_cis,
+                qkv_format=kwargs.get("qkv_format", "bshd"),
+                for_fused_rope=rope_fusion,
+                cp_size=kwargs.get("cp_size", 1),
+            )
+
+        if attention_mask is not None and padding_mask is None:
+            padding_mask = attention_mask.bool().logical_not()
+
+        layers = getattr(self, "layers", None)
+        if layers is not None:
+            layer_iter = layers.values() if hasattr(layers, "values") else layers
+            for layer in layer_iter:
+                if layer is None:
+                    continue
+                h = layer(
+                    x=h,
+                    freqs_cis=freqs_cis,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                )
+
+        # Last inner stage: collapse the hc_mult axis and apply the final norm.
+        if has_norm:
+            h = self.norm(h.mean(dim=2))
+        return h
+
+    return pipeline_forward_deepseek_v4
+
+
+def create_pipeline_forward_deepseek_v4_causal_lm() -> Callable:
+    """Pipeline-compatible forward for ``DeepseekV4ForCausalLM``.
+
+    Delegates the decoder work to the inner V4 model's PP forward (when this
+    stage still owns ``self.model``) and only applies ``self.lm_head`` when
+    present (last PP stage).
+    """
+
+    def pipeline_forward_v4_causal_lm(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        inner = getattr(self, "model", None)
+        if inner is not None:
+            hidden = inner(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        else:
+            # Tail-only CausalLM stage: the preceding stage already produced
+            # the post-norm [B, S, dim] hidden state.
+            if inputs_embeds is not None:
+                hidden = inputs_embeds
+            elif input_ids is not None and input_ids.dtype in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            ):
+                hidden = input_ids
+            else:
+                raise ValueError("V4 PP CausalLM tail stage expects a hidden-state input")
+
+        if getattr(self, "lm_head", None) is not None:
+            return self.lm_head(hidden)
+        return hidden
+
+    return pipeline_forward_v4_causal_lm
+
+
 def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
     """Return True only for Gemma4 VLM variants.
 
@@ -483,7 +637,14 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
     inner_model = getattr(model, "model", None)
     text_backbone = getattr(inner_model, "language_model", None) if inner_model is not None else None
 
-    if inner_model is not None and text_backbone is not None and _is_gemma4_vlm(model):
+    if inner_model is not None and _is_deepseek_v4(model):
+        # DeepSeek V4: needs the hc_mult expand/reduce, per-stage freqs_cis
+        # from the shared buffer, and V4 block forward signature.
+        if patch_inner_model:
+            inner_model.forward = types.MethodType(create_pipeline_forward_deepseek_v4(), inner_model)
+        if patch_causal_lm_model:
+            model.forward = types.MethodType(create_pipeline_forward_deepseek_v4_causal_lm(), model)
+    elif inner_model is not None and text_backbone is not None and _is_gemma4_vlm(model):
         # Gemma4 VLM: the text backbone needs sliding/full-attention RoPE
         # dispatch and the VLM outer needs final_logit_softcapping.
         if patch_inner_model:
