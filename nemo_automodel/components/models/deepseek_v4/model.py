@@ -357,7 +357,9 @@ class DeepseekV4Model(nn.Module):
                 position_ids,
                 self.freqs_cis,
                 qkv_format=attn_kwargs.get("qkv_format", "bshd"),
-                for_fused_rope=self.backend.rope_fusion,
+                # Force the non-fused (complex) form so DeepseekV4Attention can
+                # apply the inverse RoPE on the attention output.
+                for_fused_rope=False,
                 cp_size=attn_kwargs.get("cp_size", 1),
             )
 

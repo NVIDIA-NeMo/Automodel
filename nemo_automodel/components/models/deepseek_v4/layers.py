@@ -294,7 +294,10 @@ class DeepseekV4Attention(nn.Module):
         kv = self.kv_norm(self.wkv(x))  # [..., head_dim]
         kv_nope, kv_pe = torch.split(kv, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # RoPE
+        # RoPE — V4 applies rotation to q/k here and an INVERSE rotation to the
+        # attention output later, before wo_a (see the official model.py).  The
+        # TE fused-rope path does not give us a complex freqs_cis to conjugate,
+        # so force the non-fused (complex) path for V4.
         cu_seqlens = attn_kwargs.get("cu_seqlens", None)
         # kv_pe needs a head dimension for apply_rotary_emb_qk
         head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
@@ -304,7 +307,7 @@ class DeepseekV4Attention(nn.Module):
             kv_pe,
             freqs_cis,
             format=qkv_format,
-            rope_fusion=self.rope_fusion,
+            rope_fusion=False,
             cu_seqlens=cu_seqlens,
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
@@ -330,8 +333,27 @@ class DeepseekV4Attention(nn.Module):
 
         # --- O path (grouped) ---
         # o: [bsz, seq, n_heads, head_dim] or [num_tokens, n_heads, head_dim]
-        # Apply inverse RoPE to the pe part of o before projection (per official impl)
-        # TODO: apply_rotary_emb(o[..., -rope_head_dim:], freqs_cis, inverse=True)
+        # Apply INVERSE RoPE to the pe part of o before the output projection,
+        # matching the official model.py:
+        #   apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
+        # Without this, wo_a sees a rotated representation that its trained
+        # weights do not expect — empirically this produces ~N(0, 3.5) logits
+        # that gravitate to a few attractor tokens (argmax_match = 0%).
+        o_nope, o_pe = torch.split(o, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Build a complex conjugate freqs_cis view and multiply.  freqs_cis here
+        # is the non-fused complex form produced by freqs_cis_from_position_ids
+        # (see the rope_fusion=False change above).
+        o_pe_c = torch.view_as_complex(o_pe.float().view(*o_pe.shape[:-1], -1, 2))
+        fc = freqs_cis.conj()
+        # For bshd tensors fc shape is [B, S, rope_head_dim/2]; for thd it is
+        # [T, rope_head_dim/2]. Broadcast over the n_heads axis.
+        if qkv_format == "bshd":
+            fc = fc.view(fc.size(0), fc.size(1), 1, fc.size(-1))
+        else:
+            fc = fc.view(fc.size(0), 1, fc.size(-1))
+        o_pe_c = o_pe_c * fc
+        o_pe = torch.view_as_real(o_pe_c).flatten(-2).to(o_pe.dtype)
+        o = torch.cat([o_nope, o_pe], dim=-1)
         x_out = self.wo_b(self.wo_a(o))  # wo_a handles the reshape internally
         return x_out
 

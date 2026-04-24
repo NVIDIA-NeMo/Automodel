@@ -521,13 +521,15 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
         if position_ids is None:
             seq_len = h.shape[1]
             position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0).expand(h.shape[0], -1)
-        rope_fusion = getattr(getattr(self, "backend", None), "rope_fusion", False)
         with torch.no_grad():
             freqs_cis = freqs_cis_from_position_ids(
                 position_ids,
                 self.freqs_cis,
                 qkv_format=kwargs.get("qkv_format", "bshd"),
-                for_fused_rope=rope_fusion,
+                # Must match DeepseekV4Model.forward: V4 requires the complex
+                # form so the attention block can apply inverse RoPE on its
+                # output before wo_a.
+                for_fused_rope=False,
                 cp_size=kwargs.get("cp_size", 1),
             )
 
