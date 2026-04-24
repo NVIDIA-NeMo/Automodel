@@ -171,8 +171,8 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
     elif "benchmark" in config.stem:
         job["stage"] = "benchmark"
     elif test_folder.startswith("diffusion"):
-        job["stage"] = "diffusion_sft"
-    elif "peft" in config.stem:
+        job["stage"] = "diffusion_peft" if ("lora" in config.stem or "peft" in config.stem) else "diffusion_sft"
+    elif "peft" in config.stem or "lora" in config.stem:
         job["stage"] = "peft_ckpt_robustness" if has_robustness else "peft"
     else:
         job["stage"] = "sft_ckpt_robustness" if has_robustness else "sft"
