@@ -43,8 +43,8 @@ HC (Hyper-Connections):
   Each Block maintains hc_mult=4 copies of the hidden state.
   hc_pre  reduces [bsz, seq, hc_mult, dim] -> [bsz, seq, dim] via Sinkhorn mixing.
   hc_post expands [bsz, seq, dim] -> [bsz, seq, hc_mult, dim].
-  The hc_split_sinkhorn kernel is not yet implemented; hc_pre falls back to a
-  mean-pooling approximation and hc_post falls back to broadcasting.
+  See ``_hc_split_sinkhorn`` for the pure-torch port of the reference mixer
+  (ported from miles PR 1045's ``kernel/sinkhorn.py``).
 
 Sliding-window / compress-ratio attention is NOT yet implemented.
 All layers use full causal attention regardless of compress_ratios.
@@ -130,45 +130,115 @@ class GroupedOutputProjection(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# HC (Hyper-Connections) helpers
+# HC (Hyper-Connections) helpers — pure-torch port of miles PR 1045
+# miles_plugins/models/deepseek_v4/ops/hyper_connection.py + kernel/sinkhorn.py
 # ---------------------------------------------------------------------------
 
 
-def hc_pre_approx(x: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, None, None]:
-    """Approximate hc_pre via simple mean-pooling across the hc_mult dimension.
+def _hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-torch equivalent of the tilelang ``hc_split_sinkhorn`` kernel.
 
-    The full implementation requires the hc_split_sinkhorn CUDA kernel
-    (from the official inference code).  This approximation allows the model
-    to run end-to-end during development without the kernel.
+    Splits the ``mixes`` tensor [..., (2+hc)*hc] into three mixer heads:
+      - ``pre``  [..., hc]       : sigmoid-gated router weights + eps
+      - ``post`` [..., hc]       : 2 * sigmoid-gated output router weights
+      - ``comb`` [..., hc, hc]   : doubly-stochastic mixing matrix produced by
+                                    Sinkhorn-normalizing a softmax over rows.
 
-    Args:
-        x: [bsz, seq, hc_mult, dim]
-
-    Returns:
-        reduced: [bsz, seq, dim]
-        post, comb: None (placeholders; hc_post uses a broadcast fallback)
+    Mirrors the kernel's eps placement (added-after-first-row-norm vs
+    added-to-denominator on col-norm and subsequent iterations).
     """
-    return x.mean(dim=2), None, None
+    hc = hc_mult
+    pre_raw = mixes[..., :hc]
+    post_raw = mixes[..., hc : 2 * hc]
+    comb_raw = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc)
+
+    pre_base = hc_base[:hc]
+    post_base = hc_base[hc : 2 * hc]
+    comb_base = hc_base[2 * hc :].reshape(hc, hc)
+
+    pre = torch.sigmoid(pre_raw * hc_scale[0] + pre_base) + eps
+    post = 2.0 * torch.sigmoid(post_raw * hc_scale[1] + post_base)
+
+    comb = comb_raw * hc_scale[2] + comb_base
+    # Initial row-softmax + eps, then one column normalize.
+    comb = torch.softmax(comb, dim=-1) + eps
+    col_sum = comb.sum(dim=-2, keepdim=True)
+    comb = comb / (col_sum + eps)
+    # Remaining Sinkhorn iterations: alternating row/col normalization.
+    for _ in range(sinkhorn_iters - 1):
+        row_sum = comb.sum(dim=-1, keepdim=True)
+        comb = comb / (row_sum + eps)
+        col_sum = comb.sum(dim=-2, keepdim=True)
+        comb = comb / (col_sum + eps)
+    return pre, post, comb
 
 
-def hc_post_approx(
+def hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """HC pre-reduce: [B,S,hc_mult,dim] -> [B,S,dim] via sigmoid-gated sum.
+
+    No-grad on the mixer: only the summation ``pre * x_viewed`` flows gradient
+    back into ``x``, matching the reference ``_HYPER_CONNECTION_MIXER_NO_GRAD``.
+    """
+    shape = x.shape
+    orig_dtype = x.dtype
+    x_flat = x.flatten(2).float()  # [B, S, hc_mult*dim]
+    # HC parameters are stored as float32 in the checkpoint but mixed-precision
+    # policies (FSDP MP / cast_model_to_dtype) may downcast them at runtime.
+    # Force back to float32 here so the mixer math stays in fp32 (matches the
+    # reference's ``_keep_fp32 = True`` param marker).
+    hc_fn_f = hc_fn.float()
+    hc_scale_f = hc_scale.float()
+    hc_base_f = hc_base.float()
+    with torch.no_grad():
+        x_sq_mean = x_flat.square().mean(-1, keepdim=True)
+        rsqrt = torch.rsqrt(x_sq_mean + norm_eps)
+        mixes = torch.nn.functional.linear(x_flat, hc_fn_f) * rsqrt  # [B, S, mix_hc]
+        pre, post, comb = _hc_split_sinkhorn(
+            mixes, hc_scale_f, hc_base_f, hc_mult, sinkhorn_iters, hc_eps
+        )
+    x_viewed = x_flat.view(shape)
+    y = (pre.unsqueeze(-1) * x_viewed).sum(dim=2)
+    return y.to(orig_dtype), post, comb
+
+
+def hc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
-    post: None,
-    comb: None,
+    post: torch.Tensor,
+    comb: torch.Tensor,
 ) -> torch.Tensor:
-    """Approximate hc_post via broadcast expansion.
+    """HC post-expand: combine sub-layer output ``x`` with the multi-copy
+    ``residual`` using the mixer ``(post, comb)`` produced by ``hc_pre``.
 
-    Adds the updated x to all hc_mult copies of the residual.
-
-    Args:
-        x:        [bsz, seq, dim]
-        residual: [bsz, seq, hc_mult, dim]
-
-    Returns:
-        [bsz, seq, hc_mult, dim]
+    Shapes:
+      x        : [B, S, dim]                  (sub-layer output)
+      residual : [B, S, hc_mult, dim]         (pre-sub-layer state, kept intact)
+      post     : [B, S, hc_mult]              (gate on x into each output copy)
+      comb     : [B, S, hc_mult, hc_mult]     (stochastic mix across residual
+                                                copies into each output copy)
     """
-    return residual + x.unsqueeze(2)
+    orig_dtype = x.dtype
+    # term1[b,s,j,d] = post[b,s,j] * x[b,s,d]
+    term1 = post.unsqueeze(-1) * x.unsqueeze(-2)
+    # term2[b,s,j,d] = sum_i comb[b,s,i,j] * residual[b,s,i,d]
+    term2 = (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=2)
+    return (term1 + term2).to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------

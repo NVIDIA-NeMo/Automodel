@@ -58,8 +58,8 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_fr
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
-    hc_post_approx,
-    hc_pre_approx,
+    hc_post,
+    hc_pre,
 )
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -90,10 +90,10 @@ class DeepseekV4Block(nn.Module):
     - Carry HC parameters (stored in float32 per official impl).
     - Use MoE FFN.
 
-    HC computation (hc_pre / hc_post) currently falls back to an approximation
-    (mean-pool / broadcast-add) because the hc_split_sinkhorn kernel is not
-    available.  The HC parameters are still registered so that HF checkpoints
-    load without error.
+    HC computation uses a pure-torch port of the reference ``hc_split_sinkhorn``
+    kernel (see ``layers._hc_split_sinkhorn``).  The mixer itself runs under
+    ``torch.no_grad()`` — only the weighted-sum over ``x`` / ``residual`` flows
+    gradient back into the hidden state, matching the reference.
     """
 
     def __init__(
@@ -107,6 +107,8 @@ class DeepseekV4Block(nn.Module):
         self.layer_idx = layer_idx
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
+        self.hc_sinkhorn_iters = int(getattr(config, "hc_sinkhorn_iters", 20) or 20)
+        self.rms_norm_eps = float(config.rms_norm_eps)
 
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV4Attention(config, backend)
@@ -126,8 +128,9 @@ class DeepseekV4Block(nn.Module):
         )
 
         # HC parameters — present in ALL layers, stored as float32.
-        # requires_grad=False: full HC forward (hc_split_sinkhorn) not yet implemented;
-        # params are registered for checkpoint compatibility but not in the autograd graph.
+        # requires_grad=False per the reference's _HYPER_CONNECTION_MIXER_NO_GRAD:
+        # the (pre, post, comb) router is computed under no_grad so these params
+        # take whatever the checkpoint provides but are not tuned by the loss.
         shapes = _hc_param_shape(config.hc_mult, config.hidden_size)
         for name, shape in shapes.items():
             self.register_parameter(name, nn.Parameter(torch.zeros(shape, dtype=torch.float32), requires_grad=False))
@@ -147,24 +150,42 @@ class DeepseekV4Block(nn.Module):
 
         # Attention sub-block
         residual = x
-        x_reduced, post, comb = hc_pre_approx(x, eps=self.hc_eps)
+        x_reduced, post, comb = hc_pre(
+            x,
+            hc_fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            hc_mult=self.hc_mult,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+        )
         attn_out = self.self_attn(
             x=self.input_layernorm(x_reduced),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
             **attn_kwargs,
         )
-        x = hc_post_approx(attn_out, residual, post, comb)
+        x = hc_post(attn_out, residual, post, comb)
 
         # FFN sub-block
         residual = x
-        x_reduced, post, comb = hc_pre_approx(x, eps=self.hc_eps)
+        x_reduced, post, comb = hc_pre(
+            x,
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=self.hc_mult,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+        )
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
         if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
             self.mlp.gate.set_input_ids(input_ids)
         ffn_out = self.mlp(self.post_attention_layernorm(x_reduced), padding_mask)
-        x = hc_post_approx(ffn_out, residual, post, comb)
+        x = hc_post(ffn_out, residual, post, comb)
 
         return x
 
