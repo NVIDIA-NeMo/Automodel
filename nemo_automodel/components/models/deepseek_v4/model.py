@@ -299,6 +299,9 @@ class DeepseekV4Model(nn.Module):
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            # V4 Flash routed experts use clamped SwiGLU (gate.max=limit,
+            # up.±limit) in FP32 — see reference model.py Expert.forward.
+            swiglu_limit=float(getattr(config, "swiglu_limit", 0.0) or 0.0),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
