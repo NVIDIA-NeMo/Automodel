@@ -15,8 +15,10 @@
 ARG VLLM_IMAGE=nvcr.io/nvidia/vllm:25.12-py3
 FROM ${VLLM_IMAGE} AS deploy
 
-# Build mamba-ssm and causal-conv1d CUDA extensions against the container's matching CUDA/torch
-RUN pip install --no-build-isolation mamba-ssm causal-conv1d
+# Build mamba-ssm and causal-conv1d from source against the container's torch
+ENV MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE
+RUN pip install --no-build-isolation --no-binary=mamba-ssm,causal-conv1d \
+    mamba-ssm causal-conv1d
 
 # Test dependencies
 RUN pip install peft pytest pyyaml
