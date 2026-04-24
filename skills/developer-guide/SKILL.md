@@ -1,3 +1,8 @@
+---
+name: developer-guide
+description: Environment setup and day-to-day development workflow for NeMo AutoModel, including installation, tooling, and code quality commands.
+---
+
 # NeMo AutoModel Developer Guide
 
 ## Quick Start
