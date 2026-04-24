@@ -212,10 +212,10 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
         if known_issue_id:
             vllm_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
 
-    # Generate retrieval eval job if recipe opts in
-    retrieval_eval_job = None
-    if ci_config.get("retrieval_eval"):
-        retrieval_eval_job = {
+    # Generate embedding eval job if recipe opts in (bi-encoder retrieval models)
+    embed_eval_job = None
+    if ci_config.get("embed_eval"):
+        embed_eval_job = {
             "extends": f".{test_folder}_eval_test",
             "stage": "retrieval_eval",
             "variables": {
@@ -225,11 +225,28 @@ def generate_job(config: str, config_override: Dict[str, Any], scope: str, test_
             },
         }
         if recipe_allow_failure:
-            retrieval_eval_job['allow_failure'] = True
+            embed_eval_job['allow_failure'] = True
         if known_issue_id:
-            retrieval_eval_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
+            embed_eval_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
 
-    return job, vllm_job, retrieval_eval_job
+    # Generate reranking eval job if recipe opts in (cross-encoder retrieval models)
+    rerank_eval_job = None
+    if ci_config.get("rerank_eval"):
+        rerank_eval_job = {
+            "extends": f".{test_folder}_eval_test",
+            "stage": "retrieval_eval",
+            "variables": {
+                "CONFIG_PATH": f"{config}",
+                "TEST_LEVEL": f"{scope}",
+                "FINETUNE_TEST_NAME": f"{config.stem}",
+            },
+        }
+        if recipe_allow_failure:
+            rerank_eval_job['allow_failure'] = True
+        if known_issue_id:
+            rerank_eval_job['variables']['KNOWN_ISSUE_ID'] = known_issue_id
+
+    return job, vllm_job, embed_eval_job, rerank_eval_job
 
 
 def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
@@ -269,14 +286,18 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         if model_name in exempt_models_list or config_name in exempt_configs_list:
             continue
 
-        job, vllm_job, retrieval_eval_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
+        job, vllm_job, embed_eval_job, rerank_eval_job = generate_job(
+            config, config_override, scope, test_folder, automodel_dir
+        )
         if job is None:
             continue  # skipped via ci.known_issue_id (no allow_failure)
         pipeline[f'{config_name}'] = job
         if vllm_job:
             pipeline[f"{config_name}_vllm_deploy"] = vllm_job
-        if retrieval_eval_job:
-            pipeline[f"{config_name}_retrieval_eval"] = retrieval_eval_job
+        if embed_eval_job:
+            pipeline[f"{config_name}_embed_eval"] = embed_eval_job
+        if rerank_eval_job:
+            pipeline[f"{config_name}_rerank_eval"] = rerank_eval_job
 
     return pipeline
 
