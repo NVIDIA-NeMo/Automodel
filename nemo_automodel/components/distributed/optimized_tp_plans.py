@@ -633,7 +633,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     # Mistral3 VLM (Pixtral + Ministral3). Hard-coded qualname for native HF
     # class and the Automodel FP8-VLM subclass to avoid eager imports.
     "transformers.models.mistral3.modeling_mistral3.Mistral3ForConditionalGeneration": _parallelize_mistral3_vlm,
-    "nemo_automodel.components.models.devstral.model.Mistral3FP8VLMForConditionalGeneration": _parallelize_mistral3_vlm,
+    "nemo_automodel.components.models.mistral3_vlm_fp8.model.Mistral3FP8VLMForConditionalGeneration": _parallelize_mistral3_vlm,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input

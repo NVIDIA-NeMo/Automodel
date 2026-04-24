@@ -12,30 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State-dict adapter for Mistral3 / Ministral3 FP8 checkpoints.
+"""State-dict adapter for the Mistral-3.5 128B (dawn-ridge) FP8 VLM.
 
 Plugs into the standard nemo_automodel checkpoint flow
 (nemo_automodel/components/checkpoint/checkpointing.py ~lines 510, 556) and
-handles two responsibilities:
+handles **FP8 dequantization** during load/save:
 
-  1. **Key remapping** between on-disk HF layouts and our text-only
-     Ministral3ForCausalLM layout. Three known prefix conventions coexist
-     inside the same model family:
+  * The checkpoint's language_model Linear weights are stored as per-tensor
+    FP8 with a scalar ``weight_scale_inv`` sibling (and an unused
+    ``activation_scale`` sibling). The adapter pairs each weight with its
+    scale on load, dequantizes to bf16 (``w_bf16 = w_fp8.to(bf16) * scale``),
+    and drops the scale keys. Vision tower + multi_modal_projector + lm_head
+    are BF16 on disk and pass through unchanged.
 
-       Layout               Example disk key                               lm_head key
-       -------------------- ---------------------------------------------- --------------------------
-       DEVSTRAL_VLM  (24B)  language_model.model.layers.0.self_attn.q_proj language_model.lm_head.weight
-       DAWN_RIDGE_VLM(128B) model.language_model.layers.0.self_attn.q_proj lm_head.weight
-       DENSE        (123B)  model.layers.0.self_attn.q_proj                lm_head.weight
-
-     The caller supplies the rewrite functions (or picks one of the factory
-     classmethods below) so this adapter stays layout-agnostic.
-
-  2. **FP8 dequantization**. All three checkpoints carry per-Linear
-     `weight_scale_inv` (scalar bf16) and `activation_scale` (unused for
-     training) siblings. The adapter pairs each weight with its scale,
-     dequantizes to bf16 (`w_bf16 = w_fp8.to(bf16) * scale`), and drops the
-     scale keys.
+Keys round-trip identically: the HF VLM state_dict and the on-disk keys
+both use ``model.language_model.*``, ``model.vision_tower.*``,
+``model.multi_modal_projector.*``, ``lm_head.weight`` — no rename needed.
 
 Structurally modelled after
 `nemo_automodel/components/models/deepseek_v3/state_dict_adapter.py`.
@@ -91,61 +83,26 @@ def _dequantize_from_fp8(
 ) -> torch.Tensor:
     """Dequantize a single FP8 weight using its per-tensor scalar scale.
 
-    Mistral3 / Ministral3 (24B, 123B, dawn-ridge-128B) all use per-tensor
-    quantization (`weight_block_size=None`), so `scale_inv` is a 0-d scalar
-    and dequant collapses to a simple multiply. The per-block formula
-    (`transformers.integrations.finegrained_fp8.Fp8Dequantize.convert`,
-    finegrained_fp8.py:867-906) is not needed for this model family.
+    The dawn-ridge 128B checkpoint uses per-tensor quantization
+    (``weight_block_size=None``), so ``scale_inv`` is a 0-d scalar and
+    dequant collapses to a simple multiply. The per-block formula
+    (``transformers.integrations.finegrained_fp8.Fp8Dequantize.convert``,
+    finegrained_fp8.py:867-906) is not needed here.
     """
     return weight_fp8.to(target_dtype) * scale_inv.to(target_dtype)
-
-
-# Rewrites for each known layout ------------------------------------------- #
 
 
 def _identity(k: str) -> str:
     return k
 
 
-def _devstral_vlm_native_to_hf(k: str) -> str:
-    """`model.X` / `lm_head.X` → `language_model.model.X` / `language_model.lm_head.X`."""
-    return f"language_model.{k}"
-
-
-def _devstral_vlm_hf_to_native(k: str) -> str:
-    """`language_model.<rest>` → `<rest>`."""
-    if k.startswith("language_model."):
-        return k[len("language_model."):]
-    return k
-
-
-def _dawn_ridge_vlm_native_to_hf(k: str) -> str:
-    """`model.X` → `model.language_model.X`; `lm_head.X` untouched."""
-    if k.startswith("model."):
-        return f"model.language_model.{k[len('model.'):]}"
-    return k
-
-
-def _dawn_ridge_vlm_hf_to_native(k: str) -> str:
-    """`model.language_model.X` → `model.X`; everything else untouched."""
-    if k.startswith("model.language_model."):
-        return f"model.{k[len('model.language_model.'):]}"
-    return k
-
-
 class Mistral3FP8StateDictAdapter(StateDictAdapter):
-    """Key-remapping + FP8 dequant adapter for Mistral3-family checkpoints.
+    """FP8 dequant adapter for the Mistral-3.5 128B dawn-ridge VLM.
 
-    Args:
-        native_to_hf: Callable mapping a model-native key to its on-disk HF
-            key. Used by `to_hf` (load path emits the right keys for DCP to
-            fetch; save path writes back using these keys).
-        hf_to_native: Callable mapping an on-disk HF key to a model-native
-            key. Used by `from_hf` after DCP has populated the state dict.
-        layout_name: Optional label for logs ("devstral_vlm", "dawn_ridge_vlm",
-            "dense", etc).
-
-    Factory helpers below create the three known layouts.
+    Keys round-trip identity (HF state_dict and on-disk keys match for the
+    full VLM). Only language_model layer weights are FP8; vision_tower,
+    multi_modal_projector, and lm_head are BF16 and pass through unchanged
+    via the ``not_fp8_prefixes`` / ``_NON_QUANTIZED_SUFFIXES`` filters.
     """
 
     def __init__(
@@ -153,7 +110,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         *,
         native_to_hf: Callable[[str], str] = _identity,
         hf_to_native: Callable[[str], str] = _identity,
-        layout_name: str = "dense",
+        layout_name: str = "vlm_full",
         not_fp8_prefixes: tuple[str, ...] = (),
     ):
         self._native_to_hf = native_to_hf
@@ -161,40 +118,9 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         self._layout_name = layout_name
         self._not_fp8_prefixes = tuple(not_fp8_prefixes)
 
-    # Factory classmethods — name-based knobs instead of constant strings.
-    @classmethod
-    def for_devstral_vlm(cls) -> "Mistral3FP8StateDictAdapter":
-        """Text-only path for Devstral-Small-2-24B: `language_model.` prepended
-        to all text keys. Used when the training flow is
-        ``NeMoAutoModelForCausalLM.from_pretrained`` on a VLM checkpoint."""
-        return cls(
-            native_to_hf=_devstral_vlm_native_to_hf,
-            hf_to_native=_devstral_vlm_hf_to_native,
-            layout_name="devstral_vlm",
-        )
-
-    @classmethod
-    def for_dawn_ridge_vlm(cls) -> "Mistral3FP8StateDictAdapter":
-        """Text-only path for dawn-ridge-128B: `language_model.` injected between
-        `model.` and layer names; `lm_head` top-level."""
-        return cls(
-            native_to_hf=_dawn_ridge_vlm_native_to_hf,
-            hf_to_native=_dawn_ridge_vlm_hf_to_native,
-            layout_name="dawn_ridge_vlm",
-        )
-
-    @classmethod
-    def for_dense(cls) -> "Mistral3FP8StateDictAdapter":
-        """Devstral-2-123B layout: no prefix munging (model keys already match disk)."""
-        return cls(layout_name="dense")
-
     @classmethod
     def for_vlm_full(cls) -> "Mistral3FP8StateDictAdapter":
         """Full-VLM path for Mistral3ForConditionalGeneration checkpoints.
-
-        Used when the training flow is
-        ``NeMoAutoModelForImageTextToText.from_pretrained`` and we want the
-        whole VLM (vision_tower + multi_modal_projector + language_model).
 
         Keys round-trip identically between HF's VLM ``state_dict()`` and
         disk for the dawn-ridge-128B checkpoint (both use

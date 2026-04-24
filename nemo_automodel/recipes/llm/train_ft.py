@@ -270,14 +270,6 @@ def build_model(
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
-        # Ensure opt-in custom model registrations take effect before the
-        # registry is queried (the Devstral FP8 wrapper registers itself for
-        # Mistral3ForConditionalGeneration on import).
-        try:
-            import nemo_automodel.components.models.devstral  # noqa: F401
-        except ImportError:
-            pass
-
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
             NeMoAutoModelForCausalLM.from_pretrained,

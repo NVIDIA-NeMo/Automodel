@@ -152,10 +152,10 @@ def build_model(
             kwargs["compile_config"] = build_compile_config(cfg_compile)
 
         # Ensure opt-in custom model registrations take effect before the
-        # registry is queried (the Devstral / Mistral3.5 FP8 wrapper registers
+        # registry is queried (the Mistral-3.5 128B FP8 VLM wrapper registers
         # itself for Mistral3ForConditionalGeneration on import).
         try:
-            import nemo_automodel.components.models.devstral  # noqa: F401
+            import nemo_automodel.components.models.mistral3_vlm_fp8  # noqa: F401
         except ImportError:
             pass
 
