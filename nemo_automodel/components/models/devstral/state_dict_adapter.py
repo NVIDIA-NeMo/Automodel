@@ -57,10 +57,11 @@ logger = logging.getLogger(__name__)
 
 
 # Keys that should NOT be treated as FP8 weights — no `_scale_inv` sibling on
-# save, no dequantize on load. Matches `modules_to_not_convert` in the Mistral3
-# / Ministral3 HF configs:
-#     ['model.vision_tower', 'model.multi_modal_projector', 'lm_head']
-# plus layernorms + embeddings (never FP8 in this family).
+# save, no dequantize on load. The fixed suffix list covers layernorms +
+# embeddings + the lm_head (always non-quantized in this family). VLM
+# variants additionally pass module-prefix filters via the adapter's
+# `not_fp8_prefixes` knob, matching `modules_to_not_convert` in the HF config
+# (e.g. `model.vision_tower`, `model.multi_modal_projector`).
 _NON_QUANTIZED_SUFFIXES = (
     "embed_tokens.weight",
     "lm_head.weight",
@@ -70,11 +71,17 @@ _NON_QUANTIZED_SUFFIXES = (
 )
 
 
-def _is_fp8_weight_key(model_key: str) -> bool:
+def _is_fp8_weight_key(model_key: str, not_fp8_prefixes: tuple[str, ...] = ()) -> bool:
     """Return True iff `model_key` names an FP8 Linear weight."""
     if not model_key.endswith(".weight"):
         return False
-    return not any(model_key.endswith(suffix) for suffix in _NON_QUANTIZED_SUFFIXES)
+    if any(model_key.endswith(suffix) for suffix in _NON_QUANTIZED_SUFFIXES):
+        return False
+    if any(
+        model_key == p or model_key.startswith(p + ".") for p in not_fp8_prefixes
+    ):
+        return False
+    return True
 
 
 def _dequantize_from_fp8(
@@ -147,15 +154,19 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         native_to_hf: Callable[[str], str] = _identity,
         hf_to_native: Callable[[str], str] = _identity,
         layout_name: str = "dense",
+        not_fp8_prefixes: tuple[str, ...] = (),
     ):
         self._native_to_hf = native_to_hf
         self._hf_to_native = hf_to_native
         self._layout_name = layout_name
+        self._not_fp8_prefixes = tuple(not_fp8_prefixes)
 
     # Factory classmethods — name-based knobs instead of constant strings.
     @classmethod
     def for_devstral_vlm(cls) -> "Mistral3FP8StateDictAdapter":
-        """Devstral-Small-2-24B layout: `language_model.` prepended to all text keys."""
+        """Text-only path for Devstral-Small-2-24B: `language_model.` prepended
+        to all text keys. Used when the training flow is
+        ``NeMoAutoModelForCausalLM.from_pretrained`` on a VLM checkpoint."""
         return cls(
             native_to_hf=_devstral_vlm_native_to_hf,
             hf_to_native=_devstral_vlm_hf_to_native,
@@ -164,7 +175,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
 
     @classmethod
     def for_dawn_ridge_vlm(cls) -> "Mistral3FP8StateDictAdapter":
-        """dawn-ridge-medium-128B layout: `language_model.` injected between
+        """Text-only path for dawn-ridge-128B: `language_model.` injected between
         `model.` and layer names; `lm_head` top-level."""
         return cls(
             native_to_hf=_dawn_ridge_vlm_native_to_hf,
@@ -176,6 +187,30 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
     def for_dense(cls) -> "Mistral3FP8StateDictAdapter":
         """Devstral-2-123B layout: no prefix munging (model keys already match disk)."""
         return cls(layout_name="dense")
+
+    @classmethod
+    def for_vlm_full(cls) -> "Mistral3FP8StateDictAdapter":
+        """Full-VLM path for Mistral3ForConditionalGeneration checkpoints.
+
+        Used when the training flow is
+        ``NeMoAutoModelForImageTextToText.from_pretrained`` and we want the
+        whole VLM (vision_tower + multi_modal_projector + language_model).
+
+        Keys round-trip identically between HF's VLM ``state_dict()`` and
+        disk for the dawn-ridge-128B checkpoint (both use
+        ``model.language_model.*``, ``model.vision_tower.*``,
+        ``model.multi_modal_projector.*``, ``lm_head.weight``). Only the
+        language_model layer weights are FP8; vision / mm_projector / lm_head
+        are BF16 on disk and must be passed through without a scale_inv
+        placeholder — otherwise DCP would fail trying to fetch a non-existent
+        ``_scale_inv`` key.
+        """
+        not_fp8 = (
+            "model.vision_tower",
+            "model.multi_modal_projector",
+            # "lm_head" already in _NON_QUANTIZED_SUFFIXES via suffix match.
+        )
+        return cls(layout_name="vlm_full", not_fp8_prefixes=not_fp8)
 
     # --------------------------------------------------------------------- #
     # model → HF                                                            #
@@ -204,7 +239,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
                 if re.match(exclude_key_regex, model_key):
                     continue
             hf_key = self._native_to_hf(model_key)
-            if quantization and _is_fp8_weight_key(model_key):
+            if quantization and _is_fp8_weight_key(model_key, self._not_fp8_prefixes):
                 value = value.to(dtype=torch.float8_e4m3fn)
                 scale_placeholder = torch.empty((), dtype=torch.bfloat16)
                 hf[hf_key] = value
@@ -270,7 +305,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         """Per-tensor model → HF used by ``Checkpointer.save_model``."""
         quantization = kwargs.get("quantization", False)
         hf_key = self._native_to_hf(fqn)
-        if not quantization or not _is_fp8_weight_key(fqn):
+        if not quantization or not _is_fp8_weight_key(fqn, self._not_fp8_prefixes):
             return [(hf_key, tensor)]
         scale_placeholder = torch.empty((), dtype=torch.bfloat16)
         return [(hf_key, tensor), (hf_key + "_scale_inv", scale_placeholder)]

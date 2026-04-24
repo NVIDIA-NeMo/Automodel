@@ -1320,10 +1320,20 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
 
     model_cls = type(model)
     layers: List[nn.Module] = []
-    if model_cls in MODEL_CLS_TO_LAYERS:
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
-    elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
+    # Walk MRO so subclasses of a registered VLM (e.g. our
+    # Mistral3FP8VLMForConditionalGeneration, which extends HF's
+    # Mistral3ForConditionalGeneration to own FP8 dequant) inherit the same
+    # layer paths without needing a dedicated MAP entry.
+    mro_hit = next(
+        (
+            cls for cls in model_cls.__mro__
+            if cls in MODEL_CLS_TO_LAYERS or cls.__name__ in MODEL_CLS_TO_LAYERS
+        ),
+        None,
+    )
+    if mro_hit is not None:
+        key = mro_hit if mro_hit in MODEL_CLS_TO_LAYERS else mro_hit.__name__
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[key]))
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM)
         if isinstance(model.model.layers, nn.ModuleDict):

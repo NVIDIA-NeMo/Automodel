@@ -202,8 +202,17 @@ def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     return True
 
 
-def _resolve_custom_model_cls_for_config(config):
-    """Resolve the custom model class for *config*, if the config is compatible."""
+def _resolve_custom_model_cls_for_config(config, *, entry_cls=None):
+    """Resolve the custom model class for *config*, if the config is compatible.
+
+    Args:
+        config: The HF config to resolve a custom implementation for.
+        entry_cls: Optional. The NeMo Auto class that the user invoked
+            (e.g. ``NeMoAutoModelForCausalLM`` vs
+            ``NeMoAutoModelForImageTextToText``). Custom resolver hooks can
+            branch on this to dispatch text-only vs VLM-aware classes for
+            the same checkpoint. Default: None.
+    """
     architectures = get_architectures(config)
     if not architectures:
         return None
@@ -750,8 +759,11 @@ def __init_model(
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
         return False, model
 
-    # 2. If we have a custom model implementation available, we prioritize that over HF
-    model_cls = _resolve_custom_model_cls_for_config(hf_config)
+    # 2. If we have a custom model implementation available, we prioritize that over HF.
+    # `cls` here is the NeMo Auto entry (e.g. NeMoAutoModelForCausalLM vs
+    # NeMoAutoModelForImageTextToText) — pass it through so resolver hooks can
+    # dispatch text-only vs VLM-aware custom classes for the same checkpoint.
+    model_cls = _resolve_custom_model_cls_for_config(hf_config, entry_cls=cls)
     if model_cls is not None:
         if quantization_config is not None:
             # BnB quantization is tightly integrated with HF's from_pretrained weight
