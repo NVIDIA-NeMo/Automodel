@@ -181,9 +181,7 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
         # Force fp32 for numerical stability.
@@ -533,9 +531,7 @@ class DeepseekV4Compressor(nn.Module):
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
         self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
-        self.indexer: DeepseekV4Indexer | None = (
-            DeepseekV4Indexer(config) if compress_ratio == 4 else None
-        )
+        self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
 
     def forward(
         self,
@@ -585,16 +581,10 @@ class DeepseekV4Compressor(nn.Module):
         # or ``-1`` for "do not attend" (masked by causality).
         indexer_topk: torch.LongTensor | None = None
         if self.indexer is not None:
-            raw_topk = self.indexer(
-                hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos
-            )
-            threshold = (
-                torch.arange(1, seq_len + 1, device=raw_topk.device) // self.compress_ratio
-            ).unsqueeze(1)
+            raw_topk = self.indexer(hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos)
+            threshold = (torch.arange(1, seq_len + 1, device=raw_topk.device) // self.compress_ratio).unsqueeze(1)
             causal_invalid = raw_topk >= threshold
-            indexer_topk = torch.where(
-                causal_invalid, torch.full_like(raw_topk, -1), raw_topk
-            )
+            indexer_topk = torch.where(causal_invalid, torch.full_like(raw_topk, -1), raw_topk)
         return pooled, indexer_topk
 
 
@@ -651,9 +641,7 @@ class DeepseekV4HyperConnection(nn.Module):
         self.base = nn.Parameter(torch.empty(mix))
         self.scale = nn.Parameter(torch.empty(3))
 
-    def compute_weights(
-        self, hidden_streams: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
@@ -680,8 +668,7 @@ class DeepseekV4HyperConnection(nn.Module):
         #   3. col-norm / sum(dim=-2)
         #   4. for sinkhorn_iters - 1: row-norm / sum(dim=-1) ; col-norm / sum(dim=-2)
         comb_logit = (
-            mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale
-            + self.base[2 * hc :].view(hc, hc).float()
+            mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale + self.base[2 * hc :].view(hc, hc).float()
         )
         comb = torch.softmax(comb_logit, dim=-1) + self.hc_eps
         comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -770,9 +757,7 @@ class DeepseekV4Attention(nn.Module):
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
 
         self.compressor = (
-            DeepseekV4Compressor(config, self.compress_ratio, self.head_dim)
-            if self.compress_ratio
-            else None
+            DeepseekV4Compressor(config, self.compress_ratio, self.head_dim) if self.compress_ratio else None
         )
 
     def forward(
@@ -876,9 +861,7 @@ class DeepseekV4Attention(nn.Module):
         # If a caller supplied a 4D mask shorter than full_kv but no compressor
         # ran (shouldn't happen, but kept for defense), fall back to neutral pad.
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
-            attention_mask = F.pad(
-                attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0
-            )
+            attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
         attn_output, attn_weights = eager_attention_with_sink(
             self,
@@ -893,9 +876,7 @@ class DeepseekV4Attention(nn.Module):
 
         # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
         # HF uses).  Reference: modular_deepseek_v4.py:607.
-        attn_output = _apply_partial_rope(
-            attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim
-        ).transpose(1, 2)
+        attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
 
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
         return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights

@@ -390,9 +390,7 @@ class DeepseekV4Model(nn.Module):
 
         if position_ids is None:
             seq_len = shape_ref.shape[1]
-            position_ids = (
-                torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
-            )
+            position_ids = torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
 
         # (cos, sin) pairs for the main attention path and the compressor path.
         # Rotary modules live on every stage (PP keep-list ensures it).
@@ -426,7 +424,9 @@ class DeepseekV4Model(nn.Module):
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=self.rotary_emb_compress,
                 attention_mask=attention_mask_4d,
-                padding_mask=padding_mask if padding_mask is not None else (
+                padding_mask=padding_mask
+                if padding_mask is not None
+                else (
                     attention_mask.bool().logical_not()
                     if attention_mask is not None and attention_mask.dim() == 2
                     else None

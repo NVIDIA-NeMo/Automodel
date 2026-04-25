@@ -268,9 +268,9 @@ class TestFakeBalancedGate:
 
         # Allow some tolerance for distribution
         assert torch.all(remaining_counts > 0), "All available experts should be used"
-        assert torch.all(
-            torch.abs(remaining_counts - expected_count) < expected_count * 0.2
-        ), "Load should be roughly balanced"
+        assert torch.all(torch.abs(remaining_counts - expected_count) < expected_count * 0.2), (
+            "Load should be roughly balanced"
+        )
 
     def test_weights_are_uniform_with_skip(self, moe_config, device):
         """Test that weights are always uniform regardless of skip parameter."""
@@ -727,9 +727,7 @@ class TestGate:
         with torch.no_grad():
             gate.weight.normal_(0, 0.02)
             # Strong, non-uniform bias to ensure selection actually shifts
-            gate.e_score_correction_bias.copy_(
-                torch.linspace(-2.0, 2.0, moe_config.n_routed_experts, device=device)
-            )
+            gate.e_score_correction_bias.copy_(torch.linspace(-2.0, 2.0, moe_config.n_routed_experts, device=device))
 
         torch.manual_seed(7)
         num_tokens = 8
@@ -935,8 +933,7 @@ class TestGate:
                 weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
 
                 assert weights.dtype == input_dtype, (
-                    f"Expected output dtype {input_dtype} but got {weights.dtype} "
-                    f"with gate_precision={gate_precision}"
+                    f"Expected output dtype {input_dtype} but got {weights.dtype} with gate_precision={gate_precision}"
                 )
 
     def test_gate_precision_with_sigmoid(self, moe_config, device):
@@ -1407,9 +1404,7 @@ class TestGateAuxLossGradientFlow:
 
         weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
 
-        assert weights.grad_fn is not None, (
-            "weights must have a grad_fn from MoEAuxLossAutoScaler.apply()"
-        )
+        assert weights.grad_fn is not None, "weights must have a grad_fn from MoEAuxLossAutoScaler.apply()"
 
     def test_aux_loss_receives_gradient_through_weights(self, moe_config, device):
         moe_config.aux_loss_coeff = 0.01
@@ -1630,5 +1625,4 @@ class TestApplyBiasNotCompiled:
         from nemo_automodel.components.moe.experts import _apply_bias
 
         # torch.compile wraps functions in OptimizedModule or similar
-        assert not hasattr(_apply_bias, "_torchdynamo_orig_callable"), \
-            "_apply_bias should not be torch.compiled"
+        assert not hasattr(_apply_bias, "_torchdynamo_orig_callable"), "_apply_bias should not be torch.compiled"

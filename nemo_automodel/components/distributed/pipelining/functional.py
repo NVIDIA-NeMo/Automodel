@@ -287,9 +287,10 @@ def _precompute_stage_shapes(
     # DeepSeek V4 preserves an extra hc_mult axis between blocks, so inter-stage
     # hidden state is [mb, seq, hc_mult, dim] until the last (norm) stage folds
     # it back to [mb, seq, dim].
-    is_v4 = getattr(model_config, "model_type", None) == "deepseek_v4" or getattr(
-        getattr(model_config, "text_config", None), "model_type", None
-    ) == "deepseek_v4"
+    is_v4 = (
+        getattr(model_config, "model_type", None) == "deepseek_v4"
+        or getattr(getattr(model_config, "text_config", None), "model_type", None) == "deepseek_v4"
+    )
     hc_mult = int(getattr(model_config, "hc_mult", 1) or 1) if is_v4 else 1
 
     for stage in stages:
@@ -309,9 +310,7 @@ def _precompute_stage_shapes(
         else:
             if hc_mult > 1:
                 stage.inputs_meta = (
-                    torch.empty(
-                        microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype
-                    ),
+                    torch.empty(microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype),
                 )
             else:
                 stage.inputs_meta = (
@@ -326,15 +325,11 @@ def _precompute_stage_shapes(
         elif hc_mult > 1 and not stage_has_norm:
             # V4 mid-pipeline: tensor still carries the hc_mult axis.
             outputs_meta = (
-                torch.empty(
-                    microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype
-                ),
+                torch.empty(microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype),
             )
         else:
             # Standard intermediate stage (or V4 final-norm stage without lm_head).
-            outputs_meta = (
-                torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),
-            )
+            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
         stage._configure_outputs_meta(outputs_meta)
 
     logger.info(

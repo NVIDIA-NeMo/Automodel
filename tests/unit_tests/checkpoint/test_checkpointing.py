@@ -913,16 +913,17 @@ class TestGetStorageReaderInitStep:
         upstream_marker = MagicMock(name="UpstreamHFReader")
         backport_marker = MagicMock(name="BackportHFReader")
 
-        with patch(
-            "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
-            upstream_marker,
-        ), patch(
-            "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
-            backport_marker,
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
         ):
-            reader = checkpointer._get_storage_reader(
-                model_path="/fake/path", key_mapping=None, is_init_step=True
-            )
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=True)
 
         # Upstream reader must NOT be constructed for init-step base-model loads
         upstream_marker.assert_not_called()
@@ -938,16 +939,17 @@ class TestGetStorageReaderInitStep:
         upstream_marker = MagicMock(name="UpstreamHFReader")
         backport_marker = MagicMock(name="BackportHFReader")
 
-        with patch(
-            "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
-            upstream_marker,
-        ), patch(
-            "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
-            backport_marker,
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
         ):
-            reader = checkpointer._get_storage_reader(
-                model_path="/fake/path", key_mapping=None, is_init_step=False
-            )
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
 
         upstream_marker.assert_called_once_with(path="/fake/path")
         backport_marker.assert_not_called()
@@ -960,17 +962,18 @@ class TestGetStorageReaderInitStep:
         upstream_marker = MagicMock(name="UpstreamHFReader")
         backport_marker = MagicMock(name="BackportHFReader")
 
-        with patch(
-            "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
-            upstream_marker,
-        ), patch(
-            "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
-            backport_marker,
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
         ):
             mapping = {"old.key": "new.key"}
-            reader = checkpointer._get_storage_reader(
-                model_path="/fake/path", key_mapping=mapping, is_init_step=False
-            )
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=False)
 
         upstream_marker.assert_not_called()
         backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
@@ -983,17 +986,18 @@ class TestGetStorageReaderInitStep:
         upstream_marker = MagicMock(name="UpstreamHFReader")
         backport_marker = MagicMock(name="BackportHFReader")
 
-        with patch(
-            "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
-            upstream_marker,
-        ), patch(
-            "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
-            backport_marker,
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
         ):
             mapping = {"old.key": "new.key"}
-            reader = checkpointer._get_storage_reader(
-                model_path="/fake/path", key_mapping=mapping, is_init_step=True
-            )
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=True)
 
         upstream_marker.assert_not_called()
         backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
