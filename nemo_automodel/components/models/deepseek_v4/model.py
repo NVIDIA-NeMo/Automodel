@@ -58,8 +58,8 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_fr
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
-    hc_post,
-    hc_pre,
+    DeepseekV4HyperConnection,
+    DeepseekV4HyperHead,
 )
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -69,31 +69,14 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
-def _hc_param_shape(hc_mult: int, dim: int) -> dict[str, tuple[int, ...]]:
-    """Return the HC parameter shapes for a single block."""
-    mix_hc = (2 + hc_mult) * hc_mult  # (2+4)*4 = 24
-    hc_dim = hc_mult * dim  # 4 * 4096 = 16384
-    return {
-        "hc_attn_fn": (mix_hc, hc_dim),
-        "hc_attn_base": (mix_hc,),
-        "hc_attn_scale": (3,),
-        "hc_ffn_fn": (mix_hc, hc_dim),
-        "hc_ffn_base": (mix_hc,),
-        "hc_ffn_scale": (3,),
-    }
-
-
 class DeepseekV4Block(nn.Module):
     """Single transformer block for DeepSeek V4.
 
-    All layers:
-    - Carry HC parameters (stored in float32 per official impl).
-    - Use MoE FFN.
-
-    HC computation uses a pure-torch port of the reference ``hc_split_sinkhorn``
-    kernel (see ``layers._hc_split_sinkhorn``).  The mixer itself runs under
-    ``torch.no_grad()`` — only the weighted-sum over ``x`` / ``residual`` flows
-    gradient back into the hidden state, matching the reference.
+    Uses HuggingFace transformers PR 45616's HyperConnection decoder-layer
+    pattern: two ``DeepseekV4HyperConnection`` modules own the collapse /
+    expand mixer weights at the attention and FFN sites respectively.
+    Checkpoint's flat ``hc_attn_*`` / ``hc_ffn_*`` keys are routed into
+    ``attn_hc.*`` / ``ffn_hc.*`` by the state-dict adapter.
     """
 
     def __init__(
@@ -106,9 +89,6 @@ class DeepseekV4Block(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hc_mult = config.hc_mult
-        self.hc_eps = config.hc_eps
-        self.hc_sinkhorn_iters = int(getattr(config, "hc_sinkhorn_iters", 20) or 20)
-        self.rms_norm_eps = float(config.rms_norm_eps)
 
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV4Attention(config, backend)
@@ -127,13 +107,20 @@ class DeepseekV4Block(nn.Module):
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
 
-        # HC parameters — present in ALL layers, stored as float32.
-        # requires_grad=False per the reference's _HYPER_CONNECTION_MIXER_NO_GRAD:
-        # the (pre, post, comb) router is computed under no_grad so these params
-        # take whatever the checkpoint provides but are not tuned by the loss.
-        shapes = _hc_param_shape(config.hc_mult, config.hidden_size)
-        for name, shape in shapes.items():
-            self.register_parameter(name, nn.Parameter(torch.zeros(shape, dtype=torch.float32), requires_grad=False))
+        # HC (Hyper-Connection) mixers — one per sub-site (attention + FFN).
+        # Each owns learnable ``fn`` (fp32 packed-linear), ``base`` (fp32 bias),
+        # ``scale`` (fp32 per-head gain) parameters.  ``_keep_in_fp32_modules_strict``
+        # on ``DeepseekV4ForCausalLM`` keeps all nine HC param tensors in fp32
+        # at runtime via submodule-name matching.
+        hc_kwargs = dict(
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
+            hc_eps=float(config.hc_eps),
+            rms_norm_eps=float(config.rms_norm_eps),
+        )
+        self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
+        self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
 
     def forward(
         self,
@@ -144,57 +131,42 @@ class DeepseekV4Block(nn.Module):
         input_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        # x: [bsz, seq, hc_mult, dim] (HC multi-copy state)
+        # x throughout this layer: [B, S, hc_mult, hidden] (HC multi-copy state)
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
-        # Attention sub-block
-        residual = x
-        x_reduced, post, comb = hc_pre(
-            x,
-            hc_fn=self.hc_attn_fn,
-            hc_scale=self.hc_attn_scale,
-            hc_base=self.hc_attn_base,
-            hc_mult=self.hc_mult,
-            sinkhorn_iters=self.hc_sinkhorn_iters,
-            norm_eps=self.rms_norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        # --- Attention site: collapse → norm → attn → expand ---
+        pre, post, comb = self.attn_hc.compute_weights(x)
+        collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         attn_out = self.self_attn(
-            x=self.input_layernorm(x_reduced),
+            x=self.input_layernorm(collapsed),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
             **attn_kwargs,
         )
-        x = hc_post(attn_out, residual, post, comb)
+        dtype = x.dtype
+        # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
+        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
 
-        # FFN sub-block
-        residual = x
-        x_reduced, post, comb = hc_pre(
-            x,
-            hc_fn=self.hc_ffn_fn,
-            hc_scale=self.hc_ffn_scale,
-            hc_base=self.hc_ffn_base,
-            hc_mult=self.hc_mult,
-            sinkhorn_iters=self.hc_sinkhorn_iters,
-            norm_eps=self.rms_norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        # --- MLP site: same pattern ---
+        pre, post, comb = self.ffn_hc.compute_weights(x)
+        collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
         if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
             self.mlp.gate.set_input_ids(input_ids)
-        ffn_out = self.mlp(self.post_attention_layernorm(x_reduced), padding_mask)
-        x = hc_post(ffn_out, residual, post, comb)
-
-        return x
+        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
+        dtype = x.dtype
+        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device)
         self.mlp.init_weights(buffer_device)
-        # HC params: leave as zeros (matches official random init at first step)
+        # HC mixer params stay at whatever the checkpoint provides (init.normal_
+        # on ``fn``, init.zeros_ on ``base``, init.ones_ on ``scale`` for random
+        # init — matches HF's _init_weights at modular_deepseek_v4.py:923-926).
 
 
 class DeepseekV4HashGate(nn.Module):
@@ -335,6 +307,18 @@ class DeepseekV4Model(nn.Module):
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = DeepseekV4Block(layer_id, config, self.moe_config, backend)
 
+        # Final HC collapse: sigmoid-weighted sum across hc_mult streams before
+        # the shared RMSNorm + lm_head.  Ported from HF PR 45616's
+        # ``DeepseekV4HyperHead``.  Owns ``hc_fn`` / ``hc_base`` / ``hc_scale``
+        # — all kept in fp32 via ``_keep_in_fp32_modules_strict`` (see
+        # ``DeepseekV4ForCausalLM``).
+        self.hc_head = DeepseekV4HyperHead(
+            hc_mult=config.hc_mult,
+            hidden_size=config.hidden_size,
+            hc_eps=float(config.hc_eps),
+            rms_norm_eps=float(config.rms_norm_eps),
+        )
+
         self.norm = initialize_rms_norm_module(
             backend.rms_norm,
             config.hidden_size,
@@ -400,8 +384,11 @@ class DeepseekV4Model(nn.Module):
                 **attn_kwargs,
             )
 
-        # Reduce hc_mult copies -> [B,S,dim] for the final norm + lm_head
-        h_reduced = h.mean(dim=2)
+        # Reduce hc_mult copies -> [B,S,dim] via the learned HC head
+        # (sigmoid-gated weighted sum; NOT a plain mean).  Matches HF
+        # PR 45616's ``DeepseekV4Model.forward`` which calls
+        # ``self.hc_head(hidden_states)`` before the final RMSNorm.
+        h_reduced = self.hc_head(h)
         return self.norm(h_reduced) if self.norm else h_reduced
 
     def update_moe_gate_bias(self) -> None:
@@ -429,7 +416,23 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    # Keep HC mixers and the MoE gate's correction bias in fp32 regardless of
+    # the outer cast policy.  Matches HF PR 45616's
+    # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
+    # of modular_deepseek_v4.py) plus the existing ``e_score_correction_bias``
+    # entry that is specific to KAutomodel's shared Gate buffer.
+    _keep_in_fp32_modules_strict = [
+        "attn_hc.fn",
+        "attn_hc.base",
+        "attn_hc.scale",
+        "ffn_hc.fn",
+        "ffn_hc.base",
+        "ffn_hc.scale",
+        "hc_head.hc_fn",
+        "hc_head.hc_base",
+        "hc_head.hc_scale",
+        "e_score_correction_bias",
+    ]
 
     @classmethod
     def from_config(

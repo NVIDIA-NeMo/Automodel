@@ -130,115 +130,106 @@ class GroupedOutputProjection(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# HC (Hyper-Connections) helpers — pure-torch port of miles PR 1045
-# miles_plugins/models/deepseek_v4/ops/hyper_connection.py + kernel/sinkhorn.py
+# HC (Hyper-Connections) — ported verbatim from HuggingFace transformers
+# PR 45616 (Arthur Zucker, "Add DeepSeek V4").  Source-of-truth reference:
+# ``transformers/src/transformers/models/deepseek_v4/modular_deepseek_v4.py``
+# classes ``DeepseekV4HyperConnection`` (lines 613-670) and
+# ``DeepseekV4HyperHead`` (lines 673-690).
+#
+# The previous pure-torch port (mean-pool / softmax-comb) had three silent
+# divergences vs HF: (a) ``comb`` used row-softmax where HF uses ``sigmoid``,
+# (b) ``post`` had a ``2 *`` prefactor + missing ``+eps``, (c) the mixer was
+# wrapped in ``torch.no_grad()``.  Rather than patch those line-by-line,
+# swap wholesale to the HF classes so future HF updates flow through cleanly
+# via the adapter's state-dict rename rules.
 # ---------------------------------------------------------------------------
 
 
-def _hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-torch equivalent of the tilelang ``hc_split_sinkhorn`` kernel.
+class DeepseekV4HyperConnection(nn.Module):
+    """Per-site HyperConnection mixer (attention or FFN).  Ported from
+    ``transformers/src/transformers/models/deepseek_v4/modular_deepseek_v4.py``
+    class ``DeepseekV4HyperConnection``.
 
-    Splits the ``mixes`` tensor [..., (2+hc)*hc] into three mixer heads:
-      - ``pre``  [..., hc]       : sigmoid-gated router weights + eps
-      - ``post`` [..., hc]       : 2 * sigmoid-gated output router weights
-      - ``comb`` [..., hc, hc]   : doubly-stochastic mixing matrix produced by
-                                    Sinkhorn-normalizing a softmax over rows.
+    Owns ``fn`` (packed linear), ``base`` (bias), and ``scale`` (scalar
+    per-head gains).  ``compute_weights`` produces three mixer tensors:
 
-    Mirrors the kernel's eps placement (added-after-first-row-norm vs
-    added-to-denominator on col-norm and subsequent iterations).
+      - ``pre``   [B, S, H]       : sigmoid-gated collapse weights
+      - ``post``  [B, S, H]       : sigmoid-gated expand weights
+      - ``comb``  [B, S, H, H]    : doubly-stochastic combination matrix
+                                    from Sinkhorn-normalising sigmoid gates
+
+    All math runs in fp32 regardless of the outer cast policy; parameters
+    cast themselves via ``.float()`` on each forward.  HF lists these params
+    in ``_keep_in_fp32_modules_strict`` — the KAutomodel adapter does the
+    same via submodule-name matching.
     """
-    hc = hc_mult
-    pre_raw = mixes[..., :hc]
-    post_raw = mixes[..., hc : 2 * hc]
-    comb_raw = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc)
 
-    pre_base = hc_base[:hc]
-    post_base = hc_base[hc : 2 * hc]
-    comb_base = hc_base[2 * hc :].reshape(hc, hc)
+    def __init__(
+        self,
+        hc_mult: int,
+        hidden_size: int,
+        hc_sinkhorn_iters: int,
+        hc_eps: float,
+        rms_norm_eps: float,
+    ):
+        super().__init__()
+        self.hc_mult = hc_mult
+        self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.hc_eps = hc_eps
+        self.norm_eps = rms_norm_eps
+        mix = (2 + self.hc_mult) * self.hc_mult
+        self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size))
+        self.base = nn.Parameter(torch.empty(mix))
+        self.scale = nn.Parameter(torch.empty(3))
 
-    pre = torch.sigmoid(pre_raw * hc_scale[0] + pre_base) + eps
-    post = 2.0 * torch.sigmoid(post_raw * hc_scale[1] + post_base)
-
-    comb = comb_raw * hc_scale[2] + comb_base
-    # Initial row-softmax + eps, then one column normalize.
-    comb = torch.softmax(comb, dim=-1) + eps
-    col_sum = comb.sum(dim=-2, keepdim=True)
-    comb = comb / (col_sum + eps)
-    # Remaining Sinkhorn iterations: alternating row/col normalization.
-    for _ in range(sinkhorn_iters - 1):
-        row_sum = comb.sum(dim=-1, keepdim=True)
-        comb = comb / (row_sum + eps)
-        col_sum = comb.sum(dim=-2, keepdim=True)
-        comb = comb / (col_sum + eps)
-    return pre, post, comb
-
-
-def hc_pre(
-    x: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    norm_eps: float,
-    hc_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """HC pre-reduce: [B,S,hc_mult,dim] -> [B,S,dim] via sigmoid-gated sum.
-
-    No-grad on the mixer: only the summation ``pre * x_viewed`` flows gradient
-    back into ``x``, matching the reference ``_HYPER_CONNECTION_MIXER_NO_GRAD``.
-    """
-    shape = x.shape
-    orig_dtype = x.dtype
-    x_flat = x.flatten(2).float()  # [B, S, hc_mult*dim]
-    # HC parameters are stored as float32 in the checkpoint but mixed-precision
-    # policies (FSDP MP / cast_model_to_dtype) may downcast them at runtime.
-    # Force back to float32 here so the mixer math stays in fp32 (matches the
-    # reference's ``_keep_fp32 = True`` param marker).
-    hc_fn_f = hc_fn.float()
-    hc_scale_f = hc_scale.float()
-    hc_base_f = hc_base.float()
-    with torch.no_grad():
-        x_sq_mean = x_flat.square().mean(-1, keepdim=True)
-        rsqrt = torch.rsqrt(x_sq_mean + norm_eps)
-        mixes = torch.nn.functional.linear(x_flat, hc_fn_f) * rsqrt  # [B, S, mix_hc]
-        pre, post, comb = _hc_split_sinkhorn(
-            mixes, hc_scale_f, hc_base_f, hc_mult, sinkhorn_iters, hc_eps
+    def compute_weights(
+        self, hidden_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
+        mix = torch.nn.functional.linear(flat, self.fn.float()) * rsqrt  # [B, S, (2+H)*H]
+        pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
+        hc = self.hc_mult
+        pre = torch.sigmoid(mix[..., :hc] * pre_scale + self.base[:hc].float()) + self.hc_eps
+        post = torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + self.base[hc : 2 * hc].float()) + self.hc_eps
+        comb = (
+            torch.sigmoid(
+                mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale
+                + self.base[2 * hc :].view(hc, hc).float()
+            )
+            + self.hc_eps
         )
-    x_viewed = x_flat.view(shape)
-    y = (pre.unsqueeze(-1) * x_viewed).sum(dim=2)
-    return y.to(orig_dtype), post, comb
+        for _ in range(self.hc_sinkhorn_iters):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+        return pre, post, comb
 
 
-def hc_post(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-) -> torch.Tensor:
-    """HC post-expand: combine sub-layer output ``x`` with the multi-copy
-    ``residual`` using the mixer ``(post, comb)`` produced by ``hc_pre``.
+class DeepseekV4HyperHead(nn.Module):
+    """Final HC-stream collapse before the shared RMSNorm + ``lm_head``.
+    Ported from ``modular_deepseek_v4.py`` class ``DeepseekV4HyperHead``.
 
-    Shapes:
-      x        : [B, S, dim]                  (sub-layer output)
-      residual : [B, S, hc_mult, dim]         (pre-sub-layer state, kept intact)
-      post     : [B, S, hc_mult]              (gate on x into each output copy)
-      comb     : [B, S, hc_mult, hc_mult]     (stochastic mix across residual
-                                                copies into each output copy)
+    Sigmoid-weighted sum over the ``hc_mult`` streams (no Sinkhorn).  Used
+    once at the end of ``DeepseekV4Model.forward`` to go from
+    ``[B, S, H, D]`` back to ``[B, S, D]``.
     """
-    orig_dtype = x.dtype
-    # term1[b,s,j,d] = post[b,s,j] * x[b,s,d]
-    term1 = post.unsqueeze(-1) * x.unsqueeze(-2)
-    # term2[b,s,j,d] = sum_i comb[b,s,i,j] * residual[b,s,i,d]
-    term2 = (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=2)
-    return (term1 + term2).to(orig_dtype)
+
+    def __init__(self, hc_mult: int, hidden_size: int, hc_eps: float, rms_norm_eps: float):
+        super().__init__()
+        self.hc_mult = hc_mult
+        self.norm_eps = rms_norm_eps
+        self.eps = hc_eps
+        self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * hidden_size))
+        self.hc_base = nn.Parameter(torch.empty(self.hc_mult))
+        self.hc_scale = nn.Parameter(torch.empty(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        flat = x.flatten(2).float()
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = torch.nn.functional.linear(flat, self.hc_fn.float()) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
+        return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------

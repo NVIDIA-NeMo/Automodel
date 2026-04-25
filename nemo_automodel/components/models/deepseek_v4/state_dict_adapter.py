@@ -121,7 +121,16 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
         r"model.layers.\1.mlp.fc2_latent_proj.\2",
     ),
     # HC (hash-clustering) parameters
-    (re.compile(r"^layers\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))$"), r"model.layers.\1.\2"),
+    # HC (Hyper-Connection) per-site mixers — HF submodule layout:
+    #   layers.{i}.hc_attn_{fn,base,scale}  ->  model.layers.{i}.attn_hc.{fn,base,scale}
+    #   layers.{i}.hc_ffn_{fn,base,scale}   ->  model.layers.{i}.ffn_hc.{fn,base,scale}
+    (re.compile(r"^layers\.(\d+)\.hc_attn_(base|fn|scale)$"), r"model.layers.\1.attn_hc.\2"),
+    (re.compile(r"^layers\.(\d+)\.hc_ffn_(base|fn|scale)$"), r"model.layers.\1.ffn_hc.\2"),
+    # Final HC-head collapse module:
+    #   hc_head_{fn,base,scale}  ->  model.hc_head.hc_{fn,base,scale}
+    # (HF uses ``hc_fn`` / ``hc_base`` / ``hc_scale`` inside HyperHead, in
+    #  contrast to ``fn`` / ``base`` / ``scale`` inside HyperConnection.)
+    (re.compile(r"^hc_head_(fn|base|scale)$"), r"model.hc_head.hc_\1"),
 ]
 
 # Routed-expert pattern in HF V4 format
@@ -423,7 +432,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             re.compile(r"^model\.layers\.(\d+)\.mlp\.fc2_latent_proj\.(.+)$"),
             r"layers.\1.ffn.fc2_latent_proj.\2",
         ),
-        (re.compile(r"^model\.layers\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))$"), r"layers.\1.\2"),
+        # Reverse of the HC submodule renames above.
+        (re.compile(r"^model\.layers\.(\d+)\.attn_hc\.(fn|base|scale)$"), r"layers.\1.hc_attn_\2"),
+        (re.compile(r"^model\.layers\.(\d+)\.ffn_hc\.(fn|base|scale)$"), r"layers.\1.hc_ffn_\2"),
+        (re.compile(r"^model\.hc_head\.hc_(fn|base|scale)$"), r"hc_head_\1"),
     ]
 
     def _internal_key_to_hf(self, key: str) -> str:
