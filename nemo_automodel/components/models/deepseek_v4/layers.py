@@ -63,7 +63,6 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # ---------------------------------------------------------------------------
 # DeepSeek V4 attention + compressor + indexer + rotary embedding, ported

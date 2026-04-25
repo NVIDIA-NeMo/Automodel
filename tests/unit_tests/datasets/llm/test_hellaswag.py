@@ -97,7 +97,6 @@ def test_sample_limiting():
 def test_pad_to_max_length_control():
     """Test that pad_to_max_length parameter is properly passed to processor."""
     from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
-    from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
 
     # Import after the autouse fixture has already patched
     dummy_tokenizer = object()

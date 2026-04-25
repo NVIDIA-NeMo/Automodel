@@ -766,7 +766,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
-        experts = GroupedExpertsDeepEP(moe_config)
+        _ = GroupedExpertsDeepEP(moe_config)
 
         value = torch.randn(4, 8)
         tokens_per_expert = torch.tensor([2, 2])
@@ -777,7 +777,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_apply_bias_with_bias(self, moe_config):
         """Test _apply_bias method with bias."""
-        experts = GroupedExpertsDeepEP(moe_config)
+        _ = GroupedExpertsDeepEP(moe_config)
 
         value = torch.randn(4, 8)
         bias = [torch.randn(8), torch.randn(8)]
@@ -790,7 +790,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_apply_bias_with_probs(self, moe_config):
         """Test _apply_bias method with permuted probabilities."""
-        experts = GroupedExpertsDeepEP(moe_config)
+        _ = GroupedExpertsDeepEP(moe_config)
 
         # The bias application works on flattened tokens (4 tokens total)
         # Split by tokens_per_expert: [2, 2] means first 2 tokens go to expert 0, next 2 to expert 1

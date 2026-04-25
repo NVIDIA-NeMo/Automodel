@@ -17,8 +17,8 @@ import warnings
 import pytest
 import torch
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 class TestBackendConfigGatePrecision:
@@ -152,9 +152,6 @@ class TestBackendConfigEnableDeepepDeprecation:
 
     def test_enable_deepep_none_no_warning(self):
         """Test that enable_deepep=None (default) does not trigger warning."""
-        from nemo_automodel.components.models.common.utils import HAVE_DEEP_EP
-
-        expected_dispatcher = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             config = BackendConfig()

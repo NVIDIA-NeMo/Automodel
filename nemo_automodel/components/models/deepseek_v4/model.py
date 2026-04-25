@@ -370,7 +370,6 @@ class DeepseekV4Model(nn.Module):
         # rather than via dtype, since the stage trimming pass nulls the
         # attribute when the layer is dropped.
         on_first_stage = self.embed_tokens is not None
-        on_last_stage = getattr(self, "norm", None) is not None or getattr(self, "hc_head", None) is not None
 
         if on_first_stage:
             if input_ids is None and inputs_embeds is None:

@@ -13,25 +13,25 @@
 # limitations under the License.
 
 import types
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
-from unittest.mock import Mock, MagicMock, patch
 from torch.distributed.pipelining.schedules import (
-    PipelineScheduleSingle,
     PipelineScheduleMulti,
+    PipelineScheduleSingle,
 )
 
 from nemo_automodel.components.distributed.pipelining.functional import (
-    stage_ids_this_rank,
-    generate_hf_model_fqn_per_model_part,
-    calculate_virtual_stages,
-    split_model_into_stages,
-    build_pipeline_schedule,
-    pipeline_model,
-    _precompute_stage_shapes,
     _get_hidden_and_vocab_size,
+    _precompute_stage_shapes,
+    build_pipeline_schedule,
+    calculate_virtual_stages,
+    generate_hf_model_fqn_per_model_part,
+    pipeline_model,
     reset_pp_stage_shapes,
+    split_model_into_stages,
+    stage_ids_this_rank,
 )
 
 
