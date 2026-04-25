@@ -116,10 +116,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),
         (
-            "LlavaOneVisionForConditionalGeneration",
+            "LLaVAOneVision1_5_ForConditionalGeneration",
             (
                 "nemo_automodel.components.models.llava_onevision.model",
-                "LlavaOneVisionForConditionalGeneration",
+                "LLaVAOneVision1_5_ForConditionalGeneration",
             ),
         ),
         (
@@ -164,7 +164,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
-    "llava_onevision": ("nemo_automodel.components.models.llava_onevision.model", "LlavaOneVisionConfig"),
+    "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
 }
 
