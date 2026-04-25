@@ -74,7 +74,14 @@ model:
     # tid2eid lookup).  With pp_size=2, stage 0 owns layers [0, 1] so all
     # hash layers live where input_ids is available.
     num_hash_layers: 2
-    compress_ratios: [0, 0, 0, 0]
+    # Exercise the full attention zoo on the 4-layer truncated checkpoint:
+    #   layer 0,1: compress_ratio=0  -> pure SWA (no Compressor / Indexer)
+    #   layer 2:   compress_ratio=4  -> CSA (Compressor + Indexer)
+    #   layer 3:   compress_ratio=128 -> HCA (Compressor only)
+    # Matches the first four entries of the released full schedule, so the
+    # compressor / indexer weights for layers 2-3 in the safetensors load
+    # straight into the same modules they were trained as.
+    compress_ratios: [0, 0, 4, 128]
     num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true

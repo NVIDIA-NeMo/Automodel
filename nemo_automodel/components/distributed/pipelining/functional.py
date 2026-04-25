@@ -480,6 +480,12 @@ def split_model_into_stages(
     else:
         lm_head_fqn = "lm_head"
 
+    # DeepSeek V4: model carries an extra compressor-rotary module on every stage
+    # and an HC head on the last stage; both must survive PP module pruning.
+    is_v4_keep = getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
+    has_rotary_emb_compress = is_v4_keep and hasattr(text_model, "rotary_emb_compress")
+    has_hc_head = is_v4_keep and hasattr(text_model, "hc_head")
+
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
         module_names_per_stage = generate_hf_model_fqn_per_model_part(
@@ -493,6 +499,14 @@ def split_model_into_stages(
             fqn_prefix=layers_prefix,
             lm_head_fqn=lm_head_fqn,
         )
+
+        # V4 post-processing: keep the compressor rotary on every stage and the
+        # HC head on the last stage so the V4 PP forward can run end-to-end.
+        if has_rotary_emb_compress:
+            for stage_modules in module_names_per_stage:
+                stage_modules.append(f"{layers_prefix}rotary_emb_compress")
+        if has_hc_head:
+            module_names_per_stage[-1].append(f"{layers_prefix}hc_head")
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int

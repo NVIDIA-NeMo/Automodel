@@ -93,7 +93,54 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     # Per-layer norms
     (re.compile(r"^layers\.(\d+)\.attn_norm\.(.+)$"), r"model.layers.\1.input_layernorm.\2"),
     (re.compile(r"^layers\.(\d+)\.ffn_norm\.(.+)$"), r"model.layers.\1.post_attention_layernorm.\2"),
-    # Attention sub-keys
+    # Attention sub-keys.  Order matters: specific rules must precede the generic
+    # catch-all because regex matching short-circuits on the first match.
+    #
+    # Two structural divergences between the released DSV4-Flash safetensors
+    # (which follow the DeepSeek inference reference's module tree) and HF
+    # PR 45616's flattened layout, which we mirror:
+    #
+    #   1) Compressor's RMSNorm is named ``norm`` on disk but ``kv_norm`` in HF.
+    #   2) Indexer has its OWN nested compressor sub-module on disk
+    #      (``indexer.compressor.{ape,norm,wgate,wkv}``) but HF flattened those
+    #      attributes onto the Indexer itself (``indexer.{ape,kv_norm,wgate,wkv}``).
+    #
+    # Both renames must run before the generic ``attn.(.+)`` catch-all.
+    (re.compile(r"^layers\.(\d+)\.attn\.attn_sink$"), r"model.layers.\1.self_attn.sinks"),
+    # Indexer in HF is nested under Compressor (Compressor.indexer); on disk
+    # Indexer is a sibling of Compressor with its OWN nested compressor:
+    #   on-disk  layers.X.attn.indexer.compressor.{ape,norm,wgate,wkv}
+    #   on-disk  layers.X.attn.indexer.{wq_b,weights_proj}
+    #   our mod  model.layers.X.self_attn.compressor.indexer.{ape,kv_norm,wgate,wkv,wq_b,weights_proj}
+    # So all on-disk ``attn.indexer.*`` keys land under ``self_attn.compressor.indexer.*``.
+    # Specific ``indexer.compressor.*`` rules first (they collapse the nested compressor),
+    # then a catch-all ``indexer.*`` that just adds the ``compressor.`` prefix.
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.norm\.(.+)$"),
+        r"model.layers.\1.self_attn.compressor.indexer.kv_norm.\2",
+    ),
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.ape$"),
+        r"model.layers.\1.self_attn.compressor.indexer.ape",
+    ),
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.wgate\.(.+)$"),
+        r"model.layers.\1.self_attn.compressor.indexer.wgate.\2",
+    ),
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.indexer\.compressor\.wkv\.(.+)$"),
+        r"model.layers.\1.self_attn.compressor.indexer.wkv.\2",
+    ),
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.indexer\.(.+)$"),
+        r"model.layers.\1.self_attn.compressor.indexer.\2",
+    ),
+    # Outer compressor's norm rename (after indexer rules so we don't
+    # accidentally rewrite ``indexer.compressor.norm`` here).
+    (
+        re.compile(r"^layers\.(\d+)\.attn\.compressor\.norm\.(.+)$"),
+        r"model.layers.\1.self_attn.compressor.kv_norm.\2",
+    ),
     (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.self_attn.\2"),
     # MoE gate (score weight + optional bias correction + hash table)
     (re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$"), r"model.layers.\1.mlp.gate.e_score_correction_bias"),
@@ -405,6 +452,34 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         (re.compile(r"^lm_head\.(.+)$"), r"head.\1"),
         (re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.(.+)$"), r"layers.\1.attn_norm.\2"),
         (re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
+        (re.compile(r"^model\.layers\.(\d+)\.self_attn\.sinks$"), r"layers.\1.attn.attn_sink"),
+        # Indexer reverse: our ``compressor.indexer.*`` -> on-disk ``indexer.*``
+        # with the nested compressor un-flattened for projections.
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_norm\.(.+)$"),
+            r"layers.\1.attn.indexer.compressor.norm.\2",
+        ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.ape$"),
+            r"layers.\1.attn.indexer.compressor.ape",
+        ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.wgate\.(.+)$"),
+            r"layers.\1.attn.indexer.compressor.wgate.\2",
+        ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.wkv\.(.+)$"),
+            r"layers.\1.attn.indexer.compressor.wkv.\2",
+        ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.indexer\.(.+)$"),
+            r"layers.\1.attn.indexer.\2",
+        ),
+        # Outer compressor: our ``kv_norm`` -> on-disk ``norm``.
+        (
+            re.compile(r"^model\.layers\.(\d+)\.self_attn\.compressor\.kv_norm\.(.+)$"),
+            r"layers.\1.attn.compressor.norm.\2",
+        ),
         (re.compile(r"^model\.layers\.(\d+)\.self_attn\.(.+)$"), r"layers.\1.attn.\2"),
         # Gate (bias correction key mapped back to `bias`)
         (
@@ -537,6 +612,23 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         "attn.q_norm.weight",
         "attn.kv_norm.weight",
         "attn.attn_sink",
+        # Compressor / Indexer projections (compress_ratio>0 layers).  Stored
+        # as plain BF16 on disk — the released DSV4-Flash safetensors have NO
+        # ``.scale`` companion for any of these, so emitting a fabricated
+        # ``.scale`` placeholder makes the DCP planner ask for a key that does
+        # not exist on disk.  The Indexer's own ``wq_b`` IS FP8 (has a real
+        # ``.scale``) so it stays excluded from this list.
+        "attn.compressor.wgate.weight",
+        "attn.compressor.wkv.weight",
+        "attn.compressor.norm.weight",
+        "attn.compressor.ape",
+        # Indexer (sibling of compressor on disk).  Its nested compressor's
+        # projections are BF16, as are the indexer's ``weights_proj`` and APE.
+        "attn.indexer.compressor.wgate.weight",
+        "attn.indexer.compressor.wkv.weight",
+        "attn.indexer.compressor.norm.weight",
+        "attn.indexer.compressor.ape",
+        "attn.indexer.weights_proj.weight",
         # Latent projections are stored as BF16 in the V4 checkpoint (not FP8).
         "ffn.fc1_latent_proj.weight",
         "ffn.fc2_latent_proj.weight",

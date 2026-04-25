@@ -54,12 +54,13 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
+    DeepseekV4RotaryEmbedding,
+    build_causal_padding_mask,
 )
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -91,7 +92,7 @@ class DeepseekV4Block(nn.Module):
         self.hc_mult = config.hc_mult
 
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-        self.self_attn = DeepseekV4Attention(config, backend)
+        self.self_attn = DeepseekV4Attention(config, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
         # Hash routing: the first ``num_hash_layers`` layers use a fixed
         # tid2eid lookup table instead of the score-based generic Gate.
@@ -125,24 +126,31 @@ class DeepseekV4Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_embeddings_compress: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_compress: nn.Module | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         # x throughout this layer: [B, S, hc_mult, hidden] (HC multi-copy state)
-        if attention_mask is not None and padding_mask is None:
+        # padding_mask is only used by the MoE module; only derive it from a 2D
+        # raw attention_mask (1=valid, 0=pad).  When attention_mask is the 4D
+        # additive mask built upstream, the caller is expected to supply
+        # padding_mask separately (or leave it None for the no-pad case).
+        if attention_mask is not None and padding_mask is None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()
 
         # --- Attention site: collapse → norm → attn → expand ---
         pre, post, comb = self.attn_hc.compute_weights(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
-        attn_out = self.self_attn(
-            x=self.input_layernorm(collapsed),
-            freqs_cis=freqs_cis,
+        attn_out, _ = self.self_attn(
+            hidden_states=self.input_layernorm(collapsed),
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            **attn_kwargs,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
         )
         dtype = x.dtype
         # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
@@ -327,15 +335,20 @@ class DeepseekV4Model(nn.Module):
         )
 
         self.max_seq_len = config.max_position_embeddings
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                config.qk_rope_head_dim,
-                self.max_seq_len,
-                config.rope_theta,
-                config.rope_scaling,
-            ),
-            persistent=False,
+        # Two rotary embeddings (HF PR 45616 pattern): main rope for the token
+        # attention path, compressor rope for the long-range pooled KV branch.
+        # HF partial_rotary_factor = qk_rope_head_dim / head_dim so cos/sin
+        # come out sized to qk_rope_head_dim.
+        partial_rotary_factor = float(config.qk_rope_head_dim) / float(config.head_dim)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(
+            rope_theta=float(config.rope_theta),
+            head_dim=int(config.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
+            head_dim=int(config.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
         )
 
     def forward(
@@ -360,16 +373,28 @@ class DeepseekV4Model(nn.Module):
                 torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
             )
 
-        with torch.no_grad():
-            freqs_cis = freqs_cis_from_position_ids(
-                position_ids,
-                self.freqs_cis,
-                qkv_format=attn_kwargs.get("qkv_format", "bshd"),
-                # Force the non-fused (complex) form so DeepseekV4Attention can
-                # apply the inverse RoPE on the attention output.
-                for_fused_rope=False,
-                cp_size=attn_kwargs.get("cp_size", 1),
-            )
+        # (cos, sin) pairs for the main attention path and the compressor path.
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        position_embeddings_compress = self.rotary_emb_compress(inputs_embeds, position_ids)
+
+        # Build the 4D additive causal+padding mask once at the model level so
+        # every block (and the compressor mask-pad inside attention) operates on
+        # a consistent shape compatible with ``eager_attention_with_sink``.
+        # ``sliding_window`` matches HF's ``create_sliding_window_causal_mask``
+        # call in ``DeepseekV4Model.forward``: every layer uses the band-diagonal
+        # mask of width ``config.sliding_window`` that the released checkpoint
+        # was trained under.  Compressor / Indexer (compress_ratio>0 layers)
+        # extend KV beyond the SWA window via concat; the F.pad inside
+        # ``DeepseekV4Attention.forward`` keeps those extra columns unmasked.
+        sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
+        attention_mask_4d = build_causal_padding_mask(
+            attention_mask,
+            seq_len=inputs_embeds.shape[1],
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            batch_size=inputs_embeds.shape[0],
+            sliding_window=sliding_window,
+        )
 
         # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
         h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
@@ -377,9 +402,13 @@ class DeepseekV4Model(nn.Module):
         for layer in self.layers.values():
             h = layer(
                 x=h,
-                freqs_cis=freqs_cis,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
+                position_embeddings=position_embeddings,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=self.rotary_emb_compress,
+                attention_mask=attention_mask_4d,
+                padding_mask=padding_mask if padding_mask is not None else (
+                    attention_mask.bool().logical_not() if attention_mask is not None else None
+                ),
                 input_ids=input_ids,
                 **attn_kwargs,
             )
@@ -401,12 +430,6 @@ class DeepseekV4Model(nn.Module):
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
-            self.freqs_cis = precompute_freqs_cis(
-                self.config.qk_rope_head_dim,
-                self.max_seq_len,
-                self.config.rope_theta,
-                self.config.rope_scaling,
-            ).to(buffer_device)
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight)
             if self.norm is not None:
@@ -546,13 +569,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
         cast_model_to_dtype(self, dtype)
-        with buffer_device:
-            self.model.freqs_cis = precompute_freqs_cis(
-                self.config.qk_rope_head_dim,
-                self.model.max_seq_len,
-                self.config.rope_theta,
-                self.config.rope_scaling,
-            )
 
 
 ModelClass = DeepseekV4ForCausalLM

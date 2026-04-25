@@ -52,81 +52,479 @@ All layers use full causal attention regardless of compress_ratios.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from nemo_automodel.components.attention.utils import (
-    initialize_attn_module_and_func,
-    postprocess_output_for_attn,
-    preprocess_args_and_kwargs_for_attn,
-)
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    initialize_linear_module,
     initialize_rms_norm_module,
-)
-from nemo_automodel.components.models.deepseek_v3.rope_utils import (
-    apply_rotary_emb_qk,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # ---------------------------------------------------------------------------
-# Grouped output projection (wo_a)
+# DeepSeek V4 attention + compressor + indexer + rotary embedding, ported
+# verbatim from HuggingFace transformers PR 45616 (Arthur Zucker, "Add
+# DeepSeek V4") at
+#   transformers/src/transformers/models/deepseek_v4/modular_deepseek_v4.py
+# with two adjustments:
+#   1) Rotary helper ``apply_rotary_pos_emb`` and ``repeat_kv`` are inlined
+#      so we do not depend on HF's transformers-version-specific rotary API.
+#   2) The ``DeepseekV4Cache`` integration is replaced with a minimal
+#      training-only shim — KAutomodel training never carries a KV cache,
+#      so ``accumulate_windows`` / ``update_pool`` are pass-throughs on a
+#      per-forward scratch dict.  The KV-cache path is left for a future
+#      inference port.
+# The compressor + indexer modules are only constructed when a layer's
+# ``compress_ratio`` is non-zero; the ``validate`` YAML sets all ratios to 0
+# so those modules are dormant in the current smoke run but fully wired.
 # ---------------------------------------------------------------------------
 
 
-class GroupedOutputProjection(nn.Module):
-    """Block-diagonal output projection for DeepSeek V4.
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims of the input (Llama / GPT-NeoX style)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-    Splits the n_heads attention outputs into n_groups groups, projects each
-    group's n_heads_per_group * head_dim dimensions to o_lora_rank, then
-    concatenates.
 
-    Weight shape: [n_groups * o_lora_rank, n_heads_per_group * head_dim]
-                = [8 * 1024, 8 * 512] = [8192, 4096]
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor | None = None,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Port of transformers.models.llama.modeling_llama.apply_rotary_pos_emb."""
+    del position_ids
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
 
-    This matches the official model.py:
-        wo_a = Linear(n_heads * head_dim // n_groups, n_groups * o_lora_rank)
-        wo_a = wo_a.weight.view(n_groups, o_lora_rank, -1)
-        o = einsum("bsgd,grd->bsgr", o_grouped, wo_a)
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Port of transformers.models.llama.modeling_llama.repeat_kv."""
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+
+class DeepseekV4RotaryEmbedding(nn.Module):
+    """V4 rotary embedding.  Produces ``(cos, sin)`` sized to ``qk_rope_head_dim``
+    (via ``partial_rotary_factor = qk_rope_head_dim / head_dim``), matching HF.
     """
+
+    inv_freq: torch.Tensor
 
     def __init__(
         self,
-        n_heads: int,
+        rope_theta: float,
         head_dim: int,
-        o_lora_rank: int,
-        n_groups: int,
-        dtype: torch.dtype = torch.bfloat16,
+        partial_rotary_factor: float,
+        attention_scaling: float = 1.0,
+        device: torch.device | None = None,
     ):
         super().__init__()
-        assert n_heads % n_groups == 0
+        dim = int(head_dim * partial_rotary_factor)
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        self.attention_scaling = attention_scaling
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force fp32 for numerical stability.
+        with torch.autocast(device_type=x.device.type if x.device.type != "mps" else "cpu", enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class DeepseekV4GroupedLinear(nn.Linear):
+    """Block-diagonal grouped linear (HF PR 45616 port).
+
+    ``weight`` parameter has the standard ``nn.Linear`` shape
+    ``[out_features, in_features_per_group]`` so quantizers keyed on
+    ``nn.Linear.weight`` still find it; ``forward`` does per-group bmm.
+    """
+
+    def __init__(self, in_features_per_group: int, out_features: int, n_groups: int, bias: bool = False):
+        super().__init__(in_features_per_group, out_features, bias=bias)
         self.n_groups = n_groups
-        self.n_heads_per_group = n_heads // n_groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., n_groups, in_features_per_group]
+        batch_shape = x.shape[:-2]
+        d_in = x.shape[-1]
+        out_per_group = self.out_features // self.n_groups
+        w = self.weight.view(self.n_groups, out_per_group, d_in)
+        x = x.reshape(-1, self.n_groups, d_in).permute(1, 0, 2)
+        y = torch.bmm(x, w.transpose(-1, -2)).permute(1, 0, 2)
+        return y.reshape(*batch_shape, self.n_groups, out_per_group)
+
+
+class DeepseekV4TrainCache:
+    """Training-only cache shim mirroring the three methods ``DeepseekV4Compressor``
+    / ``DeepseekV4Indexer`` call on ``DeepseekV4Cache``.
+
+    KAutomodel training forward is stateless — we never persist KV or compressor
+    windows across calls.  Each ``DeepseekV4Attention.forward`` creates a fresh
+    cache instance, which holds per-layer scratch dicts for the duration of the
+    call.  When a full window hasn't accumulated yet we return an empty tensor
+    and let the downstream code handle it.
+    """
+
+    def __init__(self):
+        self.compressor_state: list[dict] = []
+        self.indexer_state: list[dict] = []
+
+    def _branch_state(self, state_key: str, layer_idx: int) -> dict:
+        store = getattr(self, state_key, None)
+        if store is None:
+            store = []
+            setattr(self, state_key, store)
+        while len(store) <= layer_idx:
+            store.append({"buffer_kv": None, "buffer_gate": None, "pooled": None})
+        return store[layer_idx]
+
+    def accumulate_windows(
+        self,
+        kv: torch.Tensor,
+        gate: torch.Tensor,
+        layer_idx: int,
+        state_key: str,
+        ratio: int,
+        start_pos: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        state = self._branch_state(state_key, layer_idx)
+        buf_kv, buf_gate = state["buffer_kv"], state["buffer_gate"]
+        if buf_kv is not None and buf_kv.shape[1]:
+            kv = torch.cat([buf_kv, kv], dim=1)
+            gate = torch.cat([buf_gate, gate], dim=1)
+        usable = (kv.shape[1] // ratio) * ratio
+        state["buffer_kv"] = kv[:, usable:]
+        state["buffer_gate"] = gate[:, usable:]
+        pool_base = max(0, start_pos) - (buf_kv.shape[1] if buf_kv is not None else 0)
+        return kv[:, :usable], gate[:, :usable], pool_base
+
+    def update_pool(self, new_pooled: torch.Tensor, layer_idx: int, state_key: str) -> torch.Tensor:
+        state = self._branch_state(state_key, layer_idx)
+        pool = state["pooled"]
+        if new_pooled.shape[1] > 0:
+            pool = new_pooled if pool is None else torch.cat([pool, new_pooled], dim=1)
+            state["pooled"] = pool
+        if pool is None:
+            pool = new_pooled.new_zeros((new_pooled.shape[0], 0, new_pooled.shape[-1]))
+        return pool
+
+
+def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_head_dim: int) -> torch.Tensor:
+    """Split ``x`` along its last dim into nope (first) and rope (last
+    ``rope_head_dim``) slices, rotate only the rope slice, concat back.
+    """
+    nope, rope = x[..., :-rope_head_dim], x[..., -rope_head_dim:]
+    rope, _ = apply_rotary_pos_emb(rope, torch.zeros_like(rope), cos, sin)
+    return torch.cat([nope, rope], dim=-1)
+
+
+def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -> torch.Tensor:
+    """Reshape ``[B, S, ratio, 2*head_dim]`` -> ``[B, S, 2*ratio, head_dim]`` with the
+    cross-window overlap from the DeepSeek inference reference (``Compressor.overlap_transform``
+    in ``dsv4flash/inference/model.py:307-314``).
+
+    Window N consumes:
+      * positions ``[ratio:]`` of the new tensor: the **second half** of the feature dim
+        of window N (current block).
+      * positions ``[:ratio]`` of the new tensor: the **first half** of the feature dim
+        of window N-1 (previous block, i.e. the overlap into the past).
+
+    Window 0 has no previous block, so its ``[:ratio]`` slice is left at ``fill_value``
+    (``0`` for the kv tensor, ``-inf`` for the score tensor so softmax masks it out).
+    """
+    b, s, ratio, _ = tensor.shape
+    new = tensor.new_full((b, s, 2 * ratio, head_dim), fill_value)
+    new[:, :, ratio:] = tensor[:, :, :, head_dim:]
+    new[:, 1:, :ratio] = tensor[:, :-1, :, :head_dim]
+    return new
+
+
+def _pool_windows(
+    kv: torch.Tensor,
+    gate: torch.Tensor,
+    ape: torch.Tensor,
+    ratio: int,
+    head_dim: int,
+    overlap: bool = False,
+) -> torch.Tensor:
+    """Softmax-gated sum-pool over ``ratio`` consecutive tokens.
+
+    Non-overlap mode (HF PR 45616 layout, ratio==128 in V4-Flash):
+      Input  ``kv``/``gate`` of shape ``[B, length, head_dim]``.
+      Reshape to ``[B, length/ratio, ratio, head_dim]`` and pool over the ``ratio`` axis.
+
+    Overlap mode (DeepSeek inference reference layout, ratio==4 in V4-Flash):
+      Input  ``kv``/``gate`` of shape ``[B, length, 2*head_dim]`` (``wkv``/``wgate``
+      project to ``2*head_dim`` so each window can carry both its own kv and a
+      half-overlap into the next window).
+      Reshape to ``[B, length/ratio, ratio, 2*head_dim]``, apply :func:`_overlap_transform`
+      to remap to ``[B, length/ratio, 2*ratio, head_dim]``, then pool over the ``2*ratio``
+      axis.  Each compressed token thus aggregates ``2*ratio = 8`` raw tokens — the
+      ``ratio`` tokens of the current window plus the ``ratio`` tokens of the previous
+      window — giving smoother compression boundaries that the released checkpoint
+      was trained under.
+
+    HF PR 45616 omits the overlap path entirely; the released DSV4-Flash safetensors
+    have ``ape``/``wkv``/``wgate`` shapes that only match the overlap layout (``[ratio,
+    2*head_dim]`` and ``[2*head_dim, hidden]``), so we must support it here to load
+    the released weights.
+    """
+    coff = 2 if overlap else 1
+    feat = coff * head_dim
+    batch, length, _ = kv.shape
+    n_windows = length // ratio
+    kv_w = kv.view(batch, n_windows, ratio, feat)
+    gate_w = gate.view(batch, n_windows, ratio, feat) + ape
+    if overlap:
+        kv_w = _overlap_transform(kv_w, head_dim, fill_value=0.0)
+        gate_w = _overlap_transform(gate_w, head_dim, fill_value=float("-inf"))
+    return (kv_w * gate_w.softmax(dim=2)).sum(dim=2)
+
+
+def _rope_pool_positions(
+    pool_length: int, pool_base: int, ratio: int, device: torch.device, batch: int
+) -> torch.Tensor:
+    return (torch.arange(pool_length, device=device) * ratio + pool_base).unsqueeze(0).expand(batch, -1)
+
+
+def build_causal_padding_mask(
+    attention_mask: torch.Tensor | None,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    batch_size: int = 1,
+    sliding_window: int | None = None,
+) -> torch.Tensor | None:
+    """Build a 4D additive causal+padding (+optional sliding-window) mask
+    compatible with ``eager_attention_with_sink``.
+
+    Mirrors HF's ``create_sliding_window_causal_mask`` (used in
+    ``DeepseekV4Model.forward``): each query at position ``i`` attends only to
+    keys at positions ``[max(0, i - sliding_window + 1), i]``.  The DSV4-Flash
+    weights were trained with this banding on every layer, so dropping it makes
+    the softmax see a different distribution than training and degrades loss.
+
+    Inputs:
+        attention_mask: 2D ``[B, S]`` tensor with 1=valid, 0=padding (HF convention),
+            or already-4D additive mask, or ``None``.
+        sliding_window: if not None, mask out keys further back than this many
+            positions from the query (in addition to causal masking).
+    Returns:
+        ``[B, 1, S, S]`` additive mask of ``dtype`` (0 where keep, large negative
+        where mask).
+    """
+    min_value = torch.finfo(dtype).min if dtype.is_floating_point else -1e9
+    causal = torch.full((seq_len, seq_len), min_value, dtype=dtype, device=device)
+    causal = torch.triu(causal, diagonal=1)
+    if sliding_window is not None and sliding_window > 0:
+        # Mask k_pos < q_pos - (sliding_window - 1)  →  diagonal = -(window - 1)
+        # tril at that diagonal keeps the lower-band; we need to MASK the lower
+        # tail (older keys).  Build a "too old" mask: positions where (q - k) >= window.
+        idx = torch.arange(seq_len, device=device)
+        too_old = (idx.unsqueeze(0) - idx.unsqueeze(1)) >= sliding_window  # [k_pos, q_pos] ?
+        # We want shape [q_pos, k_pos], so use [q_pos=row, k_pos=col]:
+        too_old = (idx.unsqueeze(1) - idx.unsqueeze(0)) >= sliding_window
+        causal = causal.masked_fill(too_old, min_value)
+    causal = causal.unsqueeze(0).unsqueeze(0)  # [1,1,S,S]
+    if attention_mask is None:
+        return causal.expand(batch_size, 1, seq_len, seq_len).contiguous()
+    if attention_mask.dim() == 4:
+        return attention_mask.to(dtype)
+    if attention_mask.dim() == 2:
+        # 1=valid, 0=padding -> 0 keep, min_value mask, broadcast over query rows
+        pad_add = (1.0 - attention_mask.to(dtype)) * min_value  # [B, S]
+        pad_add = pad_add.unsqueeze(1).unsqueeze(2)  # [B,1,1,S]
+        return (causal + pad_add).to(dtype)
+    raise ValueError(f"Unsupported attention_mask rank: {attention_mask.dim()}")
+
+
+def eager_attention_with_sink(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager attention with per-head sink: appends an extra softmax column
+    whose logit is ``module.sinks[h]`` and whose value-slot is zero.  Ported
+    verbatim from HF PR 45616.
+    """
+    del kwargs
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
+    combined = combined - combined.max(dim=-1, keepdim=True).values
+    probs = F.softmax(combined, dim=-1, dtype=combined.dtype)[..., :-1]
+    probs = F.dropout(probs, p=dropout, training=module.training).to(value_states.dtype)
+    return torch.matmul(probs, value_states).transpose(1, 2).contiguous(), probs
+
+
+class DeepseekV4Indexer(nn.Module):
+    """HF PR 45616 port.  Picks the top-k compressed positions per query when
+    ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
+    query projection + weights_proj head-mixer.
+    """
+
+    def __init__(self, config: DeepseekV4Config):
+        super().__init__()
+        self.compress_ratio = 4
+        # Indexer's pool is always at compress_ratio==4, which means overlap mode
+        # (matching the released checkpoint's ``indexer.compressor.{ape,wkv,wgate}``
+        # shapes of ``[ratio, 2*index_head_dim]`` / ``[2*index_head_dim, hidden_size]``).
+        self.overlap = True
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
+        self.softmax_scale = self.head_dim**-0.5
+        proj_dim = 2 * self.head_dim  # overlap mode
+        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False)
+        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
+        self.ape = nn.Parameter(torch.zeros(self.compress_ratio, proj_dim))
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
+        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_residual: torch.Tensor,
+        rotary: nn.Module,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cache: DeepseekV4TrainCache,
+        layer_idx: int,
+        start_pos: int,
+    ) -> torch.LongTensor:
+        batch, seq_len, _ = hidden_states.shape
+        kv = self.wkv(hidden_states)
+        gate = self.wgate(hidden_states)
+        ready_kv, ready_gate, pool_base = cache.accumulate_windows(
+            kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
+        )
+        new_pooled = self.kv_norm(
+            _pool_windows(
+                ready_kv,
+                ready_gate,
+                self.ape,
+                self.compress_ratio,
+                self.head_dim,
+                overlap=self.overlap,
+            )
+        )
+        if new_pooled.shape[1] > 0:
+            positions = _rope_pool_positions(
+                new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, new_pooled.shape[0]
+            )
+            cos, sin = rotary(new_pooled, positions)
+            new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+        pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
+
+        cos, sin = position_embeddings
+        q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
+        scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
+        scores = F.relu(scores) * self.softmax_scale
+        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
+        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
+        topk = min(self.index_topk, pooled_kv.shape[1])
+        return index_scores.topk(topk, dim=-1).indices
+
+
+class DeepseekV4Compressor(nn.Module):
+    """HF PR 45616 port.  Long-range KV branch.  Pools ``compress_ratio`` tokens
+    into one compressed KV; when ``ratio == 4`` the Indexer narrows the pool.
+    """
+
+    def __init__(self, config: DeepseekV4Config, compress_ratio: int, head_dim: int):
+        super().__init__()
+        self.compress_ratio = compress_ratio
         self.head_dim = head_dim
-        self.o_lora_rank = o_lora_rank
-        in_per_group = self.n_heads_per_group * head_dim  # 8 * 512 = 4096
-        out_total = n_groups * o_lora_rank  # 8 * 1024 = 8192
-        self.weight = nn.Parameter(torch.zeros(out_total, in_per_group, dtype=dtype))
+        self.rope_head_dim = config.qk_rope_head_dim
+        # Overlap mode (compress_ratio==4) doubles the feature dim of wkv / wgate /
+        # ape — the released DSV4-Flash checkpoint was trained that way to give each
+        # compressed token cross-window context. Non-overlap mode (compress_ratio==128)
+        # keeps a flat head_dim. ``kv_norm`` always normalizes over ``head_dim`` because
+        # the overlap_transform inside ``_pool_windows`` collapses 2*head_dim → head_dim
+        # before the norm runs.
+        self.overlap = compress_ratio == 4
+        coff = 2 if self.overlap else 1
+        proj_dim = coff * head_dim
+        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False)
+        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
+        self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim))
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
+        self.indexer: DeepseekV4Indexer | None = (
+            DeepseekV4Indexer(config) if compress_ratio == 4 else None
+        )
 
-    def forward(self, o: torch.Tensor) -> torch.Tensor:
-        # o: [..., n_heads, head_dim]
-        shape = o.shape[:-2]
-        # -> [..., n_groups, n_heads_per_group * head_dim]
-        o_g = o.reshape(*shape, self.n_groups, self.n_heads_per_group * self.head_dim)
-        # weight: [n_groups * o_lora_rank, n_heads_per_group * head_dim]
-        #      -> [n_groups, o_lora_rank, n_heads_per_group * head_dim]
-        w = self.weight.reshape(self.n_groups, self.o_lora_rank, self.n_heads_per_group * self.head_dim)
-        # einsum: [..., g, d] x [g, r, d]^T -> [..., g, r]
-        out = torch.einsum("...gd,grd->...gr", o_g, w)
-        # -> [..., n_groups * o_lora_rank]
-        return out.reshape(*shape, self.n_groups * self.o_lora_rank)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_residual: torch.Tensor | None,
+        rotary: nn.Module,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cache: DeepseekV4TrainCache,
+        layer_idx: int,
+        start_pos: int,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = hidden_states.shape
+        kv = self.wkv(hidden_states)
+        gate = self.wgate(hidden_states)
+        ready_kv, ready_gate, pool_base = cache.accumulate_windows(
+            kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
+        )
+        new_pooled = self.kv_norm(
+            _pool_windows(
+                ready_kv,
+                ready_gate,
+                self.ape,
+                self.compress_ratio,
+                self.head_dim,
+                overlap=self.overlap,
+            )
+        )
+        positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
+        cos, sin = rotary(new_pooled, positions)
+        new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+        pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
 
-    def init_weights(self, init_std: float = 0.02) -> None:
-        nn.init.trunc_normal_(self.weight, mean=0.0, std=init_std)
+        if self.indexer is not None:
+            topk = self.indexer(hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos)
+            expanded = pooled.unsqueeze(2).expand(-1, -1, seq_len, -1, -1)
+            idx = topk.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, self.head_dim)
+            pooled = torch.gather(expanded, 3, idx).reshape(batch, 1, -1, self.head_dim)
+        return pooled
 
 
 # ---------------------------------------------------------------------------
@@ -233,218 +631,150 @@ class DeepseekV4HyperHead(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Main attention layer
+# DeepseekV4Attention — port of HF PR 45616's DeepseekV4Attention with:
+#   - no inheritance from DeepseekV3Attention (we don't want the HF
+#     PreTrainedModel scaffolding);
+#   - ``position_embeddings`` passed in from DeepseekV4Model as a ``(cos, sin)``
+#     tuple produced by a matching ``DeepseekV4RotaryEmbedding`` (plus a
+#     separate rotary / position_embeddings pair for the compressor path);
+#   - ``past_key_values`` always ``None`` on the training path; the compressor
+#     / indexer use a per-forward ``DeepseekV4TrainCache`` shim that behaves
+#     the same as HF's ``DeepseekV4Cache`` within a single call;
+#   - a fixed dispatch to ``eager_attention_with_sink`` (KAutomodel does not
+#     register attention backends in HF's ``ALL_ATTENTION_FUNCTIONS`` table,
+#     and the sink fold-in needs this path specifically).
 # ---------------------------------------------------------------------------
 
 
 class DeepseekV4Attention(nn.Module):
-    """GQA attention with Q/O LoRA for DeepSeek V4.
+    """Sliding-window attention + Compressor + Indexer + attention sink.
 
-    K = V = wkv(x):  a single head_dim latent vector used as both key and value.
-    attn_sink      :  per-head scalar bias (shape [n_heads]) applied to the
-                      "sink" position in sparse_attn.  Stored as float32.
-    wo_a           :  grouped projection, weight [n_groups*o_lora_rank,
-                                                   n_heads_per_group*head_dim].
+    Single-head KV (``num_key_value_heads=1``), grouped low-rank output via
+    :class:`DeepseekV4GroupedLinear`.  ``compress_ratio == 0`` layers skip
+    the compressor / indexer and run pure SWA.
     """
 
-    def __init__(self, config: DeepseekV4Config, backend: BackendConfig):
+    def __init__(self, config: DeepseekV4Config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
-
-        self.n_heads = config.num_attention_heads
+        self.config = config
+        self.layer_idx = layer_idx
+        self.compress_ratio = int(config.compress_ratios[layer_idx]) if config.compress_ratios else 0
+        self.num_heads = config.num_attention_heads
+        # Single KV head broadcast to all attention heads (``num_key_value_groups == num_heads``).
+        self.num_key_value_groups = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
-        self.q_lora_rank = config.q_lora_rank
-        self.o_lora_rank = config.o_lora_rank
-        self.o_groups = config.o_groups
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.sliding_window = int(getattr(config, "sliding_window", 128) or 128)
+        self.attention_dropout = float(getattr(config, "attention_dropout", 0.0) or 0.0)
+        self.is_causal = True
+        self.scaling = self.head_dim**-0.5
 
-        self.backend = backend
-        self.rope_fusion = backend.rope_fusion
-        linear_impl = backend.linear
-        rms_norm_impl = backend.rms_norm
-        hidden_size = config.hidden_size
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
-
-        # Q LoRA
-        self.wq_a = initialize_linear_module(linear_impl, hidden_size, self.q_lora_rank, bias=False, dtype=model_dtype)
-        self.q_norm = initialize_rms_norm_module(
-            rms_norm_impl, self.q_lora_rank, eps=config.rms_norm_eps, dtype=model_dtype
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.q_norm = initialize_rms_norm_module("torch_fp32", config.q_lora_rank, eps=config.rms_norm_eps)
+        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
+        self.wo_a = DeepseekV4GroupedLinear(
+            self.num_heads * self.head_dim // config.o_groups,
+            config.o_groups * config.o_lora_rank,
+            config.o_groups,
         )
-        self.wq_b = initialize_linear_module(
-            linear_impl, self.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=model_dtype
-        )
+        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.sinks = nn.Parameter(torch.zeros(self.num_heads))
 
-        # Combined KV projection: K = V = wkv(x), single latent of dim head_dim
-        self.wkv = initialize_linear_module(linear_impl, hidden_size, self.head_dim, bias=False, dtype=model_dtype)
-        self.kv_norm = initialize_rms_norm_module(
-            rms_norm_impl, self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
-        )
-
-        # Grouped output projection
-        self.wo_a = GroupedOutputProjection(
-            n_heads=self.n_heads,
-            head_dim=self.head_dim,
-            o_lora_rank=self.o_lora_rank,
-            n_groups=self.o_groups,
-            dtype=model_dtype,
-        )
-        self.wo_b = initialize_linear_module(
-            linear_impl, self.o_groups * self.o_lora_rank, hidden_size, bias=False, dtype=model_dtype
-        )
-
-        # Attention sink: per-head learnable scalar (stored in float32 per official impl).
-        # Shape: [n_heads] — acts as an extra "sink" logit appended to the softmax
-        # denominator of every query row.  The sink column does not correspond to any
-        # token, so it contributes nothing to the output but lets probability mass
-        # drain away from real tokens for heads that should attend to "nothing".
-        self.register_parameter(
-            "attn_sink",
-            nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32), requires_grad=True),
-        )
-
-        # V4 uses the plain head_dim^-0.5 scale — unlike V3, the reference
-        # model.py line 464 does NOT fold in a YaRN mscale correction.  Applying
-        # mscale*mscale here (as V3 does) makes attention scores ~1.6x sharper
-        # than the trained model expects and shifts every layer's output
-        # distribution, which at step 0 shows up as logits std=3.5 and
-        # argmax_match=0% despite correctly loaded weights.
-        self.softmax_scale = self.head_dim**-0.5
-
-        # V4 uses 1 KV head (K=V=kv), so num_gqa_groups = n_heads for standard GQA path
-        self.attn_module, self.attn_func = initialize_attn_module_and_func(
-            attn_impl=backend.attn,
-            num_attention_heads=self.n_heads,
-            num_qk_channels=self.head_dim,
-            num_v_channels=self.head_dim,
-            softmax_scale=self.softmax_scale,
-            # GQA with n_kv_heads=1: num_gqa_groups=n_heads
-            num_gqa_groups=self.n_heads,
+        self.compressor = (
+            DeepseekV4Compressor(config, self.compress_ratio, self.head_dim)
+            if self.compress_ratio
+            else None
         )
 
     def forward(
         self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
-        **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if x.dim() == 2:
-            qkv_format = "thd"
-            num_tokens = x.shape[0]
-            bsz, seq_len = 1, num_tokens
-        else:
-            qkv_format = "bshd"
-            bsz, seq_len, _ = x.shape
+        position_embeddings_compress: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        rotary_compress: nn.Module | None = None,
+        start_pos: int = 0,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        del kwargs
+        batch, seq_len = hidden_states.shape[:2]
+        cos, sin = position_embeddings
 
-        # --- Q path ---
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        if qkv_format == "thd":
-            q = q.view(num_tokens, self.n_heads, self.head_dim)
-        else:
-            q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
+        q_residual = self.q_norm(self.wq_a(hidden_states))
+        q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
 
-        # Per-head RMSNorm on Q (as in official model: q *= rsqrt(q.sq.mean(-1, keepdim=True)))
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + 1e-6).to(q.dtype)
+        # Per-head, non-learnable rsqrt on Q before RoPE.  This step is in the
+        # official DeepSeek inference reference (`dsv4flash/inference/model.py:498`)
+        # but is missing from HF transformers PR 45616 (modular_deepseek_v4.py
+        # lines 552-557 go straight from wq_b to apply_partial_rope).  The
+        # released DSV4-Flash weights were trained expecting this normalization,
+        # so without it q·kᵀ has the wrong scale, the softmax becomes peaky, and
+        # downstream loss is severely degraded (~16-19 vs the expected ~3-6 on
+        # this validate setup).  Keep this line until HF reconciles the PR with
+        # the inference reference; if HF later adds an equivalent step, we can
+        # drop this and inherit theirs.
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
 
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
+        kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
-        # --- KV path: K = V = single latent ---
-        kv = self.kv_norm(self.wkv(x))  # [..., head_dim]
-        kv_nope, kv_pe = torch.split(kv, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        full_kv = kv
 
-        # RoPE — V4 applies rotation to q/k here and an INVERSE rotation to the
-        # attention output later, before wo_a (see the official model.py).  The
-        # TE fused-rope path does not give us a complex freqs_cis to conjugate,
-        # so force the non-fused (complex) path for V4.
-        cu_seqlens = attn_kwargs.get("cu_seqlens", None)
-        # kv_pe needs a head dimension for apply_rotary_emb_qk
-        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
-        kv_pe = kv_pe.unsqueeze(head_unsqueeze_dim)
-        q_pe, kv_pe = apply_rotary_emb_qk(
-            q_pe,
-            kv_pe,
-            freqs_cis,
-            format=qkv_format,
-            rope_fusion=False,
-            cu_seqlens=cu_seqlens,
-            cp_size=attn_kwargs.get("cp_size", 1),
-            cp_rank=attn_kwargs.get("cp_rank", 0),
+        if self.compressor is not None:
+            assert rotary_compress is not None and position_embeddings_compress is not None, (
+                "DeepseekV4Attention: compressor enabled but no rotary_compress / "
+                "position_embeddings_compress supplied by the Block/Model."
+            )
+            cache = DeepseekV4TrainCache()
+            pooled = self.compressor(
+                hidden_states,
+                q_residual=q_residual,
+                rotary=rotary_compress,
+                position_embeddings=position_embeddings_compress,
+                cache=cache,
+                layer_idx=self.layer_idx,
+                start_pos=start_pos,
+            )
+            full_kv = torch.cat([full_kv, pooled], dim=2)
+
+        if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
+            attention_mask = F.pad(
+                attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0
+            )
+
+        attn_output, attn_weights = eager_attention_with_sink(
+            self,
+            q,
+            full_kv,
+            full_kv,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
         )
-        kv_pe = kv_pe.squeeze(head_unsqueeze_dim)
 
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        kv = torch.cat([kv_nope, kv_pe], dim=-1)
+        # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
+        # HF uses).  Reference: modular_deepseek_v4.py:607.
+        attn_output = _apply_partial_rope(
+            attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim
+        ).transpose(1, 2)
 
-        # Expand kv to n_heads (K=V shared across all heads) for standard attention path
-        if qkv_format == "thd":
-            k = kv.unsqueeze(1).expand(num_tokens, self.n_heads, self.head_dim)
-            v = k  # K = V
-        else:
-            k = kv.unsqueeze(2).expand(bsz, seq_len, self.n_heads, self.head_dim)
-            v = k  # K = V
-
-        # Manual scaled dot-product attention with per-head attn_sink.
-        # The default preprocess/attn_func path uses is_causal=True which skips the
-        # bias we need for the sink. Keep the attention math in fp32 for stability.
-        if qkv_format == "bshd":
-            # [B, S, H, D] -> [B, H, S, D]
-            q_a = q.transpose(1, 2)
-            k_a = k.transpose(1, 2)
-            v_a = v.transpose(1, 2)
-        else:
-            # thd (single packed sequence) -> [1, H, T, D]
-            q_a = q.unsqueeze(0).transpose(1, 2)
-            k_a = k.unsqueeze(0).transpose(1, 2)
-            v_a = v.unsqueeze(0).transpose(1, 2)
-
-        s_len = q_a.size(-2)
-        scores = torch.matmul(q_a.float(), k_a.float().transpose(-2, -1)) * self.softmax_scale
-        causal_mask = torch.triu(
-            torch.ones(s_len, s_len, dtype=torch.bool, device=scores.device), diagonal=1
-        )
-        scores = scores.masked_fill(causal_mask, float("-inf"))
-        # Append per-head sink logit: attn_sink[h] acts as an extra softmax column
-        # whose value slot is zero (contributes nothing to the output).
-        sink = self.attn_sink.float().view(1, -1, 1, 1).expand(scores.size(0), -1, s_len, 1)
-        scores_ext = torch.cat([scores, sink], dim=-1)
-        probs = torch.softmax(scores_ext, dim=-1)[..., :-1]
-        o_a = torch.matmul(probs.to(v_a.dtype), v_a)  # [B, H, S, D]
-
-        if qkv_format == "bshd":
-            o = o_a.transpose(1, 2).contiguous()  # [B, S, H, D]
-        else:
-            o = o_a.squeeze(0).transpose(0, 1).contiguous()  # [T, H, D]
-
-        # --- O path (grouped) ---
-        # o: [bsz, seq, n_heads, head_dim] or [num_tokens, n_heads, head_dim]
-        # Apply INVERSE RoPE to the pe part of o before the output projection,
-        # matching the official model.py:
-        #   apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
-        # Without this, wo_a sees a rotated representation that its trained
-        # weights do not expect — empirically this produces ~N(0, 3.5) logits
-        # that gravitate to a few attractor tokens (argmax_match = 0%).
-        o_nope, o_pe = torch.split(o, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # Build a complex conjugate freqs_cis view and multiply.  freqs_cis here
-        # is the non-fused complex form produced by freqs_cis_from_position_ids
-        # (see the rope_fusion=False change above).
-        o_pe_c = torch.view_as_complex(o_pe.float().view(*o_pe.shape[:-1], -1, 2))
-        fc = freqs_cis.conj()
-        # For bshd tensors fc shape is [B, S, rope_head_dim/2]; for thd it is
-        # [T, rope_head_dim/2]. Broadcast over the n_heads axis.
-        if qkv_format == "bshd":
-            fc = fc.view(fc.size(0), fc.size(1), 1, fc.size(-1))
-        else:
-            fc = fc.view(fc.size(0), 1, fc.size(-1))
-        o_pe_c = o_pe_c * fc
-        o_pe = torch.view_as_real(o_pe_c).flatten(-2).to(o_pe.dtype)
-        o = torch.cat([o_nope, o_pe], dim=-1)
-        x_out = self.wo_b(self.wo_a(o))  # wo_a handles the reshape internally
-        return x_out
+        grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
+        return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
-        for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
-        self.wo_a.init_weights(init_std)
+        for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
+            if hasattr(linear, "weight"):
+                nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()
-        nn.init.zeros_(self.attn_sink)
+        nn.init.zeros_(self.sinks)
+        if self.compressor is not None:
+            for mod in self.compressor.modules():
+                if isinstance(mod, nn.Linear):
+                    nn.init.trunc_normal_(mod.weight, mean=0.0, std=init_std)
+            nn.init.zeros_(self.compressor.ape)
+            if self.compressor.indexer is not None:
+                nn.init.zeros_(self.compressor.indexer.ape)

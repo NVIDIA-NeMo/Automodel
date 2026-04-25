@@ -487,13 +487,9 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Lazy-import to avoid pulling the deepseek_v3 module at PP registration time.
-        from nemo_automodel.components.models.deepseek_v3.rope_utils import (
-            freqs_cis_from_position_ids,
-        )
-
         has_embed = getattr(self, "embed_tokens", None) is not None
         has_norm = getattr(self, "norm", None) is not None
+        has_hc_head = getattr(self, "hc_head", None) is not None
 
         # Produce the [B, S, hc_mult, dim] hidden state for this stage.
         if has_embed:
@@ -517,24 +513,37 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
             else:
                 raise ValueError("V4 PP non-first stage expects a float tensor carrying hidden state")
 
-        # Per-stage rotary frequencies (freqs_cis buffer is replicated on every stage).
+        # Build (cos, sin) for the main and compressor rotary streams using the
+        # rotary modules registered on the model (replicated on every PP stage).
         if position_ids is None:
             seq_len = h.shape[1]
             position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0).expand(h.shape[0], -1)
-        with torch.no_grad():
-            freqs_cis = freqs_cis_from_position_ids(
-                position_ids,
-                self.freqs_cis,
-                qkv_format=kwargs.get("qkv_format", "bshd"),
-                # Must match DeepseekV4Model.forward: V4 requires the complex
-                # form so the attention block can apply inverse RoPE on its
-                # output before wo_a.
-                for_fused_rope=False,
-                cp_size=kwargs.get("cp_size", 1),
-            )
+        position_embeddings = self.rotary_emb(h, position_ids)
+        position_embeddings_compress = (
+            self.rotary_emb_compress(h, position_ids)
+            if getattr(self, "rotary_emb_compress", None) is not None
+            else None
+        )
 
-        if attention_mask is not None and padding_mask is None:
+        # Derive padding_mask before we replace attention_mask with its 4D form.
+        if attention_mask is not None and padding_mask is None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()
+
+        # Build the 4D additive causal+padding mask compatible with the per-block
+        # ``eager_attention_with_sink`` path.  Match HF's
+        # ``create_sliding_window_causal_mask`` by enabling the band-diagonal
+        # restriction at the trained ``sliding_window`` width.
+        from nemo_automodel.components.models.deepseek_v4.layers import build_causal_padding_mask
+
+        sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
+        attention_mask = build_causal_padding_mask(
+            attention_mask,
+            seq_len=h.shape[1],
+            dtype=h.dtype,
+            device=h.device,
+            batch_size=h.shape[0],
+            sliding_window=sliding_window,
+        )
 
         # input_ids is only available on the first PP stage; later stages pass
         # None (hash-routing layers should be packed onto stage 0 to receive it).
@@ -547,15 +556,20 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
                     continue
                 h = layer(
                     x=h,
-                    freqs_cis=freqs_cis,
+                    position_embeddings=position_embeddings,
+                    position_embeddings_compress=position_embeddings_compress,
+                    rotary_compress=getattr(self, "rotary_emb_compress", None),
                     attention_mask=attention_mask,
                     padding_mask=padding_mask,
                     input_ids=stage_input_ids,
                 )
 
-        # Last inner stage: collapse the hc_mult axis and apply the final norm.
+        # Last inner stage: collapse the hc_mult axis via the learned HC head
+        # (matches DeepseekV4Model.forward) and apply the final norm.
+        if has_hc_head:
+            h = self.hc_head(h)
         if has_norm:
-            h = self.norm(h.mean(dim=2))
+            h = self.norm(h)
         return h
 
     return pipeline_forward_deepseek_v4
