@@ -59,8 +59,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
-    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
-    name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4-Flash
     num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
@@ -88,7 +88,7 @@ dataset:
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 packed_sequence:
   packed_sequence_size: 0
@@ -106,7 +106,7 @@ validation_dataset:
   split: validation
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
