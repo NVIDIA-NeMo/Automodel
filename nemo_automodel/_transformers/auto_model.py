@@ -94,6 +94,7 @@ from nemo_automodel._transformers.model_init import (
     _init_model,
     get_hf_config,
     get_is_hf_model,
+    initialize_custom_model_from_config,
     no_hf_meta_device,
     resolve_sdpa_method,
 )
@@ -421,6 +422,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logger.warning("Falling back to %s attention.", attn_implementation)
                 return _retry(attn_implementation=attn_implementation)
             raise
+
+        # For custom models built from config (not loading pretrained weights),
+        # materialize and initialize weights. This runs OUTSIDE init_ctx so that
+        # register_parameter works normally during weight initialization.
+        if is_custom_model and not load_base_model:
+            initialize_custom_model_from_config(model, torch_dtype)
 
         # Kernel patching
         try:
