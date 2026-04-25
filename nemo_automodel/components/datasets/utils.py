@@ -390,7 +390,7 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
         position is **allowed** to attend.
     """
     # attention_mask: [B, S]
-    B, S = attention_mask.shape
+    _, S = attention_mask.shape
 
     # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
     mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
