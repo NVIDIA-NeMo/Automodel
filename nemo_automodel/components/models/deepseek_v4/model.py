@@ -142,30 +142,67 @@ class DeepseekV4Block(nn.Module):
         if attention_mask is not None and padding_mask is None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()
 
+        # Intra-block debug dump (paired with reference Block.forward).
+        # Files written under ``$DSV4_DEBUG_DUMP/rank{R}/`` with the schema
+        # ``L{N:02d}_{stage}.pt``.  Used by tools/dsv4_state_parity to bisect
+        # where divergence enters within a block.
+        import os as _os
+        try:
+            import torch.distributed as _dist
+
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        except Exception:
+            _rank = 0
+        _root = _os.environ.get("DSV4_DEBUG_DUMP")
+        _dump_dir = f"{_root}/rank{_rank:02d}" if _root else None
+        _li = self.layer_idx
+
+        def _idump(stage: str, t: torch.Tensor) -> None:
+            if _dump_dir:
+                _os.makedirs(_dump_dir, exist_ok=True)
+                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_dump_dir}/L{_li:02d}_{stage}.pt")
+
         # --- Attention site: collapse → norm → attn → expand ---
         pre, post, comb = self.attn_hc.compute_weights(x)
+        _idump("attn_pre", pre)
+        _idump("attn_post", post)
+        _idump("attn_comb", comb)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
+        _idump("attn_collapsed", collapsed)
+        attn_normed = self.input_layernorm(collapsed)
+        _idump("attn_normed", attn_normed)
         attn_out, _ = self.self_attn(
-            hidden_states=self.input_layernorm(collapsed),
+            hidden_states=attn_normed,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_embeddings_compress=position_embeddings_compress,
             rotary_compress=rotary_compress,
         )
+        _idump("attn_out", attn_out)
         dtype = x.dtype
         # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
         x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        _idump("post_attn_x", x)
 
         # --- MLP site: same pattern ---
         pre, post, comb = self.ffn_hc.compute_weights(x)
+        _idump("ffn_pre", pre)
+        _idump("ffn_post", post)
+        _idump("ffn_comb", comb)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
+        _idump("ffn_collapsed", collapsed)
+        ffn_normed = self.post_attention_layernorm(collapsed)
+        _idump("ffn_normed", ffn_normed)
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
         if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
             self.mlp.gate.set_input_ids(input_ids)
-        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
+        mlp_out = self.mlp(ffn_normed, padding_mask)
+        _idump("mlp_out", mlp_out)
         dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        out = post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        _idump("post_mlp_x", out)
+        return out
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()
@@ -361,45 +398,93 @@ class DeepseekV4Model(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+        # PP-aware forward (same pattern as DeepseekV3Model.forward).
+        # Stage 0 of pipeline parallelism owns ``embed_tokens`` and receives
+        # raw token ids; subsequent stages have ``embed_tokens=None`` and
+        # receive the previous stage's hidden state in the ``input_ids`` slot
+        # (already 4D ``[B, S, hc_mult, hidden]`` because ``DeepseekV4Block``
+        # preserves the HC stream axis).  Detect via ``self.embed_tokens is None``
+        # rather than via dtype, since the stage trimming pass nulls the
+        # attribute when the layer is dropped.
+        on_first_stage = self.embed_tokens is not None
+        on_last_stage = getattr(self, "norm", None) is not None or getattr(self, "hc_head", None) is not None
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        if on_first_stage:
+            if input_ids is None and inputs_embeds is None:
+                raise ValueError("First PP stage requires input_ids or inputs_embeds")
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
+            h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            shape_ref = inputs_embeds  # 3D ref for rotary / mask sizing
+        else:
+            # Mid-stage: ``input_ids`` is actually the upstream activation.
+            # Either positional (4D float) or via ``inputs_embeds=`` kwarg.
+            h = input_ids if input_ids is not None else inputs_embeds
+            if h is None:
+                raise ValueError("Non-first PP stage expects an inter-stage activation")
+            # h is [B, S, hc_mult, hidden]; shape_ref needs 3D [B, S, hidden].
+            shape_ref = h.flatten(start_dim=2)[:, :, : self.config.hidden_size]
 
         if position_ids is None:
-            seq_len = inputs_embeds.shape[1]
+            seq_len = shape_ref.shape[1]
             position_ids = (
-                torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(inputs_embeds.shape[0], -1)
+                torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
             )
 
         # (cos, sin) pairs for the main attention path and the compressor path.
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
-        position_embeddings_compress = self.rotary_emb_compress(inputs_embeds, position_ids)
+        # Rotary modules live on every stage (PP keep-list ensures it).
+        position_embeddings = self.rotary_emb(shape_ref, position_ids)
+        position_embeddings_compress = self.rotary_emb_compress(shape_ref, position_ids)
 
-        # Build the 4D additive causal+padding mask once at the model level so
-        # every block (and the compressor mask-pad inside attention) operates on
-        # a consistent shape compatible with ``eager_attention_with_sink``.
-        # ``sliding_window`` matches HF's ``create_sliding_window_causal_mask``
-        # call in ``DeepseekV4Model.forward``: every layer uses the band-diagonal
-        # mask of width ``config.sliding_window`` that the released checkpoint
-        # was trained under.  Compressor / Indexer (compress_ratio>0 layers)
-        # extend KV beyond the SWA window via concat; the F.pad inside
-        # ``DeepseekV4Attention.forward`` keeps those extra columns unmasked.
+        # Build the 4D additive causal+padding+SWA mask.  Same band-diagonal
+        # pattern HF's ``create_sliding_window_causal_mask`` produces; every
+        # layer in the released DSV4-Flash was trained under it.
         sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
         attention_mask_4d = build_causal_padding_mask(
             attention_mask,
-            seq_len=inputs_embeds.shape[1],
-            dtype=inputs_embeds.dtype,
-            device=inputs_embeds.device,
-            batch_size=inputs_embeds.shape[0],
+            seq_len=shape_ref.shape[1],
+            dtype=shape_ref.dtype,
+            device=shape_ref.device,
+            batch_size=shape_ref.shape[0],
             sliding_window=sliding_window,
         )
 
-        # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
-        h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+        # ``input_ids`` is only meaningful for hash-routing layers, which live
+        # on stage 0 (num_hash_layers <= layers per stage 0).  Mid-stages pass
+        # None — hash layers shouldn't be present there.
+        layer_input_ids = input_ids if on_first_stage else None
 
-        for layer in self.layers.values():
+        # Debug dump: when ``DSV4_DEBUG_DUMP=<dir>`` is set, save per-block
+        # outputs for layer-by-layer parity with the DeepSeek inference
+        # reference (schema mirrors ``dsv4flash/inference/model.py:Transformer.forward``).
+        # Files written under ``<dir>/rank{R}/`` so concurrent ranks don't
+        # clobber each other.  After the run, pick one rank per PP stage:
+        # rank 0 of stage 0 has embed* + block_00..., last stage has hc_head_out
+        # / post_norm / logits.
+        import os as _os
+        try:
+            import torch.distributed as _dist
+
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        except Exception:
+            _rank = 0
+        _root = _os.environ.get("DSV4_DEBUG_DUMP")
+        _dump_dir = f"{_root}/rank{_rank:02d}" if _root else None
+        if _dump_dir:
+            _os.makedirs(_dump_dir, exist_ok=True)
+        def _dump(name: str, t: torch.Tensor) -> None:
+            if _dump_dir:
+                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_dump_dir}/{name}.pt")
+
+        # First-stage dumps: 3D embeds + 4D HC-expanded.  Mid-stages skip these.
+        if on_first_stage:
+            _dump("embed", inputs_embeds)
+            _dump("embed_hc", h)
+
+        for li, layer in enumerate(self.layers.values()):
+            if layer is None:  # PP-trimmed slot
+                continue
             h = layer(
                 x=h,
                 position_embeddings=position_embeddings,
@@ -407,18 +492,26 @@ class DeepseekV4Model(nn.Module):
                 rotary_compress=self.rotary_emb_compress,
                 attention_mask=attention_mask_4d,
                 padding_mask=padding_mask if padding_mask is not None else (
-                    attention_mask.bool().logical_not() if attention_mask is not None else None
+                    attention_mask.bool().logical_not()
+                    if attention_mask is not None and attention_mask.dim() == 2
+                    else None
                 ),
-                input_ids=input_ids,
+                input_ids=layer_input_ids,
                 **attn_kwargs,
             )
+            _dump(f"block_{li:02d}", h)
 
-        # Reduce hc_mult copies -> [B,S,dim] via the learned HC head
-        # (sigmoid-gated weighted sum; NOT a plain mean).  Matches HF
-        # PR 45616's ``DeepseekV4Model.forward`` which calls
-        # ``self.hc_head(hidden_states)`` before the final RMSNorm.
-        h_reduced = self.hc_head(h)
-        return self.norm(h_reduced) if self.norm else h_reduced
+        # Reduce hc_mult copies -> [B,S,dim] via the learned HC head, then
+        # apply the shared RMSNorm.  Both modules live ONLY on the last PP
+        # stage (intermediate stages keep h at 4D so the next stage can
+        # consume it).  Matches HF PR 45616's ``DeepseekV4Model.forward``.
+        if getattr(self, "hc_head", None) is not None:
+            h = self.hc_head(h)
+            _dump("hc_head_out", h)
+        if getattr(self, "norm", None) is not None:
+            h = self.norm(h)
+            _dump("post_norm", h)
+        return h
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
@@ -544,6 +637,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits
+        # Debug dump (paired with ``DeepseekV4Model.forward`` per-block dumps).
+        import os as _os
+
+        _dump_dir = _os.environ.get("DSV4_DEBUG_DUMP")
+        if _dump_dir and self.lm_head is not None:
+            _os.makedirs(_dump_dir, exist_ok=True)
+            torch.save(logits.detach().to(torch.bfloat16).cpu(), f"{_dump_dir}/logits.pt")
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             logits = logits.unsqueeze(0)
         return logits

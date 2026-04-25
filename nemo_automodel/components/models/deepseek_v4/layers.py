@@ -91,6 +91,47 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _apply_partial_rope_interleaved(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_head_dim: int
+) -> torch.Tensor:
+    """Interleaved RoPE on the last ``rope_head_dim`` dims of ``x`` (pairs are
+    ``(2k, 2k+1)``).  Matches the DeepSeek inference reference's complex-mul
+    formulation in ``dsv4flash/inference/model.py:apply_rotary_emb``: the
+    released DSV4-Flash weights were trained with this layout, NOT the
+    Llama-style ``rotate_half`` layout HF transformers PR 45616/45643 still
+    uses (pairs ``(d, d+rd/2)``).
+
+    Args:
+        x: ``[..., rope_head_dim]`` (or larger trailing dim with rope on the
+            last ``rope_head_dim`` slice).  Typical attention-layout shapes:
+            ``[B, H, S, D]`` for q/k or ``[B, 1, S, D]`` for shared-KV.
+        cos, sin: shape ``[B, S, rope_head_dim]`` produced by the Llama-style
+            ``cat([freqs, freqs], -1)`` rotary; we take the first half which
+            contains the unique per-pair frequencies (the second half is a
+            duplicate that the Llama-style helper needs and we don't).
+        rope_head_dim: Must be even.
+
+    Inverse rotation: pass ``-sin`` instead of ``sin`` (caller's
+    responsibility — same as our existing inverse-rope call site).
+    """
+    rd = rope_head_dim
+    half = rd // 2
+    nope, rope = x[..., :-rd], x[..., -rd:]
+    # Pair-reshape last dim: [..., rd] -> [..., rd/2, 2]
+    rope_pairs = rope.unflatten(-1, (-1, 2))
+    a, b = rope_pairs[..., 0], rope_pairs[..., 1]  # [..., rd/2]
+    c = cos[..., :half]
+    s = sin[..., :half]
+    # Broadcast c/s up to ``a``'s rank by inserting a head dim before S.
+    while c.ndim < a.ndim:
+        c = c.unsqueeze(1)
+        s = s.unsqueeze(1)
+    new_a = a * c - b * s
+    new_b = a * s + b * c
+    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2)
+    return torch.cat([nope, new_rope], dim=-1)
+
+
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -235,11 +276,20 @@ class DeepseekV4TrainCache:
 
 def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_head_dim: int) -> torch.Tensor:
     """Split ``x`` along its last dim into nope (first) and rope (last
-    ``rope_head_dim``) slices, rotate only the rope slice, concat back.
+    ``rope_head_dim``) slices, rotate only the rope slice with INTERLEAVED
+    pair-RoPE (pairs ``(2k, 2k+1)``), concat back.
+
+    The DSV4-Flash released checkpoint uses interleaved RoPE end-to-end
+    (see ``dsv4flash/inference/model.py:apply_rotary_emb`` — complex
+    multiplication on ``view_as_complex`` of pairs).  HF transformers PR
+    45616 / PR 45643 ship a Llama-style ``rotate_half`` here instead, which
+    pairs ``(d, d+rd/2)``.  Same algebra but a different dim-to-frequency
+    mapping — the released weights expect the interleaved layout, so the
+    Llama-style helper produces wrong activations on the released checkpoint
+    (verified empirically: kv_post_rope cosine drops from 0.9999 to 0.866
+    after one block under Llama-style; matches at >0.999 under interleaved).
     """
-    nope, rope = x[..., :-rope_head_dim], x[..., -rope_head_dim:]
-    rope, _ = apply_rotary_pos_emb(rope, torch.zeros_like(rope), cos, sin)
-    return torch.cat([nope, rope], dim=-1)
+    return _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim)
 
 
 def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -> torch.Tensor:
@@ -498,9 +548,29 @@ class DeepseekV4Compressor(nn.Module):
         layer_idx: int,
         start_pos: int,
     ) -> torch.Tensor:
+        # Debug dumps for compressor (paired with reference compressor at
+        # ``dsv4flash/inference/model.py:Compressor.forward``).  Files:
+        # ``$DSV4_DEBUG_DUMP/rank{R}/C{layer:02d}_<stage>.pt``.
+        import os as _os
+        try:
+            import torch.distributed as _dist
+
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        except Exception:
+            _rank = 0
+        _root = _os.environ.get("DSV4_DEBUG_DUMP")
+        _cdir = f"{_root}/rank{_rank:02d}" if _root else None
+
+        def _cdump(stage: str, t: torch.Tensor) -> None:
+            if _cdir:
+                _os.makedirs(_cdir, exist_ok=True)
+                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_cdir}/C{layer_idx:02d}_{stage}.pt")
+
         batch, seq_len, _ = hidden_states.shape
         kv = self.wkv(hidden_states)
         gate = self.wgate(hidden_states)
+        _cdump("kv_pre_pool", kv)
+        _cdump("gate_pre_pool", gate)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
@@ -514,17 +584,42 @@ class DeepseekV4Compressor(nn.Module):
                 overlap=self.overlap,
             )
         )
+        _cdump("pooled_pre_rope", new_pooled)
         positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
         cos, sin = rotary(new_pooled, positions)
         new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+        _cdump("pooled_post_rope", new_pooled)
         pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
 
+        # Indexer narrows the attended compressed positions per query.  The
+        # caller (DSV4Attention) is responsible for turning ``indexer_topk``
+        # into an additive attention mask; we do NOT pre-gather here.  The
+        # earlier per-query ``torch.gather`` produced an
+        # ``[B, 1, S*topk, D]`` tensor that, when concatenated to ``full_kv``
+        # and run through dense attention with ``F.pad(value=0.0)``, let
+        # every query attend to every other query's gathered slice — a
+        # silent non-causal leak (verified empirically: layer 2 attention
+        # output cosine-vs-reference jumps from 0.81 to 0.99+ once we move
+        # to mask-driven sparse semantics).
+        #
+        # ``indexer_topk`` follows the reference contract from
+        # ``dsv4flash/inference/model.py:472-475``: shape ``[B, S, K]`` with
+        # entries that are either valid pool indices in ``[0, P_total)``
+        # or ``-1`` for "do not attend" (masked by causality).
+        indexer_topk: torch.LongTensor | None = None
         if self.indexer is not None:
-            topk = self.indexer(hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos)
-            expanded = pooled.unsqueeze(2).expand(-1, -1, seq_len, -1, -1)
-            idx = topk.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, self.head_dim)
-            pooled = torch.gather(expanded, 3, idx).reshape(batch, 1, -1, self.head_dim)
-        return pooled
+            raw_topk = self.indexer(
+                hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos
+            )
+            threshold = (
+                torch.arange(1, seq_len + 1, device=raw_topk.device) // self.compress_ratio
+            ).unsqueeze(1)
+            causal_invalid = raw_topk >= threshold
+            indexer_topk = torch.where(
+                causal_invalid, torch.full_like(raw_topk, -1), raw_topk
+            )
+            _cdump("indexer_topk", indexer_topk)
+        return pooled, indexer_topk
 
 
 # ---------------------------------------------------------------------------
@@ -589,16 +684,32 @@ class DeepseekV4HyperConnection(nn.Module):
         mix = torch.nn.functional.linear(flat, self.fn.float()) * rsqrt  # [B, S, (2+H)*H]
         pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
         hc = self.hc_mult
+
+        # ``pre`` and ``post`` have DIFFERENT formulas in the released DSV4-Flash
+        # (see ``dsv4flash/inference/kernel.py:hc_split_sinkhorn_kernel`` 391-394):
+        #   pre  = sigmoid(...) + eps     range (eps, 1+eps]
+        #   post = 2 * sigmoid(...)       range (0, 2)  — NO +eps, AND a 2x prefactor
+        # HF transformers PR 45616 / 45643 treats post identically to pre (sigmoid
+        # + eps), which makes ``post`` half the magnitude the released weights
+        # were trained against — verified empirically on the parity test
+        # (auto post std = 0.5x ref post std before this fix).
         pre = torch.sigmoid(mix[..., :hc] * pre_scale + self.base[:hc].float()) + self.hc_eps
-        post = torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + self.base[hc : 2 * hc].float()) + self.hc_eps
-        comb = (
-            torch.sigmoid(
-                mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale
-                + self.base[2 * hc :].view(hc, hc).float()
-            )
-            + self.hc_eps
+        post = 2.0 * torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + self.base[hc : 2 * hc].float())
+
+        # ``comb`` uses softmax(dim=-1) on raw logits + eps, then sinkhorn.  HF
+        # uses sigmoid + eps + sinkhorn — also a divergence from the reference
+        # kernel.  Reference (kernel.py:395-413):
+        #   1. comb_logit = mix * scale + base
+        #   2. row_softmax(dim=-1) + eps   (numerically stable, NOT sigmoid)
+        #   3. col-norm / sum(dim=-2)
+        #   4. for sinkhorn_iters - 1: row-norm / sum(dim=-1) ; col-norm / sum(dim=-2)
+        comb_logit = (
+            mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale
+            + self.base[2 * hc :].view(hc, hc).float()
         )
-        for _ in range(self.hc_sinkhorn_iters):
+        comb = torch.softmax(comb_logit, dim=-1) + self.hc_eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+        for _ in range(self.hc_sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
         return pre, post, comb
@@ -700,26 +811,54 @@ class DeepseekV4Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del kwargs
         batch, seq_len = hidden_states.shape[:2]
-        cos, sin = position_embeddings
+        # IMPORTANT: for compress_ratio>0 layers the released DSV4-Flash uses
+        # the compress-rope (theta=160000 + YaRN) for the MAIN attention Q/KV
+        # too, NOT just for the compressor sub-module.  Reference at
+        # ``dsv4flash/inference/model.py:476-501`` builds ``self.freqs_cis``
+        # with ``compress_rope_theta`` whenever ``compress_ratio != 0``.  The
+        # caller passes both ``position_embeddings`` (theta=10000, no YaRN)
+        # and ``position_embeddings_compress`` (theta=160000, YaRN); we pick
+        # the right one here based on compress_ratio.
+        if self.compress_ratio and position_embeddings_compress is not None:
+            cos, sin = position_embeddings_compress
+        else:
+            cos, sin = position_embeddings
+
+        # Intra-attention debug dumps (paired with reference Attention.forward).
+        # Files written to ``$DSV4_DEBUG_DUMP/rank{R}/A{layer:02d}_<stage>.pt``.
+        import os as _os
+        try:
+            import torch.distributed as _dist
+
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        except Exception:
+            _rank = 0
+        _root = _os.environ.get("DSV4_DEBUG_DUMP")
+        _adir = f"{_root}/rank{_rank:02d}" if _root else None
+        _li = self.layer_idx
+
+        def _adump(stage: str, t: torch.Tensor) -> None:
+            if _adir:
+                _os.makedirs(_adir, exist_ok=True)
+                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_adir}/A{_li:02d}_{stage}.pt")
 
         q_residual = self.q_norm(self.wq_a(hidden_states))
-        q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        _adump("q_residual", q_residual)
+        q_perhead = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim)
+        _adump("q_perhead_pre_rsqrt", q_perhead)  # [B, S, H, D] — ref-aligned
+        q = q_perhead.transpose(1, 2)  # [B, H, S, D]
         kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        _adump("kv_pre_rope", kv.squeeze(1))  # [B, S, D] — ref-aligned
 
-        # Per-head, non-learnable rsqrt on Q before RoPE.  This step is in the
-        # official DeepSeek inference reference (`dsv4flash/inference/model.py:498`)
-        # but is missing from HF transformers PR 45616 (modular_deepseek_v4.py
-        # lines 552-557 go straight from wq_b to apply_partial_rope).  The
-        # released DSV4-Flash weights were trained expecting this normalization,
-        # so without it q·kᵀ has the wrong scale, the softmax becomes peaky, and
-        # downstream loss is severely degraded (~16-19 vs the expected ~3-6 on
-        # this validate setup).  Keep this line until HF reconciles the PR with
-        # the inference reference; if HF later adds an equivalent step, we can
-        # drop this and inherit theirs.
+        # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
+        # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+        _adump("q_post_rsqrt", q.transpose(1, 2))  # [B, S, H, D]
 
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
+        _adump("q_post_rope", q.transpose(1, 2))  # [B, S, H, D]
+        _adump("kv_post_rope", kv.squeeze(1))  # [B, S, D]
 
         full_kv = kv
 
@@ -729,7 +868,7 @@ class DeepseekV4Attention(nn.Module):
                 "position_embeddings_compress supplied by the Block/Model."
             )
             cache = DeepseekV4TrainCache()
-            pooled = self.compressor(
+            pooled, indexer_topk = self.compressor(
                 hidden_states,
                 q_residual=q_residual,
                 rotary=rotary_compress,
@@ -738,8 +877,53 @@ class DeepseekV4Attention(nn.Module):
                 layer_idx=self.layer_idx,
                 start_pos=start_pos,
             )
+            n_pooled = pooled.shape[2]
             full_kv = torch.cat([full_kv, pooled], dim=2)
 
+            # Extend the additive 4D attention mask with a per-query
+            # compressed-position mask so dense attention reproduces the
+            # reference's ``sparse_attn`` semantics (per-query topk_idxs +
+            # causality on the compressed pool).
+            #
+            # * compress_ratio == 4 (Indexer present): mask=0 only at the
+            #   pool positions selected by ``indexer_topk`` for that query,
+            #   -inf elsewhere.  ``-1`` entries in ``indexer_topk`` are
+            #   already causally-masked by Compressor.
+            # * compress_ratio > 4 (no Indexer, e.g. 128): every query q can
+            #   attend to compressed position p iff ``p < (q+1) // ratio``
+            #   (matches ``get_compress_topk_idxs`` in
+            #   ``dsv4flash/inference/model.py:289-296``).
+            if attention_mask is not None and n_pooled > 0:
+                min_val = torch.finfo(attention_mask.dtype).min
+                if indexer_topk is not None:
+                    valid = indexer_topk != -1  # [B, S, K]
+                    safe_idx = indexer_topk.clamp(min=0)
+                    indicator = torch.zeros(
+                        (batch, seq_len, n_pooled),
+                        dtype=torch.bool,
+                        device=full_kv.device,
+                    )
+                    indicator.scatter_(-1, safe_idx, valid)
+                    compressed_mask = torch.where(
+                        indicator,
+                        torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
+                        torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
+                    )  # [B, S, P]
+                else:
+                    q_pos = torch.arange(seq_len, device=full_kv.device)
+                    p_pos = torch.arange(n_pooled, device=full_kv.device)
+                    threshold = (q_pos + 1) // self.compress_ratio
+                    allowed = p_pos.unsqueeze(0) < threshold.unsqueeze(1)  # [S, P]
+                    compressed_mask = torch.where(
+                        allowed,
+                        torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
+                        torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
+                    ).expand(batch, seq_len, n_pooled)
+                compressed_mask = compressed_mask.unsqueeze(1)  # [B, 1, S, P]
+                attention_mask = torch.cat([attention_mask, compressed_mask], dim=-1)
+
+        # If a caller supplied a 4D mask shorter than full_kv but no compressor
+        # ran (shouldn't happen, but kept for defense), fall back to neutral pad.
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(
                 attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0
@@ -754,15 +938,22 @@ class DeepseekV4Attention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
         )
+        # eager_attention_with_sink returns [B, S, H, D] (already transposed).
+        _adump("attn_o_pre_inv_rope", attn_output)  # [B, S, H, D]
 
         # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
         # HF uses).  Reference: modular_deepseek_v4.py:607.
         attn_output = _apply_partial_rope(
             attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim
         ).transpose(1, 2)
+        _adump("attn_o_post_inv_rope", attn_output)  # [B, S, H, D]
 
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
-        return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
+        wo_a_out = self.wo_a(grouped)
+        _adump("wo_a_out", wo_a_out)
+        out = self.wo_b(wo_a_out.flatten(2))
+        _adump("wo_b_out", out)
+        return out, attn_weights
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):
