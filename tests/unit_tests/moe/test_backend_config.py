@@ -304,3 +304,14 @@ class TestMoEConfig:
 
         config = MoEConfigFromLayers(**base_moe_config_kwargs)
         assert config.n_routed_experts == 8
+
+    def test_swiglu_limit_default_zero(self, base_moe_config_kwargs):
+        """``swiglu_limit`` defaults to 0.0 (preserves the legacy fused swiglu path)."""
+        config = MoEConfig(**base_moe_config_kwargs)
+        assert config.swiglu_limit == 0.0
+
+    @pytest.mark.parametrize("limit", [1.0, 7.0, 100.5])
+    def test_swiglu_limit_custom_positive(self, base_moe_config_kwargs, limit):
+        """``swiglu_limit`` accepts positive floats for the DSV4 clamped variant."""
+        config = MoEConfig(**base_moe_config_kwargs, swiglu_limit=limit)
+        assert config.swiglu_limit == limit

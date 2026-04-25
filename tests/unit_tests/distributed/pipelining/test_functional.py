@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import types
+
 import pytest
 import torch
 from unittest.mock import Mock, MagicMock, patch
@@ -1143,3 +1145,359 @@ class TestResetPpStageShapes:
         assert stage.inputs_meta[0].shape == (1, 512, 2048)
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].shape == (1, 512, 128256)
+
+
+# =============================================================================
+# DeepSeek V4: extra hc_mult axis between blocks (4-D inter-stage activations)
+# =============================================================================
+
+
+class TestPrecomputeStageShapesDeepSeekV4:
+    """``_precompute_stage_shapes`` must special-case ``model_type == 'deepseek_v4'``.
+
+    DSV4 keeps an extra ``hc_mult`` axis between blocks, so inter-stage
+    activations are ``[mb, seq, hc_mult, hidden]``.  The last (norm) stage
+    folds it back to ``[mb, seq, hidden]``; the lm_head stage still produces
+    ``[mb, seq, vocab]``.
+    """
+
+    def _make_stage(
+        self,
+        *,
+        is_first,
+        is_last,
+        has_lm_head,
+        has_norm,
+        param_dtype=torch.bfloat16,
+    ):
+        """Construct a stage with explicit control over ``submod.model.norm`` / ``submod.lm_head``.
+
+        Mock auto-attributes are unsuitable here because the production code does
+        ``getattr(submod.model, "norm", None) is not None`` and ``hasattr(submod, "lm_head")``,
+        and a bare ``Mock`` would lie about both.  We therefore use a real ``nn.Module``
+        for ``submod`` with attributes set to real ``nn.Module`` instances or ``None``.
+        """
+        import torch.nn as nn
+
+        class _Submod(nn.Module):
+            pass
+
+        class _InnerModel(nn.Module):
+            pass
+
+        submod = _Submod()
+        # A trivial parameter with the requested dtype, so the dtype-inference branch
+        # picks the right model_dtype.
+        submod.register_parameter("_dummy", nn.Parameter(torch.empty(1, dtype=param_dtype)))
+
+        inner = _InnerModel()
+        if has_norm:
+            inner.norm = nn.Identity()
+        else:
+            inner.norm = None
+        submod.model = inner
+
+        if has_lm_head:
+            submod.lm_head = nn.Identity()
+        # Otherwise leave submod.lm_head absent so the production
+        # ``hasattr(submod, "lm_head") and submod.lm_head is not None`` check is False.
+
+        # Wrap with a Mock-ish stage that has the API _precompute_stage_shapes uses.
+        stage = Mock()
+        stage.is_first = is_first
+        stage.is_last = is_last
+        stage.inputs_meta = None
+        stage._outputs_meta = None
+        stage.submod = submod
+        return stage
+
+    def _v4_config(self, *, hidden_size=64, vocab_size=128, hc_mult=2):
+        import types
+
+        return types.SimpleNamespace(
+            model_type="deepseek_v4",
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            hc_mult=hc_mult,
+        )
+
+    def test_first_stage_input_ids_unchanged(self):
+        """First stage still receives [mb, seq] int64, even with hc_mult > 1."""
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False, has_norm=False)
+        config = self._v4_config(hidden_size=64, vocab_size=128, hc_mult=4)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert stage.inputs_meta[0].shape == (2, 16)
+        assert stage.inputs_meta[0].dtype == torch.long
+
+    def test_first_stage_output_carries_hc_mult(self):
+        """First V4 stage (no norm, no lm_head) outputs 4-D [mb, seq, hc_mult, hidden]."""
+        stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False, has_norm=False)
+        config = self._v4_config(hidden_size=64, vocab_size=128, hc_mult=4)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert len(out) == 1
+        assert out[0].shape == (2, 16, 4, 64)
+        assert out[0].dtype == torch.bfloat16
+        assert out[0].device.type == "meta"
+
+    def test_middle_stage_4d_input_and_output(self):
+        """Mid-pipeline V4 stage: input AND output should be 4-D ``[mb, seq, hc_mult, hidden]``."""
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False, has_norm=False)
+        config = self._v4_config(hidden_size=64, vocab_size=128, hc_mult=4)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        # 4-D input
+        assert stage.inputs_meta[0].shape == (2, 16, 4, 64)
+        # 4-D output
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert out[0].shape == (2, 16, 4, 64)
+
+    def test_last_stage_with_norm_no_lm_head_folds_to_3d_output(self):
+        """Last stage that has ``norm`` but no lm_head folds back to 3-D [mb, seq, hidden]."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=False, has_norm=True)
+        config = self._v4_config(hidden_size=64, vocab_size=128, hc_mult=4)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        # Input still carries hc_mult (this stage receives 4-D from upstream)
+        assert stage.inputs_meta[0].shape == (2, 16, 4, 64)
+        # Output is 3-D because norm folds the hc_mult axis
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert out[0].shape == (2, 16, 64)
+
+    def test_last_stage_with_lm_head_outputs_logits(self):
+        """Last stage with lm_head should still output [mb, seq, vocab] in V4."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True, has_norm=True)
+        config = self._v4_config(hidden_size=64, vocab_size=128, hc_mult=4)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert out[0].shape == (2, 16, 128)
+
+    def test_hc_mult_one_falls_back_to_3d(self):
+        """When hc_mult == 1, V4 behaves like a non-V4 model (3-D activations)."""
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False, has_norm=False)
+        config = self._v4_config(hidden_size=64, vocab_size=128, hc_mult=1)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        assert stage.inputs_meta[0].shape == (2, 16, 64)
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert out[0].shape == (2, 16, 64)
+
+    def test_v4_via_text_config_model_type(self):
+        """V4 detection should also fire when ``model_type`` lives under ``text_config``."""
+        import types
+
+        text_cfg = types.SimpleNamespace(model_type="deepseek_v4")
+        cfg = types.SimpleNamespace(
+            hidden_size=64,
+            vocab_size=128,
+            hc_mult=2,
+            text_config=text_cfg,
+        )
+
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False, has_norm=False)
+        _precompute_stage_shapes([stage], cfg, microbatch_size=1, seq_len=8)
+
+        # The hc_mult must be picked up from the root config (per the diff: ``model_config.hc_mult``)
+        assert stage.inputs_meta[0].shape == (1, 8, 2, 64)
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert out[0].shape == (1, 8, 2, 64)
+
+    def test_non_v4_unaffected_by_hc_mult_attribute(self):
+        """A non-V4 config must NOT pick up the ``hc_mult`` axis even if the attribute is present."""
+        import types
+
+        cfg = types.SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            vocab_size=128,
+            hc_mult=4,  # Should be ignored
+        )
+
+        stage = self._make_stage(is_first=False, is_last=False, has_lm_head=False, has_norm=False)
+        _precompute_stage_shapes([stage], cfg, microbatch_size=1, seq_len=8)
+
+        assert stage.inputs_meta[0].shape == (1, 8, 64)
+        out = stage._configure_outputs_meta.call_args[0][0]
+        assert out[0].shape == (1, 8, 64)
+
+
+# =============================================================================
+# DeepSeek V4: keep-list post-processing in split_model_into_stages
+# =============================================================================
+
+
+class TestSplitModelIntoStagesDeepSeekV4KeepList:
+    """``split_model_into_stages`` must keep ``rotary_emb_compress`` on every stage and
+    ``hc_head`` on the last stage when ``model.config.model_type == 'deepseek_v4'`` and the
+    corresponding attributes exist on ``text_model``.
+
+    Driving the full function end-to-end requires too much torch-distributed scaffolding,
+    so we mock the heavy collaborators (``calculate_virtual_stages``, ``generate_hf_model_fqn_per_model_part``,
+    ``get_text_module``, ``PipelineStage``, ``copy.deepcopy``, ``stage_ids_this_rank``,
+    ``get_schedule_class``) and assert on the post-processed module-name list captured by the
+    auto-generated path.
+    """
+
+    def _capture_module_names(
+        self,
+        *,
+        text_has_rotary_compress,
+        text_has_hc_head,
+        model_type,
+        num_stages=2,
+    ):
+        """Run split_model_into_stages with mocks and return the (post-processed)
+        ``module_names_per_stage`` list that was used to build stages."""
+        import torch.nn as nn
+
+        # text_model is a real nn.Module so ``hasattr`` reflects what we set explicitly.
+        class _TextModel(nn.Module):
+            pass
+
+        text_model = _TextModel()
+        text_model.layers = nn.ModuleList([nn.Identity() for _ in range(4)])
+        text_model.rotary_emb = nn.Identity()
+        if text_has_rotary_compress:
+            text_model.rotary_emb_compress = nn.Identity()
+        if text_has_hc_head:
+            text_model.hc_head = nn.Identity()
+
+        class _Wrapper(nn.Module):
+            pass
+
+        model = _Wrapper()
+        model.model = text_model  # has_model_attr=True, layers_prefix="model."
+        model.lm_head = nn.Identity()
+        model.config = types.SimpleNamespace(model_type=model_type)
+
+        mock_pp_mesh = Mock()
+        mock_pp_mesh.get_local_rank.return_value = 0
+        mock_pp_mesh.size.return_value = num_stages
+
+        # Generated FQNs (BEFORE V4 post-processing)
+        base_fqns = [
+            ["model.embed_tokens", "model.layers.0", "model.layers.1"],
+            ["model.layers.2", "model.layers.3", "model.norm", "lm_head"],
+        ]
+
+        with patch(
+            "nemo_automodel.components.distributed.pipelining.functional.get_text_module",
+            return_value=text_model,
+        ), patch(
+            "nemo_automodel.components.distributed.pipelining.functional.calculate_virtual_stages",
+            return_value=(num_stages, 1),
+        ), patch(
+            "nemo_automodel.components.distributed.pipelining.functional.generate_hf_model_fqn_per_model_part",
+            return_value=[list(s) for s in base_fqns],
+        ), patch(
+            "nemo_automodel.components.distributed.pipelining.functional.PipelineStage"
+        ), patch(
+            "nemo_automodel.components.distributed.pipelining.functional.get_schedule_class",
+            return_value=PipelineScheduleSingle,
+        ), patch(
+            "nemo_automodel.components.distributed.pipelining.functional.stage_ids_this_rank",
+            return_value=(0,),
+        ), patch("copy.deepcopy") as mock_deepcopy:
+            mock_copy = Mock()
+            mock_copy.named_children.return_value = []
+            mock_deepcopy.return_value = mock_copy
+
+            # Capture the post-processed FQN list by intercepting build_stage_from_modules' caller.
+            # Easiest: monkey-patch ``patch_hf_model_for_pp`` to a no-op and observe the
+            # mutations directly on the closure-captured list — split_model_into_stages
+            # mutates the lists in-place via ``stage_modules.append(...)``.
+            with patch(
+                "nemo_automodel.components.distributed.pipelining.functional.patch_hf_model_for_pp",
+                lambda *a, **kw: None,
+            ):
+                # ``generate_hf_model_fqn_per_model_part`` returns the list we control;
+                # split_model_into_stages then mutates it via .append.  We need to capture
+                # the list AFTER post-processing.  We do this by reading the patched mock's
+                # return_value (which is now the mutated list).
+                from nemo_automodel.components.distributed.pipelining import functional as _func
+
+                captured_lists = {"final": None}
+
+                # Replace generate_hf_model_fqn_per_model_part with a side_effect that records the returned object.
+                gen_patcher = patch.object(
+                    _func,
+                    "generate_hf_model_fqn_per_model_part",
+                    side_effect=lambda **kwargs: captured_lists.setdefault(
+                        "lists", [list(s) for s in base_fqns]
+                    )
+                    or captured_lists["lists"],
+                )
+                with gen_patcher:
+                    try:
+                        split_model_into_stages(
+                            model,
+                            mock_pp_mesh,
+                            "pp",
+                            "PipelineScheduleSingle",
+                            torch.device("cpu"),
+                            layers_per_stage=2,
+                        )
+                    except Exception:
+                        # The build-stages portion needs more scaffolding than we provide;
+                        # we only care about the post-processing mutations on the FQN lists.
+                        pass
+
+                return captured_lists.get("lists")
+
+    def test_v4_keeps_rotary_emb_compress_on_every_stage(self):
+        lists = self._capture_module_names(
+            text_has_rotary_compress=True,
+            text_has_hc_head=False,
+            model_type="deepseek_v4",
+        )
+        assert lists is not None
+        for stage_fqns in lists:
+            assert "model.rotary_emb_compress" in stage_fqns, (
+                f"rotary_emb_compress missing from a stage: {stage_fqns}"
+            )
+
+    def test_v4_keeps_hc_head_only_on_last_stage(self):
+        lists = self._capture_module_names(
+            text_has_rotary_compress=True,
+            text_has_hc_head=True,
+            model_type="deepseek_v4",
+        )
+        assert lists is not None
+        for stage_fqns in lists[:-1]:
+            assert "model.hc_head" not in stage_fqns
+        assert "model.hc_head" in lists[-1]
+
+    def test_non_v4_does_not_inject_v4_modules(self):
+        """A non-V4 model (model_type != 'deepseek_v4') should not get the keep-list
+        post-processing even if the attributes happen to be present."""
+        lists = self._capture_module_names(
+            text_has_rotary_compress=True,
+            text_has_hc_head=True,
+            model_type="llama",
+        )
+        # The post-processing block is gated by is_v4_keep — it should not run.
+        assert lists is not None
+        for stage_fqns in lists:
+            assert "model.rotary_emb_compress" not in stage_fqns
+            assert "model.hc_head" not in stage_fqns
+
+    def test_v4_without_attributes_is_noop(self):
+        """V4 model where text_model lacks the attributes: nothing is injected."""
+        lists = self._capture_module_names(
+            text_has_rotary_compress=False,
+            text_has_hc_head=False,
+            model_type="deepseek_v4",
+        )
+        assert lists is not None
+        for stage_fqns in lists:
+            assert "model.rotary_emb_compress" not in stage_fqns
+            assert "model.hc_head" not in stage_fqns

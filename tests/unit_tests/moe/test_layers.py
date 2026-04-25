@@ -654,6 +654,165 @@ class TestGate:
         assert weights.shape == (num_tokens, moe_config.n_activated_experts)
         assert indices.shape == (num_tokens, moe_config.n_activated_experts)
 
+    def test_gate_forward_sqrtsoftplus_basic(self, moe_config, device):
+        """``score_func='sqrtsoftplus'`` should compute weights as sqrt(softplus(logits))."""
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = False
+        moe_config.route_scale = 1.0
+        # No correction bias path on this test
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = False
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, aux_loss = gate(x, token_mask, cp_mesh=None)
+
+        # Shape checks
+        assert weights.shape == (num_tokens, moe_config.n_activated_experts)
+        assert indices.shape == (num_tokens, moe_config.n_activated_experts)
+        # sqrt(softplus(...)) is non-negative
+        weights_detached = weights.detach()
+        assert (weights_detached >= 0).all()
+        # Indices must be valid expert ids
+        assert (indices >= 0).all() and (indices < moe_config.n_routed_experts).all()
+
+    def test_gate_forward_sqrtsoftplus_matches_reference(self, moe_config, device):
+        """sqrtsoftplus weights should match a manual reference: weights = sqrt(softplus(logits))[gather indices]."""
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = False
+        moe_config.route_scale = 1.0
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = False
+        # Use float32 throughout for clean comparison
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        torch.manual_seed(0)
+        num_tokens = 12
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, _ = gate(x, token_mask, cp_mesh=None)
+
+        # Reference: same transform on logits
+        with torch.no_grad():
+            logits = F.linear(x, gate.weight)
+            ref_scores = torch.sqrt(F.softplus(logits.float())).to(logits.dtype)
+            ref_weights = ref_scores.gather(1, indices)
+
+        torch.testing.assert_close(weights.detach(), ref_weights, rtol=1e-5, atol=1e-5)
+
+    def test_gate_forward_sqrtsoftplus_correction_bias_only_for_selection(self, moe_config, device):
+        """``e_score_correction_bias`` shifts SELECTION but final weights come from UNBIASED scores."""
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = False
+        moe_config.route_scale = 1.0
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = True
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+            # Strong, non-uniform bias to ensure selection actually shifts
+            gate.e_score_correction_bias.copy_(
+                torch.linspace(-2.0, 2.0, moe_config.n_routed_experts, device=device)
+            )
+
+        torch.manual_seed(7)
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, _ = gate(x, token_mask, cp_mesh=None)
+
+        # Reference: unbiased sqrt(softplus(logits)) gathered at the selected indices.
+        with torch.no_grad():
+            logits = F.linear(x, gate.weight)
+            unbiased_scores = torch.sqrt(F.softplus(logits.float())).to(logits.dtype)
+            ref_weights = unbiased_scores.gather(1, indices)
+
+        torch.testing.assert_close(weights.detach(), ref_weights, rtol=1e-5, atol=1e-5)
+
+        # Sanity: indices should match those produced by topk on (unbiased + bias)
+        with torch.no_grad():
+            biased_scores = unbiased_scores + gate.e_score_correction_bias
+            ref_indices = torch.topk(biased_scores, moe_config.n_activated_experts, dim=-1)[1]
+        # topk picks may differ in tie-breaking; compare the set of selected experts per row
+        for r in range(num_tokens):
+            assert set(indices[r].tolist()) == set(ref_indices[r].tolist())
+
+    def test_gate_forward_sqrtsoftplus_with_norm_topk_prob(self, moe_config, device):
+        """When ``norm_topk_prob=True`` and topk > 1, weights are renormalised after gather."""
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = True
+        moe_config.route_scale = 1.0
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = False
+        moe_config.n_activated_experts = 2  # ensure topk > 1
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        torch.manual_seed(0)
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, _, _ = gate(x, token_mask, cp_mesh=None)
+
+        # After norm_topk_prob, each row sums to (approximately) 1
+        weights_detached = weights.detach()
+        torch.testing.assert_close(
+            weights_detached.sum(dim=-1),
+            torch.ones(num_tokens, dtype=weights_detached.dtype, device=device),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+    def test_gate_forward_sqrtsoftplus_route_scale(self, moe_config, device):
+        """``route_scale`` multiplies the final weights for the sqrtsoftplus branch too."""
+        moe_config.score_func = "sqrtsoftplus"
+        moe_config.norm_topk_prob = False
+        moe_config.route_scale = 3.5
+        moe_config.gate_bias_update_factor = 0
+        moe_config.force_e_score_correction_bias = False
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config)
+        gate = gate.to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        torch.manual_seed(0)
+        num_tokens = 6
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, _ = gate(x, token_mask, cp_mesh=None)
+
+        with torch.no_grad():
+            logits = F.linear(x, gate.weight)
+            ref_scores = torch.sqrt(F.softplus(logits.float())).to(logits.dtype)
+            ref_weights = ref_scores.gather(1, indices) * 3.5
+
+        torch.testing.assert_close(weights.detach(), ref_weights, rtol=1e-5, atol=1e-5)
+
     def test_gate_forward_with_aux_loss(self, moe_config, device):
         """Test Gate forward pass with auxiliary loss computation."""
         moe_config.aux_loss_coeff = 0.01

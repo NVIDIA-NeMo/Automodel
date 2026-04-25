@@ -113,3 +113,46 @@ def test_pad_to_max_length_control():
     # Both should complete without errors
     assert len(ds1) == 2
     assert len(ds2) == 2
+
+
+def test_load_dataset_called_without_trust_remote_code(monkeypatch):
+    """HellaSwag should call ``load_dataset`` WITHOUT a trust_remote_code kwarg.
+
+    The kwarg was removed from ``HellaSwag.__init__`` and from the wrapped
+    ``load_dataset`` call in this branch — modern HF datasets reject it
+    on script-less repos.
+    """
+    captured: dict = {"kwargs": None}
+
+    def _capturing_load_dataset(path_or_dataset, *args, **kwargs):
+        captured["path"] = path_or_dataset
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _build_tiny_dataset()
+
+    # hellaswag.py does ``from datasets import load_dataset`` — patching
+    # ``datasets.load_dataset`` does NOT update the bound local symbol once
+    # the module is cached in sys.modules.  Patch the module-local binding
+    # directly to be robust.
+    import nemo_automodel.components.datasets.llm.hellaswag as hellaswag_mod
+
+    monkeypatch.setattr(hellaswag_mod, "load_dataset", _capturing_load_dataset)
+
+    hellaswag_mod.HellaSwag(path_or_dataset="ignored", tokenizer=object())
+
+    assert captured["kwargs"] is not None, "load_dataset was not called"
+    assert "trust_remote_code" not in captured["kwargs"], (
+        f"trust_remote_code should NOT be passed to load_dataset; got {captured['kwargs']!r}"
+    )
+
+
+def test_init_does_not_accept_trust_remote_code_kwarg():
+    """Passing ``trust_remote_code`` to ``HellaSwag(...)`` must raise TypeError after this branch."""
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
+
+    with pytest.raises(TypeError):
+        HellaSwag(
+            path_or_dataset="ignored",
+            tokenizer=object(),
+            trust_remote_code=True,  # removed kwarg
+        )

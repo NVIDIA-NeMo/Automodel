@@ -32,6 +32,7 @@ from nemo_automodel.components.moe.experts import (
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
+    swiglu_clamped_deepep,
 )
 
 
@@ -78,6 +79,133 @@ class TestActivationFunctions:
         with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
             activation_fn = get_expert_activation_for_deepep(moe_config)
             assert activation_fn == mock_swiglu
+
+    def test_get_expert_activation_for_deepep_swiglu_default_uses_fused(self, moe_config):
+        """``swiglu_limit == 0`` (default) keeps the fast fused ``weighted_bias_swiglu_impl`` path."""
+        moe_config.expert_activation = "swiglu"
+        moe_config.swiglu_limit = 0.0
+
+        with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
+            assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+
+    def test_get_expert_activation_for_deepep_swiglu_with_limit_uses_clamped(self, moe_config):
+        """``swiglu_limit > 0`` dispatches to the clamped FP32 variant for DSV4."""
+        from functools import partial
+
+        moe_config.expert_activation = "swiglu"
+        moe_config.swiglu_limit = 7.0
+
+        activation_fn = get_expert_activation_for_deepep(moe_config)
+
+        # Should be a functools.partial wrapping swiglu_clamped_deepep with limit=7.0
+        assert isinstance(activation_fn, partial)
+        assert activation_fn.func is swiglu_clamped_deepep
+        assert activation_fn.keywords == {"limit": 7.0}
+
+    def test_get_expert_activation_for_deepep_swiglu_negative_limit_uses_fused(self, moe_config):
+        """A non-positive ``swiglu_limit`` (e.g. 0.0 or negative) falls back to the fused path."""
+        moe_config.expert_activation = "swiglu"
+        moe_config.swiglu_limit = -1.0
+
+        with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
+            assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+
+
+class TestSwigluClampedDeepEP:
+    """Tests for the DSV4-style clamped FP32 SwiGLU activation."""
+
+    def _eager_reference(self, x, permuted_probs, limit):
+        """Reference implementation matching the DSV4 official Expert.forward."""
+        gate, up = torch.chunk(x, 2, dim=-1)
+        gate = gate.float().clamp(max=limit)
+        up = up.float().clamp(min=-limit, max=limit)
+        inter = torch.nn.functional.silu(gate) * up
+        return (inter * permuted_probs).to(x.dtype)
+
+    def test_output_shape_and_dtype(self):
+        """Output should have shape ``[..., inter_dim]`` and the input's dtype."""
+        torch.manual_seed(0)
+        n_tokens = 4
+        inter_dim = 8
+        # x: [n_tokens, 2*inter_dim]
+        x = torch.randn(n_tokens, 2 * inter_dim, dtype=torch.float32)
+        probs = torch.rand(n_tokens, 1, dtype=torch.float32)
+
+        out = swiglu_clamped_deepep(x, probs, limit=2.0)
+
+        assert out.shape == (n_tokens, inter_dim)
+        assert out.dtype == x.dtype
+
+    @pytest.mark.parametrize("limit", [0.5, 2.0, 7.0])
+    def test_matches_eager_reference_fp32(self, limit):
+        """Compiled output must match an eager FP32 reference within tight tolerance."""
+        torch.manual_seed(42)
+        n_tokens = 8
+        inter_dim = 16
+        x = torch.randn(n_tokens, 2 * inter_dim, dtype=torch.float32) * 5.0  # exercise clamping
+        probs = torch.rand(n_tokens, 1, dtype=torch.float32)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        ref = self._eager_reference(x, probs, limit)
+        torch.testing.assert_close(out, ref, atol=1e-6, rtol=1e-6)
+
+    def test_clamping_caps_gate_above_limit(self):
+        """When gate >> limit, silu(gate) saturates near gate≈limit (gate.clamp(max=limit))."""
+        n_tokens = 2
+        inter_dim = 4
+        limit = 1.0
+        # gate: very large positive => clamped at limit; up: modest (within range).
+        gate = torch.full((n_tokens, inter_dim), 50.0, dtype=torch.float32)
+        up = torch.full((n_tokens, inter_dim), 0.5, dtype=torch.float32)
+        x = torch.cat([gate, up], dim=-1)
+        probs = torch.ones(n_tokens, 1, dtype=torch.float32)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        ref = self._eager_reference(x, probs, limit)
+        # silu(1.0) * 0.5 ≈ 0.7311 * 0.5 ≈ 0.3655
+        expected = torch.full_like(out, torch.nn.functional.silu(torch.tensor(limit)).item() * 0.5)
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+    def test_clamping_caps_up_outside_range(self):
+        """``up`` is clamped symmetrically to [-limit, limit]."""
+        n_tokens = 2
+        inter_dim = 4
+        limit = 1.0
+        gate = torch.zeros((n_tokens, inter_dim), dtype=torch.float32)  # silu(0) = 0
+        up = torch.full((n_tokens, inter_dim), -100.0, dtype=torch.float32)  # clamps to -1.0
+        x = torch.cat([gate, up], dim=-1)
+        probs = torch.ones(n_tokens, 1, dtype=torch.float32)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        # silu(0) * (-1.0) = 0
+        torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+
+    def test_dtype_roundtrip_bf16(self):
+        """Output dtype must equal input dtype (bf16 in, bf16 out)."""
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, dtype=torch.bfloat16)
+        probs = torch.rand(2, 1, dtype=torch.bfloat16)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=4.0)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (2, 4)
 
 
 class TestGroupedExpertsZeroActiveExperts:
