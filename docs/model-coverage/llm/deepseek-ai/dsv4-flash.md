@@ -29,7 +29,7 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`deepseek_v4_flash_hellaswag.yaml <../../../../examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml>` | SFT — DeepSeek V4 Flash on HellaSwag with pipeline parallelism |
+| [`deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) | SFT — DeepSeek V4 Flash on HellaSwag with pipeline parallelism |
 
 
 ## Try with NeMo AutoModel
