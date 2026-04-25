@@ -548,29 +548,9 @@ class DeepseekV4Compressor(nn.Module):
         layer_idx: int,
         start_pos: int,
     ) -> torch.Tensor:
-        # Debug dumps for compressor (paired with reference compressor at
-        # ``dsv4flash/inference/model.py:Compressor.forward``).  Files:
-        # ``$DSV4_DEBUG_DUMP/rank{R}/C{layer:02d}_<stage>.pt``.
-        import os as _os
-        try:
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        except Exception:
-            _rank = 0
-        _root = _os.environ.get("DSV4_DEBUG_DUMP")
-        _cdir = f"{_root}/rank{_rank:02d}" if _root else None
-
-        def _cdump(stage: str, t: torch.Tensor) -> None:
-            if _cdir:
-                _os.makedirs(_cdir, exist_ok=True)
-                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_cdir}/C{layer_idx:02d}_{stage}.pt")
-
         batch, seq_len, _ = hidden_states.shape
         kv = self.wkv(hidden_states)
         gate = self.wgate(hidden_states)
-        _cdump("kv_pre_pool", kv)
-        _cdump("gate_pre_pool", gate)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
@@ -584,11 +564,9 @@ class DeepseekV4Compressor(nn.Module):
                 overlap=self.overlap,
             )
         )
-        _cdump("pooled_pre_rope", new_pooled)
         positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
         cos, sin = rotary(new_pooled, positions)
         new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
-        _cdump("pooled_post_rope", new_pooled)
         pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
 
         # Indexer narrows the attended compressed positions per query.  The
@@ -618,7 +596,6 @@ class DeepseekV4Compressor(nn.Module):
             indexer_topk = torch.where(
                 causal_invalid, torch.full_like(raw_topk, -1), raw_topk
             )
-            _cdump("indexer_topk", indexer_topk)
         return pooled, indexer_topk
 
 
@@ -824,41 +801,16 @@ class DeepseekV4Attention(nn.Module):
         else:
             cos, sin = position_embeddings
 
-        # Intra-attention debug dumps (paired with reference Attention.forward).
-        # Files written to ``$DSV4_DEBUG_DUMP/rank{R}/A{layer:02d}_<stage>.pt``.
-        import os as _os
-        try:
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        except Exception:
-            _rank = 0
-        _root = _os.environ.get("DSV4_DEBUG_DUMP")
-        _adir = f"{_root}/rank{_rank:02d}" if _root else None
-        _li = self.layer_idx
-
-        def _adump(stage: str, t: torch.Tensor) -> None:
-            if _adir:
-                _os.makedirs(_adir, exist_ok=True)
-                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_adir}/A{_li:02d}_{stage}.pt")
-
         q_residual = self.q_norm(self.wq_a(hidden_states))
-        _adump("q_residual", q_residual)
-        q_perhead = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim)
-        _adump("q_perhead_pre_rsqrt", q_perhead)  # [B, S, H, D] — ref-aligned
-        q = q_perhead.transpose(1, 2)  # [B, H, S, D]
+        q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-        _adump("kv_pre_rope", kv.squeeze(1))  # [B, S, D] — ref-aligned
 
         # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
         # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
-        _adump("q_post_rsqrt", q.transpose(1, 2))  # [B, S, H, D]
 
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
-        _adump("q_post_rope", q.transpose(1, 2))  # [B, S, H, D]
-        _adump("kv_post_rope", kv.squeeze(1))  # [B, S, D]
 
         full_kv = kv
 
@@ -939,21 +891,15 @@ class DeepseekV4Attention(nn.Module):
             scaling=self.scaling,
         )
         # eager_attention_with_sink returns [B, S, H, D] (already transposed).
-        _adump("attn_o_pre_inv_rope", attn_output)  # [B, S, H, D]
 
         # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
         # HF uses).  Reference: modular_deepseek_v4.py:607.
         attn_output = _apply_partial_rope(
             attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim
         ).transpose(1, 2)
-        _adump("attn_o_post_inv_rope", attn_output)  # [B, S, H, D]
 
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
-        wo_a_out = self.wo_a(grouped)
-        _adump("wo_a_out", wo_a_out)
-        out = self.wo_b(wo_a_out.flatten(2))
-        _adump("wo_b_out", out)
-        return out, attn_weights
+        return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b, self.wo_a):

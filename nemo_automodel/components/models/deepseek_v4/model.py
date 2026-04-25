@@ -142,67 +142,30 @@ class DeepseekV4Block(nn.Module):
         if attention_mask is not None and padding_mask is None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()
 
-        # Intra-block debug dump (paired with reference Block.forward).
-        # Files written under ``$DSV4_DEBUG_DUMP/rank{R}/`` with the schema
-        # ``L{N:02d}_{stage}.pt``.  Used by tools/dsv4_state_parity to bisect
-        # where divergence enters within a block.
-        import os as _os
-        try:
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        except Exception:
-            _rank = 0
-        _root = _os.environ.get("DSV4_DEBUG_DUMP")
-        _dump_dir = f"{_root}/rank{_rank:02d}" if _root else None
-        _li = self.layer_idx
-
-        def _idump(stage: str, t: torch.Tensor) -> None:
-            if _dump_dir:
-                _os.makedirs(_dump_dir, exist_ok=True)
-                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_dump_dir}/L{_li:02d}_{stage}.pt")
-
         # --- Attention site: collapse → norm → attn → expand ---
         pre, post, comb = self.attn_hc.compute_weights(x)
-        _idump("attn_pre", pre)
-        _idump("attn_post", post)
-        _idump("attn_comb", comb)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
-        _idump("attn_collapsed", collapsed)
-        attn_normed = self.input_layernorm(collapsed)
-        _idump("attn_normed", attn_normed)
         attn_out, _ = self.self_attn(
-            hidden_states=attn_normed,
+            hidden_states=self.input_layernorm(collapsed),
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_embeddings_compress=position_embeddings_compress,
             rotary_compress=rotary_compress,
         )
-        _idump("attn_out", attn_out)
         dtype = x.dtype
         # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
         x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
-        _idump("post_attn_x", x)
 
         # --- MLP site: same pattern ---
         pre, post, comb = self.ffn_hc.compute_weights(x)
-        _idump("ffn_pre", pre)
-        _idump("ffn_post", post)
-        _idump("ffn_comb", comb)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
-        _idump("ffn_collapsed", collapsed)
-        ffn_normed = self.post_attention_layernorm(collapsed)
-        _idump("ffn_normed", ffn_normed)
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
         if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
             self.mlp.gate.set_input_ids(input_ids)
-        mlp_out = self.mlp(ffn_normed, padding_mask)
-        _idump("mlp_out", mlp_out)
+        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
-        out = post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
-        _idump("post_mlp_x", out)
-        return out
+        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()
@@ -455,34 +418,7 @@ class DeepseekV4Model(nn.Module):
         # None — hash layers shouldn't be present there.
         layer_input_ids = input_ids if on_first_stage else None
 
-        # Debug dump: when ``DSV4_DEBUG_DUMP=<dir>`` is set, save per-block
-        # outputs for layer-by-layer parity with the DeepSeek inference
-        # reference (schema mirrors ``dsv4flash/inference/model.py:Transformer.forward``).
-        # Files written under ``<dir>/rank{R}/`` so concurrent ranks don't
-        # clobber each other.  After the run, pick one rank per PP stage:
-        # rank 0 of stage 0 has embed* + block_00..., last stage has hc_head_out
-        # / post_norm / logits.
-        import os as _os
-        try:
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else 0
-        except Exception:
-            _rank = 0
-        _root = _os.environ.get("DSV4_DEBUG_DUMP")
-        _dump_dir = f"{_root}/rank{_rank:02d}" if _root else None
-        if _dump_dir:
-            _os.makedirs(_dump_dir, exist_ok=True)
-        def _dump(name: str, t: torch.Tensor) -> None:
-            if _dump_dir:
-                torch.save(t.detach().to(torch.bfloat16).cpu(), f"{_dump_dir}/{name}.pt")
-
-        # First-stage dumps: 3D embeds + 4D HC-expanded.  Mid-stages skip these.
-        if on_first_stage:
-            _dump("embed", inputs_embeds)
-            _dump("embed_hc", h)
-
-        for li, layer in enumerate(self.layers.values()):
+        for layer in self.layers.values():
             if layer is None:  # PP-trimmed slot
                 continue
             h = layer(
@@ -499,7 +435,6 @@ class DeepseekV4Model(nn.Module):
                 input_ids=layer_input_ids,
                 **attn_kwargs,
             )
-            _dump(f"block_{li:02d}", h)
 
         # Reduce hc_mult copies -> [B,S,dim] via the learned HC head, then
         # apply the shared RMSNorm.  Both modules live ONLY on the last PP
@@ -507,10 +442,8 @@ class DeepseekV4Model(nn.Module):
         # consume it).  Matches HF PR 45616's ``DeepseekV4Model.forward``.
         if getattr(self, "hc_head", None) is not None:
             h = self.hc_head(h)
-            _dump("hc_head_out", h)
         if getattr(self, "norm", None) is not None:
             h = self.norm(h)
-            _dump("post_norm", h)
         return h
 
     def update_moe_gate_bias(self) -> None:
@@ -637,13 +570,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             **attn_kwargs,
         )
         logits = self.lm_head(logits) if self.lm_head else logits
-        # Debug dump (paired with ``DeepseekV4Model.forward`` per-block dumps).
-        import os as _os
-
-        _dump_dir = _os.environ.get("DSV4_DEBUG_DUMP")
-        if _dump_dir and self.lm_head is not None:
-            _os.makedirs(_dump_dir, exist_ok=True)
-            torch.save(logits.detach().to(torch.bfloat16).cpu(), f"{_dump_dir}/logits.pt")
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             logits = logits.unsqueeze(0)
         return logits
