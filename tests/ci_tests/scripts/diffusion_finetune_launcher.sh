@@ -64,7 +64,15 @@ case "$RECIPE_NAME" in
         exit 1
         ;;
 esac
-echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME"
+
+# LoRA recipes are named *_lora.yaml — they save PEFT adapter artifacts
+# (adapter_model.safetensors + adapter_config.json) that generate.py loads via
+# model.lora_weights, not model.checkpoint.
+IS_LORA=false
+if [[ "$RECIPE_NAME" == *_lora ]]; then
+    IS_LORA=true
+fi
+echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME  LoRA=$IS_LORA"
 
 # ============================================
 # Stage 1: Download dataset
@@ -156,11 +164,23 @@ echo "[inference] Running inference smoke test..."
 echo "============================================"
 CKPT_STEP_DIR=$(ls -d $CKPT_DIR/epoch_*_step_* | sort -t_ -k4 -n | tail -1)
 
+# generate.py loads LoRA adapters from model.lora_weights and consolidated
+# full-finetune checkpoints from model.checkpoint — they are distinct code paths.
+# PEFT saves adapter_model.safetensors + adapter_config.json under the `model/`
+# subdirectory of the step checkpoint; generate.py reads those files from the
+# directory passed to --model.lora_weights without descending further.
+if [ "$IS_LORA" = "true" ]; then
+    CKPT_FLAG="--model.lora_weights"
+    CKPT_STEP_DIR="$CKPT_STEP_DIR/model"
+else
+    CKPT_FLAG="--model.checkpoint"
+fi
+
 if [ "$MEDIA_TYPE" = "image" ]; then
     uv run --extra diffusion python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
-        --model.checkpoint "$CKPT_STEP_DIR" \
+        $CKPT_FLAG "$CKPT_STEP_DIR" \
         --inference.num_inference_steps 5 \
         --output.output_dir "$INFER_DIR" \
         --vae.enable_slicing true \
@@ -176,7 +196,7 @@ else
     uv run --extra diffusion python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
-        --model.checkpoint "$CKPT_STEP_DIR" \
+        $CKPT_FLAG "$CKPT_STEP_DIR" \
         --inference.num_inference_steps 5 \
         --inference.pipeline_kwargs.num_frames "$INFER_NUM_FRAMES" \
         --output.output_dir "$INFER_DIR" \
