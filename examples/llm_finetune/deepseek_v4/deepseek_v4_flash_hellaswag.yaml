@@ -12,43 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Finetuning config for DeepSeek V4 Flash on HellaSwag
-# Replace /path/to/deepseek-v4-flash with the path to your local model checkpoint.
-#
-# Limitations vs. the paper:
-#   - HC (Hyper-Connections) uses mean-pool/broadcast-add approximation
-#     (hc_split_sinkhorn kernel not yet available)
-#   - Hash-clustering gate (first 3 layers) falls back to score-based routing
-#   - Compress-ratio sliding-window attention is not implemented; all layers
-#     use full causal attention
-#   - MTP (multi-token prediction) layer is not trained
-#
-# Single-node 8×A100-80G run (few-layer validation):
-#   automodel examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
-#
-# Two-node 16×A100-80G full model (requires EP=64 or EP=32 + more nodes):
-#   Set ep_size and num_hidden_layers in the model config accordingly.
+# To run this recipe with 16 H100 nodes (128 GPUs)
+#   torchrun --nproc-per-node 8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
+
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 2
+  global_batch_size: 256
+  local_batch_size: 8
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
+  max_steps: 100
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 8
+  pp_size: 4
+  ep_size: 32
 
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
   moe:
     reshard_after_forward: false
@@ -56,14 +53,15 @@ distributed:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
-    pretrained_model_name_or_path: /path/to/deepseek-v4-flash
-    name_or_path: /path/to/deepseek-v4-flash
+    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
+    name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
+    num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
   backend:
@@ -72,8 +70,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: false
-    fake_balanced_gate: false
+    dispatcher: torch
+    experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -90,7 +88,7 @@ dataset:
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/deepseek-v4-flash
+    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
 
 packed_sequence:
   packed_sequence_size: 0
@@ -108,7 +106,7 @@ validation_dataset:
   split: validation
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/deepseek-v4-flash
+    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/dsv4/dsv4flash
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
