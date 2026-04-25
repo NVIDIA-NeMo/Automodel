@@ -945,6 +945,47 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
+        # When CP is active, pre-compute inputs_embeds (text embed + image
+        # feature merge) on the full unsharded sequence before CP scatters
+        # input_ids to local shards.  Without this, image-token positions land
+        # on only one CP rank while pixel_values stays full-size on all ranks,
+        # causing HF's token-count check to fail.
+        _cp_mesh = (
+            self.device_mesh["cp"]
+            if (self.device_mesh is not None and "cp" in getattr(self.device_mesh, "mesh_dim_names", {}))
+            else None
+        )
+        _cp_active = _cp_mesh is not None and _cp_mesh.size() > 1
+        if _cp_active and "pixel_values" in batch:
+            _model = self.model_parts[0]
+            if hasattr(_model, "prepare_model_inputs_for_cp") or hasattr(_model, "prepare_inputs_embeds_for_cp"):
+                # Call through model.__call__ so FSDP2 pre-forward hook fires and
+                # all-gathers sharded parameters (embed_tokens weight) to Replicate
+                # placement before the embedding lookup.  Calling the method directly
+                # bypasses the hook and causes a mixed DTensor/plain-tensor error.
+                # NOTE: gradients from image encoding are NOT tracked here — the
+                # vision encoder weights receive no gradient updates via this path.
+                # If the vision encoder must be trainable, image encoding must be
+                # moved inside the per-rank CP forward pass instead.
+                prepared_inputs = _model(
+                    input_ids=batch["input_ids"],
+                    pixel_values=batch.get("pixel_values"),
+                    image_position_ids=batch.get("image_position_ids"),
+                    mm_token_type_ids=batch.get("mm_token_type_ids"),
+                    _pre_embed_only=True,
+                )
+                if isinstance(prepared_inputs, torch.Tensor):
+                    prepared_inputs = {"inputs_embeds": prepared_inputs}
+
+                batch.pop("input_ids", None)
+                batch.pop("pixel_values", None)
+                batch.pop("image_position_ids", None)
+                batch.pop("pixel_values_videos", None)
+                batch.pop("image_grid_thw", None)
+                batch.pop("video_grid_thw", None)
+                batch.pop("n_images_per_sample", None)
+                batch.update(prepared_inputs)
+
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 

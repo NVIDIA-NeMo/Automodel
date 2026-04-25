@@ -365,6 +365,24 @@ class Gemma4MoETextModelBackend(nn.Module):
         # build a vision-aware mask where tokens inside the same vision group
         # attend to each other bidirectionally (not just causally). Missing this
         # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+        #
+        # Under context parallelism inputs_embeds is a DTensor with the sequence
+        # dimension sharded across CP ranks.  mm_token_type_ids is NOT sharded
+        # (shape [B, S_global]), so passing it to create_causal_mask_mapping would
+        # produce a bidirectional mask that is inconsistent across ranks.  We null
+        # it out to force a standard causal mask; the self_attn forward pre-hook
+        # (registered by attach_context_parallel_hooks in infrastructure.py) will
+        # strip that mask and set is_causal=True so SDPA uses the DTensor
+        # ring-attention path.
+        _mm_token_type_ids_for_mask = mm_token_type_ids
+        try:
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(inputs_embeds, DTensor):
+                _mm_token_type_ids_for_mask = None
+        except ImportError:
+            pass
+
         if getattr(self.config, "use_bidirectional_attention", None) == "vision":
             from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
 
@@ -374,7 +392,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
+                mm_token_type_ids=_mm_token_type_ids_for_mask,
                 pixel_values=pixel_values,
                 is_training=self.training,
             )
@@ -505,6 +523,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         text_config = config.text_config if hasattr(config, "text_config") else config
         enable_moe = getattr(text_config, "enable_moe_block", False)
 
+        pad_token_id = getattr(text_config, "pad_token_id", None)
+        if pad_token_id is None:
+            eos = getattr(text_config, "eos_token_id", None)
+            if isinstance(eos, (list, tuple)):
+                eos = eos[0]
+            pad_token_id = eos
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
+
         if not enable_moe:
             # Dense Gemma4 — keep vanilla HF model, nothing else to do.
             return
@@ -523,8 +549,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         self.model.moe_config = self.model.language_model.moe_config
 
         self.vocab_size = text_config.vocab_size
-        pad_token_id = getattr(text_config, "pad_token_id", None)
-        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         # State dict adapter for HF ↔ NeMo weight conversion
         if self.backend.enable_hf_state_dict_adapter:
@@ -547,15 +571,98 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
+        _pre_embed_only: bool = False,
         **kwargs: Any,
     ):
-        if cache_position is None and input_ids is not None:
-            seq_len = input_ids.shape[-1]
-            cache_position = torch.arange(seq_len, device=input_ids.device)
+        if _pre_embed_only:
+            return self.prepare_model_inputs_for_cp(input_ids, pixel_values, image_position_ids, mm_token_type_ids)
+
+        if cache_position is None:
+            if input_ids is not None:
+                seq_len = input_ids.shape[-1]
+                cache_position = torch.arange(seq_len, device=input_ids.device)
+            elif inputs_embeds is not None:
+                seq_len = inputs_embeds.shape[1]
+                cache_position = torch.arange(seq_len, device=inputs_embeds.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            # Dense path — delegate to HF forward
+            # Dense path — delegate to HF forward.
+            # Under context parallelism the sequence dimension of input_ids is
+            # sharded as a DTensor. HF will call masked_scatter to insert image
+            #    features into the DTensor inputs_embeds.  After CP sharding each
+            #    rank holds a different slice of the sequence, so the number of
+            #    image-token slots per rank is unknown at this point and
+            #    masked_scatter cannot redistribute image features correctly.
+            #    CP with pixel_values is not yet supported for the dense path;
+            #    pre-compute inputs_embeds before CP sharding at the recipe level.
+            _mm_token_type_ids = mm_token_type_ids
+            try:
+                from torch.distributed.tensor import DTensor
+
+                _under_cp = isinstance(input_ids, DTensor) or isinstance(inputs_embeds, DTensor)
+                if _under_cp:
+                    if pixel_values is not None:
+                        raise NotImplementedError(
+                            "Context parallelism with pixel_values is not yet supported for the "
+                            "dense Gemma4 path.  Pre-compute inputs_embeds (with image features "
+                            "merged) before CP sharding and pass inputs_embeds instead of "
+                            "input_ids + pixel_values."
+                        )
+            except ImportError:
+                pass
+
+            if _mm_token_type_ids is None:
+                if pixel_values is not None:
+                    if input_ids is None:
+                        raise ValueError(
+                            "mm_token_type_ids is required when pixel_values have already been merged into "
+                            "inputs_embeds."
+                        )
+                    _mm_token_type_ids = (input_ids == self.config.image_token_id).to(torch.long)
+                else:
+                    _ref = input_ids if input_ids is not None else inputs_embeds
+                    try:
+                        from torch.distributed.tensor import DTensor
+
+                        if isinstance(_ref, DTensor):
+                            _ref = _ref.to_local()
+                    except ImportError:
+                        pass
+                    _seq_shape = _ref.shape if _ref.dim() == 2 else _ref.shape[:2]
+                    _mm_token_type_ids = torch.zeros(_seq_shape, dtype=torch.long, device=_ref.device)
+
+            # Pop pre-computed per_layer_inputs before any forward call.
+            # Gemma4Model.forward does NOT accept per_layer_inputs and passes **kwargs
+            # straight into language_model(..., **kwargs), which would cause
+            # "got multiple values for argument 'per_layer_inputs'" if we left it in.
+            _per_layer_inputs = kwargs.pop("per_layer_inputs", None)
+
+            # CP fast-path: when inputs_embeds is provided without input_ids and
+            # per_layer_inputs is already pre-computed by prepare_model_inputs_for_cp,
+            # bypass Gemma4Model.forward entirely.  That function always recomputes
+            # per_layer_inputs via get_per_layer_inputs(input_ids=None, inputs_embeds)
+            # which — because input_ids is None — reverse-engineers token ids by
+            # broadcasting inputs_embeds against the full vocab embedding matrix
+            # ([B, S, vocab_size, H]), allocating ~1280 GiB and OOM-ing.
+            if _per_layer_inputs is not None and inputs_embeds is not None and input_ids is None:
+                _text_outputs = self.model.language_model(
+                    input_ids=None,
+                    inputs_embeds=inputs_embeds,
+                    per_layer_inputs=_per_layer_inputs,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    **kwargs,
+                )
+                hidden_states = _text_outputs.last_hidden_state
+                logits = self.lm_head(hidden_states)
+                if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
+                    logits = logits / final_logit_softcapping
+                    logits = torch.tanh(logits)
+                    logits = logits * final_logit_softcapping
+                return logits
+
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -564,7 +671,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 cache_position=cache_position,
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
-                mm_token_type_ids=mm_token_type_ids,
+                mm_token_type_ids=_mm_token_type_ids,
                 **kwargs,
             )
 
@@ -572,7 +679,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if input_ids is not None and inputs_embeds is None:
             inputs_embeds = self.model.get_input_embeddings()(input_ids)
 
-        # Handle vision tokens
+        # Handle vision tokens.
+        # Under CP inputs_embeds is a sequence-sharded DTensor.  masked_scatter
+        # cannot correctly redistribute image features across ranks because each
+        # rank's shard may contain a different number of image-token slots.
+        # Raise early rather than producing silently wrong embeddings.
         if pixel_values is not None:
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
@@ -586,6 +697,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             else:
                 special_image_mask = torch.zeros(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
 
+            try:
+                from torch.distributed.tensor import DTensor
+
+                if isinstance(inputs_embeds, DTensor):
+                    raise NotImplementedError(
+                        "Context parallelism with pixel_values is not yet supported for the "
+                        "MoE Gemma4 path.  Pre-compute inputs_embeds (with image features "
+                        "merged) before CP sharding and pass inputs_embeds instead of "
+                        "input_ids + pixel_values."
+                    )
+            except ImportError:
+                pass
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
@@ -614,6 +737,93 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             logits = logits * final_logit_softcapping
 
         return logits
+
+    def _get_special_image_mask(
+        self,
+        input_ids: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if mm_token_type_ids is not None:
+            return mm_token_type_ids == 1
+        return input_ids == self.config.image_token_id
+
+    def _prepare_per_layer_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        special_image_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is None or not getattr(language_model, "hidden_size_per_layer_input", None):
+            return None
+
+        pad_token_id = getattr(self, "pad_token_id", None)
+        if pad_token_id is None or pad_token_id < 0:
+            cfg = getattr(self, "config", None)
+            cfg_text = getattr(cfg, "text_config", cfg)
+            pad_token_id = getattr(cfg_text, "pad_token_id", None)
+        if pad_token_id is None or pad_token_id < 0:
+            eos = getattr(getattr(self, "config", None), "eos_token_id", None)
+            if eos is None:
+                cfg_text = getattr(getattr(self, "config", None), "text_config", None)
+                eos = getattr(cfg_text, "eos_token_id", None) if cfg_text else None
+            if isinstance(eos, (list, tuple)):
+                eos = eos[0]
+            pad_token_id = eos
+        if pad_token_id is None or pad_token_id < 0:
+            raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
+
+        llm_input_ids = input_ids.masked_fill(special_image_mask, pad_token_id)
+        return language_model.get_per_layer_inputs(llm_input_ids, None)
+
+    def prepare_model_inputs_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Prepare model inputs before CP sequence sharding."""
+        special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+        prepared_inputs = {"inputs_embeds": inputs_embeds}
+
+        per_layer_inputs = self._prepare_per_layer_inputs_for_cp(input_ids, special_image_mask)
+        if per_layer_inputs is not None:
+            prepared_inputs["per_layer_inputs"] = per_layer_inputs
+
+        if pixel_values is not None:
+            image_features = self.model.get_image_features(
+                pixel_values, image_position_ids=image_position_ids, return_dict=True
+            ).pooler_output
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+            image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            prepared_inputs["inputs_embeds"] = inputs_embeds.masked_scatter(image_mask, image_features)
+
+        return prepared_inputs
+
+    def prepare_inputs_embeds_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Merge image features into text embeddings before CP sequence sharding.
+
+        When CP is active the sequence dimension of input_ids is scattered to
+        local shards.  Image-token positions are concentrated near the start of
+        the sequence so only rank 0 sees them; masked_scatter cannot redistribute
+        image features across shards and produces wrong results.  Call this on
+        the full unsharded batch before make_cp_batch_and_ctx, then pass
+        inputs_embeds to the model instead of input_ids + pixel_values.
+        """
+        return self.prepare_model_inputs_for_cp(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
+            mm_token_type_ids=mm_token_type_ids,
+        )["inputs_embeds"]
 
     @torch.no_grad()
     def initialize_weights(

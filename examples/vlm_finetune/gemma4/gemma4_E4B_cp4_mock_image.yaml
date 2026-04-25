@@ -1,0 +1,110 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gemma 4 E4B (dense 4B) — CP=4 multimodal smoke test on 4×H100 nodes.
+#
+# Topology: CP=4 × DP=8 = 32 GPUs (4 nodes × 8 GPUs each)
+# Sequence length: 8192 → each CP rank sees 2048 tokens.
+# Dataset: mock with 1 image per sample (exercises the CP pre-embed path).
+#
+# Run (replace $MASTER_ADDR / $MASTER_PORT as needed):
+#
+#   torchrun \
+#     --nnodes=4 \
+#     --nproc-per-node=8 \
+#     --rdzv-backend=c10d \
+#     --rdzv-endpoint=$MASTER_ADDR:29500 \
+#     nemo_automodel/recipes/vlm/finetune.py \
+#     -c examples/vlm_finetune/gemma4/gemma4_E4B_cp4_mock_image.yaml
+#
+# Loss-parity baseline (CP=1, same seed, same GBS):
+#   Override at launch:  --distributed.cp_size 1 --distributed.dp_size 32
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  # GBS=32, local_batch_size=1 → 1 micro-batch per DP rank per step.
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 9999
+  val_every_steps: 9999
+  max_steps: 300
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-E4B-it
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  attn_implementation: sdpa
+  text_config:
+    use_cache: false
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none      # inferred: 32 / (cp=4 × tp=1) = 8
+  tp_size: 1
+  cp_size: 4
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Mock dataset with 1 image per sample — exercises the multimodal CP path
+# (pre-embed before sequence slicing, then CP all-gather inside _cp_sdpa).
+# max_length=8192: sequence is divisible by cp_size=4 (2048 per rank).
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 10000
+  num_images_per_sample: 1
+  image_size: [256, 256]
+  max_length: 8192
+  seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  # Vision tower is frozen because gradients are not tracked in the CP
+  # pre-embed path (see finetune.py pre-embed block comment).
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
