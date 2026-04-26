@@ -48,26 +48,9 @@ A new in-tree `HuggingFaceStorageReader` recognizes `F8_E8M0` and `F8_E5M2` dtyp
 
 ## Launch Training
 
-Two recipes ship under [`examples/llm_finetune/deepseek_v4/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/deepseek_v4):
-
-- [`deepseek_v4_flash_validate.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_validate.yaml) — single-node 8 × A100-80G infrastructure validation on a 4-layer truncated harness exercising the full attention zoo (`compress_ratios=[0, 0, 4, 128]` → SWA / SWA / CSA / HCA), `num_hash_layers=2`, `pp_size=2`, `ep_size=4`. Use this first to confirm the environment and checkpoint paths before scaling out.
-- [`deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) — HellaSwag finetune recipe. The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
+A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml). The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
 
 NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
-
-### Quick infrastructure validation (single node, 8 × A100-80G)
-
-Run the 4-layer validate harness to confirm forward / backward / PP / DCP health end-to-end before launching the full schedule:
-
-```bash
-PYTHONPATH=/path/to/Automodel:$PYTHONPATH automodel \
-  examples/llm_finetune/deepseek_v4/deepseek_v4_flash_validate.yaml \
-  --nproc-per-node 8 \
-  --model.config.pretrained_model_name_or_path=/your/local/dsv4-flash \
-  --model.config.name_or_path=/your/local/dsv4-flash
-```
-
-The validate yaml uses `num_hidden_layers=4` with `compress_ratios=[0, 0, 4, 128]`, exercising SWA / SWA / CSA / HCA on every forward, and `num_hash_layers=2` so both stage-0 layers are hash-routed.
 
 ### Standalone Slurm Script
 

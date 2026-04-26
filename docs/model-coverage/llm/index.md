@@ -28,6 +28,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Qwen / Alibaba Cloud | [Qwen3-Next](qwen/qwen3-next.md) | `Qwen3NextForCausalLM` |
 | DeepSeek | [DeepSeek](deepseek-ai/deepseek.md) | `DeepseekForCausalLM` |
 | DeepSeek | [DeepSeek-V3](deepseek-ai/deepseek-v3.md) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek V4 Flash](deepseek-ai/dsv4-flash.md) | `DeepseekV4ForCausalLM` |
 | Mistral AI | [Mistral](mistralai/mistral.md) | `MistralForCausalLM` |
 | Mistral AI | [Mixtral](mistralai/mixtral.md) | `MixtralForCausalLM` |
 | Mistral AI | [Ministral3 / Devstral](mistralai/ministral3.md) | `Mistral3ForConditionalGeneration` |
@@ -96,6 +97,7 @@ qwen/qwen3-moe
 qwen/qwen3-next
 deepseek-ai/deepseek
 deepseek-ai/deepseek-v3
+deepseek-ai/dsv4-flash
 mistralai/mistral
 mistralai/mixtral
 mistralai/ministral3
