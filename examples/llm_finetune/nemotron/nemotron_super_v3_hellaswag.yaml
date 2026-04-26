@@ -115,3 +115,9 @@ ci:
     step_scheduler.global_batch_size: 64
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
+    # Phase 4 reloads the 120B HF model on rank 0 with device_map=auto. While
+    # other ranks wait at the post-Phase-4 _barrier(), the default 60 s NCCL
+    # collective timeout (dist_env.timeout_minutes=1) trips long before the
+    # rank-0 HF load finishes (>2 min for 120B). Bump to 30 min for the
+    # robustness run only — normal training keeps the tight default.
+    dist_env.timeout_minutes: 30
