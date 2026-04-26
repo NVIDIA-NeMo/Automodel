@@ -103,7 +103,12 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   recipe_owner: adil-a
-  time: "00:25:00"
+  # Wall covers both the finetune phase (~5 min) and the checkpoint-robustness
+  # phase that runs in the same SLURM allocation. The robustness phase loads
+  # the 120 B HF model on rank 0 (~3 min) and runs forwards on top of the
+  # FSDP+EP setup, which together take ~20 min on H100 — bump from 25 min so
+  # there's headroom for queue + variance.
+  time: "00:45:00"
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     experts_implementation: grouped_mm
