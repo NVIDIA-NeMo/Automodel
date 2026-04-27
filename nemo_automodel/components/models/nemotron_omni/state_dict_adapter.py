@@ -195,7 +195,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             # HF: sound_encoder.encoder.* -> Custom: sound_encoder.*
             # Because our model stores ParakeetEncoder directly as self.sound_encoder
             elif key.startswith("sound_encoder.encoder."):
-                new_key = "sound_encoder." + key[len("sound_encoder.encoder."):]
+                new_key = "sound_encoder." + key[len("sound_encoder.encoder.") :]
                 result[new_key] = value
                 debug_counts["sound_encoder"] += 1
 
@@ -208,7 +208,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
             # Strip "language_model." prefix, pass to NemotronV3StateDictAdapter,
             # then re-add "language_model." prefix
             elif key.startswith("language_model."):
-                stripped_key = key[len("language_model."):]
+                stripped_key = key[len("language_model.") :]
                 llm_state_dict[stripped_key] = value
                 debug_counts["llm"] += 1
 
@@ -292,7 +292,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
             # Sound encoder (custom -> HF: add "encoder." prefix)
             elif fqn.startswith("sound_encoder."):
-                new_key = "sound_encoder.encoder." + fqn[len("sound_encoder."):]
+                new_key = "sound_encoder.encoder." + fqn[len("sound_encoder.") :]
                 hf_result[new_key] = tensor
 
             # Sound projection (pass through)
@@ -301,16 +301,14 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
             # LLM keys (strip language_model. prefix for NemotronV3)
             elif fqn.startswith("language_model."):
-                stripped = fqn[len("language_model."):]
+                stripped = fqn[len("language_model.") :]
                 llm_state_dict[stripped] = tensor
 
             else:
                 hf_result[fqn] = tensor
 
         # Convert LLM keys to HF format
-        converted_llm = self._llm_adapter.to_hf(
-            llm_state_dict, exclude_key_regex=exclude_key_regex, **kwargs
-        )
+        converted_llm = self._llm_adapter.to_hf(llm_state_dict, exclude_key_regex=exclude_key_regex, **kwargs)
 
         # Re-add "language_model." prefix
         for key, value in converted_llm.items():
@@ -318,9 +316,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
         return hf_result
 
-    def convert_single_tensor_to_hf(
-        self, fqn: str, tensor: Any, **kwargs
-    ) -> list[tuple[str, Any]]:
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from custom format to HF format.
 
         Args:
@@ -343,7 +339,7 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
         # Sound encoder
         elif fqn.startswith("sound_encoder."):
-            new_fqn = "sound_encoder.encoder." + fqn[len("sound_encoder."):]
+            new_fqn = "sound_encoder.encoder." + fqn[len("sound_encoder.") :]
 
         # Sound projection (pass through)
         elif fqn.startswith("sound_projection."):
@@ -351,10 +347,8 @@ class NemotronOmniStateDictAdapter(StateDictAdapter):
 
         # LLM keys
         elif fqn.startswith("language_model."):
-            stripped = fqn[len("language_model."):]
-            llm_results = self._llm_adapter.convert_single_tensor_to_hf(
-                stripped, tensor, **kwargs
-            )
+            stripped = fqn[len("language_model.") :]
+            llm_results = self._llm_adapter.convert_single_tensor_to_hf(stripped, tensor, **kwargs)
             # Re-add language_model. prefix
             results = [(f"language_model.{k}", v) for k, v in llm_results]
             if exclude_key_regex:

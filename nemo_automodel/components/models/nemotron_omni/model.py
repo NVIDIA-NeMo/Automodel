@@ -275,9 +275,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         Returns:
             NemotronOmniForConditionalGeneration instance
         """
-        config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path, trust_remote_code=True
-        )
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
@@ -313,10 +311,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         self.video_context_token_id = getattr(config, "video_context_token_id", 131081)
         self.sound_context_token_id = getattr(config, "sound_context_token_id", 27)
 
-        self.num_image_token = int(
-            (self.force_image_size // self.patch_size) ** 2
-            * (self.downsample_ratio ** 2)
-        )
+        self.num_image_token = int((self.force_image_size // self.patch_size) ** 2 * (self.downsample_ratio**2))
         logger.info(f"NemotronOmni: num_image_token={self.num_image_token}")
         logger.info(f"NemotronOmni: ps_version={self.ps_version}")
         logger.info(f"NemotronOmni: img_context_token_id={self.img_context_token_id}")
@@ -329,9 +324,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # 1. Language Model (reuses nemotron_v3 custom implementation)
         # ---------------------------------------------------------------
         logger.info("NemotronOmni: Creating NemotronV3 LLM backbone...")
-        self.language_model = NemotronV3ForCausalLM(
-            llm_config, backend=self.backend, **kwargs
-        )
+        self.language_model = NemotronV3ForCausalLM(llm_config, backend=self.backend, **kwargs)
         logger.info(
             f"NemotronOmni: LLM created with {llm_config.num_hidden_layers} layers, "
             f"hidden_size={llm_config.hidden_size}, vocab_size={llm_config.vocab_size}"
@@ -347,6 +340,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # which also uses eager attention. The timm Attention class reads this
         # global flag at __init__ time, so it must be set BEFORE model creation.
         from timm.layers.config import set_fused_attn as _timm_set_fused_attn
+
         _timm_set_fused_attn(False)
         self.vision_model = AutoModel.from_config(vision_config, trust_remote_code=True)
         _timm_set_fused_attn(True)  # Restore default for any subsequent timm usage
@@ -421,8 +415,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 logger.info(f"NemotronOmni: Sound encoder created (hidden_size={sound_hidden_size})")
             except ImportError:
                 logger.warning(
-                    "NemotronOmni: ParakeetEncoder not available in transformers. "
-                    "Sound encoder will not be loaded."
+                    "NemotronOmni: ParakeetEncoder not available in transformers. Sound encoder will not be loaded."
                 )
                 self.sound_encoder = None
 
@@ -493,8 +486,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                     # it from state_dict())
                     sub.register_buffer(buf_name, buf, persistent=False)
                     logger.info(
-                        f"NemotronOmni: Converted buffer '{name}.{buf_name}' "
-                        f"to non-persistent (not in HF checkpoint)"
+                        f"NemotronOmni: Converted buffer '{name}.{buf_name}' to non-persistent (not in HF checkpoint)"
                     )
 
     # ------------------------------------------------------------------
@@ -726,9 +718,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             vit_embeds = vit_embeds[image_flags == 1]
 
             try:
-                inputs_embeds[selected] = (
-                    inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-                )
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
             except Exception as e:
                 vit_embeds = vit_embeds.reshape(-1, C)
                 logger.warning(
@@ -737,9 +727,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                     f"vit_embeds.shape={vit_embeds.shape}"
                 )
                 n_token = selected.sum()
-                inputs_embeds[selected] = (
-                    inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
-                )
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
 
             inputs_embeds = inputs_embeds.reshape(B, N, C)
 
@@ -751,23 +739,19 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
             video_selected = input_ids.reshape(B_v * N_v) == self.img_context_token_id
             video_embeds = self.extract_video_feature(pixel_values_videos)
-            inputs_embeds[video_selected] = (
-                inputs_embeds[video_selected] * 0.0 + video_embeds.reshape(-1, C_v)
-            )
+            inputs_embeds[video_selected] = inputs_embeds[video_selected] * 0.0 + video_embeds.reshape(-1, C_v)
             inputs_embeds = inputs_embeds.reshape(B_v, N_v, C_v)
 
         # --- Sound/audio token replacement ---
         has_sound = (
-            sound_features is not None
-            and self.sound_encoder is not None
-            and self.sound_context_token_id is not None
+            sound_features is not None and self.sound_encoder is not None and self.sound_context_token_id is not None
         )
         if has_sound:
             B_s, N_s, C_s = inputs_embeds.shape
             inputs_embeds = inputs_embeds.reshape(B_s * N_s, C_s)
             input_ids_flat_sound = input_ids.reshape(B_s * N_s)
 
-            sound_selected = (input_ids_flat_sound == self.sound_context_token_id)
+            sound_selected = input_ids_flat_sound == self.sound_context_token_id
             num_sound_tokens = sound_selected.sum().item()
 
             if num_sound_tokens > 0:
@@ -789,9 +773,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                     )
 
                 try:
-                    inputs_embeds[sound_selected] = (
-                        inputs_embeds[sound_selected] * 0.0
-                        + sound_embeds_flat.to(inputs_embeds.dtype)
+                    inputs_embeds[sound_selected] = inputs_embeds[sound_selected] * 0.0 + sound_embeds_flat.to(
+                        inputs_embeds.dtype
                     )
                 except Exception as e:
                     logger.warning(
@@ -799,10 +782,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                         f"inputs_embeds[sound_selected].shape={inputs_embeds[sound_selected].shape}, "
                         f"sound_embeds_flat.shape={sound_embeds_flat.shape}"
                     )
-                    inputs_embeds[sound_selected] = (
-                        inputs_embeds[sound_selected] * 0.0
-                        + sound_embeds_flat[:num_sound_tokens].to(inputs_embeds.dtype)
-                    )
+                    inputs_embeds[sound_selected] = inputs_embeds[sound_selected] * 0.0 + sound_embeds_flat[
+                        :num_sound_tokens
+                    ].to(inputs_embeds.dtype)
 
                 del sound_embeds, sound_embeds_flat
 

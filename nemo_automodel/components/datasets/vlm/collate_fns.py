@@ -1610,6 +1610,7 @@ def nemotron_omni_collate_fn(
                             continue
                         if isinstance(vid, str):
                             import decord
+
                             decord.bridge.set_bridge("native")
                             total = len(decord.VideoReader(vid))
                             # Even count required by ``video_temporal_patch_dim=2``.
@@ -1618,7 +1619,8 @@ def nemotron_omni_collate_fn(
                                 n = max(2, n - 1)
                             frame_idx = torch.linspace(0, total - 1, n).round().long().tolist()
                             frames, video_fps, indices = _read_video_frames(
-                                vid, processor=processor,
+                                vid,
+                                processor=processor,
                                 frame_indices=frame_idx,
                                 return_metadata=True,
                             )
@@ -1638,10 +1640,12 @@ def nemotron_omni_collate_fn(
                         text_parts.append(video_token)
                     elif t == "text":
                         text_parts.append(item.get("text", ""))
-                text_conversation.append({
-                    "role": message["role"],
-                    "content": "".join(text_parts),
-                })
+                text_conversation.append(
+                    {
+                        "role": message["role"],
+                        "content": "".join(text_parts),
+                    }
+                )
             else:
                 text_conversation.append(message)
 
@@ -1749,6 +1753,7 @@ def nemotron_omni_collate_fn(
             fe = getattr(processor, "_sound_feature_extractor", None)
             if fe is None:
                 from transformers import ParakeetFeatureExtractor
+
                 fe = ParakeetFeatureExtractor(sampling_rate=target_sr, feature_size=128)
                 try:
                     processor._sound_feature_extractor = fe
