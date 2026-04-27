@@ -460,6 +460,129 @@ def test_dispatch_table(collate_mod):
     assert collate_mod.COLLATE_FNS["default"] is collate_mod.default_collate_fn
 
 
+def test_nemotron_omni_dispatch_registered(collate_mod):
+    """The v3 NemotronOmni processor key must dispatch to its collate fn."""
+    assert (
+        collate_mod.COLLATE_FNS["NemotronH_Nano_Omni_Reasoning_V3Processor"]
+        is collate_mod.nemotron_omni_collate_fn
+    )
+
+
+class DummyNemotronOmniProcessor:
+    """Minimal stub that mirrors what ``nemotron_omni_collate_fn`` consumes.
+
+    Returns deterministic per-sample input_ids of varying length so the collate
+    has something interesting to right-pad.
+    """
+
+    image_token = "<image>"
+    video_token = "<video>"
+
+    def __init__(self):
+        self.tokenizer = self  # collate uses getattr(processor, "tokenizer", processor)
+        self.pad_token_id = 0
+        self.sample_lens = [3, 5]
+        self._call_idx = 0
+
+    def apply_chat_template(self, text_conversation, *, tokenize=False, **kwargs):
+        assert tokenize is False
+        return "chat:" + str(len(text_conversation))
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        n = self.sample_lens[self._call_idx]
+        self._call_idx += 1
+        ids = torch.arange(1, n + 1, dtype=torch.long).unsqueeze(0)
+        return {
+            "input_ids": ids,
+            "attention_mask": torch.ones_like(ids),
+        }
+
+
+def test_nemotron_omni_collate_text_only_pads_and_shifts(collate_mod, monkeypatch):
+    """Two text-only samples of differing length right-pad to the longer one,
+    then the per-token shift drops the trailing position so labels are aligned."""
+    processor = DummyNemotronOmniProcessor()
+
+    # build_labels is exercised in its own tests; stub it to return a fixed tensor.
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        assert processor_arg is processor
+        return torch.full(input_ids.shape, -100, dtype=torch.long)
+
+    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+
+    examples = [
+        {"conversation": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]},
+        {"conversation": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]},
+    ]
+    batch = collate_mod.nemotron_omni_collate_fn(examples, processor=processor)
+
+    # Sample lens are 3 and 5; max is 5; trailing-shift drops one position -> 4.
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch["attention_mask"].shape == (2, 4)
+    assert batch["labels"].shape == (2, 4)
+    # Right-padding of the shorter sample uses pad_token_id=0 in the tail.
+    assert batch["input_ids"][0, -1].item() == 0
+    assert batch["attention_mask"][0, -1].item() == 0
+    # No multimodal kwargs were produced for an all-text batch.
+    for k in ("pixel_values", "pixel_values_videos", "sound_features", "image_flags"):
+        assert k not in batch
+
+
+class DummyNemotronOmniImageProcessor(DummyNemotronOmniProcessor):
+    """Variant that records call kwargs and emits ``pixel_values`` when images are passed."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen_kwargs: list = []
+
+    def __call__(self, *, text, return_tensors, **kwargs):
+        assert return_tensors == "pt"
+        self.seen_kwargs.append(kwargs)
+        ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        out = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+        if "images" in kwargs:
+            out["pixel_values"] = torch.zeros(
+                len(kwargs["images"]), 3, 4, 4, dtype=torch.float32
+            )
+        return out
+
+
+def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
+    """List-content with ``type=='image'`` items should be collected into pixel_values
+    and an ``<image>`` token spliced into the text content."""
+    processor = DummyNemotronOmniImageProcessor()
+
+    monkeypatch.setattr(
+        collate_mod, "build_labels",
+        lambda ids, conv, p: torch.zeros_like(ids), raising=True,
+    )
+
+    from PIL import Image as PILImage
+    img = PILImage.new("RGB", (4, 4))
+    examples = [
+        {
+            "conversation": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": "what is this?"},
+                    ],
+                },
+                {"role": "assistant", "content": "an image"},
+            ]
+        }
+    ]
+    batch = collate_mod.nemotron_omni_collate_fn(examples, processor=processor)
+
+    # The image was extracted and forwarded to the processor, then surfaced in the batch.
+    assert processor.seen_kwargs and processor.seen_kwargs[0].get("images") == [img]
+    assert "pixel_values" in batch
+    assert batch["pixel_values"].dtype == torch.bfloat16  # collate casts to bf16
+    assert "image_flags" in batch and batch["image_flags"].shape == (1, 1)
+
+
 def test_qwen25_collate_shapes(collate_mod, monkeypatch):
     processor = DummyQwen25Processor()
     batch = collate_mod.qwen2_5_collate_fn([{"conversation": CONVERSATION}], processor)
