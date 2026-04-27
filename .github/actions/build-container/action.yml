@@ -54,6 +54,10 @@ runs:
       uses: actions/checkout@v6
       with:
         ref: ${{ steps.sha.outputs.main }}
+        # Full history is COPY'd into the container so the doc-coverage test
+        # can git-log-S the registry to determine when each arch was added
+        # (used for the 2-day grace window before a missing model card hard-fails).
+        fetch-depth: 0
 
     - name: Install GH CLI
       shell: bash
