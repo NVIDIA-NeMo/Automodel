@@ -12,22 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG VLLM_IMAGE=nvcr.io/nvidia/vllm:25.12-py3
-FROM ${VLLM_IMAGE} AS deploy
+#!/bin/bash
+set -xeuo pipefail
 
-# Build mamba-ssm and causal-conv1d from source against the container's torch
-ENV MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE
-RUN pip install --no-build-isolation --no-binary=mamba-ssm,causal-conv1d \
-    mamba-ssm causal-conv1d
+export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
+export CUDA_VISIBLE_DEVICES="0"
 
-# Test dependencies
-RUN pip install peft pytest pyyaml
-
-COPY . /opt/Automodel
-WORKDIR /opt/Automodel
-
-ARG NVIDIA_BUILD_ID
-ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
-LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
-ARG NVIDIA_BUILD_REF
-LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
+python -m torch.distributed.run --nproc_per_node=1 --nnodes=1 \
+    -m coverage run \
+    -m pytest tests/functional_tests/training/test_retrieval_dataloader_checkpoint.py -vs
