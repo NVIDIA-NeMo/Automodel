@@ -18,7 +18,7 @@ Key architectural details:
 - **MoE**: 128 experts per MoE layer, top-6 routing with sigmoid gating
 - **Total parameters**: 33B (31.5B trainable with frozen vision/audio towers)
 
-## The Task
+## Fine-Tune for Receipt Field Extraction
 
 We fine-tune NemotronOmni on the **CORD-v2** (Consolidated Receipt Dataset) to extract
 structured fields from scanned receipts:
