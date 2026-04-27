@@ -17,8 +17,8 @@ import warnings
 import pytest
 import torch
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 class TestBackendConfigGatePrecision:
@@ -152,9 +152,6 @@ class TestBackendConfigEnableDeepepDeprecation:
 
     def test_enable_deepep_none_no_warning(self):
         """Test that enable_deepep=None (default) does not trigger warning."""
-        from nemo_automodel.components.models.common.utils import HAVE_DEEP_EP
-
-        expected_dispatcher = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             config = BackendConfig()
@@ -304,3 +301,14 @@ class TestMoEConfig:
 
         config = MoEConfigFromLayers(**base_moe_config_kwargs)
         assert config.n_routed_experts == 8
+
+    def test_swiglu_limit_default_zero(self, base_moe_config_kwargs):
+        """``swiglu_limit`` defaults to 0.0 (preserves the legacy fused swiglu path)."""
+        config = MoEConfig(**base_moe_config_kwargs)
+        assert config.swiglu_limit == 0.0
+
+    @pytest.mark.parametrize("limit", [1.0, 7.0, 100.5])
+    def test_swiglu_limit_custom_positive(self, base_moe_config_kwargs, limit):
+        """``swiglu_limit`` accepts positive floats for the DSV4 clamped variant."""
+        config = MoEConfig(**base_moe_config_kwargs, swiglu_limit=limit)
+        assert config.swiglu_limit == limit

@@ -32,6 +32,7 @@ from nemo_automodel.components.moe.experts import (
     _torch_mm_experts_fwd,
     get_expert_activation_for_deepep,
     is_gated_activation,
+    swiglu_clamped_deepep,
 )
 
 
@@ -78,6 +79,133 @@ class TestActivationFunctions:
         with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
             activation_fn = get_expert_activation_for_deepep(moe_config)
             assert activation_fn == mock_swiglu
+
+    def test_get_expert_activation_for_deepep_swiglu_default_uses_fused(self, moe_config):
+        """``swiglu_limit == 0`` (default) keeps the fast fused ``weighted_bias_swiglu_impl`` path."""
+        moe_config.expert_activation = "swiglu"
+        moe_config.swiglu_limit = 0.0
+
+        with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
+            assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+
+    def test_get_expert_activation_for_deepep_swiglu_with_limit_uses_clamped(self, moe_config):
+        """``swiglu_limit > 0`` dispatches to the clamped FP32 variant for DSV4."""
+        from functools import partial
+
+        moe_config.expert_activation = "swiglu"
+        moe_config.swiglu_limit = 7.0
+
+        activation_fn = get_expert_activation_for_deepep(moe_config)
+
+        # Should be a functools.partial wrapping swiglu_clamped_deepep with limit=7.0
+        assert isinstance(activation_fn, partial)
+        assert activation_fn.func is swiglu_clamped_deepep
+        assert activation_fn.keywords == {"limit": 7.0}
+
+    def test_get_expert_activation_for_deepep_swiglu_negative_limit_uses_fused(self, moe_config):
+        """A non-positive ``swiglu_limit`` (e.g. 0.0 or negative) falls back to the fused path."""
+        moe_config.expert_activation = "swiglu"
+        moe_config.swiglu_limit = -1.0
+
+        with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
+            assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+
+
+class TestSwigluClampedDeepEP:
+    """Tests for the DSV4-style clamped FP32 SwiGLU activation."""
+
+    def _eager_reference(self, x, permuted_probs, limit):
+        """Reference implementation matching the DSV4 official Expert.forward."""
+        gate, up = torch.chunk(x, 2, dim=-1)
+        gate = gate.float().clamp(max=limit)
+        up = up.float().clamp(min=-limit, max=limit)
+        inter = torch.nn.functional.silu(gate) * up
+        return (inter * permuted_probs).to(x.dtype)
+
+    def test_output_shape_and_dtype(self):
+        """Output should have shape ``[..., inter_dim]`` and the input's dtype."""
+        torch.manual_seed(0)
+        n_tokens = 4
+        inter_dim = 8
+        # x: [n_tokens, 2*inter_dim]
+        x = torch.randn(n_tokens, 2 * inter_dim, dtype=torch.float32)
+        probs = torch.rand(n_tokens, 1, dtype=torch.float32)
+
+        out = swiglu_clamped_deepep(x, probs, limit=2.0)
+
+        assert out.shape == (n_tokens, inter_dim)
+        assert out.dtype == x.dtype
+
+    @pytest.mark.parametrize("limit", [0.5, 2.0, 7.0])
+    def test_matches_eager_reference_fp32(self, limit):
+        """Compiled output must match an eager FP32 reference within tight tolerance."""
+        torch.manual_seed(42)
+        n_tokens = 8
+        inter_dim = 16
+        x = torch.randn(n_tokens, 2 * inter_dim, dtype=torch.float32) * 5.0  # exercise clamping
+        probs = torch.rand(n_tokens, 1, dtype=torch.float32)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        ref = self._eager_reference(x, probs, limit)
+        torch.testing.assert_close(out, ref, atol=1e-6, rtol=1e-6)
+
+    def test_clamping_caps_gate_above_limit(self):
+        """When gate >> limit, silu(gate) saturates near gate≈limit (gate.clamp(max=limit))."""
+        n_tokens = 2
+        inter_dim = 4
+        limit = 1.0
+        # gate: very large positive => clamped at limit; up: modest (within range).
+        gate = torch.full((n_tokens, inter_dim), 50.0, dtype=torch.float32)
+        up = torch.full((n_tokens, inter_dim), 0.5, dtype=torch.float32)
+        x = torch.cat([gate, up], dim=-1)
+        probs = torch.ones(n_tokens, 1, dtype=torch.float32)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        ref = self._eager_reference(x, probs, limit)
+        # silu(1.0) * 0.5 ≈ 0.7311 * 0.5 ≈ 0.3655
+        expected = torch.full_like(out, torch.nn.functional.silu(torch.tensor(limit)).item() * 0.5)
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+    def test_clamping_caps_up_outside_range(self):
+        """``up`` is clamped symmetrically to [-limit, limit]."""
+        n_tokens = 2
+        inter_dim = 4
+        limit = 1.0
+        gate = torch.zeros((n_tokens, inter_dim), dtype=torch.float32)  # silu(0) = 0
+        up = torch.full((n_tokens, inter_dim), -100.0, dtype=torch.float32)  # clamps to -1.0
+        x = torch.cat([gate, up], dim=-1)
+        probs = torch.ones(n_tokens, 1, dtype=torch.float32)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        # silu(0) * (-1.0) = 0
+        torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+
+    def test_dtype_roundtrip_bf16(self):
+        """Output dtype must equal input dtype (bf16 in, bf16 out)."""
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, dtype=torch.bfloat16)
+        probs = torch.rand(2, 1, dtype=torch.bfloat16)
+
+        try:
+            out = swiglu_clamped_deepep(x, probs, limit=4.0)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile path unavailable on this host: {exc}")
+
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (2, 4)
 
 
 class TestGroupedExpertsZeroActiveExperts:
@@ -332,9 +460,7 @@ class TestGroupedExpertsZeroActiveExperts:
         x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         # Use small weights to ensure minimal contribution
-        weights = torch.full(
-            (num_tokens, moe_config.n_activated_experts), 0.01, dtype=torch.bfloat16, device=device
-        )
+        weights = torch.full((num_tokens, moe_config.n_activated_experts), 0.01, dtype=torch.bfloat16, device=device)
 
         # Non-existent expert indices
         indices = torch.full(
@@ -411,9 +537,7 @@ class TestGroupedExpertsZeroActiveExperts:
             text=True,
             timeout=60,
         )
-        assert result.returncode == 0, (
-            f"Subprocess test failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        assert result.returncode == 0, f"Subprocess test failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         assert "SUCCESS" in result.stdout, (
             f"Test did not complete successfully:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
@@ -544,9 +668,7 @@ class TestGroupedExpertsForwardLoopDTensorBias:
             experts.down_proj_bias.fill_(1.0)
         output_nonzero_bias = experts(x, token_mask, weights, indices)
 
-        assert not torch.allclose(output_zero_bias, output_nonzero_bias), (
-            "Bias should change the output"
-        )
+        assert not torch.allclose(output_zero_bias, output_nonzero_bias), "Bias should change the output"
 
     def test_forward_loop_dtensor_bias_converted_to_local(self, moe_config, device, monkeypatch):
         """Verify that isinstance(bias, DTensor) triggers .to_local() in forward.
@@ -599,9 +721,7 @@ class TestGroupedExpertsForwardLoopDTensorBias:
             monkeypatch.undo()
 
         assert output.shape == x.shape
-        assert len(to_local_calls) >= 2, (
-            f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
-        )
+        assert len(to_local_calls) >= 2, f"Expected .to_local() called for both biases, got {len(to_local_calls)} calls"
 
 
 class TestGroupedExpertsDeepEP:
@@ -638,7 +758,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
-        experts = GroupedExpertsDeepEP(moe_config)
+        _ = GroupedExpertsDeepEP(moe_config)
 
         value = torch.randn(4, 8)
         tokens_per_expert = torch.tensor([2, 2])
@@ -649,7 +769,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_apply_bias_with_bias(self, moe_config):
         """Test _apply_bias method with bias."""
-        experts = GroupedExpertsDeepEP(moe_config)
+        _ = GroupedExpertsDeepEP(moe_config)
 
         value = torch.randn(4, 8)
         bias = [torch.randn(8), torch.randn(8)]
@@ -662,7 +782,7 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_apply_bias_with_probs(self, moe_config):
         """Test _apply_bias method with permuted probabilities."""
-        experts = GroupedExpertsDeepEP(moe_config)
+        _ = GroupedExpertsDeepEP(moe_config)
 
         # The bias application works on flattened tokens (4 tokens total)
         # Split by tokens_per_expert: [2, 2] means first 2 tokens go to expert 0, next 2 to expert 1
@@ -674,9 +794,7 @@ class TestGroupedExpertsDeepEP:
         # But looking at the code, it seems like permuted_probs should be per-token, not per-feature
         permuted_probs = torch.randn(4, 8)  # 4 tokens, 8 features each to match bias shape
 
-        result = _apply_bias(
-            value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs
-        )
+        result = _apply_bias(value, bias=bias, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs)
 
         assert result.shape == value.shape
 
@@ -897,6 +1015,7 @@ class TestNonGatedActivations:
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
         )
+
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
 class TestGroupedExpertsTE:
@@ -1156,7 +1275,10 @@ class TestGroupedExpertsTE:
         assert "down_proj_bias" in state
 
         # Check bias shapes
-        expected_gate_up_bias_shape = (te_moe_config_with_bias.n_routed_experts, te_moe_config_with_bias.moe_inter_dim * 2)
+        expected_gate_up_bias_shape = (
+            te_moe_config_with_bias.n_routed_experts,
+            te_moe_config_with_bias.moe_inter_dim * 2,
+        )
         expected_down_bias_shape = (te_moe_config_with_bias.n_routed_experts, te_moe_config_with_bias.dim)
 
         assert state["gate_up_proj_bias"].shape == expected_gate_up_bias_shape
@@ -1209,9 +1331,7 @@ class TestGroupedExpertsTE:
         unexpected_keys = []
         error_msgs = []
 
-        experts._load_from_state_dict(
-            state_dict, "", None, True, missing_keys, unexpected_keys, error_msgs
-        )
+        experts._load_from_state_dict(state_dict, "", None, True, missing_keys, unexpected_keys, error_msgs)
 
         assert len(missing_keys) == 0
         assert len(error_msgs) == 0
@@ -1373,12 +1493,8 @@ class TestGroupedExpertsTE:
         assert len(missing_keys) == 0
 
         # Compare weights
-        torch.testing.assert_close(
-            experts1.gate_and_up_projs, experts2.gate_and_up_projs, rtol=1e-4, atol=1e-4
-        )
-        torch.testing.assert_close(
-            experts1.down_projs, experts2.down_projs, rtol=1e-4, atol=1e-4
-        )
+        torch.testing.assert_close(experts1.gate_and_up_projs, experts2.gate_and_up_projs, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(experts1.down_projs, experts2.down_projs, rtol=1e-4, atol=1e-4)
 
     def test_grouped_experts_te_weight_setter_with_none(self, te_moe_config):
         """Test weight setters handle None gracefully."""
@@ -1814,7 +1930,7 @@ class TestTorchGroupedMM:
             if inner is not fn.func:
                 return partial(inner, *fn.args, **fn.keywords)
             return fn
-        if hasattr(fn, '_torchdynamo_orig_callable'):
+        if hasattr(fn, "_torchdynamo_orig_callable"):
             return fn._torchdynamo_orig_callable
         return fn
 
@@ -1852,7 +1968,9 @@ class TestTorchGroupedMM:
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -1867,8 +1985,15 @@ class TestTorchGroupedMM:
         num_tokens = 16
         x = torch.randn(num_tokens, torch_mm_config_with_bias.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-        weights = torch.rand(num_tokens, torch_mm_config_with_bias.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, torch_mm_config_with_bias.n_routed_experts, (num_tokens, torch_mm_config_with_bias.n_activated_experts), device=device)
+        weights = torch.rand(
+            num_tokens, torch_mm_config_with_bias.n_activated_experts, dtype=torch.bfloat16, device=device
+        )
+        indices = torch.randint(
+            0,
+            torch_mm_config_with_bias.n_routed_experts,
+            (num_tokens, torch_mm_config_with_bias.n_activated_experts),
+            device=device,
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -1891,7 +2016,9 @@ class TestTorchGroupedMM:
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         out_mm = experts_mm(x, token_mask, weights, indices)
         out_loop = experts_loop(x, token_mask, weights, indices)
@@ -1907,7 +2034,9 @@ class TestTorchGroupedMM:
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.float32, device=device, requires_grad=True)
         token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.float32, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
         loss = output.sum()
@@ -1951,9 +2080,11 @@ class TestTorchGroupedMM:
         num_tokens = 16
         x = torch.randn(num_tokens, torch_mm_config.dim, dtype=torch.bfloat16, device=device)
         token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-        token_mask[:num_tokens // 2] = True
+        token_mask[: num_tokens // 2] = True
         weights = torch.rand(num_tokens, torch_mm_config.n_activated_experts, dtype=torch.bfloat16, device=device)
-        indices = torch.randint(0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device)
+        indices = torch.randint(
+            0, torch_mm_config.n_routed_experts, (num_tokens, torch_mm_config.n_activated_experts), device=device
+        )
 
         output = experts(x, token_mask, weights, indices)
 
@@ -2079,7 +2210,7 @@ class TestGroupedExpertsConvergenceFixes:
             if inner is not fn.func:
                 return partial(inner, *fn.args, **fn.keywords)
             return fn
-        if hasattr(fn, '_torchdynamo_orig_callable'):
+        if hasattr(fn, "_torchdynamo_orig_callable"):
             return fn._torchdynamo_orig_callable
         return fn
 
@@ -2221,9 +2352,7 @@ class TestGroupedExpertsConvergenceFixes:
         torch.testing.assert_close(
             experts_mm.gate_and_up_projs.grad, experts_loop.gate_and_up_projs.grad, rtol=1e-3, atol=1e-3
         )
-        torch.testing.assert_close(
-            experts_mm.down_projs.grad, experts_loop.down_projs.grad, rtol=1e-3, atol=1e-3
-        )
+        torch.testing.assert_close(experts_mm.down_projs.grad, experts_loop.down_projs.grad, rtol=1e-3, atol=1e-3)
 
     # --- Test 5: Loop path with bias ---
 

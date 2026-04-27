@@ -207,7 +207,7 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax', 'sigmoid', or 'softmax_with_bias').
+        score_func (str): Scoring function ('softmax', 'sigmoid', 'softmax_with_bias', or 'sqrtsoftplus').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -341,6 +341,16 @@ class Gate(nn.Module):
 
             indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
             # Final weights gathered from UNBIASED softmax scores
+            weights = original_scores.gather(1, indices)
+        elif self.score_func == "sqrtsoftplus":
+            # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
+            scores = torch.sqrt(F.softplus(scores.float())).to(scores.dtype)
+            original_scores = scores
+
+            if self.e_score_correction_bias is not None:
+                scores = scores + self.e_score_correction_bias
+
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
