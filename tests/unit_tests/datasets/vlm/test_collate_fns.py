@@ -599,7 +599,7 @@ def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
     """Test kimi_vl_collate_fn produces correct output shapes."""
     processor = DummyKimiVLProcessor()
 
-    # Stub build_labels to return deterministic labels
+    # Stub build_labels_from_template to return deterministic labels
     # The collate fn does labels[:, 1:] so we need 5 elements to get 4 after shift
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
 
@@ -607,7 +607,7 @@ def test_kimi_vl_collate_fn_shapes(collate_mod, monkeypatch):
         assert processor_arg is processor
         return labels_stub
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     batch = collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -623,7 +623,7 @@ def test_kimi_vl_collate_fn_with_max_length(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda *args, **kwargs: labels_stub, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     collate_mod.kimi_vl_collate_fn(examples, processor, max_length=2048)
@@ -639,7 +639,7 @@ def test_kimi_vl_collate_fn_extracts_images(collate_mod, monkeypatch):
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda *args, **kwargs: labels_stub, raising=True)
 
     conversation_with_image = [
         {
@@ -666,7 +666,7 @@ def test_kimi_vl_collate_fn_passes_add_special_tokens_false(collate_mod, monkeyp
     processor = DummyKimiVLProcessor()
 
     labels_stub = torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long)
-    monkeypatch.setattr(collate_mod, "build_labels", lambda *args, **kwargs: labels_stub, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", lambda *args, **kwargs: labels_stub, raising=True)
 
     examples = [{"conversation": CONVERSATION}]
     collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -685,7 +685,7 @@ def test_kimi_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
         batch_size = input_ids.shape[0]
         return torch.arange(1, 6).unsqueeze(0).repeat(batch_size, 1)
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     examples = [{"conversation": CONVERSATION} for _ in range(3)]
     batch = collate_mod.kimi_vl_collate_fn(examples, processor)
@@ -1966,12 +1966,12 @@ class TestBuildLabelsFromTemplate:
 # ---------------------------------------------------------------------------
 
 # Synthetic token IDs for a Gemma4-style tokenizer.
-_SOT = 2       # <start_of_turn>
+_SOT = 2  # <start_of_turn>
 _USER_TK = 1645  # "user"
 _MODEL_TK = 2516  # "model"
-_NL = 108      # "\n"
-_EOT = 107     # <end_of_turn>
-_U_CONTENT = 506   # "u"
+_NL = 108  # "\n"
+_EOT = 107  # <end_of_turn>
+_U_CONTENT = 506  # "u"
 # sentinel encoded as two distinct ids
 _SEN_A = 999
 _SEN_B = 888
