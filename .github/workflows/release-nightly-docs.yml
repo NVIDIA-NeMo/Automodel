@@ -34,4 +34,4 @@ jobs:
       publish-as-latest: false
       docs-version-override: "nightly"
       update-version-picker: false
-    secrets: inherit
+    secrets: inherit  # pragma: allowlist secret
