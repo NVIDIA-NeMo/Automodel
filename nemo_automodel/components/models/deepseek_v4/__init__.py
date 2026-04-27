@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,27 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-name: Release Nightly Docs
-
-on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'docs/**'
-  workflow_dispatch:
-
-concurrency:
-  group: nightly-docs-publish
-  cancel-in-progress: false
-
-jobs:
-  call-release-docs:
-    uses: ./.github/workflows/release-docs.yml
-    with:
-      dry-run: false
-      publish-as-latest: false
-      docs-version-override: "nightly"
-      update-version-picker: false
-    secrets: inherit  # pragma: allowlist secret
