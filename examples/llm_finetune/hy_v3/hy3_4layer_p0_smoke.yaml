@@ -14,15 +14,24 @@
 
 # P0 — End-to-end forward/backward/PP/EP health check for HYV3ForCausalLM.
 #
-# Proxy model (4 layers, tiny dims) — no checkpoint download required.
-# Tests: loss decreases, no NaN/Inf, PP pipeline works, EP dispatch works,
-#         FSDP2 sharding correct, e_score_correction_bias buffer updates.
+# Uses the real tencent/Hy3-preview config and weights, but only 4 layers.
+# Layers 4-79 are never created; their checkpoint keys are ignored (strict=False).
+# Tests real tensor shapes (hidden=4096, 192 experts) and real routing logic.
+#
+# Layer layout (4 layers, pp=2):
+#   Stage 0: embed + layer 0 (dense) + layer 1 (MoE)
+#   Stage 1: layer 2 (MoE) + layer 3 (MoE) + lm_head
+#   ep_size=4 → 192 / 4 = 48 experts per rank
+#   total GPUs = pp(2) × ep(4) = 8
 #
 # Hardware: 8× GPU (A100 80GB or equivalent)
 #   automodel examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml --nproc-per-node 8
 #
+# Before running: set HY3_PATH to your local Hy3-preview directory, then
+# replace the two pretrained_model_name_or_path fields below accordingly.
+#
 # Expected outcomes:
-#   - Training starts within 2 min
+#   - Training starts within 3 min (HF checkpoint loading for 4 layers)
 #   - Loss at step 100 < loss at step 1
 #   - No NaN / Inf in loss or gradients
 #   - Memory stable at every step (no OOM growth)
@@ -31,15 +40,15 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 16
-  local_batch_size: 4
+  global_batch_size: 8
+  local_batch_size: 2
   ckpt_every_steps: 999999     # disable checkpoint for P0
   val_every_steps: 2
   max_steps: 100
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  timeout_minutes: 30
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -49,41 +58,11 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.PretrainedConfig
-    architectures: [HYV3ForCausalLM]
-    model_type: hy_v3
-    # --- proxy dimensions (tiny, same structure as real HYV3) ---
-    vocab_size: 120832
-    hidden_size: 2048
-    num_hidden_layers: 4         # 1 dense (layer 0) + 3 MoE
-    num_attention_heads: 16
-    num_key_value_heads: 4
-    head_dim: 128
-    intermediate_size: 4096      # dense layer 0 FFN width
-    moe_intermediate_size: 512   # MoE expert hidden
-    max_position_embeddings: 2048
-    hidden_act: silu
-    rms_norm_eps: 1.0e-5
-    rope_parameters:
-      rope_theta: 11158840.0
-      rope_type: default
-    # --- MoE topology ---
-    num_experts: 8               # 8 / ep_size=4 = 2 experts per rank
-    num_experts_per_tok: 2
-    num_shared_experts: 1
-    first_k_dense_replace: 1     # layer 0 is dense, layers 1-3 are MoE
-    # --- HYV3-specific routing ---
-    moe_router_use_sigmoid: true
-    moe_router_enable_expert_bias: true
-    route_norm: true
-    router_scaling_factor: 2.826
-    qk_norm: true
-    initializer_range: 0.02
-    bos_token_id: 120000
-    eos_token_id: 120025
-    pad_token_id: 120002
-    use_cache: false
-    torch_dtype: bfloat16
+    _target_: transformers.AutoConfig.from_pretrained
+    pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
+    num_hidden_layers: 4           # only build layers 0-3; keys for 4-79 ignored
+    num_nextn_predict_layers: 0    # disable MTP layer
+  load_base_model: true
   trust_remote_code: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -91,9 +70,9 @@ model:
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: torch            # use torch dispatcher; upgrade to deepep for P2+
-    fake_balanced_gate: false    # exercise real sigmoid routing
-    enable_hf_state_dict_adapter: false
+    dispatcher: torch              # torch dispatcher for P0
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
 checkpoint:
@@ -104,19 +83,15 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 2                     # 2 pipeline stages
-  ep_size: 4                     # 8 experts / 4 ranks = 2 experts per rank
-                                 # total GPUs = pp * ep = 2 * 4 = 8
+  pp_size: 2
+  ep_size: 4                       # 192 / 4 = 48 experts per rank
 
   sequence_parallel: false
   activation_checkpointing: true
 
   pipeline:
-    pp_schedule: interleaved1f1b
+    pp_schedule: 1f1b
     pp_microbatch_size: 1
-    # 4 layers / layers_per_stage=1 = 4 virtual stages
-    # 4 virtual stages / pp_size=2 = 2 stages per rank  ✓ (interleaved requires >=2)
-    layers_per_stage: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
@@ -134,7 +109,7 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
-    pretrained_model_name_or_path: tencent/Hy3-preview
+    pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
 
 packed_sequence:
   packed_sequence_size: 0
@@ -150,7 +125,7 @@ validation_dataset:
   split: validation
   num_samples_limit: 32
   tokenizer:
-    pretrained_model_name_or_path: tencent/Hy3-preview
+    pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
