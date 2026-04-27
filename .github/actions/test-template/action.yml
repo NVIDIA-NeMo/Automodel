@@ -46,6 +46,16 @@ inputs:
   runner:
     description: "Runner to use for test"
     required: true
+  post-doc-coverage-comment:
+    description: |
+      Whether to upsert the doc-coverage PR comment after this test run.
+      Should be enabled on exactly one job (one CI matrix entry) — the test
+      runs in every unit-test variant but the comment must not be posted from
+      multiple jobs in parallel (race condition would create duplicates that
+      bypass the marker dedup). The doc-coverage test is in tests/unit_tests/
+      so this is only meaningful when ``is-unit-test: true``.
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -196,6 +206,49 @@ runs:
           echo "::error title=Result::❌ ${{ inputs.test-folder }} — FAILED (exit $EXIT_CODE)"
           exit 1
         fi
+
+    - name: Upsert doc-coverage PR comment
+      # Only one CI job in the matrix should opt in (see input docs); without
+      # the gate, parallel jobs racing on the GH API can bypass the marker
+      # dedup and create multiple comments on the same PR.
+      if: ${{ always() && inputs.post-doc-coverage-comment == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.PAT }}
+        REPO: ${{ github.repository }}
+        REF: ${{ github.ref }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        echo "::group::Upsert doc-coverage PR comment"
+
+        # Pull the JSON report the test wrote (path matches
+        # _DOC_REPORT_FILENAME in test_doc_coverage.py). Absent file is fine —
+        # happens when the test crashed before writing or the file path
+        # changed; bail without touching any existing comment.
+        docker cp \
+          "nemo_container_${RUN_ID}:/opt/Automodel/.pending_doc_archs.json" \
+          ./.pending_doc_archs.json 2>/dev/null \
+          || { echo "No doc-coverage report extracted; skipping."; echo "::endgroup::"; exit 0; }
+
+        # NVIDIA-NeMo CICD mirrors PRs to ``pull-request/<N>`` branches and
+        # only fires on ``push`` (see workflow ``on:`` block) — so the PR
+        # number is encoded in the ref, not in github.event.pull_request.
+        PR_NUMBER=""
+        if [[ "$REF" =~ ^refs/heads/pull-request/([0-9]+)$ ]]; then
+          PR_NUMBER="${BASH_REMATCH[1]}"
+        fi
+        if [[ -z "$PR_NUMBER" ]]; then
+          echo "Not on a PR mirror branch ($REF); skipping comment."
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        python3 .github/scripts/post_doc_coverage_comment.py \
+          --report ./.pending_doc_archs.json \
+          --repo "$REPO" \
+          --pr "$PR_NUMBER"
+
+        echo "::endgroup::"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v6

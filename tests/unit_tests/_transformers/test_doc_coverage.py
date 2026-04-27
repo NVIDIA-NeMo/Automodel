@@ -25,6 +25,7 @@ grace window expires the test hard-fails so undocumented arches do not
 accumulate silently.
 """
 
+import json
 import pathlib
 import subprocess
 import time
@@ -103,6 +104,14 @@ def _repo_root() -> pathlib.Path:
 # but does not block the merge. See module docstring for the rationale.
 _DOC_GRACE_PERIOD_DAYS = 2
 
+# Filename of the JSON report the test drops in repo root listing every
+# undocumented arch (pending + expired). The CI workflow ``docker cp``s this
+# file out of the test container and feeds it to
+# ``.github/scripts/post_doc_coverage_comment.py`` which upserts a single
+# bot-marked comment on the PR. Empty-list payload signals "all archs
+# documented" — the workflow uses that to clean up any stale prior comment.
+_DOC_REPORT_FILENAME = ".pending_doc_archs.json"
+
 
 def _arch_registration_age_days(arch_name: str, repo_root: pathlib.Path) -> float | None:
     """Return days since ``arch_name`` was last added to ``registry.py``.
@@ -169,19 +178,34 @@ def test_every_registered_arch_has_model_coverage_doc():
     md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.md")]
     assert md_contents, "No .md files found under docs/model-coverage/"
 
-    pending: list[tuple[str, str, float | None]] = []
-    expired: list[tuple[str, str, float | None]] = []
+    missing: list[tuple[str, str, float | None]] = []
     for arch_name in MODEL_ARCH_MAPPING:
         needle = _DOC_ARCH_ALIASES.get(arch_name, arch_name)
         if any(needle in content for content in md_contents):
             continue
         age_days = _arch_registration_age_days(arch_name, repo_root)
-        # Treat unknown ages (git unavailable / shallow clone) as fresh so an
-        # infra problem can't unfairly block a PR; CI guarantees full history.
-        if age_days is not None and age_days >= _DOC_GRACE_PERIOD_DAYS:
-            expired.append((arch_name, needle, age_days))
-        else:
-            pending.append((arch_name, needle, age_days))
+        missing.append((arch_name, needle, age_days))
+
+    # Treat unknown ages (git unavailable / shallow clone) as fresh so an infra
+    # problem can't unfairly block a PR; CI guarantees full history via the
+    # build-container's ``fetch-depth: 0``.
+    expired = [(a, n, age) for (a, n, age) in missing if age is not None and age >= _DOC_GRACE_PERIOD_DAYS]
+    pending = [(a, n, age) for (a, n, age) in missing if (a, n, age) not in expired]
+
+    # Always write the report (even when empty) so the CI comment-poster can
+    # tell the difference between "no run" and "all archs documented" and
+    # clean up a stale prior bot comment when docs land.
+    report = [
+        {
+            "arch": arch,
+            "needle": needle,
+            "expired": (age is not None and age >= _DOC_GRACE_PERIOD_DAYS),
+            "age_days": (None if age is None else round(age, 2)),
+            "remaining_days": (None if age is None else round(max(0.0, _DOC_GRACE_PERIOD_DAYS - age), 2)),
+        }
+        for arch, needle, age in missing
+    ]
+    (repo_root / _DOC_REPORT_FILENAME).write_text(json.dumps(report, indent=2))
 
     for arch, needle, age in pending:
         if age is None:

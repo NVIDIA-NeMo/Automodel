@@ -357,9 +357,12 @@ jobs:
       max-parallel: 5
       matrix:
         include:
+          # Only the CPU job upserts the doc-coverage PR comment so two
+          # parallel matrix jobs don't race past the marker dedup.
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
+            post-doc-coverage-comment: "true"
           - test-name: L0_Unit_Tests_GPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
@@ -387,6 +390,7 @@ jobs:
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
+          post-doc-coverage-comment: ${{ matrix.post-doc-coverage-comment || 'false' }}
 
   cicd-e2e-tests:
     strategy:

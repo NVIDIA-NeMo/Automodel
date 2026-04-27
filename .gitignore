@@ -63,6 +63,7 @@ htmlcov/
 .nox/
 .coverage
 .coverage.*
+.pending_doc_archs.json
 .cache
 nosetests.xml
 coverage.xml
