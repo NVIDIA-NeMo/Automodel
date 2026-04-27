@@ -11,3 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo_automodel.components.models.llava_onevision.model import (
+    LLaVAOneVision1_5_ForConditionalGeneration,
+    LLaVAOneVision1_5_Model,
+    Llavaonevision1_5Config,
+    RiceConfig,
+)
+from nemo_automodel.components.models.llava_onevision.state_dict_adapter import (
+    LlavaOneVisionStateDictAdapter,
+)
+
+__all__ = [
+    "LLaVAOneVision1_5_ForConditionalGeneration",
+    "LLaVAOneVision1_5_Model",
+    "Llavaonevision1_5Config",
+    "LlavaOneVisionStateDictAdapter",
+    "RiceConfig",
+]
