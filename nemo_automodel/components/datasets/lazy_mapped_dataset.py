@@ -33,14 +33,14 @@ class LazyMappedDataset(Dataset):
             (e.g. a Hugging Face ``datasets.Dataset``).
         map_fn: A callable that accepts a single example and returns the
             transformed example.
-        cache_size: Number of processed items to cache. Defaults to the full
-            dataset size. Set to 0 to disable caching.
+        cache_size: Number of processed items to cache. Defaults to the 10k
+            dataset samples. Set to 0 to disable caching or None to cache all.
 
     Returns:
         A map-style dataset that applies map_fn lazily on each item access.
     """
 
-    def __init__(self, dataset, map_fn, cache_size=None):
+    def __init__(self, dataset, map_fn, cache_size=10000):
         self._dataset = dataset
         self._map_fn = map_fn
 
