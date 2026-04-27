@@ -150,14 +150,13 @@ class TestGetVisionTokenIdsAddedTokens:
         assert 600 in fake_image._get_vision_token_ids(proc)
 
     def test_non_vision_token_not_matched(self):
+        # "image" is NOT a substring of "imagine" ("imag-e" vs "imag-ine"), so
+        # this token must NOT be matched.  Pins the keyword set's precision:
+        # near-collisions on shared prefixes do not over-trigger.
         added = {700: _StubAddedToken("<|imagine_this|>")}
         tok = _StubTokenizer(added_tokens_decoder=added)
         proc = _StubProcessor(tok)
-        # 'image' substring would erroneously match — keyword set must be tight.
-        # Current implementation accepts 'image' so 'imagine' WILL match.  This test
-        # documents the trade-off: we err on the side of over-masking unknown
-        # tokens that look vision-related rather than under-masking real ones.
-        assert 700 in fake_image._get_vision_token_ids(proc)
+        assert 700 not in fake_image._get_vision_token_ids(proc)
 
     def test_unk_token_excluded(self):
         # convert_tokens_to_ids returning unk_token_id should not pollute the set.
