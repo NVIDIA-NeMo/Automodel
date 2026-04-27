@@ -52,7 +52,7 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 
 ---
 
-## Step 0 — Environment Setup
+## Step 0 — Set Up the Environment
 
 ```bash
 # Inside the NeMo Automodel container (26.04+):
