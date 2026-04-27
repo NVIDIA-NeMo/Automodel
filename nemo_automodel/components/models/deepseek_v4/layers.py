@@ -542,6 +542,10 @@ class DeepseekV4Indexer(nn.Module):
         self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
+        # The current training path uses hard top-k indices only to build a sparse
+        # attention mask, so gradients do not flow back into the indexer scores.
+        for param in self.parameters():
+            param.requires_grad_(False)
 
     @property
     def ape(self) -> torch.Tensor:
