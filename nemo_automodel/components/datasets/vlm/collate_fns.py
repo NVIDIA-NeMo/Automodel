@@ -496,7 +496,7 @@ def phi4_mm_collate_fn(examples, processor):
         else:
             batch["input_mode"] = 0
 
-    labels = build_labels(
+    labels = build_labels_from_template(
         batch["input_ids"],
         conversations,
         processor,
@@ -1644,8 +1644,8 @@ def gemma4_prefix_collate_fn(
 
     Wraps ``default_collate_fn`` and injects ``<|channel>thought\\n<channel|>``
     after every ``<|turn>model\\n`` marker before labels are built.  The injected
-    tokens are automatically masked to -100 by ``build_labels`` (which only
-    unmasks tokens matching the assistant answer text), so the model sees its
+    tokens are automatically masked to -100 by ``build_labels_from_template``
+    (which only unmasks tokens inside assistant turns), so the model sees its
     expected thinking prefix without being penalised for it.
     """
 
