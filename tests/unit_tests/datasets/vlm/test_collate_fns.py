@@ -333,7 +333,7 @@ def test_phi4_mm_collate_fn_handles_audio_and_trimming(collate_mod, monkeypatch)
         captured["processor"] = processor_arg
         return labels_stub
 
-    monkeypatch.setattr(collate_mod, "build_labels", fake_build_labels, raising=True)
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
 
     batch = collate_mod.phi4_mm_collate_fn(examples, processor)
 
@@ -381,7 +381,10 @@ def test_phi4_mm_collate_fn_input_mode_from_processor(collate_mod, monkeypatch):
 
     examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
     monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+        collate_mod,
+        "build_labels_from_template",
+        lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long),
+        raising=True,
     )
     batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithInputMode())
     assert torch.equal(batch["input_mode"], torch.tensor([2]))
@@ -405,7 +408,10 @@ def test_phi4_mm_collate_fn_input_mode_fallback(collate_mod, monkeypatch):
 
     examples = [{"conversation": CONVERSATION, "audio": {"array": [0.1], "sampling_rate": 16000}}]
     monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+        collate_mod,
+        "build_labels_from_template",
+        lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long),
+        raising=True,
     )
     batch = collate_mod.phi4_mm_collate_fn(examples, Phi4ProcessorWithAudioEmbeds())
     assert batch["input_mode"] == 2  # SPEECH
@@ -421,7 +427,10 @@ def test_phi4_mm_collate_fn_raw_audio_passthrough(collate_mod, monkeypatch):
         {"conversation": CONVERSATION, "audio": raw_array},
     ]
     monkeypatch.setattr(
-        collate_mod, "build_labels", lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long), raising=True
+        collate_mod,
+        "build_labels_from_template",
+        lambda *a, **kw: torch.tensor([[1, 2, 3]], dtype=torch.long),
+        raising=True,
     )
     collate_mod.phi4_mm_collate_fn(examples, processor)
     # The raw array should be wrapped as a single-element tuple by the collate fn
