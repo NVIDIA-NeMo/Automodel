@@ -75,13 +75,23 @@ class TestDeepseekV4HyperConnection:
 
     @pytest.fixture
     def hc(self):
-        return DeepseekV4HyperConnection(
+        # ``DeepseekV4HyperConnection`` allocates ``fn``/``base``/``scale``
+        # via ``torch.empty(...)``; those are uninitialized memory and may
+        # contain NaN bit patterns.  Zero them so the Sinkhorn-row test has
+        # a well-defined starting point (real model loads init from the
+        # checkpoint via the state-dict adapter, not via ``empty``).
+        m = DeepseekV4HyperConnection(
             hc_mult=4,
             hidden_size=16,
             hc_sinkhorn_iters=4,
             hc_eps=1e-6,
             rms_norm_eps=1e-6,
         )
+        with torch.no_grad():
+            m.fn.zero_()
+            m.base.zero_()
+            m.scale.zero_()
+        return m
 
     def test_parameter_dtypes_are_fp32(self, hc):
         # HC params must stay fp32 even when the surrounding model is bf16.

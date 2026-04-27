@@ -83,6 +83,13 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
         experts="torch_mm",
     )
     model = DeepseekV4ForCausalLM(config, backend=backend)
+    # The model mixes per-module dtype defaults (``embed_tokens`` is built bf16
+    # via the now-deprecated ``config.torch_dtype`` path; bare ``nn.Linear``
+    # sub-modules pick up the global fp32 default).  Force everything to a
+    # single fp32 dtype for the smoke test so matmuls don't hit dtype mismatch.
+    # ``DeepseekV4HyperConnection`` keeps its parameters in fp32 explicitly —
+    # ``model.float()`` is a no-op for those.
+    model = model.float()
     # Zero all float params: Gate/GroupedExperts use torch.empty (uninitialized memory
     # that may contain NaN bit patterns). initialize_weights() is not called in smoke tests.
     with torch.no_grad():
@@ -122,25 +129,40 @@ class TestDeepseekV4ModelSmoke:
         loss = torch.nn.functional.cross_entropy(logits.view(-1, cfg.vocab_size), labels.view(-1))
         loss.backward()
 
-        missing_grad = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+        # The Indexer's parameters (``compressor.indexer.*``) feed the top-k
+        # selection of compressed positions; the indices are integer-valued
+        # so they are non-differentiable by design (this matches the official
+        # DSV4 inference reference, where those weights are frozen at load
+        # time).  Exclude them from the gradient-presence check.
+        missing_grad = [
+            n
+            for n, p in model.named_parameters()
+            if p.requires_grad and p.grad is None and ".compressor.indexer." not in n
+        ]
         assert not missing_grad, f"parameters missing gradients: {missing_grad}"
         assert loss.item() > 0, "loss is zero or negative"
 
     def test_hc_params_registered(self):
-        """HC params are registered on every block."""
+        """HC params are registered on every block via the
+        ``DeepseekV4HyperConnection`` submodules ``attn_hc`` / ``ffn_hc``
+        (the flat ``hc_attn_*`` / ``hc_ffn_*`` keys exist only in the HF
+        checkpoint and are renamed on load).
+        """
         cfg = _tiny_config()
         model = _make_model(cfg)
 
-        hc_names = {"hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"}
+        hc_param_names = {"fn", "base", "scale"}
         for layer_id in range(cfg.num_hidden_layers):
             block = model.model.layers[str(layer_id)]
-            for name in hc_names:
-                assert hasattr(block, name), f"layer {layer_id} missing {name}"
-                param = getattr(block, name)
-                assert param.dtype == torch.float32, f"{name} dtype {param.dtype} != float32"
+            for sub_name in ("attn_hc", "ffn_hc"):
+                hc = getattr(block, sub_name)
+                for pname in hc_param_names:
+                    assert hasattr(hc, pname), f"layer {layer_id} missing {sub_name}.{pname}"
+                    p = getattr(hc, pname)
+                    assert p.dtype == torch.float32, f"{sub_name}.{pname} dtype {p.dtype} != float32"
 
     def test_hc_attn_fn_shape(self):
-        """HC attn_fn has shape (mix_hc, hc_mult * hidden_size)."""
+        """HC ``fn`` matrix has shape ``(mix_hc, hc_mult * hidden_size)``."""
         cfg = _tiny_config()
         model = _make_model(cfg)
 
@@ -148,9 +170,8 @@ class TestDeepseekV4ModelSmoke:
         hc_dim = cfg.hc_mult * cfg.hidden_size  # 256 for tiny
 
         block = model.model.layers["0"]
-        assert block.hc_attn_fn.shape == (mix_hc, hc_dim), (
-            f"hc_attn_fn shape {block.hc_attn_fn.shape} != ({mix_hc}, {hc_dim})"
-        )
+        fn = block.attn_hc.fn
+        assert fn.shape == (mix_hc, hc_dim), f"attn_hc.fn shape {fn.shape} != ({mix_hc}, {hc_dim})"
 
     def test_wo_a_weight_shape(self):
         """GroupedOutputProjection has the correct weight shape."""
@@ -165,12 +186,15 @@ class TestDeepseekV4ModelSmoke:
         assert actual == expected, f"wo_a weight shape {actual} != {expected}"
 
     def test_attn_sink_shape_and_dtype(self):
-        """attn_sink is a per-head float32 scalar vector."""
+        """``sinks`` is a per-head float32 scalar vector consumed by
+        ``eager_attention_with_sink`` (HF PR 45616 named it ``sinks``;
+        the HF checkpoint key ``attn_sink`` is renamed to it on load).
+        """
         cfg = _tiny_config()
         model = _make_model(cfg)
 
         block = model.model.layers["0"]
-        sink = block.self_attn.attn_sink
+        sink = block.self_attn.sinks
         assert sink.shape == (cfg.num_attention_heads,), f"unexpected shape {sink.shape}"
         assert sink.dtype == torch.float32, f"unexpected dtype {sink.dtype}"
 
@@ -179,11 +203,19 @@ class TestDeepseekV4ModelSmoke:
         cfg = _tiny_config()
         model = _make_model(cfg)
 
-        for seq in [1, 4, 16, 32]:
-            input_ids = torch.randint(0, cfg.vocab_size, (1, seq))
-            with torch.no_grad():
-                logits = model(input_ids)
-            assert logits.shape == (1, seq, cfg.vocab_size)
+        # ``Float32RMSNorm.forward`` is ``@torch.compile``'d.  Iterating four
+        # different sequence lengths through ``compress_ratio>0`` layers (which
+        # build masks of shape ``[..., n_pooled]`` that varies per call)
+        # explodes Dynamo's per-shape recompile cache.  Disable the compile
+        # for this test — we only care about shape correctness here.
+        import torch._dynamo as _dynamo
+
+        with _dynamo.config.patch(recompile_limit=64), _dynamo.config.patch(fail_on_recompile_limit_hit=False):
+            for seq in [1, 4, 16, 32]:
+                input_ids = torch.randint(0, cfg.vocab_size, (1, seq))
+                with torch.no_grad():
+                    logits = model(input_ids)
+                assert logits.shape == (1, seq, cfg.vocab_size)
 
 
 if __name__ == "__main__":

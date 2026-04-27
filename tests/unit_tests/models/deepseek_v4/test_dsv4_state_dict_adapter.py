@@ -71,7 +71,9 @@ class TestRenameHfKey:
         assert _rename_hf_key("layers.0.attn.wkv.weight") == "model.layers.0.self_attn.wkv.weight"
 
     def test_attn_attn_sink(self):
-        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.attn_sink"
+        # ``attn_sink`` (HF) maps to ``self_attn.sinks`` to match the
+        # ``module.sinks`` attribute consumed by ``eager_attention_with_sink``.
+        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks"
 
     def test_gate_weight(self):
         assert _rename_hf_key("layers.1.ffn.gate.weight") == "model.layers.1.mlp.gate.weight"
@@ -83,22 +85,26 @@ class TestRenameHfKey:
         assert _rename_hf_key("layers.0.ffn.gate.tid2eid") == "model.layers.0.mlp.gate.tid2eid"
 
     def test_shared_expert_w1(self):
+        # The MoE module exposes the shared expert as ``mlp.shared_experts``
+        # (plural) — the rename keeps that name.
         result = _rename_hf_key("layers.0.ffn.shared_experts.w1.weight")
-        assert result == "model.layers.0.mlp.shared_expert.gate_proj.weight"
+        assert result == "model.layers.0.mlp.shared_experts.gate_proj.weight"
 
     def test_shared_expert_w3(self):
         result = _rename_hf_key("layers.0.ffn.shared_experts.w3.weight")
-        assert result == "model.layers.0.mlp.shared_expert.up_proj.weight"
+        assert result == "model.layers.0.mlp.shared_experts.up_proj.weight"
 
     def test_shared_expert_w2(self):
         result = _rename_hf_key("layers.0.ffn.shared_experts.w2.weight")
-        assert result == "model.layers.0.mlp.shared_expert.down_proj.weight"
+        assert result == "model.layers.0.mlp.shared_experts.down_proj.weight"
 
     def test_hc_attn_fn(self):
-        assert _rename_hf_key("layers.2.hc_attn_fn") == "model.layers.2.hc_attn_fn"
+        # HF flat ``hc_attn_*`` keys map into the ``attn_hc`` HyperConnection
+        # submodule (``ffn_hc`` for the MLP-site one).
+        assert _rename_hf_key("layers.2.hc_attn_fn") == "model.layers.2.attn_hc.fn"
 
     def test_hc_ffn_scale(self):
-        assert _rename_hf_key("layers.0.hc_ffn_scale") == "model.layers.0.hc_ffn_scale"
+        assert _rename_hf_key("layers.0.hc_ffn_scale") == "model.layers.0.ffn_hc.scale"
 
     def test_unknown_key_unchanged(self):
         assert _rename_hf_key("some.unknown.key") == "some.unknown.key"
@@ -124,7 +130,7 @@ class TestDeepSeekV4StateDictAdapterFromHF:
         assert "model.layers.0.input_layernorm.weight" in out
         assert "model.layers.0.self_attn.wq_a.weight" in out
         assert "model.layers.0.mlp.gate.weight" in out
-        assert "model.layers.0.hc_attn_fn" in out
+        assert "model.layers.0.attn_hc.fn" in out
 
     def test_tid2eid_skips_dequantize(self):
         adapter = _make_adapter()
