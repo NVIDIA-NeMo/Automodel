@@ -300,3 +300,151 @@ For LoRA, the checkpoint saves adapter weights instead:
 
 > **Tip**: `LOWEST_VAL` symlink points to the checkpoint with the best validation loss.
 
+---
+
+## Step 4 — Evaluate the Fine-Tuned Model
+
+### Full test set evaluation
+
+Load the consolidated checkpoint and evaluate on all test samples. Results are saved
+to a JSON file with per-sample predictions and NED (Normalized Edit Distance) scores.
+
+```python
+import torch
+import json
+from transformers import AutoModel, AutoProcessor
+from datasets import load_dataset
+from nemo_automodel.components.datasets.vlm.utils import json2token
+
+CKPT = "<checkpoint_dir>/LOWEST_VAL/model/consolidated"
+OUT_JSON = "cordv2_test_results.json"
+
+# Load model and processor
+model = AutoModel.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16)
+
+# Fix RADIO vision encoder's summary_idxs (non-persistent buffer, not in checkpoint)
+if hasattr(model, "vision_model") and hasattr(model.vision_model, "radio_model"):
+    model.vision_model.radio_model.summary_idxs = None
+
+model = model.cuda().eval()
+processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
+tokenizer = processor.tokenizer
+
+# Load dataset
+dataset = load_dataset("naver-clova-ix/cord-v2")
+
+# NED metric (0 = perfect match, 1 = completely different)
+def compute_ned(pred, target):
+    m, n = len(pred), len(target)
+    if max(m, n) == 0:
+        return 0.0
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            tmp = dp[j]
+            dp[j] = prev if pred[i - 1] == target[j - 1] else 1 + min(dp[j], dp[j - 1], prev)
+            prev = tmp
+    return dp[n] / max(m, n)
+
+# Evaluate on test set
+samples = dataset["test"]
+n = len(samples)
+total_ned = 0
+exact = 0
+near_perfect = 0
+results = []
+print(f"Evaluating on test set ({n} samples)")
+
+for i in range(n):
+    sample = samples[i]
+    image = sample["image"].convert("RGB")
+    gt = json.loads(sample["ground_truth"])["gt_parse"]
+    gt_text = json2token(gt, sort_json_key=True)
+
+    # Build prompt — enable_thinking=False for structured output
+    messages = [{"role": "user", "content": "<image>\nDescribe this image."}]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False,
+        add_generation_prompt=True, enable_thinking=False
+    )
+    inputs = processor(text=text, images=[image], return_tensors="pt")
+    for k in ["num_patches"]:
+        if k in inputs:
+            del inputs[k]
+    inputs = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+
+    generated = tokenizer.decode(
+        output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    ).strip()
+
+    ned = compute_ned(generated, gt_text)
+    total_ned += ned
+    if ned == 0.0: exact += 1
+    if ned < 0.05: near_perfect += 1
+    results.append({"index": i, "ned": ned, "prediction": generated, "ground_truth": gt_text})
+    print(f"  Sample {i:3d}: NED = {ned:.4f}")
+
+avg_ned = total_ned / n
+summary = {
+    "average_ned": avg_ned,
+    "exact_matches": exact,
+    "near_perfect": near_perfect,
+    "total": n,
+    "results": results,
+}
+with open(OUT_JSON, "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nTest Results:")
+print(f"  Average NED:     {avg_ned:.4f}")
+print(f"  Exact matches:   {exact}/{n} ({exact/n*100:.1f}%)")
+print(f"  Near-perfect:    {near_perfect}/{n} ({near_perfect/n*100:.1f}%)")
+print(f"  Saved to:        {OUT_JSON}")
+```
+
+---
+
+## Step 5 — Results Comparison
+
+### Evaluation on 5 CORD-v2 validation samples
+
+#### Full SFT (lr=1e-4, 400 steps, epoch_3_step_399)
+
+| Sample | Ground Truth | Prediction | Match |
+|--------|-------------|------------|-------|
+| 1 | `<s_total>...<s_nm>REAL GANACHE</s_nm>...<s_nm>EGG TART</s_nm>...<s_nm>PIZZA TOAST</s_nm>...` | Exact match | 100% |
+| 2 | `<s_total>...<s_nm>JAMUR</s_nm>...<s_nm>TAHU</s_nm>...` | Exact match | 100% |
+| 3 | `<s_total>...<s_nm>Gojek Chicken Chilli Sauce H</s_nm>...` | Correct values, slight name segmentation diff | 33% |
+| 4 | `<s_total>...<s_nm>VANILLA CHOCO HEART CAKE</s_nm>...` | Exact match | 100% |
+| 5 | `<s_total>...<s_nm>Sate Padang</s_nm>...` | Correct, extra `<s_unitprice>` field | ~0% |
+
+**3/5 exact matches. All samples produce correct structured output.**
+
+#### LoRA PEFT (rank=64, lr=1e-3, 400 steps, epoch_0_step_99)
+
+| Sample | Ground Truth | Prediction | Match |
+|--------|-------------|------------|-------|
+| 1 | `<s_total>...<s_nm>REAL GANACHE</s_nm>...` | Exact match | 100% |
+| 2 | `<s_total>...<s_nm>JAMUR</s_nm>...<s_nm>TAHU</s_nm>...` | Exact match | 100% |
+| 3 | `<s_total>...<s_nm>Gojek Chicken Chilli Sauce H</s_nm>...` | Correct values, slight name segmentation diff | 33% |
+| 4 | `<s_total>...<s_nm>VANILLA CHOCO HEART CAKE</s_nm>...` | Exact match | 100% |
+| 5 | `<s_total>...<s_nm>Sate Padang</s_nm>...` | Exact match | 100% |
+
+**4/5 exact matches. All samples produce correct structured output.**
+
+### Summary
+
+| | Full SFT | LoRA PEFT |
+|---|---|---|
+| Trainable params | 31.5B (95.63%) | 55M (0.17%) |
+| Learning rate | 1e-4 | 1e-3 |
+| GPU memory | ~49 GiB | ~30 GiB |
+| Training time (8x H100) | ~10 min | ~6 min |
+| Best val loss | 0.034 (step 199) | 0.045 (step 99) |
+| Final train loss | 0.004 | 0.017 |
+| Checkpoint size | ~64 GB | ~27 MB |
+| Exact matches (5 val) | 3/5 | 4/5 |

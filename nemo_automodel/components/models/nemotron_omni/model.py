@@ -357,6 +357,18 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # Make preprocessor external (required by RADIO)
         if hasattr(self.vision_model, "radio_model"):
             self.vision_model.radio_model.make_preprocessor_external()
+
+        # 3D patch projector for temporally-packed video frames. Only present when the
+        # checkpoint ships a `patch_generator.video_embedder` weight (i.e. v3+).
+        self.video_temporal_patch_dim = getattr(config, "video_temporal_patch_size", None)
+        if self.video_temporal_patch_dim is not None and hasattr(self.vision_model, "radio_model"):
+            pg = self.vision_model.radio_model.model.patch_generator
+            pg.video_embedder = nn.Linear(
+                in_features=self.video_temporal_patch_dim * 3 * pg.patch_size * pg.patch_size,
+                out_features=pg.embed_dim,
+                bias=False,
+            )
+
         self.vision_model = self.vision_model.to(dtype)
 
         # Convert RADIO buffers that are NOT in the HF checkpoint to
@@ -559,13 +571,59 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             self.vision_model.train()
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
 
-        h = w = int(vit_embeds.shape[1] ** 0.5)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+        # Patch grid comes from input dims so non-square dynamic-res tiles also work.
+        patch_size = self.vision_model.radio_model.model.patch_generator.patch_size
+        B, _, H, W = pixel_values.shape
+        h = H // patch_size
+        w = W // patch_size
+        vit_embeds = vit_embeds.reshape(B, h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
 
         vit_embeds = self.vision_projector(vit_embeds)
 
+        return vit_embeds
+
+    def extract_video_feature(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
+        """Pack ``T = video_temporal_patch_dim`` frames into channels and run the ViT.
+
+        Returns embeddings shaped like ``extract_feature`` output, but with
+        ``ceil(N_frames / T)`` rows instead of one row per frame.
+        """
+        assert self.video_temporal_patch_dim is not None, "video_temporal_patch_size missing from config"
+        pg = self.vision_model.radio_model.model.patch_generator
+        T = self.video_temporal_patch_dim
+        N, C, H, W = pixel_values_videos.shape
+
+        if N % T != 0:
+            pad = pixel_values_videos[-1:].expand(T - (N % T), -1, -1, -1)
+            pixel_values_videos = torch.cat([pixel_values_videos, pad], dim=0)
+            N = pixel_values_videos.shape[0]
+        num_groups = N // T
+
+        # Per-patch feature order ends up `[t=0,c=0..C-1, t=1,c=0..C-1, ...]`, which is
+        # the layout the checkpoint's `video_embedder.weight` expects.
+        x = pixel_values_videos.reshape(num_groups, T * C, H, W)
+
+        was_training = self.vision_model.training
+        self.vision_model.eval()
+        orig_embedder = pg.embedder
+        pg.embedder = pg.video_embedder
+        try:
+            vit_embeds = self.vision_model(x).features
+        finally:
+            pg.embedder = orig_embedder
+            if was_training:
+                self.vision_model.train()
+
+        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        patch_size = pg.patch_size
+        h = H // patch_size
+        w = W // patch_size
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
+        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+        vit_embeds = self.vision_projector(vit_embeds)
         return vit_embeds
 
     def extract_sound_feature(
@@ -608,6 +666,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         labels: Optional[torch.LongTensor] = None,
         sound_features: Optional[torch.FloatTensor] = None,
         sound_attention_mask: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -684,6 +743,19 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 )
 
             inputs_embeds = inputs_embeds.reshape(B, N, C)
+
+        # Image and video both expand to `img_context_token_id` in the prompt, so a
+        # single sample can carry only one of `pixel_values` / `pixel_values_videos`.
+        if pixel_values_videos is not None:
+            assert pixel_values is None, "pixel_values and pixel_values_videos are mutually exclusive"
+            B_v, N_v, C_v = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
+            video_selected = input_ids.reshape(B_v * N_v) == self.img_context_token_id
+            video_embeds = self.extract_video_feature(pixel_values_videos)
+            inputs_embeds[video_selected] = (
+                inputs_embeds[video_selected] * 0.0 + video_embeds.reshape(-1, C_v)
+            )
+            inputs_embeds = inputs_embeds.reshape(B_v, N_v, C_v)
 
         # --- Sound/audio token replacement ---
         has_sound = (
