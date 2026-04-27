@@ -131,6 +131,61 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
     return [format(example) for example in dataset]
 
 
+def make_llava_onevision_dataset(
+    path_or_dataset="liuhaotian/LLaVA-Instruct-150K",
+    split="train",
+    **kwargs,
+):
+    """Load and preprocess the LLaVA-Instruct-150K dataset for LLaVA-OneVision-1.5.
+
+    This function loads conversation-format data with images and returns it in
+    the standard NeMo VLM format expected by the collate function.
+
+    Args:
+        path_or_dataset: Path to the dataset on HuggingFace Hub or local path.
+        split: Dataset split to load (e.g., "train", "train[:1000]").
+        **kwargs: Additional arguments passed to load_dataset.
+
+    Returns:
+        List of dicts with "conversation" and "image" keys.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+
+    def format(example):
+        conversations = example.get("conversations", [])
+        image = example.get("image", None)
+
+        # Convert conversations to NeMo VLM format
+        nemo_conversation = []
+        for turn in conversations:
+            role = turn.get("from", "")
+            content = turn.get("value", "")
+
+            # Map role names
+            if role == "human":
+                role = "user"
+            elif role == "gpt":
+                role = "assistant"
+
+            # Parse content for image placeholders
+            content_items = []
+            if "<image>" in content:
+                content_items.append({"type": "image", "image": image})
+                content = content.replace("<image>", "").strip()
+
+            if content:
+                content_items.append({"type": "text", "text": content})
+
+            nemo_conversation.append({"role": role, "content": content_items})
+
+        return {
+            "conversation": nemo_conversation,
+            "image": image,
+        }
+
+    return [format(example) for example in dataset]
+
+
 def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
     """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
     dataset = load_dataset(path_or_dataset, split=split)
@@ -995,10 +1050,11 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     ``pixel_values_videos``, ``video_grid_thw``).
     """
 
-    def __init__(self, dataset, processor, max_length=None, max_retries=10):
+    def __init__(self, dataset, processor, max_length=None, max_retries=10, truncate=False):
         self.dataset = dataset
         self.processor = processor
         self.max_length = max_length
+        self.truncate = truncate
         self.max_retries = max_retries
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
@@ -1074,23 +1130,42 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 input_ids = result["input_ids"][0]  # (seq_len,)
                 seq_len = input_ids.shape[0]
 
-                # Precise length check — replace overlong samples
+                # Precise length check — truncate or replace overlong samples
                 if self.max_length is not None and seq_len > self.max_length:
-                    logger.warning(
-                        "Sample %d: %d tokens > max_length %d, replacing.",
-                        idx,
-                        seq_len,
-                        self.max_length,
-                    )
-                    idx = random.randint(0, len(self.dataset) - 1)
-                    continue
+                    if not self.truncate:
+                        logger.warning(
+                            "Sample %d: %d tokens > max_length %d, replacing.",
+                            idx,
+                            seq_len,
+                            self.max_length,
+                        )
+                        idx = random.randint(0, len(self.dataset) - 1)
+                        continue
 
-                # Build labels using template markers
+                # Build labels BEFORE truncation so the full assistant text
+                # can be matched against the full input_ids.
                 labels = build_labels_from_template(
                     result["input_ids"],  # (1, seq_len)
                     [conversation],
                     self.processor,
                 )[0]  # (seq_len,)
+
+                # Now truncate if needed (after labels are built)
+                if self.truncate and self.max_length is not None and seq_len > self.max_length:
+                    ml = self.max_length
+                    input_ids = input_ids[:ml]
+                    labels = labels[:ml]
+                    result = {
+                        k: (
+                            v[:, :ml]
+                            if isinstance(v, torch.Tensor) and v.dim() == 2 and v.shape[1] == seq_len
+                            else v[:ml]
+                            if isinstance(v, torch.Tensor) and v.dim() == 1 and v.shape[0] == seq_len
+                            else v
+                        )
+                        for k, v in result.items()
+                    }
+                    seq_len = ml
 
                 output = {
                     "input_ids": input_ids,
@@ -1105,6 +1180,8 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "image_grid_thw",
                     "video_grid_thw",
                     "second_per_grid_ts",
+                    "image_position_ids",
+                    "mm_token_type_ids",
                 ):
                     if key in result and result[key] is not None:
                         output[key] = result[key]

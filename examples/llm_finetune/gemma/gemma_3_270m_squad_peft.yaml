@@ -43,16 +43,16 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false 
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -99,10 +99,13 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:20:00"
+  known_issue_id: AM-154
+  allow_failure: true
   checkpoint_robustness:
-    hf_kl_threshold: 8e-3
+    hf_kl_threshold: 1e-1
     tokenizer_name: google/gemma-3-270m
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

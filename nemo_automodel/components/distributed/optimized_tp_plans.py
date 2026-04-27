@@ -41,6 +41,8 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
 
+from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
@@ -212,6 +214,41 @@ def _parallelize_gemma3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_gemma4(
+    model: Gemma4ForConditionalGeneration,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a Gemma4ForConditionalGeneration model across tensor parallel dimensions.
+
+    Gemma4 VLM uses model.language_model.{embed_tokens, layers.*} for the text
+    backbone, identical to the Gemma3 VLM layout.
+    """
+    if sequence_parallel:
+        import warnings
+
+        warnings.warn(
+            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored. ",
+            stacklevel=2,
+        )
+
+    model_prefix = "model.language_model"
+
+    return cast(
+        dict[str, ParallelStyle],
+        {
+            f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+            f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+            f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
+            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+        },
+    )
+
+
 def get_llama_nemotron_super_tp_plan(
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
@@ -266,6 +303,27 @@ def get_decilm_nemotron_tp_plan(
         base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+def _parallelize_baichuan(
+    model: BaichuanForCausalLM | None,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes a BaichuanForCausalLM model (MLP-only).
+
+    Only the MLP is sharded. The attention path stays fully replicated
+    because W_pack uses a non-interleaved [Q|K|V] layout (ColwiseParallel
+    would split it incorrectly) and NormHead (lm_head) is not nn.Linear
+    (ColwiseParallel is unsupported).
+    """
+    return cast(
+        dict[str, ParallelStyle],
+        {
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        },
+    )
 
 
 def _parallelize_llama(
@@ -523,17 +581,36 @@ def _get_class_qualname(cls: type) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+def _parallelize_qwen3_5_vlm(
+    model,
+    sequence_parallel: bool = False,
+) -> Dict[str, ParallelStyle]:
+    """Parallelize Qwen3.5 VLM by reusing transformers' base_model_tp_plan.
+
+    Qwen3.5 has mixed attention: full self_attn (every 4th layer) + linear_attn
+    (GatedDeltaNet). The transformers-provided base_model_tp_plan covers only
+    self_attn + MLP — linear_attn is not TP-shardable with stock kernels.
+    """
+    from nemo_automodel.components.distributed.parallelizer import get_hf_tp_shard_plan
+
+    return get_hf_tp_shard_plan(model)
+
+
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
+    _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
     _get_class_qualname(Qwen2ForCausalLM): _parallelize_qwen,
     _get_class_qualname(Qwen3ForCausalLM): _parallelize_qwen,
     _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
+    # Hard-coded qualname to avoid eagerly importing transformers.models.qwen3_5.
+    "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
+    _get_class_qualname(Gemma4ForConditionalGeneration): _parallelize_gemma4,
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,

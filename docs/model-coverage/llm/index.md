@@ -28,6 +28,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Qwen / Alibaba Cloud | [Qwen3-Next](qwen/qwen3-next.md) | `Qwen3NextForCausalLM` |
 | DeepSeek | [DeepSeek](deepseek-ai/deepseek.md) | `DeepseekForCausalLM` |
 | DeepSeek | [DeepSeek-V3](deepseek-ai/deepseek-v3.md) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek V4 Flash](deepseek-ai/dsv4-flash.md) | `DeepseekV4ForCausalLM` |
 | Mistral AI | [Mistral](mistralai/mistral.md) | `MistralForCausalLM` |
 | Mistral AI | [Mixtral](mistralai/mixtral.md) | `MixtralForCausalLM` |
 | Mistral AI | [Ministral3 / Devstral](mistralai/ministral3.md) | `Mistral3ForConditionalGeneration` |
@@ -49,6 +50,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Allen AI | [OLMo2](allenai/olmo2.md) | `OLMo2ForCausalLM` |
 | Allen AI | [OLMoE](allenai/olmoe.md) | `OLMoEForCausalLM` |
 | OpenAI | [GPT-OSS](openai/gpt-oss.md) | `GptOssForCausalLM` |
+| OpenAI | [GPT-2](openai/gpt2.md) | `GPT2LMHeadModel` |
 | EleutherAI | [GPT-J](eleutherai/gpt-j.md) | `GPTJForCausalLM` |
 | EleutherAI | [GPT-NeoX / Pythia](eleutherai/gpt-neox.md) | `GPTNeoXForCausalLM` |
 | BigCode | [StarCoder](bigcode/starcoder.md) | `GPTBigCodeForCausalLM` |
@@ -95,6 +97,7 @@ qwen/qwen3-moe
 qwen/qwen3-next
 deepseek-ai/deepseek
 deepseek-ai/deepseek-v3
+deepseek-ai/dsv4-flash
 mistralai/mistral
 mistralai/mixtral
 mistralai/ministral3
@@ -116,6 +119,7 @@ allenai/olmo
 allenai/olmo2
 allenai/olmoe
 openai/gpt-oss
+openai/gpt2
 eleutherai/gpt-j
 eleutherai/gpt-neox
 bigcode/starcoder

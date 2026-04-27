@@ -52,6 +52,7 @@ import sys
 from pathlib import Path
 
 from nemo_automodel.cli.utils import load_yaml, resolve_recipe_name
+from nemo_automodel.components.config.loader import resolve_yaml_env_vars
 
 # When launched via external torchrun each worker imports this module.
 # Suppress non-rank-0 CLI output before setup_logging installs RankFilter.
@@ -135,7 +136,13 @@ def main():
         logger.info("Launching job via SkyPilot")
         from nemo_automodel.components.launcher.skypilot.launcher import SkyPilotLauncher
 
-        return SkyPilotLauncher().launch(config, config_path, recipe_target, skypilot_config, extra)
+        return SkyPilotLauncher().launch(
+            config,
+            config_path,
+            recipe_target,
+            resolve_yaml_env_vars(skypilot_config),
+            extra,
+        )
 
     elif nemo_run_config := config.pop("nemo_run", None):
         logger.info("Launching job via NeMo-Run")
@@ -148,7 +155,7 @@ def main():
         from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
         from nemo_automodel.components.launcher.interactive import InteractiveLauncher
 
-        cfg = parse_args_and_load_config(str(config_path))
+        cfg = parse_args_and_load_config(str(config_path), argv=extra)
         return InteractiveLauncher().launch(cfg, config_path, recipe_target, args.nproc_per_node, extra)
 
 

@@ -82,8 +82,11 @@ jobs:
 
       - name: Install wget
         run: |
-          apt-get update
-          apt-get install -y wget git
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y wget git && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Upgrade pip
         run: |
@@ -107,6 +110,7 @@ jobs:
         env:
           PAT: ${{ secrets.PAT }}
           UV_PROJECT_ENVIRONMENT: ./venv
+          TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
@@ -117,7 +121,7 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          uv sync --link-mode copy --locked --all-groups
+          uv sync --link-mode copy --locked --all-groups --extra all
 
           uv pip install --no-deps -e .
 
@@ -148,7 +152,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        extra-groups: ["", "vlm", "fa"]
+        extra-groups: ["", "cuda", "vlm", "fa", "all"]
     env:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
     steps:
@@ -158,8 +162,11 @@ jobs:
       - name: Install automodel${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
         shell: bash -x -e -u -o pipefail {0}
         run: |
-          apt-get update
-          apt-get install -y python3 python3-pip python3-venv git
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y python3 python3-pip python3-venv git && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
           python3 -m venv ./venv
 
           . ./venv/bin/activate
@@ -168,10 +175,11 @@ jobs:
 
           PIP_ARGS=()
 
-          if [[ $EXTRA == *"fa"* ]]; then
+          if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
             pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
             pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
+            export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
           fi
 
           pip install ${PIP_ARGS[@]} .$EXTRA

@@ -22,6 +22,11 @@ from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +98,36 @@ def _read_tokenizer_class(pretrained_model_name_or_path, **kwargs):
     if config is None:
         return None
     return config.get("tokenizer_class")
+
+
+def _retry_tokenizer_via_auto_map(pretrained_model_name_or_path, *args, **kwargs):
+    """Load a tokenizer by resolving ``auto_map['AutoTokenizer']`` directly.
+
+    Fallback for transformers>=5, where models whose tokenizer_config.json only
+    registers a slow ``PreTrainedTokenizer`` subclass (e.g. Moonlight's
+    TikTokenTokenizer) fail in ``AutoTokenizer.from_pretrained`` with
+    "Couldn't instantiate the backend tokenizer ...". Bypasses AutoTokenizer
+    by resolving the class from the remote module itself.
+
+    Returns ``None`` when ``auto_map`` has no ``AutoTokenizer`` entry, so the
+    caller can re-raise the original error.
+    """
+    config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+    if config is None:
+        return None
+    ref = (config.get("auto_map") or {}).get("AutoTokenizer")
+    if isinstance(ref, (list, tuple)):
+        ref = next((r for r in ref if r), None)
+    if not ref:
+        return None
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        cls = get_class_from_dynamic_module(ref, str(pretrained_model_name_or_path))
+    except Exception:
+        logger.debug("Failed to resolve tokenizer class from auto_map", exc_info=True)
+        return None
+    return cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
 
 def _resolve_source_dir(pretrained_model_name_or_path, **kwargs):
@@ -326,7 +361,31 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except (ValueError, StrictDataclassClassValidationError) as e:
+            err = str(e)
+            if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
+                # so configs whose layer_types length differs from num_hidden_layers (e.g.
+                # stepfun-ai/Step-3.5-Flash) trip validate_layer_type before the tokenizer
+                # is built. The tokenizer itself doesn't depend on layer_types, so relax
+                # the validator globally and retry.
+                from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+                relax_layer_types_validator()
+                tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            elif "backend tokenizer" in err and kwargs.get("trust_remote_code"):
+                # transformers>=5 removed the slow-only tokenizer path, so models whose
+                # auto_map registers only a slow PreTrainedTokenizer subclass (e.g.
+                # Moonlight's TikTokenTokenizer) fail with a misleading "install
+                # sentencepiece or tiktoken" message even when both are installed.
+                # Retry by resolving the class from the remote module directly.
+                tokenizer = _retry_tokenizer_via_auto_map(pretrained_model_name_or_path, *args, **kwargs)
+                if tokenizer is None:
+                    raise
+            else:
+                raise
 
         # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
         # char_to_token() works natively for {% generation %} mask computation.

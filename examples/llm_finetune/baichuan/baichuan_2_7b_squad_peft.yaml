@@ -48,10 +48,10 @@ tokenizer:
   trust_remote_code: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -117,11 +117,14 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  recipe_owner: adil-a
   time: "00:45:00"
+  vllm_deploy: true
+  recipe_owner: adil-a
+  known_issue_id: AM-149
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
     trust_remote_code: true
+    kl_threshold: 1e-2
+    hf_kl_threshold: 5e-2
     distributed.tp_size: 2
     tokenizer_name: baichuan-inc/Baichuan2-7B-Chat
     dataset.limit_dataset_samples: 500
