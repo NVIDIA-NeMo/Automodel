@@ -64,7 +64,8 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-              --rdzv_id=${SLURM_JOB_ID}"
+              --rdzv_id=${SLURM_JOB_ID} \
+              --rdzv_conf=timeout=${RDZV_TIMEOUT:-600}"
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
@@ -86,7 +87,7 @@ if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
 fi
 
 ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $PIPELINE_DIR/$TEST_NAME/robustness_logs \
-  -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+  -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
   ${ROBUSTNESS_COMMON}"
 
 # --- Finetune ---

@@ -752,24 +752,30 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         for mp in self.model_parts:
             mp.train()
         self.timestamp = time.perf_counter()
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batches in self.step_scheduler:
-                self._enable_qat_if_delayed(self.step_scheduler.step)
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self._collect_moe_load_balance()
-                self.log_train_metrics(train_log_data)
-                val_losses = {}
-                if self.step_scheduler.is_val_step:
-                    logger.warning("Validation is not supported for pipeline parallelism; skipping")
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
-                        val_losses,
-                        best_metric_key=self.best_metric_key,
-                    )
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batches in self.step_scheduler:
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    self._collect_moe_load_balance()
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
+                        logger.warning("Validation is not supported for pipeline parallelism; skipping")
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_losses,
+                            best_metric_key=self.best_metric_key,
+                        )
+        finally:
+            if pbar is not None:
+                pbar.close()
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
