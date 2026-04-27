@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NemotronOmni (NemotronH_Nano_VL_V2) custom model for Nemo Automodel.
+"""NemotronOmni (NemotronH_Nano_Omni_Reasoning_V3) custom model for Nemo Automodel.
 
 This model is a VLM (vision-language model) with:
 - Vision encoder: RADIO v2.5-H (ViT-Huge, patch_size=16) -- loaded from HF
@@ -20,7 +20,7 @@ This model is a VLM (vision-language model) with:
 - LLM: NemotronH (hybrid Mamba+Attention MoE) -- reuses nemotron_v3 custom implementation
 - Projectors: MLP projectors for vision->LLM and audio->LLM
 
-Architecture name: "NemotronH_Nano_VL_V2" (from config.json)
+Architecture name: "NemotronH_Nano_Omni_Reasoning_V3" (from config.json)
 """
 
 import logging
@@ -147,12 +147,12 @@ class SoundProjection(nn.Module):
 
 
 class NemotronOmniConfig(PretrainedConfig):
-    """Configuration for the NemotronOmni (NemotronH_Nano_VL_V2) model.
+    """Configuration for the NemotronOmni (NemotronH_Nano_Omni_Reasoning_V3) model.
 
     This wraps the HF config and provides easy access to sub-configs.
     """
 
-    model_type = "NemotronH_Nano_VL_V2"
+    model_type = "NemotronH_Nano_Omni_Reasoning_V3"
     is_composition = True
 
     def __init__(
@@ -250,7 +250,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """Create model from config.
 
         Args:
-            config: NemotronH_Nano_VL_V2 config (HF config with trust_remote_code)
+            config: NemotronH_Nano_Omni_Reasoning_V3 config (HF config with trust_remote_code)
             backend: Backend configuration
             **kwargs: Additional arguments
 
@@ -290,7 +290,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """Initialize NemotronOmniForConditionalGeneration.
 
         Args:
-            config: NemotronH_Nano_VL_V2 config
+            config: NemotronH_Nano_Omni_Reasoning_V3 config
             backend: Backend configuration
             **kwargs: Additional arguments
         """
@@ -676,7 +676,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """Forward pass for training.
 
-        This follows the same pattern as the HF NemotronH_Nano_VL_V2.forward():
+        This follows the same pattern as the HF NemotronH_Nano_Omni_Reasoning_V3.forward():
         1. Get text embeddings from LLM embed_tokens
         2. Extract vision features from pixel_values
         3. Replace image token embeddings with vision embeddings

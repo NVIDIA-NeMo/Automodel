@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State dict adapter for NemotronOmni (NemotronH_Nano_VL_V2) models.
+"""State dict adapter for NemotronOmni (NemotronH_Nano_Omni_Reasoning_V3) models.
 
 Converts between HuggingFace checkpoint format and the custom Automodel format.
 
@@ -96,7 +96,7 @@ _VISION_PROJ_CUSTOM_TO_HF = {v: k for k, v in _VISION_PROJ_HF_TO_CUSTOM.items()}
 
 
 class NemotronOmniStateDictAdapter(StateDictAdapter):
-    """State dict adapter for NemotronOmni (NemotronH_Nano_VL_V2) models.
+    """State dict adapter for NemotronOmni (NemotronH_Nano_Omni_Reasoning_V3) models.
 
     Handles conversion between HF checkpoint format and custom Automodel format.
 
