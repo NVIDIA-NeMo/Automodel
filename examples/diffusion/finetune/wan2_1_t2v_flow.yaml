@@ -75,3 +75,7 @@ checkpoint:
   save_consolidated: true
   diffusers_compatible: true
   restore_from: null
+
+ci:
+  recipe_owner: pthombre
+  time: "00:30:00"

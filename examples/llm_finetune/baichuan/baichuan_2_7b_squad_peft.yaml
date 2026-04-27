@@ -48,10 +48,10 @@ tokenizer:
   trust_remote_code: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -120,6 +120,7 @@ ci:
   time: "00:45:00"
   vllm_deploy: true
   recipe_owner: adil-a
+  known_issue_id: AM-149
   checkpoint_robustness:
     trust_remote_code: true
     kl_threshold: 1e-2

@@ -57,6 +57,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_lora
   model_save_format: safetensors
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -103,6 +104,8 @@ ci:
   recipe_owner: adil-a
   time: "00:15:00"
   nodes: 1
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     tokenizer_name: Qwen/Qwen3-30B-A3B

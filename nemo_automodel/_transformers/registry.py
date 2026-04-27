@@ -44,6 +44,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v32.model", "DeepseekV32ForCausalLM"),
         ),
         (
+            "DeepseekV4ForCausalLM",
+            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+        ),
+        (
             "Glm4MoeForCausalLM",
             ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
@@ -116,6 +120,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),
         (
+            "LLaVAOneVision1_5_ForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.llava_onevision.model",
+                "LLaVAOneVision1_5_ForConditionalGeneration",
+            ),
+        ),
+        (
             "Qwen2ForCausalLM",
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
         ),
@@ -155,8 +166,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
+    "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
 }
 

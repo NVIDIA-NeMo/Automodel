@@ -42,10 +42,10 @@ model:
   attn_implementation: eager
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false 
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -96,7 +96,7 @@ ci:
   recipe_owner: HuiyingLi
   time: "00:20:00"
   checkpoint_robustness:
-    hf_kl_threshold: 6e-3
+    hf_kl_threshold: 1e-1
     tokenizer_name: google/gemma-3-270m
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

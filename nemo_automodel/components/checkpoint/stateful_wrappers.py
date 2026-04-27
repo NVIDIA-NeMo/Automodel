@@ -56,7 +56,12 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
-from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import (
+    get_lm_head_weight_and_name,
+    has_local_tied_lm_head,
+    is_tied_word_embeddings,
+    materialize_missing_tied_lm_head,
+)
 
 _PREFIX = "model."
 
@@ -195,12 +200,7 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
-    for name, param in model.named_parameters(remove_duplicate=False):
-        if "lm_head" in name and name.endswith(".weight"):
-            normalized_name = name.replace("_orig_mod.", "")
-            return param, normalized_name
-
-    return None, None
+    return get_lm_head_weight_and_name(model)
 
 
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
@@ -242,9 +242,10 @@ class ModelState:
                 - ["score."] for some classification heads
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
-        self.is_tied_lm_head = is_tied_word_embeddings(self.model[0])
+        self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
+        self.has_local_tied_lm_head = has_local_tied_lm_head(self.model[0])
 
-        if self.is_tied_lm_head:
+        if self.uses_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             self.lm_head_param_name = lm_head_param_name
         self.is_peft = is_peft
@@ -283,8 +284,7 @@ class ModelState:
         if self.is_peft:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
 
-        if self.is_tied_lm_head:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+        if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
         if self.is_peft and not _has_quantized_params(self.model[0]):
@@ -326,13 +326,12 @@ class ModelState:
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
-        if self.is_tied_lm_head and not self.is_peft:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
-            lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
-            # Skip for Encoder models as it doesn't have a lm_head at the top level
-            if lm_head_weight is not None and lm_head_param_name not in state_dict:
-                # weight tying guarantees this is identical to the embedding weight
-                state_dict[lm_head_param_name] = lm_head_weight.detach()
+        if self.uses_tied_lm_head and not self.is_peft:
+            materialize_missing_tied_lm_head(
+                state_dict,
+                self.model[0],
+                allow_current_lm_head_fallback=True,
+            )
 
         for model_part in self.model:
             set_model_state_dict(model_part, state_dict, options=options)
@@ -340,8 +339,7 @@ class ModelState:
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
 
-        if self.is_tied_lm_head:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+        if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
         if self.is_peft:

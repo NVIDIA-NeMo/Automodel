@@ -126,7 +126,7 @@ def _passthrough_create_causal_mask(
     embeds = inputs_embeds if inputs_embeds is not None else input_embeds
     return create_causal_mask(
         config=config,
-        input_embeds=embeds,
+        inputs_embeds=embeds,
         attention_mask=attention_mask,
         cache_position=cache_position,
         past_key_values=past_key_values,

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
+from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -102,6 +103,14 @@ def _apply_peft_and_lower_precision(
         # Attach helpers for delayed fake-quant toggling if desired
         model._qat_mode = qat_mode  # type: ignore[attr-defined]
 
+    return model
+
+
+def _apply_runtime_compatibility_fixes(model):
+    """Apply targeted runtime workarounds after sharding/load completes."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    if should_fix_rotary_embeddings(model_parts):
+        fix_rotary_embeddings(model_parts)
     return model
 
 
@@ -191,6 +200,12 @@ def _instantiate_pipeline(
 
     config_dict = config.to_dict()
     config_dict.pop("loss_fn", None)
+
+    # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
+    # the same knob controls grad-sync behavior under PP.
+    strategy_config = getattr(mesh, "strategy_config", None)
+    if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
+        config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
 
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
@@ -337,6 +352,8 @@ def apply_model_infrastructure(
     load_base_model=False,
     cache_dir=None,
     pretrained_model_name_or_path="",
+    weights_already_loaded=False,
+    inject_te_attention: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -368,6 +385,13 @@ def apply_model_infrastructure(
         pretrained_model_name_or_path: Model name or path for checkpoint loading. Default: ""
         load_base_model: Whether to load base model weights (True for from_pretrained). Default: False
         cache_dir: Cache directory for model weights. Default: None
+        weights_already_loaded: Whether pretrained weights were already loaded during
+            model init (e.g., by HF's from_pretrained on a real device, which also
+            handles BnB quantization atomically). When True, checkpoint loading in
+            this function is skipped. Default: False.
+        inject_te_attention: When True, inject TransformerEngine DotProductAttention
+            into all ``self_attn`` modules of HF models (has no effect on custom
+            models that already use TE via BackendConfig). Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -410,6 +434,14 @@ def apply_model_infrastructure(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
 
+    # Inject TE attention into HF models when requested.
+    # Done after PEFT (so projection shapes are final) and before sharding
+    # (so TE modules are included in the FSDP unit).
+    if inject_te_attention and not _uses_te_attention(model):
+        from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
+
+        _inject_te(model)
+
     # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
     # stay in sync (load-before-shard can cause NCCL collective mismatch). With PP we shard first
@@ -422,6 +454,7 @@ def apply_model_infrastructure(
         autopipeline=autopipeline,
         tp_size=mesh.tp_size,
         ep_size=mesh.ep_size,
+        dp_shard_size=mesh.dp_shard_size,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         load_base_model=load_base_model,
         peft_config=peft_config,
@@ -472,8 +505,12 @@ def apply_model_infrastructure(
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
-        if compile_config is not None:
+        if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
+        if isinstance(model_wrapper, FSDP2Manager):
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                model_wrapper.maybe_compile(mp)
         if isinstance(model_wrapper, DDPManager):
             setattr(model.module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
@@ -483,7 +520,7 @@ def apply_model_infrastructure(
     # This is needed for both from_pretrained (before checkpoint loading overwrites)
     # and from_config (where this is the only weight initialization).
     # Skipped when load_before_shard already handled materialization + init.
-    need_post_shard_init = (
+    need_materialize = (
         is_meta_device
         and not load_before_shard
         and any(
@@ -494,14 +531,17 @@ def apply_model_infrastructure(
             ]
         )
     )
-    if need_post_shard_init:
+    if need_materialize:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
             checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
 
-    # Load the checkpoint if needed (meta path, or PP/TP path where we did not load before shard)
-    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and need_post_shard_init
+    # Load the checkpoint if pretrained weights are needed and weren't already loaded
+    # (e.g., by HF's from_pretrained on a real device, which also handles BnB
+    # quantization atomically).  Decoupled from the meta-device materialization
+    # decision so that changes to the meta-device policy cannot silently skip loading.
+    should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
@@ -547,12 +587,19 @@ def apply_model_infrastructure(
     if mesh.cp_size > 1 and not _uses_te_attention(model):
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
+            attach_cp_sdpa_hooks,
             attach_linear_attn_position_hooks,
         )
+
+        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
             attach_linear_attn_position_hooks(mp)
+            if is_compile_enabled:
+                attach_cp_sdpa_hooks(mp, cp_mesh)
 
+    model = _apply_runtime_compatibility_fixes(model)
     return model

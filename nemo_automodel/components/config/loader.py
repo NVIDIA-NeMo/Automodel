@@ -345,13 +345,23 @@ class ConfigNode:
         self.raise_on_missing_attr = raise_on_missing_attr
 
     def __getattr__(self, key: str) -> Any:
+        # Dunder methods must raise AttributeError so that Python's
+        # copy/pickle/repr protocols (which call
+        # getattr(obj, "__setstate__", None), etc.) treat them as absent
+        # rather than as missing regular attributes — returning None here
+        # would break copy.deepcopy and isinstance checks.
+        if key.startswith("__") and key.endswith("__"):
+            raise AttributeError(key)
         try:
             return self.__dict__[key]
-        except:
-            if self.raise_on_missing_attr:
-                raise AttributeError
-            else:
-                return None
+        except KeyError:
+            # Read the flag safely: on a partially-constructed node
+            # (e.g. a deepcopy target that has not yet had __setstate__
+            # called) raise_on_missing_attr may itself be missing, which
+            # would recurse back into __getattr__.  Default to True.
+            if self.__dict__.get("raise_on_missing_attr", True):
+                raise AttributeError(key)
+            return None
 
     def _wrap(self, k: str, v: Any) -> Any:
         """Wrap a configuration value based on its type.
@@ -461,11 +471,14 @@ class ConfigNode:
             else:
                 config_kwargs[k] = self._instantiate_value(v)
 
-        # Override/add with passed kwargs
-        config_kwargs.update(kwargs)
-        # Resolve env interpolations at the last moment, so printing/saving the config
-        # does not leak secrets (e.g., `${oc.env:HF_TOKEN}` remains in YAML output).
+        # Resolve env interpolations on config-derived kwargs only, before merging
+        # runtime arguments (e.g. `examples`, `processor`).  Doing it after the
+        # update() would cause resolve_yaml_env_vars to scan actual data content,
+        # which can contain arbitrary strings like "$P" and raise spurious KeyErrors.
         config_kwargs = resolve_yaml_env_vars(config_kwargs)
+
+        # Override/add with passed kwargs (runtime data — must NOT be env-var-resolved)
+        config_kwargs.update(kwargs)
 
         import traceback
 
