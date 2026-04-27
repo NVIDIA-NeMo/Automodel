@@ -1317,7 +1317,7 @@ def test_kimi_k25_vl_collate_fn_labels_shifted(collate_mod, monkeypatch):
 
 
 def test_kimi_k25_vl_collate_fn_fake_image_mask(collate_mod, monkeypatch):
-    """Fake-image vision tokens must have attention_mask=0 for injected samples."""
+    """mask_fake_vision_tokens_batch must be called with the injected sample index."""
     media_token_id = 163605
 
     class FakeImageProcessor:
@@ -1329,8 +1329,6 @@ def test_kimi_k25_vl_collate_fn_fake_image_mask(collate_mod, monkeypatch):
             return "chat:processed"
 
         def __call__(self, **kwargs):
-            # Sequence: [1, media_token_id, media_token_id, 2]
-            # Two vision tokens at positions 1 and 2
             input_ids = torch.tensor([[1, media_token_id, media_token_id, 2]])
             attention_mask = torch.ones_like(input_ids)
             return {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -1343,23 +1341,27 @@ def test_kimi_k25_vl_collate_fn_fake_image_mask(collate_mod, monkeypatch):
         raising=True,
     )
 
+    mask_calls = []
+
+    def fake_mask(batch, proc, sample_indices):
+        mask_calls.append(list(sample_indices))
+
+    monkeypatch.setattr(collate_mod, "mask_fake_vision_tokens_batch", fake_mask, raising=True)
+
     conversation = [
         {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
     ]
     examples = [{"conversation": conversation, "_injected_fake": True}]
 
-    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+    collate_mod.kimi_k25_vl_collate_fn(examples, processor)
 
-    # Vision token positions (1 and 2 in the unshifted sequence, 1 and 2 after [:, :-1])
-    # After [:, :-1] the sequence is [1, media, media] (positions 0,1,2)
-    assert batch["attention_mask"][0, 1] == 0, "vision token at pos 1 should be masked"
-    assert batch["attention_mask"][0, 2] == 0, "vision token at pos 2 should be masked"
-    assert batch["attention_mask"][0, 0] == 1, "non-vision token should remain unmasked"
+    assert len(mask_calls) == 1, "mask_fake_vision_tokens_batch should be called once"
+    assert mask_calls[0] == [0], "injected sample is at batch index 0"
 
 
 def test_kimi_k25_vl_collate_fn_non_fake_not_masked(collate_mod, monkeypatch):
-    """Real-image vision tokens must NOT be masked for non-injected samples."""
+    """mask_fake_vision_tokens_batch must NOT be called for non-injected samples."""
     media_token_id = 163605
 
     class RealImageProcessor:
@@ -1383,6 +1385,14 @@ def test_kimi_k25_vl_collate_fn_non_fake_not_masked(collate_mod, monkeypatch):
         raising=True,
     )
 
+    mask_calls = []
+    monkeypatch.setattr(
+        collate_mod,
+        "mask_fake_vision_tokens_batch",
+        lambda batch, proc, indices: mask_calls.append(indices),
+        raising=True,
+    )
+
     conversation = [
         {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
@@ -1390,10 +1400,9 @@ def test_kimi_k25_vl_collate_fn_non_fake_not_masked(collate_mod, monkeypatch):
     # _injected_fake is NOT set
     examples = [{"conversation": conversation}]
 
-    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+    collate_mod.kimi_k25_vl_collate_fn(examples, processor)
 
-    # No masking should happen — all tokens keep attention_mask=1 (before last-token drop)
-    assert batch["attention_mask"][0, 1] == 1, "real vision token should not be masked"
+    assert len(mask_calls) == 0, "mask_fake_vision_tokens_batch should not be called for non-injected samples"
 
 
 # =============================================================================
