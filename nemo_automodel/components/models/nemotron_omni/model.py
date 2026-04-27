@@ -28,11 +28,10 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin

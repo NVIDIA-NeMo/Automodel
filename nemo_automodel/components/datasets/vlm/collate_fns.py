@@ -1555,6 +1555,7 @@ def nemotron_omni_collate_fn(
     """
     import numpy as np
     from transformers.video_utils import VideoMetadata
+
     from nemo_automodel.components.datasets.vlm.utils import _read_video_frames
 
     conversations = _ensure_rgb([example["conversation"] for example in examples])
