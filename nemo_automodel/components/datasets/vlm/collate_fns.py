@@ -1549,6 +1549,240 @@ def neat_packed_vlm_collater(
     return result
 
 
+def nemotron_omni_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+    max_video_frames: int = 8,
+) -> Dict[str, torch.Tensor]:
+    """Collate for NemotronOmni (image / video / audio).
+
+    Defers ``<image>``/``<video>``/``<audio>`` placeholder expansion to the processor;
+    the collate only gathers media into processor kwargs, pads, builds labels, and
+    stacks tensors.
+    """
+    import numpy as np
+    from transformers.video_utils import VideoMetadata
+
+    from nemo_automodel.components.datasets.vlm.utils import _read_video_frames
+
+    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    tokenizer = getattr(processor, "tokenizer", processor)
+    image_token = getattr(processor, "image_token", "<image>")
+    video_token = getattr(processor, "video_token", "<video>")
+
+    sample_audio: Dict[int, np.ndarray] = {}
+    target_sr = getattr(processor, "audio_sampling_rate", 16000)
+    for idx, example in enumerate(examples):
+        audio = example.get("audio")
+        if audio is None:
+            continue
+        if isinstance(audio, tuple) and len(audio) == 2:
+            waveform, sr = audio
+            waveform = np.asarray(waveform, dtype=np.float32)
+            if sr != target_sr:
+                n_out = int(round(len(waveform) * target_sr / sr))
+                waveform = np.interp(
+                    np.linspace(0, len(waveform), n_out, endpoint=False),
+                    np.arange(len(waveform)),
+                    waveform,
+                ).astype(np.float32)
+        else:
+            waveform = np.asarray(audio, dtype=np.float32)
+        sample_audio[idx] = waveform
+
+    all_images: List[List[Any]] = []
+    all_videos: List[Optional[Tuple[List[Any], Optional[VideoMetadata]]]] = []
+    texts: List[str] = []
+
+    for conversation in conversations:
+        conv_images: List[Any] = []
+        conv_video: Optional[Tuple[List[Any], Optional[VideoMetadata]]] = None
+        text_conversation = []
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    t = item.get("type")
+                    if t == "image":
+                        img = item.get("image")
+                        if img is not None:
+                            conv_images.append(img)
+                            text_parts.append(image_token)
+                    elif t == "video":
+                        vid = item.get("video")
+                        if vid is None:
+                            continue
+                        if isinstance(vid, str):
+                            import decord
+
+                            decord.bridge.set_bridge("native")
+                            total = len(decord.VideoReader(vid))
+                            # Even count required by ``video_temporal_patch_dim=2``.
+                            n = min(max_video_frames, total)
+                            if n % 2 != 0:
+                                n = max(2, n - 1)
+                            frame_idx = torch.linspace(0, total - 1, n).round().long().tolist()
+                            frames, video_fps, indices = _read_video_frames(
+                                vid,
+                                processor=processor,
+                                frame_indices=frame_idx,
+                                return_metadata=True,
+                            )
+                            metadata = VideoMetadata(
+                                total_num_frames=len(frames),
+                                fps=video_fps,
+                                frames_indices=[int(i) for i in indices],
+                            )
+                        elif isinstance(vid, list):
+                            frames = vid
+                            metadata = item.get("metadata")
+                        else:
+                            raise ValueError(f"Unsupported video type: {type(vid)}")
+                        if conv_video is not None:
+                            raise NotImplementedError("Only 1 video per sample is supported")
+                        conv_video = (frames, metadata)
+                        text_parts.append(video_token)
+                    elif t == "text":
+                        text_parts.append(item.get("text", ""))
+                text_conversation.append(
+                    {
+                        "role": message["role"],
+                        "content": "".join(text_parts),
+                    }
+                )
+            else:
+                text_conversation.append(message)
+
+        all_images.append(conv_images)
+        all_videos.append(conv_video)
+        text = tokenizer.apply_chat_template(text_conversation, tokenize=False)
+        texts.append(text)
+
+    all_input_ids: List[torch.Tensor] = []
+    all_attention_masks: List[torch.Tensor] = []
+    sample_pixel_values: Dict[int, Any] = {}
+    sample_pixel_values_videos: Dict[int, Any] = {}
+    sample_sound_clips: Dict[int, Any] = {}
+
+    for i, (text, images, video) in enumerate(zip(texts, all_images, all_videos)):
+        kwargs: Dict[str, Any] = {"text": text, "return_tensors": "pt"}
+        if images:
+            kwargs["images"] = images
+        if video is not None:
+            frames, metadata = video
+            kwargs["videos"] = frames
+            if metadata is not None:
+                kwargs["videos_kwargs"] = {"video_metadata": metadata}
+        if i in sample_audio:
+            kwargs["audio"] = [sample_audio[i]]
+
+        batch_i = processor(**kwargs)
+        all_input_ids.append(batch_i["input_ids"][0])
+        all_attention_masks.append(batch_i["attention_mask"][0])
+
+        if batch_i.get("pixel_values") is not None:
+            sample_pixel_values[i] = batch_i["pixel_values"]
+        if batch_i.get("pixel_values_videos") is not None:
+            sample_pixel_values_videos[i] = batch_i["pixel_values_videos"]
+        if batch_i.get("sound_clips") is not None:
+            sample_sound_clips[i] = batch_i["sound_clips"]
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", None) or 0
+    seq_lengths = [ids.shape[0] for ids in all_input_ids]
+    target_len = max_length if max_length is not None else max(seq_lengths)
+
+    padded_input_ids = []
+    padded_attention_masks = []
+    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+        seq_len = input_ids.shape[0]
+        if seq_len < target_len:
+            pad_len = target_len - seq_len
+            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
+            attn_mask = torch.cat([attn_mask, torch.zeros(pad_len, dtype=attn_mask.dtype)])
+        elif seq_len > target_len:
+            input_ids = input_ids[:target_len]
+            attn_mask = attn_mask[:target_len]
+        padded_input_ids.append(input_ids)
+        padded_attention_masks.append(attn_mask)
+
+    result: Dict[str, Any] = {
+        "input_ids": torch.stack(padded_input_ids),
+        "attention_mask": torch.stack(padded_attention_masks),
+    }
+
+    def _flatten_pv(per_sample_dict: Dict[int, Any]) -> List[torch.Tensor]:
+        flat: List[torch.Tensor] = []
+        for i in range(len(padded_input_ids)):
+            pv = per_sample_dict.get(i)
+            if pv is None:
+                continue
+            if isinstance(pv, torch.Tensor):
+                if pv.dim() == 4:
+                    for k in range(pv.shape[0]):
+                        flat.append(pv[k])
+                else:
+                    flat.append(pv)
+            else:
+                flat.extend(pv)
+        return flat
+
+    flat_images = _flatten_pv(sample_pixel_values)
+    if flat_images:
+        if all(t.shape == flat_images[0].shape for t in flat_images):
+            result["pixel_values"] = torch.stack(flat_images).to(torch.bfloat16)
+        else:
+            # Variable shapes — extract_feature handles list input.
+            result["pixel_values"] = [t.to(torch.bfloat16) for t in flat_images]
+        result["image_flags"] = torch.ones(len(flat_images), 1, dtype=torch.long)
+
+    flat_video_frames = _flatten_pv(sample_pixel_values_videos)
+    if flat_video_frames:
+        if all(t.shape == flat_video_frames[0].shape for t in flat_video_frames):
+            result["pixel_values_videos"] = torch.stack(flat_video_frames).to(torch.bfloat16)
+        else:
+            result["pixel_values_videos"] = [t.to(torch.bfloat16) for t in flat_video_frames]
+
+    if sample_sound_clips:
+        all_waves_np: List[np.ndarray] = []
+        for i in range(len(padded_input_ids)):
+            clips = sample_sound_clips.get(i)
+            if clips is None:
+                continue
+            wave = clips[0] if isinstance(clips, list) else clips
+            if isinstance(wave, torch.Tensor):
+                wave = wave.cpu().numpy()
+            wave = np.asarray(wave, dtype=np.float32).squeeze()
+            all_waves_np.append(wave)
+        if all_waves_np:
+            fe = getattr(processor, "_sound_feature_extractor", None)
+            if fe is None:
+                from transformers import ParakeetFeatureExtractor
+
+                fe = ParakeetFeatureExtractor(sampling_rate=target_sr, feature_size=128)
+                try:
+                    processor._sound_feature_extractor = fe
+                except Exception:
+                    pass
+            audio_inputs = fe(all_waves_np, sampling_rate=target_sr, return_tensors="pt")
+            result["sound_features"] = audio_inputs["input_features"].to(torch.float32)
+            if "attention_mask" in audio_inputs:
+                result["sound_attention_mask"] = audio_inputs["attention_mask"].to(torch.long)
+
+    labels = build_labels(result["input_ids"], conversations, processor)
+    result["labels"] = labels[:, 1:]
+
+    input_shape = result["input_ids"].shape
+    for key, value in list(result.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            result[key] = value[:, :-1]
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Gemma4 thinking-channel prefix injection
 # ---------------------------------------------------------------------------
@@ -1728,6 +1962,7 @@ COLLATE_FNS = {
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
+    "NemotronH_Nano_Omni_Reasoning_V3Processor": nemotron_omni_collate_fn,
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,
     "default": default_collate_fn,
 }
