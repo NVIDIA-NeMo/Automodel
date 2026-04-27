@@ -312,26 +312,36 @@ to a JSON file with per-sample predictions and NED (Normalized Edit Distance) sc
 ```python
 import torch
 import json
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 from datasets import load_dataset
 from nemo_automodel.components.datasets.vlm.utils import json2token
 
 CKPT = "<checkpoint_dir>/LOWEST_VAL/model/consolidated"
 OUT_JSON = "cordv2_test_results.json"
 
-# Load model and processor
-model = AutoModel.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16)
+# Load processor
+processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
+tokenizer = processor.tokenizer
 
-# Fix RADIO vision encoder's summary_idxs (non-persistent buffer, not in checkpoint)
+# Resolve the trust_remote_code model class via from_config, then load weights.
+# Using AutoModel.from_pretrained directly can mis-route on v3 dumps.
+config = AutoConfig.from_pretrained(CKPT, trust_remote_code=True)
+model_class = type(AutoModel.from_config(config, trust_remote_code=True))
+if not hasattr(model_class, "all_tied_weights_keys"):
+    model_class.all_tied_weights_keys = {}
+model = model_class.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16)
+
+# Reset RADIO's `summary_idxs` (non-persistent buffer; can be a meta tensor after load)
 if hasattr(model, "vision_model") and hasattr(model.vision_model, "radio_model"):
     model.vision_model.radio_model.summary_idxs = None
 
 model = model.cuda().eval()
-processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
-tokenizer = processor.tokenizer
 
 # Load dataset
 dataset = load_dataset("naver-clova-ix/cord-v2")
+
+# v3 processor returns extra placeholder-expansion metadata that is NOT a generate() kwarg.
+PROCESSOR_METADATA_KEYS = ("num_patches", "num_tokens", "imgs_sizes")
 
 # NED metric (0 = perfect match, 1 = completely different)
 def compute_ned(pred, target):
@@ -369,9 +379,8 @@ for i in range(n):
         add_generation_prompt=True, enable_thinking=False
     )
     inputs = processor(text=text, images=[image], return_tensors="pt")
-    for k in ["num_patches"]:
-        if k in inputs:
-            del inputs[k]
+    for k in PROCESSOR_METADATA_KEYS:
+        inputs.pop(k, None)
     inputs = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     with torch.no_grad():
