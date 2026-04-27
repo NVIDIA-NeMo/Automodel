@@ -20,7 +20,7 @@ For other installation options, see our [NeMo AutoModel Installation Guide](../.
 | Microsoft | [Phi-4-multimodal](microsoft/phi4-multimodal.md) | Text · Image · Audio | `Phi4MultimodalForCausalLM` |
 | NVIDIA | [Nemotron-3-Nano-Omni](nvidia/nemotron-omni.md) | Text · Image · Audio | `NemotronH_Nano_Omni_Reasoning_V3` |
 
-## Fine-Tuning
+## Fine-Tune Omni Models
 
 All supported omni models can be fine-tuned using full SFT or PEFT (LoRA) approaches. See the [VLM Fine-Tuning Guide](../../guides/omni/gemma3-3n.md) for general setup instructions.
 
