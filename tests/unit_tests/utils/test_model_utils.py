@@ -353,9 +353,7 @@ def sound_model() -> nn.Module:
 
 def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
     """``freeze_audio_tower=True`` must also freeze NemotronOmni's ``sound_*`` modules."""
-    model_utils.apply_parameter_freezing(
-        sound_model, {"freeze_audio_tower": True, "freeze_vision_tower": False}
-    )
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
 
     assert not _any_requires_grad(sound_model.sound_encoder)
     assert not _any_requires_grad(sound_model.sound_projection)
@@ -364,9 +362,7 @@ def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
 
 def test_freeze_audio_tower_false_keeps_sound_trainable(sound_model):
     """Sound modules stay trainable when audio freeze is off."""
-    model_utils.apply_parameter_freezing(
-        sound_model, {"freeze_audio_tower": False, "freeze_vision_tower": False}
-    )
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
 
     assert _all_requires_grad(sound_model.sound_encoder)
     assert _all_requires_grad(sound_model.sound_projection)

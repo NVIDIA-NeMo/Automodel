@@ -462,10 +462,7 @@ def test_dispatch_table(collate_mod):
 
 def test_nemotron_omni_dispatch_registered(collate_mod):
     """The v3 NemotronOmni processor key must dispatch to its collate fn."""
-    assert (
-        collate_mod.COLLATE_FNS["NemotronH_Nano_Omni_Reasoning_V3Processor"]
-        is collate_mod.nemotron_omni_collate_fn
-    )
+    assert collate_mod.COLLATE_FNS["NemotronH_Nano_Omni_Reasoning_V3Processor"] is collate_mod.nemotron_omni_collate_fn
 
 
 class DummyNemotronOmniProcessor:
@@ -542,9 +539,7 @@ class DummyNemotronOmniImageProcessor(DummyNemotronOmniProcessor):
         ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
         out = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
         if "images" in kwargs:
-            out["pixel_values"] = torch.zeros(
-                len(kwargs["images"]), 3, 4, 4, dtype=torch.float32
-            )
+            out["pixel_values"] = torch.zeros(len(kwargs["images"]), 3, 4, 4, dtype=torch.float32)
         return out
 
 
@@ -554,11 +549,14 @@ def test_nemotron_omni_collate_extracts_images(collate_mod, monkeypatch):
     processor = DummyNemotronOmniImageProcessor()
 
     monkeypatch.setattr(
-        collate_mod, "build_labels",
-        lambda ids, conv, p: torch.zeros_like(ids), raising=True,
+        collate_mod,
+        "build_labels",
+        lambda ids, conv, p: torch.zeros_like(ids),
+        raising=True,
     )
 
     from PIL import Image as PILImage
+
     img = PILImage.new("RGB", (4, 4))
     examples = [
         {
@@ -2089,12 +2087,12 @@ class TestBuildLabelsFromTemplate:
 # ---------------------------------------------------------------------------
 
 # Synthetic token IDs for a Gemma4-style tokenizer.
-_SOT = 2       # <start_of_turn>
+_SOT = 2  # <start_of_turn>
 _USER_TK = 1645  # "user"
 _MODEL_TK = 2516  # "model"
-_NL = 108      # "\n"
-_EOT = 107     # <end_of_turn>
-_U_CONTENT = 506   # "u"
+_NL = 108  # "\n"
+_EOT = 107  # <end_of_turn>
+_U_CONTENT = 506  # "u"
 # sentinel encoded as two distinct ids
 _SEN_A = 999
 _SEN_B = 888

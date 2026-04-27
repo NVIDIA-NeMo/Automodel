@@ -24,7 +24,6 @@ suites — not here.
 
 import pytest
 import torch
-import torch.nn as nn
 
 from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniConfig,
@@ -33,7 +32,6 @@ from nemo_automodel.components.models.nemotron_omni.model import (
     SquaredReLU,
     VisionProjector,
 )
-
 
 # ---------------------------------------------------------------------------
 # Activations / norms

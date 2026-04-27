@@ -27,9 +27,9 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.nemotron_omni.state_dict_adapter import (
-    NemotronOmniStateDictAdapter,
     _VISION_PROJ_CUSTOM_TO_HF,
     _VISION_PROJ_HF_TO_CUSTOM,
+    NemotronOmniStateDictAdapter,
 )
 
 
@@ -47,9 +47,7 @@ def adapter():
     a._llm_adapter = MagicMock()
     a._llm_adapter.from_hf.side_effect = lambda sd, **kwargs: dict(sd)
     a._llm_adapter.to_hf.side_effect = lambda sd, **kwargs: dict(sd)
-    a._llm_adapter.convert_single_tensor_to_hf.side_effect = (
-        lambda fqn, tensor, **kwargs: [(fqn, tensor)]
-    )
+    a._llm_adapter.convert_single_tensor_to_hf.side_effect = lambda fqn, tensor, **kwargs: [(fqn, tensor)]
     return a
 
 
@@ -187,38 +185,28 @@ def test_to_hf_exclude_key_regex(adapter):
 
 
 def test_convert_single_tensor_vision_projector(adapter):
-    pairs = adapter.convert_single_tensor_to_hf(
-        "vision_projector.linear1.weight", torch.zeros(2, 2)
-    )
+    pairs = adapter.convert_single_tensor_to_hf("vision_projector.linear1.weight", torch.zeros(2, 2))
     assert pairs == [("mlp1.1.weight", pairs[0][1])]
 
 
 def test_convert_single_tensor_sound_encoder(adapter):
-    pairs = adapter.convert_single_tensor_to_hf(
-        "sound_encoder.layers.0.weight", torch.zeros(2)
-    )
+    pairs = adapter.convert_single_tensor_to_hf("sound_encoder.layers.0.weight", torch.zeros(2))
     new_fqn, _ = pairs[0]
     assert new_fqn == "sound_encoder.encoder.layers.0.weight"
 
 
 def test_convert_single_tensor_pass_through(adapter):
     """``vision_model.*`` and ``sound_projection.*`` keep their original FQNs."""
-    pairs_v = adapter.convert_single_tensor_to_hf(
-        "vision_model.radio_model.x", torch.zeros(1)
-    )
+    pairs_v = adapter.convert_single_tensor_to_hf("vision_model.radio_model.x", torch.zeros(1))
     assert pairs_v[0][0] == "vision_model.radio_model.x"
 
-    pairs_s = adapter.convert_single_tensor_to_hf(
-        "sound_projection.norm.weight", torch.zeros(1)
-    )
+    pairs_s = adapter.convert_single_tensor_to_hf("sound_projection.norm.weight", torch.zeros(1))
     assert pairs_s[0][0] == "sound_projection.norm.weight"
 
 
 def test_convert_single_tensor_llm_delegates(adapter):
     """LLM keys are stripped, delegated, then re-prefixed."""
-    pairs = adapter.convert_single_tensor_to_hf(
-        "language_model.lm_head.weight", torch.zeros(1)
-    )
+    pairs = adapter.convert_single_tensor_to_hf("language_model.lm_head.weight", torch.zeros(1))
     assert pairs[0][0] == "language_model.lm_head.weight"
     args, _ = adapter._llm_adapter.convert_single_tensor_to_hf.call_args
     assert args[0] == "lm_head.weight"
