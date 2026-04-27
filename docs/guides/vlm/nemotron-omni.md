@@ -98,7 +98,7 @@ Test       : 100 samples
 Ground-truth keys: ['menu', 'sub_total', 'total', 'void_menu']
 ```
 
-### Target format: JSON-to-token conversion
+### Target Format: JSON-to-Token Conversion
 
 NeMo Automodel converts structured JSON into an XML-like **token sequence** using
 the `json2token()` function. This is the format the model is trained to produce:
