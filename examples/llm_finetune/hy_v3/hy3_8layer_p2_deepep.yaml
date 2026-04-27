@@ -1,0 +1,173 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# P2 — DeepEP dispatcher + larger proxy (8 layers) scale-up test for HYV3ForCausalLM.
+#
+# Proxy model (8 layers, same dims as P0/P1) — no checkpoint download required.
+# Replaces the torch dispatcher with deepep to validate the full EP communication
+# path (async_finish=True, communicate-compute overlap).
+#
+# Layer layout:
+#   8 layers / layers_per_stage=2 → 4 virtual stages
+#   4 virtual stages / pp_size=2  → 2 stages per rank  ✓ (interleaved requires >=2)
+#   total GPUs = pp(2) × ep(4) = 8
+#
+# Hardware: 8× GPU (A100 80GB or equivalent) with NVLINK / NVSwitch for DeepEP
+#   automodel examples/llm_finetune/hy_v3/hy3_8layer_p2_deepep.yaml --nproc-per-node 8
+#
+# Expected outcomes:
+#   - Training starts within 3 min (DeepEP kernel compilation on first step)
+#   - Loss at step 200 < loss at step 1
+#   - No NaN / Inf in loss or gradients
+#   - Throughput (tokens/sec) measurably higher than P0 torch dispatcher run
+#   - Memory stable at every step (no OOM growth)
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 4
+  ckpt_every_steps: 999999     # disable checkpoint for P2
+  val_every_steps: 20
+  max_steps: 200
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.PretrainedConfig
+    architectures: [HYV3ForCausalLM]
+    model_type: hy_v3
+    # --- proxy dimensions (same as P0, but 8 layers) ---
+    vocab_size: 120832
+    hidden_size: 2048
+    num_hidden_layers: 8         # 1 dense (layer 0) + 7 MoE
+    num_attention_heads: 16
+    num_key_value_heads: 4
+    head_dim: 128
+    intermediate_size: 4096
+    moe_intermediate_size: 512
+    max_position_embeddings: 2048
+    hidden_act: silu
+    rms_norm_eps: 1.0e-5
+    rope_parameters:
+      rope_theta: 11158840.0
+      rope_type: default
+    # --- MoE topology ---
+    num_experts: 8               # 8 / ep_size=4 = 2 experts per rank
+    num_experts_per_tok: 2
+    num_shared_experts: 1
+    first_k_dense_replace: 1
+    # --- HYV3-specific routing ---
+    moe_router_use_sigmoid: true
+    moe_router_enable_expert_bias: true
+    route_norm: true
+    router_scaling_factor: 2.826
+    qk_norm: true
+    initializer_range: 0.02
+    bos_token_id: 120000
+    eos_token_id: 120025
+    pad_token_id: 120002
+    use_cache: false
+    torch_dtype: bfloat16
+  trust_remote_code: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: deepep            # tests full DeepEP communication path
+    fake_balanced_gate: false     # exercise real sigmoid routing
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: /tmp/checkpoints/hy3_p2/
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 2
+  ep_size: 4
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    # 8 layers / layers_per_stage=2 → 4 virtual stages
+    # 4 virtual stages / pp_size=2  → 2 stages per rank  ✓
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    pretrained_model_name_or_path: tencent/Hy3-preview
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 32
+  tokenizer:
+    pretrained_model_name_or_path: tencent/Hy3-preview
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  batch_size: 4
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.95]
+  eps: 1.0e-7
+  lr: 5.0e-4
+  weight_decay: 0.0
+
+ci:
+  recipe_owner: khazic
+  time: "00:45:00"
