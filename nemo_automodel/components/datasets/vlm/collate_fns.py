@@ -845,6 +845,7 @@ def kimi_k25_vl_collate_fn(
     # Optionally drop overlong samples before processing
     if max_length is not None and drop_overlong:
         conversations, _kept = _drop_overlong_samples(conversations, processor, max_length)
+        examples = [examples[i] for i in _kept]
 
     # Get media token ID
     media_token_id = getattr(processor, "media_placeholder_token_id", None)
@@ -858,6 +859,7 @@ def kimi_k25_vl_collate_fn(
     # Process each sample individually, dropping any that exceed max_length
     # after token expansion.
     kept_conversations = []
+    kept_examples = []
     all_expanded = []
     all_pixel_values = []
     all_grid_thws = []
@@ -909,6 +911,7 @@ def kimi_k25_vl_collate_fn(
                 attention_mask = attention_mask[:max_length]
 
         kept_conversations.append(conversation)
+        kept_examples.append(examples[i])
 
         # Only include image data if all expanded image tokens survived truncation.
         # Partial truncation into image regions would cause a mismatch in the model forward.
@@ -990,6 +993,11 @@ def kimi_k25_vl_collate_fn(
         processor,
     )
     result["labels"] = labels[:, 1:]
+
+    # Mask fake vision tokens for samples that had fake images injected at dataset level.
+    fake_indices = [i for i, ex in enumerate(kept_examples) if ex.get("_injected_fake")]
+    if fake_indices:
+        mask_fake_vision_tokens_batch(result, processor, fake_indices)
 
     # Shift inputs (remove last token for autoregressive training)
     input_shape = result["input_ids"].shape
