@@ -10,7 +10,7 @@ To run omni models with NeMo AutoModel, use NeMo container version [`25.11.00`](
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
-For other installation options, see our [Installation Guide](../../guides/installation.md).
+For other installation options, see our [NeMo AutoModel Installation Guide](../../guides/installation.md).
 
 ## Supported Models
 
