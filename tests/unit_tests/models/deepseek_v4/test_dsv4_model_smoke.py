@@ -23,11 +23,24 @@ Or as a standalone script:
         tests/unit_tests/models/deepseek_v4/test_dsv4_model_smoke.py
 """
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+
+# ``MoE.forward`` (in ``nemo_automodel/components/moe/layers.py``)
+# unconditionally creates a ``torch.cuda.Stream()`` when the model has a
+# shared expert.  On the CPU-only CI image (``L0_Unit_Tests_CPU``) that
+# raises ``AcceleratorError: CUDA driver version is insufficient`` even
+# though the model parameters live on the CPU.  Gate the forward-running
+# smoke tests on CUDA availability — the rest of the file (HC params,
+# weight shapes, attn-sink dtype) is pure metadata and runs everywhere.
+_REQUIRES_CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="MoE.forward unconditionally allocates torch.cuda.Stream() for shared experts",
+)
 
 
 def _tiny_config(**overrides) -> DeepseekV4Config:
@@ -101,6 +114,7 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    @_REQUIRES_CUDA
     def test_forward_shape(self):
         """Forward pass produces logits of the right shape."""
         cfg = _tiny_config()
@@ -115,6 +129,7 @@ class TestDeepseekV4ModelSmoke:
         assert not logits.isnan().any(), "logits contain NaN"
         assert not logits.isinf().any(), "logits contain Inf"
 
+    @_REQUIRES_CUDA
     def test_backward(self):
         """Backward pass produces gradients on all trainable parameters."""
         cfg = _tiny_config()
@@ -198,6 +213,7 @@ class TestDeepseekV4ModelSmoke:
         assert sink.shape == (cfg.num_attention_heads,), f"unexpected shape {sink.shape}"
         assert sink.dtype == torch.float32, f"unexpected dtype {sink.dtype}"
 
+    @_REQUIRES_CUDA
     def test_different_seq_lengths(self):
         """Model runs without error for several sequence lengths."""
         cfg = _tiny_config()
