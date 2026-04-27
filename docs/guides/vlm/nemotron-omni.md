@@ -375,7 +375,7 @@ for i in range(5):
 
 ## Step 5 — Results Comparison
 
-### Evaluation on 5 CORD-v2 validation samples
+### Evaluation on 5 CORD-v2 Validation Samples
 
 #### Full SFT (lr=1e-4, 400 steps, epoch_3_step_399)
 
