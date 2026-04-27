@@ -40,7 +40,7 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 | **Step 1** | Explore the CORD-v2 dataset |
 | **Step 2** | Training configuration (SFT and LoRA) |
 | **Step 3** | Launch fine-tuning |
-| **Step 4** | Evaluate the fine-tuned model |
+| **Step 4** | Run inference on the fine-tuned model |
 | **Step 5** | Compare SFT vs LoRA results |
 
 ## Hardware Requirements
@@ -302,12 +302,10 @@ For LoRA, the checkpoint saves adapter weights instead:
 
 ---
 
-## Step 4 — Evaluate the Fine-Tuned Model
+## Step 4 — Run Inference on the Fine-Tuned Model
 
-### Full test set evaluation
-
-Load the consolidated checkpoint and evaluate on all test samples. Results are saved
-to a JSON file with per-sample predictions and NED (Normalized Edit Distance) scores.
+Load the consolidated checkpoint and run inference on a handful of validation samples
+to spot-check structured output.
 
 ```python
 import torch
@@ -317,7 +315,6 @@ from datasets import load_dataset
 from nemo_automodel.components.datasets.vlm.utils import json2token
 
 CKPT = "<checkpoint_dir>/LOWEST_VAL/model/consolidated"
-OUT_JSON = "cordv2_test_results.json"
 
 # Load processor
 processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
@@ -343,31 +340,9 @@ dataset = load_dataset("naver-clova-ix/cord-v2")
 # v3 processor returns extra placeholder-expansion metadata that is NOT a generate() kwarg.
 PROCESSOR_METADATA_KEYS = ("num_patches", "num_tokens", "imgs_sizes")
 
-# NED metric (0 = perfect match, 1 = completely different)
-def compute_ned(pred, target):
-    m, n = len(pred), len(target)
-    if max(m, n) == 0:
-        return 0.0
-    dp = list(range(n + 1))
-    for i in range(1, m + 1):
-        prev, dp[0] = dp[0], i
-        for j in range(1, n + 1):
-            tmp = dp[j]
-            dp[j] = prev if pred[i - 1] == target[j - 1] else 1 + min(dp[j], dp[j - 1], prev)
-            prev = tmp
-    return dp[n] / max(m, n)
-
-# Evaluate on test set
-samples = dataset["test"]
-n = len(samples)
-total_ned = 0
-exact = 0
-near_perfect = 0
-results = []
-print(f"Evaluating on test set ({n} samples)")
-
-for i in range(n):
-    sample = samples[i]
+# Run inference on the first 5 validation samples
+for i in range(5):
+    sample = dataset["validation"][i]
     image = sample["image"].convert("RGB")
     gt = json.loads(sample["ground_truth"])["gt_parse"]
     gt_text = json2token(gt, sort_json_key=True)
@@ -376,7 +351,7 @@ for i in range(n):
     messages = [{"role": "user", "content": "<image>\nDescribe this image."}]
     text = tokenizer.apply_chat_template(
         messages, tokenize=False,
-        add_generation_prompt=True, enable_thinking=False
+        add_generation_prompt=True, enable_thinking=False,
     )
     inputs = processor(text=text, images=[image], return_tensors="pt")
     for k in PROCESSOR_METADATA_KEYS:
@@ -387,32 +362,12 @@ for i in range(n):
         output_ids = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
 
     generated = tokenizer.decode(
-        output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True,
     ).strip()
 
-    ned = compute_ned(generated, gt_text)
-    total_ned += ned
-    if ned == 0.0: exact += 1
-    if ned < 0.05: near_perfect += 1
-    results.append({"index": i, "ned": ned, "prediction": generated, "ground_truth": gt_text})
-    print(f"  Sample {i:3d}: NED = {ned:.4f}")
-
-avg_ned = total_ned / n
-summary = {
-    "average_ned": avg_ned,
-    "exact_matches": exact,
-    "near_perfect": near_perfect,
-    "total": n,
-    "results": results,
-}
-with open(OUT_JSON, "w") as f:
-    json.dump(summary, f, indent=2)
-
-print(f"\nTest Results:")
-print(f"  Average NED:     {avg_ned:.4f}")
-print(f"  Exact matches:   {exact}/{n} ({exact/n*100:.1f}%)")
-print(f"  Near-perfect:    {near_perfect}/{n} ({near_perfect/n*100:.1f}%)")
-print(f"  Saved to:        {OUT_JSON}")
+    print(f"\n=== Sample {i} ===")
+    print(f"Ground truth: {gt_text}")
+    print(f"Prediction:   {generated}")
 ```
 
 ---
