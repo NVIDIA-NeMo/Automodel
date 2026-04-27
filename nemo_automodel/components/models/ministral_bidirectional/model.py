@@ -25,9 +25,7 @@ class Ministral3BidirectionalConfig(Ministral3Config):
 
     model_type = "ministral3_bidirec"
 
-    def __init__(
-        self, pooling: str = "avg", temperature: float = 1.0, **kwargs
-    ) -> None:
+    def __init__(self, pooling: str = "avg", temperature: float = 1.0, **kwargs) -> None:
         self.pooling = pooling
         self.temperature = temperature
         super().__init__(**kwargs)
@@ -76,12 +74,8 @@ class Ministral3BidirectionalModel(Ministral3Model):
 
         text_cfg = getattr(hub_config, "text_config", None)
         if text_cfg is not None:
-            return cls._from_vlm_checkpoint(
-                pretrained_model_name_or_path, hub_config, **kwargs
-            )
-        return super().from_pretrained(
-            pretrained_model_name_or_path, *model_args, **kwargs
-        )
+            return cls._from_vlm_checkpoint(pretrained_model_name_or_path, hub_config, **kwargs)
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
     @classmethod
     def _from_vlm_checkpoint(cls, model_name_or_path, vlm_config, **kwargs):
@@ -89,11 +83,11 @@ class Ministral3BidirectionalModel(Ministral3Model):
         torch_dtype = kwargs.get("torch_dtype", None)
         attn_implementation = kwargs.get("attn_implementation", None)
 
-        logger.info(
-            f"Loading VLM from {model_name_or_path} to extract language model weights"
-        )
+        logger.info(f"Loading VLM from {model_name_or_path} to extract language model weights")
         vlm = AutoModel.from_pretrained(
-            model_name_or_path, torch_dtype=torch_dtype, trust_remote_code=True,
+            model_name_or_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
         )
         state_dict = vlm.language_model.state_dict()
         del vlm
@@ -106,11 +100,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
         model = cls(text_config)
         model.load_state_dict(state_dict)
         if torch_dtype is not None:
-            dtype = (
-                getattr(torch, torch_dtype)
-                if isinstance(torch_dtype, str)
-                else torch_dtype
-            )
+            dtype = getattr(torch, torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
             model = model.to(dtype)
 
         return model
@@ -132,9 +122,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
         with a bidirectional mask, allowing all tokens to attend to each other.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -143,11 +131,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
             past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length()
-                if past_key_values is not None
-                else 0
-            )
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
