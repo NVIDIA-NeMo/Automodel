@@ -143,7 +143,7 @@ class Ministral3BidirectionalModel(Ministral3Model):
 
         bidirectional_mask = create_bidirectional_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
 
