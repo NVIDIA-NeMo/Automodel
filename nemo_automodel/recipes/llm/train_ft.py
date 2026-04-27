@@ -548,7 +548,7 @@ def build_dataloader(
                     split=cfg_ds.split,
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", None) or 0,
+                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
                     cp_size=cp_size,
                 )
 

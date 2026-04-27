@@ -8,7 +8,7 @@ Covers both full SFT and LoRA PEFT.**
 
 ## What is NemotronOmni?
 
-NemotronOmni (`NemotronH_Nano_VL_V2`) is a ~33B multimodal MoE model supporting
+NemotronOmni (`NemotronH_Nano_Omni_Reasoning_V3`) is a ~33B multimodal MoE model supporting
 image, video, and audio inputs.
 
 Key architectural details:
