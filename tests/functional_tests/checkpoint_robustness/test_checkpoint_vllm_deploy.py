@@ -46,8 +46,12 @@ PROMPTS = [
 
 def _extract_custom_args(argv):
     custom_keys = {
-        "--deploy_model_path", "--tokenizer", "--max_new_tokens",
-        "--adapter_path", "--config_path", "--deploy_mode",
+        "--deploy_model_path",
+        "--tokenizer",
+        "--max_new_tokens",
+        "--adapter_path",
+        "--config_path",
+        "--deploy_mode",
     }
     boolean_keys = {"--vllm_smoke_test", "--trust_remote_code"}
     custom = {}
@@ -111,13 +115,16 @@ def _resolve_args(custom_args):
         tokenizer = model_path
 
     # -- flags --
-    trust_remote_code = custom_args.get("trust_remote_code", False)
-    if not trust_remote_code and model_cfg.get("trust_remote_code"):
-        trust_remote_code = True
+    # trust_remote_code placement varies: top-level `model:` or nested under
+    # `ci.checkpoint_robustness:`. Accept any source that says true.
+    ckpt_robustness_cfg = ci_cfg.get("checkpoint_robustness") or {}
+    trust_remote_code = bool(
+        custom_args.get("trust_remote_code")
+        or model_cfg.get("trust_remote_code")
+        or ckpt_robustness_cfg.get("trust_remote_code")
+    )
 
-    smoke_test = custom_args.get("vllm_smoke_test", False)
-    if not smoke_test and ci_cfg.get("vllm_smoke_test"):
-        smoke_test = True
+    smoke_test = bool(custom_args.get("vllm_smoke_test") or ci_cfg.get("vllm_smoke_test"))
 
     max_new_tokens = int(custom_args.get("max_new_tokens", "20"))
 
@@ -138,7 +145,6 @@ sys.argv = _remaining_argv
 
 def test_vllm_greedy_matches_hf():
     """Load a checkpoint with HF and vLLM, then verify greedy outputs match token-for-token."""
-    pytest.importorskip("vllm")
 
     args = _resolve_args(_custom_args)
     model_path = args["model_path"]

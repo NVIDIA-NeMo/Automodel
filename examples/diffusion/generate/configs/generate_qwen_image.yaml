@@ -1,0 +1,28 @@
+model:
+  pretrained_model_name_or_path: "Qwen/Qwen-Image"
+  checkpoint: null
+  lora_weights: null
+  lora_scale: 1.0
+
+inference:
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  height: 256
+  width: 256
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs: {}
+
+output:
+  output_dir: "./inference_outputs"
+
+distributed: null
+
+vae:
+  enable_slicing: false
+  enable_tiling: false
+  enable_cpu_offload: true
+
+seed: 42

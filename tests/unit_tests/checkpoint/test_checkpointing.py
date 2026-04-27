@@ -28,8 +28,13 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _is_custom_model,
     _model_has_dtensors,
     _reinit_non_persistent_buffers,
+    _summarize_state_dict_key_diff,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.utils import (
+    has_local_tied_lm_head,
+    materialize_missing_tied_lm_head,
+)
 
 
 def _make_keys(count: int) -> list[str]:
@@ -76,6 +81,31 @@ def test_equally_divide_layers_num_shards_one():
 
     assert len(mapping) == len(keys)
     assert set(mapping.values()) == {1}
+
+
+def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
+    summary = _summarize_state_dict_key_diff(
+        {"a.weight", "b.bias", "c.weight"},
+        {"a.weight", "c.weight", "extra.weight"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 1
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["b.bias"]
+    assert summary["unexpected_examples"] == ["extra.weight"]
+
+
+def test_summarize_state_dict_key_diff_limits_examples():
+    summary = _summarize_state_dict_key_diff(
+        {"a", "b", "c", "d"},
+        {"x"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 4
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["a", "b"]
 
 
 # =============================================================================
@@ -134,6 +164,43 @@ class TestGetLmHeadWeightAndName:
 
         assert name == "lm_head.weight"
         assert "_orig_mod" not in name
+
+
+class _PipelineLastStageLikeModel(torch.nn.Module):
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=True)
+        self.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+
+def test_has_local_tied_lm_head_is_false_for_pp_last_stage_like_partition():
+    model = _PipelineLastStageLikeModel()
+
+    assert has_local_tied_lm_head(model) is False
+
+
+def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
+    model = _PipelineLastStageLikeModel()
+    embed_weight = torch.full_like(model.lm_head.weight, 3.0)
+    state_dict = {"model.language_model.embed_tokens.weight": embed_weight}
+
+    materialized = materialize_missing_tied_lm_head(state_dict, model, allow_current_lm_head_fallback=False)
+
+    assert materialized is True
+    assert "lm_head.weight" in state_dict
+    assert torch.equal(state_dict["lm_head.weight"], embed_weight)
+    assert not torch.equal(state_dict["lm_head.weight"], model.lm_head.weight.detach())
+
+
+def test_model_state_keeps_pp_last_stage_lm_head_in_saved_state_dict():
+    model = _PipelineLastStageLikeModel()
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert "lm_head.weight" in saved_state_dict
 
 
 # =============================================================================
@@ -801,3 +868,137 @@ class TestCheckpointerSaveModelDiffusersRename:
 
         assert (consolidated_dir / "model.safetensors.index.json").exists()
         assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+
+# =============================================================================
+# Tests for _get_storage_reader: is_init_step uses backport, not upstream HF reader
+# =============================================================================
+
+
+class TestGetStorageReaderInitStep:
+    """``_get_storage_reader`` must prefer the in-tree backport when ``is_init_step=True``.
+
+    The upstream ``HuggingFaceStorageReader`` (in ``torch.distributed.checkpoint.hf_storage``)
+    delegates dtype decoding to ``safetensors.torch._TYPES``, which does not
+    yet recognise the FP8 scale dtypes (``F8_E5M2``/``F8_E8M0``) emitted by
+    quantised HF checkpoints such as DSV4.  For base-model HF loads
+    (``is_init_step=True``) we must therefore use the in-tree backport whose
+    ``DTYPE_MAP`` was extended for those dtypes.  Mid-training DCP loads
+    (``is_init_step=False`` and no key remap) may still use the faster upstream
+    reader.
+    """
+
+    def _make_checkpointer(self):
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            Checkpointer,
+            CheckpointingConfig,
+        )
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_init_step_returns_backport_reader_not_upstream(self):
+        """is_init_step=True with no key_mapping should still go through the in-tree backport."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=True)
+
+        # Upstream reader must NOT be constructed for init-step base-model loads
+        upstream_marker.assert_not_called()
+        # Backport reader must be constructed instead
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=None)
+        assert reader is backport_marker.return_value
+
+    def test_non_init_step_no_keymap_uses_upstream(self):
+        """For mid-training safetensors loads (is_init_step=False, no key_mapping),
+        the faster upstream reader is preferred."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
+
+        upstream_marker.assert_called_once_with(path="/fake/path")
+        backport_marker.assert_not_called()
+        assert reader is upstream_marker.return_value
+
+    def test_keymap_always_uses_backport(self):
+        """When a key_mapping is supplied, the backport reader is always used (regardless of is_init_step)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=False)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
+
+    def test_init_step_with_keymap_uses_backport(self):
+        """is_init_step=True + key_mapping must also use the backport (only one path remains)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=True)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value

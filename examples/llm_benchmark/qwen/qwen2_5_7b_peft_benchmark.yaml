@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# QLora configuration for Llama-3.1-8B on SQuAD dataset
-# Uses 4-bit quantization with LoRA adapters
+# Benchmark configuration for Qwen2.5-7B with LoRA
 #
 # To run this recipe:
-#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_peft_benchmark.yaml --nproc-per-node 8
+#   automodel examples/llm_finetune/qwen/qwen2_5_7b_peft_benchmark.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
-seed: 42
+seed: 1111
 
-# NEW: Add benchmark section
+# Benchmark section
 benchmark:
   warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
@@ -45,20 +44,21 @@ dist_env:
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 42
+  seed: 1111
   ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
+  torch_dtype: bf16
   force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
-  dropout: 0.1
+  dropout: 0.0
   use_triton: true
 
 distributed:
@@ -85,15 +85,6 @@ dataloader:
   batch_size: null  # Dataset already yields batches
   # Note: model_config will be auto-injected by train_ft.py for PP models
 
-# validation_dataset:
-#   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-#   path_or_dataset_id: Muennighoff/natural-instructions
-#   split: validation
-#   column_mapping:
-#     instruction: definition
-#     question: inputs
-#     answer: targets
-
 optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.999]
@@ -105,7 +96,7 @@ optimizer:
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
-#   name: llama3_1_8b_squad_qlora
+#   name: qwen2_5_7b_peft_benchmark
 #   save_dir: <your_wandb_save_dir>
 
 ci:

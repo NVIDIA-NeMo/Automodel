@@ -1,0 +1,33 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+ARG VLLM_IMAGE=nvcr.io/nvidia/vllm:25.12-py3
+FROM ${VLLM_IMAGE} AS deploy
+
+# Build mamba-ssm and causal-conv1d from source against the container's torch
+ENV MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE
+RUN pip install --no-build-isolation --no-binary=mamba-ssm,causal-conv1d \
+    mamba-ssm causal-conv1d
+
+# Test dependencies
+RUN pip install peft pytest pyyaml
+
+COPY . /opt/Automodel
+WORKDIR /opt/Automodel
+
+ARG NVIDIA_BUILD_ID
+ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
+LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
+ARG NVIDIA_BUILD_REF
+LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"

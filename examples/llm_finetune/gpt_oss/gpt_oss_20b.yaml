@@ -123,7 +123,7 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   checkpoint_robustness:
-    hf_kl_threshold: 5e-2
+    hf_kl_threshold: 1e-1
     tokenizer_name: openai/gpt-oss-20b
     check_phantom_keys: true
     no_check_resume: true

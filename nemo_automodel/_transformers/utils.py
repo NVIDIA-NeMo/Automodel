@@ -225,8 +225,17 @@ def apply_cache_compatibility_patches():
                 source = _find_embedding_source(self)
                 if source is None:
                     raise ValueError("Could not find the source of the embedding layer")
-                self._nemo_tied_weights_keys = {k: source for k in tied}
-                self._tied_weights_keys = {}
+                tied_dict = {k: source for k in tied}
+                self._nemo_tied_weights_keys = tied_dict
+                # Keep the v5 dict form on the model so that any downstream HF
+                # code path (e.g. vanilla ``AutoModelForCausalLM.from_pretrained``
+                # used by the checkpoint-robustness test) ties the weights via
+                # HF's own ``tie_weights`` and does not leave the tied sibling
+                # (``lm_head.weight``) zero-initialised — which would cause
+                # NaN logits for tied-embedding remote-code models like
+                # Nemotron-Flash-1B whose forward does
+                # ``logits / lm_head.weight.norm()``.
+                self._tied_weights_keys = tied_dict
             # call orig post init
             _orig_post_init(self)
 
@@ -235,6 +244,10 @@ def apply_cache_compatibility_patches():
 
     _patch_phi4mm_processor()
     _patch_peft_prepare_inputs()
+
+    from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+    _patch_legacy_flash_attn_flag()
 
 
 def _patch_phi4mm_processor():

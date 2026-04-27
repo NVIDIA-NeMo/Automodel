@@ -1,14 +1,16 @@
-# Based on your existing config, modified for benchmarking
+# Custom Qwen2.5-72B with combined projections for benchmarking
+# Based on Qwen2_72B_peft_benchmark.yaml but using custom model implementation
+# Similar to custom_llama3_3_70b_instruct_peft_benchmark.yaml
 
 # To run this recipe:
-#   automodel examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml --nproc-per-node 8
+#   automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark_2nodes.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42
 
-# NEW: Add benchmark section
+# Benchmark section
 benchmark:
   warmup_steps: 5
   peak_tflops: 989  # H100: 989, A100: 312
@@ -35,12 +37,12 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
+  pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   use_triton: True
@@ -58,9 +60,9 @@ distributed:
   cp_size: 1
   pp_size: 1
 
-  sequence_parallel: true
+  sequence_parallel: false
   activation_checkpointing: true
-  enable_async_tensor_parallel: true
+  enable_async_tensor_parallel: false
   enable_fsdp2_prefetch: true
   enable_compile: true
   defer_fsdp_grad_sync: false
@@ -93,5 +95,5 @@ lr_scheduler:
 
 ci:
   recipe_owner: ZhiyuLi-Nvidia
-  time: "00:15:00"
   nodes: 2
+  time: "00:20:00"

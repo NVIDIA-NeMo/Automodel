@@ -22,9 +22,6 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0"
 
 cd /opt/Automodel
-uv venv /tmp/vllm_deploy_venv
-source /tmp/vllm_deploy_venv/bin/activate
-uv pip install --no-config -r tests/ci_tests/requirements_deploy.txt
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
 FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"
@@ -40,13 +37,13 @@ fi
 echo "Using checkpoint: ${CKPT_BASE}"
 
 if [[ "$CI_JOB_STAGE" == *"peft"* ]]; then
-    python -m pytest $TEST_SCRIPT \
+    python -m pytest --tb=short $TEST_SCRIPT \
         --deploy_mode peft \
         --config_path "$CONFIG_PATH" \
         --adapter_path "${CKPT_BASE}/model/" \
         --max_new_tokens 50
 else
-    python -m pytest $TEST_SCRIPT \
+    python -m pytest --tb=short $TEST_SCRIPT \
         --deploy_mode sft \
         --config_path "$CONFIG_PATH" \
         --deploy_model_path "${CKPT_BASE}/model/consolidated/" \

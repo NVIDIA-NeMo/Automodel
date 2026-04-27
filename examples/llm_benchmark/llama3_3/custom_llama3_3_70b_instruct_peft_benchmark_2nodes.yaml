@@ -1,7 +1,7 @@
 # Based on your existing config, modified for benchmarking
 
 # To run this recipe:
-#   automodel examples/llm_finetune/llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml --nproc-per-node 8
+#   automodel examples/llm_finetune/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -15,18 +15,18 @@ benchmark:
   nsys_start: -1    # Set to step number to profile (e.g., 10)
   nsys_end: -1      # Set to end step (e.g., 15)
   nsys_ranks: []    # e.g., [0] to profile rank 0
-  num_nodes: 1
+  num_nodes: 2
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 1
+  local_batch_size: 2
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -37,12 +37,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.3-70B-Instruct
   torch_dtype: bf16
-  trust_remote_code: true
-  force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   use_triton: True
@@ -55,14 +53,18 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  dp_size: none
-  tp_size: 8
+  dp_size: null
+  tp_size: 2
   cp_size: 1
   pp_size: 1
 
-  sequence_parallel: false
-  activation_checkpointing: false
-
+  sequence_parallel: true
+  activation_checkpointing: true
+  enable_async_tensor_parallel: true
+  enable_fsdp2_prefetch: true
+  enable_compile: true
+  defer_fsdp_grad_sync: false
+  patch_is_packed_sequence: true  # Patch transformers._is_packed_sequence to always return False: removes CPU-GPU sync per attention layer and ensures static shapes for torch.compile. Safe for non-packed (standard) training only.
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -77,7 +79,6 @@ dataset:
 dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: null  # Dataset already yields batches
-  # Note: model_config will be auto-injected by train_ft.py for PP models
 
 optimizer:
   _target_: torch.optim.Adam
@@ -92,4 +93,5 @@ lr_scheduler:
 
 ci:
   recipe_owner: ZhiyuLi-Nvidia
-  time: "00:30:00"
+  time: "00:15:00"
+  nodes: 2

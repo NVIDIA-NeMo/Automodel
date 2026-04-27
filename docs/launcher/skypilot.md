@@ -1,6 +1,6 @@
-# Run on Any Cloud with SkyPilot
+# Run with SkyPilot
 
-In this guide, you will learn how to launch NeMo AutoModel training jobs on any major cloud provider (AWS, GCP, Azure, Lambda, Kubernetes) using [SkyPilot](https://skypilot.readthedocs.io). For on-premises cluster usage, see [Run on a Cluster (Slurm)](./slurm.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
+In this guide, you will learn how to launch NeMo AutoModel training jobs with [SkyPilot](https://docs.skypilot.co/en/stable/docs/). SkyPilot can target public clouds such as AWS, GCP, Azure, and Lambda, and it can also submit jobs to Kubernetes clusters. For a beginner-friendly Kubernetes walkthrough, see [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md). For on-premises cluster usage without SkyPilot, see [Run on a Cluster (Slurm)](./slurm.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
 
 SkyPilot is an open-source framework that abstracts cloud infrastructure so you can train on whichever cloud is cheapest or most available at launch time — including automatic spot-instance handling for significant cost savings.
 
@@ -8,17 +8,17 @@ SkyPilot is an open-source framework that abstracts cloud infrastructure so you 
 
 Complete the following setup steps before launching your first AutoModel job on a cloud provider.
 
-1. **Install SkyPilot** with the connector for your target cloud:
+1. **Install SkyPilot** with the connector for your target infrastructure:
 
 ```bash
-pip install "skypilot[gcp]"      # Google Cloud
-pip install "skypilot[aws]"      # Amazon Web Services
-pip install "skypilot[azure]"    # Microsoft Azure
-pip install "skypilot[lambda]"   # Lambda Cloud
-pip install "skypilot[kubernetes]"  # Any Kubernetes cluster
+uv pip install "skypilot[gcp]"         # Google Cloud
+uv pip install "skypilot[aws]"         # Amazon Web Services
+uv pip install "skypilot[azure]"       # Microsoft Azure
+uv pip install "skypilot[lambda]"      # Lambda Cloud
+uv pip install "skypilot[kubernetes]"  # Any Kubernetes cluster
 ```
 
-2. **Configure your cloud credentials** by following the SkyPilot credential setup guide for your cloud, then verify:
+2. **Configure access** for your target infrastructure, then verify:
 
 ```bash
 sky check
@@ -38,7 +38,7 @@ export WANDB_API_KEY=...        # Optional: Weights & Biases logging
 Add a `skypilot:` section to any existing config YAML, then run the same `automodel` command you already know:
 
 ```bash
-automodel finetune llm -c your_config_with_skypilot.yaml
+automodel your_config_with_skypilot.yaml
 ```
 
 The CLI detects the `skypilot:` key, strips it from the training config, uploads the code and config to a cloud VM, and launches training — all in one command.
@@ -118,7 +118,7 @@ skypilot:
   hf_token: ${HF_TOKEN}
 ```
 
-### GCP — spot V100, 8 GPUs (single node)
+### GCP — Spot V100, 8 GPUs (Single Node)
 
 ```yaml
 skypilot:
@@ -130,7 +130,7 @@ skypilot:
   hf_token: ${HF_TOKEN}
 ```
 
-### Multi-node distributed training (2 × 8 × A100)
+### Multi-Node Distributed Training (2 x 8 x A100)
 
 ```yaml
 skypilot:
@@ -142,7 +142,7 @@ skypilot:
   hf_token: ${HF_TOKEN}
 ```
 
-For multi-node jobs the launcher automatically adds the SkyPilot rendezvous environment variables (`$SKYPILOT_NODE_RANK`, `$SKYPILOT_NUM_NODES`, `$SKYPILOT_NODE_IPS`) to the `torchrun` command.
+For multi-node jobs, the launcher automatically adds the SkyPilot rendezvous environment variables (`$SKYPILOT_NODE_RANK`, `$SKYPILOT_NUM_NODES`, `$SKYPILOT_NODE_IPS`) to the `torchrun` command.
 
 ## Monitor and Manage Jobs
 
@@ -172,9 +172,18 @@ sky down <cluster_name>       # Terminate the cluster and stop billing
 Override any training parameter from the command line, same as with local runs:
 
 ```bash
-automodel finetune llm -c config_with_skypilot.yaml \
+automodel config_with_skypilot.yaml \
   --model.pretrained_model_name_or_path meta-llama/Llama-3.2-3B
 ```
+
+## Kubernetes Users
+
+If you want to run on a Kubernetes cluster, use `cloud: kubernetes` and follow the dedicated [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md). That guide includes:
+
+- a copy-paste single-node config
+- a two-node example
+- sample `sky` and `kubectl` output to help you sanity-check your setup
+- a short troubleshooting section for common first-run issues
 
 ## When to Use SkyPilot vs. Slurm
 

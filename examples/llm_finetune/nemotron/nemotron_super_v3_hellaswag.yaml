@@ -103,7 +103,8 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   recipe_owner: adil-a
-  time: "00:15:00"
+  time: "00:25:00"
+  known_issue_id: AM-156
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     experts_implementation: grouped_mm
@@ -111,5 +112,6 @@ ci:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
     hf_device_map_auto: true
     no_check_resume: true
+    step_scheduler.global_batch_size: 64
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500

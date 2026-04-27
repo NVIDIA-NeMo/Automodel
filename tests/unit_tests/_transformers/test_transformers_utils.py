@@ -389,7 +389,7 @@ class TestApplyCacheCompatibilityPatchesIntegration:
         assert isinstance(tied, dict)
         assert "lm_head.weight" in tied
         assert tied["lm_head.weight"] == "model.embed_tokens.weight"
-        assert model._tied_weights_keys == {}
+        assert model._tied_weights_keys == tied
 
     def test_tied_weights_keys_patch_converts_any_model(self):
         """The post_init patch should convert _tied_weights_keys for any model, not just phi4mm."""
@@ -418,7 +418,40 @@ class TestApplyCacheCompatibilityPatchesIntegration:
         assert isinstance(tied, dict)
         assert "lm_head.weight" in model._nemo_tied_weights_keys
         assert tied["lm_head.weight"] == "model.embed_tokens.weight"
-        assert model._tied_weights_keys == {}
+        assert model._tied_weights_keys == tied
+
+    def test_tied_weights_keys_patch_resolves_top_level_embed_tokens(self):
+        """The post_init patch resolves embed_tokens at the top level via get_input_embeddings."""
+        apply_cache_compatibility_patches()
+        import torch.nn as nn
+        from transformers import PretrainedConfig
+        from transformers.modeling_utils import PreTrainedModel
+
+        class _MockConfig(PretrainedConfig):
+            model_type = "nemotron_flash"
+
+        class _Model(PreTrainedModel):
+            config_class = _MockConfig
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.embed_tokens = nn.Embedding(100, 16)
+                self.lm_head = nn.Linear(16, 100, bias=False)
+                self._tied_weights_keys = ["lm_head.weight"]
+                self.post_init()
+
+            def get_input_embeddings(self):
+                return self.embed_tokens
+
+            def forward(self, x):
+                return self.lm_head(self.embed_tokens(x))
+
+        model = _Model(_MockConfig())
+        assert isinstance(model._tied_weights_keys, dict)
+        assert "lm_head.weight" in model._tied_weights_keys
+        assert model._tied_weights_keys["lm_head.weight"] == "embed_tokens.weight"
+        assert isinstance(model._nemo_tied_weights_keys, dict)
+        assert model._nemo_tied_weights_keys["lm_head.weight"] == "embed_tokens.weight"
 
     def test_patches_peft_prepare_inputs(self):
         """PeftModelForCausalLM.__init__ should be patched for missing prepare_inputs_for_generation."""
