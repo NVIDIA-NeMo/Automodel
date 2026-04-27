@@ -1316,6 +1316,95 @@ def test_kimi_k25_vl_collate_fn_labels_shifted(collate_mod, monkeypatch):
     assert batch["labels"].shape[1] == 4  # 5 - 1 = 4
 
 
+def test_kimi_k25_vl_collate_fn_fake_image_mask(collate_mod, monkeypatch):
+    """mask_fake_vision_tokens_batch must be called with the injected sample index."""
+    media_token_id = 163605
+
+    class FakeImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = media_token_id
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            input_ids = torch.tensor([[1, media_token_id, media_token_id, 2]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = FakeImageProcessor()
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda ids, convs, proc: torch.full_like(ids, -100),
+        raising=True,
+    )
+
+    mask_calls = []
+
+    def fake_mask(batch, proc, sample_indices):
+        mask_calls.append(list(sample_indices))
+
+    monkeypatch.setattr(collate_mod, "mask_fake_vision_tokens_batch", fake_mask, raising=True)
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+    examples = [{"conversation": conversation, "_injected_fake": True}]
+
+    collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert len(mask_calls) == 1, "mask_fake_vision_tokens_batch should be called once"
+    assert mask_calls[0] == [0], "injected sample is at batch index 0"
+
+
+def test_kimi_k25_vl_collate_fn_non_fake_not_masked(collate_mod, monkeypatch):
+    """mask_fake_vision_tokens_batch must NOT be called for non-injected samples."""
+    media_token_id = 163605
+
+    class RealImageProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = media_token_id
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, **kwargs):
+            input_ids = torch.tensor([[1, media_token_id, 2]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = RealImageProcessor()
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda ids, convs, proc: torch.full_like(ids, -100),
+        raising=True,
+    )
+
+    mask_calls = []
+    monkeypatch.setattr(
+        collate_mod,
+        "mask_fake_vision_tokens_batch",
+        lambda batch, proc, indices: mask_calls.append(indices),
+        raising=True,
+    )
+
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+    # _injected_fake is NOT set
+    examples = [{"conversation": conversation}]
+
+    collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert len(mask_calls) == 0, "mask_fake_vision_tokens_batch should not be called for non-injected samples"
+
+
 # =============================================================================
 # Tests for _ensure_rgb
 # =============================================================================
@@ -1966,12 +2055,12 @@ class TestBuildLabelsFromTemplate:
 # ---------------------------------------------------------------------------
 
 # Synthetic token IDs for a Gemma4-style tokenizer.
-_SOT = 2       # <start_of_turn>
+_SOT = 2  # <start_of_turn>
 _USER_TK = 1645  # "user"
 _MODEL_TK = 2516  # "model"
-_NL = 108      # "\n"
-_EOT = 107     # <end_of_turn>
-_U_CONTENT = 506   # "u"
+_NL = 108  # "\n"
+_EOT = 107  # <end_of_turn>
+_U_CONTENT = 506  # "u"
 # sentinel encoded as two distinct ids
 _SEN_A = 999
 _SEN_B = 888
