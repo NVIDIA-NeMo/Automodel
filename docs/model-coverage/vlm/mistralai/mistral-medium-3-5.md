@@ -1,0 +1,158 @@
+# Mistral Medium 3.5
+
+[Mistral Medium 3.5](https://huggingface.co/mistralai) is Mistral AI's
+flagship **128B dense** model that merges instruction-following, reasoning,
+and coding into a single checkpoint with a configurable reasoning mode.
+It unifies the lineage of *Mistral Medium 3.1*, *Magistral Medium*, and
+*Devstral 2* into one model, and ships natively in FP8 (per-tensor
+`weight_scale_inv`) so the full model fits inside an H200 node or 2 ×
+H100 nodes — a notable footprint advantage over comparably-capable
+Mixture-of-Experts (MoE) systems.
+
+:::{card}
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `Mistral3ForConditionalGeneration` (Pixtral vision tower + dense Ministral-3 text decoder) |
+| **Parameters** | 128B (dense, FP8 on disk) |
+| **Context Window** | 256k tokens |
+| **Languages** | 40+ (English, French, Spanish, German, Russian, Chinese, Japanese, Italian, Portuguese, Arabic, Hindi, Korean, plus Indic / Nordic / Eastern European tail) |
+| **License** | Modified MIT (open-weights, ≤ $20M annual revenue threshold) |
+| **HF Org** | [mistralai](https://huggingface.co/mistralai) |
+:::
+
+## Architecture
+
+Mistral Medium 3.5 is a **dense** transformer — no MoE routing — built on
+the same text backbone as
+[`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512):
+88 Ministral-3 decoder layers (hidden 12288, 96 attention heads,
+8 KV heads, GQA) with the standard llama-style RoPE + RMSNorm + SwiGLU
+MLP layout. The multimodal variant adds a Pixtral vision tower and
+multi-modal projector on top, making it an
+`AutoModelForImageTextToText` checkpoint.
+
+Compared with MoE models of similar capability, the dense layout
+trades sparse-activation throughput for a substantially smaller
+deployment footprint — relevant when you want to fine-tune or serve
+the model on a single node.
+
+## Key Strengths
+
+- **Compactness.** Dense 128B fits in fewer GPUs than the comparable
+  MoE class — a single H200 node or 2 × H100 nodes for inference.
+- **Configurable reasoning mode.** One checkpoint covers chat,
+  agentic, and reasoning workloads; the reasoning mode is toggled at
+  inference time.
+- **Strong agentic performance.** Competitive on tool-use and
+  decision-making benchmarks; suitable as a base for connector-driven
+  agent workflows.
+- **Long context.** 256k-token window for document parsing and
+  research-assistant use cases.
+
+Trade-offs disclosed in the model card: weaker non-agentic benchmark
+performance and more verbose outputs than some closed-source
+competitors.
+
+## Use Cases
+
+- Agentic workflows with connectors
+- Cloud and local async coding
+- Document parsing (multimodal — text + image)
+- Research assistants
+- General chat
+- Base model for downstream fine-tuning
+
+## Available Models
+
+- **Mistral-Medium-3.5 128B**
+
+## Class
+
+- HF: `Mistral3ForConditionalGeneration`
+- NeMo AutoModel custom: `Mistral3FP8VLMForConditionalGeneration`
+  ([source](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/mistral3_vlm/model.py))
+
+The custom class extends HF's `Mistral3ForConditionalGeneration` and
+attaches a `Mistral3FP8StateDictAdapter.for_vlm_full()` so the FP8
+checkpoint dequantizes per-shard inside the standard DCP load — the
+full BF16 model is never materialized on a single rank, allowing TP+PP
+training to fit on H100-80GB.
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Mistral Medium 3.5 128B | [`mistralai/Mistral-Medium-3.5`](https://huggingface.co/mistralai) |
+
+## Example Recipes
+
+| Recipe | Dataset | Description |
+|---|---|---|
+| {download}`mistral3p5_128b_medpix.yaml <../../../../examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml>` | MedPix-VQA | SFT — Mistral Medium 3.5 128B on MedPix, 8 nodes × 8 GPUs (TP=8 PP=8) |
+
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](../../../guides/installation.md)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+:::{note}
+This recipe was validated on **8 nodes × 8 GPUs (64 H100s)** with
+TP=8 PP=8 DP=1. See the [Launcher Guide](../../../launcher/slurm.md)
+for multi-node setup. Inference / single-node fine-tune fits in
+**1 × H200** or **2 × H100** nodes thanks to the dense + FP8 layout.
+:::
+
+**3. Run the recipe** via Slurm (see the
+[fine-tuning guide](../../../guides/vlm/mistral-medium-3-5.md) for a
+complete launch script):
+
+```bash
+sbatch your_slurm_script.sub
+```
+
+:::{dropdown} Run with Docker
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml
+```
+:::
+
+See the [Installation Guide](../../../guides/installation.md) and the
+[Mistral Medium 3.5 Fine-Tuning Guide](../../../guides/vlm/mistral-medium-3-5.md).
+
+## Fine-Tuning
+
+See the [Mistral Medium 3.5 Fine-Tuning Guide](../../../guides/vlm/mistral-medium-3-5.md).
+
+## Hugging Face Model Cards
+
+- [mistralai](https://huggingface.co/mistralai)
+- Related architecture: [`mistralai/Devstral-2-123B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)
