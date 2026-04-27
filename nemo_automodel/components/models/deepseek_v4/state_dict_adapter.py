@@ -44,7 +44,9 @@ Both suffixes are handled by the dequantization step.
 from __future__ import annotations
 
 import enum
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -62,10 +64,10 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
-    get_expert_slice_for_rank,
     get_submesh,
     is_dtensor,
     should_load_expert_for_rank,
+    split_experts_weights_dtensor_aware,
 )
 
 # V4 Flash routed-expert weights are stored as FP4 (e2m1fn) packed two values per
@@ -191,6 +193,13 @@ class _HashBiasScope(enum.Enum):
     HF = re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$")
 
 
+class _ExpertQuantLayout(enum.Enum):
+    """On-disk routed-expert quantization layout for DeepSeek V4 checkpoints."""
+
+    FP4 = "fp4"
+    FP8 = "fp8"
+
+
 def _rename_hf_key(key: str) -> str:
     """Apply simple rename rules; returns the key unchanged if no rule matches."""
     for pattern, replacement in _HF_TO_INTERNAL_RENAMES:
@@ -214,6 +223,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
+        self._checkpoint_expert_quant_layout_cache: _ExpertQuantLayout | None = None
 
     # ------------------------------------------------------------------
     # from_hf
@@ -256,7 +266,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             if scale_key is not None:
                 scale = state_dict[scale_key]
                 if self._is_expert_weight_key(key):
-                    state_dict[key] = self._dequantize_expert_fp4(weight, scale, self.dtype)
+                    state_dict[key] = self._dequantize_expert_weight(key, weight, scale)
                 else:
                     state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
                 scale_keys_to_remove.append(scale_key)
@@ -539,15 +549,20 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 if key.endswith(".weight") and not self._is_non_quantized(key):
                     base = key[: -len(".weight")]
                     if self._is_expert_weight_key(key):
-                        # V4 Flash routed experts are stored as FP4 e2m1 packed two
-                        # values per int8 byte, with per-row / 32-col e8m0 scales.
-                        # DCP validates shape + dtype against the checkpoint BEFORE
-                        # dequantization happens, so the placeholders must match the
-                        # on-disk layout exactly.  We emit empty tensors (content is
-                        # overwritten by dcp.load) with the packed shape/dtype.
-                        int8_val, e8m0_scale = self._build_fp4_expert_placeholders(value)
-                        quantized.append((key, int8_val))
-                        quantized.append((base + ".scale", e8m0_scale))
+                        if self._checkpoint_expert_quant_layout() is _ExpertQuantLayout.FP8:
+                            fp8_val, scale = self._build_fp8_expert_placeholders(value)
+                            quantized.append((key, fp8_val))
+                            quantized.append((base + ".scale", scale))
+                        else:
+                            # V4 Flash routed experts are stored as FP4 e2m1 packed two
+                            # values per int8 byte, with per-row / 32-col e8m0 scales.
+                            # DCP validates shape + dtype against the checkpoint BEFORE
+                            # dequantization happens, so the placeholders must match the
+                            # on-disk layout exactly.  We emit empty tensors (content is
+                            # overwritten by dcp.load) with the packed shape/dtype.
+                            int8_val, e8m0_scale = self._build_fp4_expert_placeholders(value)
+                            quantized.append((key, int8_val))
+                            quantized.append((base + ".scale", e8m0_scale))
                         continue
                     if is_dtensor(value):
                         # Preserve DTensor structure so DCP knows the global shape
@@ -555,11 +570,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                         # only the local shard to a plain tensor strips the mesh /
                         # placement metadata and causes a shape mismatch (e.g.
                         # local [128, 4096] vs checkpoint global [512, 4096]).
-                        local_fp8 = value.to_local().to(torch.float8_e4m3fn)
+                        local = value.to_local()
+                        local_fp8 = self._empty_or_cast_fp8(local)
                         fp8_val = DTensor.from_local(local_fp8, value.device_mesh, value.placements)
                     else:
-                        fp8_val = value.cpu().to(torch.float8_e4m3fn)
-                    scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
+                        fp8_val = self._empty_or_cast_fp8(value)
+                    scale = self._build_fp8_global_scale_placeholder(value)
                     quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
                 else:
@@ -599,6 +615,49 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         packed = torch.empty(*value.shape[:-1], in_dim // 2, dtype=torch.int8)
         scale = torch.empty(*value.shape[:-1], in_dim // FP4_COL_BLOCK, dtype=torch.float8_e8m0fnu)
         return packed, scale
+
+    @staticmethod
+    def _build_fp8_expert_placeholders(value: Any) -> tuple[Any, Any]:
+        """Return placeholders for the DeepSeek V4 Base routed-expert FP8 layout."""
+        if is_dtensor(value):
+            local_fp8 = DeepSeekV4StateDictAdapter._empty_or_cast_fp8(value.to_local())
+            fp8_val = DTensor.from_local(local_fp8, value.device_mesh, value.placements)
+        else:
+            fp8_val = DeepSeekV4StateDictAdapter._empty_or_cast_fp8(value)
+
+        scale = DeepSeekV4StateDictAdapter._build_fp8_dtensor_scale_placeholder(value)
+        return fp8_val, scale
+
+    @staticmethod
+    def _build_fp8_global_scale_placeholder(value: Any) -> torch.Tensor:
+        if is_dtensor(value):
+            local = value.to_local()
+            return torch.ones(
+                DeepSeekV4StateDictAdapter._scale_shape_from_shape(value.shape),
+                dtype=torch.float32,
+                device=local.device,
+            )
+
+        return torch.ones(DeepSeekV4StateDictAdapter._scale_shape_from_shape(value.shape), dtype=torch.float32)
+
+    @staticmethod
+    def _build_fp8_dtensor_scale_placeholder(value: Any) -> Any:
+        if is_dtensor(value):
+            local = value.to_local()
+            scale_local = torch.ones(
+                DeepSeekV4StateDictAdapter._scale_shape_from_shape(local.shape),
+                dtype=torch.float32,
+                device=local.device,
+            )
+            return DTensor.from_local(scale_local, value.device_mesh, value.placements)
+
+        return DeepSeekV4StateDictAdapter._build_fp8_global_scale_placeholder(value)
+
+    @staticmethod
+    def _empty_or_cast_fp8(value: torch.Tensor) -> torch.Tensor:
+        if value.is_meta:
+            return torch.empty(tuple(value.shape), dtype=torch.float8_e4m3fn, device=value.device)
+        return value.to(torch.float8_e4m3fn)
 
     _NON_QUANTIZED_PATTERNS = [
         "attn_norm.weight",
@@ -642,7 +701,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return "ffn.experts." in key
 
     def _scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
-        r, c = weight.shape
+        return self._scale_shape_from_shape(weight.shape)
+
+    @staticmethod
+    def _scale_shape_from_shape(shape: torch.Size | tuple[int, ...]) -> tuple[int, int]:
+        r, c = shape
         return ((r + BLOCK_SIZE - 1) // BLOCK_SIZE, (c + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
     def _expert_scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
@@ -654,6 +717,69 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """
         r, c = weight.shape
         return (r, (c + FP4_COL_BLOCK - 1) // FP4_COL_BLOCK)
+
+    def _dequantize_expert_weight(self, key: str, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        layout = self._expert_quant_layout_from_tensors(weight, scale)
+        if layout is _ExpertQuantLayout.FP4:
+            return self._dequantize_expert_fp4(weight, scale, self.dtype)
+        return dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
+
+    def _expert_quant_layout_from_tensors(self, weight: torch.Tensor, scale: torch.Tensor) -> _ExpertQuantLayout:
+        weight_local = weight.to_local() if is_dtensor(weight) else weight
+        scale_local = scale.to_local() if is_dtensor(scale) else scale
+
+        if weight_local.dtype == torch.int8:
+            return _ExpertQuantLayout.FP4
+
+        if weight_local.dtype == torch.float8_e4m3fn:
+            return _ExpertQuantLayout.FP8
+
+        if tuple(scale_local.shape) == self._scale_shape(weight_local):
+            return _ExpertQuantLayout.FP8
+
+        return _ExpertQuantLayout.FP4
+
+    def _checkpoint_expert_quant_layout(self) -> _ExpertQuantLayout:
+        override = os.environ.get("NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT")
+        if override:
+            normalized = override.lower()
+            if normalized in {"fp4", "mxfp4", "flash"}:
+                return _ExpertQuantLayout.FP4
+            if normalized in {"fp8", "base"}:
+                return _ExpertQuantLayout.FP8
+            raise ValueError(
+                "NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT must be one of: fp4, mxfp4, flash, fp8, base"
+            )
+
+        if self._checkpoint_expert_quant_layout_cache is not None:
+            return self._checkpoint_expert_quant_layout_cache
+
+        self._checkpoint_expert_quant_layout_cache = self._detect_checkpoint_expert_quant_layout()
+        return self._checkpoint_expert_quant_layout_cache
+
+    def _detect_checkpoint_expert_quant_layout(self) -> _ExpertQuantLayout:
+        ckpt_path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
+        if not ckpt_path:
+            return _ExpertQuantLayout.FP4
+
+        path = Path(ckpt_path)
+        if not path.is_dir():
+            return _ExpertQuantLayout.FP4
+
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return _ExpertQuantLayout.FP4
+
+        for sf_path in sorted(path.glob("*.safetensors")):
+            with safe_open(sf_path, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not _EXPERT_PATTERN.match(key):
+                        continue
+                    weight = handle.get_tensor(key)
+                    return _ExpertQuantLayout.FP4 if weight.dtype == torch.int8 else _ExpertQuantLayout.FP8
+
+        return _ExpertQuantLayout.FP4
 
     @staticmethod
     def _dequantize_expert_fp4(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -702,13 +828,14 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if m:
             layer_num = m.group(2)
             n_total = self.moe_config.n_routed_experts
-            local_tensor, start_eid, end_eid = get_expert_slice_for_rank(tensor, n_total)
-            inter_dim = local_tensor.shape[-1] // 2
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
             result = []
-            for local_i in range(local_tensor.shape[0]):
-                t = local_tensor[local_i]  # [hidden_dim, 2*inter_dim]
+            for t, eid in zip(expert_tensors, expert_ids):
+                inter_dim = t.shape[-1] // 2
+                # t is [hidden_dim, 2*inter_dim]. If the expert tensor is
+                # sharded on hidden dim, keep it as a DTensor so DCP sees the
+                # checkpoint's global expert shape.
                 gate_t, up_t = t.split(inter_dim, dim=-1)
-                eid = start_eid + local_i
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w1.weight", gate_t.T))
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w3.weight", up_t.T))
             return result
@@ -717,11 +844,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         if m:
             layer_num = m.group(2)
             n_total = self.moe_config.n_routed_experts
-            local_tensor, start_eid, end_eid = get_expert_slice_for_rank(tensor, n_total)
+            expert_tensors, expert_ids = split_experts_weights_dtensor_aware(tensor, n_total)
             result = []
-            for local_i in range(local_tensor.shape[0]):
-                eid = start_eid + local_i
-                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", local_tensor[local_i].T))
+            for t, eid in zip(expert_tensors, expert_ids):
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", t.T))
             return result
 
         return [(fqn, tensor)]
