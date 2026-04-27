@@ -7,13 +7,13 @@ NeMo AutoModel provides several ways to launch training. The right choice depend
 | Launcher | Best for | GPUs | Guide |
 |---|---|---|---|
 | **Local Workstation** | Getting started, debugging, single-node training | 1-8 on one machine | [Local Workstation](./local-workstation.md) |
-| **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Slurm](./slurm.md) |
 | **NeMo-Run** | Managed execution on Slurm, Kubernetes, Docker, local | 1+ | [NeMo-Run](./nemo-run.md) |
-| **SkyPilot** | Cloud training (AWS, GCP, Azure) with spot pricing | Any | [SkyPilot](./skypilot.md) |
+| **SkyPilot** | Cloud training or Kubernetes clusters | Any | [SkyPilot](./skypilot.md) |
+| **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Slurm](./slurm.md) |
 
-### I have 1-2 GPUs on my workstation
+### I Have 1–2 GPUs on My Workstation
 
-Use the **interactive** launcher. No scheduler or cluster software needed:
+Use the **interactive** launcher. No scheduler or cluster software is needed:
 
 ```bash
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
@@ -21,7 +21,7 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 
 See the [Local Workstation](./local-workstation.md) guide.
 
-### I have access to a Slurm cluster
+### I Have Access to a Slurm Cluster
 
 Add a `slurm:` section to your YAML config and submit with the same `automodel` command. The CLI generates the `torchrun` invocation and calls `sbatch` for you:
 
@@ -31,7 +31,7 @@ automodel config_with_slurm.yaml
 
 See the [Slurm](./slurm.md) guide.
 
-### I want managed job submission (Slurm, Kubernetes, Docker)
+### I Want Managed Job Submission (Slurm, Kubernetes, Docker)
 
 Add a `nemo_run:` section to your YAML config. NeMo-Run loads a pre-configured executor for your compute target and submits the job:
 
@@ -41,7 +41,7 @@ automodel config_with_nemo_run.yaml
 
 See the [NeMo-Run](./nemo-run.md) guide.
 
-### I want to train on the cloud
+### I Want to Train on the Cloud
 
 Add a `skypilot:` section to your YAML config. SkyPilot provisions VMs on any major cloud and handles spot-instance preemption automatically:
 
@@ -50,6 +50,16 @@ automodel config_with_skypilot.yaml
 ```
 
 See the [SkyPilot](./skypilot.md) guide.
+
+### I Want to Train on Kubernetes with SkyPilot
+
+Use the same `skypilot:` launcher, but set `cloud: kubernetes`. This is a good fit when your team already has a GPU-backed Kubernetes cluster and you want SkyPilot to handle job submission and multi-node orchestration:
+
+```bash
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml
+```
+
+See the [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md).
 
 ## All Launchers Use the Same Config
 

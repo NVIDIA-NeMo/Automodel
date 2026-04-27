@@ -6,6 +6,11 @@ See the [Model Coverage Overview](overview.md) for release summaries, and the [L
 
 | Date | Model | HF Model ID | Modality | Recipe | Try on Brev |
 |------|-------|-------------|----------|--------|------|
+| 2026-04-25 | DeepSeek V4 Flash | [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | LLM | [deepseek_v4_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) | 🚧 |
+| 2026-04-22 | Qwen3.6-27B | [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) | VLM | [qwen3_6_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml) | 🚧 |
+| 2026-04-16 | LLaVA-OneVision-1.5 (4B / 8B) | [`lmms-lab/LLaVA-OneVision-1.5-4B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct) | VLM | [llava_ov_1_5_4b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml) | 🚧 |
+| 2026-04-16 | Qwen3.6 MoE | [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | VLM | [qwen3_6_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml) | 🚧 |
+| 2026-04-12 | MiniMax-M2.7 | [`MiniMaxAI/MiniMax-M2.7`](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) | LLM | [minimax_m2.7_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.7_hellaswag_pp.yaml) |
 | 2026-04-07 | GLM-5.1 | [`zai-org/GLM-5.1`](https://huggingface.co/zai-org/GLM-5.1) | LLM | [glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) | 🚧 |
 | 2026-04-02 | Gemma 4 | [`google/gemma-4-4b-it`](https://huggingface.co/google/gemma-4-4b-it) | VLM | [gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) | 🚧 |
 | 2026-03-16 | Mistral Small 4 | [`mistralai/Mistral-Small-4-119B-2603`](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) | VLM | [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) | 🚧 |

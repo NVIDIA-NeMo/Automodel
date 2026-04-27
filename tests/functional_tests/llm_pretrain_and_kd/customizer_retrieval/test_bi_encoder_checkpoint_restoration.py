@@ -233,8 +233,8 @@ class TestBiEncoderCheckpointRestoration:
         """Train bi-encoder with LoRA -> load in NeMo -> save -> verify base
         weights restored by transformers + LoRA weights by safetensors."""
 
-        from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
         from nemo_automodel._transformers.retrieval import BiEncoderModel
+        from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
         from nemo_automodel.components.models.llama_bidirectional import LlamaBidirectionalModel
 
         # ---- Step 1: Train with PEFT -------------------------------------

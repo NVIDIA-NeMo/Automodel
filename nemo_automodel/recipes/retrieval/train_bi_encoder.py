@@ -288,33 +288,35 @@ class TrainBiEncoderRecipe(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                # The step scheduler yields a list of batches for gradient accumulation
+                for batches in self.step_scheduler:
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
-            if hasattr(self.dataloader.dataset, "set_epoch"):
-                self.dataloader.dataset.set_epoch(epoch)
+                    val_loss = None
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        self.log_val_metrics(val_log_data)
+                        val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
+                        for mp in self.model_parts:
+                            mp.train()
 
-            # The step scheduler yields a list of batches for gradient accumulation
-            for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self.log_train_metrics(train_log_data)
-
-                val_loss = None
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    val_log_data = self._run_validation_epoch(self.val_dataloader)
-                    self.log_val_metrics(val_log_data)
-                    val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
-                    for mp in self.model_parts:
-                        mp.train()
-
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_loss=train_log_data.metrics["loss"],
-                        val_loss=val_loss,
-                    )
-                self._maybe_collect_garbage()
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_loss=train_log_data.metrics["loss"],
+                            val_loss=val_loss,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()

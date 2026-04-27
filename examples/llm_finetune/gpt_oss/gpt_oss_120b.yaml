@@ -37,6 +37,12 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: openai/gpt-oss-120b
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    dispatcher: hybridep
+    experts: torch_mm
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 
 checkpoint:
   enabled: true

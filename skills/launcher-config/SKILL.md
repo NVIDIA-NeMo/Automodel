@@ -1,3 +1,8 @@
+---
+name: launcher-config
+description: Configure NeMo AutoModel job launches for interactive runs, Slurm clusters, and SkyPilot cloud execution.
+---
+
 # Launcher Configuration
 
 NeMo AutoModel supports three launch methods: interactive (torchrun), Slurm (HPC clusters), and SkyPilot (cloud-agnostic).

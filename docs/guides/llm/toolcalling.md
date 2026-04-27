@@ -1,4 +1,4 @@
-# Function Calling with NeMo AutoModel using FunctionGemma
+# Function Calling with FunctionGemma
 
 This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270M function-calling model, with NeMo AutoModel on the xLAM function-calling dataset.
 
@@ -107,7 +107,7 @@ To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alp
 ```yaml
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 16
   use_triton: true
