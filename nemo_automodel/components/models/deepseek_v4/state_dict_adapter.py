@@ -747,9 +747,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 return _ExpertQuantLayout.FP4
             if normalized in {"fp8", "base"}:
                 return _ExpertQuantLayout.FP8
-            raise ValueError(
-                "NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT must be one of: fp4, mxfp4, flash, fp8, base"
-            )
+            raise ValueError("NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT must be one of: fp4, mxfp4, flash, fp8, base")
 
         if self._checkpoint_expert_quant_layout_cache is not None:
             return self._checkpoint_expert_quant_layout_cache
