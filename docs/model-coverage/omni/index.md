@@ -18,6 +18,7 @@ For other installation options, see our [Installation Guide](../../guides/instal
 |---|---|---|---|
 | Qwen / Alibaba Cloud | [Qwen3-Omni](qwen/qwen3-omni.md) | Text · Image · Audio · Video | `Qwen3OmniForConditionalGeneration` |
 | Microsoft | [Phi-4-multimodal](microsoft/phi4-multimodal.md) | Text · Image · Audio | `Phi4MultimodalForCausalLM` |
+| NVIDIA | [Nemotron-3-Nano-Omni](nvidia/nemotron-omni.md) | Text · Image · Audio | `NemotronH_Nano_Omni_Reasoning_V3` |
 
 ## Fine-Tuning
 
@@ -28,4 +29,5 @@ All supported omni models can be fine-tuned using full SFT or PEFT (LoRA) approa
 
 qwen/qwen3-omni
 microsoft/phi4-multimodal
+nvidia/nemotron-omni
 ```
