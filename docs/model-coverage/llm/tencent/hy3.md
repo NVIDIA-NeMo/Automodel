@@ -35,7 +35,7 @@
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([NeMo AutoModel](../../../guides/installation.md)):
 
 ```bash
 pip install nemo-automodel
