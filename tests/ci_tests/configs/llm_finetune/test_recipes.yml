@@ -13,18 +13,20 @@
 # limitations under the License.
 
 configs:
+  - baichuan/baichuan_2_7b_squad.yaml
+  - baichuan/baichuan_2_7b_squad_peft.yaml
   - cohere/cohere_command_r_7b_hellaswag_fp8.yaml
   - deepseek_v32/deepseek_v32_hellaswag_pp.yaml
   - gemma/gemma_3_270m_squad.yaml
   - gemma/gemma_3_270m_squad_peft.yaml
   - glm/glm_4_9b_chat_hf_hellaswag_fp8.yaml
-  - glm/glm_5_hellaswag_pp.yaml
   - gpt_oss/gpt_oss_120b.yaml
+  - gpt_oss/gpt_oss_20b.yaml
+  - gpt_oss/gpt_oss_20b_peft.yaml
   - gpt_oss/gpt_oss_20b_single_gpu.yaml
-  - llama3_2/customizer_llama_3_2_1b_full_sft_chat.yaml
-  - llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml
+  - llama3_2/llama_3_2_3b_instruct_squad.yaml
+  - llama3_2/llama_3_2_3b_instruct_squad_peft.yaml
   - llama3_3/llama_3_3_70b_instruct_squad.yaml
-  - mistral/ministral3_3b_squad.yaml
   - mistral/ministral3_3b_squad_peft.yaml
   - mistral/mixtral-8x7b-v0-1_squad.yaml
   - mistral/mixtral-8x7b-v0-1_squad_peft.yaml
@@ -35,11 +37,17 @@ configs:
   - nemotron/nemotron_nano_4b_squad.yaml
   - nemotron/nemotron_nano_9b_squad.yaml
   - nemotron/nemotron_nano_9b_squad_peft.yaml
+  - nemotron/nemotron_nano_v3_hellaswag.yaml
+  - nemotron/nemotron_nano_v3_hellaswag_peft.yaml
   - nemotron/nemotron_super_v3_hellaswag.yaml
+  - nemotron/nemotron_super_v3_hellaswag_peft.yaml
   - nemotron_flash/nemotron_flash_1b_squad.yaml
   - nemotron_flash/nemotron_flash_1b_squad_peft.yaml
+  - phi/phi_4_squad.yaml
+  - phi/phi_4_squad_peft.yaml
   - qwen/qwen2_5_7b_instruct_chat.yaml
-  - qwen/qwen3_moe_30b_hellaswag.yaml
-  - qwen/qwen3_moe_30b_uccl_ep.yaml
+  - qwen/qwen2_5_7b_squad.yaml
+  - qwen/qwen2_5_7b_squad_peft.yaml
+  - qwen/qwen3_moe_30b_te_deepep.yaml
   - qwen/qwq_32b_squad_peft.yaml
   - stepfun/step_3.5_flash_hellaswag_pp.yaml

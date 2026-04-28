@@ -1,7 +1,7 @@
 # Based on your existing config, modified for benchmarking
 
 # To run this recipe:
-#   automodel examples/llm_finetune/llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
@@ -42,7 +42,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   use_triton: True
@@ -92,4 +92,4 @@ lr_scheduler:
 
 ci:
   recipe_owner: ZhiyuLi-Nvidia
-  time: "00:30:00"
+  time: "01:00:00"

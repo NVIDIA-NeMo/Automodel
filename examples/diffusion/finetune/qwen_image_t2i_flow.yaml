@@ -5,7 +5,7 @@ model:
   attention_backend: "flash"
 
 optim:
-  learning_rate: 2e-5
+  learning_rate: 1e-5
 
   optimizer:
     weight_decay: 0.01
@@ -28,22 +28,25 @@ flow_matching:
   timestep_sampling: "logit_normal"
   logit_mean: 0.0
   logit_std: 1.0
-  flow_shift: 1.0
+  flow_shift: 2.23
   mix_uniform_ratio: 0.0
-  sigma_min: 0.0
+  sigma_min: 0.02
   sigma_max: 1.0
   num_train_timesteps: 1000
   i2v_prob: 0.0
-  use_loss_weighting: false
+  use_loss_weighting: true
+  loss_weighting_scheme: "bsmntw"
   log_interval: 100
   summary_log_interval: 10
 
 step_scheduler:
-  num_epochs: 5000
+  num_epochs: 10
   local_batch_size: 1
   global_batch_size: 8
   ckpt_every_steps: 500
+  save_checkpoint_every_epoch: false
   log_every: 1
+  # max_steps: null  # Set to limit training to a specific number of steps
 
 data:
   dataloader:
@@ -75,3 +78,7 @@ dist_env:
   init_method: "env://"
 
 seed: 42
+
+ci:
+  recipe_owner: pthombre
+  time: "00:30:00"

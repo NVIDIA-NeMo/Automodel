@@ -83,6 +83,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
+from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
@@ -1412,36 +1413,60 @@ def _get_parallel_plan(
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:
-        base_model_tp_plan = {
-            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-            "lm_head": ColwiseParallel(output_layouts=Replicate()),
-        }
-        if sequence_parallel:
-            base_model_sp_plan = {
-                "model.embed_tokens": VocabParallelEmbedding(
-                    input_layouts=Replicate(),
-                    output_layouts=Shard(1),
-                    use_local_output=False,
-                ),
-                "model.norm": SequenceParallel(),
-                "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+        # Try HF's per-model _tp_plan first — it correctly handles multimodal
+        # architectures like Mistral3ForConditionalGeneration whose text layers
+        # live under model.language_model.layers.* and would be missed by the
+        # hardcoded llama-style wildcards below.
+        hf_plan = None
+        try:
+            hf_plan = get_hf_tp_shard_plan(model)
+        except Exception as e:
+            logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
+
+        if hf_plan:
+            model_parallel_plan = hf_plan
+            logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
+        else:
+            base_model_tp_plan = {
+                "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+                "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
+                "model.layers.*.mlp.up_proj": ColwiseParallel(),
+                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                "lm_head": ColwiseParallel(output_layouts=Replicate()),
             }
-            base_model_tp_plan.update(base_model_sp_plan)
-        model_parallel_plan = base_model_tp_plan
-        logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
+            if sequence_parallel:
+                base_model_sp_plan = {
+                    "model.embed_tokens": VocabParallelEmbedding(
+                        input_layouts=Replicate(),
+                        output_layouts=Shard(1),
+                        use_local_output=False,
+                    ),
+                    "model.norm": SequenceParallel(),
+                    "model.layers.*.input_layernorm": SequenceParallel(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+                    "model.layers.*.post_attention_layernorm": SequenceParallel(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+                    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+                }
+                base_model_tp_plan.update(base_model_sp_plan)
+            model_parallel_plan = base_model_tp_plan
+            logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
+
+    # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
+    # Under TP, sharding lm_head turns the weight into a DTensor while `logits` is a
+    # plain tensor (output_layouts=Replicate), and the mixed-operand division raises
+    # "aten.div.Tensor got mixed torch.Tensor and DTensor". Drop lm_head from the plan
+    # so its weight stays replicated and the division stays in plain-tensor space.
+    if _is_nemotron_flash_config(getattr(model, "config", None)):
+        for k in ("lm_head", "language_model.lm_head"):
+            if model_parallel_plan.pop(k, None) is not None:
+                logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
 
     return model_parallel_plan
 

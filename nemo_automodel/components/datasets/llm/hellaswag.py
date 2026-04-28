@@ -34,7 +34,6 @@ class HellaSwag:
         tokenizer,
         split="train",
         num_samples_limit=None,
-        trust_remote_code=True,
         pad_to_max_length=True,
     ):
         """Initialize the HellaSwag dataset wrapper.
@@ -44,7 +43,6 @@ class HellaSwag:
             tokenizer (PreTrainedTokenizer): The tokenizer used to process text.
             split (str, optional): Dataset split to use (e.g., 'train', 'validation'). Defaults to 'train'.
             num_samples_limit (int, optional): Maximum number of samples to load. Defaults to None.
-            trust_remote_code (bool, optional): Whether to trust remote code. Defaults to True.
             pad_to_max_length (bool, optional): Whether to pad sequences to max length in the dataset.
                 If False, sequences will have variable lengths and padding will be handled by the collate function.
                 Defaults to True.
@@ -54,7 +52,7 @@ class HellaSwag:
         """
         if isinstance(num_samples_limit, int):
             split = f"{split}[:{num_samples_limit}]"
-        raw_datasets = load_dataset(path_or_dataset, split=split, trust_remote_code=trust_remote_code)
+        raw_datasets = load_dataset(path_or_dataset, split=split)
         processor = SFTSingleTurnPreprocessor(tokenizer)
         processor.pad_to_max_length = pad_to_max_length
         self.dataset = processor.process(raw_datasets, self)
