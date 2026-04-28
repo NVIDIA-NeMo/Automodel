@@ -12,7 +12,7 @@ For first-stage dense retrieval, see [Embedding Models](../embedding/index.md).
 
 | Owner | Model | Architecture | Wrapper Class | Tasks |
 |---|---|---|---|---|
-| Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
+| NVIDIA | [llama-nemotron-rerank-1b-v2](nvidia/llama-bidirectional.md) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
 
 ## Hugging Face Auto Backbones
 
@@ -36,5 +36,5 @@ For a complete walkthrough of training configuration, model-specific settings, a
 ```{toctree}
 :hidden:
 
-meta/llama-bidirectional
+nvidia/llama-bidirectional
 ```

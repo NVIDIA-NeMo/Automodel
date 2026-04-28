@@ -14,8 +14,8 @@ Embedding models use bi-encoders to produce dense representations for queries an
 
 | Owner | Model | Architecture | Auto Class | Tasks |
 |---|---|---|---|---|
-| Meta | [Llama (Bidirectional)](meta/llama-bidirectional.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
-| NVIDIA | [Llama-Embed-Nemotron-8B](nvidia/llama-embed-nemotron-8b.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| NVIDIA | [llama-nemotron-embed-1b-v2](nvidia/llama-bidirectional.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| NVIDIA | [llama-embed-nemotron-8b](nvidia/llama-embed-nemotron-8b.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
 
 ### Hugging Face Auto Backbones
 
@@ -48,6 +48,6 @@ For a complete walkthrough of training configuration, model-specific settings, a
 ```{toctree}
 :hidden:
 
-meta/llama-bidirectional
+nvidia/llama-bidirectional
 nvidia/llama-embed-nemotron-8b
 ```
