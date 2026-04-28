@@ -56,7 +56,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
+    pretrained_model_name_or_path: /llm-align/open_models/hunyuan3
     num_hidden_layers: 8           # only build layers 0-7; keys for 8-79 ignored
   load_base_model: true
   trust_remote_code: false
@@ -108,7 +108,7 @@ dataset:
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
+    pretrained_model_name_or_path: /llm-align/open_models/hunyuan3
 
 packed_sequence:
   packed_sequence_size: 0
@@ -127,7 +127,7 @@ validation_dataset:
   num_samples_limit: 32
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
+    pretrained_model_name_or_path: /llm-align/open_models/hunyuan3
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
