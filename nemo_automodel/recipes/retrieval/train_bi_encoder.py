@@ -347,9 +347,43 @@ class TrainBiEncoderRecipe(BaseRecipe):
             p_reps = model(passage)
 
             n_passages = self.train_n_passages
-            scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-            if model.l2_normalize:
-                scores = scores / self.temperature
+            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
+                if getattr(model, "pooling", None) == "colbert":
+                    raise NotImplementedError("Distributed in-batch negatives are not implemented for ColBERT pooling.")
+                from nemo_automodel.components.models.common.inbatch_neg_utils import (
+                    dist_gather_tensor,
+                    mask_gathered_passages_same_doc_as_positive,
+                )
+
+                local_bs = q_reps.shape[0]
+                dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+                rank = torch.distributed.get_rank() if dist_initialized else 0
+                world_size = torch.distributed.get_world_size() if dist_initialized else 1
+                all_p = dist_gather_tensor(p_reps)
+                expected_p = world_size * local_bs * n_passages
+                assert all_p.shape[0] == expected_p, (
+                    f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                )
+                scores = torch.mm(q_reps, all_p.t())
+                labels = (
+                    torch.arange(local_bs, device=q_reps.device) + rank * local_bs
+                ) * n_passages
+                if model.l2_normalize:
+                    scores = scores / self.temperature
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if passage_doc_ids is not None:
+                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
+                    mask_gathered_passages_same_doc_as_positive(
+                        scores,
+                        all_doc_ids,
+                        train_n_passages=n_passages,
+                        rank=rank,
+                        local_batch_size=local_bs,
+                    )
+            else:
+                scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                if model.l2_normalize:
+                    scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
 
             loss_buffer.append(loss.clone().detach())
