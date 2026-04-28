@@ -967,6 +967,7 @@ class _NeMoAutoModelForRetrievalBase:
         model = encoder_cls.build(
             model_name_or_path=pretrained_model_name_or_path,
             attn_implementation=attn_implementation,
+            torch_dtype=torch_dtype,
             **build_kwargs,
         )
 
