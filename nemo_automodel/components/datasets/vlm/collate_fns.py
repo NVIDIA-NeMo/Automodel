@@ -776,54 +776,62 @@ def _expand_image_tokens(
     media_token_id: int,
     merge_kernel_size: Tuple[int, int] = _DEFAULT_MERGE_KERNEL,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Expand single image placeholder tokens to the correct number based on grid_thws.
+    """Expand image placeholder tokens to the correct patch counts based on grid_thws.
 
     For PP, this ensures the sequence length is fixed BEFORE the model forward pass,
     eliminating dynamic sequence expansion inside the model.
 
-    Assumes 1 image per sample (1 placeholder per sequence).
+    Supports both single-image and multi-image samples.  Each placeholder token is
+    expanded to ``(h // merge_h) * (w // merge_w)`` tokens using the corresponding
+    entry in *grid_thws*.  The number of placeholders must match ``grid_thws.shape[0]``.
 
     Args:
-        input_ids: (seq_len,) tensor with 1 media_token_id placeholder
-        attention_mask: (seq_len,) tensor
-        grid_thws: (1, 3) tensor with [t, h, w] for the single image
-        media_token_id: Token ID of the image placeholder
-        merge_kernel_size: Vision tower's patch merge kernel, default (2, 2)
+        input_ids: (seq_len,) tensor containing one ``media_token_id`` per image.
+        attention_mask: (seq_len,) tensor aligned with *input_ids*.
+        grid_thws: (N, 3) tensor with ``[t, h, w]`` for each of the N images.
+        media_token_id: Token ID used as the image placeholder.
+        merge_kernel_size: Vision tower's patch merge kernel, default (2, 2).
 
     Returns:
-        expanded_input_ids: Input IDs with placeholder expanded to N tokens
-        expanded_attention_mask: Attention mask expanded accordingly
+        expanded_input_ids: Input IDs with each placeholder expanded to its patch count.
+        expanded_attention_mask: Attention mask expanded accordingly.
+
+    Raises:
+        ValueError: When the number of placeholders does not match ``grid_thws.shape[0]``.
     """
     merge_h, merge_w = merge_kernel_size
 
-    # Calculate number of image tokens: (h // merge_h) * (w // merge_w)
-    t, h, w = grid_thws[0].tolist()
-    num_image_tokens = (h // merge_h) * (w // merge_w)
-
-    # Find the placeholder position
     placeholder_positions = (input_ids == media_token_id).nonzero(as_tuple=True)[0]
     if len(placeholder_positions) == 0:
-        # No placeholder found, return as-is
         return input_ids, attention_mask
 
-    # For 1 image per sample, there should be exactly 1 placeholder
-    placeholder_pos = placeholder_positions[0].item()
+    n_placeholders = len(placeholder_positions)
+    n_images = grid_thws.shape[0]
+    if n_placeholders != n_images:
+        raise ValueError(
+            f"_expand_image_tokens: found {n_placeholders} placeholder(s) in input_ids "
+            f"but grid_thws has {n_images} row(s). They must match."
+        )
 
-    # Build expanded tensors
-    before = input_ids[:placeholder_pos]
-    after = input_ids[placeholder_pos + 1 :]
+    # Rebuild input_ids and attention_mask by expanding each placeholder in order.
+    # We iterate through the placeholder positions; between consecutive placeholders
+    # we copy the original tokens unchanged.
+    pieces_ids: List[torch.Tensor] = []
+    pieces_mask: List[torch.Tensor] = []
+    cursor = 0
+    for placeholder_pos, (_, h, w) in zip(placeholder_positions.tolist(), grid_thws.tolist()):
+        n_tokens = (int(h) // merge_h) * (int(w) // merge_w)
+        pieces_ids.append(input_ids[cursor:placeholder_pos])
+        pieces_mask.append(attention_mask[cursor:placeholder_pos])
+        pieces_ids.append(torch.full((n_tokens,), media_token_id, dtype=input_ids.dtype))
+        pieces_mask.append(torch.ones(n_tokens, dtype=attention_mask.dtype))
+        cursor = placeholder_pos + 1
 
-    # Expand: replace 1 placeholder with num_image_tokens placeholders
-    expanded_placeholder = torch.full((num_image_tokens,), media_token_id, dtype=input_ids.dtype)
-    expanded_input_ids = torch.cat([before, expanded_placeholder, after])
+    # Append tokens after the last placeholder
+    pieces_ids.append(input_ids[cursor:])
+    pieces_mask.append(attention_mask[cursor:])
 
-    # Expand attention mask similarly
-    before_mask = attention_mask[:placeholder_pos]
-    after_mask = attention_mask[placeholder_pos + 1 :]
-    expanded_mask_tokens = torch.ones(num_image_tokens, dtype=attention_mask.dtype)
-    expanded_attention_mask = torch.cat([before_mask, expanded_mask_tokens, after_mask])
-
-    return expanded_input_ids, expanded_attention_mask
+    return torch.cat(pieces_ids), torch.cat(pieces_mask)
 
 
 def kimi_k25_vl_collate_fn(
