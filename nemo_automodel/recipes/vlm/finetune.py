@@ -221,14 +221,20 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         save_consolidated=True,
         is_peft=is_peft,
     )
+    user_cfg = {}
     if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        user_cfg = cfg_ckpt.to_dict()
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
         )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
 

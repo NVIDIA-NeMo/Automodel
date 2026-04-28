@@ -45,7 +45,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/copper-meadow_vv0-hf
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M2.7
   trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
