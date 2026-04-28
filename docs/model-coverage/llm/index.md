@@ -11,7 +11,7 @@ To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
-For other installation options (e.g., uv), please see our [Installation Guide](../../guides/installation.md).
+For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](../../guides/installation.md).
 
 ## Supported Models
 
