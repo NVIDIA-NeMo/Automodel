@@ -20,21 +20,21 @@ import os
 import shutil
 from pathlib import Path
 
+import datasets
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor
 import torch.nn as nn
+import yaml
 from peft import PeftModel
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
-import yaml
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
-import datasets
 datasets.disable_caching()
 
 
@@ -52,11 +52,11 @@ def get_validation_loss(
     with torch.no_grad():
         out = model(**val_batch)
         loss = calculate_loss(
-                loss_fn,
-                logits=out.logits,
-                labels=labels,
-                mask=loss_mask,
-            )
+            loss_fn,
+            logits=out.logits,
+            labels=labels,
+            mask=loss_mask,
+        )
         return loss
 
 
@@ -95,13 +95,15 @@ def load_dcp(ckpt_dir: Path | str) -> tuple[dict, dict]:
 
 
 def compare_configs(source_config: dict, restored_config: dict):
-    """ Recursively compare two configs."""
+    """Recursively compare two configs."""
     for k, v in source_config.items():
         if k in restored_config:
             if isinstance(v, dict):
                 compare_configs(v, restored_config[k])
             else:
-                assert v == restored_config[k], f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                assert v == restored_config[k], (
+                    f"Config mismatch for key {k}. Expected {v} but got {restored_config[k]}"
+                )
 
 
 def load_safetensors(ckpt_dir: Path | str) -> dict[str, torch.Tensor]:
@@ -124,6 +126,7 @@ def to_cpu(
     Converts a state dictionary to CPU.
     """
     return {k: v.cpu() for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
+
 
 def get_test_peft_vlm_checkpoint_expected_keys():
     expected_model_keys = {
@@ -634,6 +637,7 @@ def test_hf_peft_checkpoint():
         "lora_A_init": "xavier",
         "lora_dtype": None,
         "match_all_linear": False,
+        "moe_rank_scaling": False,
         "target_modules": [],
         "use_dora": False,
         "use_triton": True,
@@ -666,7 +670,7 @@ def test_hf_peft_checkpoint():
         # PEFT model state is consolidated - use FULL tensor shape (no splitting)
         curr_shard = v
         model_keys_fixture[k] = (list(curr_shard.shape), curr_shard.dtype, str(curr_shard.device))
-    
+
     # the saved optimizer state has an "optim." prefix that DCP adds.
     # For the on-disk view to match, it needs to be prepended with the "optim." prefix
     flattened_optim_dict = _rename_keys(optimizer_state_dict, "optim.")
@@ -952,8 +956,7 @@ def test_hf_peft_checkpoint():
 
 
 def _rename_keys(d: dict, prepend: str):
-    """Rename the keys of *d* by prepending *prepend* to each key.
-    """
+    """Rename the keys of *d* by prepending *prepend* to each key."""
     flat: dict[str, torch.Tensor] = {}
     for k, v in d.items():
         key = f"{prepend}{k}"

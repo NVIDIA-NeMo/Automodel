@@ -58,6 +58,7 @@ except ModuleNotFoundError:
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -65,6 +66,7 @@ from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .cp_linear_attn import CPAwareGatedDeltaNet
 from .state_dict_adapter import Qwen3_5MoeStateDictAdapter
 
 
@@ -74,9 +76,9 @@ class Qwen3_5MoeBlock(Block):
 
     def __init__(self, layer_idx, config, moe_config, backend):
         super().__init__(layer_idx, config, moe_config, backend)
-        # Replace the Qwen3Next fused GatedDeltaNet with the Qwen3.5-MoE native one
+        # Replace the Qwen3Next fused GatedDeltaNet with CP-aware variant
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
+            self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -95,7 +97,11 @@ class Qwen3_5MoeBlock(Block):
             ]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-            self.linear_attn.norm.reset_parameters()
+            if hasattr(self.linear_attn.norm, "reset_parameters"):
+                self.linear_attn.norm.reset_parameters()
+            else:
+                # HF Qwen3_5MoeRMSNormGated has no reset_parameters; manually reset weight to ones
+                self.linear_attn.norm.weight.data.fill_(1.0)
         self.mlp.init_weights(buffer_device)
 
 
@@ -218,10 +224,13 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
@@ -229,7 +238,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
         # No ``decoder_sparse_step`` — defaults to 1 so every layer is MoE.
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.hidden_size,  # unused — no dense MLP layers
             moe_inter_dim=config.moe_intermediate_size,
@@ -251,6 +260,9 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # --------------- Layers ---------------
         embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
@@ -303,8 +315,23 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             position_ids = position_ids[1:]
 
+        # When context parallelism is active the attention_mask is NOT sharded
+        # along the sequence dimension (it keeps shape [B, S_global] while
+        # hidden_states are [B, S_local]).  Both TE ring-attention and FLA CP
+        # do not support padding masks, so we null them out.
+        if getattr(self, "_cp_enabled", False):
+            attention_mask = None
+            padding_mask = None
+
         if padding_mask is None and attention_mask is not None:
-            padding_mask = attention_mask.bool().logical_not()
+            if attention_mask.ndim <= 2:
+                # 1D/2D mask (standard or indexed packing mask): invert directly
+                padding_mask = attention_mask.bool().logical_not()
+            else:
+                # 4D mask [B, 1, S, S] (e.g. from sdpa packing collater):
+                # extract per-token padding from the diagonal (a token is padded
+                # if it cannot attend to itself).
+                padding_mask = attention_mask[:, 0].diagonal(dim1=-2, dim2=-1).bool().logical_not()
 
         hidden_states = inputs_embeds
 
@@ -320,6 +347,7 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                position_ids=position_ids,
                 **attn_kwargs,
             )
 
@@ -411,7 +439,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace HF text decoder with our NeMo backend
         text_config = config.text_config if hasattr(config, "text_config") else config
-        self.model.language_model = Qwen3_5MoeTextModelBackend(text_config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model.language_model = Qwen3_5MoeTextModelBackend(
+            text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
+        )
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
@@ -541,7 +572,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
 
         with buffer_device:
             self.model.language_model.rotary_emb.device = buffer_device

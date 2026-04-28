@@ -20,6 +20,8 @@ import torch.nn as nn
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
+    cast_model_to_dtype,
+    get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -99,13 +101,22 @@ class Block(nn.Module):
 
 
 class Glm4MoeLiteModel(nn.Module):
-    def __init__(self, config: Any, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Any,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map config -> MoE wrapper (same as GLM4 MoE)
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
@@ -115,7 +126,7 @@ class Glm4MoeLiteModel(nn.Module):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-3,
             score_func="sigmoid",  # GLM4 MoE uses sigmoid scoring with groups
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0.0,  # GLM4 MoE doesn't use aux loss in the HF implementation
@@ -125,6 +136,9 @@ class Glm4MoeLiteModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -140,11 +154,7 @@ class Glm4MoeLiteModel(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
 
         # Precompute freqs for MLA's rotary embedding
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if hasattr(config, "rope_parameters"):
-            rope_theta = config.rope_parameters["rope_theta"]
-        else:
-            rope_theta = config.rope_theta
+        rope_theta, rope_scaling, _ = get_rope_config(config)
 
         self.freqs = precompute_freqs_cis(
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -206,6 +216,8 @@ class Glm4MoeLiteModel(nn.Module):
 
 
 class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
     @classmethod
     def from_config(
         cls,
@@ -239,12 +251,30 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Glm4MoeLiteModel(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Glm4MoeLiteModel(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Glm4MoeStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -291,7 +321,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if isinstance(layer.mlp, MoE):
                 layer.mlp.gate.e_score_correction_bias = torch.zeros(

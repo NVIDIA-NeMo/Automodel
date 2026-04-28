@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 4
@@ -33,12 +39,15 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B
   torch_dtype: bf16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: "torch_fp32"
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
-  model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false 
+  model_save_format: safetensors # torch_save or safetensors
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -90,3 +99,19 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir> 
+
+ci:
+  time: "00:45:00"
+  vllm_deploy: true
+  recipe_owner: HuiyingLi
+  known_issue_id: AM-154
+  allow_failure: true
+  checkpoint_robustness:
+    hf_kl_threshold: 1e-1
+    distributed.tp_size: 2
+    tokenizer_name: Qwen/Qwen2.5-7B
+    cross_tp_size: 2
+    cross_tp_kl_threshold: 9e-3
+    resume_loss_threshold: 5e-2
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

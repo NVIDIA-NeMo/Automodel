@@ -1,14 +1,26 @@
 [
     {
-        "version": "latest",
+        "version": "nightly",
+        "url": "https://docs.nvidia.com/nemo/automodel/nightly/"
+    },
+    {
+        "name": "0.4.0 (latest) · 26.04",
+        "version": "0.4.0",
         "url": "https://docs.nvidia.com/nemo/automodel/latest/"
     },
     {
+        "name": "0.3.0 · 26.02",
+        "version": "0.3.0",
+        "url": "https://docs.nvidia.com/nemo/automodel/0.3.0/"
+    },
+    {
+        "name": "0.2.0 · 25.11",
         "version": "0.2.0",
         "url": "https://docs.nvidia.com/nemo/automodel/0.2.0/"
     },
     {
+        "name": "0.1.0",
         "version": "0.1.0",
         "url": "https://docs.nvidia.com/nemo/automodel/0.1.0/"
-    },
+    }
 ]

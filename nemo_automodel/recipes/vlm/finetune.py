@@ -14,6 +14,17 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
 import logging
 import pathlib
 import time
@@ -32,10 +43,15 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+from nemo_automodel._transformers import (
+    NeMoAutoModelForCausalLM,
+    NeMoAutoModelForImageTextToText,
+    NeMoAutoModelForMultimodalLM,
+)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
@@ -47,6 +63,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -58,7 +75,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -78,6 +95,8 @@ def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
     elif cfg_model.get("config", None) is not None:
+        if isinstance(cfg_model.config, str):
+            return cfg_model.config
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
@@ -136,6 +155,10 @@ def build_model(
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
             NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
         )
 
         if is_nemo_auto_model:
@@ -224,8 +247,101 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
+def _chunk_vlm_media(
+    pixel_values: torch.Tensor,
+    image_grid: torch.Tensor,
+    batch_size: int,
+    n_microbatches: int,
+    n_images_per_sample: torch.Tensor | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Split VLM pixel_values and image_grid into PP microbatch chunks.
+
+    Handles four layouts:
+    1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
+    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
+    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
+       ``n_images_per_sample`` (general case, works for packed sequences too).
+    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
+    """
+    n_images = image_grid.shape[0]
+    pixel_values_chunks: list[torch.Tensor] = []
+    image_grid_chunks: list[torch.Tensor] = []
+
+    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
+        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
+        # Both are indexed by image along dim 0, one entry per sample.
+        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
+        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
+        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
+        # All images are padded to the same max_patches, so split by image count directly.
+        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
+        samples_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            s_start = mb_idx * samples_per_mb
+            s_end = min(s_start + samples_per_mb, batch_size)
+            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
+            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[img_start:img_end])
+            image_grid_chunks.append(image_grid[img_start:img_end])
+    elif n_images_per_sample is not None:
+        # General case: use per-sample image counts to associate images with
+        # batch items.  Works for packed sequences (multiple images per item).
+        patch_counts = image_grid.prod(dim=1)
+        cumsum_patches = torch.cumsum(patch_counts, dim=0)
+        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
+
+        samples_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            s_start = mb_idx * samples_per_mb
+            s_end = min(s_start + samples_per_mb, batch_size)
+
+            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
+            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
+
+            image_grid_chunks.append(image_grid[img_start:img_end])
+
+            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
+            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
+    elif n_images == batch_size:
+        # Legacy: exactly 1 image per sample.
+        patch_counts = image_grid.prod(dim=1)
+        cumsum = torch.cumsum(patch_counts, dim=0)
+
+        images_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            img_start = mb_idx * images_per_mb
+            img_end = min(img_start + images_per_mb, n_images)
+
+            image_grid_chunks.append(image_grid[img_start:img_end])
+
+            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
+            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
+    else:
+        pixel_values_chunks.append(pixel_values)
+        image_grid_chunks.append(image_grid)
+        for _ in range(n_microbatches - 1):
+            pixel_values_chunks.append(pixel_values[:0])
+            image_grid_chunks.append(image_grid[:0])
+        logging.warning(
+            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+        )
+
+    return pixel_values_chunks, image_grid_chunks
+
+
 def build_dataloader(
-    cfg_ds, cfg_dl, pretrained_model_name_or_path, cfg_processor, device_mesh, seed, local_batch_size
+    cfg_ds,
+    cfg_dl,
+    pretrained_model_name_or_path,
+    cfg_processor,
+    device_mesh,
+    seed,
+    local_batch_size,
+    cfg_model=None,
+    cfg_ps=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -237,6 +353,9 @@ def build_dataloader(
         device_mesh: Device mesh for distributed training.
         seed: Random seed.
         local_batch_size: Local batch size.
+        cfg_model: Model configuration (used to detect attention backend).
+        cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
+            When provided, takes precedence over ``dataset.packing``.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -245,44 +364,150 @@ def build_dataloader(
         "shuffle": cfg_dl.get("shuffle", True),
     }
     if device_mesh is not None:
+        from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
         dist_sampler_kwargs |= {
-            "num_replicas": device_mesh["dp"].size(),
-            "rank": device_mesh["dp"].get_local_rank(),
+            "num_replicas": dp_mesh.size(),
+            "rank": dp_mesh.get_local_rank(),
         }
 
     with ScopedRNG(seed=seed, ranked=True):
         processor = None
         processor_kwargs = {}
-        if cfg_processor is not None and hasattr(cfg_processor, "instantiate"):
-            processor = cfg_processor.instantiate()
-        elif cfg_processor is not None:
-            processor_kwargs = cfg_processor.to_dict()
-
-        # If no processor was instantiated, try AutoProcessor
-        if processor is None:
-            try:
-                processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-            except Exception as e:
-                # Some models do not provide an AutoProcessor
-                processor = None
-                logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
         with FirstRankPerNode():
-            ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
+            # Ensure the processor has a _target_ attribute too
+            if (
+                cfg_processor is not None
+                and hasattr(cfg_processor, "instantiate")
+                and hasattr(cfg_processor, "_target_")
+            ):
+                processor = cfg_processor.instantiate()
+            elif cfg_processor is not None:
+                processor_kwargs = cfg_processor.to_dict()
 
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            ds,
-            **dist_sampler_kwargs,
-        )
-        collate_cfg = cfg_dl.get("collate_fn", None)
-        if collate_cfg:
-            collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+            # If no processor was instantiated, try AutoProcessor
+            if processor is None:
+                try:
+                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                except Exception as e:
+                    # AutoProcessor.from_pretrained internally loads AutoConfig. Configs
+                    # whose layer_types length differs from num_hidden_layers trip
+                    # validate_layer_type. The processor itself doesn't depend on
+                    # layer_types, so relax the validator and retry once before giving up.
+                    err = str(e)
+                    if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                        from nemo_automodel._transformers.v4_patches.layer_types import (
+                            relax_layer_types_validator,
+                        )
+
+                        relax_layer_types_validator()
+                        try:
+                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                        except Exception as retry_exc:
+                            processor = None
+                            logging.warning(
+                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
+                            )
+                    else:
+                        # Some models do not provide an AutoProcessor
+                        processor = None
+                        logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+
+            chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
+            # Update chat_template if chat_template is given
+            if chat_template_raw is not None and processor is not None:
+                processor.chat_template = _resolve_chat_template(chat_template_raw)
+                processor.tokenizer.chat_template = processor.chat_template
+
+            _path_or_ds = getattr(cfg_ds, "path_or_dataset", None) or cfg_ds.get("path_or_dataset", None)
+            if _path_or_ds is not None:
+                ds = cfg_ds.instantiate(path_or_dataset=_path_or_ds)
+            else:
+                ds = cfg_ds.instantiate()
+
+        # Resolve packing config: top-level packed_sequence (LLM-style) takes
+        # precedence over legacy dataset.packing (backward compat).
+        if cfg_ps is not None:
+            _ps_enabled = getattr(cfg_ps, "pack_size", 0) > 0
+            packing_cfg = cfg_ps if _ps_enabled else None
+            pretokenize = getattr(cfg_ps, "pretokenize", _ps_enabled)
+            max_length = getattr(cfg_ps, "max_length", None)
         else:
-            processor_type = type(processor).__name__
-            if processor_type not in COLLATE_FNS:
-                processor_type = "default"
-                logging.warning(f"You are using {processor_type} with default collate function.")
-            collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+            _legacy = cfg_ds.get("packing", None)
+            _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
+            packing_cfg = _legacy if _ps_enabled else None
+            max_length = cfg_ds.get("max_length", None)
+            pretokenize = cfg_ds.get("pretokenize", max_length is not None)
+
+        if pretokenize:
+            from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+            from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+
+            ds_raw = ds
+            truncate = cfg_ds.get("truncate", max_length is not None)
+            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
+
+            if packing_cfg:
+                from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+                from nemo_automodel.components.datasets.vlm.neat_packing_vlm import neat_pack_dataset_vlm
+                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+
+                ds = neat_pack_dataset_vlm(
+                    ds,
+                    pack_size=packing_cfg.get("pack_size", max_length),
+                    padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
+                    drop_long_samples=packing_cfg.get("drop_long_samples", True),
+                    max_packs=packing_cfg.get("max_packs", None),
+                    ds_raw=ds_raw,
+                    packing_ratio=packing_cfg.get("packing_ratio", 1.0),
+                    processor=processor,
+                    balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
+                )
+                _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
+                _collate_max_length = packing_cfg.get("collate_max_length", None)
+                _attn_impl = get_attn_implementation(cfg_model)
+
+                configure_packing(attn_implementation=_attn_impl)
+                logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
+
+                collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: (
+                    neat_packed_vlm_collater(
+                        examples,
+                        padding_idx=_pi,
+                        max_length=_ml,
+                        attn_implementation=_ai,
+                    )
+                )
+            else:
+                collate_cfg = cfg_dl.get("collate_fn", None)
+                if collate_cfg:
+                    collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+                else:
+                    collate_fn = lambda examples: pad_collate_fn(examples, processor)
+
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                ds,
+                **dist_sampler_kwargs,
+            )
+        else:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                ds,
+                **dist_sampler_kwargs,
+            )
+            collate_cfg = cfg_dl.get("collate_fn", None)
+            if collate_cfg:
+                collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
+            else:
+                processor_type = type(processor).__name__
+                if processor_type not in COLLATE_FNS:
+                    logging.warning(f"You are using {processor_type} with default collate function.")
+                    processor_type = "default"
+                collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
+
+        if hasattr(ds, "robust_collate"):
+            collate_fn = ds.robust_collate(collate_fn)
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
@@ -560,6 +785,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
+        # Disable fused RoPE when context parallelism is enabled (cp > 1)
+        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+            self.cfg.model.backend.rope_fusion = False
+
         model = build_model(
             self.cfg.model,
             self.cfg.get("freeze_config", None),
@@ -595,6 +825,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             device_mesh=self.device_mesh,
             seed=self.cfg.get("seed", 42),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            cfg_model=self.cfg.model,
+            cfg_ps=self.cfg.get("packed_sequence", None),
         )
 
         # Build validation dataloader if the config provides it
@@ -618,6 +850,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
+        self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
         self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
@@ -652,32 +885,39 @@ class FinetuneRecipeForVLM(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batch_idx, batches in enumerate(self.step_scheduler):
-                log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # log
-                self.log_train_metrics(log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batch_idx, batches in enumerate(self.step_scheduler):
+                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # log
+                    self.log_train_metrics(log_data)
+                    self._update_progress_bar(pbar, log_data.metrics)
 
-                val_loss = {}
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        val_log_data = self._run_validation_epoch(self.val_dataloader)
-                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_log_data)
-                    for mp in self.model_parts:
-                        mp.train()
+                    val_loss = {}
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        if self.pp_enabled:
+                            logger.warning("Validation is not supported for pipeline parallelism")
+                        else:
+                            val_log_data = self._run_validation_epoch(self.val_dataloader)
+                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_log_data)
+                        for mp in self.model_parts:
+                            mp.train()
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        log_data.metrics["loss"],
-                        val_loss,
-                        best_metric_key=self.best_metric_key,
-                    )
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            log_data.metrics["loss"],
+                            val_loss,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -722,6 +962,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # VLM: Custom chunking for pixel_values and image_grid
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
@@ -729,42 +970,28 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 pixel_values = batch.pop("pixel_values", None)
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
+                image_sizes = batch.pop("image_sizes", None)
+                image_position_ids = batch.pop("image_position_ids", None)
+                n_images_per_sample = batch.pop("n_images_per_sample", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
+                if image_grid is None and image_sizes is not None:
+                    image_grid = image_sizes
+                if image_grid is None and image_position_ids is not None:
+                    image_grid = image_position_ids
 
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
                     n_microbatches = self.pp._info.schedule._n_microbatches
                     batch_size = input_ids.shape[0]
-                    n_images = image_grid.shape[0]
 
-                    patch_counts = image_grid.prod(dim=1)
-                    cumsum = torch.cumsum(patch_counts, dim=0)
-
-                    pixel_values_chunks = []
-                    image_grid_chunks = []
-
-                    if n_images == batch_size:
-                        # 1 image per sample
-                        images_per_mb = batch_size // n_microbatches
-                        for mb_idx in range(n_microbatches):
-                            img_start = mb_idx * images_per_mb
-                            img_end = min(img_start + images_per_mb, n_images)
-
-                            image_grid_chunks.append(image_grid[img_start:img_end])
-
-                            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-                            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-                            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-                    else:
-                        pixel_values_chunks.append(pixel_values)
-                        image_grid_chunks.append(image_grid)
-                        for _ in range(n_microbatches - 1):
-                            pixel_values_chunks.append(pixel_values[:0])
-                            image_grid_chunks.append(image_grid[:0])
-                        logging.warning(
-                            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
-                        )
+                    pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
+                        pixel_values,
+                        image_grid,
+                        batch_size,
+                        n_microbatches,
+                        n_images_per_sample=n_images_per_sample,
+                    )
 
                     # Store pre-chunked tensors on model for forward to use
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
@@ -801,6 +1028,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx:
+                batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -835,6 +1063,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
+        # multiplies them by main_loss_backward_scale during backward.  This
+        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
+        # apply to *all* gradients (including aux loss):
+        #
+        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
+        #           Scale = dp_group_size  →  net = 1.
+        #
+        #   PP:     FSDP divides by dp_group_size, then
+        #           scale_grads_and_clip_grad_norm divides by
+        #           (num_label_tokens / dp_group_size).  The dp_group_size
+        #           factors cancel, leaving net 1/num_label_tokens.
+        #           Scale = num_label_tokens  →  net = 1.
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
@@ -909,7 +1158,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
             reporting_loss = reporting_loss.float().to(self.dist_env.device)
             # Send loss to first rank from the last PP stage of rank0's mesh coords.
             # This avoids picking a global-rank sender from a different EP/PP group.
@@ -959,7 +1208,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
+                batch = {
+                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
 
@@ -974,6 +1226,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
+                    batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
                     else:

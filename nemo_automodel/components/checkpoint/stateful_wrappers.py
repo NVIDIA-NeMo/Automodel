@@ -16,6 +16,38 @@ from functools import partial
 from typing import Any, Optional
 
 import torch
+
+from nemo_automodel.shared.import_utils import safe_import_te
+
+HAS_TE, transformer_engine = safe_import_te()
+
+# The Conflict:
+# PyTorch DCP passes an _EXTRA_STATE sentinel for missing keys, but Transformer Engine (TE)
+# throws a RuntimeError if it receives anything other than None or a Tensor.
+#
+# The Fix (Monkeypatch):
+# Intercept set_extra_state calls. If the input is the _EXTRA_STATE sentinel, return early
+# (doing nothing) to safely ignore the missing state without crashing TE.
+if HAS_TE:
+    import transformer_engine.pytorch.module.base as te_base
+    import transformer_engine.pytorch.ops.op as te_ops
+
+    _original_set_extra_state = te_base.TransformerEngineBaseModule.set_extra_state
+    _original_op_set_extra_state = te_ops.BasicOperation.set_extra_state
+
+    def _safe_set_extra_state(self, state):
+        if state is not None and "EXTRA_STATE" in str(type(state)):
+            return
+        return _original_set_extra_state(self, state)
+
+    def _safe_op_set_extra_state(self, state):
+        if state is not None and "EXTRA_STATE" in str(type(state)):
+            return
+        return _original_op_set_extra_state(self, state)
+
+    te_base.TransformerEngineBaseModule.set_extra_state = _safe_set_extra_state
+    te_ops.BasicOperation.set_extra_state = _safe_op_set_extra_state
+
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -24,7 +56,12 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
-from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import (
+    get_lm_head_weight_and_name,
+    has_local_tied_lm_head,
+    is_tied_word_embeddings,
+    materialize_missing_tied_lm_head,
+)
 
 _PREFIX = "model."
 
@@ -43,19 +80,74 @@ def _has_quantized_params(model: torch.nn.Module) -> bool:
     return any(map(_is_quantized_module, model.modules()))
 
 
+def _has_expert_parallelism(model: torch.nn.Module) -> bool:
+    """Check if any MoE expert module in the model has expert parallelism enabled.
+
+    After EP initialization, expert modules (GroupedExpertsDeepEP, GroupedExpertsTE)
+    store ``ep_size`` on themselves. A value > 1 signals that expert weights are
+    sharded across EP ranks and DCP's state_dict APIs cannot handle them.
+    """
+    return any(getattr(m, "ep_size", 1) > 1 for m in model.modules())
+
+
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
-    """Extract only trainable PEFT adapter weights, bypassing DCP for quantized models.
+    """Extract only trainable PEFT adapter weights, bypassing DCP.
 
     This function directly iterates over model parameters to collect trainable weights,
-    avoiding PyTorch DCP's state_dict traversal which fails on BitsAndBytes quantized
-    modules (Params4bit, Int8Params, etc.).
+    avoiding PyTorch DCP's state_dict traversal which fails on (1) BitsAndBytes quantized
+    modules (Params4bit, Int8Params, etc.) and (2) MoE models with expert parallelism
+    where expert weights are sharded across EP ranks.
     """
     state_dict = {}
     for name, param in model.named_parameters():
         if param.requires_grad:
+            # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
+            # Without this, activation checkpointing causes key mismatches on reload.
+            name = name.replace("_checkpoint_wrapped_module.", "")
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
+
+
+def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    """Load trainable PEFT adapter weights into the model, bypassing DCP.
+
+    Mirrors _get_peft_state_dict: directly assigns saved tensors to model parameters
+    by name, handling DTensor re-sharding for EP-parallel weights. This avoids
+    DCP's set_model_state_dict() which raises KeyError on expert-parallel FQNs.
+    """
+    from torch.distributed.tensor import DTensor, Replicate
+
+    # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
+    # Without this, activation checkpointing causes key mismatches on reload.
+    param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
+    loaded, skipped = 0, 0
+
+    for name, saved_tensor in state_dict.items():
+        if name not in param_dict:
+            skipped += 1
+            continue
+
+        param = param_dict[name]
+        if not param.requires_grad:
+            skipped += 1
+            continue
+
+        if isinstance(param.data, DTensor):
+            full_t = saved_tensor.to(param.data.to_local().device)
+            full_dt = DTensor.from_local(
+                full_t, device_mesh=param.data.device_mesh, placements=[Replicate()] * param.data.device_mesh.ndim
+            )
+            local_shard = full_dt.redistribute(placements=param.data.placements).to_local()
+            param.data.to_local().copy_(local_shard)
+        else:
+            param.data.copy_(saved_tensor.to(param.data.device))
+        loaded += 1
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        import logging
+
+        logging.getLogger(__name__).info(f"_set_peft_state_dict: loaded {loaded} params, skipped {skipped} keys")
 
 
 def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
@@ -106,12 +198,7 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
-    for name, param in model.named_parameters(remove_duplicate=False):
-        if "lm_head" in name and name.endswith(".weight"):
-            normalized_name = name.replace("_orig_mod.", "")
-            return param, normalized_name
-
-    return None, None
+    return get_lm_head_weight_and_name(model)
 
 
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
@@ -153,9 +240,10 @@ class ModelState:
                 - ["score."] for some classification heads
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
-        self.is_tied_lm_head = is_tied_word_embeddings(self.model[0])
+        self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
+        self.has_local_tied_lm_head = has_local_tied_lm_head(self.model[0])
 
-        if self.is_tied_lm_head:
+        if self.uses_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             self.lm_head_param_name = lm_head_param_name
         self.is_peft = is_peft
@@ -172,11 +260,13 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        # For PEFT models with quantized parameters (e.g., QLoRA with BitsAndBytes),
-        # bypass PyTorch DCP's get_model_state_dict() which fails when traversing
-        # quantized parameter types like Params4bit. Instead, directly collect
+        # For PEFT models with quantized parameters or expert parallelism, bypass
+        # PyTorch DCP's get_model_state_dict() which fails when: (1) traversing
+        # quantized parameter types like Params4bit (QLoRA with BitsAndBytes); or
+        # (2) expert weights are sharded across EP ranks (MoE+EP), causing DCP to
+        # raise KeyError on expert-parallel FQNs. Instead, directly collect
         # trainable PEFT adapter weights.
-        if self.is_peft and _has_quantized_params(self.model[0]):
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
             options = None
@@ -186,8 +276,13 @@ class ModelState:
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
-        if self.is_tied_lm_head:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+        # @akoumpa: the second is_peft statement above keeps buffers in the state dict
+        # this filtering removes them.
+        # TODO: this is a hack and we should find a better way to do this.
+        if self.is_peft:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+
+        if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
         if self.is_peft and not _has_quantized_params(self.model[0]):
@@ -216,27 +311,33 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
+            # @akoumpa: I'm not sure about this code.
+            # For EP models, DCP's set_model_state_dict silently skips EP-sharded
+            # LoRA params (strict=False hides the FQN mismatch caused by custom
+            # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
+            if _has_expert_parallelism(self.model[0]):
+                for model_part in self.model:
+                    _set_peft_state_dict(model_part, state_dict)
+                return
             options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
-        if self.is_tied_lm_head and not self.is_peft:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
-            lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
-            # Skip for Biencoder models as it doesn't have a lm_head at the top level
-            if lm_head_weight is not None and lm_head_param_name not in state_dict:
-                # weight tying guarantees this is identical to the embedding weight
-                state_dict[lm_head_param_name] = lm_head_weight.detach()
+        if self.uses_tied_lm_head and not self.is_peft:
+            materialize_missing_tied_lm_head(
+                state_dict,
+                self.model[0],
+                allow_current_lm_head_fallback=True,
+            )
 
-        func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
-        list(map(func, self.model))
+        for model_part in self.model:
+            set_model_state_dict(model_part, state_dict, options=options)
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
 
-        if self.is_tied_lm_head:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+        if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
         if self.is_peft:
@@ -312,12 +413,13 @@ class OptimizerState:
         Returns:
             dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
         """
-        # For PEFT models with quantized parameters (e.g., QLoRA with BitsAndBytes),
-        # bypass PyTorch DCP's get_optimizer_state_dict() which fails because DCP
-        # cannot build a consistent parameter-ID-to-FQN mapping when the model
-        # contains quantized frozen params (Params4bit/Int8Params) alongside
-        # trainable LoRA params. Use native optimizer state_dict instead.
-        if self.is_peft and _has_quantized_params(self.model[0]):
+        # For PEFT models with quantized parameters or expert parallelism, bypass
+        # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
+        # build a consistent parameter-ID-to-FQN mapping when the model contains
+        # quantized frozen params (Params4bit/Int8Params) alongside trainable LoRA
+        # params, or when expert weights are sharded across EP ranks (MoE+EP) and
+        # the optimizer only tracks trainable params. Use native state_dict instead.
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             optimizer_state_dict = self.optimizer[0].state_dict()
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
@@ -343,8 +445,8 @@ class OptimizerState:
         Args:
             state_dict (dict): State dictionary containing optimizer and scheduler states to load.
         """
-        # For PEFT + quantized models, use native load to match the native save path.
-        if self.is_peft and _has_quantized_params(self.model[0]):
+        # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
+        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             self.optimizer[0].load_state_dict(state_dict["optim"])
         else:
             # sets our state dicts on the optimizer, now that we've loaded

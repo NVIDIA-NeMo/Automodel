@@ -43,7 +43,9 @@ except ImportError:
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
@@ -350,9 +352,27 @@ class BaseRecipe:
             # Unwrap DDP if present
             if isinstance(unwrapped_model, DistributedDataParallel):
                 unwrapped_model = unwrapped_model.module
-            unwrapped_model.save_pretrained(
-                save_directory=path, checkpointer=self.checkpointer, tokenizer=tokenizer, peft_config=self.peft_config
-            )
+            # Models with HFCheckpointingMixin route save_pretrained through checkpointer.save_model (DCP).
+            # Models without it (e.g. diffusers) would use their native save_pretrained which fails on
+            # FSDP2-sharded DTensors, so fall back to checkpointer.save_model directly.
+            if hasattr(unwrapped_model, "save_pretrained") and hasattr(unwrapped_model.save_pretrained, "__func__"):
+                from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+
+                if isinstance(unwrapped_model, HFCheckpointingMixin):
+                    unwrapped_model.save_pretrained(
+                        save_directory=path,
+                        checkpointer=self.checkpointer,
+                        tokenizer=tokenizer,
+                        peft_config=self.peft_config,
+                    )
+                else:
+                    self.checkpointer.save_model(
+                        model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                    )
+            else:
+                self.checkpointer.save_model(
+                    model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
+                )
 
         # Sync before checkpointing for Dion
         optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
@@ -652,6 +672,7 @@ class BaseRecipe:
         attrs = {
             "Gradient accumulation steps": step_scheduler.grad_acc_steps,
             "Checkpoint every steps": step_scheduler.ckpt_every_steps,
+            "Garbage collect every steps": getattr(step_scheduler, "gc_every_steps", None),
             "Current Epoch": step_scheduler.epoch,
             "Number of epochs": step_scheduler.num_epochs,
             "Validation every steps": step_scheduler.val_every_steps,
@@ -661,12 +682,34 @@ class BaseRecipe:
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
 
+    def _setup_garbage_collection(self, step_scheduler: StepScheduler | None = None) -> None:
+        """Initialize manual garbage collection based on step scheduler config."""
+        if step_scheduler is None:
+            step_scheduler = getattr(self, "step_scheduler", None)
+
+        gc_every_steps = getattr(step_scheduler, "gc_every_steps", None)
+        if gc_every_steps is None:
+            self.garbage_collector = None
+            return
+
+        self.garbage_collector = GarbageCollection(gc_every_steps=gc_every_steps)
+
+    def _maybe_collect_garbage(self) -> None:
+        """Run manual garbage collection if the current step is configured for it."""
+        step_scheduler = getattr(self, "step_scheduler", None)
+        garbage_collector = getattr(self, "garbage_collector", None)
+        if step_scheduler is None or garbage_collector is None:
+            return
+
+        garbage_collector.run(step_scheduler.step)
+
     def _get_dp_group(self, include_cp: bool = False):
         if not self.device_mesh:
             return None
+
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh["dp_cp"].get_group()
-        return self.device_mesh["dp"].get_group()
+            return get_flat_mesh(self.device_mesh, "dp_cp").get_group()
+        return get_flat_mesh(self.device_mesh, "dp").get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
@@ -689,9 +732,10 @@ class BaseRecipe:
             if dist.is_initialized():
                 return dist.get_rank()
             return 0
+
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh.get_local_rank("dp_cp")
-        return self.device_mesh.get_local_rank("dp")
+            return get_flat_mesh(self.device_mesh, "dp_cp").get_local_rank()
+        return get_flat_mesh(self.device_mesh, "dp").get_local_rank()
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -711,6 +755,40 @@ class BaseRecipe:
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
+
+    def _make_progress_bar(self):
+        """Create a tqdm progress bar on rank 0; returns None on other ranks."""
+        if not _is_rank_0():
+            return None
+        from tqdm import tqdm
+
+        return tqdm(
+            total=getattr(self.step_scheduler, "max_steps", None),
+            initial=getattr(self.step_scheduler, "step", 0),
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
+        )
+
+    def _update_progress_bar(self, pbar, metrics: dict) -> None:
+        """Update tqdm bar with loss/lr/tps from a metrics dict (no-op if pbar is None)."""
+        if pbar is None:
+            return
+        postfix = {}
+        for loss_key in ("loss", "Loss/Train_Total"):
+            if loss_key in metrics:
+                postfix["loss"] = f"{metrics[loss_key]:.4f}"
+                break
+        for lr_key in ("lr", "Train/lr"):
+            if lr_key in metrics:
+                postfix["lr"] = f"{metrics[lr_key]:.2e}"
+                break
+        for tps_key in ("tps", "Train/tps"):
+            if tps_key in metrics:
+                postfix["tps"] = f"{metrics[tps_key]:.0f}"
+                break
+        pbar.set_postfix(**postfix)
+        pbar.update(1)
 
 
 def _find_latest_checkpoint(checkpoint_dir):

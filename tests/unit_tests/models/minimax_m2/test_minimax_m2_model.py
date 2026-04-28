@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -24,11 +25,16 @@ class MockMiniMaxM2Config:
     max_position_embeddings: int = 256
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
+    rope_parameters: dict = None
     num_local_experts: int = 4
     num_experts_per_tok: int = 2
     scoring_func: str = "sigmoid"
     use_qk_norm: bool = True
     torch_dtype: str = "bfloat16"
+
+    def __post_init__(self):
+        if self.rope_parameters is None:
+            self.rope_parameters = {"rope_theta": self.rope_theta, "rope_type": "default"}
 
 
 @pytest.fixture
@@ -61,7 +67,7 @@ def moe_config():
         n_expert_groups=0,
         n_limited_groups=0,
         train_gate=True,
-        gate_bias_update_factor=0.0,
+        gate_bias_update_factor=1e-3,
         score_func="sigmoid",
         route_scale=1.0,
         aux_loss_coeff=0.0,
@@ -71,6 +77,88 @@ def moe_config():
         expert_activation="swiglu",
         dtype=torch.bfloat16,
     )
+
+
+@dataclass
+class MockMiniMaxM2ConfigNoRopeParams:
+    """Simulates a real HF MiniMaxM2Config that lacks a rope_parameters attribute."""
+
+    vocab_size: int = 128
+    hidden_size: int = 64
+    intermediate_size: int = 32
+    num_hidden_layers: int = 2
+    num_attention_heads: int = 4
+    num_key_value_heads: int = 2
+    head_dim: int = 16
+    rotary_dim: int = 8
+    max_position_embeddings: int = 256
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 5000000.0
+    num_local_experts: int = 4
+    num_experts_per_tok: int = 2
+    scoring_func: str = "sigmoid"
+    use_qk_norm: bool = True
+    torch_dtype: str = "bfloat16"
+
+
+class TestRopeParametersFallback:
+    """Tests for the rope_parameters fallback when the HF config lacks it."""
+
+    def test_rope_parameters_constructed_when_missing(self, backend):
+        """When config has no rope_parameters attr, MiniMaxM2Model should construct it."""
+        cfg = MockMiniMaxM2ConfigNoRopeParams()
+        assert not hasattr(cfg, "rope_parameters")
+        model = MiniMaxM2Model(cfg, backend)
+        assert hasattr(cfg, "rope_parameters")
+        assert cfg.rope_parameters["rope_theta"] == 5000000.0
+        assert cfg.rope_parameters["rope_type"] == "default"
+        assert cfg.rope_parameters["partial_rotary_factor"] == pytest.approx(8 / 16)
+
+    def test_rope_parameters_constructed_when_none(self, backend):
+        """When config.rope_parameters is explicitly None, it should be populated."""
+        cfg = MockMiniMaxM2Config(rope_theta=500000.0)
+        cfg.rope_parameters = None
+        model = MiniMaxM2Model(cfg, backend)
+        assert cfg.rope_parameters is not None
+        assert cfg.rope_parameters["rope_theta"] == 500000.0
+
+    def test_rope_parameters_preserved_when_present(self, backend):
+        """When config already has rope_parameters, they should not be overwritten."""
+        custom_params = {"rope_theta": 42.0, "rope_type": "custom", "partial_rotary_factor": 0.25}
+        cfg = MockMiniMaxM2Config()
+        cfg.rope_parameters = custom_params
+        model = MiniMaxM2Model(cfg, backend)
+        assert cfg.rope_parameters is custom_params
+
+    def test_partial_rotary_factor_computation(self, backend):
+        """partial_rotary_factor should be rotary_dim / head_dim."""
+        cfg = MockMiniMaxM2ConfigNoRopeParams(rotary_dim=4, head_dim=16)
+        model = MiniMaxM2Model(cfg, backend)
+        assert cfg.rope_parameters["partial_rotary_factor"] == pytest.approx(0.25)
+
+    def test_defaults_when_rotary_dim_missing(self, backend):
+        """When rotary_dim is absent, partial_rotary_factor should default to 1.0 (head_dim/head_dim)."""
+        cfg = SimpleNamespace(
+            vocab_size=128, hidden_size=64, intermediate_size=32, num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+            max_position_embeddings=256, rms_norm_eps=1e-6, rope_theta=10000.0,
+            num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
+            use_qk_norm=True, torch_dtype="bfloat16",
+        )
+        model = MiniMaxM2Model(cfg, backend)
+        assert cfg.rope_parameters["partial_rotary_factor"] == pytest.approx(1.0)
+
+    def test_defaults_when_rope_theta_missing(self, backend):
+        """When rope_theta is absent, it should default to 5000000.0."""
+        cfg = SimpleNamespace(
+            vocab_size=128, hidden_size=64, intermediate_size=32, num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=16, rotary_dim=8,
+            max_position_embeddings=256, rms_norm_eps=1e-6,
+            num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
+            use_qk_norm=True, torch_dtype="bfloat16",
+        )
+        model = MiniMaxM2Model(cfg, backend)
+        assert cfg.rope_parameters["rope_theta"] == 5000000.0
 
 
 class TestMiniMaxM2Block:
@@ -115,3 +203,27 @@ class TestMiniMaxM2ForCausalLM:
             logits = model(input_ids)
 
         assert logits.shape == (2, 6, config.vocab_size)
+
+
+class TestMoeOverrides:
+    """Tests for the moe_overrides dict pattern."""
+
+    def test_moe_overrides_applied(self, config, backend):
+        """moe_overrides should merge into the default MoEConfig."""
+        model = MiniMaxM2Model(config, backend, moe_overrides={"gate_bias_update_factor": 0.5})
+        assert model.moe_config.gate_bias_update_factor == 0.5
+
+    def test_moe_overrides_preserves_defaults(self, config, backend):
+        """Unspecified fields should keep their defaults."""
+        model = MiniMaxM2Model(config, backend, moe_overrides={"gate_bias_update_factor": 0.5})
+        assert model.moe_config.aux_loss_coeff == 0
+
+    def test_moe_config_and_moe_overrides_raises(self, config, backend, moe_config):
+        """Passing both moe_config and moe_overrides should raise ValueError."""
+        with pytest.raises(ValueError, match="Cannot pass both"):
+            MiniMaxM2Model(config, backend, moe_config=moe_config, moe_overrides={"gate_bias_update_factor": 0.5})
+
+    def test_moe_overrides_via_causal_lm(self, config, backend):
+        """moe_overrides should flow from ForCausalLM to inner model."""
+        model = MiniMaxM2ForCausalLM(config, backend=backend, moe_overrides={"gate_bias_update_factor": 0.5})
+        assert model.model.moe_config.gate_bias_update_factor == 0.5

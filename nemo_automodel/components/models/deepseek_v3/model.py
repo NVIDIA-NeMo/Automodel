@@ -18,8 +18,14 @@ import torch
 import torch.nn as nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
@@ -114,11 +120,14 @@ class DeepseekV3Model(nn.Module):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         super().__init__()
         self.backend = backend
         self.config = config
-        self.moe_config = moe_config or MoEConfig(
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
@@ -128,12 +137,15 @@ class DeepseekV3Model(nn.Module):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-3,
             score_func="sigmoid",
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
         )
@@ -143,13 +155,14 @@ class DeepseekV3Model(nn.Module):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
+        rope_theta, rope_scaling, _ = get_rope_config(config)
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
                 config.qk_rope_head_dim,
                 self.max_seq_len,
-                config.rope_parameters["rope_theta"] if hasattr(config, "rope_parameters") else config.rope_theta,
-                config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             ),
             persistent=False,
         )
@@ -211,13 +224,12 @@ class DeepseekV3Model(nn.Module):
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
         with buffer_device:
+            rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.max_seq_len,
-                self.config.rope_parameters["rope_theta"]
-                if hasattr(self.config, "rope_parameters")
-                else self.config.rope_theta,
-                self.config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             )
             self.freqs_cis = self.freqs_cis.to(buffer_device)
             if self.embed_tokens is not None:
@@ -231,6 +243,8 @@ class DeepseekV3Model(nn.Module):
 
 
 class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+
     @classmethod
     def from_config(
         cls,
@@ -261,12 +275,30 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = DeepseekV3Model(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = DeepseekV3Model(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV3StateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -319,15 +351,14 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
+            rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.model.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.model.max_seq_len,
-                self.config.rope_parameters["rope_theta"]
-                if hasattr(self.config, "rope_parameters")
-                else self.config.rope_theta,
-                self.config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             )
 
 

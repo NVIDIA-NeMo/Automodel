@@ -19,19 +19,24 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.models.common import initialize_rms_norm_module
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 
 
 class NemotronV3Attention(nn.Module):
-    """Multi-headed attention for NemotronV3 (Nano-v3).
+    """GQA attention for NemotronV3 (no RoPE), compatible with TE/SDPA backends."""
 
-    This is a standard GQA attention module following the NemotronH architecture.
-    Uses PyTorch's scaled_dot_product_attention (SDPA) for the attention computation.
-    Note: RoPE is not applied in this module, matching the HF NemotronHAttention implementation.
-    """
-
-    def __init__(self, config):
+    def __init__(self, config, backend: BackendConfig | None = None):
         super().__init__()
+        self.backend = backend or BackendConfig()
 
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -40,64 +45,84 @@ class NemotronV3Attention(nn.Module):
         self.attention_bias = getattr(config, "attention_bias", False)
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
 
-        # Q, K, V, O projections
-        self.q_proj = nn.Linear(
-            self.hidden_size,
-            self.num_attention_heads * self.head_dim,
-            bias=self.attention_bias,
+        self.q_proj = initialize_linear_module(
+            self.backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, self.attention_bias
         )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=self.attention_bias,
+        self.k_proj = initialize_linear_module(
+            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=self.attention_bias,
+        self.v_proj = initialize_linear_module(
+            self.backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, self.attention_bias
         )
-        self.o_proj = nn.Linear(
-            self.num_attention_heads * self.head_dim,
-            self.hidden_size,
-            bias=self.attention_bias,
+        self.o_proj = initialize_linear_module(
+            self.backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, self.attention_bias
+        )
+
+        softmax_scale = self.head_dim**-0.5
+        self.attn_module, self.attn_func = initialize_attn_module_and_func(
+            attn_impl=self.backend.attn,
+            num_attention_heads=self.num_attention_heads,
+            num_qk_channels=self.head_dim,
+            num_v_channels=self.head_dim,
+            softmax_scale=softmax_scale,
+            num_gqa_groups=self.num_key_value_heads,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        past_key_values=None,
+        layer_idx: int | None = None,
+        **attn_kwargs,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = hidden_states.size()
+        if hidden_states.dim() == 2:
+            qkv_format = "thd"
+            num_tokens = hidden_states.shape[0]
+        else:
+            qkv_format = "bshd"
+            bsz, seqlen, _ = hidden_states.size()
 
-        # Compute Q, K, V
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
-        # Reshape to (B, H, S, D) for SDPA
-        q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # Inference path: KV cache with SDPA
+        if past_key_values is not None:
+            q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim).transpose(1, 2)
+            k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            if layer_idx is not None:
+                k, v = past_key_values.update(k, v, layer_idx)
+            is_causal = attention_mask is None and q.shape[2] > 1 and q.shape[2] == k.shape[2]
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+                enable_gqa=self.num_key_value_heads != self.num_attention_heads,
+            )
+            output = output.transpose(1, 2).contiguous()
+            output = output.view(bsz, seqlen, self.num_attention_heads * self.head_dim)
+            return self.o_proj(output)
 
-        # Run attention with SDPA
-        is_causal = attention_mask is None and seqlen > 1
-        output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-            enable_gqa=self.num_key_value_heads != self.num_attention_heads,
+        # Training path: backend-aware attention (TE or SDPA)
+        if qkv_format == "thd":
+            q = q.view(num_tokens, self.num_attention_heads, self.head_dim)
+            k = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
+            v = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
+        else:
+            q = q.view(bsz, seqlen, self.num_attention_heads, self.head_dim)
+            k = k.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+            v = v.view(bsz, seqlen, self.num_key_value_heads, self.head_dim)
+
+        q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask, self.backend.attn, **attn_kwargs
         )
-
-        # Reshape back to (B, S, H * D)
-        output = output.transpose(1, 2).contiguous()
-        output = output.view(bsz, seqlen, self.num_attention_heads * self.head_dim)
-
-        # Output projection
-        output = self.o_proj(output)
-
+        output = self.attn_func(q, k, v, **_attn_kwargs)
+        output = postprocess_output_for_attn(output, self.backend.attn)
+        flatten_dim = 2 if qkv_format == "bshd" else 1
+        output = self.o_proj(output.flatten(flatten_dim))
         return output
 
     @torch.no_grad()
@@ -107,13 +132,11 @@ class NemotronV3Attention(nn.Module):
         rescale_prenorm_residual: bool = True,
         buffer_device: torch.device | None = None,
     ) -> None:
-        """Initialize attention weights following NemotronV3 spec."""
         with buffer_device:
             for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
                 if proj.bias is not None:
                     nn.init.zeros_(proj.bias)
 
-            # Rescale o_proj for stable residual stream
             if rescale_prenorm_residual:
                 self.o_proj.weight /= math.sqrt(num_hidden_layers)
 
@@ -213,57 +236,262 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
 
+        # Context parallelism — set post-construction by the parallelizer
+        self.cp = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        past_key_values=None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
-        """Forward pass using fused CUDA kernels (training only).
+        """Forward pass with three code paths.
+
+        Path A (training): past_key_values is None → fully-fused kernel.
+        Path B (prefill): past_key_values present, seq_len > 1 → unfused scan + cache init.
+        Path C (decode): past_key_values present, seq_len == 1, has_previous_state → single-step update.
 
         Args:
             hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
             attention_mask: Optional attention mask (applied to padding)
+            past_key_values: Optional NemotronHybridCache instance.
+            cache_position: Token positions for cache updates.
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
         """
-        from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+        squeezed = hidden_states.dim() == 2
+        if squeezed:
+            hidden_states = hidden_states.unsqueeze(0)
 
-        # Apply mask to padding states if provided
+        batch_size, seq_len, _ = hidden_states.shape
+
+        use_cache = past_key_values is not None
+        use_precomputed_states = (
+            use_cache
+            and past_key_values.has_previous_state
+            and seq_len == 1
+            and cache_position is not None
+            and cache_position[0] > 0
+        )
+
+        # Build seq_idx for Mamba kernel (marks sequence boundaries for packing / CP).
+        seq_idx = kwargs.get("seq_idx", None)
+        if seq_idx is None and "cu_seqlens" in kwargs:
+            cu_seqlens = kwargs["cu_seqlens"]
+            # cu_seqlens from the THD batch is GLOBAL (pre-TE-partitioning).
+            # When CP is active, the mamba kernel receives the global sequence
+            # (after all-to-all gather).  Scale total_len by cp_size so that
+            # seq_idx has the correct global length.
+            cp_size = self.cp.cp_size if self.cp is not None else 1
+            total_len = (hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]) * cp_size
+            positions = torch.arange(total_len, device=hidden_states.device)
+            seq_idx = (torch.searchsorted(cu_seqlens[1:], positions)).unsqueeze(0).to(torch.int32)
+
+        # --- Path A: Training (no cache) → fused kernel ---
+        if not use_cache:
+            from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+
+            if attention_mask is not None:
+                hidden_states = hidden_states * attention_mask.unsqueeze(-1)
+
+            projected_states = self.in_proj(hidden_states)
+
+            dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
+
+            if self.cp is not None:
+                cu_seqlens_cp = kwargs.get("cu_seqlens")
+                # CP reorder helpers expect 2D [T, H] when cu_seqlens is provided (THD format).
+                # The mixer unsqueezes 2D input to [1, T, H] above, so squeeze back for CP methods.
+                if squeezed and cu_seqlens_cp is not None:
+                    projected_states = projected_states.squeeze(0)
+                projected_states = self.cp.pre_conv_ssm(projected_states, cu_seqlens=cu_seqlens_cp)
+                if squeezed and cu_seqlens_cp is not None:
+                    projected_states = projected_states.unsqueeze(0).contiguous()
+                A = -torch.exp(self.cp.get_A_log().float())
+
+                out = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.cp.get_conv1d_weight(),
+                    self.cp.get_conv1d_bias(),
+                    self.cp.get_dt_bias(),
+                    A,
+                    D=self.cp.get_D(),
+                    chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,
+                    activation=self.activation,
+                    rmsnorm_weight=None,
+                    outproj_weight=None,
+                    headdim=self.head_dim,
+                    ngroups=self.cp.n_groups_local,
+                    norm_before_gate=False,
+                    return_final_states=False,
+                    **dt_limit_kwargs,
+                )
+                if out.ndim == 4:
+                    out = out.reshape(out.shape[0], out.shape[1], -1)
+
+                # Squeeze back to 2D for post_conv_ssm when in THD mode.
+                if squeezed and cu_seqlens_cp is not None:
+                    out = out.squeeze(0)
+                out = self.cp.post_conv_ssm(out, cu_seqlens=cu_seqlens_cp)
+                if squeezed and cu_seqlens_cp is not None:
+                    out = out.unsqueeze(0)
+                out = self.norm(out, gate=None)
+                out = self.out_proj(out)
+                if squeezed:
+                    out = out.squeeze(0)
+                return out
+            else:
+                A = -torch.exp(self.A_log.float())
+
+                out = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=self.D,
+                    chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight,
+                    rmsnorm_eps=self.norm.variance_epsilon,
+                    outproj_weight=self.out_proj.weight,
+                    outproj_bias=self.out_proj.bias,
+                    headdim=self.head_dim,
+                    ngroups=self.n_groups,
+                    norm_before_gate=False,
+                    return_final_states=False,
+                    **dt_limit_kwargs,
+                )
+                if squeezed:
+                    out = out.squeeze(0)
+                return out
+
+        # --- Path C: Decode (single token, cached state) ---
+        if use_precomputed_states:
+            from causal_conv1d import causal_conv1d_update
+            from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+
+            if attention_mask is not None:
+                hidden_states = hidden_states * attention_mask.unsqueeze(-1)
+
+            projected_states = self.in_proj(hidden_states).squeeze(1)  # (B, proj_size)
+
+            gate, hidden_states_B_C, dt = projected_states.split(
+                [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+            )
+
+            # Conv update (single step)
+            hidden_states_B_C = causal_conv1d_update(
+                hidden_states_B_C,
+                past_key_values.conv_states[self.layer_idx],
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                self.activation,
+            )
+
+            groups_time_state_size = self.n_groups * self.ssm_state_size
+            hidden_states_inner, B, C = torch.split(
+                hidden_states_B_C,
+                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                dim=-1,
+            )
+
+            # Reshape for selective_state_update
+            A = -torch.exp(self.A_log.float())
+            A = A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias = self.dt_bias[:, None].expand(-1, self.head_dim)
+            D = self.D[:, None].expand(-1, self.head_dim)
+            B = B.view(batch_size, self.n_groups, self.ssm_state_size)
+            C = C.view(batch_size, self.n_groups, self.ssm_state_size)
+            hidden_states_reshaped = hidden_states_inner.view(batch_size, self.num_heads, self.head_dim)
+
+            hidden_states_inner = selective_state_update(
+                past_key_values.ssm_states[self.layer_idx],
+                hidden_states_reshaped,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z=None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+            )
+            hidden_states_inner = hidden_states_inner.view(batch_size, self.num_heads * self.head_dim)
+
+            # Gated RMSNorm + output projection
+            out = self.norm(hidden_states_inner, gate)
+            out = self.out_proj(out[:, None, :])  # unsqueeze seq dim back
+            return out
+
+        # --- Path B: Prefill (multi-token, cache init) ---
+        from causal_conv1d import causal_conv1d_fn
+        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
         if attention_mask is not None:
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
-        # Input projection
         projected_states = self.in_proj(hidden_states)
 
-        # Compute A from A_log
-        A = -torch.exp(self.A_log.float())
+        gate, hidden_states_B_C, dt = projected_states.split(
+            [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+        )
 
-        # Time step limit kwargs
+        # Store conv state for future decode steps
+        conv_states = F.pad(
+            hidden_states_B_C.permute(0, 2, 1),
+            (self.conv_kernel_size - hidden_states_B_C.shape[1], 0),
+        )
+        past_key_values.update_conv_state(self.layer_idx, conv_states, cache_position)
+
+        # Full-sequence conv1d (contiguous required by causal_conv1d kernel)
+        hidden_states_B_C = causal_conv1d_fn(
+            x=hidden_states_B_C.transpose(1, 2).contiguous(),
+            weight=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias,
+            activation=self.activation,
+        ).transpose(1, 2)[:, :seq_len]
+
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+        hidden_states_inner, B, C = torch.split(
+            hidden_states_B_C,
+            [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+            dim=-1,
+        )
+
+        A = -torch.exp(self.A_log.float())
         dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
-        # Fused kernel: conv1d + SSM scan + gated norm + output projection
-        out = mamba_split_conv1d_scan_combined(
-            projected_states,
-            self.conv1d.weight.squeeze(1),
-            self.conv1d.bias,
-            self.dt_bias,
+        # Chunk SSM scan
+        scan_output, ssm_state = mamba_chunk_scan_combined(
+            hidden_states_inner.view(batch_size, seq_len, -1, self.head_dim),
+            nn.functional.softplus(dt + self.dt_bias),
             A,
-            D=self.D,
+            B.view(batch_size, seq_len, self.n_groups, -1),
+            C.view(batch_size, seq_len, self.n_groups, -1),
             chunk_size=self.chunk_size,
+            D=self.D,
+            z=None,
             seq_idx=None,
-            activation=self.activation,
-            rmsnorm_weight=self.norm.weight,
-            rmsnorm_eps=self.norm.variance_epsilon,
-            outproj_weight=self.out_proj.weight,
-            outproj_bias=self.out_proj.bias,
-            headdim=self.head_dim,
-            ngroups=self.n_groups,
-            norm_before_gate=False,
-            return_final_states=False,
+            return_final_states=True,
             **dt_limit_kwargs,
         )
 
+        # Store SSM state for future decode steps
+        if ssm_state is not None:
+            past_key_values.ssm_states[self.layer_idx].copy_(ssm_state)
+
+        scan_output = scan_output.view(batch_size, seq_len, -1)
+
+        # Gated RMSNorm + output projection
+        out = self.norm(scan_output, gate)
+        out = self.out_proj(out)
         return out
 
     @torch.no_grad()
@@ -347,7 +575,7 @@ class NemotronV3Block(nn.Module):
         if self.block_type == "mamba":
             self.mixer = NemotronV3Mamba2Mixer(config, layer_idx=layer_idx)
         elif self.block_type == "attention":
-            self.mixer = NemotronV3Attention(config)
+            self.mixer = NemotronV3Attention(config, backend=backend)
         elif self.block_type == "mlp":
             from nemo_automodel.components.moe.layers import MLP
             from nemo_automodel.shared.utils import dtype_from_str
@@ -373,6 +601,18 @@ class NemotronV3Block(nn.Module):
             raise ValueError(f"Invalid block_type: {self.block_type}")
 
     @property
+    def layer_type(self):
+        """Map block_type to MoE parallelizer's layer_type convention."""
+        if self.block_type == "attention":
+            return "full_attention"
+        return self.block_type
+
+    @property
+    def self_attn(self):
+        """Alias for mixer, for compatibility with MoE parallelizer."""
+        return self.mixer
+
+    @property
     def mlp(self):
         """Return mixer for MoE blocks for compatibility with parallelizer."""
         if self.block_type == "moe":
@@ -383,6 +623,9 @@ class NemotronV3Block(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        past_key_values=None,
+        cache_position: torch.LongTensor | None = None,
+        **attn_kwargs,
     ) -> torch.Tensor:
         """Forward pass through the block.
 
@@ -392,6 +635,10 @@ class NemotronV3Block(nn.Module):
                 - For attention: 4D causal mask [batch, 1, seq_len, seq_len]
                 - For mamba: 2D padding mask [batch, seq_len]
                 - For mlp/moe: None
+            past_key_values: Optional NemotronHybridCache for KV/SSM caching.
+            cache_position: Token position indices for cache updates.
+            **attn_kwargs: Additional keyword arguments forwarded to attention layers
+                only (e.g. cu_seqlens, cp_size, cp_rank for Context Parallelism).
 
         Returns:
             Output tensor of shape (batch, seq_len, hidden_size)
@@ -408,13 +655,22 @@ class NemotronV3Block(nn.Module):
 
         # Apply mixer based on block type
         if self.block_type == "mamba":
-            # Mamba takes 2D attention_mask for padding
-            hidden_states = self.mixer(hidden_states, attention_mask=attention_mask)
+            hidden_states = self.mixer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                **attn_kwargs,
+            )
         elif self.block_type == "attention":
-            # Attention takes 4D causal mask
-            hidden_states = self.mixer(hidden_states, attention_mask=attention_mask)
+            hidden_states = self.mixer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                layer_idx=self.layer_idx,
+                **attn_kwargs,
+            )
         elif self.block_type in ["mlp", "moe"]:
-            # MLP/MoE don't use masks
             hidden_states = self.mixer(hidden_states)
         else:
             raise ValueError(f"Invalid block_type: {self.block_type}")
@@ -455,8 +711,9 @@ class NemotronV3Block(nn.Module):
             self.mixer.init_weights(buffer_device=buffer_device, init_std=init_std)
 
             # Override gate weight with normal (not trunc_normal) for backward compat
-            nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
-            if self.mixer.gate.bias is not None:
+            if hasattr(self.mixer.gate, "weight"):
+                nn.init.normal_(self.mixer.gate.weight, mean=0.0, std=init_std)
+            if hasattr(self.mixer.gate, "bias") and self.mixer.gate.bias is not None:
                 nn.init.zeros_(self.mixer.gate.bias)
 
             # Zero expert biases

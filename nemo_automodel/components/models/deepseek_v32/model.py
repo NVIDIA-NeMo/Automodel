@@ -22,7 +22,7 @@ the use of DeepseekV32MLA (with Indexer) instead of the standard MLA.
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common import BackendConfig, get_rope_config, initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,
     DeepseekV3ForCausalLM,
@@ -83,13 +83,16 @@ class DeepseekV32Model(DeepseekV3Model):
         backend: BackendConfig,
         *,
         moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
     ):
         # Call grandparent __init__ to skip DeepseekV3Model's __init__
         nn.Module.__init__(self)
 
         self.backend = backend
         self.config = config
-        self.moe_config = moe_config or MoEConfig(
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
@@ -99,12 +102,15 @@ class DeepseekV32Model(DeepseekV3Model):
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-3,
             score_func="sigmoid",
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -116,13 +122,14 @@ class DeepseekV32Model(DeepseekV3Model):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
+        rope_theta, rope_scaling, _ = get_rope_config(config)
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
                 config.qk_rope_head_dim,
                 self.max_seq_len,
-                config.rope_parameters["rope_theta"] if hasattr(config, "rope_parameters") else config.rope_theta,
-                config.rope_parameters if hasattr(config, "rope_parameters") else config.rope_scaling,
+                rope_theta,
+                rope_scaling,
             ),
             persistent=False,
         )
@@ -169,13 +176,31 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         self.config = config
         self.backend = backend or BackendConfig()
         # Use V3.2 Model instead of V3 Model
-        self.model = DeepseekV32Model(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = DeepseekV32Model(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             # Use V3.2 adapter instead of V3 adapter
             self.state_dict_adapter = DeepSeekV32StateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
 
 ModelClass = DeepseekV32ForCausalLM

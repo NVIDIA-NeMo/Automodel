@@ -1,22 +1,22 @@
-# Function Calling with NeMo Automodel using FunctionGemma
+# Function Calling with FunctionGemma
 
-This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270m function-calling model with NeMo Automodel on the xLAM function-calling dataset.
+This tutorial walks through fine-tuning [FunctionGemma](https://huggingface.co/google/functiongemma-270m-it), Google's 270M function-calling model, with NeMo AutoModel on the xLAM function-calling dataset.
 
 
-## FunctionGemma introduction
+## FunctionGemma Introduction
 FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 architecture with a function-calling chat format. It is intended to be fine-tuned for task-specific function calling, and its compact size makes it practical for edge or resource-constrained deployments.
-- Gemma 3 architecture, updated tokenizer and function-calling chat format.
+- Gemma 3 architecture, updated tokenizer, and function-calling chat format.
 - Trained specifically for function calling: multiple tool definitions, parallel calls, tool responses, and natural-language summaries.
 - Small/edge friendly: ~270M params for fast, dense inference on-device.
 - Text-only, function-oriented model (not a general dialogue model), best used after task-specific finetuning.
 
 ## Prerequisites
-- Install NeMo Automodel and its extras: `pip install nemo-automodel`.
-- A FunctionGemma checkpoint available locally or via https://huggingface.co/google/functiongemma-270m-it.
+- Install NeMo AutoModel and its extras: `pip install nemo-automodel`.
+- A FunctionGemma checkpoint available locally or using <https://huggingface.co/google/functiongemma-270m-it>.
 - Small model footprint: can be fine-tuned on a single GPU; scale batch/sequence as needed.
 
-## The xLAM dataset
-xLAM is a function-calling dataset containing user queries, tool schemas, and tool call traces. It covers diverse tools and arguments so models learn to emit structured tool calls.
+## xLAM Dataset
+The xLAM function-calling dataset contains user queries, tool schemas, and tool call traces. It covers diverse tools and arguments so models learn to emit structured tool calls.
 - Dataset URL: https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k
 - Each sample provides:
   - `query`: the user request.
@@ -84,39 +84,37 @@ def _format_example(
 
 
 
-## Run full-parameter SFT
-Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start finetune:
+## Run Full-Parameter SFT
+Use the ready-made config at [`examples/llm_finetune/gemma/functiongemma_xlam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/functiongemma_xlam.yaml) to start fine-tuning:
 
 
 
 With the config in place, launch training (8 GPUs shown; adjust `--nproc-per-node` as needed):
 
 ```bash
-torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
-You should be able to see training loss curve similar to the below:
+You should be able to see a training loss curve similar to the one shown below:
 
 <p align="center">
   <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
 </p>
 
 ## Run PEFT (LoRA)
-To apply LoRA (PEFT), uncomment the `peft` block in the recipe and tune rank/alpha/targets per the [SFT/PEFT guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/toolcalling.md). Example override:
+To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alpha/targets per the [SFT/PEFT guide](finetune.md). Example override:
 
 ```yaml
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 16
   use_triton: true
 ```
 Then fine-tune with the same recipe. Adjust the number of GPUs as needed.
 ```bash
-torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py \
-  --config examples/llm_finetune/gemma/functiongemma_xlam.yaml
+automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 <p align="center">

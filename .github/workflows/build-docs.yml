@@ -33,7 +33,7 @@ jobs:
   build-docs:
     needs: [pre-flight]
     if: needs.pre-flight.outputs.is_deployment_workflow != 'true'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.57.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.80.2
 
   build-docs-summary:
     needs: [pre-flight, build-docs]
@@ -45,6 +45,9 @@ jobs:
       && !cancelled()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}

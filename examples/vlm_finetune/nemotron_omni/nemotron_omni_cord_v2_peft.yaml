@@ -1,0 +1,116 @@
+# NemotronOmni LoRA fine-tuning on CORD-V2 (receipt OCR) dataset
+#
+# Run:
+#   cd automodel-omni
+#   PYTHONPATH=$(pwd):$PYTHONPATH automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 200
+  max_steps: 400
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  trust_remote_code: true
+  torch_dtype: torch.bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    enable_deepep: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision_model*"
+    - "*audio*"
+    - "*sound*"
+    - "*lm_head*"
+    - "*mlp1*"
+  dim: 64
+  alpha: 128
+  use_triton: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  trust_remote_code: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 4096
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
+  path_or_dataset: naver-clova-ix/cord-v2
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
+    max_length: 4096
+
+wandb:
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nemotron_omni_cordv2_v2_lora_400steps
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-3
+  weight_decay: 0.01
+  betas: [0.9, 0.95]

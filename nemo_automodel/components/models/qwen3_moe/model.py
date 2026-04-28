@@ -18,8 +18,14 @@ import torch
 import torch.nn as nn
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
@@ -91,15 +97,24 @@ class Block(nn.Module):
 
 
 class Qwen3MoeModel(nn.Module):
-    def __init__(self, config: Qwen3MoeConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Qwen3MoeConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3 MoE config -> our MoE wrapper
         # Qwen config fields from example config:
         # - hidden_size, intermediate_size, moe_intermediate_size, num_experts, num_experts_per_tok, norm_topk_prob
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
@@ -119,6 +134,9 @@ class Qwen3MoeModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=True,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -132,19 +150,16 @@ class Qwen3MoeModel(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
-        if hasattr(config, "rope_parameters"):
-            base = config.rope_parameters["rope_theta"]
-        else:
-            base = config.rope_theta
+        base, rope_scaling, _ = get_rope_config(config)
 
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
             base=base,
             dtype=torch.float32,
-            initial_context_length=4096,
-            scaling_factor=1.0,
-            ntk_alpha=1.0,
-            ntk_beta=32.0,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
 
@@ -233,12 +248,25 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3MoeStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -285,7 +313,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

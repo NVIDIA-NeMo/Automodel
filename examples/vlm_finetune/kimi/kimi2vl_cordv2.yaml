@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# To run this recipe:
+#   automodel examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 2
@@ -53,7 +59,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: te
+    rms_norm: torch_fp32
     rope_fusion: true
     enable_deepep: true
     fake_balanced_gate: false
@@ -113,3 +119,6 @@ freeze_config:
 #   project: <your_project_name>
 #   entity: <your_entity_name>
 #   name: kimi2vl_finetune
+
+ci:
+  recipe_owner: akoumpa

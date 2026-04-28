@@ -1,6 +1,6 @@
-# YAML Configuration and Environment Variable Interpolation
+# YAML Configuration
 
-NeMo Automodel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
+NeMo AutoModel recipes are configured with YAML. Under the hood, YAML is parsed into a `ConfigNode` which:
 
 - Translates common scalar strings into typed Python values (e.g., `"10"` → `10`).
 - Resolves `_target_` (and `*_fn`) into Python callables/classes.
@@ -10,7 +10,7 @@ NeMo Automodel recipes are configured with YAML. Under the hood, YAML is parsed 
 
 ## Load Model and Dataset Configs
 
-Most recipes load the YAML via `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
+Most recipes load the YAML using `nemo_automodel.components.config.loader.load_yaml_config()`, which returns a `ConfigNode`.
 
 Within a `ConfigNode`:
 
@@ -32,7 +32,7 @@ YAML-native types (like `step_size: 10` without quotes) are already typed by the
 
 ## Use `_target_` for Instantiation
 
-Any mapping containing a `_target_` key can be instantiated via `ConfigNode.instantiate()`:
+Any mapping containing a `_target_` key can be instantiated using `ConfigNode.instantiate()`:
 
 ```yaml
 model:
@@ -53,10 +53,14 @@ By default, resolving targets is restricted:
 - Accessing private or dunder attributes is blocked by default.
 - Loading out-of-tree user code can be enabled with `NEMO_ENABLE_USER_MODULES=1` or by calling `set_enable_user_modules(True)`.
 
+## Distributed Section (Strategy-Based)
+
+The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema: use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`, plus optional parallelism sizes (`dp_size`, `tp_size`, `pp_size`, etc.) and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. See the [Pipelining](pipelining.md) guide and recipe example configs for full examples.
+
 
 ## Interpolate Environment Variables in YAML
 
-NeMo Automodel supports env var interpolation inside YAML **string values**.
+NeMo AutoModel supports env var interpolation inside YAML **string values**.
 
 ### Supported Forms
 
@@ -75,7 +79,7 @@ NeMo Automodel supports env var interpolation inside YAML **string values**.
 
 - Interpolation happens when values are wrapped into a `ConfigNode`.
 - If a referenced env var is **missing** and **no default** is provided, config loading raises a `KeyError`.
-- Defaults are supported only for braced forms via the first comma: `${VAR,default_value}`.
+- Defaults are supported only for braced forms using the first comma: `${VAR,default_value}`.
 
 ### Example (Databricks Delta)
 
@@ -102,24 +106,18 @@ Printing a **leaf value** (for example, `print(cfg.dataset.delta_storage_options
 :::
 
 
-## Configure Slurm (`automodel` CLI)
+## Configure Slurm
 
-The `automodel` CLI loads YAML via `yaml.safe_load()` and then extracts the `slurm:` section.
-Since the `slurm:` dict is not wrapped into a `ConfigNode`, **env placeholders are passed through as-is**. This lets you defer expansion to job runtime (and avoids embedding secrets into generated scripts).
+SLURM jobs are submitted with `sbatch` directly — no YAML section needed.
+Copy the reference script, edit `CONFIG` and cluster settings, then submit:
 
-Example:
-
-```yaml
-slurm:
-  hf_home: ${HF_HOME}        # passed through to the template as-is
-  hf_token: ${HF_TOKEN}      # also passed through (recommended for secrets)
-  env_vars:
-    WANDB_API_KEY: ${WANDB_API_KEY}
+```bash
+cp slurm.sub my_cluster.sub
+vim my_cluster.sub
+sbatch my_cluster.sub
 ```
 
-:::{note}
-- `job_dir` is used by the CLI on the submit host to create the local log directory and write the sbatch script/config. If you set `job_dir` to a placeholder like `${SLURM_JOB_DIR}`, the CLI will treat it literally.
-- Some values are rendered into `#SBATCH` directives (which are **not** shell-expanded). Prefer env placeholders for runtime `export ...` lines (`hf_token`, `env_vars`, etc.), not for SBATCH fields.
-- The `slurm:` section is passed through to a **bash script**. Use bash-compatible syntax (`$VAR` / `${VAR}`) there. Python-only forms like `${oc.env:VAR}` (and dotted names like `${foo.bar}`) are not valid bash parameter expansions and can fail at runtime.
-:::
+All cluster-specific configuration (SBATCH directives, container image, mounts,
+secrets, environment variables) lives in your sbatch script.  See
+[Run on a Cluster](../launcher/slurm.md) for full examples.
 

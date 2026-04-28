@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config examples/llm_finetune/nemotron/nemotron_nano_9b_squad_peft.yaml
-# Adjust --nproc-per-node to the number of GPUs available on your host machine.
 
+# To run this recipe:
+#   automodel examples/llm_finetune/nemotron/nemotron_nano_9b_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64
@@ -27,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 20
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -48,9 +50,15 @@ compile:
   dynamic: true  # Set to false for better performance with fixed shapes
   backend: null  # Use default backend (inductor)
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
   dim: 8
   alpha: 32
   use_triton: True
@@ -99,3 +107,17 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  vllm_deploy: true
+  recipe_owner: HuiyingLi
+  time: "00:25:00"
+  checkpoint_robustness:
+    kl_threshold: 5e-3
+    hf_kl_threshold: 5e-3
+    distributed.tp_size: 2
+    tokenizer_name: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+    trust_remote_code: true
+    no_check_resume: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

@@ -17,8 +17,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
+from nemo_automodel.components.models.common import (
+    BackendConfig,
+    get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.minimax_m2.layers import MiniMaxM2Attention
 from nemo_automodel.components.models.minimax_m2.state_dict_adapter import MiniMaxM2StateDictAdapter
@@ -74,17 +80,26 @@ class Block(nn.Module):
 
 
 class MiniMaxM2Model(nn.Module):
-    def __init__(self, config: Any, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Any,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         # Keep compatibility with generic MoE utilities that read config.num_experts.
         self.config.num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", None))
 
         score_func = getattr(config, "scoring_func", "sigmoid")
         score_func = "softmax" if str(score_func).lower() == "softmax" else "sigmoid"
 
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.intermediate_size,
@@ -94,10 +109,10 @@ class MiniMaxM2Model(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            gate_bias_update_factor=0.0,
+            gate_bias_update_factor=1e-3,
             score_func=score_func,
             route_scale=1.0,
-            aux_loss_coeff=getattr(config, "router_aux_loss_coef", 0.0),
+            aux_loss_coeff=0,
             norm_topk_prob=True,
             router_bias=False,
             expert_bias=False,
@@ -106,6 +121,9 @@ class MiniMaxM2Model(nn.Module):
             force_e_score_correction_bias=True,
             dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -122,20 +140,23 @@ class MiniMaxM2Model(nn.Module):
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
-        # Resolve partial_rotary_factor the same way HF does: from rope_parameters dict,
-        # defaulting to 1.0. Note: config.rotary_dim is NOT used by HF's RoPE init.
-        if hasattr(config, "rope_parameters") and isinstance(config.rope_parameters, dict):
-            partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
-        else:
-            partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        if not hasattr(config, "rope_parameters") or config.rope_parameters is None:
+            rotary_dim = getattr(config, "rotary_dim", self.head_dim)
+            config.rope_parameters = {
+                "rope_theta": getattr(config, "rope_theta", 5000000.0),
+                "rope_type": "default",
+                "partial_rotary_factor": rotary_dim / self.head_dim,
+            }
+
+        base, rope_scaling, partial_rotary_factor = get_rope_config(config)
         self.rotary_emb = RotaryEmbedding(
             head_dim=self.head_dim,
-            base=getattr(config, "rope_theta", 10000),
+            base=base,
             dtype=torch.float32,
-            initial_context_length=4096,
-            scaling_factor=1.0,
-            ntk_alpha=1.0,
-            ntk_beta=32.0,
+            initial_context_length=rope_scaling.get("original_max_position_embeddings", 4096),
+            scaling_factor=rope_scaling.get("factor", 1.0),
+            ntk_alpha=rope_scaling.get("beta_slow", 1.0),
+            ntk_beta=rope_scaling.get("beta_fast", 32.0),
             partial_rotary_factor=partial_rotary_factor,
             device=torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"),
         )
@@ -233,7 +254,13 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = MiniMaxM2Model(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = MiniMaxM2Model(
+            config,
+            backend=self.backend,
+            moe_config=moe_config,
+            moe_overrides=moe_overrides,
+        )
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = MiniMaxM2StateDictAdapter(
@@ -242,6 +269,18 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 self.backend,
                 dtype=get_dtype(getattr(config, "torch_dtype", "bfloat16"), torch.bfloat16),
             )
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -290,7 +329,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 

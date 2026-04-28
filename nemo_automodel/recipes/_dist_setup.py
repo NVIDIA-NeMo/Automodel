@@ -28,6 +28,7 @@ from nemo_automodel.components.distributed.mesh import (
 )
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
+from nemo_automodel.shared.utils import dtype_from_str
 
 _PARALLELISM_DEFAULTS: Dict[str, Any] = {
     "tp_size": 1,
@@ -76,7 +77,14 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     strategy_cls = STRATEGY_MAP[strategy_name]
 
     # -- parallelism sizes --------------------------------------------------
-    parallelism = {k: cfg.pop(k, default) for k, default in _PARALLELISM_DEFAULTS.items()}
+    # Use `val if val is not None` so that explicit YAML nulls (``ep_size:``
+    # or ``ep_size: null``) fall back to the default instead of propagating
+    # None — dict.pop only returns the default when the key is *absent*.
+    parallelism = {
+        k: (v if v is not None else default)
+        for k, default in _PARALLELISM_DEFAULTS.items()
+        for v in [cfg.pop(k, default)]
+    }
 
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
@@ -93,17 +101,59 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # Everything still in *cfg* is forwarded to the strategy constructor.
     strategy_kwargs: Dict[str, Any] = cfg
 
+    # Instantiate mp_policy from YAML dict for the strategy config.
+    # Follows the same ``_target_`` pattern used for MoE mp_policy below.
+    if "mp_policy" in strategy_kwargs:
+        mp_raw = strategy_kwargs["mp_policy"]
+        if isinstance(mp_raw, dict):
+            mp_raw = mp_raw.copy()
+            target = mp_raw.pop("_target_", None)
+            for key in ("param_dtype", "reduce_dtype", "output_dtype"):
+                if key in mp_raw and isinstance(mp_raw[key], str):
+                    mp_raw[key] = dtype_from_str(mp_raw[key])
+            if target is not None and callable(target):
+                strategy_kwargs["mp_policy"] = target(**mp_raw)
+            else:
+                from torch.distributed.fsdp import MixedPrecisionPolicy
+
+                strategy_kwargs["mp_policy"] = MixedPrecisionPolicy(**mp_raw)
+
+    # Instantiate offload_policy from YAML dict (same ``_target_`` pattern).
+    if "offload_policy" in strategy_kwargs:
+        op_raw = strategy_kwargs["offload_policy"]
+        if isinstance(op_raw, dict):
+            op_raw = op_raw.copy()
+            target = op_raw.pop("_target_", None)
+            if target is not None:
+                if isinstance(target, str):
+                    # Resolve dotted path to class
+                    import importlib
+
+                    mod_path, cls_name = target.rsplit(".", 1)
+                    target = getattr(importlib.import_module(mod_path), cls_name)
+                strategy_kwargs["offload_policy"] = target(**op_raw)
+            else:
+                from torch.distributed.fsdp import CPUOffloadPolicy
+
+                strategy_kwargs["offload_policy"] = CPUOffloadPolicy(**op_raw)
+
+    # Convert autocast_dtype string to torch.dtype if present.
+    if "autocast_dtype" in strategy_kwargs:
+        val = strategy_kwargs["autocast_dtype"]
+        if isinstance(val, str):
+            strategy_kwargs["autocast_dtype"] = dtype_from_str(val)
+
     _validate_strategy_kwargs(strategy_name, strategy_cls, strategy_kwargs)
 
     # Route activation_checkpointing: for non-EP configs it goes on the
     # strategy config; for EP configs it stays only on MeshContext
     # (the MoE infra reads it from there).
-    ep_size: int = parallelism.get("ep_size", 1)
+    ep_size: int = parallelism.get("ep_size") or 1
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
     # current parallelism sizes (e.g. pipeline section present but pp_size=1,
     # which is common when a YAML template is overridden via CLI).
-    pp_size: int = parallelism.get("pp_size", 1)
+    pp_size: int = parallelism.get("pp_size") or 1
     if pipeline_dict is not None and pp_size <= 1:
         pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
@@ -113,7 +163,24 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     strategy_config = strategy_cls(**strategy_kwargs)
 
-    pipeline_config = PipelineConfig(**pipeline_dict) if pipeline_dict is not None else None
+    if pipeline_dict is not None:
+        pipeline_config = PipelineConfig(**pipeline_dict)
+    elif pp_size > 1:
+        pipeline_config = PipelineConfig()
+    else:
+        pipeline_config = None
+
+    # Instantiate nested _target_ configs (e.g. mp_policy) before constructing MoEParallelizerConfig
+    if moe_dict is not None and "mp_policy" in moe_dict:
+        mp_raw = moe_dict["mp_policy"]
+        if isinstance(mp_raw, dict) and callable(mp_raw.get("_target_")):
+            mp_raw = mp_raw.copy()
+            target = mp_raw.pop("_target_")
+            for key in ("param_dtype", "reduce_dtype", "output_dtype"):
+                if key in mp_raw and isinstance(mp_raw[key], str):
+                    mp_raw[key] = dtype_from_str(mp_raw[key])
+            moe_dict["mp_policy"] = target(**mp_raw)
+
     moe_config = MoEParallelizerConfig(**(moe_dict or {})) if ep_size > 1 else None
 
     # Full cross-field validation is deferred to MeshContext.__post_init__
@@ -145,7 +212,7 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
     """
     from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
-    cfg_dict = cfg.distributed.to_dict()
+    cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
     parsed = parse_distributed_section(cfg_dict)
 
     device_mesh, moe_mesh = create_device_mesh(

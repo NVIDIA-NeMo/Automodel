@@ -44,13 +44,15 @@ def _iter_fsdp_modules(module: torch.nn.Module) -> Iterator[FSDPModule]:
     if hasattr(module, "visual") and isinstance(module.visual, FSDPModule):
         yield module.visual
 
-    # Check experts in each layer
+    # Check experts in each layer (Qwen-style: block.mlp.experts; Gemma4-style: block.moe.experts)
     if hasattr(_model, "layers"):
         for _, block in _model.layers.named_children():
-            if hasattr(block, "mlp") and hasattr(block.mlp, "experts"):
-                experts = block.mlp.experts
-                if isinstance(experts, FSDPModule):
-                    yield experts
+            for attr in ("mlp", "moe"):
+                mod = getattr(block, attr, None)
+                if mod is not None and hasattr(mod, "experts"):
+                    experts = mod.experts
+                    if isinstance(experts, FSDPModule):
+                        yield experts
 
 
 def _configure_fsdp_module(
@@ -233,9 +235,14 @@ def patched_backward_maybe_with_nosync(
                 result = perform_backward(backward_type)()
     # If submod is a FSDP module
     elif isinstance(self.submod, FSDPModule):
-        self.submod.set_is_last_backward(False)
-        self.submod.set_reshard_after_backward(False)
-        self.submod.set_requires_gradient_sync(False)
+        if getattr(self, "_reduce_grad_per_microbatch", False):
+            self.submod.set_is_last_backward(True)
+            self.submod.set_reshard_after_backward(True)
+            self.submod.set_requires_gradient_sync(True)
+        else:
+            self.submod.set_is_last_backward(False)
+            self.submod.set_reshard_after_backward(False)
+            self.submod.set_requires_gradient_sync(False)
         result = perform_backward(backward_type)()
         if last_backward:
             # Manually call post backward for FSDP

@@ -1,0 +1,100 @@
+seed: 42
+
+wandb:
+  project: wan-t2v-flow-matching
+  mode: online
+  name: wan2_1_lora_run
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  # Required when peft block is present — triggers QKV unfuse before injection
+  # and is passed to auto_diffusion_pipeline for model-specific setup.
+  model_type: "wan"
+  mode: finetune
+
+# ── LoRA / PEFT configuration ─────────────────────────────────────────────────
+# Remove this section for full fine-tune.
+# Mirrors the LLM peft config pattern — PeftConfig is instantiated directly.
+# Note: unfuse_projections() is called automatically in the pipeline before injection.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "*.to_q"
+    - "*.to_k"
+    - "*.to_v"
+    - "*.to_out.0"
+
+optim:
+  learning_rate: 5e-6
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+# FSDP2 with param_dtype=None when LoRA enabled:
+#   base weights (bf16): sharded, no grad comms
+#   LoRA weights (fp32): sharded, grad allreduced by FSDP2
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  dp_size: 8
+
+flow_matching:
+  adapter_type: "simple"
+  adapter_kwargs: {}
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  i2v_prob: 0.3
+  use_loss_weighting: true
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  num_epochs: 100
+  log_every: 2
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
+
+ci:
+  recipe_owner: pthombre
+  time: "00:30:00"

@@ -21,4 +21,3 @@ TP_OUTPUT_PARITY_MINIFIED = "L2_TP_Output_Parity_Minified.sh"
 class TestTensorParallelOutputParityMinified:
     def test_tp2_vs_tp1_logits_kl_div_minified_models(self):
         run_test_script(TEST_FOLDER, TP_OUTPUT_PARITY_MINIFIED)
-

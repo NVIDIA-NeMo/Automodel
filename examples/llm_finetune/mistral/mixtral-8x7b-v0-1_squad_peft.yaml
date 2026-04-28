@@ -13,7 +13,11 @@
 # limitations under the License.
 
 # single node 8xh200
-# torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/mixtral/mixtral-8x7b-v0-1_squad_peft.yaml
+# To run this recipe:
+#   automodel examples/llm_finetune/mistral/mixtral-8x7b-v0-1_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
@@ -46,7 +50,7 @@ checkpoint:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -97,4 +101,9 @@ optimizer:
 
 lr_scheduler:
   lr_decay_style: cosine
-  min_lr: 1.0e-6 
+  min_lr: 1.0e-6
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 2
+  time: "00:35:00"

@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=8 recipes/llm_finetune/finetune.py --config recipes/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml
 
+# To run this recipe:
+#   automodel examples/llm_finetune/nemotron/llama3_3_nemotron_super_49B_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 8
@@ -26,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 20
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -48,7 +51,7 @@ compile:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -60,6 +63,12 @@ distributed:
   cp_size: 1
 
   sequence_parallel: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -97,3 +106,19 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  time: "01:00:00"
+  vllm_deploy: true
+  vllm_deploy_known_issue_id: AM-176
+  recipe_owner: HuiyingLi
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-3
+    resume_loss_threshold: 5e-2
+    trust_remote_code: true
+    distributed.tp_size: 2
+    tokenizer_name: nvidia/Llama-3_3-Nemotron-Super-49B-v1_5
+    check_fused_qkv_keys: true
+    hf_device_map_auto: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

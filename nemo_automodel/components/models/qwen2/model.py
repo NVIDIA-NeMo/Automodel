@@ -14,8 +14,8 @@
 
 """Custom Qwen2 model implementation for NeMo Automodel.
 
-This module provides a self-contained Qwen2 implementation with combined QKV/gate_up projections.
-Uses shared components from common/ for fused projections.
+This module provides a self-contained Qwen2 implementation with separate
+HuggingFace-style q/k/v and gate/up projections.
 
 Example (YAML):
 
@@ -23,8 +23,6 @@ Example (YAML):
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B
-  use_fused_qkv: true
-  use_fused_gate_up: true
 ```
 """
 
@@ -46,14 +44,16 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    CombinedGateUpMLP,
-    CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
 # Use shared rope_utils (same implementation as Llama, supports both config formats)
-from nemo_automodel.components.models.llama.rope_utils import Qwen2RotaryEmbedding, apply_rotary_pos_emb
+from nemo_automodel.components.models.llama.rope_utils import (
+    Qwen2RotaryEmbedding,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_fused,
+)
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
@@ -62,14 +62,10 @@ __all__ = ["Qwen2ForCausalLM"]
 check_model_inputs = get_check_model_inputs_decorator()
 
 
-class Qwen2Attention(CombinedQKVAttentionMixin, nn.Module):
-    """Multi-headed attention with combined QKV projection.
+class Qwen2Attention(nn.Module):
+    """Multi-headed attention with separate QKV projections — HuggingFace default layout."""
 
-    Uses CombinedQKVAttentionMixin for efficient combined QKV projection.
-    ALWAYS uses combined projections - this is the whole point of the custom implementation.
-    """
-
-    def __init__(self, config: Qwen2Config, layer_idx: int):
+    def __init__(self, config: Qwen2Config, layer_idx: int, backend: Optional["BackendConfig"] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -78,15 +74,12 @@ class Qwen2Attention(CombinedQKVAttentionMixin, nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.rope_fusion = getattr(backend, "rope_fusion", False)
 
-        # Setup combined QKV projection using mixin (ALWAYS combined in custom implementation)
-        self.setup_qkv_projection(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=self.head_dim,
-            bias=True,  # Qwen2 uses bias in attention
-        )
+        # Separate projections -- same layout as HuggingFace default Qwen2
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
 
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
@@ -103,15 +96,20 @@ class Qwen2Attention(CombinedQKVAttentionMixin, nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # Compute Q, K, V using mixin (handles fused or separate projection)
-        q, k, v = self.compute_qkv(hidden_states)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.rope_fusion and len(position_embeddings) == 3:
+            cos, sin, freqs_cis = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, freqs_cis)
+        else:
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -139,11 +137,27 @@ class Qwen2Attention(CombinedQKVAttentionMixin, nn.Module):
         return attn_output, attn_weights
 
 
-class Qwen2DecoderLayer(GradientCheckpointingLayer):
-    """Single Qwen2 decoder layer with RMSNorm, attention, and combined MLP.
+class Qwen2SeparateMLP(nn.Module):
+    """SwiGLU MLP with separate gate_proj and up_proj -- identical to HuggingFace default."""
 
-    ALWAYS uses combined projections - this is the whole point of the custom implementation.
-    """
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        from transformers.activations import ACT2FN
+
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        mlp_bias = getattr(config, "mlp_bias", False)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Qwen2DecoderLayer(GradientCheckpointingLayer):
+    """Single Qwen2 decoder layer with RMSNorm, attention, and MLP."""
 
     def __init__(
         self,
@@ -154,11 +168,9 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # ALWAYS use combined QKV in custom implementation
-        self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx, backend=backend)
 
-        # ALWAYS use combined gate_up MLP in custom implementation
-        self.mlp = CombinedGateUpMLP(config=config)
+        self.mlp = Qwen2SeparateMLP(config=config)
 
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
@@ -224,10 +236,7 @@ class Qwen2PreTrainedModel(PreTrainedModel):
 
 
 class Qwen2Model(Qwen2PreTrainedModel):
-    """Qwen2 transformer model (embeddings + decoder layers + norm).
-
-    ALWAYS uses combined projections - this is the whole point of the custom implementation.
-    """
+    """Qwen2 transformer model (embeddings + decoder layers + norm)."""
 
     def __init__(
         self,
@@ -239,7 +248,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        # ALWAYS use combined projections in all layers
         self.layers = nn.ModuleList(
             [
                 Qwen2DecoderLayer(
@@ -253,7 +261,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.norm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
         )
-        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        self.rotary_emb = Qwen2RotaryEmbedding(config=config, rope_fusion=backend.rope_fusion)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
@@ -304,7 +312,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
@@ -361,7 +369,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     """Qwen2 model with causal language modeling head.
 
-    ALWAYS uses combined projections - this is the whole point of the custom implementation.
+    Uses separate q/k/v and gate/up projections -- HuggingFace layout.
     """
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -375,7 +383,6 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     ):
         super().__init__(config)
         self.backend = backend or BackendConfig()
-        # ALWAYS use combined projections
         self.model = Qwen2Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -398,8 +405,19 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f"[Qwen2ForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print("[Qwen2ForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[Qwen2ForCausalLM] torch_dtype: {self.config.torch_dtype}")
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     @can_return_tuple
     def forward(

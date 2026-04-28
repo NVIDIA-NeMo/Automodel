@@ -28,28 +28,30 @@ concurrency:
 permissions:
   id-token: write
   contents: read
+  pull-requests: read
 
 env:
-  container-registry: nemoci.azurecr.io
+  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.69.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.80.1
     with:
-      default_runner_prefix: ${{ vars.DEFAULT_RUNNER_PREFIX }}
-      non_nvidia_runner_prefix: ${{ vars.NON_NVIDIA_RUNNER_PREFIX }}
-      default_test_data_path: ${{ vars.DEFAULT_TEST_DATA_PATH }}
-      non_nvidia_test_data_path: ${{ vars.NON_NVIDIA_TEST_DATA_PATH }}
+      default_runner_prefix: nemo-ci-aws-gpu-x2
+      non_nvidia_runner_prefix: nemo-ci-aws-gpu-x2-ephemeral
+      default_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
+      non_nvidia_test_data_path: /mnt/datadrive/TestData/nemo-fw/TestData
+      sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
     secrets:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Set up UV
@@ -75,12 +77,12 @@ jobs:
           uv run --active ruff format --check --verbose .
 
   import_linting:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Set up UV
@@ -103,8 +105,55 @@ jobs:
           source ./venv/bin/activate
           uv run lint-imports --debug --verbose --no-cache
 
+  type_checking:
+    runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Set up UV
+        uses: astral-sh/setup-uv@v1
+        with:
+          version: 0.8.22
+      - name: Install ty
+        env:
+          UV_PROJECT_ENVIRONMENT: ./venv
+        run: |
+          uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+          source ./venv/bin/activate
+
+          export PATH="./bin/:$PATH"
+
+          uv sync --link-mode copy --locked --group linting
+
+      - name: Run ty
+        run: |
+          source ./venv/bin/activate
+          uv run --active ty --version
+
+          uv pip install -q tomli
+          TY_DIRS=$(python3 -c "
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          dirs = set()
+          for override in data.get('tool', {}).get('ty', {}).get('overrides', []):
+              for pattern in override.get('include', []):
+                  dirs.add(pattern.replace('/**', ''))
+          print(' '.join(sorted(dirs)))
+          ")
+
+          echo "ty check targets: $TY_DIRS"
+          uv run --active ty check --verbose $TY_DIRS
+
   Nemo_Linting_Test:
-    needs: [linting, import_linting]
+    needs: [linting, import_linting, type_checking]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -112,17 +161,20 @@ jobs:
         env:
           LINTING_RESULT: ${{ toJson(needs.linting) }}
           IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
+          TYPE_CHECKING_RESULT: ${{ toJson(needs.type_checking) }}
         run: |
           LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
           IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
+          TYPE_CHECKING=$(echo "$TYPE_CHECKING_RESULT" | jq -r '.result')
 
-          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]]; then
+          if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]] && [[ "$TYPE_CHECKING" == "success" ]]; then
             echo "All linting checks passed."
             exit 0
           else
             echo "Some linting checks failed:"
             echo "  - linting: $LINTING"
             echo "  - import_linting: $IMPORT_LINTING"
+            echo "  - type_checking: $TYPE_CHECKING"
             exit 1
           fi
 
@@ -148,21 +200,16 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
-    environment: nemo-ci
+    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/build-container
         with:
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           dockerfile-path: "./docker/Dockerfile"
-          has-azure-credentials: "true"
           PAT: ${{ secrets.PAT }}
-          repo-name: "Automodel"
+          repo-name: ${{ vars.CI_REPO_NAME || 'Automodel' }}
 
   cicd-unit-tests:
     strategy:
@@ -171,16 +218,15 @@ jobs:
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
-            runner: linux-amd64-cpu16
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
           - test-name: L0_Unit_Tests_GPU
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
             timeout: 30
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
-    environment: nemo-ci
     if: |
       (
         success()
@@ -190,20 +236,16 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         with:
           timeout: ${{ matrix.timeout || 10 }}
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
-          has-azure-credentials: "true"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   cicd-e2e-tests:
@@ -215,47 +257,56 @@ jobs:
           - test-name: L2_Pretrain_and_KD
             test-folder: llm_pretrain_and_kd
             timeout: 20
-            runner: self-hosted-nemo
-            test-data-path: "/mnt/datadrive/TestData"
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
-            runner: self-hosted-nemo
-            test-data-path: "/mnt/datadrive/TestData"
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer
             test-folder: hf_transformer
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
             timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_LLM
             test-folder: hf_transformer_llm
             timeout: 40
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_HF_Transformer_VLM
             test-folder: hf_transformer_vlm
             timeout: 60
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Datasets
             test-folder: data
             timeout: 20
-            runner: ${{ needs.pre-flight.outputs.runner_prefix }}-gpu-x2
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Context_Parallel
+            test-folder: context_parallel
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          - test-name: L2_Retrieval
+            test-folder: retrieval
+            timeout: 20
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
-    environment: nemo-ci
     if: |
       (
         success()
@@ -265,20 +316,16 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions/test-template
         with:
           test-folder: ${{ matrix.test-folder }}
           timeout: ${{ matrix.timeout }}
           is_unit_test: "false"
-          has-azure-credentials: "true"
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ matrix.test-data-path }}
-          container-image: ${{ env.container-registry }}/automodel:${{ github.sha }}
+          container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
   Nemo_CICD_Test:
@@ -298,7 +345,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get workflow result
         id: result
@@ -330,10 +377,10 @@ jobs:
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
-    environment: nemo-ci
+      && vars.ENABLE_CODECOV == 'true'
     steps:
       - name: Generate fake coverage report
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
@@ -355,17 +402,24 @@ jobs:
         || success()
       )
       && !cancelled()
+      && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:
         flag: [unit-test, e2e]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
+          path: coverage-downloads
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
@@ -373,11 +427,15 @@ jobs:
         run: |
           pip install coverage[toml]
 
-          ls -al .
-          ls -al coverage-*/
-          coverage combine --keep $(ls coverage-*/.coverage)
+          if ! [ -d coverage-downloads ] || [ -z "$(ls -A coverage-downloads)" ]; then
+            echo "No coverage artifacts found for ${{ matrix.flag }}, skipping."
+            exit 0
+          fi
+          ls -al coverage-downloads/
+          coverage combine --keep $(find coverage-downloads -name '.coverage')
           coverage report -i
-          rm -rf coverage-*
+          coverage xml -i
+          rm -rf coverage-downloads
           ls -al
 
       - name: Upload coverage reports to Codecov
@@ -386,11 +444,29 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
             .coverage
           include-hidden-files: true
+
+  cleanup-taint-node:
+    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}
+    needs:
+      - pre-flight
+      - Nemo_CICD_Test
+      - Coverage
+      - Coverage_Fake
+    if: |
+      always()
+      && !cancelled()
+      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
+    steps:
+      - name: Taint node for cleanup
+        if: contains(runner.name, 'ephemeral')
+        shell: bash
+        run: taint-node.sh

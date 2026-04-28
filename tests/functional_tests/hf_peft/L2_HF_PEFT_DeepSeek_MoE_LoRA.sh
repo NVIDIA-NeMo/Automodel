@@ -18,7 +18,7 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
-coverage run --data-file=/workspace/.coverage --source=/workspace  \
+coverage run  \
 nemo_automodel/recipes/llm/train_ft.py \
     --config tests/functional_tests/hf_peft/deepseek_moe_lora_small_for_test.yaml \
     --step_scheduler.max_steps 10 \

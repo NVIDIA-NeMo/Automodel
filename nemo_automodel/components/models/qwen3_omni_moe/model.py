@@ -29,6 +29,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -42,15 +43,24 @@ class Qwen3OmniMoeThinkerTextModel(
 ):  # corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
 
-    def __init__(self, config: Qwen3OmniMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTextConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
@@ -70,6 +80,9 @@ class Qwen3OmniMoeThinkerTextModel(
             expert_activation="swiglu",
             softmax_before_topk=True,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -214,7 +227,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.backend = backend
 
         text_config = base_config.text_config if hasattr(base_config, "text_config") else base_config
-        self.model = Qwen3OmniMoeThinkerTextModel(text_config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Qwen3OmniMoeThinkerTextModel(
+            text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
+        )
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )
@@ -242,6 +258,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def forward(
         self,
@@ -314,7 +336,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         # Images
         if pixel_values is not None:
-            image_embeds, image_embeds_multiscale = self.get_image_features(pixel_values, image_grid_thw)
+            image_features = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = image_features.pooler_output
+            image_embeds_multiscale = image_features.deepstack_features
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -325,7 +349,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         # Videos
         if pixel_values_videos is not None:
-            video_embeds, video_embeds_multiscale = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_features = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = video_features.pooler_output
+            video_embeds_multiscale = video_features.deepstack_features
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -429,7 +455,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

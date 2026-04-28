@@ -13,11 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# export HF_HOME=/nemo-rl/hf_cache/
-# /nemo-rl/hemild/automodel-main/.venv/bin/torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/train_ft.py --config examples/llm_finetune/qwen3/qwen3_8b_hellaswag_pp_peft.yaml
-# This config combines Pipeline Parallelism with PEFT (LoRA) for efficient training
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_8b_hellaswag_pp_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 128
@@ -25,6 +26,7 @@ step_scheduler:
   ckpt_every_steps: 200
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -38,11 +40,10 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-8B
-  cache_dir: /nemo-rl/hf_cache/
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: False
@@ -93,7 +94,9 @@ validation_dataset:
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 168  # must match the training batch seq_len to avoid static PP shape mismatch
 
 optimizer:
   _target_: torch.optim.Adam
@@ -109,3 +112,6 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: hemildesai

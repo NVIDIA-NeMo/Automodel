@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwq_32b_squad_peft.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 4
@@ -37,7 +43,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -92,9 +98,14 @@ optimizer:
   weight_decay: 0
   # min_lr: 1.0e-5
 
+ci:
+  recipe_owner: adil-a
+  nodes: 4
+  local_batch_size: 2
+
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>

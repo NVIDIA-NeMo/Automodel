@@ -24,7 +24,6 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from nemo_automodel.recipes._dist_setup import parse_distributed_section
 
-
 # ---------------------------------------------------------------------------
 # Basic dict parsing
 # ---------------------------------------------------------------------------
@@ -65,8 +64,12 @@ class TestParsing:
     def test_all_parallelism_keys(self):
         cfg = {
             "strategy": "fsdp2",
-            "dp_size": 4, "tp_size": 2, "pp_size": 2,
-            "cp_size": 2, "ep_size": 2, "dp_replicate_size": 2,
+            "dp_size": 4,
+            "tp_size": 2,
+            "pp_size": 2,
+            "cp_size": 2,
+            "ep_size": 2,
+            "dp_replicate_size": 2,
         }
         result = parse_distributed_section(cfg)
         assert result["dp_size"] == 4
@@ -125,6 +128,13 @@ class TestPipeline:
     def test_pp_enabled_true_when_pp_gt_1(self):
         assert parse_distributed_section({"pp_size": 2})["pp_enabled"] is True
 
+    def test_default_pipeline_config_created_when_pp_gt_1_and_no_pipeline_dict(self):
+        """pp_size > 1 without a pipeline section must still yield a PipelineConfig."""
+        result = parse_distributed_section({"pp_size": 4})
+        assert result["pp_enabled"] is True
+        assert isinstance(result["pipeline_config"], PipelineConfig)
+        assert result["pipeline_config"].pp_schedule == "1f1b"
+
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
 
@@ -154,6 +164,63 @@ class TestMoE:
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
         assert isinstance(result["moe_config"], MoEParallelizerConfig)
         assert result["moe_config"].ignore_router_for_ac is False
+
+    def test_mp_policy_none_when_omitted(self):
+        result = parse_distributed_section({"ep_size": 2, "moe": {}})
+        assert result["moe_config"].mp_policy is None
+
+    def test_mp_policy_target_instantiated(self):
+        """mp_policy with resolved _target_ callable is instantiated to MixedPrecisionPolicy."""
+        import torch
+        from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
+
+        cfg = {
+            "ep_size": 2,
+            "moe": {
+                "mp_policy": {
+                    "_target_": MixedPrecisionPolicy,
+                    "param_dtype": "bfloat16",
+                    "reduce_dtype": "float32",
+                    "output_dtype": "bfloat16",
+                    "cast_forward_inputs": True,
+                }
+            },
+        }
+        result = parse_distributed_section(cfg)
+        mp = result["moe_config"].mp_policy
+        assert isinstance(mp, MixedPrecisionPolicy)
+        assert mp.param_dtype == torch.bfloat16
+        assert mp.reduce_dtype == torch.float32
+        assert mp.output_dtype == torch.bfloat16
+        assert mp.cast_forward_inputs is True
+
+    def test_mp_policy_in_to_dict(self):
+        from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
+
+        cfg = {
+            "ep_size": 2,
+            "moe": {
+                "mp_policy": {
+                    "_target_": MixedPrecisionPolicy,
+                    "param_dtype": "bfloat16",
+                    "reduce_dtype": "float32",
+                }
+            },
+        }
+        result = parse_distributed_section(cfg)
+        d = result["moe_config"].to_dict()
+        assert "mp_policy" in d
+        assert isinstance(d["mp_policy"], MixedPrecisionPolicy)
+
+    def test_mp_policy_passthrough_when_already_instantiated(self):
+        """MixedPrecisionPolicy object passed directly is kept as-is."""
+        import torch
+        from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
+
+        policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32)
+        cfg = {"ep_size": 2, "moe": {"mp_policy": policy}}
+        result = parse_distributed_section(cfg)
+        assert result["moe_config"].mp_policy is policy
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +313,11 @@ class TestValidation:
 class TestIntegration:
     def test_megatron_fsdp_with_valid_options(self):
         cfg = {
-            "strategy": "megatron_fsdp", "tp_size": 2,
-            "zero_dp_strategy": 2, "overlap_grad_reduce": False, "activation_checkpointing": True,
+            "strategy": "megatron_fsdp",
+            "tp_size": 2,
+            "zero_dp_strategy": 2,
+            "overlap_grad_reduce": False,
+            "activation_checkpointing": True,
         }
         result = parse_distributed_section(cfg)
         assert result["strategy_config"].zero_dp_strategy == 2
@@ -257,8 +327,14 @@ class TestIntegration:
 
     def test_fsdp2_full_config(self):
         cfg = {
-            "strategy": "fsdp2", "tp_size": 4, "pp_size": 2, "cp_size": 2, "dp_replicate_size": 2,
-            "sequence_parallel": True, "activation_checkpointing": True, "defer_fsdp_grad_sync": False,
+            "strategy": "fsdp2",
+            "tp_size": 4,
+            "pp_size": 2,
+            "cp_size": 2,
+            "dp_replicate_size": 2,
+            "sequence_parallel": True,
+            "activation_checkpointing": True,
+            "defer_fsdp_grad_sync": False,
             "pipeline": {"pp_schedule": "1f1b", "pp_microbatch_size": 2},
         }
         result = parse_distributed_section(cfg)
@@ -269,8 +345,11 @@ class TestIntegration:
 
     def test_combined_pipeline_and_moe(self):
         cfg = {
-            "strategy": "fsdp2", "pp_size": 2, "ep_size": 2,
-            "pipeline": {"pp_schedule": "1f1b"}, "moe": {"ignore_router_for_ac": True},
+            "strategy": "fsdp2",
+            "pp_size": 2,
+            "ep_size": 2,
+            "pipeline": {"pp_schedule": "1f1b"},
+            "moe": {"ignore_router_for_ac": True},
         }
         result = parse_distributed_section(cfg)
         assert result["pp_enabled"] is True
@@ -282,3 +361,36 @@ class TestIntegration:
     def test_backend_configuration(self, strategy):
         result = parse_distributed_section({"strategy": strategy, "backend": "gloo"})
         assert result["strategy_config"].backend == "gloo"
+
+
+# ---------------------------------------------------------------------------
+# None-value handling (YAML `key:` or `key: null`)
+# ---------------------------------------------------------------------------
+
+
+class TestNoneParallelismValues:
+    """Parallelism keys present with None values (e.g. ``ep_size: null`` in YAML)
+    must be treated identically to the key being absent."""
+
+    def test_ep_size_none_defaults_to_1(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "ep_size": None})
+        assert result["ep_size"] == 1
+        assert result["moe_config"] is None
+
+    def test_pp_size_none_defaults_to_1(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "pp_size": None})
+        assert result["pp_size"] == 1
+        assert result["pp_enabled"] is False
+        assert result["pipeline_config"] is None
+
+    def test_ep_size_none_routes_ac_to_strategy(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": None})
+        assert result["strategy_config"].activation_checkpointing is True
+
+    def test_pp_size_none_discards_pipeline_dict(self):
+        result = parse_distributed_section({"pp_size": None, "pipeline": {"pp_schedule": "1f1b"}})
+        assert result["pipeline_config"] is None
+
+    def test_ep_size_none_discards_moe_dict(self):
+        result = parse_distributed_section({"ep_size": None, "moe": {"ignore_router_for_ac": True}})
+        assert result["moe_config"] is None

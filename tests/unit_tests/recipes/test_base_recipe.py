@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -57,7 +58,7 @@ def _patch_checkpoint_ops(monkeypatch):
             self.tp_rank = tp_rank
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
-        
+
         def save_model(self, model=None, weights_path=None, peft_config=None, tokenizer=None):
             """Save model state dict."""
             if model is None:
@@ -271,6 +272,31 @@ def test_load_checkpoint_fresh_start_empty_dir(tmp_path):
 
     # Should succeed - no checkpoints exist
     recipe_inst.load_checkpoint(restore_from=None)
+
+
+def test_setup_and_maybe_collect_garbage(tmp_path, monkeypatch):
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.step_scheduler = SimpleNamespace(gc_every_steps=2, step=1)
+
+    class _GC:
+        def __init__(self):
+            self.run_called = []
+
+        def run(self, step_count):
+            self.run_called.append(step_count)
+
+    gc_obj = _GC()
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.GarbageCollection", lambda gc_every_steps: gc_obj)
+
+    recipe_inst._setup_garbage_collection()
+    assert recipe_inst.garbage_collector is gc_obj
+
+    recipe_inst._maybe_collect_garbage()
+    assert gc_obj.run_called == [1]
+
+    recipe_inst.step_scheduler.step = 2
+    recipe_inst._maybe_collect_garbage()
+    assert gc_obj.run_called == [1, 2]
 
 
 def test_load_checkpoint_auto_detect_restores_latest(tmp_path):
@@ -582,5 +608,104 @@ def test_load_checkpoint_path_with_separator_treated_as_full_path(tmp_path):
 
     # Load using relative path with separator
     recipe_inst.load_checkpoint(restore_from=str(nested_dir / "epoch_0_step_100"))
+
+
+# ---------------------------------------------------------------------------
+# Tests for _make_progress_bar and _update_progress_bar
+# ---------------------------------------------------------------------------
+
+
+class _FakeRecipe:
+    """Minimal stand-in that exposes the two progress-bar helpers."""
+
+    _make_progress_bar = BaseRecipe._make_progress_bar
+    _update_progress_bar = BaseRecipe._update_progress_bar
+
+
+def _make_fake_recipe(max_steps=10, step=0):
+    r = _FakeRecipe()
+    r.step_scheduler = SimpleNamespace(max_steps=max_steps, step=step)
+    return r
+
+
+class TestMakeProgressBar:
+    def test_returns_tqdm_on_rank0(self, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        r = _make_fake_recipe(max_steps=100, step=5)
+        pbar = r._make_progress_bar()
+        assert pbar is not None
+        assert pbar.total == 100
+        assert pbar.n == 5
+        pbar.close()
+
+    def test_returns_none_on_non_rank0(self, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+        r = _make_fake_recipe()
+        assert r._make_progress_bar() is None
+
+    def test_tolerates_missing_max_steps(self, monkeypatch):
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        r = _FakeRecipe()
+        r.step_scheduler = SimpleNamespace()  # no max_steps, no step
+        pbar = r._make_progress_bar()
+        assert pbar is not None
+        assert pbar.total is None
+        pbar.close()
+
+
+class TestUpdateProgressBar:
+    def _make_pbar(self):
+        import io
+
+        from tqdm import tqdm
+
+        return tqdm(total=10, file=io.StringIO())
+
+    def test_noop_when_pbar_is_none(self):
+        r = _FakeRecipe()
+        r._update_progress_bar(None, {"loss": 1.0})  # must not raise
+
+    def test_uses_loss_key(self):
+        r = _FakeRecipe()
+        pbar = self._make_pbar()
+        r._update_progress_bar(pbar, {"loss": 1.2345})
+        assert "loss=1.2345" in pbar.postfix
+        pbar.close()
+
+    def test_falls_back_to_Loss_Train_Total(self):
+        r = _FakeRecipe()
+        pbar = self._make_pbar()
+        r._update_progress_bar(pbar, {"Loss/Train_Total": 0.5})
+        assert "loss=0.5000" in pbar.postfix
+        pbar.close()
+
+    def test_uses_lr_key(self):
+        r = _FakeRecipe()
+        pbar = self._make_pbar()
+        r._update_progress_bar(pbar, {"lr": 1e-4})
+        assert "lr=" in pbar.postfix
+        pbar.close()
+
+    def test_falls_back_to_Train_lr(self):
+        r = _FakeRecipe()
+        pbar = self._make_pbar()
+        r._update_progress_bar(pbar, {"Train/lr": 2e-5})
+        assert "lr=" in pbar.postfix
+        pbar.close()
+
+    def test_uses_tps_key(self):
+        r = _FakeRecipe()
+        pbar = self._make_pbar()
+        r._update_progress_bar(pbar, {"tps": 512.7})
+        assert "tps=513" in pbar.postfix
+        pbar.close()
+
+    def test_unknown_keys_produce_no_postfix(self):
+        r = _FakeRecipe()
+        pbar = self._make_pbar()
+        r._update_progress_bar(pbar, {"unknown_metric": 99.0})
+        assert not pbar.postfix
+        pbar.close()
 
     # Should succeed without FileNotFoundError

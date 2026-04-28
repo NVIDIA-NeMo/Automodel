@@ -31,6 +31,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModelOutputWithPast,
 )
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import (
     Fp32SafeQwen3_5MoeTextRotaryEmbedding,
     Fp32SafeQwen3_5MoeVisionRotaryEmbedding,
@@ -41,7 +42,6 @@ from nemo_automodel.components.models.qwen3_5_moe.model import (
     Qwen3_5MoeTextModelBackend,
 )
 from nemo_automodel.components.moe.layers import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -226,6 +226,25 @@ class TestQwen3_5MoeBlock:
         # 5 linear projections should be initialized: in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
         assert mock_trunc.call_count == 5
         mock_norm_reset.assert_called_once()
+
+    def test_init_weights_linear_attention_norm_without_reset_parameters(self, text_config_with_linear, moe_config, backend_config):
+        """Fallback path when norm (e.g. HF Qwen3_5MoeRMSNormGated) lacks reset_parameters."""
+        block = Qwen3_5MoeBlock(1, text_config_with_linear, moe_config, backend_config)
+
+        # Replace norm with a simple module that has weight but NO reset_parameters
+        fake_norm = torch.nn.Module()
+        fake_norm.weight = torch.nn.Parameter(torch.zeros(block.linear_attn.norm.weight.shape))
+        block.linear_attn.norm = fake_norm
+
+        with (
+            patch.object(block.input_layernorm, "reset_parameters"),
+            patch.object(block.post_attention_layernorm, "reset_parameters"),
+            patch.object(block.mlp, "init_weights"),
+            patch("torch.nn.init.trunc_normal_"),
+        ):
+            block.init_weights(torch.device("cpu"))
+
+        assert torch.all(fake_norm.weight.data == 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +887,41 @@ class TestTextModelBackendPaddingMaskDerivation:
             model(input_ids=input_ids, attention_mask=attention_mask)
 
         expected = attention_mask.bool().logical_not()
+        assert captured["padding_mask"] is not None
+        torch.testing.assert_close(captured["padding_mask"], expected)
+
+    def test_forward_derives_padding_mask_from_4d_attention_mask(self, text_config, backend_config, moe_config, device):
+        """When attention_mask is 4D (sdpa packing), padding_mask is extracted from diagonal."""
+        model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
+
+        batch, seq_len = 1, 4
+        input_ids = torch.randint(0, text_config.vocab_size, (batch, seq_len), device=device)
+
+        # Build a 4D block-causal mask: tokens 0-1 attend to each other, token 2 alone, token 3 is padding
+        mask_4d = torch.zeros(batch, 1, seq_len, seq_len, dtype=torch.bool, device=device)
+        mask_4d[0, 0, 0, 0] = True
+        mask_4d[0, 0, 1, 0] = True
+        mask_4d[0, 0, 1, 1] = True
+        mask_4d[0, 0, 2, 2] = True
+        # token 3: all False (padding — cannot attend to itself)
+
+        cos = torch.zeros(3, batch, seq_len, text_config.head_dim * 2, device=device)
+        sin = torch.ones_like(cos)
+
+        captured = {}
+
+        def layer_forward(x, **kwargs):
+            captured["padding_mask"] = kwargs.get("padding_mask")
+            return x
+
+        for layer in model.layers.values():
+            layer.forward = MagicMock(side_effect=layer_forward)
+
+        with patch.object(model.rotary_emb, "forward", return_value=(cos, sin)):
+            model(input_ids=input_ids, attention_mask=mask_4d)
+
+        # Token 3 is padding (diagonal is False), others are not
+        expected = torch.tensor([[False, False, False, True]], device=device)
         assert captured["padding_mask"] is not None
         torch.testing.assert_close(captured["padding_mask"], expected)
 
