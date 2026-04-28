@@ -29,6 +29,7 @@ import inspect
 import logging
 import pathlib
 import time
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -1049,6 +1050,32 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
             self.loss_fn = MaskedCrossEntropy()
 
+        # DEBUG: dump post-load state_dict so we can compare against the raw HF
+        # reference (parity check). Trigger via env var so this is a no-op for
+        # production runs. AUTOMODEL_PARITY_DUMP=<dir> writes one .pt per rank.
+        _parity_dir = os.environ.get("AUTOMODEL_PARITY_DUMP")
+        if _parity_dir:
+            import torch.distributed as _td
+
+            _rank = _td.get_rank() if _td.is_initialized() else 0
+            os.makedirs(_parity_dir, exist_ok=True)
+            _model_for_dump = (
+                model.parts if hasattr(model, "parts") and not isinstance(model, torch.nn.Module) else [model]
+            )
+            if isinstance(model, AutoPipeline):
+                _model_for_dump = model.parts
+            else:
+                _model_for_dump = [model]
+            _flat: dict[str, "torch.Tensor"] = {}
+            for _idx, _part in enumerate(_model_for_dump):
+                for _k, _v in _part.state_dict().items():
+                    _t = _v.to_local() if hasattr(_v, "to_local") else _v
+                    _flat[f"part{_idx}.{_k}"] = _t.detach().cpu()
+            _path = os.path.join(_parity_dir, f"rank{_rank}_state_dict.pt")
+            torch.save(_flat, _path)
+            _shapes = {k: tuple(v.shape) for k, v in list(_flat.items())[:5]}
+            print(f"[parity-dump] rank {_rank}: wrote {_path} ({len(_flat)} tensors). first 5 shapes={_shapes}", flush=True)
+
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
@@ -1167,6 +1194,105 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
+
+        # DEBUG: per-layer logits parity dump. AUTOMODEL_PARITY_LOGITS=<dir>
+        # runs a single deterministic forward right after setup, with hooks on
+        # embed_tokens, every decoder layer, the final norm, and lm_head; each
+        # rank writes its captured tensors. Compare against an HF transformers
+        # forward of the same input ids (seed 0, seqlen 8) for parity.
+        _parity_logits_dir = os.environ.get("AUTOMODEL_PARITY_LOGITS")
+        if _parity_logits_dir:
+            self._dump_parity_logits(_parity_logits_dir)
+
+    def _dump_parity_logits(self, dump_dir: str) -> None:
+        """Run one deterministic forward with hooks and dump per-layer activations.
+
+        Inputs are torch.randint(0, vocab_size, (1, 8)) under generator(seed=0)
+        on CPU, then moved to GPU — matches the HF reference dump.
+        """
+        import torch.distributed as _td
+
+        _rank = _td.get_rank() if _td.is_initialized() else 0
+        os.makedirs(dump_dir, exist_ok=True)
+
+        captured: dict[str, torch.Tensor] = {}
+        hooks: list = []
+
+        def _hook(name: str):
+            def fn(_m, _a, output):
+                t = output[0] if isinstance(output, (tuple, list)) else output
+                if t is None:
+                    return
+                if hasattr(t, "to_local"):
+                    t = t.to_local()
+                captured[name] = t.detach().float().cpu()
+
+            return fn
+
+        for part in self.model_parts:
+            inner = getattr(part, "model", None)
+            if inner is None:
+                continue
+            if getattr(inner, "embed_tokens", None) is not None:
+                hooks.append(inner.embed_tokens.register_forward_hook(_hook("hidden_0")))
+            layers = getattr(inner, "layers", None)
+            if layers is not None:
+                for key in list(layers):
+                    try:
+                        idx = int(key)
+                    except (TypeError, ValueError):
+                        continue
+                    layer = layers[key]
+                    if layer is None:
+                        continue
+                    hooks.append(layer.register_forward_hook(_hook(f"hidden_{idx + 1}")))
+            if getattr(inner, "norm", None) is not None:
+                hooks.append(inner.norm.register_forward_hook(_hook("hidden_norm")))
+            if getattr(part, "lm_head", None) is not None:
+                hooks.append(part.lm_head.register_forward_hook(_hook("logits")))
+
+        # Build deterministic fixed inputs. Pipeline schedule expects
+        # local_batch_size rows so the chunker can produce the configured
+        # number of microbatches; we slice down to the first row when comparing.
+        cfg_model = self.model_parts[0]
+        vocab_size = getattr(getattr(cfg_model, "config", None), "vocab_size", 120832)
+        local_bs = self.cfg.get("step_scheduler.local_batch_size", 1)
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        # Reuse the same first-row sequence as the HF reference run.
+        first_row = torch.randint(0, vocab_size, (1, 8), generator=gen, dtype=torch.long)
+        input_ids = first_row.expand(local_bs, -1).contiguous().to(self.dist_env.device)
+
+        for part in self.model_parts:
+            part.eval()
+
+        try:
+            with torch.no_grad():
+                if self.pp is not None:
+                    # Pipeline path: drive both stages via the schedule.
+                    # Last stage needs a target+losses sink; we don't care about
+                    # the loss number itself, just that forward completes.
+                    self.pp.update_seq_len(input_ids.shape[1])
+                    has_last = self.pp.info.has_last_stage
+                    has_first = self.pp.info.has_first_stage
+                    losses_sink = [] if has_last else None
+                    targets = (
+                        torch.zeros_like(input_ids) if has_last else None
+                    )
+                    if has_first:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses_sink)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses_sink)
+                else:
+                    self.model_parts[0](input_ids=input_ids)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        captured["inputs"] = input_ids.detach().cpu()
+        path = os.path.join(dump_dir, f"rank{_rank}_outputs.pt")
+        torch.save(captured, path)
+        keys = list(captured.keys())
+        print(f"[parity-logits] rank {_rank}: wrote {path} (keys={keys})", flush=True)
 
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
