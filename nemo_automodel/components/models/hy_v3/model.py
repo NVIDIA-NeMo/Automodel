@@ -303,7 +303,7 @@ class HYV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.model.layers.values():
-                if isinstance(block.mlp, MoE):
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
                     block.mlp.gate.update_bias()
 
     @torch.no_grad()
