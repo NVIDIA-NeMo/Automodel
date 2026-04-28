@@ -71,6 +71,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Stability AI | [StableLM](stabilityai/stablelm.md) | `StableLmForCausalLM` |
 | Stepfun AI | [Step-3.5](stepfun-ai/step-3-5.md) | `Step3p5ForCausalLM` |
 | Parasail AI | [GritLM](parasail-ai/gritlm.md) | `GritLM` |
+| Tencent | [Hy3-preview](tencent/hy3.md) | `HYV3ForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
@@ -140,4 +141,5 @@ orionstar/orion
 stabilityai/stablelm
 stepfun-ai/step-3-5
 parasail-ai/gritlm
+tencent/hy3
 ```
