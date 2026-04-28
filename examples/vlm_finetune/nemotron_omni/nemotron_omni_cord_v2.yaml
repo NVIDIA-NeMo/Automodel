@@ -24,7 +24,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/nemotron-3-nano-omni-ea1_v2.0
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/omniv/nomni-v3-bf16
   trust_remote_code: true
   torch_dtype: torch.bfloat16
   backend:
@@ -39,7 +39,7 @@ model:
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/nemotron-3-nano-omni-ea1_v2.0
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/omniv/nomni-v3-bf16
   trust_remote_code: true
 
 checkpoint:
