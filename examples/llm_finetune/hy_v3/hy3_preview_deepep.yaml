@@ -24,10 +24,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 4
+  local_batch_size: 8
   ckpt_every_steps: 500
-  val_every_steps: 100
+  val_every_steps: 500
   num_epochs: 1
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -64,8 +65,8 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 8  # 192 experts / 8 ranks = 24 experts per rank
+  pp_size: 4
+  ep_size: 32  # 192 experts / 8 ranks = 24 experts per rank
 
   sequence_parallel: false
   activation_checkpointing: true
