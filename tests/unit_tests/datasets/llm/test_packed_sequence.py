@@ -31,9 +31,7 @@ def base_dataset():
 
 def test_basic_packing(base_dataset):
     """Test basic packing without splitting across packs"""
-    packed_ds = pack_dataset(
-        base_dataset, split="train", packed_sequence_size=10, max_packs=None
-    )
+    packed_ds = pack_dataset(base_dataset, split="train", packed_sequence_size=10, max_packs=None)
 
     assert len(packed_ds) == 2
     # Check packed_ds[0] is [1,2,3,4,5,6,7,8,9] plus [0] for padding
@@ -59,9 +57,7 @@ def test_basic_packing(base_dataset):
 )
 def test_packing_respects_max_packs(base_dataset, max_packs, expected):
     """Test packing with different max_packs configurations"""
-    packed_ds = pack_dataset(
-        base_dataset, split="train", packed_sequence_size=5, max_packs=max_packs
-    )
+    packed_ds = pack_dataset(base_dataset, split="train", packed_sequence_size=5, max_packs=max_packs)
     assert len(packed_ds) == expected
 
 
@@ -71,9 +67,7 @@ def test_loss_mask_handling():
         {"input_ids": [[1, 2, 3], [4, 5, 6]], "labels": [[1, 2, 3], [4, 5, 6]], "loss_mask": [[1, 1, 0], [1, 1, 1]]}
     )
 
-    packed_ds = pack_dataset(
-        ds_with_mask, split="train", packed_sequence_size=5, max_packs=None
-    )
+    packed_ds = pack_dataset(ds_with_mask, split="train", packed_sequence_size=5, max_packs=None)
     assert packed_ds[0]["labels"][-3:] == [-100] * 3
     assert packed_ds[0]["labels"][:2] != [-100] * 2
     assert packed_ds[1]["labels"][:3] != [-100] * 3
@@ -82,9 +76,7 @@ def test_loss_mask_handling():
 
 def test_position_id_wrapping(base_dataset):
     """Test position ID generation with wrapping"""
-    packed_ds = pack_dataset(
-        base_dataset, split="train", packed_sequence_size=5, max_packs=None
-    )
+    packed_ds = pack_dataset(base_dataset, split="train", packed_sequence_size=5, max_packs=None)
     assert packed_ds[0]["position_ids"] == [0, 1, 2, 3, 4]
 
 
@@ -92,9 +84,7 @@ def test_exact_fit():
     """Test sequence that exactly fills pack size"""
     exact_fit_ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5]], "labels": [[1, 2, 3, 4, 5]]})
 
-    packed_ds = pack_dataset(
-        exact_fit_ds, split="train", packed_sequence_size=5, max_packs=None
-    )
+    packed_ds = pack_dataset(exact_fit_ds, split="train", packed_sequence_size=5, max_packs=None)
     assert len(packed_ds) == 1
     assert packed_ds[0]["input_ids"] == [1, 2, 3, 4, 5]
 
@@ -104,7 +94,7 @@ def test_error_on_oversized_sequence():
     oversized_ds = Dataset.from_dict({"input_ids": [[1, 2, 3, 4, 5, 6]], "labels": [[1, 2, 3, 4, 5, 6]]})
 
     with pytest.raises(ValueError):
-        pack_dataset(oversized_ds, split="train", packed_sequence_size=5, max_packs=None)
+        pack_dataset(oversized_ds, split="train", packed_sequence_size=5, max_packs=None, drop_long_samples=False)
 
 
 def test_seq_lens_padded():
@@ -141,6 +131,7 @@ def test_seq_lens_padded():
     assert len(packed_ds) == 1
     # Verify seq_lens (actual sequence lengths: 3 + 2 + 4 = 9 tokens)
     import torch
+
     seq_lens = packed_ds[0]["seq_lens"]
     if isinstance(seq_lens, torch.Tensor):
         seq_lens = seq_lens.tolist()
@@ -183,6 +174,7 @@ def test_seq_lens_padded_multiple_packs():
     assert "seq_lens_padded" in packed_ds[1]
 
     import torch
+
     # Check that seq_lens_padded is correct for both packs
     seq_lens_padded_0 = packed_ds[0]["seq_lens_padded"]
     if isinstance(seq_lens_padded_0, torch.Tensor):
@@ -212,6 +204,7 @@ def test_seq_lens_padded_always_present(base_dataset):
     assert "seq_lens_padded" in packed_ds[1]
 
     import torch
+
     # Verify seq_lens vs seq_lens_padded for each pack
     for i in range(len(packed_ds)):
         seq_lens = packed_ds[i]["seq_lens"]
@@ -251,6 +244,7 @@ def test_seq_lens_padded_exact_fit():
 
     assert len(packed_ds) == 1
     import torch
+
     seq_lens = packed_ds[0]["seq_lens"]
     seq_lens_padded = packed_ds[0]["seq_lens_padded"]
 
@@ -284,6 +278,7 @@ def test_seq_lens_padded_multiple_packs():
     assert len(packed_ds) == 2
 
     import torch
+
     # Check first pack
     seq_lens_0 = packed_ds[0]["seq_lens"]
     seq_lens_padded_0 = packed_ds[0]["seq_lens_padded"]
@@ -326,6 +321,7 @@ def test_seq_lens_padded_sum():
 
     assert len(packed_ds) == 1
     import torch
+
     seq_lens_padded = packed_ds[0]["seq_lens_padded"]
     if isinstance(seq_lens_padded, torch.Tensor):
         seq_lens_padded = seq_lens_padded.tolist()
@@ -358,6 +354,7 @@ def test_cp_aware_packing_basic():
     )
 
     import torch
+
     assert len(packed_ds) == 1
 
     # seq_lens should contain original lengths
@@ -392,6 +389,7 @@ def test_cp_aware_packing_different_cp_sizes():
     )
 
     import torch
+
     seq_lens = packed_ds[0]["seq_lens"]
     if isinstance(seq_lens, torch.Tensor):
         seq_lens = seq_lens.tolist()
@@ -438,6 +436,7 @@ def test_cp_aware_packing_no_cp():
     )
 
     import torch
+
     # seq_lens should contain original lengths (no CP padding)
     seq_lens = packed_ds[0]["seq_lens"]
     if isinstance(seq_lens, torch.Tensor):
@@ -462,6 +461,7 @@ def test_cp_aware_packing_multiple_packs():
     )
 
     import torch
+
     # Should create at least 2 packs
     assert len(packed_ds) >= 2
 
@@ -491,6 +491,7 @@ def test_cp_aware_packing_exact_fit():
     )
 
     import torch
+
     # seq_lens should be 4 (already divisible by 4, no additional padding needed)
     seq_lens = packed_ds[0]["seq_lens"]
     if isinstance(seq_lens, torch.Tensor):
@@ -521,6 +522,7 @@ def test_cp_aware_packing_multiple_sequences():
     )
 
     import torch
+
     # seq_lens should contain original lengths
     seq_lens = packed_ds[0]["seq_lens"]
     if isinstance(seq_lens, torch.Tensor):

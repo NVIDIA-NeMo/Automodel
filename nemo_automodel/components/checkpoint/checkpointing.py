@@ -1002,7 +1002,15 @@ class Checkpointer:
             Configured storage reader or None for other formats.
         """
         if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
-            if key_mapping is None:
+            # The upstream HuggingFaceStorageReader delegates dtype decoding to
+            # safetensors.torch._TYPES, which does not yet recognize the FP8
+            # scale dtypes emitted by some quantized HF checkpoints (e.g.
+            # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
+            # read_metadata → DCP ends up with metadata=None on every rank).
+            # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
+            # so prefer it for base-model HF loads. Mid-training DCP loads may
+            # still use the faster upstream reader.
+            if key_mapping is None and not is_init_step:
                 try:
                     from torch.distributed.checkpoint.hf_storage import (
                         HuggingFaceStorageReader as _UpstreamHFReader,

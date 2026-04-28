@@ -17,16 +17,16 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 import torch.nn as nn
-from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
-    create_pipeline_forward_inner,
     create_pipeline_forward_causal_lm,
-    patch_hf_model_for_pp,
+    create_pipeline_forward_inner,
     init_hf_model_buffers,
+    patch_hf_model_for_pp,
     validate_hf_model_for_pipeline_support,
 )
+
 
 class TestCreatePipelineForwardInner:
     """Test create_pipeline_forward_inner function."""
@@ -731,6 +731,10 @@ class TestValidateHfModelForPipelineSupport:
             output = forward_fn(mock_model, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
             assert isinstance(output, BaseModelOutputWithPast)
+            assert "inputs_embeds" in mock_create_causal.call_args.kwargs
+            assert "input_embeds" not in mock_create_causal.call_args.kwargs
+            assert "inputs_embeds" in mock_create_sliding.call_args.kwargs
+            assert "input_embeds" not in mock_create_sliding.call_args.kwargs
 
     def test_attentions_not_collected(self):
         """Attentions are not collected in the new inner forward."""
@@ -765,11 +769,16 @@ class TestValidateHfModelForPipelineSupport:
         mock_model.norm = None
         mock_model.layers = None
 
-        # Create a mock text module with rotary_emb
+        # Create a mock text module with rotary_emb. The pipeline_forward now
+        # routes embed_tokens / layers / norm through the text module too, so
+        # explicitly stub them out to None to skip those branches.
         mock_text_module = Mock()
         mock_rotary = Mock()
         mock_rotary.return_value = (torch.randn(1, 10, 64), torch.randn(1, 10, 64))
         mock_text_module.rotary_emb = mock_rotary
+        mock_text_module.embed_tokens = None
+        mock_text_module.layers = None
+        mock_text_module.norm = None
 
         mock_get_text_module.return_value = mock_text_module
 
@@ -795,9 +804,14 @@ class TestValidateHfModelForPipelineSupport:
         mock_model.norm = None
         mock_model.layers = None
 
-        # Create a mock text module with None rotary_emb
+        # Create a mock text module with None rotary_emb. Stub out the text
+        # module's embed_tokens / layers / norm too (now routed through text
+        # module by pipeline_forward).
         mock_text_module = Mock()
         mock_text_module.rotary_emb = None
+        mock_text_module.embed_tokens = None
+        mock_text_module.layers = None
+        mock_text_module.norm = None
 
         mock_get_text_module.return_value = mock_text_module
 
@@ -815,9 +829,9 @@ class TestValidateHfModelForPipelineSupport:
 # -----------------------------------------------------------------------------
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
-    get_text_module,
-    TEXT_MODULE_ATTRS,
     MULTIMODAL_SUFFIXES,
+    TEXT_MODULE_ATTRS,
+    get_text_module,
 )
 
 

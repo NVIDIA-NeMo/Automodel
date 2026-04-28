@@ -31,6 +31,7 @@ MULTIMODAL_SUFFIXES = (
     "visual",
     "image_encoder",
     "vision_encoder",
+    "embed_vision",
     "audio_tower",
     "audio_encoder",
     "audio_model",
@@ -49,7 +50,9 @@ def get_text_module(model: nn.Module) -> nn.Module:
     for attr_name in TEXT_MODULE_ATTRS:
         if hasattr(model, attr_name):
             nested = getattr(model, attr_name)
-            if nested is not None:
+            # Only descend into a real submodule; Mock-only attrs from tests
+            # (which hasattr() accepts) are not nn.Module and should be skipped.
+            if nested is not None and isinstance(nested, nn.Module):
                 return nested
     return model
 
@@ -70,12 +73,17 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        # For VLM models the text components (embed_tokens, layers, norm) live on a
+        # nested text module (e.g. model.language_model) rather than directly on self.
+        # get_text_module returns self when no nesting exists (e.g. LlamaModel).
+        text_module = get_text_module(self)
+
         # Embeddings handling
         if inputs_embeds is None:
-            if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+            if hasattr(text_module, "embed_tokens") and text_module.embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = self.embed_tokens(input_ids)
+                inputs_embeds = text_module.embed_tokens(input_ids)
             else:
                 if (
                     input_ids is not None
@@ -121,11 +129,11 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             if not isinstance((causal_mask_mapping := attention_mask), dict):
                 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-                # Note: input_embeds is only used for shape and dtype, not values
+                # Note: inputs_embeds is only used for shape and dtype, not values
                 # We could use a dummy tensor here, but inputs_embeds is already available
                 mask_kwargs = {
                     "config": self.config,
-                    "input_embeds": inputs_embeds,
+                    "inputs_embeds": inputs_embeds,
                     "attention_mask": attention_mask,
                     "cache_position": cache_position,
                     "past_key_values": None,  # Training-only: no KV cache
@@ -143,9 +151,9 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if rotary_emb is not None:
             position_embeddings = rotary_emb(hidden_states, position_ids)
 
-        if hasattr(self, "layers") and self.layers is not None:
+        if hasattr(text_module, "layers") and text_module.layers is not None:
             # Works for dict-like or list-like containers
-            layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
                 if hasattr(decoder_layer, "attention_type"):
@@ -164,8 +172,8 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 )
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
-        if hasattr(self, "norm") and self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+        if hasattr(text_module, "norm") and text_module.norm is not None:
+            hidden_states = text_module.norm(hidden_states)
 
         if model_class_name == "PipelineStage":
             return hidden_states
