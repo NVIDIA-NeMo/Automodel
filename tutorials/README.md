@@ -5,9 +5,9 @@ End-to-end tutorials covering the LLM customization lifecycle using
 
 | Tutorial | Dataset | Description | Launch on Brev |
 |----------|---------|-------------|----------------|
-| [Supervised Fine-Tuning (SFT)](./sft-peft) | [SQuAD](https://huggingface.co/datasets/rajpurkar/squad) | Full-parameter SFT to adapt a pre-trained model to follow instructions. | 🚧 |
-| [Parameter-Efficient Fine-Tuning (PEFT)](./sft-peft) | [SQuAD](https://huggingface.co/datasets/rajpurkar/squad) | Memory-efficient LoRA fine-tuning for task adaptation. | 🚧 |
-| [Evaluation](./evaluation) | Standard benchmarks (MMLU, HellaSwag, IFEval, etc.) | Evaluate AutoModel checkpoints with lm-evaluation-harness. | 🚧 |
+| [Supervised Fine-Tuning (SFT)](./sft-peft) | [SQuAD](https://huggingface.co/datasets/rajpurkar/squad) | Full-parameter SFT to adapt a pre-trained model to follow instructions. | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)] |
+| [Parameter-Efficient Fine-Tuning (PEFT)](./sft-peft) | [SQuAD](https://huggingface.co/datasets/rajpurkar/squad) | Memory-efficient LoRA fine-tuning for task adaptation. | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)] |
+| [Evaluation](./evaluation) | Standard benchmarks (MMLU, HellaSwag, IFEval, etc.) | Evaluate AutoModel checkpoints with lm-evaluation-harness. | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)] |
 | [Nemotron Parse Fine-Tuning](./nemotron-parse) | [Invoices](https://huggingface.co/datasets/katanaml-org/invoices-donut-data-v1) | Fine-tune Nemotron Parse v1.1 for structured document extraction. | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM) |
 
 ## Prerequisites
