@@ -126,8 +126,7 @@ class HYV3Model(nn.Module):
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
-            # Expert-bias correction: updated every backward pass at rate 1e-3
-            gate_bias_update_factor=1e-3,
+            gate_bias_update_factor=0.0,
             score_func="sigmoid",
             route_scale=getattr(config, "router_scaling_factor", 1.0),
             aux_loss_coeff=0.0,
