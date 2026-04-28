@@ -29,8 +29,6 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`hy3_4layer_p0_smoke.yaml <../../../../examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml>` | SFT — Hy3 4-layer smoke test (P0) |
-| {download}`hy3_4layer_p1_ckpt.yaml <../../../../examples/llm_finetune/hy_v3/hy3_4layer_p1_ckpt.yaml>` | SFT — Hy3 4-layer checkpoint test (P1) |
 | {download}`hy3_preview_deepep.yaml <../../../../examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml>` | SFT — Hy3-preview with DeepEP |
 
 ## Try with NeMo AutoModel
