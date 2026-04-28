@@ -135,6 +135,10 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
         total_params += n
         if p.requires_grad:
             trainable_params += n
+        # .norm() on a meta tensor returns a meta tensor (no error), which would
+        # then break the .item() call below; skip meta params like count_model_parameters.
+        if p.is_meta:
+            continue
         try:
             local_sq_norm += p.detach().norm(2) ** 2
         except Exception:
