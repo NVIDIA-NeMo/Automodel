@@ -2,7 +2,7 @@
 
 [Llama-Embed-Nemotron-8B](https://huggingface.co/nvidia/llama-embed-nemotron-8b) is NVIDIA's text embedding model for retrieval, semantic similarity, classification, and multilingual retrieval workloads. In NeMo AutoModel, it is reproduced with the bidirectional Llama bi-encoder backbone.
 
-For architecture-level details such as bidirectional attention and pooling strategies, see [Llama (Bidirectional)](../meta/llama-bidirectional.md).
+For architecture-level details such as bidirectional attention and pooling strategies, see [Llama (Bidirectional)](./llama-bidirectional.md).
 
 :::{card}
 | | |
