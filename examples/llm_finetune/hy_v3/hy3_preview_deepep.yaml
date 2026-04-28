@@ -50,6 +50,7 @@ model:
     experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
+    gate_precision: float32
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -70,12 +71,16 @@ distributed:
   activation_checkpointing: true
 
   pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 4
-    round_virtual_stages_to_pp_multiple: up
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -84,13 +89,18 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: tencent/Hy3-preview
 
 packed_sequence:
   packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
   shuffle: true
 
 validation_dataset:
@@ -98,18 +108,24 @@ validation_dataset:
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 64
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: tencent/Hy3-preview
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 4
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
-  eps: 1e-7
-  lr: 1.0e-5
-  weight_decay: 0.1
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.0
 
 # Uncomment for W&B logging
 # wandb:

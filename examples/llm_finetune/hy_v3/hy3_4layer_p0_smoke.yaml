@@ -61,7 +61,6 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
     num_hidden_layers: 4           # only build layers 0-3; keys for 4-79 ignored
-    num_nextn_predict_layers: 0    # disable MTP layer
   load_base_model: true
   trust_remote_code: false
   backend:
@@ -72,6 +71,8 @@ model:
     experts: torch_mm
     dispatcher: torch              # torch dispatcher for P0
     fake_balanced_gate: false
+    gate_precision: float32
+    rope_fusion: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -109,6 +110,7 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
   tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
 
 packed_sequence:
@@ -116,7 +118,9 @@ packed_sequence:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
   shuffle: true
 
 validation_dataset:
@@ -125,18 +129,22 @@ validation_dataset:
   split: validation
   num_samples_limit: 32
   tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: /path/to/Hy3-preview   # <-- replace with local path
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  batch_size: 4
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
-  eps: 1.0e-7
-  lr: 5.0e-4
+  eps: 1e-8
+  lr: 1e-5
   weight_decay: 0.0
 
 ci:
