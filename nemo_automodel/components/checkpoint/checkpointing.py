@@ -809,7 +809,13 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            if is_init_step and storage_reader is not None:
+                from torch.distributed.checkpoint import DefaultLoadPlanner
+
+                planner = DefaultLoadPlanner(allow_partial_load=True)
+            else:
+                planner = None
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, planner=planner)
         return state_dict
 
     def _do_save(
