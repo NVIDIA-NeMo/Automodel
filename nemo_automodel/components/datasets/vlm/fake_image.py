@@ -28,8 +28,11 @@ keeping the visual encoder active.
 """
 
 import copy
+import logging
 
 from PIL import Image as PILImage
+
+logger = logging.getLogger(__name__)
 
 # Constant 56x56 white PIL image used as the fake placeholder.
 _FAKE_IMAGE = PILImage.new("RGB", (56, 56), (255, 255, 255))
@@ -90,25 +93,127 @@ def inject_fake_image_into_conversation(conversation):
     return conversation
 
 
-def _get_vision_token_ids(processor):
-    """Collect vision token IDs from a processor/tokenizer."""
-    vision_token_ids = set()
+# Attribute names that VLM processors / configs use to expose vision token IDs.
+# Different model families use different names; we scan all of them.
+_VISION_TOKEN_ID_ATTRS = (
+    "image_token_id",  # Qwen2/3-VL, generic HF VLMs (also Gemma3 alias)
+    "video_token_id",  # Qwen2/3-VL
+    "image_token_index",  # LLaVA family, Pixtral/Mistral3, Gemma3
+    "video_token_index",  # LLaVA-OneVision / NeXT-Video
+    "media_placeholder_token_id",  # Kimi K2.5, KimiVL
+    "vision_start_token_id",  # Qwen
+    "vision_end_token_id",  # Qwen
+    "vision_token_id",  # Qwen
+    "image_break_token_id",  # Pixtral / Mistral3
+    "image_end_token_id",  # Pixtral / Mistral3
+    "boi_token_index",  # Gemma3 (begin-of-image)
+    "eoi_token_index",  # Gemma3 (end-of-image)
+    "boi_token_id",  # Gemma3 alias
+    "eoi_token_id",  # Gemma3 alias
+)
 
-    for attr in ("image_token_id", "video_token_id"):
-        tid = getattr(processor, attr, None)
-        if tid is not None:
-            vision_token_ids.add(tid)
+# Explicit vision token strings used across VLM families.
+_VISION_TOKEN_STRINGS = (
+    "<|vision_start|>",
+    "<|vision_end|>",  # Qwen
+    "<|image_pad|>",
+    "<|video_pad|>",  # Qwen
+    "<|media_start|>",
+    "<|media_content|>",  # Kimi K2.5 / KimiVL
+    "<|media_end|>",
+    "<|media_pad|>",  # Kimi K2.5 / KimiVL
+    "<image>",
+    "<video>",  # LLaVA family
+    "<|image|>",
+    "<|video|>",  # Some HF chat templates
+    "[IMG]",
+    "[IMG_END]",
+    "[IMG_BREAK]",  # Pixtral / Mistral3
+)
+
+# Substrings used to fuzzy-match additional vision tokens from the tokenizer's
+# added_tokens_decoder.  Kept short enough to avoid colliding with non-vision
+# tokens like ``<|imagine|>`` (no such real token, but be defensive).
+_VISION_TOKEN_KEYWORDS = ("image", "video", "media", "vision", "img_pad", "vid_pad")
+
+
+def _scan_attrs(source, attr_names):
+    """Yield integer token IDs found via ``getattr`` on *source*."""
+    if source is None:
+        return
+    for attr in attr_names:
+        tid = getattr(source, attr, None)
+        if isinstance(tid, int):
+            yield tid
+
+
+def _get_vision_token_ids(processor):
+    """Collect vision token IDs from a processor / tokenizer / config.
+
+    Walks three sources to be robust across VLM families:
+    1. Known attribute names on the processor *and* its ``config`` (Gemma4,
+       LLaVA put the IDs on the config rather than the processor).
+    2. A curated list of vision token strings looked up via
+       ``tokenizer.convert_tokens_to_ids``.
+    3. A keyword-based fuzzy scan of ``tokenizer.added_tokens_decoder`` so
+       custom or future VLMs are picked up automatically.
+    """
+    vision_token_ids: set[int] = set()
+
+    config = getattr(processor, "config", None)
+    for tid in _scan_attrs(processor, _VISION_TOKEN_ID_ATTRS):
+        vision_token_ids.add(tid)
+    for tid in _scan_attrs(config, _VISION_TOKEN_ID_ATTRS):
+        vision_token_ids.add(tid)
 
     tokenizer = getattr(processor, "tokenizer", processor)
-    for token in ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>"):
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    for token in _VISION_TOKEN_STRINGS:
         try:
             tid = tokenizer.convert_tokens_to_ids(token)
-            if isinstance(tid, int) and tid != getattr(tokenizer, "unk_token_id", None):
-                vision_token_ids.add(tid)
         except Exception:
-            pass
+            continue
+        if isinstance(tid, int) and tid != unk_id:
+            vision_token_ids.add(tid)
+
+    added = getattr(tokenizer, "added_tokens_decoder", None)
+    if isinstance(added, dict):
+        for tid, tok in added.items():
+            try:
+                tok_str = getattr(tok, "content", str(tok)).lower()
+            except Exception:
+                continue
+            if any(kw in tok_str for kw in _VISION_TOKEN_KEYWORDS):
+                try:
+                    vision_token_ids.add(int(tid))
+                except (TypeError, ValueError):
+                    continue
 
     return vision_token_ids
+
+
+_warned_unknown_processors: set[str] = set()
+
+
+def _warn_no_vision_tokens(processor) -> None:
+    """Log a one-time warning when a processor exposes no recognizable vision tokens.
+
+    Without this warning a fake-image injection silently leaves the vision
+    tokens visible to attention, which can degrade training quality without
+    any other observable symptom.
+    """
+    key = type(processor).__name__
+    if key in _warned_unknown_processors:
+        return
+    _warned_unknown_processors.add(key)
+    logger.warning(
+        "fake_image: could not detect any vision token IDs from processor %s. "
+        "Fake-image vision tokens will NOT be masked from attention. "
+        "If this model uses a non-standard vision token, extend "
+        "_VISION_TOKEN_ID_ATTRS / _VISION_TOKEN_STRINGS in fake_image.py.",
+        key,
+    )
 
 
 def mask_fake_vision_tokens_single(sample_dict, processor):
@@ -117,8 +222,11 @@ def mask_fake_vision_tokens_single(sample_dict, processor):
     Sets ``attention_mask = 0`` for every vision token in *sample_dict*.
     This is used at ``__getitem__`` time for pre-tokenized datasets.
     """
+    if "attention_mask" not in sample_dict:
+        return
     vision_token_ids = _get_vision_token_ids(processor)
-    if not vision_token_ids or "attention_mask" not in sample_dict:
+    if not vision_token_ids:
+        _warn_no_vision_tokens(processor)
         return
 
     input_ids = sample_dict["input_ids"]
@@ -133,8 +241,11 @@ def mask_fake_vision_tokens_batch(batch, processor, sample_indices):
     Sets ``attention_mask = 0`` for every vision token in the given
     *sample_indices* of the batch.
     """
+    if "attention_mask" not in batch or not sample_indices:
+        return
     vision_token_ids = _get_vision_token_ids(processor)
-    if not vision_token_ids or "attention_mask" not in batch or not sample_indices:
+    if not vision_token_ids:
+        _warn_no_vision_tokens(processor)
         return
 
     for idx in sample_indices:

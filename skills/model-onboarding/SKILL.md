@@ -1,3 +1,8 @@
+---
+name: model-onboarding
+description: Guide for onboarding new model families into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
+---
+
 # Adding Model Support to NeMo AutoModel
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.

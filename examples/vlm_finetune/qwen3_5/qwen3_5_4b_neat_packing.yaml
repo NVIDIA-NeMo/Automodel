@@ -108,3 +108,4 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  known_issue_id: AM-158

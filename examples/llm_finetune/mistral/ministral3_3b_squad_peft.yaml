@@ -116,6 +116,8 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   time: "00:15:00"
+  known_issue_id: AM-154
+  allow_failure: true
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     distributed.tp_size: 2

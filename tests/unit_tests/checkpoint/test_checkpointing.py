@@ -868,3 +868,137 @@ class TestCheckpointerSaveModelDiffusersRename:
 
         assert (consolidated_dir / "model.safetensors.index.json").exists()
         assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+
+# =============================================================================
+# Tests for _get_storage_reader: is_init_step uses backport, not upstream HF reader
+# =============================================================================
+
+
+class TestGetStorageReaderInitStep:
+    """``_get_storage_reader`` must prefer the in-tree backport when ``is_init_step=True``.
+
+    The upstream ``HuggingFaceStorageReader`` (in ``torch.distributed.checkpoint.hf_storage``)
+    delegates dtype decoding to ``safetensors.torch._TYPES``, which does not
+    yet recognise the FP8 scale dtypes (``F8_E5M2``/``F8_E8M0``) emitted by
+    quantised HF checkpoints such as DSV4.  For base-model HF loads
+    (``is_init_step=True``) we must therefore use the in-tree backport whose
+    ``DTYPE_MAP`` was extended for those dtypes.  Mid-training DCP loads
+    (``is_init_step=False`` and no key remap) may still use the faster upstream
+    reader.
+    """
+
+    def _make_checkpointer(self):
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            Checkpointer,
+            CheckpointingConfig,
+        )
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_init_step_returns_backport_reader_not_upstream(self):
+        """is_init_step=True with no key_mapping should still go through the in-tree backport."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=True)
+
+        # Upstream reader must NOT be constructed for init-step base-model loads
+        upstream_marker.assert_not_called()
+        # Backport reader must be constructed instead
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=None)
+        assert reader is backport_marker.return_value
+
+    def test_non_init_step_no_keymap_uses_upstream(self):
+        """For mid-training safetensors loads (is_init_step=False, no key_mapping),
+        the faster upstream reader is preferred."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
+
+        upstream_marker.assert_called_once_with(path="/fake/path")
+        backport_marker.assert_not_called()
+        assert reader is upstream_marker.return_value
+
+    def test_keymap_always_uses_backport(self):
+        """When a key_mapping is supplied, the backport reader is always used (regardless of is_init_step)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=False)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
+
+    def test_init_step_with_keymap_uses_backport(self):
+        """is_init_step=True + key_mapping must also use the backport (only one path remains)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=True)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
