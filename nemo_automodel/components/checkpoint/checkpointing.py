@@ -514,6 +514,13 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
         )
 
+        checkpoint_metadata_keys: set[str] | None = None
+        adapter = getattr(model_state.model[0], "state_dict_adapter", None)
+        trim_for_checkpoint = getattr(adapter, "trim_state_dict_for_checkpoint_load", None)
+        if callable(trim_for_checkpoint):
+            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            state_dict = trim_for_checkpoint(state_dict, checkpoint_metadata_keys)
+
         compat_tied_lm_head_source_key: str | None = None
         lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
         should_try_tied_lm_head_compat = (
@@ -523,7 +530,8 @@ class Checkpointer:
             and lm_head_param_name in state_dict
         )
         if should_try_tied_lm_head_compat:
-            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            if checkpoint_metadata_keys is None:
+                checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
                     if source_name not in checkpoint_metadata_keys or source_name in state_dict:
