@@ -840,7 +840,7 @@ class Checkpointer:
             return
 
         ret = None
-        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        planner = dcp.DefaultSavePlanner()
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
             ret = dcp.async_save(
