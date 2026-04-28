@@ -33,6 +33,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _yarn_correction_range,
     _yarn_linear_ramp,
     build_causal_padding_mask,
+    build_packed_causal_padding_mask,
     eager_attention_with_sink,
 )
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
@@ -166,6 +167,100 @@ class TestDeepseekV4HyperConnection:
 
 class TestDeepseekV4OptimizedKernels:
     """Numerical equivalence tests for optional DSV4 kernel dispatch."""
+
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
+            ),
+        ],
+    )
+    def test_eager_attention_with_sink_matches_unpacked_packed_sequence(self, device):
+        torch.manual_seed(123)
+        batch, seq_len, heads, dim = 2, 6, 3, 8
+        seq_lens = torch.tensor([[3, 2, 0], [1, 4, 0]], dtype=torch.long)
+        sliding_window = 3
+        q = torch.randn(batch, heads, seq_len, dim, device=device)
+        kv = torch.randn(batch, 1, seq_len, dim, device=device)
+        sinks = torch.randn(heads, device=device)
+        grad = torch.randn(batch, seq_len, heads, dim, device=device)
+        grad = torch.where(
+            (
+                torch.arange(seq_len, device=device).expand(batch, -1)
+                < seq_lens.to(device=device).sum(dim=-1, keepdim=True)
+            )
+            .unsqueeze(-1)
+            .unsqueeze(-1),
+            grad,
+            torch.zeros_like(grad),
+        )
+
+        class DummyModule:
+            num_key_value_groups = heads
+            training = False
+
+            def __init__(self, sinks):
+                self.sinks = sinks
+
+        def packed_attention(q_, kv_, sinks_):
+            attention_mask = build_packed_causal_padding_mask(
+                seq_lens,
+                seq_len=seq_len,
+                dtype=q_.dtype,
+                device=q_.device,
+                sliding_window=sliding_window,
+            )
+            return eager_attention_with_sink(
+                DummyModule(sinks_),
+                q_,
+                kv_,
+                kv_,
+                attention_mask,
+                scaling=dim**-0.5,
+            )[0]
+
+        def unpacked_attention(q_, kv_, sinks_):
+            outputs = []
+            for batch_idx in range(batch):
+                batch_outputs = []
+                offset = 0
+                for length in seq_lens[batch_idx].tolist():
+                    if length == 0:
+                        continue
+                    attention_mask = build_causal_padding_mask(
+                        attention_mask=None,
+                        seq_len=length,
+                        dtype=q_.dtype,
+                        device=q_.device,
+                        batch_size=1,
+                        sliding_window=sliding_window,
+                    )
+                    doc_output = eager_attention_with_sink(
+                        DummyModule(sinks_),
+                        q_[batch_idx : batch_idx + 1, :, offset : offset + length],
+                        kv_[batch_idx : batch_idx + 1, :, offset : offset + length],
+                        kv_[batch_idx : batch_idx + 1, :, offset : offset + length],
+                        attention_mask,
+                        scaling=dim**-0.5,
+                    )[0]
+                    batch_outputs.append(doc_output)
+                    offset += length
+                padding = seq_len - offset
+                if padding:
+                    batch_outputs.append(q_.new_zeros(1, padding, heads, dim))
+                outputs.append(torch.cat(batch_outputs, dim=1))
+            return torch.cat(outputs, dim=0)
+
+        expected, expected_grads = _run_forward_backward(unpacked_attention, (q, kv, sinks), grad)
+        actual, actual_grads = _run_forward_backward(packed_attention, (q, kv, sinks), grad)
+
+        rtol, atol = (1e-4, 1e-5) if device == "cuda" else (1e-5, 1e-6)
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
 
     def test_sinkhorn_torch_backend_matches_reference(self):
         torch.manual_seed(123)
