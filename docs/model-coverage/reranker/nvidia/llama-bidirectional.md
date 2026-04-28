@@ -69,7 +69,7 @@ automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.02.00
+  nvcr.io/nvidia/nemo-automodel:26.04.00
 ```
 
 **2. Navigate to the AutoModel directory** (where the recipes are):
