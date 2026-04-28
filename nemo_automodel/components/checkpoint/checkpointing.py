@@ -553,11 +553,6 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        # Pass moe_mesh so adapter.from_hf can validate / merge against the
-        # rank-local subset of experts. DCP has already populated only the
-        # rank-local slice; the mixin's _from_hf_w_merged_experts iterates only
-        # what's in the dict (no re-slicing), but it needs the mesh to know
-        # which expert IDs are expected on this rank.
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         key_diff = _summarize_state_dict_key_diff(expected_keys, set(state_dict.keys()))
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
@@ -814,13 +809,7 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
-            if is_init_step and storage_reader is not None:
-                from torch.distributed.checkpoint import DefaultLoadPlanner
-
-                planner = DefaultLoadPlanner(allow_partial_load=True)
-            else:
-                planner = None
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, planner=planner)
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
     def _do_save(

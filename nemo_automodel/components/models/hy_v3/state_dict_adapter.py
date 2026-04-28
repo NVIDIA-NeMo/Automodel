@@ -139,15 +139,10 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         Steps:
           1. Drop MTP (multi-token prediction) layer keys.
           2. Apply HYV3 name renames (on-disk -> native HF naming).
-          3. Recover the EP device_mesh if the caller passed None: the standard
-             DCP path (checkpointing.py) calls us with ``moe_mesh=None`` on the
-             assumption that the state dict is already EP-local, but the mixin's
-             validator/merger needs the mesh to know which expert subset to
-             expect. Any per-expert tensor that survived ``to_hf`` is a DTensor
-             we can introspect for the mesh.
-          4. Merge per-expert split tensors into grouped form via the mixin.
+          3. Merge per-expert split tensors into grouped form via the mixin
+             (validates expert availability against the rank's EP slice).
         """
-        # Step 1 + 2: filter MTP, then rename in a single pass to avoid copying twice.
+        # Step 1 + 2: filter MTP, rename to native names, in a single pass.
         renamed: dict[str, Any] = {}
         for k, v in hf_state_dict.items():
             if self._is_mtp_key(k):
@@ -159,11 +154,7 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
                     break
             renamed[new_k] = v
 
-        # Step 3: recover device_mesh from any expert-shard DTensor in the dict.
-        if device_mesh is None:
-            device_mesh = self._infer_ep_mesh(renamed)
-
-        # Step 4: per-expert merge + EP slicing via the mixin.
+        # Step 3: per-expert merge + EP slicing via the mixin.
         return self._from_hf_w_merged_experts(renamed, device_mesh)
 
     # ------------------------------------------------------------------
@@ -212,24 +203,3 @@ class HYV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
         num_hidden = getattr(self.config, "num_hidden_layers", 80)
         m = re.match(r"(?:model\.)?layers\.(\d+)\.", key)
         return bool(m and int(m.group(1)) >= num_hidden)
-
-    def _infer_ep_mesh(self, state_dict: dict[str, Any]) -> Optional[DeviceMesh]:
-        """Return the EP device mesh inferred from any per-expert DTensor in *state_dict*.
-
-        The standard DCP load path produces per-expert split DTensors (via
-        ``to_hf``) whose ``device_mesh`` carries the ``ep`` dimension we need
-        to drive ``_from_hf_w_merged_experts``. We probe the dict for any
-        DTensor expert tensor and reuse its mesh.
-        """
-        from torch.distributed.tensor import DTensor
-
-        expert_segment = self._expert_path_segment
-        for k, v in state_dict.items():
-            if not isinstance(v, DTensor):
-                continue
-            if f".{expert_segment}." not in k:
-                continue
-            mesh = v.device_mesh
-            if mesh is not None and "ep" in (mesh.mesh_dim_names or ()):
-                return mesh
-        return None
