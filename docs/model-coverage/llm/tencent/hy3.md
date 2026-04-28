@@ -54,7 +54,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml
 ```
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [NeMo AutoModel Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Fine-Tuning
 
