@@ -53,7 +53,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: transformers.AutoConfig.from_pretrained
-    pretrained_model_name_or_path: /llm-align/open_models/hunyuan3
+    pretrained_model_name_or_path: tencent/Hy3-preview
     num_hidden_layers: 4
   load_base_model: true
   trust_remote_code: false
@@ -107,7 +107,7 @@ dataset:
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /llm-align/open_models/hunyuan3
+    pretrained_model_name_or_path: tencent/Hy3-preview
 
 packed_sequence:
   packed_sequence_size: 0
@@ -126,7 +126,7 @@ validation_dataset:
   num_samples_limit: 32
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /llm-align/open_models/hunyuan3
+    pretrained_model_name_or_path: tencent/Hy3-preview
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
