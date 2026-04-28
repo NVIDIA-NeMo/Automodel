@@ -61,12 +61,12 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4HyperHead,
     DeepseekV4RotaryEmbedding,
     build_causal_padding_mask,
+    build_packed_causal_padding_mask,
 )
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -119,6 +119,7 @@ class DeepseekV4Block(nn.Module):
             hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
+            sinkhorn_backend=backend.dsv4_sinkhorn,
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
@@ -396,6 +397,9 @@ class DeepseekV4Model(nn.Module):
             # h is [B, S, hc_mult, hidden]; shape_ref needs 3D [B, S, hidden].
             shape_ref = h.flatten(start_dim=2)[:, :, : self.config.hidden_size]
 
+        if position_ids is not None and position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+
         if position_ids is None:
             seq_len = shape_ref.shape[1]
             position_ids = torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
@@ -409,14 +413,23 @@ class DeepseekV4Model(nn.Module):
         # pattern HF's ``create_sliding_window_causal_mask`` produces; every
         # layer in the released DSV4-Flash was trained under it.
         sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
-        attention_mask_4d = build_causal_padding_mask(
-            attention_mask,
-            seq_len=shape_ref.shape[1],
-            dtype=shape_ref.dtype,
-            device=shape_ref.device,
-            batch_size=shape_ref.shape[0],
-            sliding_window=sliding_window,
-        )
+        if attn_kwargs.get("qkv_format") == "thd" and attn_kwargs.get("seq_lens") is not None:
+            attention_mask_4d = build_packed_causal_padding_mask(
+                attn_kwargs["seq_lens"],
+                seq_len=shape_ref.shape[1],
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                sliding_window=sliding_window,
+            )
+        else:
+            attention_mask_4d = build_causal_padding_mask(
+                attention_mask,
+                seq_len=shape_ref.shape[1],
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                batch_size=shape_ref.shape[0],
+                sliding_window=sliding_window,
+            )
 
         # ``input_ids`` is only meaningful for hash-routing layers, which live
         # on stage 0 (num_hash_layers <= layers per stage 0).  Mid-stages pass
@@ -571,12 +584,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
-
         logits = self.model(
             input_ids,
             position_ids=position_ids,

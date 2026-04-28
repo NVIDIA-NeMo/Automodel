@@ -32,7 +32,28 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _yarn_correction_dim,
     _yarn_correction_range,
     _yarn_linear_ramp,
+    build_causal_padding_mask,
+    eager_attention_with_sink,
 )
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
+    build_dsv4_sparse_topk_indices,
+    dense_attention_topk_torch,
+    dsv4_indexer_scores,
+    dsv4_indexer_topk_scores,
+    dsv4_sinkhorn_normalize,
+    dsv4_sparse_attention,
+    extract_indexer_topk_scores_torch,
+    indexer_scores_torch,
+    is_dsv4_kernel_available,
+    sinkhorn_normalize_torch,
+)
+
+
+def _run_forward_backward(fn, inputs, grad_output):
+    leaves = [input_.detach().clone().requires_grad_(True) for input_ in inputs]
+    output = fn(*leaves)
+    torch.autograd.backward(output, grad_output.to(dtype=output.dtype, device=output.device))
+    return output.detach(), [leaf.grad.detach() for leaf in leaves]
 
 
 class TestDeepseekV4AttentionMask:
@@ -141,6 +162,396 @@ class TestDeepseekV4HyperConnection:
         col_sums = comb.sum(dim=-2)
         torch.testing.assert_close(row_sums, torch.ones_like(row_sums), rtol=0, atol=1e-2)
         torch.testing.assert_close(col_sums, torch.ones_like(col_sums), rtol=0, atol=1e-2)
+
+
+class TestDeepseekV4OptimizedKernels:
+    """Numerical equivalence tests for optional DSV4 kernel dispatch."""
+
+    def test_sinkhorn_torch_backend_matches_reference(self):
+        torch.manual_seed(123)
+        x = torch.randn(2, 3, 4, 4)
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: sinkhorn_normalize_torch(x_, repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
+        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
+    )
+    def test_sinkhorn_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        x = torch.randn(2, 128, 4, 4, device="cuda")
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_sparse_attention_torch_matches_dense_topk_reference(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim = 2, 7, 3, 8
+        n_pooled = 3
+        q = torch.randn(bsz, seq, heads, dim)
+        kv = torch.randn(bsz, seq + n_pooled, dim)
+        sinks = torch.randn(heads)
+        grad = torch.randn_like(q)
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=bsz,
+            seq_len=seq,
+            key_len=seq + n_pooled,
+            window_size=4,
+            device=q.device,
+            compress_ratio=4,
+            n_pooled=n_pooled,
+        )
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dense_attention_topk_torch(q_, kv_, sinks_, topk, dim**-0.5),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_sparse_attention_matches_current_eager_mask_path(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim = 2, 7, 3, 8
+        n_pooled, ratio, window = 3, 4, 4
+        q = torch.randn(bsz, seq, heads, dim)
+        kv = torch.randn(bsz, seq + n_pooled, dim)
+        sinks = torch.randn(heads)
+        grad = torch.randn_like(q)
+
+        base_mask = build_causal_padding_mask(
+            attention_mask=None,
+            seq_len=seq,
+            dtype=q.dtype,
+            device=q.device,
+            batch_size=bsz,
+            sliding_window=window,
+        )
+        min_val = torch.finfo(q.dtype).min
+        q_pos = torch.arange(seq, device=q.device)
+        p_pos = torch.arange(n_pooled, device=q.device)
+        allowed = p_pos.unsqueeze(0) < ((q_pos + 1) // ratio).unsqueeze(1)
+        compressed_mask = torch.where(
+            allowed,
+            torch.zeros((), dtype=q.dtype, device=q.device),
+            torch.full((), min_val, dtype=q.dtype, device=q.device),
+        )
+        attention_mask = torch.cat([base_mask, compressed_mask.expand(bsz, seq, n_pooled).unsqueeze(1)], dim=-1)
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=bsz,
+            seq_len=seq,
+            key_len=seq + n_pooled,
+            window_size=window,
+            device=q.device,
+            attention_mask=attention_mask,
+            compress_ratio=ratio,
+            n_pooled=n_pooled,
+        )
+
+        class DummyModule:
+            num_key_value_groups = heads
+
+            def __init__(self, sinks):
+                self.sinks = sinks
+                self.training = False
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: eager_attention_with_sink(
+                DummyModule(sinks_),
+                q_.transpose(1, 2),
+                kv_.unsqueeze(1),
+                kv_.unsqueeze(1),
+                attention_mask,
+                scaling=dim**-0.5,
+            )[0],
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
+    )
+    def test_sparse_attention_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, key_len, topk_len = 1, 16, 8, 128, 20, 16
+        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
+        sinks = torch.randn(heads, device="cuda")
+        topk = torch.stack(
+            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
+        ).to(torch.int32)
+        topk[:, :, -4:] = -1
+        grad = torch.randn(bsz, seq, dim, heads, device="cuda", dtype=q.dtype).transpose(2, 3)
+        assert not grad.is_contiguous()
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="tilelang",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
+    )
+    def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, n_pooled = 1, 192, 128, 128, 48
+        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(bsz, seq + n_pooled, dim, device="cuda", dtype=torch.bfloat16)
+        sinks = torch.randn(heads, device="cuda")
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=bsz,
+            seq_len=seq,
+            key_len=seq + n_pooled,
+            window_size=128,
+            device=q.device,
+            compress_ratio=4,
+            n_pooled=n_pooled,
+        )
+        assert (topk == -1).any()
+        grad = torch.randn_like(q).transpose(2, 3).contiguous().transpose(2, 3)
+        assert not grad.is_contiguous()
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="tilelang",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+
+    def test_indexer_scores_torch_backend_matches_reference(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled = 2, 7, 3, 8, 5
+        q = torch.randn(bsz, seq, heads, dim)
+        pooled_kv = torch.randn(bsz, pooled, dim)
+        weights = torch.randn(bsz, seq, heads)
+        grad = torch.randn(bsz, seq, pooled)
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: indexer_scores_torch(q_, pooled_kv_, weights_, dim**-0.5),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_indexer_topk_scores_torch_backend_matches_reference(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled, topk = 2, 7, 3, 8, 5, 4
+        q = torch.randn(bsz, seq, heads, dim)
+        pooled_kv = torch.randn(bsz, pooled, dim)
+        weights = torch.randn(bsz, seq, heads)
+        topk_indices = torch.randint(0, pooled, (bsz, seq, topk))
+        topk_indices[:, :, -1] = -1
+        grad = torch.randn(bsz, seq, topk)
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: extract_indexer_topk_scores_torch(
+                indexer_scores_torch(q_, pooled_kv_, weights_, dim**-0.5),
+                topk_indices,
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
+    )
+    def test_indexer_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled = 2, 16, 8, 128, 4
+        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
+        q_pos = torch.arange(seq, device="cuda")
+        pooled_pos = torch.arange(pooled, device="cuda")
+        valid = pooled_pos.unsqueeze(0) < ((q_pos + 1) // 4).unsqueeze(1)
+        expected = dsv4_indexer_scores(
+            q,
+            pooled_kv,
+            weights,
+            compress_ratio=4,
+            softmax_scale=dim**-0.5,
+            backend="torch",
+        )
+        expected = torch.where(valid.unsqueeze(0), expected, torch.full_like(expected, float("-inf")))
+        actual = dsv4_indexer_scores(
+            q,
+            pooled_kv,
+            weights,
+            compress_ratio=4,
+            softmax_scale=dim**-0.5,
+            backend="tilelang",
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
+    )
+    def test_indexer_topk_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled, topk = 1, 16, 8, 128, 4, 4
+        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
+        topk_indices = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(bsz, seq, -1)
+        q_pos = torch.arange(seq, device="cuda")
+        valid_end = ((q_pos + 1) // 4).view(1, seq, 1)
+        topk_indices = torch.where(topk_indices < valid_end, topk_indices, torch.full_like(topk_indices, -1))
+        grad = torch.randn(bsz, seq, topk, device="cuda")
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="tilelang",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)
 
 
 class TestApplyPartialRopeInterleaved:
