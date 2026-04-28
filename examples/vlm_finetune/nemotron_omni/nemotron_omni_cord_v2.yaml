@@ -24,7 +24,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/nemotron-3-nano-omni-ea1_v2.0
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   trust_remote_code: true
   torch_dtype: torch.bfloat16
   backend:
@@ -39,12 +39,12 @@ model:
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/nemotron-3-nano-omni-ea1_v2.0
+  pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   trust_remote_code: true
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/logs/cordv2_v2_lr1e4_ckpts/
+  checkpoint_dir: vlm_checkpoints/
   model_save_format: safetensors
   save_consolidated: true
 
