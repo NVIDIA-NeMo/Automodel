@@ -1174,20 +1174,35 @@ class TestBuildCheckpointConfig:
         assert config.save_consolidated is False
         assert config.is_peft is True
 
-    def test_build_checkpoint_config_rejects_peft_with_torch_save(self):
-        """Test that PEFT with torch_save format raises error."""
+    def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
+        """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+        from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
+            "checkpoint_dir": "/user/ckpt/",
+            # torch_save-specific / incompatible options that must be discarded:
+            "save_consolidated": False,
+            "is_async": True,
         }
 
-        with pytest.raises(ValueError, match="PEFT checkpointing is not supported for torch_save"):
-            build_checkpoint_config(
+        with caplog.at_level("WARNING", logger="nemo_automodel.recipes.vlm.finetune"):
+            config = build_checkpoint_config(
                 cfg_ckpt=cfg_ckpt,
                 cache_dir=None,
                 model_repo_id="org/model",
                 is_peft=True,
             )
+
+        assert any("discarding" in rec.message.lower() for rec in caplog.records)
+        assert config.is_peft is True
+        assert config.model_save_format == SerializationFormat.SAFETENSORS
+        # checkpoint_dir is preserved from the user config
+        assert config.checkpoint_dir == "/user/ckpt/"
+        # other user-provided torch_save options are discarded (defaults restored)
+        assert config.save_consolidated is True
+        assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
         """Test that HF_HUB_CACHE is used when cache_dir is None."""
