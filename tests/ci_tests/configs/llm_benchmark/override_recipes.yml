@@ -13,6 +13,18 @@
 # limitations under the License.
 
 exempt_models:
+  - deepseek
+  - glm
+  - gpt_oss
+  - kimi
+  - llama3_1
+  - llama3_3
+  - minimax
+  - mistral
+  - moonlight
+  - nemotron
+  - qwen
+  - step
 
 exempt_configs:
 
