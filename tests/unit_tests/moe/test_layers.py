@@ -828,6 +828,46 @@ class TestGate:
         assert aux_loss.numel() == 1  # Scalar loss
         assert aux_loss.requires_grad
 
+    def test_gate_aux_loss_under_activation_checkpointing(self, moe_config, device):
+        """Aux-loss path must be activation-checkpoint safe: saved tensors that AC
+        observes during forward must match dtype on backward recompute. Regression
+        test for the case where Gate cast `original_scores` back to bf16 right
+        before `_compute_aux_loss`, producing bf16 saved tensors that recomputed as
+        fp32 inside `torch.utils.checkpoint.NO_REENTRANT` and tripped
+        `check_recomputed_tensors_match`.
+        """
+        moe_config.aux_loss_coeff = 0.01
+        # Force gate_precision=fp32 — the configuration that triggered the bug
+        # (Nemotron-3-Nano sets this in nemotron_v3/layers.py).
+        gate = Gate(moe_config, gate_precision=torch.float32)
+        gate = gate.to(device)
+        gate.train()
+
+        num_tokens = 16
+        x = torch.randn(
+            num_tokens,
+            moe_config.dim,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        def gate_fwd(x_):
+            weights, _, aux_loss = gate(x_, token_mask, cp_mesh=None)
+            # Inject the aux_loss gradient the same way the real model does, so
+            # MoEAuxLossAutoScaler's saved tensor is exercised on backward.
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                1.0, device=x_.device
+            )
+            return weights.sum()
+
+        loss = torch.utils.checkpoint.checkpoint(gate_fwd, x, use_reentrant=False)
+        # Pre-fix this raised CheckpointError("Recomputed values for the
+        # following tensors have different metadata") inside the unpack hook.
+        loss.backward()
+        assert x.grad is not None
+
     def test_gate_update_bias(self, moe_config, device):
         """Test gate bias update mechanism."""
         moe_config.gate_bias_update_factor = 0.1

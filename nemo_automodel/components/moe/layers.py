@@ -384,7 +384,10 @@ class Gate(nn.Module):
 
         if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
-            original_scores = original_scores.to(dtype=original_dtype)
+            # Keep original_scores in gate_precision (fp32 for numerical stability) — it
+            # only feeds _compute_aux_loss, and casting back to bf16 here makes the saved
+            # tensors of that path mismatch their recomputed counterparts under
+            # activation checkpointing (forward saves bf16, recompute produces fp32).
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
