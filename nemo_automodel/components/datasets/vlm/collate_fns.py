@@ -742,7 +742,7 @@ def kimi_vl_collate_fn(
 
     batch = processor(**processor_kwargs)
 
-    labels = build_labels(
+    labels = build_labels_from_template(
         batch["input_ids"],
         conversations,
         processor,
