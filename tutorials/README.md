@@ -5,11 +5,9 @@ End-to-end tutorials covering the LLM customization lifecycle using
 
 | Tutorial | Dataset | Description | Launch on Brev |
 |----------|---------|-------------|----------------|
-| [Domain Adaptive Pre-Training (DAPT)](./dapt) | Domain-specific text corpus | Continued pre-training of a foundation model on domain data to improve in-domain performance (inspired by [ChipNeMo](https://arxiv.org/abs/2311.00176)). | 🚧 |
 | [Supervised Fine-Tuning (SFT)](./sft-peft) | [SQuAD](https://huggingface.co/datasets/rajpurkar/squad) | Full-parameter SFT to adapt a pre-trained model to follow instructions. | 🚧 |
 | [Parameter-Efficient Fine-Tuning (PEFT)](./sft-peft) | [SQuAD](https://huggingface.co/datasets/rajpurkar/squad) | Memory-efficient LoRA fine-tuning for task adaptation. | 🚧 |
 | [Evaluation](./evaluation) | Standard benchmarks (MMLU, HellaSwag, IFEval, etc.) | Evaluate AutoModel checkpoints with lm-evaluation-harness. | 🚧 |
-| [Reasoning SFT](./reasoning-sft) | Reasoning instruction data (OpenAI chat format) | Fine-tune a model to selectively enable chain-of-thought reasoning via system prompt control. | 🚧 |
 | [Nemotron Parse Fine-Tuning](./nemotron-parse) | [Invoices](https://huggingface.co/datasets/katanaml-org/invoices-donut-data-v1) | Fine-tune Nemotron Parse v1.1 for structured document extraction. | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM) |
 
 ## Prerequisites
