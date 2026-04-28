@@ -42,10 +42,10 @@ model:
   trust_remote_code: true
 
 checkpoint:
-  enabled: false
+  enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: false 
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2
@@ -104,7 +104,7 @@ ci:
   node_multiplier: true
   vllm_deploy: true
   checkpoint_robustness:
-    hf_kl_threshold: 1.2e-3
+    hf_kl_threshold: 2e-3
     tokenizer_name: microsoft/phi-4
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500

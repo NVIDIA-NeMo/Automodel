@@ -34,19 +34,6 @@ inputs:
     description: "Run tests on CPU only"
     required: false
     default: "false"
-  azure-client-id:
-    description: "Azure Client ID"
-    required: true
-  azure-tenant-id:
-    description: "Azure Tenant ID"
-    required: true
-  azure-subscription-id:
-    description: "Azure Subscription ID"
-    required: true
-  has-azure-credentials:
-    description: "Has Azure credentials"
-    required: false
-    default: "false"
   PAT:
     description: "GitHub Personal Access Token"
     required: true
@@ -63,33 +50,15 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install Azure CLI
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        echo "::group::Install Azure CLI"
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-        echo "::endgroup::"
-
-    - name: Azure Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      uses: azure/login@v2
-      with:
-        client-id: ${{ inputs.azure-client-id }}
-        tenant-id: ${{ inputs.azure-tenant-id }}
-        subscription-id: ${{ inputs.azure-subscription-id }}
-
-    - name: Azure ACR Login
-      shell: bash
-      run: |
-        az acr login --name nemoci
-
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
       if: ${{ contains(inputs.runner, 'aws') }}
       run: |
-        apt-get update
-        apt-get install -y uuid-runtime
+        for i in 1 2 3; do
+          apt-get update && apt-get install -y uuid-runtime && break
+          echo "Attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
 
     - name: Start container
       shell: bash
@@ -153,6 +122,15 @@ runs:
         echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
+    - name: Display launch info
+      shell: bash
+      run: |
+        echo -e "\033[1;34m┌─ launching test ─────────────────────────────────────────────────────────┐\033[0m"
+        echo -e "\033[1;34m│  test      : ${{ inputs.test-folder }}\033[0m"
+        echo -e "\033[1;34m│  runner    : ${{ inputs.runner }}\033[0m"
+        echo -e "\033[1;34m│  container : ${{ inputs.container-image }}\033[0m"
+        echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
+
     - name: Run main script
       uses: nick-fields/retry@v3
       id: run-main-script
@@ -166,34 +144,48 @@ runs:
 
     - name: Check result
       id: check
-      shell: bash
+      shell: bash -e -u -o pipefail {0}
+      if: always()
       run: |
-        echo "::group::Check result"
         docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage combine || true
         docker exec nemo_container_${{ github.run_id }} /opt/venv/bin/coverage xml || true
-        docker cp nemo_container_${{ github.run_id }}:/opt/Automodel/.coverage .coverage
-        docker cp nemo_container_${{ github.run_id }}:/opt/Automodel/coverage.xml coverage.xml
+        docker cp nemo_container_${{ github.run_id }}:/opt/Automodel/.coverage .coverage || true
+        docker cp nemo_container_${{ github.run_id }}:/opt/Automodel/coverage.xml coverage.xml || true
 
         coverage_report=coverage-${{ steps.create.outputs.coverage-prefix }}-${{ github.run_id }}-$(uuidgen)
-        echo "coverage_report=$coverage_report" >> "$GITHUB_OUTPUT"
+        echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
 
         if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
-          echo "::warning:: Test failed, but displayed as successful because it is marked as optional."
+          echo "::warning::Test failed but is marked optional — treating as success."
           IS_SUCCESS=true
         fi
 
-        if [[ "$IS_SUCCESS" == "false" ]]; then
-          echo Test did not finish successfully.
-          exit 1
-        else
-          docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i
-        fi
-
-        exit $EXIT_CODE
+        echo "::group::Coverage report"
+        docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i || true
         echo "::endgroup::"
+
+        if [[ "$IS_SUCCESS" == "true" ]]; then
+          echo -e "\033[1;32m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m║   ✅  PASSED                                                             ║\033[0m"
+          echo -e "\033[1;32m║   ${{ inputs.test-folder }}\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::notice title=Result::✅ ${{ inputs.test-folder }} — PASSED"
+          exit 0
+        else
+          echo -e "\033[1;31m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m║   ❌  FAILED  (exit code: ${EXIT_CODE})                                  ║\033[0m"
+          echo -e "\033[1;31m║   ${{ inputs.test-folder }}\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::error title=Result::❌ ${{ inputs.test-folder }} — FAILED (exit $EXIT_CODE)"
+          exit 1
+        fi
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v6

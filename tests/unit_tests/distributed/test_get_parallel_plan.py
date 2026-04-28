@@ -151,18 +151,15 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
     assert result is sentinel
 
 
-# 4. HF fallback when no optimised plan exists
+# 4. HF plan is used when no optimised plan exists
 def test_hf_fallback(monkeypatch):
-    # When no optimised plan exists and HF is not explicitly requested, the helper
-    # should return the default base plan.
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: {"hf": "plan2"}, raising=True)
+    # When no optimised plan exists, the helper should prefer the HF-provided plan.
+    hf_plan = {"model.embed_tokens": "embed", "lm_head": "head"}
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda m: hf_plan, raising=True)
     _set_global_model_cls(monkeypatch, _DummyModel)
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
-    assert isinstance(result, dict)
-    # base plan should include embed_tokens and lm_head entries
-    assert "model.embed_tokens" in result
-    assert "lm_head" in result
+    assert result is hf_plan
 
 
 def test_hf_fallback_sequence_parallel_assert(monkeypatch):
