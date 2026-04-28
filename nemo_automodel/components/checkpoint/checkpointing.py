@@ -553,7 +553,10 @@ class Checkpointer:
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
             state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
-        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        # DCP already handled EP tensor distribution via DTensors, so don't
+        # pass moe_mesh here — adapter.from_hf must only rename keys, not
+        # re-slice experts that are already EP-local inside the DTensors.
+        state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=None)
         key_diff = _summarize_state_dict_key_diff(expected_keys, set(state_dict.keys()))
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             logging.warning(
