@@ -997,6 +997,85 @@ class TestExpandImageTokens:
         assert expanded_ids.dtype == torch.int32
         assert expanded_mask.dtype == torch.int64
 
+    def test_expand_image_tokens_multi_image_different_sizes(self, collate_mod):
+        """Multi-image: two placeholders with different grid sizes."""
+        media_token_id = 163605
+        # [BOS, PH1, TEXT, PH2, EOS]
+        input_ids = torch.tensor([1, media_token_id, 99, media_token_id, 2])
+        attention_mask = torch.ones(5, dtype=torch.long)
+
+        # First image: [1,2,2] -> (2//2)*(2//2) = 1 token
+        # Second image: [1,4,4] -> (4//2)*(4//2) = 4 tokens
+        grid_thws = torch.tensor([[1, 2, 2], [1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # 5 - 2 placeholders + 1 + 4 = 8 tokens
+        assert expanded_ids.shape[0] == 8
+        assert expanded_mask.shape[0] == 8
+
+        # [1, media*1, 99, media*4, 2]
+        assert expanded_ids[0] == 1
+        assert expanded_ids[1] == media_token_id
+        assert expanded_ids[2] == 99
+        assert (expanded_ids[3:7] == media_token_id).all()
+        assert expanded_ids[7] == 2
+
+    def test_expand_image_tokens_multi_image_same_size(self, collate_mod):
+        """Multi-image: two placeholders with identical grid sizes."""
+        media_token_id = 163605
+        input_ids = torch.tensor([media_token_id, 50, media_token_id])
+        attention_mask = torch.ones(3, dtype=torch.long)
+
+        # Both images: [1,4,4] -> 4 tokens each
+        grid_thws = torch.tensor([[1, 4, 4], [1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # 3 - 2 + 4 + 4 = 9 tokens
+        assert expanded_ids.shape[0] == 9
+        assert (expanded_ids[0:4] == media_token_id).all()
+        assert expanded_ids[4] == 50
+        assert (expanded_ids[5:9] == media_token_id).all()
+
+    def test_expand_image_tokens_three_images(self, collate_mod):
+        """Multi-image: three placeholders each with 4-token expansion."""
+        media_token_id = 163605
+        input_ids = torch.tensor([1, media_token_id, 2, media_token_id, 3, media_token_id, 4])
+        attention_mask = torch.ones(7, dtype=torch.long)
+
+        # All three: [1,4,4] -> 4 tokens each
+        grid_thws = torch.tensor([[1, 4, 4], [1, 4, 4], [1, 4, 4]])
+
+        expanded_ids, expanded_mask = collate_mod._expand_image_tokens(
+            input_ids, attention_mask, grid_thws, media_token_id
+        )
+
+        # 7 - 3 + 4*3 = 16 tokens
+        assert expanded_ids.shape[0] == 16
+        assert expanded_mask.shape[0] == 16
+
+        # Spot-check non-image tokens
+        assert expanded_ids[0] == 1
+        assert expanded_ids[5] == 2
+        assert expanded_ids[10] == 3
+        assert expanded_ids[15] == 4
+
+    def test_expand_image_tokens_mismatch_raises(self, collate_mod):
+        """ValueError when placeholder count does not match grid_thws rows."""
+        media_token_id = 163605
+        # Two placeholders but only one grid entry
+        input_ids = torch.tensor([media_token_id, 5, media_token_id])
+        attention_mask = torch.ones(3, dtype=torch.long)
+        grid_thws = torch.tensor([[1, 4, 4]])
+
+        with pytest.raises(ValueError, match="placeholder"):
+            collate_mod._expand_image_tokens(input_ids, attention_mask, grid_thws, media_token_id)
+
 
 # =============================================================================
 # Tests for kimi_k25_vl_collate_fn
