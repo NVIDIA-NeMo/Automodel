@@ -59,13 +59,10 @@ class TestCustomConfigRegistration:
         assert cls.model_type == "hy_v3"
 
 
-class TestRetrievalMappingSync:
-    """Sync-state tests: the PR removed the Ministral3 bidirectional retrieval
-    backbone; ensure those keys are no longer in SUPPORTED_BACKBONES."""
+class TestSupportedBackbonesIntact:
+    """Sanity check that hy_v3 registration didn't disturb existing backbones."""
 
-    def test_ministral3_not_in_supported_backbones(self):
+    def test_llama_still_in_supported_backbones(self):
         from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
-        assert "ministral3" not in SUPPORTED_BACKBONES
-        assert "ministral3_bidirec" not in SUPPORTED_BACKBONES
-        assert "mistral3" not in SUPPORTED_BACKBONES
+        assert "llama" in SUPPORTED_BACKBONES

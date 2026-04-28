@@ -291,61 +291,36 @@ def test_peft_with_tp_disables_triton(caplog):
     assert "Disabling Triton with TP" in caplog.text
 
 
-def test_build_checkpoint_config_rejects_peft_with_torch_save():
-    """PEFT + torch_save must hard-error (no silent fallback to safetensors)."""
+def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog):
+    """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+    from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
     from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
 
     cfg_ckpt = MagicMock()
     cfg_ckpt.to_dict.return_value = {
         "model_save_format": "torch_save",
         "checkpoint_dir": "/user/ckpt/",
+        # torch_save-specific / incompatible options that must be discarded:
+        "save_consolidated": False,
+        "is_async": True,
     }
 
-    with pytest.raises(ValueError, match="PEFT checkpointing is not supported for torch_save"):
-        build_checkpoint_config(
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.recipes.llm.train_ft"):
+        config = build_checkpoint_config(
             cfg_ckpt=cfg_ckpt,
             cache_dir=None,
             model_repo_id="org/model",
             is_peft=True,
         )
 
-
-def test_build_checkpoint_config_accepts_peft_with_safetensors():
-    """PEFT + safetensors (the default) is the supported path."""
-    from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
-    from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
-
-    cfg_ckpt = MagicMock()
-    cfg_ckpt.to_dict.return_value = {
-        "model_save_format": "safetensors",
-        "checkpoint_dir": "/user/ckpt/",
-    }
-    config = build_checkpoint_config(
-        cfg_ckpt=cfg_ckpt,
-        cache_dir=None,
-        model_repo_id="org/model",
-        is_peft=True,
-    )
+    assert any("discarding" in rec.message.lower() for rec in caplog.records)
     assert config.is_peft is True
     assert config.model_save_format == SerializationFormat.SAFETENSORS
+    # checkpoint_dir is preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
-
-
-def test_build_checkpoint_config_accepts_non_peft_with_torch_save():
-    """Non-PEFT runs may use torch_save freely."""
-    from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
-    from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
-
-    cfg_ckpt = MagicMock()
-    cfg_ckpt.to_dict.return_value = {"model_save_format": "torch_save"}
-    config = build_checkpoint_config(
-        cfg_ckpt=cfg_ckpt,
-        cache_dir=None,
-        model_repo_id="org/model",
-        is_peft=False,
-    )
-    assert config.is_peft is False
-    assert config.model_save_format == SerializationFormat.TORCH_SAVE
+    # other user-provided torch_save options are discarded (defaults restored)
+    assert config.save_consolidated is True
+    assert config.is_async is False
 
 
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
