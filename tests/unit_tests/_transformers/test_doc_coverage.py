@@ -57,6 +57,8 @@ _DOC_ARCH_ALIASES = {
     # Ministral3 text model; covered on the Ministral3 / Ministral3-VL pages
     # that list the VLM arch ``Mistral3ForConditionalGeneration``.
     "Ministral3ForCausalLM": "Mistral3ForConditionalGeneration",
+    # Bi-encoder variant of Ministral3, covered on the same Ministral3 / Ministral3-VL pages.
+    "Ministral3BidirectionalModel": "Mistral3ForConditionalGeneration",
     # Mistral4 text model is the backbone of Mistral-Small-4 VLM; documented
     # on the Mistral-Small-4 page via the recipe path ``mistral4``.
     "Mistral4ForCausalLM": "mistral4",
