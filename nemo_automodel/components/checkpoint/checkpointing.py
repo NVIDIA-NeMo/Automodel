@@ -375,7 +375,7 @@ class Checkpointer:
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        self._do_load(state_dict, os.path.join(weights_path, "optim"), allow_partial_load=True)
         optimizer_state.load_state_dict(state_dict)
 
     @torch.no_grad()
@@ -790,6 +790,7 @@ class Checkpointer:
         path: str,
         storage_reader: Optional[_HuggingFaceStorageReader] = None,
         is_init_step: bool = False,
+        allow_partial_load: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Load a state dictionary from `path` using DCP or PEFT special-case logic.
@@ -799,6 +800,9 @@ class Checkpointer:
             path: Checkpoint directory path.
             storage_reader: Optional HF storage reader for safetensors.
             is_init_step: True if loading from a base checkpoint during initialization.
+            allow_partial_load: If True, skip state_dict keys absent in the checkpoint
+                (e.g. optimizer params that never received a gradient and therefore have
+                no per-parameter state saved).
 
         Returns:
             The populated state dictionary (may be replaced for PEFT).
@@ -809,7 +813,12 @@ class Checkpointer:
         if self.config.is_peft and is_model and (not is_init_step):
             state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
         else:
-            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
+            planner = None
+            if allow_partial_load:
+                from torch.distributed.checkpoint import DefaultLoadPlanner
+
+                planner = DefaultLoadPlanner(allow_partial_load=True)
+            dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, planner=planner)
         return state_dict
 
     def _do_save(
