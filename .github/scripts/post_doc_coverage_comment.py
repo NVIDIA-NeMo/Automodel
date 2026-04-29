@@ -15,7 +15,7 @@ nemo_automodel install required, since the registry is parsed via AST rather
 than imported.
 
 Behavior:
-  - empty report      -> deletes the existing bot comment, if any.
+  - empty report      -> leaves any prior bot comment in place (no delete).
   - pending entries   -> upserts the bot comment, exits 0.
   - expired entries   -> upserts the bot comment, exits 1 (CI check fails).
 
@@ -340,8 +340,7 @@ def main() -> int:
         if existing_id is None:
             print("All archs documented and no prior bot comment; nothing to do.")
         else:
-            print(f"All archs documented; deleting stale bot comment {existing_id}.")
-            _api("DELETE", f"/repos/{args.repo}/issues/comments/{existing_id}")
+            print(f"All archs documented; leaving prior bot comment {existing_id} in place.")
         return 0
 
     author = _get_pr_author(args.repo, args.pr)
