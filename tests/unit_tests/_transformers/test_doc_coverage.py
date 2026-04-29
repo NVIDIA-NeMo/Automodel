@@ -32,6 +32,7 @@ truth that the workflow reads.
 """
 
 import pathlib
+import re
 import subprocess
 import time
 
@@ -113,17 +114,19 @@ def _repo_root() -> pathlib.Path:
 _DOC_GRACE_PERIOD_DAYS = 7
 
 
-def _arch_registration_age_days(arch_name: str, repo_root: pathlib.Path) -> float | None:
-    """Return days since ``arch_name`` was last added to ``registry.py``.
+def _arch_registration_info(arch_name: str, repo_root: pathlib.Path) -> dict | None:
+    """Return registration info for ``arch_name`` from ``registry.py`` git
+    history: ``{"age_days": float, "pr": int | None}``, or ``None`` if git
+    history is unavailable (not a git repo, shallow clone that pruned the
+    commit, ``git`` not on PATH, etc.).
 
-    Uses ``git log -S "<arch_name>"`` on ``registry.py`` to find the most
-    recent commit that changed the count of occurrences of the arch's
-    quoted dict-key string — i.e., the commit that registered it. Returns
-    ``None`` if git history is unavailable (not a git repo, shallow clone
-    that pruned the commit, ``git`` not on PATH, etc.). Callers treat
-    ``None`` as "fresh" so missing-doc cases default to a warning rather
-    than blocking on infra issues; CI's build-container is configured with
-    ``fetch-depth: 0`` so the lookup succeeds in the test container.
+    ``pr`` is parsed from the squash-merge subject suffix ``(#NNNN)`` —
+    NVIDIA-NeMo's PR merges land that way. Direct pushes return ``None`` so
+    the caller can omit the link instead of fabricating one. Callers treat
+    ``None`` for the whole record as "fresh" so missing-doc cases default
+    to a warning rather than blocking on infra issues; CI's build-container
+    is configured with ``fetch-depth: 0`` so the lookup succeeds in the
+    test container.
     """
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
     try:
@@ -134,7 +137,7 @@ def _arch_registration_age_days(arch_name: str, repo_root: pathlib.Path) -> floa
                 str(repo_root),
                 "log",
                 "-1",
-                "--format=%ct",
+                "--format=%ct%x09%s",
                 "-S",
                 f'"{arch_name}"',
                 "--",
@@ -148,11 +151,16 @@ def _arch_registration_age_days(arch_name: str, repo_root: pathlib.Path) -> floa
         return None
     if not out:
         return None
+    ts_str, _, subject = out.partition("\t")
     try:
-        commit_time = int(out)
+        commit_time = int(ts_str)
     except ValueError:
         return None
-    return (time.time() - commit_time) / 86400.0
+    m = re.search(r"\(#(\d+)\)\s*$", subject)
+    return {
+        "age_days": (time.time() - commit_time) / 86400.0,
+        "pr": int(m.group(1)) if m else None,
+    }
 
 
 def test_every_registered_arch_has_model_coverage_doc():
@@ -178,31 +186,34 @@ def test_every_registered_arch_has_model_coverage_doc():
     md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.md")]
     assert md_contents, "No .md files found under docs/model-coverage/"
 
-    missing: list[tuple[str, str, float | None]] = []
+    missing: list[tuple[str, str, float | None, int | None]] = []
     for arch_name in MODEL_ARCH_MAPPING:
         needle = _DOC_ARCH_ALIASES.get(arch_name, arch_name)
         if any(needle in content for content in md_contents):
             continue
-        age_days = _arch_registration_age_days(arch_name, repo_root)
-        missing.append((arch_name, needle, age_days))
+        info = _arch_registration_info(arch_name, repo_root)
+        age_days = info["age_days"] if info else None
+        pr_number = info["pr"] if info else None
+        missing.append((arch_name, needle, age_days, pr_number))
 
     # Treat unknown ages (git unavailable / shallow clone) as fresh so an infra
     # problem can't unfairly block a PR; CI guarantees full history via the
     # build-container's ``fetch-depth: 0``.
-    expired = [(a, n, age) for (a, n, age) in missing if age is not None and age >= _DOC_GRACE_PERIOD_DAYS]
-    pending = [(a, n, age) for (a, n, age) in missing if (a, n, age) not in expired]
+    expired = [(a, n, age, pr) for (a, n, age, pr) in missing if age is not None and age >= _DOC_GRACE_PERIOD_DAYS]
+    pending = [entry for entry in missing if entry not in expired]
 
-    for arch, needle, age in pending:
+    for arch, needle, age, pr in pending:
         if age is None:
             remaining_msg = f"{_DOC_GRACE_PERIOD_DAYS} day(s) (registration date unknown — assuming fresh)"
         else:
             remaining_msg = f"{max(0.0, _DOC_GRACE_PERIOD_DAYS - age):.1f} day(s)"
+        pr_msg = f" (added in #{pr})" if pr is not None else ""
         # GitHub Actions parses ``::warning file=…::…`` lines from stdout into
         # PR-level annotations. Pytest is run with ``-s`` (no capture) in CI
         # so the print reaches the workflow log unmodified.
         print(
             f"::warning file=nemo_automodel/_transformers/registry.py::"
-            f"Architecture '{arch}' has no model card under docs/model-coverage/ "
+            f"Architecture '{arch}'{pr_msg} has no model card under docs/model-coverage/ "
             f"(looked for {needle!r}). {remaining_msg} remain in the "
             f"{_DOC_GRACE_PERIOD_DAYS}-day grace window before this becomes a "
             f"hard failure — please open a follow-up docs PR or add the arch "
@@ -211,7 +222,10 @@ def test_every_registered_arch_has_model_coverage_doc():
 
     if expired:
         details = "\n".join(
-            f"  - {arch} (looked for {needle!r}, registered {age:.1f} days ago)" for arch, needle, age in expired
+            f"  - {arch} (looked for {needle!r}, registered {age:.1f} days ago"
+            + (f", added in #{pr}" if pr is not None else "")
+            + ")"
+            for arch, needle, age, pr in expired
         )
         raise AssertionError(
             f"The following registered architectures have been missing a model "

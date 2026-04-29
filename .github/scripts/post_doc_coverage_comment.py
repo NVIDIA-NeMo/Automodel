@@ -30,6 +30,7 @@ import ast
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -92,10 +93,11 @@ def _load_test_module(test_file: Path):
     return mod
 
 
-def _arch_registration_age_days(arch_name: str, repo_root: Path) -> float | None:
-    """Days since ``arch_name`` was last added to ``registry.py`` per
-    ``git log -S``. Returns None if history is unavailable (shallow clone,
-    git not on PATH); the caller treats that as "fresh".
+def _arch_registration_info(arch_name: str, repo_root: Path) -> dict | None:
+    """Return ``{"age_days": float, "pr": int | None}`` for the commit that
+    last added ``arch_name`` to registry.py, or ``None`` if history is
+    unavailable (shallow clone, git not on PATH). ``pr`` is parsed from the
+    squash-merge subject suffix ``(#NNNN)``; direct pushes return ``None``.
     """
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
     try:
@@ -106,7 +108,7 @@ def _arch_registration_age_days(arch_name: str, repo_root: Path) -> float | None
                 str(repo_root),
                 "log",
                 "-1",
-                "--format=%ct",
+                "--format=%ct%x09%s",
                 "-S",
                 f'"{arch_name}"',
                 "--",
@@ -120,10 +122,16 @@ def _arch_registration_age_days(arch_name: str, repo_root: Path) -> float | None
         return None
     if not out:
         return None
+    ts_str, _, subject = out.partition("\t")
     try:
-        return (time.time() - int(out)) / 86400.0
+        commit_time = int(ts_str)
     except ValueError:
         return None
+    m = re.search(r"\(#(\d+)\)\s*$", subject)
+    return {
+        "age_days": (time.time() - commit_time) / 86400.0,
+        "pr": int(m.group(1)) if m else None,
+    }
 
 
 def _build_report(repo_root: Path) -> tuple[list[dict], int]:
@@ -155,7 +163,9 @@ def _build_report(repo_root: Path) -> tuple[list[dict], int]:
         needle = aliases.get(arch, arch)
         if any(needle in c for c in md_contents):
             continue
-        age = _arch_registration_age_days(arch, repo_root)
+        info = _arch_registration_info(arch, repo_root)
+        age = info["age_days"] if info else None
+        pr = info["pr"] if info else None
         report.append(
             {
                 "arch": arch,
@@ -163,6 +173,7 @@ def _build_report(repo_root: Path) -> tuple[list[dict], int]:
                 "expired": (age is not None and age >= grace_days),
                 "age_days": (None if age is None else round(age, 2)),
                 "remaining_days": (None if age is None else round(max(0.0, grace_days - age), 2)),
+                "pr": pr,
             }
         )
     return report, grace_days
@@ -236,7 +247,7 @@ def _get_pr_author(repo: str, pr: int) -> str | None:
     return login if isinstance(login, str) else None
 
 
-def _render_body(report: list[dict], grace_days: int, author: str | None = None) -> str:
+def _render_body(report: list[dict], grace_days: int, repo: str, author: str | None = None) -> str:
     lines = [
         _MARKER,
         "",
@@ -251,8 +262,8 @@ def _render_body(report: list[dict], grace_days: int, author: str | None = None)
         "is auto-managed by CI and will be removed once every arch has a "
         "doc page.",
         "",
-        "| Architecture | Status |",
-        "|---|---|",
+        "| Architecture | Added in | Status |",
+        "|---|---|---|",
     ]
     for entry in report:
         arch = entry["arch"]
@@ -268,7 +279,9 @@ def _render_body(report: list[dict], grace_days: int, author: str | None = None)
                 f"⚠️ pending — {entry['remaining_days']:.1f} day(s) remain in the "
                 f"{grace_days}-day grace window before this becomes a hard failure"
             )
-        lines.append(f"| `{arch}` | {status} |")
+        pr = entry.get("pr")
+        added_in = f"[#{pr}](https://github.com/{repo}/pull/{pr})" if pr else "—"
+        lines.append(f"| `{arch}` | {added_in} | {status} |")
 
     lines += [
         "",
@@ -319,7 +332,7 @@ def main() -> int:
         return 0
 
     author = _get_pr_author(args.repo, args.pr)
-    body = _render_body(report, grace_days, author=author)
+    body = _render_body(report, grace_days, repo=args.repo, author=author)
     if existing_id is None:
         print(f"Posting new bot comment to PR #{args.pr}.")
         _api("POST", f"/repos/{args.repo}/issues/{args.pr}/comments", body={"body": body})
