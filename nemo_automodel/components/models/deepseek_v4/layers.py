@@ -72,6 +72,12 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_sparse_attention,
 )
 
+
+def _dsv4_kernel_backend(backend: BackendConfig) -> str:
+    """Use TileLang DSV4 kernels only when the attention backend requests them."""
+    return "tilelang" if backend.attn == "tilelang" else "torch"
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek V4 attention + compressor + indexer + rotary embedding, ported
 # verbatim from HuggingFace transformers PR 45616 (Arthur Zucker, "Add
@@ -636,7 +642,7 @@ class DeepseekV4Indexer(nn.Module):
             weights,
             compress_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
-            backend=self.backend.dsv4_indexer,
+            backend=_dsv4_kernel_backend(self.backend),
         )
         topk = min(self.index_topk, pooled_kv.shape[1])
         return index_scores.topk(topk, dim=-1).indices
@@ -1017,7 +1023,8 @@ class DeepseekV4Attention(nn.Module):
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        if self.backend.dsv4_sparse_attn != "torch":
+        attn_backend = _dsv4_kernel_backend(self.backend)
+        if attn_backend == "tilelang":
             topk_idxs = build_dsv4_sparse_topk_indices(
                 batch_size=batch,
                 seq_len=seq_len,
@@ -1035,7 +1042,7 @@ class DeepseekV4Attention(nn.Module):
                 self.sinks,
                 topk_idxs,
                 self.scaling,
-                backend=self.backend.dsv4_sparse_attn,
+                backend=attn_backend,
             )
             attn_weights = None
         else:

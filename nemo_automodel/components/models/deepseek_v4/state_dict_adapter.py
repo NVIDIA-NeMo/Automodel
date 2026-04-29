@@ -44,7 +44,6 @@ Both suffixes are handled by the dequantization step.
 from __future__ import annotations
 
 import enum
-import logging
 import os
 import re
 from pathlib import Path
@@ -70,8 +69,6 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
 )
-
-logger = logging.getLogger(__name__)
 
 # V4 Flash routed-expert weights are stored as FP4 (e2m1fn) packed two values per
 # int8 byte, with FP8 (e8m0fnu) per-row scales covering 32-column groups:
@@ -218,8 +215,6 @@ def _rename_hf_key(key: str) -> str:
 
 class DeepSeekV4StateDictAdapter(StateDictAdapter):
     """State dict adapter for DeepSeek V4."""
-
-    _ATTN_SINK_HF_PATTERN = re.compile(r"^layers\.(\d+)\.attn\.attn_sink$")
 
     def __init__(
         self,
@@ -408,34 +403,6 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # (observed in practice during DCP load even after the internal-side drop).
         hf_state_dict = self._drop_hash_layer_gate_bias(hf_state_dict, _HashBiasScope.HF)
         return hf_state_dict
-
-    def trim_state_dict_for_checkpoint_load(
-        self,
-        state_dict: dict[str, Any],
-        checkpoint_keys: set[str],
-    ) -> dict[str, Any]:
-        """Drop trainable DSV4 keys that are absent from the base checkpoint.
-
-        The released DeepSeek-V4-Flash checkpoint does not include
-        ``layers.*.attn.attn_sink``.  Our implementation still keeps the sink as
-        a trainable parameter and initializes it to zero; removing only the
-        missing HF-side load placeholders lets DCP stay strict for all real
-        checkpoint tensors.
-        """
-        filtered: dict[str, Any] = {}
-        dropped = 0
-        for key, value in state_dict.items():
-            if self._ATTN_SINK_HF_PATTERN.match(key) and key not in checkpoint_keys:
-                dropped += 1
-                continue
-            filtered[key] = value
-        if dropped:
-            logger.warning(
-                "DeepSeek V4 checkpoint is missing %d attention-sink tensors; "
-                "leaving model-side sinks at their initialized values.",
-                dropped,
-            )
-        return filtered
 
     def _checkpoint_num_hash_layers(self) -> int:
         """Read ``num_hash_layers`` directly from the checkpoint's config.json.

@@ -48,24 +48,23 @@ Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 _HAS_TILE_KERNELS_SINKHORN, _tile_kernels_sinkhorn = safe_import_from(
     "tile_kernels.modeling.mhc.ops",
     "sinkhorn_normalize",
-    msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use dsv4_sinkhorn='tilelang'.",
+    msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use backend.attn='tilelang'.",
 )
 _HAS_MILES_SPARSE_ATTN, _miles_sparse_attn_tilelang = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
     "sparse_attn_tilelang",
-    msg="Vendored Miles DeepSeek V4 sparse attention is unavailable. Install tilelang to use "
-    "dsv4_sparse_attn='tilelang'.",
+    msg="Vendored Miles DeepSeek V4 sparse attention is unavailable. Install tilelang to use backend.attn='tilelang'.",
 )
 _HAS_MILES_SPARSE_ATTN_CHUNKED, _miles_sparse_attn_tilelang_head_chunked = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
     "sparse_attn_tilelang_head_chunked",
     msg="Vendored Miles DeepSeek V4 chunked sparse attention is unavailable. Install tilelang to use "
-    "dsv4_sparse_attn='tilelang'.",
+    "backend.attn='tilelang'.",
 )
 _HAS_MILES_INDEXER, _miles_batched_indexer_fwd = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",
     "batched_indexer_fwd",
-    msg="Vendored Miles DeepSeek V4 indexer is unavailable. Install tilelang to use dsv4_indexer='tilelang'.",
+    msg="Vendored Miles DeepSeek V4 indexer is unavailable. Install tilelang to use backend.attn='tilelang'.",
 )
 _HAS_MILES_CU_SEQLENS, _miles_make_causal_cu_seqlens = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.tilelang_indexer_fwd",

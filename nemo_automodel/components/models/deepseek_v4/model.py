@@ -60,6 +60,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
     DeepseekV4RotaryEmbedding,
+    _dsv4_kernel_backend,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
@@ -119,7 +120,7 @@ class DeepseekV4Block(nn.Module):
             hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
-            sinkhorn_backend=backend.dsv4_sinkhorn,
+            sinkhorn_backend=_dsv4_kernel_backend(backend),
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
