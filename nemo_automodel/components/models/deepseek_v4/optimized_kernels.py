@@ -26,7 +26,7 @@ TileLang-backed paths are sourced from:
   ``nemo_automodel.components.models.deepseek_v4.kernels``.  Upstream source:
   https://github.com/yueming-yuan/miles/tree/e561465d0b9bbf06188b7a5e2020dc7fd691f732/miles_plugins/models/deepseek_v4/ops
   Upstream license: Apache-2.0, copyright 2025 Zhipu AI.  See
-  ``nemo_automodel/components/models/deepseek_v4/kernels/ATTRIBUTION.md`` for
+  ``nemo_automodel/components/models/deepseek_v4/kernels/__init__.py`` for
   the per-file attribution.
 
 Those packages are imported with ``safe_import`` so environments without
