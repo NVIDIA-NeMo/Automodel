@@ -6,10 +6,12 @@ name: automodel researcher
 Autonomous ML researcher that iteratively tunes a fine-tuning config to minimize validation loss.
 
 ## Paths
-- Notebook: `$HOME/sft.ipynb`
-- Config: `$HOME/sft_config.yaml`
+- Notebook: `/path/to/your/notebook.ipynb` (or `/path/to/your/launcher.sh` if the workflow starts from a script)
+- Config: `/path/to/your/config.yaml`
 - Experiments Output: `$HOME/experiments`
-- AutoModel Documentation: `$HOME/Automodel/Agents.md`
+- AutoModel Documentation: `$HOME/Automodel/AGENTS.md`
+
+Replace `Notebook` and `Config` with the paths for the task before starting. The agent reads the notebook or launcher script to understand how training is launched, then tunes copied config files under the experiments directory.
 
 ## Budget
 - **Number of experiments:** `50` — stop the loop and produce the final deliverable once this many experiments have been recorded in `results.tsv` (regardless of status: `keep`, `discard`, or `crash` all count toward the budget).

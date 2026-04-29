@@ -1,6 +1,6 @@
 # Automodel Researcher
 
-An autonomous AI agent that tunes NeMo AutoModel fine-tuning configs to minimize validation loss without human intervention. You point it at a notebook and YAML config; it runs a loop—baseline, GPU saturation probe, then hyperparameter optimization—until the experiment **budget** is exhausted.
+An autonomous AI agent that tunes NeMo AutoModel fine-tuning configs to minimize validation loss without human intervention. Set `Notebook` to your training notebook or launcher script, set `Config` to the YAML config you want to tune, and the research agent will run autonomously through the baseline, GPU saturation probe, and hyperparameter optimization loop until the experiment **budget** is exhausted.
 
 Full behavior (paths, permissions, logging schema, loop rules, final notebook) lives in [`program.md`](program.md).
 
