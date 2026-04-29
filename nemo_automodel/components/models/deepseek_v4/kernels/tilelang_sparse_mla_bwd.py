@@ -25,9 +25,14 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Outputs: dQ [B, S, H, D], dKV [B, S_kv, D], dAttnSink [H]
-import tilelang
+try:
+    import tilelang
+    from tilelang import language as T
+except ImportError as _e:
+    from nemo_automodel.shared.import_utils import UnavailableError
+
+    raise UnavailableError(f"tilelang is required for {__name__}: {_e}") from _e
 import torch
-from tilelang import language as T
 
 
 @tilelang.jit(out_idx=[-1])

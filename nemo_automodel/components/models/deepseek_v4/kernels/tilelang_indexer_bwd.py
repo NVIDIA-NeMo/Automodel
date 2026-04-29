@@ -20,8 +20,13 @@
 #   Original source:
 # https://github.com/yueming-yuan/miles/blob/e561465d0b9bbf06188b7a5e2020dc7fd691f732/miles_plugins/models/deepseek_v4/ops/kernel/tilelang_indexer_bwd.py
 # Adapted from miles_plugins/models/glm5/ops/tilelang_indexer_bwd.py for DeepSeek-V4.
-import tilelang as tl
-import tilelang.language as T
+try:
+    import tilelang as tl
+    import tilelang.language as T
+except ImportError as _e:
+    from nemo_automodel.shared.import_utils import UnavailableError
+
+    raise UnavailableError(f"tilelang is required for {__name__}: {_e}") from _e
 import torch
 
 BF16 = T.bfloat16

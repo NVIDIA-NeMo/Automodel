@@ -24,9 +24,14 @@
 #   - Operates on [seqlen, batch, heads, dim] (SBHD) layout, batch handled externally
 #   - Uses causal mask via cu_seqlens instead of variable-length packed sequences
 #   - Supports compressed KV (seq_len_kv = seq_len_q / compress_ratio)
-import tilelang
+try:
+    import tilelang
+    from tilelang import language as T
+except ImportError as _e:
+    from nemo_automodel.shared.import_utils import UnavailableError
+
+    raise UnavailableError(f"tilelang is required for {__name__}: {_e}") from _e
 import torch
-from tilelang import language as T
 
 
 @tilelang.jit(
