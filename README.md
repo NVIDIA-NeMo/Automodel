@@ -22,6 +22,7 @@
 
 ## 📣 News and Discussions
 - [04/25/2026][**DeepSeek V4 Flash**](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) We now support finetuning `deepseek-ai/DeepSeek-V4-Flash`, thanks to [@Khazic](https://github.com/khazic). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) and [guide](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/dsv4-flash.md).
+- [04/28/2026][**Hy3-preview**](https://huggingface.co/tencent/Hy3-preview) We now support finetuning `tencent/Hy3-preview`, thanks to [@Khazic](https://github.com/khazic). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml).
 - [04/22/2026][**Qwen3.6-27B**](https://huggingface.co/Qwen/Qwen3.6-27B) We now support finetuning `Qwen/Qwen3.6-27B`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml).
 - [04/20/2026][**Qwen-Image**](https://huggingface.co/Qwen/Qwen-Image) We now support finetuning `Qwen/Qwen-Image`, thanks to [@harshareddy832](https://github.com/harshareddy832). Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml).
 - [04/16/2026][**Qwen3.6 MoE**](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) We now support finetuning `Qwen/Qwen3.6-35B-A3B`. Check out our [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml).
