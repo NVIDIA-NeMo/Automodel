@@ -1292,6 +1292,11 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
             "vision_tower.vision_model.encoder.layers",
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        # FP8 VLM subclass (own FP8 dequant on top of HF's Mistral3). String-keyed
+        # because NeMo Auto wraps the class via HFCheckpointingMixin into a new
+        # type with the same __name__ but distinct identity, so direct class
+        # comparison misses; the elif `model_cls.__name__ in MAP` check catches it.
+        "Mistral3FP8VLMForConditionalGeneration": ["model.language_model.layers", "model.vision_tower.transformer.layers"],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
         # module load (which would defeat test monkeypatches that stub the
@@ -1317,20 +1322,10 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
 
     model_cls = type(model)
     layers: List[nn.Module] = []
-    # Walk MRO so subclasses of a registered VLM (e.g. our
-    # Mistral3FP8VLMForConditionalGeneration, which extends HF's
-    # Mistral3ForConditionalGeneration to own FP8 dequant) inherit the same
-    # layer paths without needing a dedicated MAP entry.
-    mro_hit = next(
-        (
-            cls for cls in model_cls.__mro__
-            if cls in MODEL_CLS_TO_LAYERS or cls.__name__ in MODEL_CLS_TO_LAYERS
-        ),
-        None,
-    )
-    if mro_hit is not None:
-        key = mro_hit if mro_hit in MODEL_CLS_TO_LAYERS else mro_hit.__name__
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[key]))
+    if model_cls in MODEL_CLS_TO_LAYERS:
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
+    elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM)
         if isinstance(model.model.layers, nn.ModuleDict):
