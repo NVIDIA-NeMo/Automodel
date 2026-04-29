@@ -70,8 +70,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: torch
-    experts: torch_mm
+    dispatcher: deepep
+    experts: gmm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
