@@ -32,6 +32,7 @@ permissions:
 
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+  container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/automodel
 
 jobs:
   pre-flight:
@@ -191,8 +192,9 @@ jobs:
         run: |
           echo "Running CI tests"
 
-  cicd-container-build:
+  cicd-compute-build-matrix:
     needs: [pre-flight, cicd-wait-in-queue]
+    runs-on: ubuntu-latest
     if: |
       (
         success()
@@ -200,16 +202,154 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
     steps:
+      - name: Compute build matrix
+        id: compute
+        env:
+          RUNNER_PREFIX: ${{ needs.pre-flight.outputs.runner_prefix }}
+          REGISTRY_AWS: ${{ env.container-registry }}
+          REGISTRY_GCP: ${{ env.container-registry-gb200 }}
+          IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
+        run: |
+          AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "${RUNNER_PREFIX}" \
+            '{"cloud": "aws", "registry": $registry, "runner": $runner}')
+          if [[ "$IS_MEMBER" == "true" ]]; then
+            GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "nemo-ci-gcp-gpu-x2" \
+              '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
+              '{"include": [$aws, $gcp]}')
+          else
+            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" '{"include": [$aws]}')
+          fi
+          echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
+
+  cicd-container-build:
+    needs: [pre-flight, cicd-wait-in-queue, cicd-compute-build-matrix]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.matrix) }}
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+    runs-on: ${{ matrix.runner }}
+    environment: ${{ contains(matrix.registry, 'azure') && 'nemo-ci' || '' }}
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v6
-      - name: main
-        uses: ./.github/actions/build-container
         with:
-          dockerfile-path: "./docker/Dockerfile"
-          PAT: ${{ secrets.PAT }}
-          repo-name: ${{ vars.CI_REPO_NAME || 'Automodel' }}
+          ref: ${{ steps.sha.outputs.main }}
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.12
+
+      - name: Install GH CLI
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y gh && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Get last merged PR
+        id: cache_from
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST_PRS=$(gh api graphql \
+            -F owner="NVIDIA-NeMo" \
+            -F name="${{ vars.CI_REPO_NAME || 'Automodel' }}" \
+            -f query='
+              query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+                    nodes {
+                      number
+                    }
+                  }
+                }
+              }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
+              echo "type=registry,ref=${{ matrix.registry }}/automodel:$number-buildcache,mode=max"
+            done)
+
+          echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
+          echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
+          echo "EOF" | tee -a $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute cache keys
+        id: cache_keys
+        shell: bash
+        run: |
+          PR_NUMBER="${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}"
+          BRANCH_SANITIZED=$(echo "${{ github.ref_name }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            KEY="main"
+          elif [[ -n "$PR_NUMBER" ]]; then
+            KEY="$PR_NUMBER"
+          else
+            KEY="$BRANCH_SANITIZED"
+          fi
+          echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "cache-to=type=registry,ref=${{ matrix.registry }}/automodel:${KEY}-buildcache,mode=max" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Compute platform
+        id: platform
+        run: |
+          if [[ "${{ matrix.cloud }}" == "gcp" ]]; then
+            echo "platforms=linux/arm64" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          file: ./docker/Dockerfile
+          push: true
+          context: .
+          platforms: ${{ steps.platform.outputs.platforms }}
+          build-args: |
+            BASE_IMAGE=pytorch
+          cache-from: |
+            type=registry,ref=${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}-buildcache,mode=max
+            type=registry,ref=${{ matrix.registry }}/automodel:main-buildcache,mode=max
+            ${{ steps.cache_from.outputs.LAST_PRS }}
+          cache-to: ${{ steps.cache_keys.outputs.cache-to }}
+          no-cache: false
+          tags: |
+            ${{ matrix.registry }}/automodel:${{ steps.cache_keys.outputs.key }}
+            ${{ matrix.registry }}/automodel:${{ github.sha }}
+          secrets: |
+            GH_TOKEN=${{ secrets.PAT }}
 
   cicd-unit-tests:
     strategy:
@@ -328,11 +468,77 @@ jobs:
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
           runner: ${{ matrix.runner }}
 
+  cicd-e2e-tests-gb200:
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        include:
+          - test-name: L2_Pretrain_and_KD
+            test-folder: llm_pretrain_and_kd
+            timeout: 20
+            is-optional: "true"
+          - test-name: L2_HF_DCP
+            test-folder: hf_dcp
+            timeout: 40
+          - test-name: L2_HF_PEFT
+            test-folder: hf_peft
+            timeout: 30
+            is-optional: "true"
+          - test-name: L2_HF_Transformer
+            test-folder: hf_transformer
+            timeout: 20
+          - test-name: L2_HF_Transformer_Finetune
+            test-folder: hf_transformer_finetune
+            timeout: 40
+          - test-name: L2_HF_Transformer_LLM
+            test-folder: hf_transformer_llm
+            timeout: 40
+          - test-name: L2_HF_Transformer_VLM
+            test-folder: hf_transformer_vlm
+            timeout: 60
+            is-optional: "true"
+          - test-name: L2_Datasets
+            test-folder: data
+            timeout: 20
+          - test-name: L2_Context_Parallel
+            test-folder: context_parallel
+            timeout: 20
+          - test-name: L2_Retrieval
+            test-folder: retrieval
+            timeout: 20
+    needs: [pre-flight, cicd-unit-tests, cicd-container-build]
+    runs-on: nemo-ci-gcp-gpu-x2
+    name: gb200_${{ matrix.test-name }}
+    if: |
+      (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+      )
+      && !cancelled()
+      && needs.pre-flight.outputs.is_member == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: main
+        uses: ./.github/actions/test-template
+        with:
+          test-folder: ${{ matrix.test-folder }}
+          timeout: ${{ matrix.timeout }}
+          is-optional: ${{ matrix.is-optional || 'false' }}
+          is_unit_test: "false"
+          PAT: ${{ secrets.PAT }}
+          test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
+          runner: nemo-ci-gcp-gpu-x2
+
   Nemo_CICD_Test:
     needs:
       - pre-flight
       - cicd-unit-tests
       - cicd-e2e-tests
+      - cicd-e2e-tests-gb200
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
@@ -354,8 +560,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
+          IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+          if [[ "$IS_MEMBER" == "true" ]]; then
+            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+          else
+            FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | startswith("gb200_") | not))] | length') || echo 0
+          fi
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
               echo "✅ All previous jobs completed successfully"

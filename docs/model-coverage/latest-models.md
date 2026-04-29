@@ -6,6 +6,8 @@ See the [Model Coverage Overview](overview.md) for release summaries, and the [L
 
 | Date | Model | HF Model ID | Modality | Recipe | Try on Brev |
 |------|-------|-------------|----------|--------|------|
+| 2026-04-29 | Mistral Medium 3.5 | [`mistralai/Mistral-Medium-3.5-128B`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B) | VLM | [mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) | 🚧 |
+| 2026-04-28 | Hy3-preview | [`tencent/Hy3-preview`](https://huggingface.co/tencent/Hy3-preview) | LLM | [hy3_preview_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml) | 🚧 |
 | 2026-04-25 | DeepSeek V4 Flash | [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | LLM | [deepseek_v4_flash_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) | 🚧 |
 | 2026-04-22 | Qwen3.6-27B | [`Qwen/Qwen3.6-27B`](https://huggingface.co/Qwen/Qwen3.6-27B) | VLM | [qwen3_6_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml) | 🚧 |
 | 2026-04-16 | LLaVA-OneVision-1.5 (4B / 8B) | [`lmms-lab/LLaVA-OneVision-1.5-4B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct) | VLM | [llava_ov_1_5_4b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml) | 🚧 |
