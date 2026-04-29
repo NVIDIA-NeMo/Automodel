@@ -218,12 +218,34 @@ def _find_existing_comment_id(repo: str, pr: int) -> int | None:
     return min(matches)
 
 
-def _render_body(report: list[dict], grace_days: int) -> str:
+def _get_pr_author(repo: str, pr: int) -> str | None:
+    """Return the PR author's login, or None on any API failure. The mention
+    is only useful for the initial POST — GitHub doesn't re-notify on PATCH,
+    so a flaky lookup here just suppresses the @-ping, never duplicates it.
+    """
+    try:
+        result = _api("GET", f"/repos/{repo}/pulls/{pr}")
+    except error.HTTPError:
+        return None
+    if not isinstance(result, dict):
+        return None
+    user = result.get("user")
+    if not isinstance(user, dict):
+        return None
+    login = user.get("login")
+    return login if isinstance(login, str) else None
+
+
+def _render_body(report: list[dict], grace_days: int, author: str | None = None) -> str:
     lines = [
         _MARKER,
         "",
         "## Pending model-coverage docs",
         "",
+    ]
+    if author:
+        lines += [f"cc @{author}", ""]
+    lines += [
         "The following architectures are registered in `MODEL_ARCH_MAPPING` "
         "but have no model card under `docs/model-coverage/`. This comment "
         "is auto-managed by CI and will be removed once every arch has a "
@@ -296,7 +318,8 @@ def main() -> int:
             _api("DELETE", f"/repos/{args.repo}/issues/comments/{existing_id}")
         return 0
 
-    body = _render_body(report, grace_days)
+    author = _get_pr_author(args.repo, args.pr)
+    body = _render_body(report, grace_days, author=author)
     if existing_id is None:
         print(f"Posting new bot comment to PR #{args.pr}.")
         _api("POST", f"/repos/{args.repo}/issues/{args.pr}/comments", body={"body": body})
