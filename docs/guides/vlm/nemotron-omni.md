@@ -305,6 +305,8 @@ For LoRA, the checkpoint saves adapter weights instead:
 
 ## Step 4 — Run Inference on the Fine-Tuned Model
 
+### Full SFT inference
+
 Load the consolidated checkpoint and run inference on a handful of validation samples
 to spot-check structured output.
 
@@ -370,6 +372,69 @@ for i in range(5):
     print(f"Ground truth: {gt_text}")
     print(f"Prediction:   {generated}")
 ```
+
+### LoRA PEFT inference
+
+NeMo Automodel saves LoRA adapters under its internal wrapper FQNs
+(e.g. `language_model.model.layers.X.mixer.in_proj`), which differ from the HF
+base model namespace (`language_model.backbone.layers.X.mixer.in_proj`).
+To apply the adapter, merge the delta weights directly into the base model with
+a small FQN translation:
+
+```python
+import json, re
+import torch
+from pathlib import Path
+from safetensors import safe_open
+from transformers import AutoModel, AutoProcessor
+
+BASE    = "<path_to_nemotron_omni_v3>"
+ADAPTER = "<ckpt_dir>/LOWEST_VAL/model"
+
+# Load base directly to GPU. Skip AutoModel.from_config — instantiating a 30B
+# model on CPU just to read the class type adds 5+ minutes.
+processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
+model = AutoModel.from_pretrained(
+    BASE, trust_remote_code=True, dtype=torch.bfloat16,
+    device_map={"": torch.cuda.current_device()},
+)
+if hasattr(model, "vision_model") and hasattr(model.vision_model, "radio_model"):
+    model.vision_model.radio_model.summary_idxs = None
+
+# Wrapper -> HF base FQN translation. vision_projector.* targets are listed in
+# adapter_config.json but no tensors are saved for them, so we just skip those.
+def translate(fqn):
+    if fqn.startswith("language_model.model."):
+        return "language_model.backbone." + fqn[len("language_model.model."):]
+    return None
+
+cfg   = json.loads((Path(ADAPTER) / "adapter_config.json").read_text())
+scale = cfg["lora_alpha"] / cfg["r"]
+
+pairs = {}
+with safe_open(str(Path(ADAPTER) / "adapter_model.safetensors"), framework="pt") as f:
+    for k in f.keys():
+        m = re.match(r"^base_model\.model\.(.+)\.lora_(A|B)\.weight$", k)
+        if m:
+            pairs.setdefault(m.group(1), {})[m.group(2)] = f.get_tensor(k)
+
+modules = dict(model.named_modules())
+for wrapper_fqn, ab in pairs.items():
+    hf_fqn = translate(wrapper_fqn)
+    if hf_fqn is None or hf_fqn not in modules:
+        continue
+    W = modules[hf_fqn].weight
+    A = ab["A"].to(device=W.device, dtype=torch.float32)
+    B = ab["B"].to(device=W.device, dtype=torch.float32)
+    with torch.no_grad():
+        W.add_(((B @ A) * scale).to(W.dtype))
+
+model.eval()
+# ... then run the same generate() loop as in the SFT example above.
+```
+
+**Resources** — single GPU; ~60 GB GPU RAM for the bf16 30B base.
+**Runtime** — ~75 s base load + ~1 s LoRA merge + ~5–15 s per sample.
 
 ---
 
