@@ -1,0 +1,133 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DeepSeek-V4-Pro HellaSwag smoke/throughput run with DSV4 TileLang sparse
+# attention, indexer, and Sinkhorn enabled. Parallelism follows the 1T Kimi K2
+# example shape: 64 nodes, PP=8, EP=64, global batch 1024.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 1024
+  local_batch_size: 8
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: false
+  val_every_steps: 500
+  num_epochs: 10
+  max_steps: 20
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 8
+  ep_size: 64
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+  moe:
+    ignore_router_for_ac: true
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Pro
+    name_or_path: deepseek-ai/DeepSeek-V4-Pro
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: eager
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    dispatcher: torch
+    experts: torch_mm
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+    dsv4_sparse_attn: tilelang
+    dsv4_indexer: tilelang
+    dsv4_sinkhorn: tilelang
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  pad_to_max_length: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Pro
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+
+_validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  pad_to_max_length: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Pro
+
+_validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.1
