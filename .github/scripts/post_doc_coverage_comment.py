@@ -41,7 +41,7 @@ _API_ROOT = "https://api.github.com"
 
 # Fallback if the test module cannot be loaded (path moved, etc.). The test
 # is the source of truth — see ``_load_grace_period`` below.
-_DOC_GRACE_PERIOD_DAYS_DEFAULT = 2
+_DOC_GRACE_PERIOD_DAYS_DEFAULT = 7
 
 
 def _repo_root() -> Path:

@@ -110,7 +110,7 @@ def _repo_root() -> pathlib.Path:
 #
 # Read by the ``Doc coverage`` workflow's ``post_doc_coverage_comment.py``
 # script, which loads this module by file path to share the same window.
-_DOC_GRACE_PERIOD_DAYS = 2
+_DOC_GRACE_PERIOD_DAYS = 7
 
 
 def _arch_registration_age_days(arch_name: str, repo_root: pathlib.Path) -> float | None:
