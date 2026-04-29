@@ -36,6 +36,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
 from transformers.models.phi.modeling_phi import PhiForCausalLM
 from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
@@ -45,6 +46,7 @@ from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
+from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM as CustomQwen2ForCausalLM
 
 
@@ -404,6 +406,30 @@ def _parallelize_ministral3(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_mistral3_vlm(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """TP plan for Mistral3ForConditionalGeneration (and subclasses like
+    Mistral3FP8VLMForConditionalGeneration). The Ministral3 text backbone
+    lives at ``model.language_model.{embed_tokens, layers.*}``; vision_tower
+    and multi_modal_projector stay replicated across TP ranks.
+    """
+    model_prefix = "model.language_model"
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 def _parallelize_qwen(
     model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
     sequence_parallel: bool = False,
@@ -606,6 +632,10 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
+    # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
+    # FP8-VLM subclass that owns FP8 dequant.
+    _get_class_qualname(Mistral3ForConditionalGeneration): _parallelize_mistral3_vlm,
+    _get_class_qualname(Mistral3FP8VLMForConditionalGeneration): _parallelize_mistral3_vlm,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     _get_class_qualname(Gemma3ForCausalLM): _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input

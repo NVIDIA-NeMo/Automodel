@@ -643,6 +643,11 @@ class Checkpointer:
             and getattr(mod, "padding_idx", None) is not None
             for mod in model.modules()
         )
+        # Models that know the upcoming load will fully populate every tensor
+        # (e.g. Devstral FP8 via its state_dict_adapter) can opt out of HF's
+        # random init. Skipping also sidesteps stage-divergent DTensor
+        # collectives inside `initialize_weights()` that would hang PP setups.
+        owns_weight_load = bool(getattr(model, "_skip_init_weights_on_load", False))
         skip_initialize_weights = (
             model_class
             in [
@@ -652,6 +657,7 @@ class Checkpointer:
             or is_nemotron_v2
             or is_nemotron_v3_hf
             or has_padding_idx
+            or owns_weight_load
         )
         if not skip_initialize_weights:
             for _, module in model.named_modules():

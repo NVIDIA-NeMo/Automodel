@@ -36,14 +36,6 @@ Both use the `Mistral3ForConditionalGeneration` architecture.
 | Ministral-3 14B Instruct | [`mistralai/Ministral-3-14B-Instruct-2512`](https://huggingface.co/mistralai/Ministral-3-14B-Instruct-2512) |
 | Devstral Small 2 24B | [`mistralai/Devstral-Small-2-24B-Instruct-2512`](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512) |
 
-## Example Recipes
-
-| Recipe | Description |
-|---|---|
-| {download}`devstral2_small_2512_squad.yaml <../../../../examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml>` | SFT — Devstral Small 2 24B on SQuAD |
-| {download}`devstral2_small_2512_squad_peft.yaml <../../../../examples/llm_finetune/devstral/devstral2_small_2512_squad_peft.yaml>` | LoRA — Devstral Small 2 24B on SQuAD |
-
-
 ## Try with NeMo AutoModel
 
 **1. Install** ([full instructions](../../../guides/installation.md)):
