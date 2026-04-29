@@ -28,9 +28,8 @@ try:
     import tilelang
     from tilelang import language as T
 except ImportError as _e:
-    from nemo_automodel.shared.import_utils import UnavailableError
-
-    raise UnavailableError(f"tilelang is required for {__name__}: {_e}") from _e
+    # See comment in tilelang_indexer_bwd.py.
+    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
 import torch
 
 
