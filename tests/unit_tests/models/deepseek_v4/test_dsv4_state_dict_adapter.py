@@ -291,7 +291,6 @@ class TestDeepSeekV4StateDictAdapterToHF:
         assert by_key["layers.0.ffn.experts.0.w2.weight"].shape == (64, 16)
         assert by_key["layers.0.ffn.experts.0.w2.scale"].dtype == torch.float8_e8m0fnu
         assert by_key["layers.0.ffn.experts.0.w2.scale"].shape == (64, 1)
-
 class TestDeepSeekV4StateDictAdapterMTPRoundTrip:
     """Cover the MTP-layer path on both directions of the adapter.
 

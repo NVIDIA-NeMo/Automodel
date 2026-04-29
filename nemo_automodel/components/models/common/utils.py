@@ -141,7 +141,9 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", or "flex").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
+            For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
+            indexer, and Sinkhorn kernels together.
         linear: Linear layer backend ("torch" or "te").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
@@ -163,19 +165,9 @@ class BackendConfig:
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
             torch.dtype or string (e.g., "torch.float32", "float32").
-        dsv4_sparse_attn: DeepSeek V4 sparse attention backend. "torch" keeps
-            the existing dense torch attention path, "sparse_torch" uses the
-            Miles sparse top-k torch formulation, "tilelang" requires Miles
-            TileLang kernels, and "auto" uses TileLang when available.
-        dsv4_indexer: DeepSeek V4 C4 indexer backend. "torch" keeps the current
-            torch implementation, "tilelang" requires Miles TileLang kernels,
-            and "auto" uses TileLang when available.
-        dsv4_sinkhorn: DeepSeek V4 HyperConnection Sinkhorn backend. "torch" keeps
-            the current torch implementation, "tilelang" requires TileKernels,
-            and "auto" uses TileKernels when available.
     """
 
-    attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
@@ -197,9 +189,6 @@ class BackendConfig:
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
     gate_precision: str | torch.dtype | None = None
-    dsv4_sparse_attn: Literal["torch", "sparse_torch", "tilelang", "auto"] = "torch"
-    dsv4_indexer: Literal["torch", "tilelang", "auto"] = "torch"
-    dsv4_sinkhorn: Literal["torch", "tilelang", "auto"] = "torch"
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None

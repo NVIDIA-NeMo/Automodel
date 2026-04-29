@@ -68,7 +68,7 @@ model:
   load_base_model: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    attn: tilelang
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
@@ -76,9 +76,6 @@ model:
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-    dsv4_sparse_attn: tilelang
-    dsv4_indexer: tilelang
-    dsv4_sinkhorn: tilelang
 
 checkpoint:
   enabled: false
