@@ -34,7 +34,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: false
     dispatcher: deepep
-    experts: gmm
+    experts: torch_mm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
