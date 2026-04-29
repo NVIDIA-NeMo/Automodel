@@ -23,9 +23,14 @@ day-0 partner-release workflow: model lands now (often required by the
 marketing announcement schedule), docs follow in a separate PR. Once the
 grace window expires the test hard-fails so undocumented arches do not
 accumulate silently.
+
+The ``Doc coverage`` GitHub Actions workflow runs the same detection
+independently (parsing ``registry.py`` via AST so it does not need NeMo
+installed) and upserts a PR comment listing pending/expired arches —
+``_DOC_ARCH_ALIASES`` and ``_DOC_GRACE_PERIOD_DAYS`` here are the source of
+truth that the workflow reads.
 """
 
-import json
 import pathlib
 import subprocess
 import time
@@ -102,15 +107,10 @@ def _repo_root() -> pathlib.Path:
 # a hard test failure. During the grace window the test still surfaces the
 # missing-doc finding as a GitHub Actions ``::warning::`` annotation on the PR
 # but does not block the merge. See module docstring for the rationale.
+#
+# Read by the ``Doc coverage`` workflow's ``post_doc_coverage_comment.py``
+# script, which loads this module by file path to share the same window.
 _DOC_GRACE_PERIOD_DAYS = 2
-
-# Filename of the JSON report the test drops in repo root listing every
-# undocumented arch (pending + expired). The CI workflow ``docker cp``s this
-# file out of the test container and feeds it to
-# ``.github/scripts/post_doc_coverage_comment.py`` which upserts a single
-# bot-marked comment on the PR. Empty-list payload signals "all archs
-# documented" — the workflow uses that to clean up any stale prior comment.
-_DOC_REPORT_FILENAME = ".pending_doc_archs.json"
 
 
 def _arch_registration_age_days(arch_name: str, repo_root: pathlib.Path) -> float | None:
@@ -191,21 +191,6 @@ def test_every_registered_arch_has_model_coverage_doc():
     # build-container's ``fetch-depth: 0``.
     expired = [(a, n, age) for (a, n, age) in missing if age is not None and age >= _DOC_GRACE_PERIOD_DAYS]
     pending = [(a, n, age) for (a, n, age) in missing if (a, n, age) not in expired]
-
-    # Always write the report (even when empty) so the CI comment-poster can
-    # tell the difference between "no run" and "all archs documented" and
-    # clean up a stale prior bot comment when docs land.
-    report = [
-        {
-            "arch": arch,
-            "needle": needle,
-            "expired": (age is not None and age >= _DOC_GRACE_PERIOD_DAYS),
-            "age_days": (None if age is None else round(age, 2)),
-            "remaining_days": (None if age is None else round(max(0.0, _DOC_GRACE_PERIOD_DAYS - age), 2)),
-        }
-        for arch, needle, age in missing
-    ]
-    (repo_root / _DOC_REPORT_FILENAME).write_text(json.dumps(report, indent=2))
 
     for arch, needle, age in pending:
         if age is None:
