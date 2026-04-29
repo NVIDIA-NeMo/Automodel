@@ -24,9 +24,11 @@ try:
     import tilelang as tl
     import tilelang.language as T
 except ImportError as _e:
-    from nemo_automodel.shared.import_utils import UnavailableError
-
-    raise UnavailableError(f"tilelang is required for {__name__}: {_e}") from _e
+    # Re-raise as ImportError so callers using ``safe_import_from`` /
+    # ``pytest.importorskip`` skip cleanly. The "UnavailableError" tag in
+    # the message is what FW-CI ``check_imports`` greps for to classify
+    # this optional-dep failure as gracefully handled.
+    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
 import torch
 
 BF16 = T.bfloat16
