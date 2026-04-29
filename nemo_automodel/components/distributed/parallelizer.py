@@ -1296,7 +1296,10 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         # because NeMo Auto wraps the class via HFCheckpointingMixin into a new
         # type with the same __name__ but distinct identity, so direct class
         # comparison misses; the elif `model_cls.__name__ in MAP` check catches it.
-        "Mistral3FP8VLMForConditionalGeneration": ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        "Mistral3FP8VLMForConditionalGeneration": [
+            "model.language_model.layers",
+            "model.vision_tower.transformer.layers",
+        ],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
         # module load (which would defeat test monkeypatches that stub the

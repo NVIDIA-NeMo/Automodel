@@ -69,9 +69,7 @@ def _is_fp8_weight_key(model_key: str, not_fp8_prefixes: tuple[str, ...] = ()) -
         return False
     if any(model_key.endswith(suffix) for suffix in _NON_QUANTIZED_SUFFIXES):
         return False
-    if any(
-        model_key == p or model_key.startswith(p + ".") for p in not_fp8_prefixes
-    ):
+    if any(model_key == p or model_key.startswith(p + ".") for p in not_fp8_prefixes):
         return False
     return True
 
@@ -189,11 +187,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         dropped_scales = 0
         dropped_act_scales = 0
 
-        scale_map = {
-            k[: -len("_scale_inv")]: v
-            for k, v in hf_state_dict.items()
-            if k.endswith("_scale_inv")
-        }
+        scale_map = {k[: -len("_scale_inv")]: v for k, v in hf_state_dict.items() if k.endswith("_scale_inv")}
 
         for hf_key, value in hf_state_dict.items():
             if hf_key.endswith("_scale_inv"):
@@ -225,9 +219,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
     # --------------------------------------------------------------------- #
     # Per-tensor conversion (save path)                                      #
     # --------------------------------------------------------------------- #
-    def convert_single_tensor_to_hf(
-        self, fqn: str, tensor: Any, **kwargs
-    ) -> list[tuple[str, Any]]:
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Per-tensor model → HF used by ``Checkpointer.save_model``."""
         quantization = kwargs.get("quantization", False)
         hf_key = self._native_to_hf(fqn)

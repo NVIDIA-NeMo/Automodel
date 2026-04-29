@@ -522,9 +522,7 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
                     image_sizes=image_sizes,
                     return_dict=True,
                 ).pooler_output
-                image_features = torch.cat(image_features, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
                 special_image_mask = inner.get_placeholder_mask(
                     input_ids, inputs_embeds=inputs_embeds, image_features=image_features
                 )
@@ -614,9 +612,7 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
         # through vision_tower on stage 0 and let the text backbone use the
         # generic inner PP forward.
         if patch_inner_model:
-            text_backbone.forward = types.MethodType(
-                create_pipeline_forward_inner("PipelineStage"), text_backbone
-            )
+            text_backbone.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), text_backbone)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_mistral3_vlm(), model)
     elif inner_model is not None:

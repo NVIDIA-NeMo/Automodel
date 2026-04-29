@@ -157,9 +157,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         for sub in self.modules():
             if "inv_freq" in getattr(sub, "_buffers", {}):
                 sub._mistral3_fp8_rotary_reinit_done = False
-                sub.register_forward_pre_hook(
-                    _rotary_reinit_self_hook, with_kwargs=True, prepend=True
-                )
+                sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:
