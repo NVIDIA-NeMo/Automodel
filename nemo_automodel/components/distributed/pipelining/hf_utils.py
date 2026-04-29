@@ -565,12 +565,7 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
 def _is_mistral3_vlm(model: torch.nn.Module) -> bool:
     """Return True for Mistral3ForConditionalGeneration (Pixtral + Ministral3)."""
     config = getattr(model, "config", None)
-    if config is None:
-        return False
-    if getattr(config, "model_type", None) == "mistral3":
-        return True
-    text_config = getattr(config, "text_config", None)
-    return getattr(text_config, "model_type", None) in ("ministral3", "mistral3")
+    return config is not None and getattr(config, "model_type", None) == "mistral3"
 
 
 def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
