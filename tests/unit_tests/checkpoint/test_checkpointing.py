@@ -1002,3 +1002,56 @@ class TestGetStorageReaderInitStep:
         upstream_marker.assert_not_called()
         backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
         assert reader is backport_marker.return_value
+
+
+# =============================================================================
+# Tests for the _skip_init_weights_on_load gate (Mistral3 FP8 VLM PR)
+# =============================================================================
+
+
+class TestSkipInitWeightsOnLoadGate:
+    """The Checkpointer.initialize_model_weights gate that lets a model opt
+    out of HF's initialize_weights() via a class attribute.
+
+    Without this gate, Mistral3FP8VLMForConditionalGeneration's PP load
+    deadlocks on stage-divergent DTensor collectives inside HF's init.
+    """
+
+    def _make_meta_model(self):
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model._is_hf_initialized = True
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        return model
+
+    def test_skip_when_attr_true(self):
+        """A model with _skip_init_weights_on_load=True takes the skip branch."""
+        model = self._make_meta_model()
+        model._skip_init_weights_on_load = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        # And the _is_hf_initialized flag is left alone (not reset to False).
+        assert model._is_hf_initialized is True
+
+    def test_does_not_skip_when_attr_false(self):
+        """attr=False (or attr-missing default) does NOT take the skip branch."""
+        model = self._make_meta_model()
+        model._skip_init_weights_on_load = False
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_does_not_skip_when_attr_missing(self):
+        """No attr at all → default behavior (initialize_weights runs)."""
+        model = self._make_meta_model()
+        assert not hasattr(model, "_skip_init_weights_on_load")
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()

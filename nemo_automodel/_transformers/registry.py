@@ -120,6 +120,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
         ),
         (
+            "Mistral3FP8VLMForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.mistral3_vlm.model",
+                "Mistral3FP8VLMForConditionalGeneration",
+            ),
+        ),
+        (
             "NemotronHForCausalLM",
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),

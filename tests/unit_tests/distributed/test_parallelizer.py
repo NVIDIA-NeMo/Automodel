@@ -1670,3 +1670,41 @@ class TestExtractModelLayers:
         result = _extract_model_layers(GenericCausalLM(layer_dict))
         assert len(result) == 3
         assert [id(r) for r in result] == [id(v) for v in layer_dict.values()]
+
+    def test_string_keyed_mistral3_fp8_vlm(self):
+        """The ``"Mistral3FP8VLMForConditionalGeneration"`` string-key entry
+        catches the runtime class produced by ``_get_mixin_wrapped_class``
+        (``HFCheckpointingMixin``), which has the same ``__name__`` as our
+        custom class but a distinct identity. Without this entry, the model
+        falls through to the largest-ModuleList heuristic and crashes.
+
+        Validates the elif ``model_cls.__name__ in MODEL_CLS_TO_LAYERS`` branch.
+        """
+
+        class Mistral3FP8VLMForConditionalGeneration(nn.Module):
+            """Stand-in named exactly like the registered string key —
+            mirrors the wrapper class that NeMo Auto creates at runtime."""
+
+            def __init__(self):
+                super().__init__()
+                inner = nn.Module()
+                lang = nn.Module()
+                lang.layers = self._mklayers(3)
+                inner.language_model = lang
+                vt = nn.Module()
+                tx = nn.Module()
+                tx.layers = self._mklayers(2)
+                vt.transformer = tx
+                inner.vision_tower = vt
+                self.model = inner
+
+            @staticmethod
+            def _mklayers(n):
+                return nn.ModuleList([_FakeLayer() for _ in range(n)])
+
+        model = Mistral3FP8VLMForConditionalGeneration()
+        result = _extract_model_layers(model)
+
+        # 3 text-decoder + 2 vision tower layers, all flattened.
+        assert len(result) == 5
+        assert not any(isinstance(r, nn.ModuleList) for r in result)
