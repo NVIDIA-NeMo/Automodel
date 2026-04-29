@@ -40,9 +40,11 @@ from urllib import error, parse, request
 _MARKER = "<!-- nemo-doc-coverage-bot -->"
 _API_ROOT = "https://api.github.com"
 
-# Fallback if the test module cannot be loaded (path moved, etc.). The test
-# is the source of truth — see ``_load_grace_period`` below.
-_DOC_GRACE_PERIOD_DAYS_DEFAULT = 7
+# Days to wait after an arch is registered before a missing model card becomes
+# a hard CI failure. During the grace window the workflow still posts the bot
+# comment but exits 0 so the PR check stays green — the day-0 partner-release
+# flow can land a model and follow up with docs in a separate PR.
+_DOC_GRACE_PERIOD_DAYS = 7
 
 
 def _repo_root() -> Path:
@@ -54,7 +56,7 @@ def _extract_arch_names(registry_path: Path) -> list[str]:
 
     Avoids importing ``nemo_automodel`` (which would pull in torch and the
     full model stack). Walks the ``OrderedDict([(arch, value), ...])``
-    literal — same structure the doc-coverage test relies on.
+    literal in registry.py.
     """
     tree = ast.parse(registry_path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
@@ -79,18 +81,18 @@ def _extract_arch_names(registry_path: Path) -> list[str]:
     return []
 
 
-def _load_test_module(test_file: Path):
-    """Load ``test_doc_coverage.py`` by file path so we can read its
-    constants (``_DOC_ARCH_ALIASES``, ``_DOC_GRACE_PERIOD_DAYS``) without
-    requiring an importable ``tests`` package. Module-level imports in
-    that test file are stdlib-only, so this does not pull in nemo_automodel.
+def _load_aliases(data_file: Path) -> dict[str, str]:
+    """Load ``_DOC_ARCH_ALIASES`` from the shared data module by file path
+    so we don't need an importable ``tests`` package. Returns an empty dict
+    if the file is missing — every registry name is then matched literally
+    against doc contents (no aliasing applied).
     """
-    spec = importlib.util.spec_from_file_location("_doc_coverage_test_const", test_file)
+    spec = importlib.util.spec_from_file_location("_doc_coverage_data", data_file)
     if spec is None or spec.loader is None:
-        return None
+        return {}
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    return dict(getattr(mod, "_DOC_ARCH_ALIASES", {}))
 
 
 def _arch_registration_info(arch_name: str, repo_root: Path) -> dict | None:
@@ -134,9 +136,15 @@ def _arch_registration_info(arch_name: str, repo_root: Path) -> dict | None:
     }
 
 
-def _build_report(repo_root: Path) -> tuple[list[dict], int]:
-    """Compute the missing-arch report and return ``(report, grace_days)``.
-    Each entry has the same shape the legacy JSON file used.
+def _build_report(repo_root: Path) -> list[dict]:
+    """Compute the missing-arch report. Each entry has ``arch``, ``needle``,
+    ``expired``, ``age_days``, ``remaining_days``, ``pr``.
+
+    Validates ``_DOC_ARCH_ALIASES`` first: every alias target must literally
+    appear in some ``docs/model-coverage/*.md`` file, otherwise the alias is
+    a no-op and the affected arch is silently undocumented. Raises
+    ``RuntimeError`` on broken aliases — caller exits 1 instead of posting
+    a comment.
     """
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
     arch_names = _extract_arch_names(registry_path)
@@ -146,17 +154,16 @@ def _build_report(repo_root: Path) -> tuple[list[dict], int]:
             "the MODEL_ARCH_MAPPING literal format may have changed."
         )
 
-    test_file = repo_root / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py"
-    test_mod = _load_test_module(test_file)
-    aliases: dict[str, str] = dict(getattr(test_mod, "_DOC_ARCH_ALIASES", {})) if test_mod else {}
-    grace_days = (
-        int(getattr(test_mod, "_DOC_GRACE_PERIOD_DAYS", _DOC_GRACE_PERIOD_DAYS_DEFAULT))
-        if test_mod
-        else _DOC_GRACE_PERIOD_DAYS_DEFAULT
-    )
+    data_file = repo_root / "tests" / "unit_tests" / "_transformers" / "_doc_coverage_data.py"
+    aliases = _load_aliases(data_file)
 
     docs_dir = repo_root / "docs" / "model-coverage"
     md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.md")]
+
+    bad_aliases = [(arch, needle) for arch, needle in aliases.items() if not any(needle in c for c in md_contents)]
+    if bad_aliases:
+        details = "\n".join(f"  - {arch} -> {needle!r}" for arch, needle in bad_aliases)
+        raise RuntimeError(f"_DOC_ARCH_ALIASES entries point at strings absent from docs/model-coverage/:\n{details}")
 
     report: list[dict] = []
     for arch in arch_names:
@@ -170,13 +177,13 @@ def _build_report(repo_root: Path) -> tuple[list[dict], int]:
             {
                 "arch": arch,
                 "needle": needle,
-                "expired": (age is not None and age >= grace_days),
+                "expired": (age is not None and age >= _DOC_GRACE_PERIOD_DAYS),
                 "age_days": (None if age is None else round(age, 2)),
-                "remaining_days": (None if age is None else round(max(0.0, grace_days - age), 2)),
+                "remaining_days": (None if age is None else round(max(0.0, _DOC_GRACE_PERIOD_DAYS - age), 2)),
                 "pr": pr,
             }
         )
-    return report, grace_days
+    return report
 
 
 def _api(method: str, path: str, body: dict | None = None) -> object:
@@ -247,7 +254,7 @@ def _get_pr_author(repo: str, pr: int) -> str | None:
     return login if isinstance(login, str) else None
 
 
-def _render_body(report: list[dict], grace_days: int, repo: str, author: str | None = None) -> str:
+def _render_body(report: list[dict], repo: str, author: str | None = None) -> str:
     lines = [
         _MARKER,
         "",
@@ -277,7 +284,7 @@ def _render_body(report: list[dict], grace_days: int, repo: str, author: str | N
         else:
             status = (
                 f"⚠️ pending — {entry['remaining_days']:.1f} day(s) remain in the "
-                f"{grace_days}-day grace window before this becomes a hard failure"
+                f"{_DOC_GRACE_PERIOD_DAYS}-day grace window before this becomes a hard failure"
             )
         pr = entry.get("pr")
         added_in = f"[#{pr}](https://github.com/{repo}/pull/{pr})" if pr else "—"
@@ -289,7 +296,7 @@ def _render_body(report: list[dict], grace_days: int, repo: str, author: str | N
         "`docs/model-coverage/<modality>/<org>/<model>.md` (preferred for new "
         "architectures), update an existing card to mention the arch name, "
         "or add an entry to `_DOC_ARCH_ALIASES` in "
-        "`tests/unit_tests/_transformers/test_doc_coverage.py` with a comment "
+        "`tests/unit_tests/_transformers/_doc_coverage_data.py` with a comment "
         "explaining the mismatch.",
     ]
     return "\n".join(lines) + "\n"
@@ -306,7 +313,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    report, grace_days = _build_report(_repo_root())
+    try:
+        report = _build_report(_repo_root())
+    except RuntimeError as e:
+        # Configuration error (broken aliases, registry format change). Don't
+        # post a comment — surface the failure on the workflow log instead.
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     expired = any(entry["expired"] for entry in report)
 
     print(json.dumps(report, indent=2))
@@ -332,7 +345,7 @@ def main() -> int:
         return 0
 
     author = _get_pr_author(args.repo, args.pr)
-    body = _render_body(report, grace_days, repo=args.repo, author=author)
+    body = _render_body(report, repo=args.repo, author=author)
     if existing_id is None:
         print(f"Posting new bot comment to PR #{args.pr}.")
         _api("POST", f"/repos/{args.repo}/issues/{args.pr}/comments", body={"body": body})

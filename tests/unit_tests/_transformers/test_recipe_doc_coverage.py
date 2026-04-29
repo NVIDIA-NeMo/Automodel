@@ -20,8 +20,9 @@ via ``AutoConfig.from_pretrained`` (config.json only — no GPU allocation, no
 weight download), then asserts every resolved architecture is mentioned in at
 least one ``docs/model-coverage/*.md`` file.
 
-This complements ``test_doc_coverage.py`` which only covers archs registered
-in ``MODEL_ARCH_MAPPING``. Many recipes fine-tune HF-native archs (e.g.,
+This complements the ``Doc coverage`` GitHub Actions workflow (which only
+covers archs registered in ``MODEL_ARCH_MAPPING``). Many recipes fine-tune
+HF-native archs (e.g.,
 ``Olmo2ForCausalLM``) that never get added to the registry, and still need
 documentation.
 
@@ -49,7 +50,7 @@ from typing import Iterable
 import pytest
 import yaml
 
-from tests.unit_tests._transformers.test_doc_coverage import _DOC_ARCH_ALIASES
+from tests.unit_tests._transformers._doc_coverage_data import _DOC_ARCH_ALIASES
 
 
 def _repo_root() -> pathlib.Path:
@@ -202,7 +203,7 @@ def test_recipe_archs_have_doc_coverage():
             "Fix by either:\n"
             "  1. Adding a new .md file under docs/model-coverage/, or\n"
             "  2. Updating an existing .md file to mention the arch name, or\n"
-            "  3. Adding an entry to _DOC_ARCH_ALIASES in test_doc_coverage.py "
+            "  3. Adding an entry to _DOC_ARCH_ALIASES in _doc_coverage_data.py "
             "with a comment explaining the mismatch."
         )
 
