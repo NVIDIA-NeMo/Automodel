@@ -176,13 +176,6 @@ MODEL_ARCH_MAPPING = OrderedDict(
             "Step3p5ForCausalLM",
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
-        # Dummy entry to smoke-test the day-0 doc-coverage CI flow (warning +
-        # bot comment within the grace window, no PR block). Remove after the
-        # comment is observed on the PR.
-        (
-            "DummyDay0CITestForCausalLM",
-            ("nemo_automodel.components.models._dummy_day0_ci_test.model", "DummyDay0CITestForCausalLM"),
-        ),
     ]
 )
 
