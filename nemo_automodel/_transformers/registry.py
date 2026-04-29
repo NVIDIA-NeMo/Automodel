@@ -183,6 +183,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             "Step3p5ForCausalLM",
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
+        # Dummy entry to smoke-test the doc-coverage bot comment on PR #2068.
+        # Within the 7-day grace window so it surfaces as ⚠️ pending with a
+        # PR link in the ``Added in`` column. Remove after the comment is
+        # observed.
+        (
+            "DummyDay0CITestForCausalLM",
+            ("nemo_automodel.components.models._dummy_day0_ci_test.model", "DummyDay0CITestForCausalLM"),
+        ),
     ]
 )
 
