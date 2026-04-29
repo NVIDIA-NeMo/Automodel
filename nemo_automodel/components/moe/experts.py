@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -37,6 +38,8 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
+
+_MOE_SCATTER_CHUNK_ROWS_ENV = "NEMO_AUTOMODEL_MOE_SCATTER_CHUNK_ROWS"
 
 # ── EP variable-length collective helpers ──
 
@@ -198,6 +201,37 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     return output
 
 
+def _get_moe_scatter_chunk_rows() -> int:
+    raw_value = os.environ.get(_MOE_SCATTER_CHUNK_ROWS_ENV, "0")
+    try:
+        chunk_rows = int(raw_value)
+    except ValueError as e:
+        raise ValueError(
+            f"{_MOE_SCATTER_CHUNK_ROWS_ENV} must be an integer, got {raw_value!r}"
+        ) from e
+
+    if chunk_rows < 0:
+        raise ValueError(
+            f"{_MOE_SCATTER_CHUNK_ROWS_ENV} must be >= 0, got {chunk_rows}"
+        )
+    return chunk_rows
+
+
+def _scatter_add_fp32(
+    y: torch.Tensor,
+    scatter_ids: torch.Tensor,
+    output: torch.Tensor,
+    chunk_rows: int,
+) -> None:
+    if chunk_rows == 0 or output.size(0) <= chunk_rows:
+        y.scatter_add_(0, scatter_ids, output.float())
+        return
+
+    for start in range(0, output.size(0), chunk_rows):
+        end = min(start + chunk_rows, output.size(0))
+        y.scatter_add_(0, scatter_ids[start:end], output[start:end].float())
+
+
 class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
@@ -227,6 +261,7 @@ class GroupedExperts(nn.Module):
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        self.scatter_chunk_rows = _get_moe_scatter_chunk_rows()
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -504,7 +539,7 @@ class GroupedExperts(nn.Module):
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
+            _scatter_add_fp32(y, scatter_ids, output2, self.scatter_chunk_rows)
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
