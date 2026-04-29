@@ -45,13 +45,13 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/dawn-ridge-medium-3p5-128b-hf_vv1
+  pretrained_model_name_or_path: mistralai/Mistral-Medium-3.5-128B
   torch_dtype: torch.bfloat16
   attn_implementation: eager
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/coreai/users/huiyingl/dev123/dawn-ridge-medium-3p5-128b-hf_vv1
+  pretrained_model_name_or_path: mistralai/Mistral-Medium-3.5-128B
 
 checkpoint:
   enabled: false
