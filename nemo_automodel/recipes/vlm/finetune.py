@@ -151,14 +151,6 @@ def build_model(
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
 
-        # Ensure opt-in custom model registrations take effect before the
-        # registry is queried (the Mistral-3.5 128B FP8 VLM wrapper registers
-        # itself for Mistral3ForConditionalGeneration on import).
-        try:
-            import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
-        except ImportError:
-            pass
-
         # Check if using NeMoAutoModel
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForImageTextToText.from_config,
