@@ -202,7 +202,7 @@ file gives step-by-step instructions an AI agent can follow.
 | 6 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
 | 7 | automodel-researcher     | `automodel-researcher`     | Autonomous fine-tuning experiment loops for minimizing validation loss |
 
-Use `skills/automodel-researcher/` when the task is to run NemoClaw/autoresearch-style autonomous tuning for an AutoModel fine-tuning notebook and config. Start with `skills/automodel-researcher/README.md` for the high-level workflow and artifacts, then follow `skills/automodel-researcher/program.md` for the experiment budget, logging schema, GPU saturation pass, optimization loop, and final best-run notebook deliverable.
+Use `skills/automodel-researcher/` when the task is to run autoresearch-style autonomous tuning for an AutoModel. Start with `skills/automodel-researcher/README.md` for the high understanding, then follow `skills/automodel-researcher/program.md` for details.
 
 When starting a task, identify which skill applies and read that file for
 domain-specific guidance before writing any code.
