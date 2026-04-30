@@ -23,9 +23,6 @@ configs:
   # -- cohere --
   - cohere/cohere_command_r_7b_squad.yaml
 
-  # -- devstral --
-  - devstral/devstral2_small_2512_squad.yaml
-
   # -- falcon --
   - falcon/falcon3_7b_instruct_squad.yaml
 
