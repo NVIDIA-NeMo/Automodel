@@ -45,6 +45,22 @@ Inline annotations are also attached to the offending lines in the **Files Chang
 
 STDERR_HEADER = "Missing nightly recipe references:"
 
+STDERR_HOW_TO_FIX = """
+------------------------------------------------------------
+How to fix - for each missing entry above, choose one:
+
+  1. Add the recipe at the path shown (typical when a recipe was
+     renamed or moved without updating nightly_recipes.yml).
+
+  2. Remove the line from
+     tests/ci_tests/configs/<folder>/nightly_recipes.yml
+     if the recipe is genuinely gone.
+
+  3. Mark as known issue: add ci.known_issue_id: AM-xxx
+     (or ci.allow_failure: true) to the recipe YAML.
+     See tests/ci_tests/README.md.
+------------------------------------------------------------"""
+
 ANNOTATION_MSG_TEMPLATE = (
     "Recipe '{config}' not found at {rel_path}. "
     "Add the recipe, remove this line, or set ci.known_issue_id on the recipe."
@@ -82,6 +98,7 @@ def _write_stderr_report(missing_by_list, automodel_dir):
         for config, rel_path, line in items:
             loc = f"line {line}" if line else "line ?"
             print(f"    - [{loc}] {config} -> {rel_path} (not found)", file=sys.stderr)
+    print(STDERR_HOW_TO_FIX, file=sys.stderr)
 
 
 def _emit_gh_annotations(missing_by_list, automodel_dir):
