@@ -312,6 +312,8 @@ omit = [
     # Vendored from https://github.com/uccl-project/uccl/tree/main/ep/deep_ep_wrapper
     "nemo_automodel/components/moe/uccl_ep/_buffer.py",
     "nemo_automodel/components/moe/uccl_ep/_utils.py",
+    # Vendored DeepSeek V4 TileLang kernels (Miles upstream, Apache-2.0)
+    "nemo_automodel/components/models/deepseek_v4/kernels/*.py",
     "config.py",
     "config-3.py",
     # transformer v5 backports
