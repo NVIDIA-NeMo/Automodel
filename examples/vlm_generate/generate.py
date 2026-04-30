@@ -41,9 +41,9 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-from nemo_automodel.checkpoint.checkpointing import CheckpointingConfig, load_model
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-from nemo_automodel.loggers.log_utils import setup_logging
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.loggers.log_utils import setup_logging
 
 # TODO: Parse config from YAML and run generate with FSDP2/distributed in general
 
@@ -125,7 +125,7 @@ def load_model_from_checkpoint(
         Loaded NeMoAutoModelForImageTextToText model
     """
     # initialize distributed
-    from nemo_automodel.distributed.init_utils import initialize_distributed
+    from nemo_automodel.components.distributed.init_utils import initialize_distributed
 
     initialize_distributed(backend="nccl", timeout_minutes=10)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -159,7 +159,13 @@ def load_model_from_checkpoint(
         save_consolidated=False,
         is_peft=is_peft_checkpoint(checkpoint_path),
     )
-    load_model(model, str(checkpoint_path), checkpoint_config)
+    checkpointer = Checkpointer(
+        config=checkpoint_config,
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+    )
+    checkpointer.load_model(model, model_path)
     logging.info(f"✅ Model loaded successfully from {checkpoint_path}")
     return model
 
