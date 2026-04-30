@@ -405,14 +405,47 @@ ignore_imports = [
 python-version = "3.10"
 
 [tool.ty.src]
-include = ["nemo_automodel"]
+include = ["nemo_automodel", "examples"]
 exclude = [
     "tests/**",
     "nemo_automodel/components/checkpoint/_backports/**",
 ]
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["**"]
+# Optional dependencies that ty cannot resolve in this env but are legitimately
+# imported under try/except or feature gates. Keep this list narrow so that
+# accidental stale imports (e.g. after a package reorg) are still surfaced.
+allowed-unresolved-imports = [
+    "bitsandbytes",
+    "causal_conv1d",
+    "comet_ml",
+    "cut_cross_entropy",
+    "cut_cross_entropy.**",
+    "databricks",
+    "databricks.**",
+    "deep_ep",
+    "deep_ep.**",
+    "dion",
+    "fast_hadamard_transform",
+    "fla.**",
+    "flash_attn",
+    "grouped_gemm",
+    "liger_kernel.**",
+    "lmdb",
+    "mamba_ssm.**",
+    "megatron.**",
+    "nemo_automodel.components.datasets.llm.megatron.helpers_cpp",
+    "nemo_run",
+    "pynvml",
+    "sky",
+    "torch.distributed._mesh_layout",
+    "transformer_engine",
+    "transformer_engine.**",
+    "transformer_engine_torch",
+    "transformers.tokenization_utils",
+    "uccl",
+    "uccl.**",
+]
 
 [tool.ty.rules]
 unused-ignore-comment = "warn"
