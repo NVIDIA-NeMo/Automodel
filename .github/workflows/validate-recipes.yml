@@ -40,5 +40,35 @@ jobs:
           version: 0.8.22
 
       - name: Validate recipe references
+        id: validate
         run: |
-          uv run --with ruamel.yaml python tests/ci_tests/utils/validate_recipes.py --automodel-dir .
+          uv run --with ruamel.yaml python tests/ci_tests/utils/validate_recipes.py --automodel-dir . 2> validator.err
+          rc=$?
+          cat validator.err >&2
+          exit $rc
+
+      - name: Report failure with mitigation steps
+        if: failure() && steps.validate.outcome == 'failure'
+        run: |
+          {
+            echo "## Nightly recipe validation failed"
+            echo
+            echo "One or more recipes listed in \`nightly_recipes.yml\` do not exist on disk."
+            echo "AutoModel's nightly CI generator skips missing recipes at runtime, but a broken reference still means the listed test never runs. Fix it before merge."
+            echo
+            echo "### Missing entries"
+            echo
+            echo '```'
+            cat validator.err
+            echo '```'
+            echo
+            echo "### How to fix"
+            echo
+            echo "For each missing entry above, choose one:"
+            echo
+            echo "1. **Add the recipe** — create the YAML at the path shown. Typical when a recipe was renamed or moved without updating \`nightly_recipes.yml\`."
+            echo "2. **Remove from nightly** — delete the offending line from \`tests/ci_tests/configs/<folder>/nightly_recipes.yml\` if the recipe is genuinely gone."
+            echo "3. **Mark as known issue** — add \`ci.known_issue_id: AM-xxx\` (or \`ci.allow_failure: true\`) to the recipe YAML if it should be skipped/tolerated. See \`tests/ci_tests/README.md\`."
+            echo
+            echo "Inline annotations are also attached to the offending lines in the **Files Changed** tab."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -16,6 +16,7 @@
 """Validate that every recipe path in tests/ci_tests/configs/<folder>/nightly_recipes.yml exists under examples/."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -25,14 +26,26 @@ yaml = YAML()
 
 
 def collect_nightly_lists(automodel_dir: Path):
-    """Yield (recipe_list_path, examples_dir, configs) for each nightly_recipes.yml."""
+    """Yield (recipe_list_path, examples_dir, [(config, line_number)]) for each nightly_recipes.yml."""
     configs_root = automodel_dir / "tests" / "ci_tests" / "configs"
     for recipe_list in sorted(configs_root.glob("*/nightly_recipes.yml")):
         with recipe_list.open("r", encoding="utf-8") as f:
             data = yaml.load(f) or {}
         configs = data.get("configs") or []
         examples_dir = data.get("examples_dir", recipe_list.parent.name)
-        yield recipe_list, examples_dir, configs
+        # ruamel.yaml round-trip mode tracks line/col per sequence entry in .lc.data.
+        lc = getattr(configs, "lc", None)
+        entries = []
+        for i, config in enumerate(configs):
+            line = None
+            if lc is not None and lc.data and i in lc.data:
+                line = lc.data[i][0] + 1
+            entries.append((config, line))
+        yield recipe_list, examples_dir, entries
+
+
+def _gh_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def main():
@@ -41,24 +54,34 @@ def main():
     args = parser.parse_args()
 
     automodel_dir = Path(args.automodel_dir).resolve()
-    missing_by_list: dict[Path, list[tuple[str, Path]]] = {}
+    missing_by_list: dict[Path, list[tuple[str, Path, int | None]]] = {}
 
-    for recipe_list, examples_dir, configs in collect_nightly_lists(automodel_dir):
-        for config in configs:
+    for recipe_list, examples_dir, entries in collect_nightly_lists(automodel_dir):
+        for config, line in entries:
             rel_path = Path("examples") / examples_dir / config
             if not (automodel_dir / rel_path).is_file():
-                missing_by_list.setdefault(recipe_list, []).append((config, rel_path))
+                missing_by_list.setdefault(recipe_list, []).append((config, rel_path, line))
 
     if not missing_by_list:
         print("All nightly recipe references valid.")
         return 0
 
+    in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+
     print("Missing nightly recipe references:", file=sys.stderr)
-    for recipe_list, entries in missing_by_list.items():
+    for recipe_list, items in missing_by_list.items():
         rel_list = recipe_list.relative_to(automodel_dir)
         print(f"\n  {rel_list}:", file=sys.stderr)
-        for config, rel_path in entries:
-            print(f"    - {config} -> {rel_path} (not found)", file=sys.stderr)
+        for config, rel_path, line in items:
+            loc = f"line {line}" if line else "line ?"
+            print(f"    - [{loc}] {config} -> {rel_path} (not found)", file=sys.stderr)
+            if in_ci:
+                msg = _gh_escape(
+                    f"Recipe '{config}' not found at {rel_path}. "
+                    "Add the recipe, remove this line, or set ci.known_issue_id on the recipe."
+                )
+                line_part = f",line={line}" if line else ""
+                print(f"::error file={rel_list}{line_part}::{msg}")
     return 1
 
 
