@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Validate nightly recipes
+name: Validate recipe configs
 
 on:
   pull_request:
     paths:
-      - 'tests/ci_tests/configs/**/nightly_recipes.yml'
+      - 'tests/ci_tests/configs/**'
       - 'examples/**/*.yaml'
-      - 'tests/ci_tests/utils/validate_recipes.py'
+      - 'tests/ci_tests/utils/validate_nightly_recipes.py'
       - 'tests/ci_tests/utils/generate_ci_tests.py'
 
 jobs:
@@ -44,5 +44,5 @@ jobs:
           uv venv .venv-validator
           uv pip install --python .venv-validator/bin/python --quiet ruamel.yaml
 
-      - name: Validate recipe references
-        run: .venv-validator/bin/python tests/ci_tests/utils/validate_recipes.py --automodel-dir .
+      - name: Validate nightly recipe references
+        run: .venv-validator/bin/python tests/ci_tests/utils/validate_nightly_recipes.py --automodel-dir .
