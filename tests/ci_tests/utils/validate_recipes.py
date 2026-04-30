@@ -16,7 +16,6 @@
 """Validate that every recipe path in tests/ci_tests/configs/<folder>/nightly_recipes.yml exists under examples/."""
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -25,27 +24,9 @@ from ruamel.yaml import YAML
 yaml = YAML()
 
 
-SUMMARY_HEADER = "## Nightly recipe validation failed"
+REPORT_HEADER = "Missing nightly recipe references:"
 
-SUMMARY_INTRO = (
-    "One or more recipes listed in `nightly_recipes.yml` do not exist on disk.\n"
-    "AutoModel's nightly CI generator skips missing recipes at runtime, but a "
-    "broken reference still means the listed test never runs. Fix it before merge."
-)
-
-SUMMARY_HOW_TO_FIX = """### How to fix
-
-For each missing entry above, choose one:
-
-1. **Add the recipe** — create the YAML at the path shown. Typical when a recipe was renamed or moved without updating `nightly_recipes.yml`.
-2. **Remove from nightly** — delete the offending line from `tests/ci_tests/configs/<folder>/nightly_recipes.yml` if the recipe is genuinely gone.
-3. **Mark as known issue** — add `ci.known_issue_id: AM-xxx` (or `ci.allow_failure: true`) to the recipe YAML. See `tests/ci_tests/README.md`.
-
-Inline annotations are also attached to the offending lines in the **Files Changed** tab."""
-
-STDERR_HEADER = "Missing nightly recipe references:"
-
-STDERR_HOW_TO_FIX = """
+REPORT_HOW_TO_FIX = """
 ------------------------------------------------------------
 How to fix - for each missing entry above, choose one:
 
@@ -56,15 +37,8 @@ How to fix - for each missing entry above, choose one:
      tests/ci_tests/configs/<folder>/nightly_recipes.yml
      if the recipe is genuinely gone.
 
-  3. Mark as known issue: add ci.known_issue_id: AM-xxx
-     (or ci.allow_failure: true) to the recipe YAML.
-     See tests/ci_tests/README.md.
+See tests/ci_tests/README.md for details.
 ------------------------------------------------------------"""
-
-ANNOTATION_MSG_TEMPLATE = (
-    "Recipe '{config}' not found at {rel_path}. "
-    "Add the recipe, remove this line, or set ci.known_issue_id on the recipe."
-)
 
 
 def collect_nightly_lists(automodel_dir: Path):
@@ -86,46 +60,6 @@ def collect_nightly_lists(automodel_dir: Path):
         yield recipe_list, examples_dir, entries
 
 
-def _gh_escape(value: str) -> str:
-    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-
-def _write_stderr_report(missing_by_list, automodel_dir):
-    print(STDERR_HEADER, file=sys.stderr)
-    for recipe_list, items in missing_by_list.items():
-        rel_list = recipe_list.relative_to(automodel_dir)
-        print(f"\n  {rel_list}:", file=sys.stderr)
-        for config, rel_path, line in items:
-            loc = f"line {line}" if line else "line ?"
-            print(f"    - [{loc}] {config} -> {rel_path} (not found)", file=sys.stderr)
-    print(STDERR_HOW_TO_FIX, file=sys.stderr)
-
-
-def _emit_gh_annotations(missing_by_list, automodel_dir):
-    for recipe_list, items in missing_by_list.items():
-        rel_list = recipe_list.relative_to(automodel_dir)
-        for config, rel_path, line in items:
-            msg = _gh_escape(ANNOTATION_MSG_TEMPLATE.format(config=config, rel_path=rel_path))
-            line_part = f",line={line}" if line else ""
-            print(f"::error file={rel_list}{line_part}::{msg}")
-
-
-def _write_step_summary(summary_path, missing_by_list, automodel_dir):
-    sections = [SUMMARY_HEADER, "", SUMMARY_INTRO, "", "### Missing entries", ""]
-    for recipe_list, items in missing_by_list.items():
-        rel_list = recipe_list.relative_to(automodel_dir)
-        sections.append(f"**`{rel_list}`**")
-        sections.append("")
-        for config, rel_path, line in items:
-            loc = f"L{line}" if line else "L?"
-            sections.append(f"- {loc}: `{config}` → `{rel_path}` (not found)")
-        sections.append("")
-    sections.append(SUMMARY_HOW_TO_FIX)
-    sections.append("")
-    with open(summary_path, "a", encoding="utf-8") as f:
-        f.write("\n".join(sections))
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--automodel-dir", type=str, required=True, help="Path to Automodel directory")
@@ -141,17 +75,17 @@ def main():
                 missing_by_list.setdefault(recipe_list, []).append((config, rel_path, line))
 
     if not missing_by_list:
-        print("All nightly recipe references valid.")
+        print("All nightly recipe references valid.", file=sys.stderr)
         return 0
 
-    _write_stderr_report(missing_by_list, automodel_dir)
-
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        _emit_gh_annotations(missing_by_list, automodel_dir)
-
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        _write_step_summary(summary_path, missing_by_list, automodel_dir)
+    print(REPORT_HEADER, file=sys.stderr)
+    for recipe_list, items in missing_by_list.items():
+        rel_list = recipe_list.relative_to(automodel_dir)
+        print(f"\n  {rel_list}:", file=sys.stderr)
+        for config, rel_path, line in items:
+            loc = f"line {line}" if line else "line ?"
+            print(f"    - [{loc}] {config} -> {rel_path} (not found)", file=sys.stderr)
+    print(REPORT_HOW_TO_FIX, file=sys.stderr)
 
     return 1
 
