@@ -1004,7 +1004,6 @@ class TestGetStorageReaderInitStep:
         assert reader is backport_marker.return_value
 
 
-# =============================================================================
 # Tests for the _skip_init_weights_on_load gate (Mistral3 FP8 VLM PR)
 # =============================================================================
 
@@ -1055,3 +1054,106 @@ class TestSkipInitWeightsOnLoadGate:
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
         model.initialize_weights.assert_called_once()
+
+
+class TestConsolidatedIndexUnderPPWithoutSourceIndex:
+    """_maybe_build_consolidated_index else-branch (NVIDIA-NeMo/Automodel#1512)."""
+
+    def _make_checkpointer(self, tmp_path):
+        # empty_cache is created but contains no model.safetensors.index.json so
+        # get_safetensors_index_path returns None.
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "empty_cache"),
+            model_repo_id="fake/repo-without-index",
+            save_consolidated=True,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+        return checkpointer
+
+    @staticmethod
+    def _fake_model_state(pre_shard_hf_state_dict_keys=None):
+        """ModelState-like stub used by _maybe_build_consolidated_index."""
+        if pre_shard_hf_state_dict_keys is None:
+            model = SimpleNamespace(config=SimpleNamespace(model_type="nemotron_h"))
+        else:
+            model = MagicMock(spec=torch.nn.Module)
+            model.config = SimpleNamespace(model_type="nemotron_h")
+            model._pre_shard_hf_state_dict_keys = list(pre_shard_hf_state_dict_keys)
+        return SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+
+    @pytest.mark.run_only_on("CPU")
+    def test_falls_back_to_local_state_dict_when_pre_shard_keys_missing(self, tmp_path):
+        """No HF index AND no _pre_shard_hf_state_dict_keys → legacy local-keys fallback."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
+
+        rank_state_dict = {
+            "backbone.embeddings.weight": torch.empty(0),
+            "backbone.layers.0.mixer.qkv_proj.weight": torch.empty(0),
+        }
+        model_state = self._fake_model_state(pre_shard_hf_state_dict_keys=None)
+
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, rank_state_dict)
+
+        assert mapping == {k: 1 for k in rank_state_dict.keys()}
+
+    @pytest.mark.run_only_on("CPU")
+    def test_global_pre_shard_keys_yield_consistent_mapping_across_pp_ranks(self, tmp_path):
+        """Disjoint per-rank PP state dicts but the same global pre-shard key set →
+        every rank produces the identical mapping covering every FQN, so
+        consolidate_safetensors_files_on_every_rank's idx%world_size partitioning
+        cannot drop any keys.
+        """
+        checkpointer = self._make_checkpointer(tmp_path)
+        os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
+
+        global_pre_shard_keys = sorted(
+            [
+                "backbone.embeddings.weight",
+                *[f"backbone.layers.{i}.mixer.qkv_proj.weight" for i in range(52)],
+                "backbone.norm_f.weight",
+                "lm_head.weight",
+            ]
+        )
+
+        # Per-rank disjoint state_dicts (PP slicing).
+        world_size = 8
+        layer_chunks = [list(range(i * 7, (i + 1) * 7)) for i in range(world_size - 1)]
+        layer_chunks.append(list(range(7 * (world_size - 1), 52)))
+        per_rank_state_dicts: list[dict[str, torch.Tensor]] = []
+        for r in range(world_size):
+            sd: dict[str, torch.Tensor] = {}
+            if r == 0:
+                sd["backbone.embeddings.weight"] = torch.empty(0)
+            for layer_idx in layer_chunks[r]:
+                sd[f"backbone.layers.{layer_idx}.mixer.qkv_proj.weight"] = torch.empty(0)
+            if r == world_size - 1:
+                sd["backbone.norm_f.weight"] = torch.empty(0)
+                sd["lm_head.weight"] = torch.empty(0)
+            per_rank_state_dicts.append(sd)
+
+        # Every rank produces the SAME mapping (and it covers every global FQN).
+        per_rank_mappings = []
+        for sd in per_rank_state_dicts:
+            mapping = checkpointer._maybe_build_consolidated_index(self._fake_model_state(global_pre_shard_keys), sd)
+            per_rank_mappings.append(mapping)
+
+        first = per_rank_mappings[0]
+        assert sorted(first.keys()) == global_pre_shard_keys
+        assert "backbone.norm_f.weight" in first  # every rank sees rank-7's norm_f
+        for r, m in enumerate(per_rank_mappings[1:], start=1):
+            assert sorted(m.keys()) == global_pre_shard_keys, f"rank {r} mapping diverges"
+
+        # Round-robin: any rank consolidating idx 1 covers every global FQN.
+        consolidated_keys: set[str] = set()
+        for r, mapping in enumerate(per_rank_mappings):
+            indices_for_this_rank = {idx for idx in set(mapping.values()) if idx % world_size == r}
+            for fqn, idx in mapping.items():
+                if idx in indices_for_this_rank:
+                    consolidated_keys.add(fqn)
+        assert consolidated_keys == set(global_pre_shard_keys)
