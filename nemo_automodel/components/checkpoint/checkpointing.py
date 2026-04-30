@@ -930,7 +930,13 @@ class Checkpointer:
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
-            fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
+            pre_shard_hf_state_dict_keys = (
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+            )
+            if pre_shard_hf_state_dict_keys:
+                fqn_to_file_index_mapping = {k: 1 for k in pre_shard_hf_state_dict_keys}
+            else:
+                fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
