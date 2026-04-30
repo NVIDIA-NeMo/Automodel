@@ -157,9 +157,40 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
+def _yarn_correction_dim(num_rotations: float, dim: int, base: float, max_seq_len: int) -> float:
+    import math
+    return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+
+def _yarn_correction_range(
+    low_rot: float, high_rot: float, dim: int, base: float, max_seq_len: int
+) -> tuple[int, int]:
+    import math
+    low = math.floor(_yarn_correction_dim(low_rot, dim, base, max_seq_len))
+    high = math.ceil(_yarn_correction_dim(high_rot, dim, base, max_seq_len))
+    return max(low, 0), min(high, dim - 1)
+
+
+def _yarn_linear_ramp(min_v: float, max_v: float, dim: int, device=None) -> torch.Tensor:
+    if min_v == max_v:
+        max_v += 0.001
+    linear = (torch.arange(dim, dtype=torch.float32, device=device) - min_v) / (max_v - min_v)
+    return torch.clamp(linear, 0, 1)
+
+
 class DeepseekV4RotaryEmbedding(nn.Module):
     """V4 rotary embedding.  Produces ``(cos, sin)`` sized to ``qk_rope_head_dim``
     (via ``partial_rotary_factor = qk_rope_head_dim / head_dim``), matching HF.
+
+    YaRN: when ``rope_scaling`` is a YaRN-typed dict
+    (``{"type": "yarn", "factor": F, "original_max_position_embeddings": L0,
+    "beta_fast": ..., "beta_slow": ...}``), modify ``inv_freq`` per
+    ``dsv4flash/inference/model.py:precompute_freqs_cis`` — frequency
+    interpolation with a smooth linear ramp between beta_fast/beta_slow
+    correction dims.  Used by the compress-rope (theta=160000) on layers
+    with ``compress_ratio > 0``.  The main rope (theta=10000, used only on
+    sliding-window layers) gets ``rope_scaling=None`` because the reference
+    builds it with ``original_seq_len=0`` for those layers.
     """
 
     inv_freq: torch.Tensor
@@ -171,12 +202,22 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         partial_rotary_factor: float,
         attention_scaling: float = 1.0,
         device: torch.device | None = None,
+        rope_scaling: dict | None = None,
     ):
         super().__init__()
         dim = int(head_dim * partial_rotary_factor)
         inv_freq = 1.0 / (
             rope_theta ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
+        if rope_scaling and str(rope_scaling.get("type", "")).lower() == "yarn":
+            factor = float(rope_scaling.get("factor", 1.0))
+            orig = int(rope_scaling.get("original_max_position_embeddings", 0))
+            beta_fast = float(rope_scaling.get("beta_fast", 32))
+            beta_slow = float(rope_scaling.get("beta_slow", 1))
+            if orig > 0 and factor > 0:
+                low, high = _yarn_correction_range(beta_fast, beta_slow, dim, rope_theta, orig)
+                smooth = 1.0 - _yarn_linear_ramp(low, high, dim // 2, device=inv_freq.device)
+                inv_freq = inv_freq / factor * (1.0 - smooth) + inv_freq * smooth
         self.attention_scaling = attention_scaling
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
