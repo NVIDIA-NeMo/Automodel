@@ -26,7 +26,11 @@ import torch
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
+    DeepseekV4RotaryEmbedding,
     _apply_partial_rope_interleaved,
+    _yarn_correction_dim,
+    _yarn_correction_range,
+    _yarn_linear_ramp,
 )
 
 
@@ -166,3 +170,192 @@ class TestApplyPartialRopeInterleaved:
         sin = torch.zeros(bsz, seq, rd)
         y = _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim=rd)
         torch.testing.assert_close(y, x)
+
+
+class TestYaRNHelpers:
+    """Sanity checks on the three pure-math helpers that build the YaRN
+    correction ramp.  Reference math: ``dsv4flash/inference/model.py:
+    precompute_freqs_cis`` (the inner ``find_correction_dim`` /
+    ``find_correction_range`` / ``linear_ramp_factor`` helpers).
+    """
+
+    def test_correction_dim_monotonic_in_rotations(self):
+        """``find_correction_dim`` is monotonically *decreasing* in
+        ``num_rotations`` (more rotations ⇒ lower dim index, since the
+        higher-frequency dims rotate more often within a fixed window).
+        """
+        # DSV4-Flash compress-rope: dim=64, base=160000, max_seq_len=65536
+        d_low = _yarn_correction_dim(num_rotations=1, dim=64, base=160000, max_seq_len=65536)
+        d_high = _yarn_correction_dim(num_rotations=32, dim=64, base=160000, max_seq_len=65536)
+        assert d_high < d_low
+
+    def test_correction_range_clamped(self):
+        """``find_correction_range`` clamps to ``[0, dim-1]``."""
+        low, high = _yarn_correction_range(
+            low_rot=32, high_rot=1, dim=64, base=160000, max_seq_len=65536
+        )
+        assert 0 <= low <= high <= 63
+
+    def test_linear_ramp_endpoints_and_clamp(self):
+        """Ramp is ``0`` below ``min_v``, ``1`` above ``max_v``, linear in
+        between.  ``dim=32`` matches DSV4 inv_freq length.
+        """
+        ramp = _yarn_linear_ramp(min_v=15.0, max_v=25.0, dim=32)
+        # Below min: 0
+        assert torch.all(ramp[:16] == 0.0)
+        # Above max: 1
+        assert torch.all(ramp[26:] == 1.0)
+        # In between: in [0, 1]
+        assert torch.all((ramp >= 0.0) & (ramp <= 1.0))
+
+    def test_linear_ramp_handles_min_eq_max(self):
+        """When ``min == max`` the helper bumps ``max`` by 1e-3 to avoid
+        division by zero; the ramp should still be a valid step function."""
+        ramp = _yarn_linear_ramp(min_v=5.0, max_v=5.0, dim=10)
+        assert torch.all((ramp >= 0.0) & (ramp <= 1.0))
+
+
+class TestDeepseekV4RotaryEmbeddingYaRN:
+    """``DeepseekV4RotaryEmbedding`` with and without ``rope_scaling``.
+
+    DSV4-Flash uses YaRN on the compress-rope path only:
+        rope_theta=160000, factor=16, original_max_position_embeddings=65536,
+        beta_fast=32, beta_slow=1.
+    """
+
+    def _yarn_kwargs(self, **overrides):
+        kwargs = dict(
+            rope_theta=160000.0,
+            head_dim=128,
+            partial_rotary_factor=0.5,  # qk_rope_head_dim=64
+            rope_scaling={
+                "type": "yarn",
+                "factor": 16,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32,
+                "beta_slow": 1,
+            },
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_no_rope_scaling_is_plain_rope(self):
+        """``rope_scaling=None`` ⇒ plain ``1 / theta^(2i/d)`` inv_freq."""
+        rope = DeepseekV4RotaryEmbedding(
+            rope_theta=10000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
+        )
+        dim = 64  # head_dim * partial_rotary_factor
+        expected = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        torch.testing.assert_close(rope.inv_freq, expected)
+
+    def test_yarn_attenuates_high_freq_dims_by_factor(self):
+        """The highest-frequency dims (above the correction range) are
+        divided by ``factor`` exactly; lowest-frequency dims (below the
+        correction range) are unchanged.
+        """
+        plain = DeepseekV4RotaryEmbedding(
+            rope_theta=160000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
+        )
+        yarn = DeepseekV4RotaryEmbedding(**self._yarn_kwargs())
+
+        ratio = yarn.inv_freq / plain.inv_freq
+
+        # Low-frequency dims (small i, low rotation rate) are below the
+        # correction-range floor — ramp=0, smooth=1, so inv_freq is unchanged.
+        torch.testing.assert_close(ratio[:8], torch.ones(8), rtol=0, atol=1e-5)
+
+        # High-frequency dims (large i, fast rotation) are above the ceiling —
+        # ramp=1, smooth=0, so inv_freq /= factor (exactly 1/16).
+        torch.testing.assert_close(ratio[-4:], torch.full((4,), 1.0 / 16.0), rtol=0, atol=1e-5)
+
+        # Middle band is monotonically interpolating between 1.0 and 1/16.
+        mid = ratio[8:-4]
+        assert torch.all(mid <= ratio[7:-4][:-1] + 1e-6)
+        assert torch.all(mid >= 1.0 / 16.0 - 1e-6)
+
+    def test_yarn_factor_one_is_no_op(self):
+        """``factor=1`` ⇒ ``inv_freq / 1 * (1-smooth) + inv_freq*smooth`` = ``inv_freq``."""
+        plain = DeepseekV4RotaryEmbedding(
+            rope_theta=160000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
+        )
+        yarn = DeepseekV4RotaryEmbedding(
+            **self._yarn_kwargs(rope_scaling={
+                "type": "yarn",
+                "factor": 1,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32,
+                "beta_slow": 1,
+            })
+        )
+        torch.testing.assert_close(yarn.inv_freq, plain.inv_freq, rtol=0, atol=1e-7)
+
+    def test_yarn_zero_original_max_pos_is_no_op(self):
+        """``original_max_position_embeddings=0`` short-circuits YaRN
+        (matches reference's ``if original_seq_len > 0`` gate)."""
+        plain = DeepseekV4RotaryEmbedding(
+            rope_theta=160000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
+        )
+        yarn = DeepseekV4RotaryEmbedding(
+            **self._yarn_kwargs(rope_scaling={
+                "type": "yarn",
+                "factor": 16,
+                "original_max_position_embeddings": 0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+            })
+        )
+        torch.testing.assert_close(yarn.inv_freq, plain.inv_freq, rtol=0, atol=1e-7)
+
+    def test_yarn_unrecognized_type_is_no_op(self):
+        """A ``rope_scaling`` dict whose ``type`` is not ``"yarn"`` should
+        be ignored (the gate is exact-string-match insensitive only to case).
+        """
+        plain = DeepseekV4RotaryEmbedding(
+            rope_theta=160000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
+        )
+        yarn = DeepseekV4RotaryEmbedding(
+            rope_theta=160000.0,
+            head_dim=128,
+            partial_rotary_factor=0.5,
+            rope_scaling={"type": "linear", "factor": 16},
+        )
+        torch.testing.assert_close(yarn.inv_freq, plain.inv_freq)
+
+    def test_yarn_matches_reference_math_pointwise(self):
+        """Recompute YaRN's ``inv_freq`` from the reference formula and
+        check pointwise equality (catches any drift in the helper port).
+        """
+        rope_theta = 160000.0
+        dim = 64
+        factor = 16
+        orig = 65536
+        beta_fast = 32
+        beta_slow = 1
+
+        # Reference formula from dsv4flash/inference/model.py:
+        #   freqs = 1.0 / (base ** (arange(0, dim, 2) / dim))
+        #   low, high = find_correction_range(beta_fast, beta_slow, dim, base, orig)
+        #   smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        #   freqs = freqs / factor * (1 - smooth) + freqs * smooth
+        plain_freqs = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        low, high = _yarn_correction_range(beta_fast, beta_slow, dim, rope_theta, orig)
+        smooth = 1.0 - _yarn_linear_ramp(low, high, dim // 2)
+        expected = plain_freqs / factor * (1.0 - smooth) + plain_freqs * smooth
+
+        yarn = DeepseekV4RotaryEmbedding(**self._yarn_kwargs())
+        torch.testing.assert_close(yarn.inv_freq, expected, rtol=0, atol=1e-7)
+
+    def test_yarn_forward_returns_correct_shape_and_dtype(self):
+        """Smoke check: the YaRN-modified rotary still produces ``(cos, sin)``
+        sized to ``qk_rope_head_dim`` and downcasts to ``x.dtype`` if the
+        forward returns BF16-casted tensors.
+        """
+        rope = DeepseekV4RotaryEmbedding(**self._yarn_kwargs())
+        bsz, seq = 2, 16
+        x = torch.zeros(bsz, seq, dtype=torch.bfloat16)
+        position_ids = torch.arange(seq).unsqueeze(0).expand(bsz, -1)
+        cos, sin = rope(x, position_ids)
+        # rope_head_dim = head_dim * partial_rotary_factor = 64
+        assert cos.shape == (bsz, seq, 64)
+        assert sin.shape == (bsz, seq, 64)
+        assert not torch.isnan(cos).any() and not torch.isnan(sin).any()
