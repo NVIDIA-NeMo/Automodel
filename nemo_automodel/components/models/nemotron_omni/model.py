@@ -606,8 +606,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """
         if isinstance(imgs_sizes, torch.Tensor):
             imgs_sizes_list: list[tuple[int, int]] = [
-                (int(imgs_sizes[i, 0].item()), int(imgs_sizes[i, 1].item()))
-                for i in range(imgs_sizes.shape[0])
+                (int(imgs_sizes[i, 0].item()), int(imgs_sizes[i, 1].item())) for i in range(imgs_sizes.shape[0])
             ]
         else:
             imgs_sizes_list = [(int(h), int(w)) for (h, w) in imgs_sizes]
@@ -656,9 +655,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         return vit_embeds
 
-    def _pixel_shuffle_dynamic_res(
-        self, x: torch.Tensor, imgs_sizes: list[tuple[int, int]]
-    ) -> torch.Tensor:
+    def _pixel_shuffle_dynamic_res(self, x: torch.Tensor, imgs_sizes: list[tuple[int, int]]) -> torch.Tensor:
         """Per-image pixel-shuffle for dynamic-resolution outputs.
 
         Ported from vLLM's `NanoNemotronVLMultimodal.pixel_shuffle_dynamic_res`.
@@ -667,9 +664,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         with `downsample_ratio`, and flattens back to a concatenated (N, L', C).
         """
         patch_dim = self.patch_size
-        seq_lens = [
-            (h // patch_dim) * (w // patch_dim) for (h, w) in imgs_sizes
-        ]
+        seq_lens = [(h // patch_dim) * (w // patch_dim) for (h, w) in imgs_sizes]
         splits = torch.split(x, seq_lens, dim=-2)
         out = []
         for i, sv in enumerate(splits):
