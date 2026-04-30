@@ -159,13 +159,13 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 def _yarn_correction_dim(num_rotations: float, dim: int, base: float, max_seq_len: int) -> float:
     import math
+
     return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
 
 
-def _yarn_correction_range(
-    low_rot: float, high_rot: float, dim: int, base: float, max_seq_len: int
-) -> tuple[int, int]:
+def _yarn_correction_range(low_rot: float, high_rot: float, dim: int, base: float, max_seq_len: int) -> tuple[int, int]:
     import math
+
     low = math.floor(_yarn_correction_dim(low_rot, dim, base, max_seq_len))
     high = math.ceil(_yarn_correction_dim(high_rot, dim, base, max_seq_len))
     return max(low, 0), min(high, dim - 1)

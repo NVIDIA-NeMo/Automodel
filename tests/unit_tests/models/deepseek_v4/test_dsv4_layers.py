@@ -191,9 +191,7 @@ class TestYaRNHelpers:
 
     def test_correction_range_clamped(self):
         """``find_correction_range`` clamps to ``[0, dim-1]``."""
-        low, high = _yarn_correction_range(
-            low_rot=32, high_rot=1, dim=64, base=160000, max_seq_len=65536
-        )
+        low, high = _yarn_correction_range(low_rot=32, high_rot=1, dim=64, base=160000, max_seq_len=65536)
         assert 0 <= low <= high <= 63
 
     def test_linear_ramp_endpoints_and_clamp(self):
@@ -241,9 +239,7 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
 
     def test_no_rope_scaling_is_plain_rope(self):
         """``rope_scaling=None`` ⇒ plain ``1 / theta^(2i/d)`` inv_freq."""
-        rope = DeepseekV4RotaryEmbedding(
-            rope_theta=10000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
-        )
+        rope = DeepseekV4RotaryEmbedding(rope_theta=10000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None)
         dim = 64  # head_dim * partial_rotary_factor
         expected = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         torch.testing.assert_close(rope.inv_freq, expected)
@@ -279,13 +275,15 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
             rope_theta=160000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
         )
         yarn = DeepseekV4RotaryEmbedding(
-            **self._yarn_kwargs(rope_scaling={
-                "type": "yarn",
-                "factor": 1,
-                "original_max_position_embeddings": 65536,
-                "beta_fast": 32,
-                "beta_slow": 1,
-            })
+            **self._yarn_kwargs(
+                rope_scaling={
+                    "type": "yarn",
+                    "factor": 1,
+                    "original_max_position_embeddings": 65536,
+                    "beta_fast": 32,
+                    "beta_slow": 1,
+                }
+            )
         )
         torch.testing.assert_close(yarn.inv_freq, plain.inv_freq, rtol=0, atol=1e-7)
 
@@ -296,13 +294,15 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
             rope_theta=160000.0, head_dim=128, partial_rotary_factor=0.5, rope_scaling=None
         )
         yarn = DeepseekV4RotaryEmbedding(
-            **self._yarn_kwargs(rope_scaling={
-                "type": "yarn",
-                "factor": 16,
-                "original_max_position_embeddings": 0,
-                "beta_fast": 32,
-                "beta_slow": 1,
-            })
+            **self._yarn_kwargs(
+                rope_scaling={
+                    "type": "yarn",
+                    "factor": 16,
+                    "original_max_position_embeddings": 0,
+                    "beta_fast": 32,
+                    "beta_slow": 1,
+                }
+            )
         )
         torch.testing.assert_close(yarn.inv_freq, plain.inv_freq, rtol=0, atol=1e-7)
 
