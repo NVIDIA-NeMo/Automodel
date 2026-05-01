@@ -2,8 +2,9 @@
 
 Reusable task guides for AI coding agents working in this repo.
 
-Shared skills live here (`skills/`) so they don't conflict with anyone's
-personal `.claude/skills/` directory.
+Skills are defined centrally here and symlinked into the agentic directories
+that need them, keeping a single source of truth without polluting personal
+`.claude/skills/` setups.
 
 ## Usage
 
