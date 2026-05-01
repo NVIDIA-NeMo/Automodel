@@ -84,7 +84,7 @@ dependencies = [
     "torch>=2.6.0",
     "torchdata",
     "transformers==5.5.0",
-    "wandb",
+    "wandb>=0.26.1",
     "torchao",
     "mlflow",
     "flashoptim>=0.1.3",
