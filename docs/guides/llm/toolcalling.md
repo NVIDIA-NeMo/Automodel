@@ -98,7 +98,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 You should be able to see a training loss curve similar to the one shown below:
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
 </p>
 
 ## Run PEFT (LoRA)
@@ -118,5 +118,5 @@ automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400">
 </p>
