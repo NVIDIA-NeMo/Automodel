@@ -314,6 +314,13 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **retry_kwargs,
             )
 
+        # ``attn_implementation="te"`` is a NeMo extension: route through SDPA
+        # for model init and inject TE DotProductAttention post-init.
+        inject_te_attention = attn_implementation == "te"
+        if inject_te_attention:
+            logger.info("attn_implementation='te' requested: using 'sdpa' for model init and will inject TE post-init.")
+            attn_implementation = "sdpa"
+
         if is_hf_model:
             attn_implementation, use_liger_kernel = _apply_preload_overrides(
                 mesh.tp_size,
@@ -322,6 +329,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 attn_implementation,
                 use_liger_kernel,
             )
+            # If preload overrides changed attn_implementation away from "sdpa"
+            # (e.g., packed sequence forces "flash_attention_2"), TE injection
+            # cannot intercept F.scaled_dot_product_attention; skip it.
+            if inject_te_attention and attn_implementation != "sdpa":
+                logger.warning(
+                    "TE attention injection requires SDPA but attn_implementation was overridden to '%s'. "
+                    "Skipping TE injection.",
+                    attn_implementation,
+                )
+                inject_te_attention = False
         device = torch.cuda.current_device()
 
         # When PEFT is requested, force dequantization of FP8-quantized models.
@@ -433,6 +450,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if is_hf_model:
             _verify_sdpa_support(model, mesh.cp_size)
 
+        # HF from_pretrained on a real device loads (and potentially quantizes) weights
+        # during init.  Custom models and meta-device initialization do not load weights
+        # here; they rely on apply_model_infrastructure to load the checkpoint later.
+        weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
+
         from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
 
         attach_capabilities_and_validate(model, mesh)
@@ -455,6 +477,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             load_base_model=load_base_model,
             cache_dir=cache_dir,
             freeze_config=freeze_config,
+            weights_already_loaded=weights_already_loaded,
+            inject_te_attention=inject_te_attention,
         )
 
         return model
@@ -943,6 +967,7 @@ class _NeMoAutoModelForRetrievalBase:
         model = encoder_cls.build(
             model_name_or_path=pretrained_model_name_or_path,
             attn_implementation=attn_implementation,
+            torch_dtype=torch_dtype,
             **build_kwargs,
         )
 

@@ -64,7 +64,7 @@ dataset:
   split: train
 
 packed_sequence:
-  packed_sequence_size: 1024
+  packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -94,3 +94,4 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
+  known_issue_id: AM-153

@@ -38,9 +38,25 @@ elif [ "$TEST_LEVEL" = "performance" ]; then
   CONFIG="${CONFIG}"
 else
   CONFIG="${CONFIG} \
-        --step_scheduler.ckpt_every_steps 100 \
-        --step_scheduler.max_steps ${MAX_STEPS:-100} \
-        --step_scheduler.val_every_steps 100"
+        --step_scheduler.ckpt_every_steps 50 \
+        --step_scheduler.max_steps ${MAX_STEPS:-50} \
+        --step_scheduler.val_every_steps 50"
+fi
+
+# Per-config nproc override (set via ci.nproc_per_node in recipe YAML)
+NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
+
+# Customizer contract test dataset overrides
+if [[ "${CONFIG_PATH}" == *customizer_* ]]; then
+  CUSTOMIZER_DATA="${NEMO_CI_PATH}/datasets/customizer/sample-datasets"
+  if [[ "${CONFIG_PATH}" == *chat* ]]; then
+    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/train.jsonl \
+      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/validation.jsonl"
+  else
+    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/train.jsonl \
+      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/validation.jsonl"
+  fi
+  CONFIG="${CONFIG} ${CUSTOMIZER_DATASET_ARGS}"
 fi
 
 # Command to execute, defaults to torchrun
@@ -48,7 +64,8 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-              --rdzv_id=${SLURM_JOB_ID}"
+              --rdzv_id=${SLURM_JOB_ID} \
+              --rdzv_conf=timeout=${RDZV_TIMEOUT:-600}"
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
@@ -62,14 +79,15 @@ ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
   --step_scheduler.ckpt_every_steps 5 \
   --step_scheduler.val_every_steps 5 \
   --step_scheduler.global_batch_size 32 \
-  --step_scheduler.local_batch_size 2"
+  --step_scheduler.local_batch_size 2 \
+  ${CUSTOMIZER_DATASET_ARGS:-}"
 
 if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
   ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
 fi
 
 ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $PIPELINE_DIR/$TEST_NAME/robustness_logs \
-  -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+  -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
   ${ROBUSTNESS_COMMON}"
 
 # --- Finetune ---

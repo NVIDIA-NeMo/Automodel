@@ -38,8 +38,9 @@ ENV PIP_NO_CACHE_DIR=1
 WORKDIR /opt
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Address CVE-2025-68973
-RUN apt-get update && apt install -y --only-upgrade gnupg && \
+# Address CVE-2025-68973; install ffmpeg dev libs for torchcodec source build
+RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
+    apt-get install -y --no-install-recommends ffmpeg libavdevice-dev pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -129,7 +130,7 @@ RUN pip install "aiohttp>=3.13.3" \
         "jaraco-context>=6.1.0" \
         "nbconvert>=7.17.0" \
         "onnx>=1.21.0" \
-        "pillow>=12.1.1" \
+        "pillow>=12.2.0" \
         "protobuf>=6.33.5" \
         "setuptools>=80.10.2" \
         "tornado>=6.5.5" \
@@ -154,11 +155,16 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
     fi && \
     uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
 
+# Rebuild torchcodec from source to match the container's PyTorch ABI
+RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+    pip install --no-build-isolation --force-reinstall --no-deps \
+        git+https://github.com/pytorch/torchcodec.git@v0.8.0
+
 # Patch wandb-core: bump vulnerable Go deps (CVE fixes)
 ARG TARGETARCH
 RUN if python3 -c "import wandb" 2>/dev/null; then \
         GRPC_VERSION=1.79.3 && \
-        OTEL_VERSION=1.35.0 && \
+        OTEL_VERSION=1.43.0 && \
         GO_VERSION=1.26.1 && \
         WANDB_VERSION=$(python3 -c "import wandb; print(wandb.__version__)") && \
         WANDB_CORE_BIN=/opt/venv/lib/python3.12/site-packages/wandb/bin/wandb-core && \
@@ -169,6 +175,7 @@ RUN if python3 -c "import wandb" 2>/dev/null; then \
         cd /tmp/wandb-src/core && \
         go get google.golang.org/grpc@v${GRPC_VERSION} && \
         go get go.opentelemetry.io/otel/sdk@v${OTEL_VERSION} && \
+        go get github.com/go-jose/go-jose/v4@v4.1.4 && \
         go mod tidy && \
         go mod vendor && \
         CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
@@ -179,6 +186,11 @@ RUN if python3 -c "import wandb" 2>/dev/null; then \
     fi
 
 COPY . /opt/Automodel
+
+# Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
+    fi
 
 WORKDIR /opt/Automodel
 

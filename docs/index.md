@@ -93,10 +93,13 @@ Find the right guide for your task -- fine-tuning, pretraining, distillation, di
 | **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.md)             |
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
 | **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                 |
+| **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](guides/dllm/finetune.md)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
-| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3_5.md)                |
+| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3-5.md)                |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
-| **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large_moe_finetune.md)         |
+| **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.md)         |
+| **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](guides/llm/dsv4-flash.md)   |
+| **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](guides/llm/hy3.md)                |
 | **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.md) |
 | **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](guides/quantization-aware-training.md)       |
 | **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](guides/llm/knowledge-distillation.md)   |
@@ -242,14 +245,19 @@ Overview <guides/overview.md>
 SFT & PEFT <guides/llm/finetune.md>
 Function Calling <guides/llm/toolcalling.md>
 guides/llm/knowledge-distillation.md
-Large MoE Fine-Tuning <guides/llm/large_moe_finetune.md>
+Large MoE Fine-Tuning <guides/llm/large-moe-finetune.md>
+DeepSeek V4 Flash <guides/llm/dsv4-flash.md>
+Hy3-preview <guides/llm/hy3.md>
 Pretraining <guides/llm/pretraining.md>
 NanoGPT Pretraining <guides/llm/nanogpt-pretraining.md>
 Sequence Classification <guides/llm/sequence-classification.md>
 Gemma 3 / 3n <guides/omni/gemma3-3n.md>
 Gemma 4 <guides/vlm/gemma4.md>
-Qwen3.5-VL <guides/vlm/qwen3_5.md>
+Qwen3.5-VL <guides/vlm/qwen3-5.md>
+Nemotron-Omni <guides/vlm/nemotron-omni.md>
+Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
+dLLM Fine-Tuning <guides/dllm/finetune.md>
 QAT <guides/quantization-aware-training.md>
 Databricks <guides/llm/databricks.md>
 ::::
@@ -274,6 +282,7 @@ Local Workstation <launcher/local-workstation.md>
 SLURM Cluster <launcher/slurm.md>
 NeMo-Run <launcher/nemo-run.md>
 SkyPilot <launcher/skypilot.md>
+SkyPilot k8s <launcher/skypilot-kubernetes.md>
 ::::
 
 ::::{toctree}

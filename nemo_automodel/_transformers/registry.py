@@ -44,6 +44,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v32.model", "DeepseekV32ForCausalLM"),
         ),
         (
+            "DeepseekV4ForCausalLM",
+            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+        ),
+        (
             "Glm4MoeForCausalLM",
             ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
@@ -100,6 +104,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
         ),
         (
+            "Ministral3BidirectionalModel",
+            (
+                "nemo_automodel.components.models.ministral_bidirectional.model",
+                "Ministral3BidirectionalModel",
+                {"retrieval"},
+            ),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
@@ -108,12 +120,37 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
         ),
         (
+            "Mistral3FP8VLMForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.mistral3_vlm.model",
+                "Mistral3FP8VLMForConditionalGeneration",
+            ),
+        ),
+        (
             "NemotronHForCausalLM",
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
         (
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            (
+                "nemo_automodel.components.models.nemotron_omni.model",
+                "NemotronOmniForConditionalGeneration",
+            ),
+        ),
+        (
             "NemotronParseForConditionalGeneration",
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
+        ),
+        (
+            "LLaVAOneVision1_5_ForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.llava_onevision.model",
+                "LLaVAOneVision1_5_ForConditionalGeneration",
+            ),
+        ),
+        (
+            "HYV3ForCausalLM",
+            ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
         (
             "Qwen2ForCausalLM",
@@ -155,8 +192,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
+    "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
+    "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
 }
 
