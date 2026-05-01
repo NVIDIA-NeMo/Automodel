@@ -183,4 +183,3 @@ slurm*.out
 # Local launcher job output directories
 slurm_jobs/
 skypilot_jobs/
-CLAUDE.md
