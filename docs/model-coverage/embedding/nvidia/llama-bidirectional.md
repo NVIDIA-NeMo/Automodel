@@ -52,6 +52,7 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 | Recipe | Description |
 |---|---|
 | {download}`llama3_2_1b.yaml <../../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml>` | Bi-encoder — Llama 3.2 1B embedding model |
+| {download}`llama_embed_nemotron_8b.yaml <../../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml>` | Bi-encoder — reproduction recipe for [`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b) (uses [`nvidia/embed-nemotron-dataset-v1`](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1)) |
 
 ## Try with NeMo AutoModel
 
