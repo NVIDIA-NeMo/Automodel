@@ -21,8 +21,11 @@ claude --add-dir skills
 | Skill | Description |
 |---|---|
 | `model-onboarding` | Onboard a new model family (LLM, VLM, MoE, etc.) |
-| `developer-guide` | Environment setup and day-to-day dev workflow |
 | `recipe-development` | Create and modify training/eval recipes |
 | `parity-testing` | Verify numerical correctness against references |
 | `distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
 | `launcher-config` | Slurm and SkyPilot job submission |
+| `linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
+| `cicd` | Commit/PR workflow, CI trigger mechanism, failure investigation |
+| `build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
+| `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
