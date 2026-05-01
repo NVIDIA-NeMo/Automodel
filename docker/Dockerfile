@@ -13,7 +13,7 @@
 # limitations under the License.
 
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -159,31 +159,6 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
     pip install --no-build-isolation --force-reinstall --no-deps \
         git+https://github.com/pytorch/torchcodec.git@v0.8.0
-
-# Patch wandb-core: bump vulnerable Go deps (CVE fixes)
-ARG TARGETARCH
-RUN if python3 -c "import wandb" 2>/dev/null; then \
-        GRPC_VERSION=1.79.3 && \
-        OTEL_VERSION=1.43.0 && \
-        GO_VERSION=1.26.1 && \
-        WANDB_VERSION=$(python3 -c "import wandb; print(wandb.__version__)") && \
-        WANDB_CORE_BIN=/opt/venv/lib/python3.12/site-packages/wandb/bin/wandb-core && \
-        curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /tmp -xz && \
-        export PATH="/tmp/go/bin:$PATH" && \
-        export GOPATH=/tmp/gopath && \
-        git clone --depth 1 --branch "v${WANDB_VERSION}" https://github.com/wandb/wandb.git /tmp/wandb-src && \
-        cd /tmp/wandb-src/core && \
-        go get google.golang.org/grpc@v${GRPC_VERSION} && \
-        go get go.opentelemetry.io/otel/sdk@v${OTEL_VERSION} && \
-        go get github.com/go-jose/go-jose/v4@v4.1.4 && \
-        go mod tidy && \
-        go mod vendor && \
-        CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
-            -o "${WANDB_CORE_BIN}" ./cmd/wandb-core/ && \
-        rm -rf /tmp/wandb-src /tmp/go /tmp/gopath; \
-    else \
-        echo "wandb not installed, skipping CVE patch"; \
-    fi
 
 COPY . /opt/Automodel
 
