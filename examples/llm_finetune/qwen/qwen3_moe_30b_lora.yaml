@@ -102,7 +102,7 @@ optimizer:
 
 ci:
   recipe_owner: adil-a
-  time: "00:15:00"
+  time: "00:30:00"
   nodes: 1
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
