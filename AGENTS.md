@@ -201,5 +201,16 @@ file gives step-by-step instructions an AI agent can follow.
 | 5 | parity-testing           | `parity-testing`           | Verify numerical correctness against reference implementations |
 | 6 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
 
-When starting a task, identify which skill applies and read that file for
-domain-specific guidance before writing any code.
+**Always read the relevant `SKILL.md` before starting any task it covers —
+skills are mandatory context, not optional background reading.**
+
+**Workflow — mandatory order for every task:**
+1. **Pull information first.** Read the commit, PR, error log, file, or
+   whatever artifact the task is about. Do not reason about it yet.
+2. **Select and invoke the skill.** Based on what you just read, identify
+   the relevant skill and invoke it before forming any answer or plan.
+3. **Answer or implement.** Only after the skill is loaded, use its context
+   to reason, diagnose, or write code.
+
+Never skip or reorder these steps. Do not wait for the user to name the right
+skill keyword — infer it from the artifact you read.
