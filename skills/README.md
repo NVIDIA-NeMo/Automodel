@@ -7,14 +7,10 @@ personal `.claude/skills/` directory.
 
 ## Usage
 
-### Claude Code
+Skills are synced to the global Claude Code skill registry via CI and are
+available to AI agents as invocable slash commands without any extra flags.
 
-Launch Claude Code with the `--add-dir` flag to auto-register the shared
-skills as slash commands:
-
-```bash
-claude --add-dir skills
-```
+To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 
 ## Available skills
 
