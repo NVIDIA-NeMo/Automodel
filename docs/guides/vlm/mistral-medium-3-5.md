@@ -93,5 +93,5 @@ The training loss curves for Mistral Medium 3.5 fine-tuned on
 MedPix-VQA are shown below.
 
 <p align="center">
-  <img src="mistralm35.png" alt="Mistral Medium 3.5 Training Loss Curve" width="500">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/mistralm35.png" alt="Mistral Medium 3.5 Training Loss Curve" width="500">
 </p>
