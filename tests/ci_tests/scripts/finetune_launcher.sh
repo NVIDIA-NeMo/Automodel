@@ -34,11 +34,29 @@ if [ "$TEST_LEVEL" = "convergence" ]; then
          --wandb.entity Nemo-automodel \
          --wandb.name ${TEST_NAME} \
          --wandb.dir /tmp/wandb/"
+elif [ "$TEST_LEVEL" = "performance" ]; then
+  CONFIG="${CONFIG}"
 else
   CONFIG="${CONFIG} \
-        --step_scheduler.ckpt_every_steps 100 \
-        --step_scheduler.max_steps ${MAX_STEPS:-100} \
-        --step_scheduler.val_every_steps 100"
+        --step_scheduler.ckpt_every_steps 50 \
+        --step_scheduler.max_steps ${MAX_STEPS:-50} \
+        --step_scheduler.val_every_steps 50"
+fi
+
+# Per-config nproc override (set via ci.nproc_per_node in recipe YAML)
+NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
+
+# Customizer contract test dataset overrides
+if [[ "${CONFIG_PATH}" == *customizer_* ]]; then
+  CUSTOMIZER_DATA="${NEMO_CI_PATH}/datasets/customizer/sample-datasets"
+  if [[ "${CONFIG_PATH}" == *chat* ]]; then
+    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/train.jsonl \
+      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/validation.jsonl"
+  else
+    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/train.jsonl \
+      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/validation.jsonl"
+  fi
+  CONFIG="${CONFIG} ${CUSTOMIZER_DATASET_ARGS}"
 fi
 
 # Command to execute, defaults to torchrun
@@ -46,7 +64,8 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-              --rdzv_id=${SLURM_JOB_ID}"
+              --rdzv_id=${SLURM_JOB_ID} \
+              --rdzv_conf=timeout=${RDZV_TIMEOUT:-600}"
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
@@ -59,15 +78,16 @@ ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
   --step_scheduler.max_steps 5 \
   --step_scheduler.ckpt_every_steps 5 \
   --step_scheduler.val_every_steps 5 \
-  --step_scheduler.global_batch_size 16 \
-  --step_scheduler.local_batch_size 2"
+  --step_scheduler.global_batch_size 32 \
+  --step_scheduler.local_batch_size 2 \
+  ${CUSTOMIZER_DATASET_ARGS:-}"
 
 if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
   ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
 fi
 
 ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $PIPELINE_DIR/$TEST_NAME/robustness_logs \
-  -m pytest tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+  -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
   ${ROBUSTNESS_COMMON}"
 
 # --- Finetune ---
@@ -76,12 +96,46 @@ RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
 echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"
+FINETUNE_START=$SECONDS
+
 eval $RUN_CMD
+FINETUNE_EXIT_CODE=$?
+
+FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
+echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
+
+# Collect benchmark artifact for performance tests
+if [ "$TEST_LEVEL" = "performance" ]; then
+  echo "[benchmark] Collecting benchmark artifact..."
+  python3 /opt/Automodel/tests/ci_tests/scripts/collect_benchmark_artifact.py \
+    --config /opt/Automodel/${CONFIG_PATH} \
+    --log $PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out \
+    --output $PIPELINE_DIR/$TEST_NAME/benchmark_results.json || true
+fi
+
+if [[ "$FINETUNE_EXIT_CODE" -ne 0 ]]; then
+  echo "[finetune] Failed with exit code ${FINETUNE_EXIT_CODE}, skipping robustness test"
+  exit $FINETUNE_EXIT_CODE
+fi
 
 # --- Checkpoint Robustness ---
 if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
   echo "============================================"
+  ROBUSTNESS_START=$SECONDS
+
   eval $ROBUSTNESS_CMD
+  ROBUSTNESS_EXIT_CODE=$?
+
+  ROBUSTNESS_ELAPSED=$((SECONDS - ROBUSTNESS_START))
+  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"robustness\",\"seconds\":${ROBUSTNESS_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"total\",\"seconds\":$((SECONDS)),\"allocated\":\"${TIME}\"}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+  echo "[timing] Robustness completed in ${ROBUSTNESS_ELAPSED}s (total: ${SECONDS}s)"
+
+  if [[ "$ROBUSTNESS_EXIT_CODE" -ne 0 ]]; then
+    echo "[checkpoint_robustness] Failed with exit code ${ROBUSTNESS_EXIT_CODE}"
+    exit $ROBUSTNESS_EXIT_CODE
+  fi
 fi

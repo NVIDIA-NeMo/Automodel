@@ -44,6 +44,7 @@ model:
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  add_eos_token: false
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

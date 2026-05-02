@@ -20,11 +20,39 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
-    _get_parallel_plan,
     fsdp2_strategy_parallelize,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_is_packed_sequence_for_training() -> None:
+    """Eliminate CPU-GPU sync from flash attention for standard (non-packed) training.
+
+    transformers._is_packed_sequence() returns a GPU bool scalar when batch_size==1,
+    which causes Python's ``if`` to call aten::is_nonzero — a CPU-GPU sync — once per
+    attention layer per forward pass.  With FSDP+TP+gradient-checkpointing this fires
+    hundreds of times per iteration.
+
+    For standard (non-packed) training sequences are never packed, so returning the
+    Python False immediately is both correct and avoids the sync.  Do NOT apply this
+    patch when using packed-sequence training (multiple sequences concatenated into one
+    tensor with position_ids that reset to 0 mid-sequence).
+    """
+    try:
+        import transformers.modeling_flash_attention_utils as _fa_utils
+
+        if getattr(_fa_utils, "_is_packed_sequence_patched", False):
+            return  # already patched
+
+        def _is_packed_sequence_no_sync(position_ids, batch_size):
+            # Non-packed training: position_ids is always a simple arange -- never packed.
+            return False
+
+        _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
+        _fa_utils._is_packed_sequence_patched = True
+    except (ImportError, AttributeError):
+        pass
 
 
 class FSDP2Manager:
@@ -68,6 +96,11 @@ class FSDP2Manager:
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
         self.backend = config.backend
+        self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
+        self.enable_compile = config.enable_compile
+        self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
+        self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
+        self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
 
     def parallelize(self, model):
         """
@@ -88,23 +121,29 @@ class FSDP2Manager:
                     logger.error("Model does not support gradient checkpointing.")
             return model
 
-        if self.device_mesh["tp"].size() > 1:
-            # Delegate plan selection to central helper
-            tp_shard_plan = _get_parallel_plan(
-                model,
-                sequence_parallel=bool(self.sequence_parallel),
-                tp_shard_plan=self.tp_plan,
-            )
-        else:
-            tp_shard_plan = None
+        if self.config.patch_is_packed_sequence:
+            _patch_is_packed_sequence_for_training()
 
         fsdp2_strategy_parallelize(
             model,
             device_mesh=self.device_mesh,
             mp_policy=self.mp_policy,
-            tp_shard_plan=tp_shard_plan,
+            tp_shard_plan=self.tp_plan,
             offload_policy=self.offload_policy,
             sequence_parallel=bool(self.sequence_parallel),
             activation_checkpointing=self.activation_checkpointing,
+            enable_async_tensor_parallel=self.enable_async_tensor_parallel,
+            enable_compile=self.enable_compile,
+            enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
+            fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
+            fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
         )
+
         return model
+
+    def maybe_compile(self, model):
+        """Apply per-layer compile after sharding, alongside whole-model compile_model()."""
+        if self.enable_compile or (self.enable_async_tensor_parallel and self.device_mesh["tp"].size() > 1):
+            from nemo_automodel.components.distributed.parallelizer import _apply_per_layer_compile
+
+            _apply_per_layer_compile(model)

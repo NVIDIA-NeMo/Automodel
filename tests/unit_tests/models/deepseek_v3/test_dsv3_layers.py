@@ -207,6 +207,8 @@ class TestMLAInitialization:
         for key, value in overrides.items():
             setattr(config, key, value)
 
+        config.rope_parameters = config.rope_scaling
+
         return config
 
     @skip_te
@@ -364,6 +366,8 @@ class TestMLAForward:
         for key, value in overrides.items():
             setattr(config, key, value)
 
+        config.rope_parameters = config.rope_scaling
+
         return config
 
     def test_mla_forward_tensor_shapes(self):
@@ -486,6 +490,8 @@ class TestMLAInitWeights:
 
         for key, value in overrides.items():
             setattr(config, key, value)
+
+        config.rope_parameters = config.rope_scaling
 
         return config
 

@@ -136,5 +136,3 @@ def test_glue_mrpc_max_length_resolution(monkeypatch: pytest.MonkeyPatch, tok_ma
     # Assert the tokenizer call received the resolved max_length
     assert "max_length" in tokenizer.last_kwargs
     assert tokenizer.last_kwargs["truncation"] is True
-
-

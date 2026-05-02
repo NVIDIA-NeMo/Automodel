@@ -73,8 +73,8 @@ dataset:
 
 packed_sequence:
   pretokenize: true
-  max_length: 8192
-  pack_size: 8192
+  max_length: 4096
+  pack_size: 4096
   packing_ratio: 0.9
   drop_long_samples: true
 
@@ -108,3 +108,4 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  known_issue_id: AM-158

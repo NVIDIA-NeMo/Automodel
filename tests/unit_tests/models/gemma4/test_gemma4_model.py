@@ -16,9 +16,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
-pytest.importorskip("transformers.models.gemma4", reason="Gemma4 not available in this transformers version")
-
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -47,12 +44,11 @@ def _make_text_config(**overrides):
         num_hidden_layers=4,
         intermediate_size=128,
         rms_norm_eps=1e-6,
-        rope_theta=10000.0,
         max_position_embeddings=256,
         enable_moe_block=True,
         num_experts=4,
         top_k_experts=2,
-        expert_intermediate_size=64,
+        moe_intermediate_size=64,
         layer_types=["full_attention", "sliding_attention"] * 2,
         sliding_window=128,
         hidden_activation="gelu_pytorch_tanh",
@@ -74,7 +70,7 @@ def _make_moe_config(text_config=None):
     return MoEConfig(
         dim=tc.hidden_size,
         inter_dim=tc.intermediate_size,
-        moe_inter_dim=tc.expert_intermediate_size,
+        moe_inter_dim=tc.moe_intermediate_size,
         n_routed_experts=tc.num_experts,
         n_shared_experts=0,
         n_activated_experts=tc.top_k_experts,
@@ -152,7 +148,7 @@ class TestGemma4Gate:
 
     def test_root_size_value(self, text_config):
         gate = Gemma4Gate(text_config)
-        expected = text_config.hidden_size ** -0.5
+        expected = text_config.hidden_size**-0.5
         torch.testing.assert_close(gate.root_size, torch.tensor(expected))
 
     def test_scale_initialized_to_ones(self, text_config):
@@ -223,6 +219,64 @@ class TestGemma4MoE:
         moe = Gemma4MoE(moe_config, backend_config, text_config)
         assert moe.gate.num_experts == text_config.num_experts
 
+    def test_forward_routes_gate_input_to_gate(self, moe_config, backend_config, text_config, device):
+        # HF Gemma4 sends the raw residual to the router and the normalized
+        # input to the experts. When gate_input is provided, the gate must
+        # receive it (not the normalized x).
+        moe = Gemma4MoE(moe_config, backend_config, text_config).to(device).to(torch.bfloat16)
+
+        batch, seq = 2, 4
+        dim = text_config.hidden_size
+        num_tokens = batch * seq
+        topk = text_config.top_k_experts
+
+        weights = torch.ones(num_tokens, topk, device=device, dtype=torch.bfloat16)
+        indices = torch.zeros(num_tokens, topk, device=device, dtype=torch.long)
+        expert_out = torch.zeros(num_tokens, dim, device=device, dtype=torch.bfloat16)
+
+        normed = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+        raw = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+
+        # Patch .forward rather than the submodule itself — nn.Module blocks
+        # assigning a MagicMock as a child module.
+        with (
+            patch.object(moe.gate, "forward", return_value=(weights, indices, None)) as mock_gate,
+            patch.object(moe.experts, "forward", return_value=expert_out) as mock_experts,
+        ):
+            moe(normed, gate_input=raw)
+
+        # gate receives the raw residual (not the normed input)
+        gate_input_arg = mock_gate.call_args[0][0]
+        torch.testing.assert_close(gate_input_arg, raw.view(-1, dim))
+        # experts still receive the normed input
+        expert_input_arg = mock_experts.call_args[0][0]
+        torch.testing.assert_close(expert_input_arg, normed.view(-1, dim))
+
+    def test_forward_without_gate_input_preserves_prior_behavior(self, moe_config, backend_config, text_config, device):
+        # When gate_input is omitted, the gate must receive x — preserving
+        # the original single-input contract for any non-Gemma4 caller.
+        moe = Gemma4MoE(moe_config, backend_config, text_config).to(device).to(torch.bfloat16)
+
+        batch, seq = 2, 4
+        dim = text_config.hidden_size
+        num_tokens = batch * seq
+        topk = text_config.top_k_experts
+
+        weights = torch.ones(num_tokens, topk, device=device, dtype=torch.bfloat16)
+        indices = torch.zeros(num_tokens, topk, device=device, dtype=torch.long)
+        expert_out = torch.zeros(num_tokens, dim, device=device, dtype=torch.bfloat16)
+
+        x = torch.randn(batch, seq, dim, device=device, dtype=torch.bfloat16)
+
+        with (
+            patch.object(moe.gate, "forward", return_value=(weights, indices, None)) as mock_gate,
+            patch.object(moe.experts, "forward", return_value=expert_out),
+        ):
+            moe(x)
+
+        gate_input_arg = mock_gate.call_args[0][0]
+        torch.testing.assert_close(gate_input_arg, x.view(-1, dim))
+
 
 # ---------------------------------------------------------------------------
 # Gemma4MoEDecoderLayer tests
@@ -280,6 +334,41 @@ class TestGemma4MoEDecoderLayer:
 
         assert out.shape == x.shape
 
+    def test_moe_receives_unnormed_residual_as_gate_input(self, text_config, moe_config, backend_config, device):
+        # Regression guard for the Gemma4 MoE double-normalization bug:
+        # the decoder layer must pass the raw post-attention residual (not
+        # pre_feedforward_layernorm_2(x)) to the gate. See upstream issue
+        # #1852 — double-norm caused gen_kl_error 0.116 on
+        # Gemma4-26B-A4B-it GRPO; after the fix, 0.0011.
+        layer = Gemma4MoEDecoderLayer(text_config, layer_idx=0, moe_config=moe_config, backend=backend_config)
+        layer = layer.to(device).to(torch.bfloat16)
+
+        batch, seq = 2, 4
+        x = torch.randn(batch, seq, text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        pos_emb = (
+            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq, text_config.head_dim // 2, device=device, dtype=torch.bfloat16),
+        )
+        # Sentinel distinguishable by value — what pre_feedforward_layernorm_2 returns.
+        sentinel = torch.full_like(x, 7.0)
+
+        with (
+            patch.object(layer.self_attn, "forward", return_value=(torch.zeros_like(x), None)),
+            patch.object(layer.pre_feedforward_layernorm_2, "forward", return_value=sentinel),
+            patch.object(layer.moe, "forward", return_value=torch.zeros_like(x)) as mock_moe,
+        ):
+            layer(x, position_embeddings=pos_emb)
+
+        # Positional moe_input is the normalized sentinel from pre_feedforward_layernorm_2.
+        moe_input_arg = mock_moe.call_args[0][0]
+        torch.testing.assert_close(moe_input_arg, sentinel)
+
+        # gate_input kwarg must be passed AND differ from the normalized sentinel —
+        # i.e. it is the raw post-attention residual, not the layernormed moe_input.
+        assert "gate_input" in mock_moe.call_args.kwargs
+        gate_input = mock_moe.call_args.kwargs["gate_input"]
+        assert not torch.equal(gate_input, sentinel)
+
 
 # ---------------------------------------------------------------------------
 # Gemma4MoETextModelBackend tests
@@ -317,7 +406,7 @@ class TestGemma4MoETextModelBackend:
         assert model.moe_config.dim == text_config.hidden_size
         assert model.moe_config.n_routed_experts == text_config.num_experts
         assert model.moe_config.n_activated_experts == text_config.top_k_experts
-        assert model.moe_config.moe_inter_dim == text_config.expert_intermediate_size
+        assert model.moe_config.moe_inter_dim == text_config.moe_intermediate_size
         assert model.moe_config.expert_activation == "geglu"
 
     def test_moe_config_accepts_override(self, text_config, backend_config, moe_config):
@@ -365,8 +454,11 @@ class TestGemma4ForConditionalGeneration:
 
     def test_state_dict_adapter_created_when_enabled(self, gemma4_config):
         backend = BackendConfig(
-            linear="torch", attn="sdpa", rms_norm="torch",
-            experts="torch", dispatcher="torch",
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
             enable_hf_state_dict_adapter=True,
         )
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend)
@@ -382,8 +474,11 @@ class TestGemma4ForConditionalGeneration:
         model = Gemma4ForConditionalGeneration(
             cfg,
             backend=BackendConfig(
-                linear="torch", attn="sdpa", rms_norm="torch",
-                experts="torch", dispatcher="torch",
+                linear="torch",
+                attn="sdpa",
+                rms_norm="torch",
+                experts="torch",
+                dispatcher="torch",
                 enable_hf_state_dict_adapter=False,
             ),
             text_config=override,
@@ -472,6 +567,7 @@ class TestGemma4ForConditionalGeneration:
                 def tracker(buf_dev):
                     init_calls.append(buf_dev)
                     return orig(buf_dev)
+
                 return tracker
 
             layer.moe.init_weights = make_tracker(original_init)
@@ -498,8 +594,11 @@ class TestGemma4ForConditionalGenerationClassmethods:
     def test_from_pretrained_classmethod(self):
         cfg = _make_gemma4_config()
         backend = BackendConfig(
-            linear="torch", attn="sdpa", rms_norm="torch",
-            experts="torch", dispatcher="torch",
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            experts="torch",
+            dispatcher="torch",
             enable_hf_state_dict_adapter=False,
         )
 
@@ -509,11 +608,13 @@ class TestGemma4ForConditionalGenerationClassmethods:
             mock_from_pretrained.return_value = cfg
 
             with patch.object(
-                Gemma4ForConditionalGeneration, "from_config",
+                Gemma4ForConditionalGeneration,
+                "from_config",
                 wraps=Gemma4ForConditionalGeneration.from_config,
             ) as mock_from_config:
                 model = Gemma4ForConditionalGeneration.from_pretrained(
-                    "gemma4/model", backend=backend,
+                    "gemma4/model",
+                    backend=backend,
                 )
                 assert isinstance(model, Gemma4ForConditionalGeneration)
                 mock_from_pretrained.assert_called_once_with("gemma4/model")

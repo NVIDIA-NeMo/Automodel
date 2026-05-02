@@ -182,6 +182,119 @@ class TestUtilityFunctions:
         assert _get_next_fallback_attn("0") == "eager"
 
 
+class TestPatchLegacyFlashAttnFlag:
+    """Bridge the legacy ``_supports_flash_attn_2`` flag to v5.5's ``_supports_flash_attn``.
+
+    transformers v5.5 renamed the FA2-support attribute and switched the dispatch
+    check to the new name only. Remote-code models pinned against <=v5.3 still set
+    the legacy flag; the patch installs a fallback property so they dispatch to FA2.
+    """
+
+    def test_installs_property_on_base(self):
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+        assert isinstance(mu.PreTrainedModel.__dict__["_supports_flash_attn"], property)
+
+    def test_is_idempotent(self):
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+        prop1 = mu.PreTrainedModel.__dict__["_supports_flash_attn"]
+        _patch_legacy_flash_attn_flag()
+        prop2 = mu.PreTrainedModel.__dict__["_supports_flash_attn"]
+        assert prop1 is prop2
+
+    def test_legacy_flag_bridged_to_true(self):
+        """Subclass with only ``_supports_flash_attn_2 = True`` resolves to True."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Legacy(mu.PreTrainedModel):
+            _supports_flash_attn_2 = True
+
+        assert _Legacy.__new__(_Legacy)._supports_flash_attn is True
+
+    def test_explicit_new_flag_true_wins(self):
+        """Subclass that sets ``_supports_flash_attn = True`` directly shadows the property."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Native(mu.PreTrainedModel):
+            _supports_flash_attn = True
+
+        assert _Native.__new__(_Native)._supports_flash_attn is True
+
+    def test_explicit_new_flag_false_wins_over_legacy_true(self):
+        """Explicit ``_supports_flash_attn = False`` shadows a legacy True."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Native(mu.PreTrainedModel):
+            _supports_flash_attn = False
+            _supports_flash_attn_2 = True
+
+        assert _Native.__new__(_Native)._supports_flash_attn is False
+
+    def test_neither_flag_falls_back_to_base_default(self):
+        """Subclass with neither flag falls back to the captured base default (False)."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Bare(mu.PreTrainedModel):
+            pass
+
+        assert _Bare.__new__(_Bare)._supports_flash_attn is False
+
+    def test_legacy_flag_false_does_not_bridge(self):
+        """Only ``_supports_flash_attn_2 is True`` bridges; False passes through."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _LegacyFalse(mu.PreTrainedModel):
+            _supports_flash_attn_2 = False
+
+        assert _LegacyFalse.__new__(_LegacyFalse)._supports_flash_attn is False
+
+    def test_nearest_subclass_wins_in_mro(self):
+        """In multi-level inheritance, the nearest ``_supports_flash_attn`` in MRO wins."""
+        import transformers.modeling_utils as mu
+
+        from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
+
+        _patch_legacy_flash_attn_flag()
+
+        class _Ancestor(mu.PreTrainedModel):
+            _supports_flash_attn_2 = True
+
+        class _Mid(_Ancestor):
+            _supports_flash_attn = False
+
+        class _Leaf(_Mid):
+            pass
+
+        assert _Leaf.__new__(_Leaf)._supports_flash_attn is False
+
+
 class DummyModel(torch.nn.Module):
     """A tiny nn.Module that behaves enough like a HF/BERT style model."""
 
@@ -1054,6 +1167,70 @@ class TestBuildModelRetryDepth:
         ):
             mock_init.side_effect = [
                 RuntimeError("Tensor.item() cannot be called on meta tensors"),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
+
+    def test_aten_equal_not_implemented_error_retries_without_meta_device(self):
+        """NotImplementedError for aten::equal on meta tensors triggers retry without meta device.
+
+        Reproduces the failure introduced by transformers >= 5.4.0 which added a
+        torch.equal() call inside tie_weights() (HF PR #44497). When the model is
+        initialised inside init_empty_weights() the tensors are on the meta device
+        and torch.equal() raises NotImplementedError.
+        """
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=2),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                NotImplementedError(
+                    "aten::equal: attempted to run this operator with Meta tensors, "
+                    "but there was no fake impl or Meta kernel registered."
+                ),
+                (False, sentinel_model),
+            ]
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+            assert result is sentinel_model
+            assert mock_init.call_count == 2
+
+    def test_meta_tensor_not_implemented_error_retries_without_meta_device_on_hf_path(self):
+        """HF meta init errors should retry even when Automodel did not pick meta init."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        dummy_manager_cls = type("DummyManager", (), {})
+        build_kwargs["model_wrapper"] = dummy_manager_cls()
+        with (
+            patch("nemo_automodel._transformers.auto_model.MegatronFSDPManager", dummy_manager_cls),
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.side_effect = [
+                NotImplementedError("Cannot copy out of meta tensor; no data!"),
                 (False, sentinel_model),
             ]
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)

@@ -99,6 +99,7 @@ def build_encoder_backbone(
     model_name_or_path: str,
     task: str,
     trust_remote_code: bool = False,
+    pooling: Optional[str] = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -113,6 +114,9 @@ def build_encoder_backbone(
         model_name_or_path: Path or HuggingFace Hub identifier.
         task: The encoder task (e.g. ``"embedding"``, ``"score"``).
         trust_remote_code: Whether to allow custom remote code.
+        pooling: Bi-encoder pooling strategy for registry backbones (e.g. Llama bidirectional)
+            that accept it on ``from_pretrained``. Must not be forwarded to standard HF models
+            (e.g. Qwen3) loaded via ``AutoModel``; those only receive ``**hf_kwargs``.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -126,6 +130,7 @@ def build_encoder_backbone(
     model_type = getattr(config, "model_type", "")
 
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+
     if task_map is not None:
         arch_name = task_map.get(task)
         if arch_name is None:
@@ -139,6 +144,8 @@ def build_encoder_backbone(
         BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
         logger.info(f"Using {arch_name} from registry")
 
+        if pooling is not None:
+            hf_kwargs["pooling"] = pooling
         return BidirectionalModelClass.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
@@ -190,9 +197,16 @@ _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
 }
+_MINISTRAL3_BIDIREC_TASKS = {
+    "embedding": "Ministral3BidirectionalModel",
+}
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
+    "ministral3": _MINISTRAL3_BIDIREC_TASKS,
+    "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
+    # Mistral3-VL Hub configs use top-level model_type "mistral3" (language is nested under text_config).
+    "mistral3": _MINISTRAL3_BIDIREC_TASKS,
 }
 
 

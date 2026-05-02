@@ -11,7 +11,7 @@ To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
-For other installation options (e.g., uv), please see our [Installation Guide](../../guides/installation.md).
+For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](../../guides/installation.md).
 
 ## Supported Models
 
@@ -28,6 +28,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Qwen / Alibaba Cloud | [Qwen3-Next](qwen/qwen3-next.md) | `Qwen3NextForCausalLM` |
 | DeepSeek | [DeepSeek](deepseek-ai/deepseek.md) | `DeepseekForCausalLM` |
 | DeepSeek | [DeepSeek-V3](deepseek-ai/deepseek-v3.md) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek V4 Flash](deepseek-ai/dsv4-flash.md) | `DeepseekV4ForCausalLM` |
 | Mistral AI | [Mistral](mistralai/mistral.md) | `MistralForCausalLM` |
 | Mistral AI | [Mixtral](mistralai/mixtral.md) | `MixtralForCausalLM` |
 | Mistral AI | [Ministral3 / Devstral](mistralai/ministral3.md) | `Mistral3ForConditionalGeneration` |
@@ -49,6 +50,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Allen AI | [OLMo2](allenai/olmo2.md) | `OLMo2ForCausalLM` |
 | Allen AI | [OLMoE](allenai/olmoe.md) | `OLMoEForCausalLM` |
 | OpenAI | [GPT-OSS](openai/gpt-oss.md) | `GptOssForCausalLM` |
+| OpenAI | [GPT-2](openai/gpt2.md) | `GPT2LMHeadModel` |
 | EleutherAI | [GPT-J](eleutherai/gpt-j.md) | `GPTJForCausalLM` |
 | EleutherAI | [GPT-NeoX / Pythia](eleutherai/gpt-neox.md) | `GPTNeoXForCausalLM` |
 | BigCode | [StarCoder](bigcode/starcoder.md) | `GPTBigCodeForCausalLM` |
@@ -69,6 +71,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Stability AI | [StableLM](stabilityai/stablelm.md) | `StableLmForCausalLM` |
 | Stepfun AI | [Step-3.5](stepfun-ai/step-3-5.md) | `Step3p5ForCausalLM` |
 | Parasail AI | [GritLM](parasail-ai/gritlm.md) | `GritLM` |
+| Tencent | [Hy3-preview](tencent/hy3.md) | `HYV3ForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
@@ -77,7 +80,7 @@ The models listed above can be fine-tuned using NeMo AutoModel. We support two p
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
 
-Please see our [Fine-Tuning Guide](../../guides/llm/finetune.md) to learn how to apply both methods to your data.
+See the [Fine-Tuning Guide](../../guides/llm/finetune.md) to learn how to apply both methods to your data.
 
 :::{tip}
 In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
@@ -95,6 +98,7 @@ qwen/qwen3-moe
 qwen/qwen3-next
 deepseek-ai/deepseek
 deepseek-ai/deepseek-v3
+deepseek-ai/dsv4-flash
 mistralai/mistral
 mistralai/mixtral
 mistralai/ministral3
@@ -116,6 +120,7 @@ allenai/olmo
 allenai/olmo2
 allenai/olmoe
 openai/gpt-oss
+openai/gpt2
 eleutherai/gpt-j
 eleutherai/gpt-neox
 bigcode/starcoder
@@ -136,4 +141,5 @@ orionstar/orion
 stabilityai/stablelm
 stepfun-ai/step-3-5
 parasail-ai/gritlm
+tencent/hy3
 ```

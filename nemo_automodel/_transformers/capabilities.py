@@ -78,9 +78,17 @@ def _has_backend(model: "nn.Module") -> bool:
 
 
 def _uses_te_attention(model: "nn.Module") -> bool:
-    """True when the model was constructed with the TE attention backend."""
+    """True when the model uses the TE attention backend.
+
+    Covers two cases:
+    - Custom models built with ``BackendConfig(attn='te')``.
+    - HF models that had TE injected via :func:`inject_te_attention`
+      (flagged by ``model._te_attention_injected``).
+    """
     backend = getattr(model, "backend", None)
-    return getattr(backend, "attn", None) == "te"
+    if getattr(backend, "attn", None) == "te":
+        return True
+    return getattr(model, "_te_attention_injected", False)
 
 
 def _is_hybrid(model: "nn.Module") -> bool:
@@ -215,7 +223,7 @@ class ModelSupports:
     @property
     def supports_gradient_checkpointing(self) -> bool:
         """Gradient checkpointing is supported."""
-        if self.supports_ep:
+        if self.supports_ep and self.ep_size > 1:
             return False
         for cls in type(self._model).__mro__:
             if "supports_gradient_checkpointing" in cls.__dict__:

@@ -81,7 +81,7 @@ See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuni
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large_moe_finetune.md).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
 
 ## Hugging Face Model Cards
 

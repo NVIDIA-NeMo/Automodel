@@ -114,3 +114,55 @@ def test_parse_args_and_load_config(monkeypatch):
         ("opt.lr", "<T:1e-4>"),
         ("seed", "<T:123>"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# parse_cli_argv / parse_args_and_load_config with explicit argv
+# ---------------------------------------------------------------------------
+def test_parse_cli_argv_with_explicit_argv():
+    """When argv is passed explicitly, sys.argv should be ignored."""
+    cfg_path, overrides = cli.parse_cli_argv(
+        default_cfg_path="default.yaml",
+        argv=["--step_scheduler.max_steps", "10", "--checkpoint.checkpoint_dir", "/tmp/ckpt"],
+    )
+    assert cfg_path == "default.yaml"
+    assert overrides == [
+        "step_scheduler.max_steps=10",
+        "checkpoint.checkpoint_dir=/tmp/ckpt",
+    ]
+
+
+def test_parse_cli_argv_explicit_argv_excludes_nproc():
+    """Simulates the automodel CLI passing extra args (without --nproc-per-node)."""
+    cfg_path, overrides = cli.parse_cli_argv(
+        default_cfg_path="/path/to/config.yaml",
+        argv=["--step_scheduler.max_steps", "10"],
+    )
+    assert cfg_path == "/path/to/config.yaml"
+    assert overrides == ["step_scheduler.max_steps=10"]
+    # nproc-per-node should NOT appear in overrides
+    assert not any("nproc" in o for o in overrides)
+
+
+def test_parse_cli_argv_explicit_empty_argv():
+    """Empty argv with default_cfg_path should return no overrides."""
+    cfg_path, overrides = cli.parse_cli_argv(
+        default_cfg_path="config.yaml",
+        argv=[],
+    )
+    assert cfg_path == "config.yaml"
+    assert overrides == []
+
+
+def test_parse_args_and_load_config_with_argv(monkeypatch):
+    """parse_args_and_load_config should respect explicit argv parameter."""
+    dummy_cfg = DummyConfig()
+    monkeypatch.setattr(cli, "load_yaml_config", lambda path: dummy_cfg, raising=True)
+    monkeypatch.setattr(cli, "translate_value", lambda s: f"<T:{s}>", raising=True)
+
+    returned_cfg = cli.parse_args_and_load_config(
+        default_cfg_path="cfg.yaml",
+        argv=["--opt.lr", "1e-4"],
+    )
+    assert returned_cfg is dummy_cfg
+    assert dummy_cfg._calls == [("opt.lr", "<T:1e-4>")]

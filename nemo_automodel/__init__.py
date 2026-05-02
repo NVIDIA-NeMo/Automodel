@@ -16,8 +16,20 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import sys
+import warnings
 from types import ModuleType
 from typing import Any
+
+# Pydantic v2 emits UnsupportedFieldAttributeWarning for Field(repr=...) /
+# Field(frozen=...) used inside 3.12-style `type` aliases in third-party libs.
+# Suppress early so any later import that triggers pydantic schema generation
+# (e.g. transformers, huggingface_hub) won't emit these warnings.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
 
 from .package_info import __package_name__, __version__
 
@@ -102,6 +114,23 @@ class _ModelsAliasFinder(importlib.abc.MetaPathFinder):
 
 
 sys.meta_path.insert(0, _ModelsAliasFinder())
+
+
+# ---------------------------------------------------------------------------
+# Register a lightweight import hook that widens ``ALLOWED_LAYER_TYPES`` the
+# moment ``transformers.configuration_utils`` is loaded. The hook module imports
+# only stdlib + logging, so it does NOT force a transformers import at
+# ``import nemo_automodel`` time — preserving the lightweight-import promise.
+# ---------------------------------------------------------------------------
+try:
+    from nemo_automodel._transformers.v4_patches.layer_types import (
+        install_layer_types_patch_hook as _install_layer_types_patch_hook,
+    )
+
+    _install_layer_types_patch_hook()
+except Exception:
+    # Never let a hook failure break ``import nemo_automodel``.
+    pass
 
 
 def __getattr__(name: str) -> ModuleType | Any:

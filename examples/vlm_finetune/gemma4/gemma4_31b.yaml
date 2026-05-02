@@ -40,10 +40,13 @@ model:
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
-  attn_implementation: sdpa
+  attn_implementation: eager
   # 31B does not using kv_shared layers (only used in 2B, 4B), hence use_cache: false.
   text_config:
     use_cache: false
+
+processor:
+  padding_side: right
 
 checkpoint:
   enabled: true
@@ -107,4 +110,5 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
-  recipe_owner: hemildesai
+  recipe_owner: athitten
+  time: "00:20:00"

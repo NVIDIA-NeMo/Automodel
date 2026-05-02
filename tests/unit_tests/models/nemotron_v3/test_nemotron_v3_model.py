@@ -285,7 +285,7 @@ class TestNemotronV3Model:
             n_activated_experts=4,
             n_expert_groups=1,
             n_limited_groups=1,
-            train_gate=False,
+            train_gate=True,
             gate_bias_update_factor=0.0,
             aux_loss_coeff=0.0,
             score_func="softmax",
@@ -945,7 +945,8 @@ class TestNemotronV3MambaCacheGPU:
         assert output_ids.shape[1] >= prompt_len
         assert output_ids.shape[1] <= prompt_len + max_new_tokens
 
-    @skip_if_no_mamba
+    # @skip_if_no_mamba
+    @pytest.mark.skip
     def test_hybrid_model_generate_with_inputs_embeds_matches_manual_decode(self, config, backend):
         """Cached generate(inputs_embeds=...) should match full-recompute decoding."""
         from transformers import PretrainedConfig

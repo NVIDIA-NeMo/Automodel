@@ -77,10 +77,6 @@ class Block(nn.Module):
             attn_out = self.linear_attn(
                 hidden_states=self.input_layernorm(x),
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                qkv_format=attn_kwargs.get("qkv_format"),
-                cu_seqlens=attn_kwargs.get("cu_seqlens"),
-                seq_index=attn_kwargs.get("seq_index"),
             )
         elif self.layer_type == "full_attention":
             attn_out = self.self_attn(
@@ -119,13 +115,22 @@ class Block(nn.Module):
 
 
 class Qwen3NextModel(nn.Module):
-    def __init__(self, config: Qwen3NextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3Next MoE config -> our MoE wrapper
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
@@ -147,6 +152,9 @@ class Qwen3NextModel(nn.Module):
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
@@ -259,7 +267,8 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         self.backend = backend or BackendConfig()
-        self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Qwen3NextModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3NextStateDictAdapter(

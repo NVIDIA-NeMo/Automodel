@@ -21,4 +21,3 @@ TEST_FILENAME = "L2_FusedLinearCrossEntropy_HiddenStates_Minified.sh"
 class TestFusedLinearCrossEntropyHiddenStatesMinified:
     def test_fused_linear_ce_hidden_states_minified(self):
         run_test_script(TEST_FOLDER, TEST_FILENAME)
-

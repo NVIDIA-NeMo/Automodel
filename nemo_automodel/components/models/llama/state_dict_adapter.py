@@ -12,23 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State dict adapter for Llama model with combined projections.
+"""State dict adapter for Llama model.
 
-Uses the generic CombinedProjectionStateDictAdapter from common/.
+The model uses separate q_proj / k_proj / v_proj / gate_proj / up_proj that match
+HuggingFace key names exactly, so the adapter is a passthrough (only tied-weight
+handling is applied in from_hf).
 """
+
+import logging
+import re
+from typing import Any, Optional
 
 from transformers import LlamaConfig
 
-from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
-    CombinedProjectionStateDictAdapter,
-)
+logger = logging.getLogger(__name__)
 
 
-class LlamaStateDictAdapter(CombinedProjectionStateDictAdapter):
+class LlamaStateDictAdapter:
     """State dict adapter for Llama models.
 
-    Inherits from the generic CombinedProjectionStateDictAdapter,
-    providing a clean interface specific to Llama.
+    Uses separate projections that match HuggingFace key names exactly, so
+    from_hf / to_hf are simple passthroughs (only tied-weight handling in
+    from_hf).
 
     Example:
         from transformers import LlamaConfig
@@ -45,4 +50,27 @@ class LlamaStateDictAdapter(CombinedProjectionStateDictAdapter):
 
     def __init__(self, config: LlamaConfig):
         """Initialize adapter with Llama config."""
-        super().__init__(config)
+        self.config = config
+
+    def from_hf(self, hf_state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
+        # HF keys match model keys directly.
+        # Only need to handle tied lm_head weights.
+        custom_state_dict = dict(hf_state_dict)
+        if getattr(self.config, "tie_word_embeddings", True):
+            embed_key = "model.embed_tokens.weight"
+            lm_head_key = "lm_head.weight"
+            if lm_head_key not in custom_state_dict and embed_key in custom_state_dict:
+                logger.info(f"Tying lm_head.weight to {embed_key} (HuggingFace checkpoint has tied weights)")
+                custom_state_dict[lm_head_key] = custom_state_dict[embed_key]
+        return custom_state_dict
+
+    def to_hf(
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: Optional[str] = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        # Model keys are already in HF format.
+        if exclude_key_regex is not None:
+            return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
+        return dict(state_dict)

@@ -20,6 +20,8 @@ from typing import Any, Literal, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard as _Shard
 
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_kernel import (
@@ -73,6 +75,12 @@ class PeftConfig:
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
         )
+
+
+def _extract_base_dtype(quantization_config, default_dtype=torch.bfloat16) -> torch.dtype:
+    if hasattr(quantization_config, "bnb_4bit_compute_dtype"):
+        return quantization_config.bnb_4bit_compute_dtype
+    return default_dtype
 
 
 class LinearLoRA(nn.Linear):
@@ -244,7 +252,21 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            res = F.linear(x, self.weight, bias)
+            # bmm avoids aten.view which cannot flatten a sharded dimension.
+            # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
+            # (sequence parallelism) or during AOT-autograd tracing with compile.
+            _x_needs_bmm = (
+                isinstance(x, DTensor)
+                and x.dim() == 3
+                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
+            )
+            if torch.compiler.is_compiling() or _x_needs_bmm:
+                b = x.shape[0]
+                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
+                if bias is not None:
+                    res = res + bias
+            else:
+                res = F.linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":
@@ -527,7 +549,7 @@ def apply_lora_to_linear_modules(
                 num_modules_matched += 1
                 lora_dtype = peft_config.lora_dtype
                 if quantization_config is not None and lora_dtype is None:
-                    lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+                    lora_dtype = _extract_base_dtype(quantization_config, torch.bfloat16)
 
                 # Compute effective LoRA rank for MoE modules
                 moe_dim = peft_config.dim
@@ -572,7 +594,7 @@ def apply_lora_to_linear_modules(
                 # For QLora, set lora_dtype to float16/bfloat16 since base weights are quantized
                 lora_dtype = peft_config.lora_dtype
                 if quantization_config is not None and lora_dtype is None:
-                    lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
+                    lora_dtype = _extract_base_dtype(quantization_config, torch.bfloat16)
 
                 patch_linear_module(
                     module,

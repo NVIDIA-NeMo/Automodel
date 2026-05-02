@@ -267,5 +267,43 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         return global_tensor
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        """Convert a single native tensor back to HF format (used by to_hf for non-expert keys)."""
+        """Convert a single native tensor back to HF format.
+
+        Handles per-tensor conversion for weight streaming (IPC refit) required in RL training:
+        - Router keys: moe.gate.{proj.weight,scale} -> router.{proj.weight,scale}
+        - Expert gate_and_up_projs: transpose [E, hidden, 2*inter] -> [E, 2*inter, hidden]
+          and rename to experts.gate_up_proj
+        - Expert down_projs: transpose [E, inter, hidden] -> [E, hidden, inter],
+          rename to experts.down_proj, and emit router.per_expert_scale as ones
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if exclude_key_regex and re.match(exclude_key_regex, fqn):
+            return []
+
+        # --- Router keys: moe.gate.{attr} -> router.{attr} ---
+        gate_match = re.search(r"(layers\.\d+)\.moe\.gate\.(proj\.weight|scale)$", fqn)
+        if gate_match:
+            layer_path = gate_match.group(1)
+            gate_attr = gate_match.group(2)
+            hf_key = fqn.replace(f"{layer_path}.moe.gate.{gate_attr}", f"{layer_path}.router.{gate_attr}")
+            return [(hf_key, tensor)]
+
+        # --- Expert: gate_and_up_projs -> experts.gate_up_proj (transposed) ---
+        if ".moe.experts.gate_and_up_projs" in fqn:
+            hf_key = fqn.replace(".moe.experts.gate_and_up_projs", ".experts.gate_up_proj")
+            return [(hf_key, tensor.transpose(-2, -1).contiguous())]
+
+        # --- Expert: down_projs -> experts.down_proj (transposed) + per_expert_scale ---
+        if ".moe.experts.down_projs" in fqn:
+            hf_key = fqn.replace(".moe.experts.down_projs", ".experts.down_proj")
+            transposed = tensor.transpose(-2, -1).contiguous()
+            layer_match = re.search(r"(.*layers\.\d+)\.", fqn)
+            scale_key = f"{layer_match.group(1)}.router.per_expert_scale"
+            n_experts = tensor.shape[0]
+            return [
+                (hf_key, transposed),
+                (scale_key, torch.ones(n_experts, dtype=tensor.dtype)),
+            ]
+
+        # --- Pass-through for all other keys ---
         return [(fqn, tensor)]

@@ -109,6 +109,21 @@ class TestCollateFnTextToImage:
             with pytest.raises(NotImplementedError, match="On-the-fly text encoding"):
                 collate_fn_text_to_image([{}, {}])
 
+    def test_prompt_embeds_only(self):
+        """Test collate with only prompt_embeds (Qwen-Image case, no clip_hidden or pooled)."""
+        prod_batch = _make_production_batch(has_prompt_embeds=True, has_clip_hidden=False)
+        # Remove pooled_prompt_embeds to simulate Qwen-Image cache
+        del prod_batch["pooled_prompt_embeds"]
+        with patch(
+            "nemo_automodel.components.datasets.diffusion.collate_fns.collate_fn_production",
+            return_value=prod_batch,
+        ):
+            result = collate_fn_text_to_image([{}, {}])
+
+        assert "text_embeddings" in result
+        assert "clip_hidden" not in result
+        assert "pooled_prompt_embeds" not in result
+
     def test_metadata_fields(self):
         prod_batch = _make_production_batch(has_prompt_embeds=True)
         with patch(

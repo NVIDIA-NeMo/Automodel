@@ -19,7 +19,7 @@ from typing import Iterable
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from nemo_automodel.components.models.common.utils import set_is_first_microbatch, set_is_optim_step
 
@@ -103,41 +103,55 @@ def _clip_grad_norm_impl(
             sharding_groups[key] = []
         sharding_groups[key].append(p)
 
-    # Compute norm for each sharding group
+    # Compute norm for each sharding group using a scalar-first reduction:
+    # sum(|g_local|^p) locally → single-scalar allreduce per Shard mesh dim.
+    # Going through torch.nn.utils.get_total_norm on DTensor grads would stack
+    # per-param scalar DTensors into a 1-D DTensor whose local length equals
+    # the number of local param tensors in the group. Under EP, that length
+    # can differ across ranks, and the vector_norm redistribute (Partial →
+    # Replicate) then allreduces with mismatched numel and hangs.
+    is_inf = math.isinf(norm_type)
     group_norms = []
     for group_params in sharding_groups.values():
-        grads = [p.grad for p in group_params]
-        group_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
-        group_norm = group_norm.float().to(target_device)
+        first = group_params[0]
+        is_dtensor = isinstance(first, DTensor)
+        # Partial placements can't be reduced via sum-of-local-norms; materialize
+        # those per-grad (each full_tensor() is a same-shape collective, safe).
+        has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
 
-        # Convert DTensor norms to regular tensors and ensure they're on the same device
-        if isinstance(group_norm, DTensor):
-            group_norm = group_norm.full_tensor()
+        local_val = torch.zeros((), dtype=torch.float32, device=target_device)
+        for p in group_params:
+            g = p.grad
+            if isinstance(g, DTensor):
+                g = g.full_tensor() if has_partial else g.to_local()
+            g = g.detach().float()
+            if is_inf:
+                local_val = torch.maximum(local_val, g.abs().max())
+            else:
+                local_val = local_val + g.abs().pow(norm_type).sum()
 
-        # Ensure the norm is a regular tensor by cloning and detaching
-        # This removes any DTensor metadata that might cause issues
-        group_norm = group_norm.clone().detach()
+        if is_dtensor and not has_partial:
+            mesh = first.device_mesh
+            op = torch.distributed.ReduceOp.MAX if is_inf else torch.distributed.ReduceOp.SUM
+            for dim_idx, pl in enumerate(first.placements):
+                if isinstance(pl, Replicate):
+                    continue
+                torch.distributed.all_reduce(local_val, op=op, group=mesh.get_group(mesh_dim=dim_idx))
 
-        group_norms.append(group_norm)
+        group_norms.append(local_val if is_inf else local_val.pow(1.0 / norm_type))
 
-    # Combine norms across groups
+    # Combine norms across groups (all rank-identical scalars, no comm)
     if len(group_norms) == 0:
         total_norm = torch.tensor(0.0, device=target_device)
     elif len(group_norms) == 1:
         total_norm = group_norms[0]
+    elif is_inf:
+        total_norm = torch.stack(group_norms).max()
     else:
-        # Ensure all group norms are on the same device (use the first one's device)
-        group_norms = [gn.to(target_device) if gn.device != target_device else gn for gn in group_norms]
-
-        if math.isinf(norm_type):
-            # For inf norm, take the maximum across groups
-            total_norm = torch.stack(group_norms).max()
-        else:
-            # For p-norm, combine as (sum of p-th powers)^(1/p)
-            total_norm = torch.tensor(0.0, device=target_device)
-            for gn in group_norms:
-                total_norm += gn**norm_type
-            total_norm = total_norm ** (1.0 / norm_type)
+        total_norm = torch.zeros((), dtype=torch.float32, device=target_device)
+        for gn in group_norms:
+            total_norm = total_norm + gn.pow(norm_type)
+        total_norm = total_norm.pow(1.0 / norm_type)
 
     total_norm = total_norm.float().to(target_device)
     # Reduce across pipeline parallel mesh if provided

@@ -10,7 +10,7 @@ To run omni models with NeMo AutoModel, use NeMo container version [`25.11.00`](
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
-For other installation options, see our [Installation Guide](../../guides/installation.md).
+For other installation options, see our [NeMo AutoModel Installation Guide](../../guides/installation.md).
 
 ## Supported Models
 
@@ -18,8 +18,9 @@ For other installation options, see our [Installation Guide](../../guides/instal
 |---|---|---|---|
 | Qwen / Alibaba Cloud | [Qwen3-Omni](qwen/qwen3-omni.md) | Text · Image · Audio · Video | `Qwen3OmniForConditionalGeneration` |
 | Microsoft | [Phi-4-multimodal](microsoft/phi4-multimodal.md) | Text · Image · Audio | `Phi4MultimodalForCausalLM` |
+| NVIDIA | [Nemotron-3-Nano-Omni](nvidia/nemotron-omni.md) | Text · Image · Audio | `NemotronH_Nano_Omni_Reasoning_V3` |
 
-## Fine-Tuning
+## Fine-Tune Omni Models
 
 All supported omni models can be fine-tuned using full SFT or PEFT (LoRA) approaches. See the [VLM Fine-Tuning Guide](../../guides/omni/gemma3-3n.md) for general setup instructions.
 
@@ -28,4 +29,5 @@ All supported omni models can be fine-tuned using full SFT or PEFT (LoRA) approa
 
 qwen/qwen3-omni
 microsoft/phi4-multimodal
+nvidia/nemotron-omni
 ```

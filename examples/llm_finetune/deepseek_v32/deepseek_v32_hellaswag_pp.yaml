@@ -133,3 +133,4 @@ ci:
   recipe_owner: hemildesai
   nodes: 32
   time: "00:30:00"
+  known_issue_id: AM-152

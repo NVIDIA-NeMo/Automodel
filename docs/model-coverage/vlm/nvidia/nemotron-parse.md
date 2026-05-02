@@ -27,9 +27,9 @@
 
 ## Example Recipes
 
-| Recipe | Dataset | Description |
-|---|---|---|
-| {download}`nemotron_parse_v1_1.yaml <../../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 |
+| Recipe | Dataset | Description | Try on Brev |
+|---|---|---|---|
+| {download}`nemotron_parse_v1_1.yaml <../../../../examples/vlm_finetune/nemotron/nemotron_parse_v1_1.yaml>` | cord-v2 | SFT — Nemotron-Parse on CORD-v2 | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM) |
 
 
 ## Try with NeMo AutoModel
@@ -78,9 +78,13 @@ automodel --nproc-per-node=8 examples/vlm_finetune/nemotron/nemotron_parse_v1_1.
 
 See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
-## Fine-Tuning
+## Fine-Tuning Tutorial on Brev
 
-See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+Launch the end-to-end Nemotron Parse fine-tuning tutorial on Brev with a single click:
+
+[![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3C6LDKU2DfOvpVTFhjw3YQ4djPM)
+
+See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/nemotron-parse/finetune.ipynb) and the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 

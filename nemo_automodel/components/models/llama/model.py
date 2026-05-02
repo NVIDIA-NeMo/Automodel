@@ -14,8 +14,8 @@
 
 """Custom Llama model implementation for NeMo Automodel.
 
-This module provides a self-contained Llama implementation with combined QKV and gate_up projections
-for improved efficiency. Following HuggingFace's implementation with optimizations.
+This module provides a self-contained Llama implementation following HuggingFace's
+implementation. Uses separate q_proj/k_proj/v_proj and gate_proj/up_proj (HF-style).
 
 Example (YAML):
 
@@ -46,25 +46,32 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    CombinedGateUpMLP,
-    CombinedQKVAttentionMixin,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding, apply_rotary_pos_emb
+from nemo_automodel.components.models.llama.rope_utils import (
+    LlamaRotaryEmbedding,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_fused,
+)
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 check_model_inputs = get_check_model_inputs_decorator()
 
 
-class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper with combined QKV projection."""
+class LlamaAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper.
+
+    Uses separate q_proj / k_proj / v_proj -- identical to the default
+    HuggingFace Llama implementation.
+    """
 
     def __init__(
         self,
         config: LlamaConfig,
         layer_idx: int,
+        backend: Optional["BackendConfig"] = None,
     ):
         super().__init__()
         self.config = config
@@ -74,14 +81,17 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.rope_fusion = getattr(backend, "rope_fusion", False)
 
-        # Combined QKV projection for improved efficiency
-        self.setup_qkv_projection(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=self.head_dim,
-            bias=config.attention_bias,
+        # Separate projections -- same layout as HuggingFace default Llama
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
 
         self.o_proj = nn.Linear(
@@ -100,15 +110,20 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # Compute Q, K, V using mixin (handles fused or separate projection)
-        q, k, v = self.compute_qkv(hidden_states)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.rope_fusion and len(position_embeddings) == 3:
+            cos, sin, freqs_cis = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, freqs_cis)
+        else:
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # Handle past_key_values if provided (for generation)
         if past_key_values is not None:
@@ -138,30 +153,21 @@ class LlamaAttention(CombinedQKVAttentionMixin, nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    """SwiGLU MLP with combined gate_up projection for efficiency."""
+    """SwiGLU MLP with separate gate_proj and up_proj -- identical to HuggingFace default."""
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-
-        # Combined gate and up projections
-        self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         from transformers.activations import ACT2FN
 
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Project and split into gate and up
-        gate_up = self.gate_up_proj(x)
-        # Handle tensor parallelism: split based on actual tensor size
-        gate_up_size = gate_up.shape[-1]
-        local_intermediate_size = gate_up_size // 2
-        gate, up = gate_up.split([local_intermediate_size, local_intermediate_size], dim=-1)
-
-        return self.down_proj(self.act_fn(gate) * up)
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
@@ -182,10 +188,10 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = LlamaAttention(
             config=config,
             layer_idx=layer_idx,
+            backend=backend,
         )
 
-        # ALWAYS use combined gate_up MLP for efficiency
-        self.mlp = CombinedGateUpMLP(config=config)
+        self.mlp = LlamaMLP(config=config)
 
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
@@ -277,7 +283,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.norm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
         )
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config, rope_fusion=backend.rope_fusion)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -331,7 +337,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # Create proper causal mask (matches HuggingFace implementation)
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
@@ -421,7 +427,6 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             print(f"[LlamaForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print("[LlamaForCausalLM] Custom implementation with COMBINED QKV and gate_up projections")
             print(f"[LlamaForCausalLM] torch_dtype: {self.config.torch_dtype}")
 
     def get_input_embeddings(self):

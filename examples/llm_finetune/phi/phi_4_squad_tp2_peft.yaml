@@ -39,7 +39,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -103,3 +103,4 @@ optimizer:
 
 ci:
   recipe_owner: akoumpa
+  time: "00:15:00"

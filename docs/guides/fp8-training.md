@@ -1,4 +1,4 @@
-# FP8 Training in NeMo AutoModel
+# FP8 Training
 
 NeMo AutoModel supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
 

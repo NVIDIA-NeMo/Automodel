@@ -1,0 +1,5 @@
+peft
+pytest
+pyyaml
+# Required by Nemotron-Flash modeling code loaded via trust_remote_code
+flash-linear-attention

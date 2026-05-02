@@ -15,6 +15,7 @@
 
 import pytest
 import torch
+from transformers.cache_utils import DynamicCache
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.baichuan.model import (
@@ -481,6 +482,33 @@ class TestPrepareInputsForGeneration:
         inputs = model.prepare_inputs_for_generation(input_ids, inputs_embeds=embeds)
         assert "inputs_embeds" in inputs
         assert "input_ids" not in inputs
+
+
+class TestDynamicCacheCompat:
+    """Regression test for DynamicCache incompatibility (baichuan_2_7b_squad_vllm_deploy)."""
+
+    def test_forward_with_dynamic_cache(self):
+        cfg = _tiny_config(use_cache=True)
+        model = BaichuanModel(cfg)
+        model.eval()
+        bsz, seq_len = 1, 4
+        input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq_len))
+
+        # First forward to populate cache
+        with torch.no_grad():
+            out = model(input_ids=input_ids, use_cache=True)
+        legacy_cache = out.past_key_values
+
+        # Convert legacy cache to DynamicCache (simulates what GenerationMixin does)
+        dynamic_cache = DynamicCache()
+        for layer_idx, (key, value) in enumerate(legacy_cache):
+            dynamic_cache.update(key, value, layer_idx)
+
+        # Second forward with DynamicCache — this was the failing path
+        next_token = torch.randint(0, cfg.vocab_size, (bsz, 1))
+        with torch.no_grad():
+            out2 = model(input_ids=next_token, past_key_values=dynamic_cache, use_cache=True)
+        assert out2.last_hidden_state.shape == (bsz, 1, cfg.hidden_size)
 
 
 class TestReorderCache:

@@ -87,6 +87,15 @@ def test_masked_cross_entropy_gpu():
     assert loss_gpu is not None
 
 
+def test_masked_cross_entropy_zero_label_tokens_no_nan():
+    """Loss must be exactly 0.0 (not NaN) when num_label_tokens=0 (empty supervision)."""
+    logits = torch.randn(2, 10, 1000)
+    labels = torch.full((2, 10), -100, dtype=torch.long)
+    loss = MaskedCrossEntropy(reduction="sum")(logits, labels, num_label_tokens=0)
+    assert not torch.isnan(loss), "Loss should not be NaN when num_label_tokens=0"
+    assert loss.item() == 0.0, f"Loss should be 0.0 when num_label_tokens=0, got {loss.item()}"
+
+
 def test_masked_cross_entropy_num_label_tokens_normalization():
     """Ensure that the loss is divided by ``num_label_tokens`` when provided."""
 
@@ -106,9 +115,7 @@ def test_masked_cross_entropy_num_label_tokens_normalization():
     expected_loss = loss_sum / num_label_tokens
 
     # Loss from ChunkedCrossEntropy with num_label_tokens specified
-    loss_masked = MaskedCrossEntropy()(
-        logits, targets, num_label_tokens=num_label_tokens
-    )
+    loss_masked = MaskedCrossEntropy()(logits, targets, num_label_tokens=num_label_tokens)
 
     assert torch.allclose(loss_masked, expected_loss, atol=1e-6), (
         f"Expected normalized loss {expected_loss.item()}, but got {loss_masked.item()}."

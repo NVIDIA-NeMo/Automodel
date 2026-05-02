@@ -135,5 +135,3 @@ def test_main_raises_if_missing_metadata(tmp_path, monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         script.main()
-
-

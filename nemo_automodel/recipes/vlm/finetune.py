@@ -14,6 +14,17 @@
 
 from __future__ import annotations
 
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
 import logging
 import pathlib
 import time
@@ -212,14 +223,20 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         save_consolidated=True,
         is_peft=is_peft,
     )
+    user_cfg = {}
     if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        user_cfg = cfg_ckpt.to_dict()
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
         )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
 
@@ -245,19 +262,34 @@ def _chunk_vlm_media(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Split VLM pixel_values and image_grid into PP microbatch chunks.
 
-    Handles three layouts:
+    Handles four layouts:
     1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
-    2. Flat patches ``[total_patches, D]`` with per-sample image counts from
+    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
+    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
        ``n_images_per_sample`` (general case, works for packed sequences too).
-    3. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
+    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
     """
     n_images = image_grid.shape[0]
     pixel_values_chunks: list[torch.Tensor] = []
     image_grid_chunks: list[torch.Tensor] = []
 
-    if pixel_values.dim() == 4 and pixel_values.shape[0] == batch_size:
+    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
+        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
+        # Both are indexed by image along dim 0, one entry per sample.
         pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
         image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
+    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
+        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
+        # All images are padded to the same max_patches, so split by image count directly.
+        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
+        samples_per_mb = batch_size // n_microbatches
+        for mb_idx in range(n_microbatches):
+            s_start = mb_idx * samples_per_mb
+            s_end = min(s_start + samples_per_mb, batch_size)
+            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
+            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
+            pixel_values_chunks.append(pixel_values[img_start:img_end])
+            image_grid_chunks.append(image_grid[img_start:img_end])
     elif n_images_per_sample is not None:
         # General case: use per-sample image counts to associate images with
         # batch items.  Works for packed sequences (multiple images per item).
@@ -366,9 +398,28 @@ def build_dataloader(
                 try:
                     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
                 except Exception as e:
-                    # Some models do not provide an AutoProcessor
-                    processor = None
-                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+                    # AutoProcessor.from_pretrained internally loads AutoConfig. Configs
+                    # whose layer_types length differs from num_hidden_layers trip
+                    # validate_layer_type. The processor itself doesn't depend on
+                    # layer_types, so relax the validator and retry once before giving up.
+                    err = str(e)
+                    if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                        from nemo_automodel._transformers.v4_patches.layer_types import (
+                            relax_layer_types_validator,
+                        )
+
+                        relax_layer_types_validator()
+                        try:
+                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                        except Exception as retry_exc:
+                            processor = None
+                            logging.warning(
+                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
+                            )
+                    else:
+                        # Some models do not provide an AutoProcessor
+                        processor = None
+                        logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
             chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
             # Update chat_template if chat_template is given
@@ -376,7 +427,11 @@ def build_dataloader(
                 processor.chat_template = _resolve_chat_template(chat_template_raw)
                 processor.tokenizer.chat_template = processor.chat_template
 
-            ds = cfg_ds.instantiate(path_or_dataset=cfg_ds.path_or_dataset)
+            _path_or_ds = getattr(cfg_ds, "path_or_dataset", None) or cfg_ds.get("path_or_dataset", None)
+            if _path_or_ds is not None:
+                ds = cfg_ds.instantiate(path_or_dataset=_path_or_ds)
+            else:
+                ds = cfg_ds.instantiate()
 
         # Resolve packing config: top-level packed_sequence (LLM-style) takes
         # precedence over legacy dataset.packing (backward compat).
@@ -389,15 +444,16 @@ def build_dataloader(
             _legacy = cfg_ds.get("packing", None)
             _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
             packing_cfg = _legacy if _ps_enabled else None
-            pretokenize = cfg_ds.get("pretokenize", False)
             max_length = cfg_ds.get("max_length", None)
+            pretokenize = cfg_ds.get("pretokenize", max_length is not None)
 
         if pretokenize:
             from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
             from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
             ds_raw = ds
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length)
+            truncate = cfg_ds.get("truncate", max_length is not None)
+            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -408,7 +464,7 @@ def build_dataloader(
                     ds,
                     pack_size=packing_cfg.get("pack_size", max_length),
                     padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
-                    drop_long_samples=packing_cfg.get("drop_long_samples", False),
+                    drop_long_samples=packing_cfg.get("drop_long_samples", True),
                     max_packs=packing_cfg.get("max_packs", None),
                     ds_raw=ds_raw,
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
@@ -422,8 +478,8 @@ def build_dataloader(
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
 
-                collate_fn = (
-                    lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: neat_packed_vlm_collater(
+                collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: (
+                    neat_packed_vlm_collater(
                         examples,
                         padding_idx=_pi,
                         max_length=_ml,
@@ -835,33 +891,39 @@ class FinetuneRecipeForVLM(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batch_idx, batches in enumerate(self.step_scheduler):
-                log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # log
-                self.log_train_metrics(log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batch_idx, batches in enumerate(self.step_scheduler):
+                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # log
+                    self.log_train_metrics(log_data)
+                    self._update_progress_bar(pbar, log_data.metrics)
 
-                val_loss = {}
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        val_log_data = self._run_validation_epoch(self.val_dataloader)
-                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_log_data)
-                    for mp in self.model_parts:
-                        mp.train()
+                    val_loss = {}
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        if self.pp_enabled:
+                            logger.warning("Validation is not supported for pipeline parallelism")
+                        else:
+                            val_log_data = self._run_validation_epoch(self.val_dataloader)
+                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_log_data)
+                        for mp in self.model_parts:
+                            mp.train()
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        log_data.metrics["loss"],
-                        val_loss,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            log_data.metrics["loss"],
+                            val_loss,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -906,6 +968,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # VLM: Custom chunking for pixel_values and image_grid
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
@@ -914,11 +977,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 image_grid_hws = batch.pop("image_grid_hws", None)
                 image_grid_thw = batch.pop("image_grid_thw", None)
                 image_sizes = batch.pop("image_sizes", None)
+                image_position_ids = batch.pop("image_position_ids", None)
                 n_images_per_sample = batch.pop("n_images_per_sample", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
                 if image_grid is None and image_sizes is not None:
                     image_grid = image_sizes
+                if image_grid is None and image_position_ids is not None:
+                    image_grid = image_position_ids
 
                 if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
                     stage0_model = self.model_parts[0]
@@ -1098,7 +1164,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
             reporting_loss = reporting_loss.float().to(self.dist_env.device)
             # Send loss to first rank from the last PP stage of rank0's mesh coords.
             # This avoids picking a global-rank sender from a different EP/PP group.

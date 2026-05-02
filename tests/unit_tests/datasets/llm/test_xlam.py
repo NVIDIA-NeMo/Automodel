@@ -132,6 +132,12 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
         def __init__(self, items):
             self.items = items
             self.map_calls = []
+        
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+        def __len__(self):
+            return len(self.items)
 
         def map(self, fn, batched=False, remove_columns=None):
             self.map_calls.append({"batched": batched, "remove_columns": remove_columns})
@@ -148,7 +154,7 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
     monkeypatch.setattr(xlam, "_add_pad_token", lambda tok: 13)
 
     fmt_calls = []
-
+    
     def fake_format_example(example, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation):
         fmt_calls.append(
             {
@@ -181,8 +187,5 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
     )
 
     assert dataset_calls == {"name": "dummy", "split": "train[:2]"}
-    assert result == [{"formatted": 0}, {"formatted": 1}]
-    assert dummy_ds.map_calls[0]["batched"] is False
-    assert dummy_ds.map_calls[0]["remove_columns"] == ["id", "query", "answers", "tools"]
+    assert list(result) == [{"formatted": 0}, {"formatted": 1}]
     assert fmt_calls[0]["pad"] == 13 and fmt_calls[0]["eos"] == tok.eos_token_id
-

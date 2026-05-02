@@ -119,5 +119,3 @@ def test_redact_does_not_touch_non_sensitive_keys():
     data = {"email": "a@b.com", "profile": {"city": "nyc"}}
     redacted = loader._redact(data)
     assert redacted == {"email": "a@b.com", "profile": {"city": "nyc"}}
-
-

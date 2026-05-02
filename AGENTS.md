@@ -33,6 +33,21 @@ hand.
 
 ---
 
+## Git & PR conventions
+
+- **Branch names** use the format `<github-handle>/<type>/<short-desc>`
+  (e.g. `jdoe/fix/rope-scaling`).
+- **Commit messages** follow [Conventional Commits](https://www.conventionalcommits.org/):
+  `type(scope)?: description` — e.g. `fix(ci): retry apt-get on mirror failures`.
+- **PR titles** must match the same format. The CI `Validate PR title` check
+  enforces this; a non-conforming title will fail the check.
+  Valid types: `feat` `fix` `docs` `style` `refactor` `perf` `test` `build`
+  `ci` `chore` `revert` `cp`. Title must be ≤ 80 characters.
+- **Never** use bracket-prefixed styles such as `[ci] fix: …` — those will
+  fail validation.
+
+---
+
 ## Architecture Overview
 
 ```

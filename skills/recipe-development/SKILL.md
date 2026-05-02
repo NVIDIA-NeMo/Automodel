@@ -1,3 +1,8 @@
+---
+name: recipe-development
+description: Create and modify NeMo AutoModel training and evaluation recipes, including YAML structure, builders, and execution flow.
+---
+
 # NeMo AutoModel Recipe Development
 
 ## Recipe Architecture

@@ -43,7 +43,11 @@ def _infer_vocab_size(model_cfg):
     from transformers import AutoConfig
 
     config_section = model_cfg.config
-    trust_remote_code = getattr(config_section, "trust_remote_code", False)
+    # Recipes may set trust_remote_code either at the model level (nemo_automodel
+    # convention) or nested under `config` -- accept either.
+    trust_remote_code = getattr(model_cfg, "trust_remote_code", False) or getattr(
+        config_section, "trust_remote_code", False
+    )
 
     # Use the config's _target_ if it's a custom config class (e.g. DeepseekV32Config)
     config_target = getattr(config_section, "_target_", None)
@@ -52,7 +56,13 @@ def _infer_vocab_size(model_cfg):
     if config_target is not None and callable(config_target):
         target_name = getattr(config_target, "__qualname__", "")
         if "AutoConfig" not in target_name:
-            model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
+            if hasattr(config_target, "from_pretrained"):
+                # `_target_` resolved to a config class; call its classmethod.
+                model_config = config_target.from_pretrained(config_section.pretrained_model_name_or_path)
+            else:
+                # `_target_` already resolved to the factory itself
+                # (e.g. `DeepseekV32Config.from_pretrained`); invoke it directly.
+                model_config = config_target(config_section.pretrained_model_name_or_path)
     elif isinstance(config_target, str) and "AutoConfig" not in config_target:
         import importlib
 

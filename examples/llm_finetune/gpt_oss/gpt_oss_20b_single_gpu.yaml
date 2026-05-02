@@ -18,7 +18,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 32
+  local_batch_size: 16
   ckpt_every_steps: 50
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 2
@@ -97,3 +97,5 @@ optimizer:
 
 ci:
   recipe_owner: akoumpa
+  nproc_per_node: 1
+  known_issue_id: AM-159

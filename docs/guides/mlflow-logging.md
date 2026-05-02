@@ -1,4 +1,4 @@
-# MLflow Logging in NeMo AutoModel
+# MLflow Logging
 
 ## Introduction
 

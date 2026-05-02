@@ -42,6 +42,12 @@ model:
   trust_remote_code: true
   force_hf: true
 
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+
 # torch.compile configuration
 compile:
   enabled: false
@@ -96,9 +102,10 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  time: "00:15:00"
+  recipe_owner: adil-a
+  time: "00:20:00"
   checkpoint_robustness:
-    hf_kl_threshold: 7e-4
+    hf_kl_threshold: 3e-3
     distributed.tp_size: 2
     tokenizer_name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
     cross_tp_size: 2

@@ -1,4 +1,4 @@
-# Knowledge Distillation with NeMo AutoModel
+# Knowledge Distillation
 
 This guide walks through fine-tuning a **student** LLM with the help of a
 larger **teacher** model using the `kd` (knowledge distillation) recipe.
@@ -87,7 +87,7 @@ distributed:
 # PEFT can be enabled by uncommenting below – student weights will remain small
 # peft:
 #   _target_: nemo_automodel.components._peft.lora.PeftConfig
-#   match_all_linear: true
+#   target_modules: '*_proj'
 #   dim: 16
 #   alpha: 32
 #   use_triton: true

@@ -1,4 +1,4 @@
-# Checkpointing in NeMo Automodel
+# Checkpointing
 
 ## Introduction
 

@@ -312,6 +312,11 @@ class GroupedExperts(nn.Module):
             else None
         )
 
+        # Match activation dtype for grouped_mm; covers the case where FSDP2's
+        # MixedPrecisionPolicy does not reach EP DTensors.
+        gate_and_up_projs = gate_and_up_projs.to(x.dtype)
+        down_projs = down_projs.to(x.dtype)
+
         # EP variable-length all-gather
         if ep_size > 1:
             ep_group = ep_mesh.get_group()
@@ -541,8 +546,36 @@ def relu2_deepep(x, permuted_probs):
     return (inter * permuted_probs).to(x.dtype)
 
 
+@torch.compile(fullgraph=True, options={"max_autotune": True})
+def swiglu_clamped_deepep(x, permuted_probs, limit: float):
+    """Clamped SwiGLU (DeepSeek V4 style) for DeepEP.
+
+    Gate is clamped at ``max=limit`` and up at ``(-limit, +limit)`` in FP32
+    before ``silu(gate) * up``; the result is multiplied by the permuted
+    routing probs and cast back.  Matches the official V4 Expert.forward::
+
+        gate = self.w1(x).float()
+        up   = self.w3(x).float()
+        if self.swiglu_limit > 0:
+            up   = torch.clamp(up,   min=-swiglu_limit, max=swiglu_limit)
+            gate = torch.clamp(gate,                     max=swiglu_limit)
+        y = F.silu(gate) * up
+
+    ``x`` has shape ``[..., 2 * inter_dim]`` with gate in the first half
+    and up in the second half (same layout as ``weighted_bias_swiglu_impl``).
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = gate.float().clamp(max=limit)
+    up = up.float().clamp(min=-limit, max=limit)
+    inter = F.silu(gate) * up
+    return (inter * permuted_probs).to(x.dtype)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     if config.expert_activation == "swiglu":
+        # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
+        if getattr(config, "swiglu_limit", 0.0) > 0.0:
+            return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "quick_geglu":
         return partial(
@@ -687,6 +720,10 @@ class GroupedExpertsDeepEP(nn.Module):
 
         gate_and_up_projs = self.gate_and_up_projs.to_local()
         down_projs = self.down_projs.to_local()
+
+        # Match activation dtype for grouped_mm; see GroupedExperts.forward.
+        gate_and_up_projs = gate_and_up_projs.to(permuted_local_hidden_states.dtype)
+        down_projs = down_projs.to(permuted_local_hidden_states.dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:

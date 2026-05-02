@@ -39,10 +39,16 @@ class TextToImageDataset(BaseMultiresolutionDataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Load a single sample."""
         item = self.metadata[idx]
-        cache_file = Path(item["cache_file"])
+        cache_file = Path(item["cache_file"]).resolve()
+        cache_dir = Path(self.cache_dir).resolve()
+
+        try:
+            cache_file.relative_to(cache_dir)
+        except ValueError as e:
+            raise ValueError(f"Cache file {cache_file} is outside cache directory {cache_dir}") from e
 
         # Load cached data
-        data = torch.load(cache_file, map_location="cpu")
+        data = torch.load(cache_file, map_location="cpu", weights_only=True)
 
         # Prepare output - support both bucket_resolution and crop_resolution keys
         resolution_key = "bucket_resolution" if "bucket_resolution" in item else "crop_resolution"
@@ -61,8 +67,12 @@ class TextToImageDataset(BaseMultiresolutionDataset):
             output["clip_tokens"] = data["clip_tokens"].squeeze(0)
             output["t5_tokens"] = data["t5_tokens"].squeeze(0)
         else:
-            output["clip_hidden"] = data["clip_hidden"].squeeze(0)
-            output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
-            output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
+            # Model-agnostic: include whichever text embedding keys the cache provides
+            if "clip_hidden" in data:
+                output["clip_hidden"] = data["clip_hidden"].squeeze(0)
+            if "pooled_prompt_embeds" in data:
+                output["pooled_prompt_embeds"] = data["pooled_prompt_embeds"].squeeze(0)
+            if "prompt_embeds" in data:
+                output["prompt_embeds"] = data["prompt_embeds"].squeeze(0)
 
         return output

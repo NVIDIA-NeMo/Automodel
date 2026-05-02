@@ -76,22 +76,17 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         # Reverse mapping for to_hf conversion
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items() if v is not None}
 
-    # replace _apply_key_mapping with leaf-aware replacement
+    # replace _apply_key_mapping with leaf-aware in-place replacement
     def _apply_key_mapping(self, state_dict: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
-        keys_to_remove = set()
-        new_state_dict = {}
-        for key, value in state_dict.items():
+        for key in list(state_dict.keys()):
             new_key = key
             for pattern, replacement in mapping.items():
                 if replacement is not None and key.endswith(pattern):
                     new_key = key[: -len(pattern)] + replacement
                     break
-            new_state_dict[new_key] = value
-            keys_to_remove.add(key)
-
-        for key in keys_to_remove:
-            del state_dict[key]
-        return new_state_dict
+            if new_key != key:
+                state_dict[new_key] = state_dict.pop(key)
+        return state_dict
 
     def _dequantize_block_scale_tensors(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         layer_name_to_quantized_weights = defaultdict(dict)
@@ -181,17 +176,18 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         out = out.transpose(1, 2).contiguous()
         # Restore desired DTensor sharding: shard experts (dim 0) by 'ep' and hidden dim (dim 2) by 'ep_shard'.
         if isinstance(out, torch.distributed.tensor.DTensor):
-            placements = []
             mesh_dim_names = out.device_mesh.mesh_dim_names
-            for dim_name in mesh_dim_names:
-                if dim_name == "ep":
-                    placements.append(torch.distributed.tensor.Shard(0))
-                elif dim_name == "ep_shard":
-                    placements.append(torch.distributed.tensor.Shard(2))
-                else:
-                    raise ValueError(f"Unexpected dimension name: {dim_name}")
-            if placements != out.placements:
-                out = out.redistribute(placements=tuple(placements))
+            if "ep" in mesh_dim_names or "ep_shard" in mesh_dim_names:
+                placements = []
+                for dim_name in mesh_dim_names:
+                    if dim_name == "ep":
+                        placements.append(torch.distributed.tensor.Shard(0))
+                    elif dim_name == "ep_shard":
+                        placements.append(torch.distributed.tensor.Shard(2))
+                    else:
+                        placements.append(torch.distributed.tensor.Replicate())
+                if placements != out.placements:
+                    out = out.redistribute(placements=tuple(placements))
         return out
 
     def to_hf(
@@ -214,9 +210,12 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         device_mesh: Optional["DeviceMesh"] = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Convert HF checkpoint to native format.
+        """Convert HF checkpoint to native format in-place.
         - Apply key mappings from HF to internal format
-        - Add quantization block and scale tensors
+        - Dequantize block/scale tensors (freeing originals)
+
+        Operates in-place on the input dict to avoid allocating a full copy,
+        reducing peak memory from 2x to ~1x model size.
         """
         # Detect model prefix usage
         for key in hf_state_dict.keys():
@@ -224,11 +223,10 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 self._uses_model_prefix = True
                 break
 
-        native_state_dict = dict(hf_state_dict)
-        native_state_dict = self._dequantize_block_scale_tensors(native_state_dict)
-        native_state_dict = self._apply_key_mapping(native_state_dict, self.hf_to_internal_map)
+        self._dequantize_block_scale_tensors(hf_state_dict)
+        self._apply_key_mapping(hf_state_dict, self.hf_to_internal_map)
 
-        return native_state_dict
+        return hf_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         """Convert a single tensor from native format to HuggingFace format.

@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -346,6 +348,20 @@ def test_get_pad_token_from_key(val, expected):
 )
 def test_make_attention_mask_from_labels(ids, expected):
     assert sftp.make_attention_mask_from_labels(ids) == expected
+
+
+def test_create_causal_mask_mapping_uses_inputs_embeds_keyword() -> None:
+    """Mask creation must use the Transformers 5.3+ inputs_embeds keyword."""
+    with patch.object(sftp, "create_causal_mask", return_value="full_attention") as mock_create_causal:
+        mapping = sftp.create_causal_mask_mapping(
+            model_config=SimpleNamespace(),
+            batch_size=2,
+            seq_len=4,
+        )
+
+    assert mapping == {"full_attention": "full_attention"}
+    assert "inputs_embeds" in mock_create_causal.call_args.kwargs
+    assert "input_embeds" not in mock_create_causal.call_args.kwargs
 
 
 class TestPackedSequenceTHDCollater:
