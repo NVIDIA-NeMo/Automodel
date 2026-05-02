@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.utils import default_collater
 
 # Skip decorator for tests that require CUDA
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1520,6 +1521,110 @@ def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
     # Invoke the chained collate to verify ordering
     chained_fn(["dummy_batch"])
     assert call_order == ["base", "masks"]
+
+
+def test_build_dataloader_strips_padding_mask_for_unsupported_model():
+    """Default collater output should drop padding_mask when model.forward cannot accept it."""
+
+    class ModelWithoutPaddingMask(nn.Module):
+        def forward(self, input_ids, attention_mask=None):
+            return input_ids
+
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+            "collate_fn": default_collater,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({})
+
+    build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=2,
+        global_batch_size=4,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        model=ModelWithoutPaddingMask(),
+    )
+
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    collate_fn = getattr(mod.dl_factory_capture, "captured")["collate_fn"]
+    batch = collate_fn(
+        [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [1, 2], "loss_mask": [1, 1]},
+            {"input_ids": [3], "attention_mask": [1], "labels": [3], "loss_mask": [1]},
+        ]
+    )
+
+    assert "padding_mask" not in batch
+
+
+def test_build_dataloader_keeps_padding_mask_for_supported_model():
+    """Default collater output should preserve padding_mask when model.forward supports it."""
+
+    class ModelWithPaddingMask(nn.Module):
+        def forward(self, input_ids, attention_mask=None, padding_mask=None):
+            return input_ids
+
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+            "collate_fn": default_collater,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({})
+
+    build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=2,
+        global_batch_size=4,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        model=ModelWithPaddingMask(),
+    )
+
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    collate_fn = getattr(mod.dl_factory_capture, "captured")["collate_fn"]
+    batch = collate_fn(
+        [
+            {"input_ids": [1, 2], "attention_mask": [1, 1], "labels": [1, 2], "loss_mask": [1, 1]},
+            {"input_ids": [3], "attention_mask": [1], "labels": [3], "loss_mask": [1]},
+        ]
+    )
+
+    assert "padding_mask" in batch
 
 
 @pytest.mark.parametrize(

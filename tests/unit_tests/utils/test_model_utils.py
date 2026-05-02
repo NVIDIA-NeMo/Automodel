@@ -422,6 +422,27 @@ def test_non_phi4mm_use_cache_unchanged():
 
 
 class TestFilterForwardKwargs:
+    def test_supports_padding_mask_when_explicit(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, padding_mask=None):
+                return input_ids
+
+        assert model_utils._supports_padding_mask(Model()) is True
+
+    def test_supports_padding_mask_when_var_keyword(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return input_ids
+
+        assert model_utils._supports_padding_mask(Model()) is True
+
+    def test_does_not_support_padding_mask_when_missing(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, attention_mask=None):
+                return input_ids
+
+        assert model_utils._supports_padding_mask(Model()) is False
+
     def test_drops_unsupported_kwargs(self):
         class Model(nn.Module):
             def forward(self, input_ids, attention_mask=None):
