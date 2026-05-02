@@ -309,8 +309,8 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     out["labels"] = sample["labels"][1:]
     out["attention_mask"] = sample["attention_mask"][:-1]
 
-    if "mm_token_type_ids" in sample and sample["mm_token_type_ids"] is not None:
-        mm_ttids = torch.as_tensor(sample["mm_token_type_ids"])
+    if (mm_ttids := sample.get("mm_token_type_ids")) is not None:
+        mm_ttids = torch.as_tensor(mm_ttids)
         out["mm_token_type_ids"] = mm_ttids[0, :-1] if mm_ttids.ndim == 2 else mm_ttids[:-1]
 
     if has_mrope and "position_ids" in sample and sample["position_ids"] is not None:
