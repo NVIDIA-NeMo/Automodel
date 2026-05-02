@@ -66,6 +66,13 @@ from nemo_automodel.components.checkpoint.utils import (
 _PREFIX = "model."
 
 
+def _optimizer_state_dict_options() -> StateDictOptions:
+    return StateDictOptions(
+        flatten_optimizer_state_dict=True,
+        cpu_offload=True,
+    )
+
+
 def _is_quantized_module(module: torch.nn.Module) -> bool:
     """Check if a module is a BitsAndBytes quantized type.
 
@@ -428,7 +435,7 @@ class OptimizerState:
             # to FSDP.SHARDED_STATE_DICT
             func = partial(
                 get_optimizer_state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
+                options=_optimizer_state_dict_options(),
             )
             optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
 
@@ -455,7 +462,7 @@ class OptimizerState:
             func = partial(
                 set_optimizer_state_dict,
                 optim_state_dict=state_dict["optim"],
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
+                options=_optimizer_state_dict_options(),
             )
             list(map(func, self.model, self.optimizer))
 
