@@ -302,6 +302,10 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     out["labels"] = sample["labels"][1:]
     out["attention_mask"] = sample["attention_mask"][:-1]
 
+    if "mm_token_type_ids" in sample and sample["mm_token_type_ids"] is not None:
+        mm_ttids = torch.as_tensor(sample["mm_token_type_ids"])
+        out["mm_token_type_ids"] = mm_ttids[0, :-1] if mm_ttids.ndim == 2 else mm_ttids[:-1]
+
     if has_mrope and "position_ids" in sample and sample["position_ids"] is not None:
         out["position_ids"] = sample["position_ids"][:, :-1]
 
@@ -321,6 +325,7 @@ def _build_packed_vlm_sample(
     all_input_ids: list[int] = []
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
+    all_mm_token_type_ids: list[int] = []
     all_position_ids_1d: list[int] = []
     mrope_position_ids_list: list[torch.Tensor] = []
 
@@ -345,6 +350,12 @@ def _build_packed_vlm_sample(
         all_input_ids.extend(ids)
         all_labels.extend(labs)
         all_attention_mask.extend([seq_idx] * seq_len)
+
+        mm_ttids = sample.get("mm_token_type_ids")
+        if mm_ttids is not None:
+            all_mm_token_type_ids.extend(mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else mm_ttids)
+        else:
+            all_mm_token_type_ids.extend([0] * seq_len)
 
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
@@ -371,6 +382,7 @@ def _build_packed_vlm_sample(
         "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
         "labels": torch.tensor(all_labels, dtype=torch.long),
         "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
+        "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
         "n_images": n_images,
         "n_videos": n_videos,
     }

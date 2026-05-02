@@ -1496,6 +1496,12 @@ def neat_packed_vlm_collater(
     labels = torch.stack([_pad_1d(x["labels"], LABEL_PAD, max_len) for x in batch])
     attention_mask = torch.stack([_pad_1d(x["attention_mask"], 0, max_len) for x in batch])
 
+    def _get_mm_token_type_ids(item):
+        v = item.get("mm_token_type_ids")
+        return v if v is not None else torch.zeros(0, dtype=torch.long)
+
+    mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
+
     if use_flash:
         # Keep indexed [B, S] mask for flash_attn_varlen_func.
         # The patched _get_unpad_data will extract per-document cu_seqlens.
@@ -1526,6 +1532,7 @@ def neat_packed_vlm_collater(
         "labels": labels,
         "position_ids": position_ids,
         "attention_mask": attention_mask_out,
+        "mm_token_type_ids": mm_token_type_ids,
     }
 
     # Store indexed attention mask for loss functions that need per-sample
