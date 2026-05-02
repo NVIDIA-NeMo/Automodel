@@ -114,9 +114,7 @@ class Gemma4Gate(nn.Module):
         expert_scores = self.proj(x_norm)
         router_probs = F.softmax(expert_scores, dim=-1)
 
-        # Top-k on raw scores (matching HF Gemma4Router behaviour)
-        _, indices = torch.topk(expert_scores, k=self.topk, dim=-1)
-        weights = router_probs.gather(-1, indices)
+        weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
         return weights, indices, None
 
