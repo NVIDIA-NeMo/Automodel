@@ -271,6 +271,21 @@ def apply_fsdp(
         mp_policy=mp_policy,
         offload_policy=offload_policy,
     )
+    fp32_mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+
+    def fully_shard_fp32(module: nn.Module) -> None:
+        module._nemo_force_fp32_after_cast = True
+        fully_shard(
+            module,
+            mesh=fsdp_mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=fp32_mp_policy,
+            offload_policy=offload_policy,
+        )
 
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
@@ -280,6 +295,11 @@ def apply_fsdp(
     _model = get_text_module(_model)
 
     for block in _iter_moe_blocks(model, _model):
+        for hc_name in ("attn_hc", "ffn_hc"):
+            hc_module = getattr(block, hc_name, None)
+            if hc_module is not None:
+                fully_shard_fp32(hc_module)
+
         moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -322,6 +342,10 @@ def apply_fsdp(
             )
         else:
             fully_shard_default(lm_head)
+
+    hc_head = getattr(_model, "hc_head", None)
+    if hc_head is not None:
+        fully_shard_fp32(hc_head)
 
     # TODO: properly handle all possible multimodal component names
     if hasattr(model, "audio_tower") and model.audio_tower is not None:

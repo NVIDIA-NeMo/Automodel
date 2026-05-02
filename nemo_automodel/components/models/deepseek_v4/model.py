@@ -202,7 +202,9 @@ class DeepseekV4Block(nn.Module):
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
+        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(dtype), x
+        )
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()
@@ -389,6 +391,7 @@ class DeepseekV4Model(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
             rope_scaling=None,
         )
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
             head_dim=int(config.head_dim),

@@ -449,12 +449,19 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
     model.to(dtype)
     if fp32_keywords:
         if _has_dtensor_params(model):
-            logger.warning(
-                "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
-                "restoration for keywords=%s. Only buffers will be restored to fp32. "
-                "FSDP2 requires uniform dtype within each parameter group.",
-                fp32_keywords,
-            )
+            restored_modules = _restore_marked_fp32_modules(model)
+            if restored_modules:
+                logger.info(
+                    "Restored %d marked FSDP2 module(s) to fp32 after dtype cast.",
+                    restored_modules,
+                )
+            else:
+                logger.warning(
+                    "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
+                    "restoration for keywords=%s. Only buffers will be restored to fp32. "
+                    "FSDP2 requires uniform dtype within each parameter group.",
+                    fp32_keywords,
+                )
             _restore_fp32_buffers(model, fp32_keywords)
         else:
             _restore_fp32_modules(model, fp32_keywords)
@@ -515,6 +522,16 @@ def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
             module_name, _, buffer_name = name.rpartition(".")
             module = model.get_submodule(module_name) if module_name else model
             module._buffers[buffer_name] = buf.to(torch.float32)
+
+
+def _restore_marked_fp32_modules(model: nn.Module) -> int:
+    """Cast FSDP2 modules that were deliberately isolated for fp32 params."""
+    restored = 0
+    for module in model.modules():
+        if getattr(module, "_nemo_force_fp32_after_cast", False):
+            module.to(torch.float32)
+            restored += 1
+    return restored
 
 
 def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
