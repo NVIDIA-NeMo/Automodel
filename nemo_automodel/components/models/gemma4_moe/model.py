@@ -264,6 +264,26 @@ class Gemma4MoEDecoderLayer(nn.Module):
         return x
 
 
+def _convert_bool_4d_mask_to_additive(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a 4D bool allowed-mask to HF additive format (0.0 allowed, -inf masked)."""
+    if attention_mask.ndim != 4 or attention_mask.dtype != torch.bool:
+        return attention_mask
+    additive = torch.zeros(attention_mask.shape, dtype=dtype, device=attention_mask.device)
+    return additive.masked_fill(~attention_mask, torch.finfo(dtype).min)
+
+
+def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Derive 2D padding mask (True = pad) from 1D, 2D, or 4D attention mask."""
+    if attention_mask.ndim == 2:
+        return attention_mask == 0
+    if attention_mask.ndim == 4:
+        diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+        if attention_mask.dtype == torch.bool:
+            return diagonal.logical_not()
+        return diagonal != 0
+    return attention_mask.bool().logical_not()
+
+
 # ---------------------------------------------------------------------------
 # Text model backend
 # ---------------------------------------------------------------------------
@@ -356,7 +376,10 @@ class Gemma4MoETextModelBackend(nn.Module):
             position_ids = cache_position.unsqueeze(0)
 
         if padding_mask is None and attention_mask is not None:
-            padding_mask = attention_mask.bool().logical_not()
+            padding_mask = _derive_padding_mask(attention_mask)
+
+        if attention_mask is not None:
+            attention_mask = _convert_bool_4d_mask_to_additive(attention_mask, inputs_embeds.dtype)
 
         hidden_states = inputs_embeds
 
