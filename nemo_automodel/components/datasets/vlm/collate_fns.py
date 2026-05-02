@@ -1541,7 +1541,7 @@ def neat_packed_vlm_collater(
         if tensors:
             result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
 
-    for key in ("image_grid_thw", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)

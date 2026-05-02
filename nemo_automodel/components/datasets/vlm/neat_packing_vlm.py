@@ -47,7 +47,7 @@ from nemo_automodel.components.datasets.vlm.samplers import (
 
 logger = logging.getLogger(__name__)
 
-MEDIA_KEYS = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts")
+MEDIA_KEYS = ("pixel_values", "image_grid_thw", "image_position_ids", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts")
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +326,7 @@ def _build_packed_vlm_sample(
 
     pixel_values_list: list[torch.Tensor] = []
     image_grid_thw_list: list[torch.Tensor] = []
+    image_position_ids_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
     video_grid_thw_list: list[torch.Tensor] = []
     second_per_grid_ts_list: list[torch.Tensor] = []
@@ -355,6 +356,8 @@ def _build_packed_vlm_sample(
         if "image_grid_thw" in sample and sample["image_grid_thw"] is not None:
             n_images += sample["image_grid_thw"].shape[0]
             image_grid_thw_list.append(sample["image_grid_thw"])
+        if "image_position_ids" in sample and sample["image_position_ids"] is not None:
+            image_position_ids_list.append(sample["image_position_ids"])
         if "pixel_values_videos" in sample and sample["pixel_values_videos"] is not None:
             pixel_values_videos_list.append(sample["pixel_values_videos"])
         if "video_grid_thw" in sample and sample["video_grid_thw"] is not None:
@@ -379,6 +382,7 @@ def _build_packed_vlm_sample(
 
     packed["pixel_values"] = torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
+    packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
     packed["video_grid_thw"] = torch.cat(video_grid_thw_list, dim=0) if video_grid_thw_list else None
     packed["second_per_grid_ts"] = torch.cat(second_per_grid_ts_list, dim=0) if second_per_grid_ts_list else None
