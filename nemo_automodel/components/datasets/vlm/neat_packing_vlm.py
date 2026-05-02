@@ -47,7 +47,14 @@ from nemo_automodel.components.datasets.vlm.samplers import (
 
 logger = logging.getLogger(__name__)
 
-MEDIA_KEYS = ("pixel_values", "image_grid_thw", "image_position_ids", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts")
+MEDIA_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "image_position_ids",
+    "pixel_values_videos",
+    "video_grid_thw",
+    "second_per_grid_ts",
+)
 
 
 # ---------------------------------------------------------------------------
