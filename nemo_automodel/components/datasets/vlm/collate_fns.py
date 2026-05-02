@@ -1811,13 +1811,6 @@ def _inject_thinking_prefix_tokens(
 ) -> Dict[str, torch.Tensor]:
     """Insert ``<|channel>thought\\n<channel|>`` tokens after every ``<|turn>model\\n`` marker.
 
-    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
-    channel prefix before the actual response.  When this prefix is absent from
-    training sequences the model predicts ``<|channel>`` but the label says
-    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
-    as -100 in labels) lets the model see its expected pattern and brings
-    initial loss down to ~3.
-
     Modifies ``input_ids``, ``attention_mask``, and ``mm_token_type_ids``
     (if present).  Additionally, any other 2-D integer tensor whose second
     dimension matches ``input_ids`` is extended with zeros so that sequence
@@ -1892,6 +1885,25 @@ def _inject_thinking_prefix_tokens(
     return batch
 
 
+def gemma4_inject_thinking_prefix(
+    batch: Dict[str, torch.Tensor],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Inject Gemma4's thinking-channel prefix after every assistant turn marker.
+
+    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
+    channel prefix before the actual response.  When this prefix is absent from
+    training sequences the model predicts ``<|channel>`` but the label says
+    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
+    as -100 in labels) lets the model see its expected pattern and brings
+    initial loss down to ~3.
+
+    Safe no-op for non-Gemma4 tokenizers.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    return _inject_thinking_prefix_tokens(batch, tokenizer)
+
+
 def gemma4_prefix_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1907,8 +1919,7 @@ def gemma4_prefix_collate_fn(
     """
 
     def _inject(batch, proc):
-        tokenizer = getattr(proc, "tokenizer", proc)
-        batch = _inject_thinking_prefix_tokens(batch, tokenizer)
+        batch = gemma4_inject_thinking_prefix(batch, proc)
         if max_length is not None and batch["input_ids"].size(1) > max_length:
             for key in list(batch.keys()):
                 v = batch[key]
