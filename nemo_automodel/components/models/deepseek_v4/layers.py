@@ -204,13 +204,23 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         head_dim: int,
         partial_rotary_factor: float,
         attention_scaling: float = 1.0,
+        original_max_position_embeddings: int = 0,
+        rope_factor: float = 1.0,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
         device: torch.device | None = None,
         rope_scaling: dict | None = None,
     ):
         super().__init__()
         dim = int(head_dim * partial_rotary_factor)
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        inv_freq = _compute_dsv4_inv_freq(
+            dim=dim,
+            rope_theta=rope_theta,
+            original_max_position_embeddings=original_max_position_embeddings,
+            rope_factor=rope_factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+            device=device,
         )
         if rope_scaling and str(rope_scaling.get("type", "")).lower() == "yarn":
             factor = float(rope_scaling.get("factor", 1.0))
@@ -235,6 +245,66 @@ class DeepseekV4RotaryEmbedding(nn.Module):
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def _compute_dsv4_inv_freq(
+    *,
+    dim: int,
+    rope_theta: float,
+    original_max_position_embeddings: int,
+    rope_factor: float,
+    beta_fast: int,
+    beta_slow: int,
+    device: torch.device | None,
+) -> torch.Tensor:
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+    )
+    if original_max_position_embeddings <= 0:
+        return inv_freq
+
+    low, high = _find_dsv4_yarn_correction_range(
+        beta_fast,
+        beta_slow,
+        dim,
+        rope_theta,
+        original_max_position_embeddings,
+    )
+    smooth = 1.0 - _linear_dsv4_yarn_ramp(low, high, dim // 2, device=device)
+    return inv_freq / rope_factor * (1.0 - smooth) + inv_freq * smooth
+
+
+def _find_dsv4_yarn_correction_range(
+    low_rot: int,
+    high_rot: int,
+    dim: int,
+    rope_theta: float,
+    original_max_position_embeddings: int,
+) -> tuple[int, int]:
+    def correction_dim(num_rotations: int) -> float:
+        return dim * torch.log(
+            torch.tensor(
+                original_max_position_embeddings / (num_rotations * 2 * torch.pi),
+                dtype=torch.float32,
+            )
+        ).item() / (2 * torch.log(torch.tensor(rope_theta, dtype=torch.float32)).item())
+
+    low = int(torch.floor(torch.tensor(correction_dim(low_rot))).item())
+    high = int(torch.ceil(torch.tensor(correction_dim(high_rot))).item())
+    return max(low, 0), min(high, dim - 1)
+
+
+def _linear_dsv4_yarn_ramp(
+    low: int,
+    high: int,
+    dim: int,
+    *,
+    device: torch.device | None,
+) -> torch.Tensor:
+    if low == high:
+        high += 0.001
+    ramp = (torch.arange(dim, dtype=torch.float32, device=device) - low) / (high - low)
+    return torch.clamp(ramp, 0, 1)
 
 
 class DeepseekV4GroupedLinear(nn.Linear):
@@ -470,11 +540,11 @@ def eager_attention_with_sink(
     del kwargs
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)).float() * scaling
     if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
+        attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]].float()
     sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
-    combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
+    combined = torch.cat([attn_weights, sinks.float()], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined, dim=-1, dtype=torch.float32)[..., :-1]
     probs = F.dropout(probs, p=dropout, training=module.training).to(value_states.dtype)
