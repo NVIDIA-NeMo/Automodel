@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -35,6 +36,7 @@ from packaging.version import parse
 from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -79,6 +81,33 @@ def _is_safetensors_checkpoint(path: str) -> bool:
     if os.path.isfile(os.path.join(path, "model.safetensors.index.json")):
         return True
     return len(glob.glob(os.path.join(path, "*.safetensors"))) > 0
+
+
+def _as_model_parts(model: nn.Module | list[nn.Module]) -> list[nn.Module]:
+    return model if isinstance(model, list) else [model]
+
+
+def _as_optimizers(
+    optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+) -> list[torch.optim.Optimizer]:
+    return optimizer if isinstance(optimizer, list) else [optimizer]
+
+
+def _get_module_device(module: nn.Module) -> Optional[torch.device]:
+    for tensor in chain(module.parameters(), module.buffers()):
+        return tensor.device
+    return None
+
+
+def _move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+    device: str | torch.device,
+) -> None:
+    for optim in _as_optimizers(optimizer):
+        for state in optim.state.values():
+            for key, value in state.items():
+                if isinstance(value, (DTensor, torch.Tensor)):
+                    state[key] = value.to(device)
 
 
 def _is_bin_checkpoint(path: str) -> bool:
@@ -362,7 +391,12 @@ class Checkpointer:
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
     def load_optimizer(
-        self, optimizer: torch.optim.Optimizer, model: nn.Module, weights_path: str, scheduler: Optional[Any] = None
+        self,
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+        model: nn.Module | list[nn.Module],
+        weights_path: str,
+        scheduler: Optional[Any] = None,
+        load_on_cpu: bool = False,
     ) -> None:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
@@ -372,11 +406,34 @@ class Checkpointer:
             model: Model providing partitioning context for the optimizer wrapper.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
+            load_on_cpu: If True, move model parameters and existing optimizer
+                state to CPU after DCP reads the optimizer state but before
+                optimizer.load_state_dict() casts state tensors.
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
-        optimizer_state.load_state_dict(state_dict)
+
+        if not load_on_cpu:
+            optimizer_state.load_state_dict(state_dict)
+            return
+
+        model_parts = _as_model_parts(model)
+        restore_devices = [_get_module_device(model_part) for model_part in model_parts]
+        _move_optimizer_state_to_device(optimizer, "cpu")
+        for model_part in model_parts:
+            model_part.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        try:
+            optimizer_state.load_state_dict(state_dict)
+        finally:
+            for model_part, device in zip(model_parts, restore_devices):
+                if device is not None and device.type != "cpu":
+                    model_part.to(device)
+            gc.collect()
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def load_model(
