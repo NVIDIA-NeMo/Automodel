@@ -455,7 +455,7 @@ def build_dataloader(
             truncate = cfg_ds.get("truncate", max_length is not None)
 
             post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
-            
+
             ds = PreTokenizedDatasetWrapper(
                 ds_raw,
                 processor,
