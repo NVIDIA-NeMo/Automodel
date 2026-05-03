@@ -549,3 +549,12 @@ def patch_hf_model(model, cp_enabled=False):
             patched,
             cp_enabled,
         )
+
+        # Attach a state_dict_adapter so saved checkpoints hide the
+        # ``_fp32_params`` wrapping and remain HF-loadable directly.
+        if not hasattr(model, "state_dict_adapter"):
+            from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
+                Qwen3_5DenseStateDictAdapter,
+            )
+
+            model.state_dict_adapter = Qwen3_5DenseStateDictAdapter()
