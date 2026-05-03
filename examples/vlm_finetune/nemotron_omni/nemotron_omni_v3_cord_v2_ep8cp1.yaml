@@ -43,10 +43,7 @@ processor:
   trust_remote_code: true
 
 checkpoint:
-  enabled: true
-  checkpoint_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/omniv/logs/cordv2_v3_ep8cp1_ac_ckpts/
-  model_save_format: safetensors
-  save_consolidated: true
+  enabled: false
 
 distributed:
   strategy: fsdp2
@@ -55,7 +52,6 @@ distributed:
   pp_size: 1
   ep_size: 8
   sequence_parallel: false
-  activation_checkpointing: true
 
 freeze_config:
   freeze_embeddings: true
