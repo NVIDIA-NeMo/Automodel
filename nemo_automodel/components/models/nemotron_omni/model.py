@@ -744,6 +744,112 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         return sound_embeds
 
     # ------------------------------------------------------------------
+    # Context parallelism pre-processing
+    # ------------------------------------------------------------------
+
+    def prepare_inputs_embeds_for_cp(self, batch: dict) -> dict:
+        """Pre-compute ``inputs_embeds`` with image/video/audio tokens replaced
+        BEFORE context-parallel sharding.
+
+        Under CP > 1 the sequence is sharded across ranks; multimodal feature
+        scatter must happen on the full un-sharded sequence so each rank ends
+        up with embeddings matching its slice of input_ids. This method runs
+        the same scatter logic as ``forward``'s multimodal block, returning a
+        new batch dict where ``input_ids``/multimodal tensors are replaced by
+        ``inputs_embeds``. The downstream make_cp_batch_and_ctx then shards
+        the embeds.
+        """
+        input_ids = batch["input_ids"]
+        inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+        pixel_values = batch.get("pixel_values", None)
+        image_flags = batch.get("image_flags", None)
+        imgs_sizes = batch.get("imgs_sizes", None)
+        pixel_values_videos = batch.get("pixel_values_videos", None)
+        sound_features = batch.get("sound_features", None)
+        sound_attention_mask = batch.get("sound_attention_mask", None)
+
+        if pixel_values is not None and imgs_sizes is not None:
+            B, N, C = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(B * N, C)
+            input_ids_flat = input_ids.reshape(B * N)
+            selected = input_ids_flat == self.img_context_token_id
+            vit_embeds = self.extract_feature_dynamic(pixel_values, imgs_sizes)
+            vit_embeds = vit_embeds.reshape(-1, C)
+            try:
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds
+            except Exception:
+                n_token = int(selected.sum().item())
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
+            inputs_embeds = inputs_embeds.reshape(B, N, C)
+        elif pixel_values is not None and image_flags is not None:
+            image_flags_squeezed = image_flags.squeeze(-1)
+            B, N, C = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(B * N, C)
+            input_ids_flat = input_ids.reshape(B * N)
+            selected = input_ids_flat == self.img_context_token_id
+            vit_embeds = self.extract_feature(pixel_values)
+            vit_embeds = vit_embeds[image_flags_squeezed == 1]
+            try:
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
+            except Exception:
+                vit_embeds = vit_embeds.reshape(-1, C)
+                n_token = selected.sum()
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
+            inputs_embeds = inputs_embeds.reshape(B, N, C)
+
+        if pixel_values_videos is not None:
+            assert pixel_values is None, "pixel_values and pixel_values_videos are mutually exclusive"
+            B_v, N_v, C_v = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
+            video_selected = input_ids.reshape(B_v * N_v) == self.img_context_token_id
+            video_embeds = self.extract_video_feature(pixel_values_videos)
+            inputs_embeds[video_selected] = inputs_embeds[video_selected] * 0.0 + video_embeds.reshape(-1, C_v)
+            inputs_embeds = inputs_embeds.reshape(B_v, N_v, C_v)
+
+        has_sound = (
+            sound_features is not None and self.sound_encoder is not None and self.sound_context_token_id is not None
+        )
+        if has_sound:
+            B_s, N_s, C_s = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(B_s * N_s, C_s)
+            input_ids_flat_sound = input_ids.reshape(B_s * N_s)
+            sound_selected = input_ids_flat_sound == self.sound_context_token_id
+            num_sound_tokens = sound_selected.sum().item()
+            if num_sound_tokens > 0:
+                target_dtype = inputs_embeds.dtype
+                sound_features = sound_features.to(dtype=target_dtype, device=inputs_embeds.device)
+                if sound_attention_mask is not None:
+                    sound_attention_mask = sound_attention_mask.to(device=inputs_embeds.device)
+                sound_embeds = self.extract_sound_feature(sound_features, sound_attention_mask)
+                sound_embeds_flat = sound_embeds.reshape(-1, C_s)
+                try:
+                    inputs_embeds[sound_selected] = inputs_embeds[sound_selected] * 0.0 + sound_embeds_flat.to(
+                        inputs_embeds.dtype
+                    )
+                except Exception:
+                    inputs_embeds[sound_selected] = inputs_embeds[sound_selected] * 0.0 + sound_embeds_flat[
+                        :num_sound_tokens
+                    ].to(inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.reshape(B_s, N_s, C_s)
+
+        skip_keys = {
+            "input_ids",
+            "pixel_values",
+            "image_flags",
+            "imgs_sizes",
+            "image_grid_hws",
+            "image_grid_thw",
+            "image_sizes",
+            "pixel_values_videos",
+            "sound_features",
+            "sound_attention_mask",
+        }
+        new_batch = {k: v for k, v in batch.items() if k not in skip_keys}
+        new_batch["inputs_embeds"] = inputs_embeds
+        return new_batch
+
+    # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
 
@@ -792,6 +898,12 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """
         return_dict = return_dict if return_dict is not None else True
 
+        # Caller pre-supplied inputs_embeds (CP path: prepare_inputs_embeds_for_cp
+        # ran the multimodal scatter on the un-sharded sequence before
+        # context_parallel sharded the tensors). In that case skip the embed +
+        # multimodal-replacement block entirely; the shards are already correct.
+        _embeds_pre_built = inputs_embeds is not None
+
         # Get text embeddings
         if inputs_embeds is None:
             inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
@@ -810,7 +922,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         #
         # When both are None (or pixel_values is None), we skip image
         # injection and run the LM path on text embeddings only.
-        if pixel_values is not None and imgs_sizes is not None:
+        if not _embeds_pre_built and pixel_values is not None and imgs_sizes is not None:
             B, N, C = inputs_embeds.shape
             inputs_embeds = inputs_embeds.reshape(B * N, C)
             input_ids_flat = input_ids.reshape(B * N)
@@ -839,7 +951,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
 
             inputs_embeds = inputs_embeds.reshape(B, N, C)
-        elif pixel_values is not None and image_flags is not None:
+        elif not _embeds_pre_built and pixel_values is not None and image_flags is not None:
             image_flags = image_flags.squeeze(-1)
 
             B, N, C = inputs_embeds.shape
@@ -877,7 +989,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         # Image and video both expand to `img_context_token_id` in the prompt, so a
         # single sample can carry only one of `pixel_values` / `pixel_values_videos`.
-        if pixel_values_videos is not None:
+        if not _embeds_pre_built and pixel_values_videos is not None:
             assert pixel_values is None, "pixel_values and pixel_values_videos are mutually exclusive"
             B_v, N_v, C_v = inputs_embeds.shape
             inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
@@ -888,7 +1000,10 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         # --- Sound/audio token replacement ---
         has_sound = (
-            sound_features is not None and self.sound_encoder is not None and self.sound_context_token_id is not None
+            not _embeds_pre_built
+            and sound_features is not None
+            and self.sound_encoder is not None
+            and self.sound_context_token_id is not None
         )
         if has_sound:
             B_s, N_s, C_s = inputs_embeds.shape

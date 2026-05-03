@@ -271,11 +271,23 @@ def make_cp_batch_and_ctx(
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
+    # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
+    # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    if has_inputs_embeds:
+        primary_seq_tensor = batch["inputs_embeds"]
+    else:
+        primary_seq_tensor = batch["input_ids"]
+    seq_len = primary_seq_tensor.shape[1]
+
     # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
+        batch["position_ids"] = torch.arange(0, seq_len).unsqueeze(0).to(primary_seq_tensor.device)
 
-    input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
 
     # Determine correct seq dim for CP sharding
@@ -285,9 +297,10 @@ def make_cp_batch_and_ctx(
     labels = batch["labels"]
 
     # Collect all available tensors for context parallel
-    cp_buffers = [input_ids, labels, position_ids]
+    cp_buffers = [primary_seq_tensor, labels, position_ids]
+    # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
-    cp_no_restore_buffers = {input_ids, labels}
+    cp_no_restore_buffers = {primary_seq_tensor, labels}
 
     # Add loss_mask if available
     if loss_mask is not None:
@@ -301,6 +314,38 @@ def make_cp_batch_and_ctx(
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
+
+    # Pad sequence length to be divisible by 2 * cp_size (required by
+    # context_parallel load balancing). The inputs_embeds path can hit
+    # arbitrary seq lengths from the VLM collator, so we pad here rather
+    # than relying on dataset-side padding.
+    cp_divisor = cp_mesh.size() * 2
+    if seq_len % cp_divisor != 0:
+        pad_len = cp_divisor - (seq_len % cp_divisor)
+        new_no_restore = set()
+        for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
+            pad_shape = list(buf.shape)
+            pad_shape[dim] = pad_len
+            if buf.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
+            else:
+                # labels use -100 (ignore_index); position_ids and other ints get 0.
+                fill_val = -100 if (buf is labels) else 0
+                pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
+            old_buf = buf
+            cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
+            if old_buf in cp_no_restore_buffers:
+                new_no_restore.add(cp_buffers[i])
+        cp_no_restore_buffers = new_no_restore
+        # Mirror the padded primary tensor back into the batch so the model
+        # forward sees the padded shape (we already padded labels/position_ids
+        # via cp_buffers, but those are still the original objects in `batch`).
+        if has_inputs_embeds:
+            batch["inputs_embeds"] = cp_buffers[0]
+        else:
+            batch["input_ids"] = cp_buffers[0]
+        batch["labels"] = cp_buffers[1]
+        batch["position_ids"] = cp_buffers[2]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

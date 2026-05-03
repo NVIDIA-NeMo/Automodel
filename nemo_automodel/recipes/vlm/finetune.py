@@ -951,8 +951,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
-        labels = batch.pop("labels")
+        # For VLM + CP > 1 (non-PP), defer make_cp_batch_and_ctx until inside
+        # sync_ctx where FSDP params are materialized for vision pre-processing.
+        # The CP path needs to scatter image/audio embeddings on the FULL
+        # un-sharded sequence before context_parallel shards inputs_embeds.
+        _vlm_cp_deferred = (
+            self.dist_setup.cp_size > 1
+            and not self.pp_enabled
+            and hasattr(self.model_parts[0], "prepare_inputs_embeds_for_cp")
+        )
+        if _vlm_cp_deferred:
+            train_ctx = nullcontext
+            labels = batch.pop("labels")
+        else:
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+            labels = batch.pop("labels")
 
         if self.pp_enabled:
             if not is_train:
@@ -1033,30 +1046,53 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
-                            "Set `model.text_config.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
+            with sync_ctx:
+                # VLM + CP: pre-compute embeddings with vision/audio tokens
+                # INSIDE sync_ctx (so FSDP params are materialized) but BEFORE
+                # train_ctx (so tensors are NOT yet DTensors from context_parallel).
+                if _vlm_cp_deferred:
+                    # FSDP root lazy init must precede prepare_inputs_embeds_for_cp
+                    # because submodule forwards else hit "already initialized".
+                    if not getattr(self, "_fsdp_init_done", False):
+                        dummy_ids = torch.zeros(1, 2, dtype=torch.long, device=self.dist_env.device)
+                        with torch.no_grad():
+                            try:
+                                model(input_ids=dummy_ids)
+                            except Exception:
+                                pass
+                        self._fsdp_init_done = True
+                    with torch.no_grad():
+                        batch = model.prepare_inputs_embeds_for_cp(batch)
+                    batch["labels"] = labels
+                    train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+                    labels = batch.pop("labels")
 
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
-                    num_label_tokens=num_label_tokens,
-                )
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                with train_ctx():
+                    batch = filter_forward_kwargs(model, batch)
+                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                        # use num_logits_to_keep to avoid full logits matrix in memory
+                        out = model(logits_to_keep=1, **batch)
+                        if "hidden_states" not in out:
+                            raise ValueError(
+                                "FusedLinearCrossEntropy requires the model to output hidden states. "
+                                "Set `model.text_config.output_hidden_states=True` in the config."
+                            )
+                    else:
+                        out = model(**batch)
+
+                    local_loss = calculate_loss(
+                        self.loss_fn,
+                        logits=getattr(out, "logits", out),
+                        labels=labels,
+                        model=model,
+                        hidden_states=out.hidden_states[-1]
+                        if getattr(out, "hidden_states", None) is not None
+                        else None,
+                        num_label_tokens=num_label_tokens,
+                    )
+                    loss_buffer.append(local_loss.clone().detach())
+                    if is_train:
+                        (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1226,8 +1262,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     and "position_ids" not in batch
                     and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
                 ):
+                    seq_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
                     batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
+                        torch.arange(0, batch[seq_key].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
                     )
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
