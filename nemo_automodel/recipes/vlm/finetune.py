@@ -1051,18 +1051,44 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 # INSIDE sync_ctx (so FSDP params are materialized) but BEFORE
                 # train_ctx (so tensors are NOT yet DTensors from context_parallel).
                 if _vlm_cp_deferred:
-                    # FSDP root lazy init must precede prepare_inputs_embeds_for_cp
-                    # because submodule forwards else hit "already initialized".
-                    if not getattr(self, "_fsdp_init_done", False):
-                        dummy_ids = torch.zeros(1, 2, dtype=torch.long, device=self.dist_env.device)
-                        with torch.no_grad():
-                            try:
-                                model(input_ids=dummy_ids)
-                            except Exception:
-                                pass
-                        self._fsdp_init_done = True
+                    # Route the multimodal scatter through model.__call__ so
+                    # FSDP2's forward pre-hooks fire on the root and all-gather
+                    # the vision tower's sharded Linear weights. Calling
+                    # prepare_inputs_embeds_for_cp directly would skip the
+                    # hooks and trigger "mixed Tensor and DTensor" errors in
+                    # the vision tower.
+                    mm_keys = (
+                        "input_ids",
+                        "pixel_values",
+                        "image_flags",
+                        "imgs_sizes",
+                        "pixel_values_videos",
+                        "sound_features",
+                        "sound_attention_mask",
+                    )
+                    mm_kwargs = {k: batch[k] for k in mm_keys if batch.get(k) is not None}
                     with torch.no_grad():
-                        batch = model.prepare_inputs_embeds_for_cp(batch)
+                        new_batch = model(return_inputs_embeds_only=True, **mm_kwargs)
+                    # Carry over keys that prepare_inputs_embeds_for_cp's
+                    # skip_keys list dropped on input (e.g. attention_mask,
+                    # position_ids) and which are needed downstream.
+                    _dropped_by_skip_keys = {
+                        "input_ids",
+                        "pixel_values",
+                        "image_flags",
+                        "imgs_sizes",
+                        "image_grid_hws",
+                        "image_grid_thw",
+                        "image_sizes",
+                        "pixel_values_videos",
+                        "sound_features",
+                        "sound_attention_mask",
+                    }
+                    for k, v in batch.items():
+                        if k in new_batch or k in _dropped_by_skip_keys:
+                            continue
+                        new_batch[k] = v
+                    batch = new_batch
                     batch["labels"] = labels
                     train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                     labels = batch.pop("labels")
