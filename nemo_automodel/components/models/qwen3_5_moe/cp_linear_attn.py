@@ -561,7 +561,5 @@ def patch_hf_model(model, cp_enabled=False):
         if not hasattr(model, "state_dict_adapter"):
             import importlib
 
-            adapter_module = importlib.import_module(
-                "nemo_automodel.components.models.qwen3_5.state_dict_adapter"
-            )
+            adapter_module = importlib.import_module("nemo_automodel.components.models.qwen3_5.state_dict_adapter")
             model.state_dict_adapter = adapter_module.Qwen3_5DenseStateDictAdapter()
