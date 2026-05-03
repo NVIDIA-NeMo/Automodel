@@ -25,6 +25,7 @@ def _doc_id_str_to_int64(doc_id: str) -> int:
     h = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
     return int.from_bytes(h, "little", signed=False) & ((1 << 63) - 1)
 
+
 if TYPE_CHECKING:
     from transformers import BatchEncoding
 

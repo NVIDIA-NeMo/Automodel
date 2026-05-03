@@ -361,13 +361,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
                 all_p = dist_gather_tensor(p_reps)
                 expected_p = world_size * local_bs * n_passages
-                assert all_p.shape[0] == expected_p, (
-                    f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                )
+                assert all_p.shape[0] == expected_p, f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
                 scores = torch.mm(q_reps, all_p.t())
-                labels = (
-                    torch.arange(local_bs, device=q_reps.device) + rank * local_bs
-                ) * n_passages
+                labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
                 if model.l2_normalize:
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")
