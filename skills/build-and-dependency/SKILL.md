@@ -11,44 +11,60 @@ when_to_use: Setting up a dev environment, adding or removing dependencies, swit
 Clone and install:
 
 ```bash
-git clone <repo-url> && cd nemo-automodel
-uv sync --locked --extra cuda --extra extra
+git clone https://github.com/NVIDIA-NeMo/Automodel.git && cd Automodel
+uv sync --locked --all-groups --extra all
 ```
 
-Or use the NeMo-AutoModel container from NVIDIA NGC:
+Or use the NeMo-AutoModel container from NVIDIA NGC (pick a published tag from
+[the NGC catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) —
+e.g. `26.04`):
 
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:latest
-docker run --gpus all -it nvcr.io/nvidia/nemo-automodel:latest
+docker pull nvcr.io/nvidia/nemo-automodel:26.04
+docker run --gpus all -it nvcr.io/nvidia/nemo-automodel:26.04
 ```
 
 ## Installation Options
 
 ### Option 1: NeMo-AutoModel Container (NGC)
 
-The container ships with all dependencies pre-installed. Mount your data and code:
+The container ships with all dependencies pre-installed at `/opt/Automodel`
+(WORKDIR) with the venv at `/opt/venv`. To develop against your host checkout,
+bind-mount over the installed source:
 
 ```bash
-docker run --gpus all -v $(pwd):/workspace -it nvcr.io/nvidia/nemo-automodel:latest
+docker run --gpus all -v $(pwd):/opt/Automodel -it nvcr.io/nvidia/nemo-automodel:26.04
 ```
 
 ### Option 2: uv (Recommended for Local Development)
 
+`--all-groups` pulls the `build`, `docs`, and `test` dev groups (defined in
+`pyproject.toml`); drop it for a runtime-only install.
+
 ```bash
-uv sync --locked                          # base install
-uv sync --locked --extra cuda             # CUDA support
-uv sync --locked --extra fa               # flash-attention
-uv sync --locked --extra moe              # mixture-of-experts
-uv sync --locked --extra vlm              # vision-language models
-uv sync --locked --extra diffusion        # diffusion models
-uv sync --locked --extra delta-databricks # Delta Lake / Databricks
-uv sync --locked --extra all              # everything
+uv sync --locked --all-groups                          # base + dev groups
+uv sync --locked --all-groups --extra cuda             # CUDA support
+uv sync --locked --all-groups --extra fa               # flash-attention
+uv sync --locked --all-groups --extra moe              # mixture-of-experts
+uv sync --locked --all-groups --extra vlm              # vision-language models
+uv sync --locked --all-groups --extra diffusion        # diffusion models
+uv sync --locked --all-groups --extra delta-databricks # Delta Lake / Databricks
+uv sync --locked --all-groups --extra all              # everything
 ```
 
 ### Option 3: pip
 
+Full install (matches `uv sync --extra all`):
+
 ```bash
 pip install -e ".[all]"
+```
+
+Login-node / submitter-only install — lightweight package for SLURM, k8s, or
+NeMo-Run job submission without local CUDA deps:
+
+```bash
+pip install nemo-automodel[cli]
 ```
 
 ## Package Management
@@ -105,4 +121,4 @@ automodel finetune llm -c config.yaml --model.name_or_path meta-llama/Llama-3.2-
 |---|---|---|
 | Stale `.venv` after switching branches | Cached environment out of sync | Delete `.venv` and re-run `uv sync --locked` |
 | Import errors for optional features (TE, flash-attn, MoE) | Missing extras | Install the matching `uv` extra (`--extra fa`, `--extra moe`, etc.) |
-| TransformerEngine version mismatch | TE pinned to container version | Pin TE version to what the container ships, or rebuild from source |
+| TransformerEngine version mismatch | The TE installed by `uv sync` takes precedence over the version baked into the container | Set the desired TE version in `pyproject.toml` / `uv.lock` and re-run `uv sync` — the venv's TE wins, not the container's |
