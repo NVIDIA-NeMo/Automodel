@@ -951,21 +951,34 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-        # For VLM + CP > 1 (non-PP), defer make_cp_batch_and_ctx until inside
-        # sync_ctx where FSDP params are materialized for vision pre-processing.
-        # The CP path needs to scatter image/audio embeddings on the FULL
-        # un-sharded sequence before context_parallel shards inputs_embeds.
-        _vlm_cp_deferred = (
-            self.dist_setup.cp_size > 1
-            and not self.pp_enabled
-            and hasattr(self.model_parts[0], "prepare_inputs_embeds_for_cp")
-        )
-        if _vlm_cp_deferred:
-            train_ctx = nullcontext
-            labels = batch.pop("labels")
-        else:
-            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
-            labels = batch.pop("labels")
+        # VLM + CP > 1 (non-PP): scatter image/video/audio features into
+        # inputs_embeds on the full un-sharded sequence before context_parallel
+        # shards along the seq dim. We route through model.__call__ so FSDP2's
+        # forward pre-hook fires and all-gathers the vision tower's sharded
+        # weights (calling prepare_*_for_cp directly skips the hook -> mixed
+        # Tensor/DTensor errors).
+        _model = self.model_parts[0]
+        _cp_active = self.dist_setup.cp_size > 1 and not self.pp_enabled
+        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+            mm_keys = (
+                "input_ids",
+                "pixel_values",
+                "image_flags",
+                "imgs_sizes",
+                "pixel_values_videos",
+                "sound_features",
+                "sound_attention_mask",
+            )
+            mm_kwargs = {k: batch[k] for k in mm_keys if batch.get(k) is not None}
+            with torch.no_grad():
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            _drop = set(mm_keys) | {"image_grid_hws", "image_grid_thw", "image_sizes"}
+            for k in _drop:
+                batch.pop(k, None)
+            batch.update(prepared)
+
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        labels = batch.pop("labels")
 
         if self.pp_enabled:
             if not is_train:
@@ -1047,52 +1060,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else nullcontext()
             )
             with sync_ctx:
-                # VLM + CP: pre-compute embeddings with vision/audio tokens
-                # INSIDE sync_ctx (so FSDP params are materialized) but BEFORE
-                # train_ctx (so tensors are NOT yet DTensors from context_parallel).
-                if _vlm_cp_deferred:
-                    # Route the multimodal scatter through model.__call__ so
-                    # FSDP2's forward pre-hooks fire on the root and all-gather
-                    # the vision tower's sharded Linear weights. Calling
-                    # prepare_inputs_embeds_for_cp directly would skip the
-                    # hooks and trigger "mixed Tensor and DTensor" errors in
-                    # the vision tower.
-                    mm_keys = (
-                        "input_ids",
-                        "pixel_values",
-                        "image_flags",
-                        "imgs_sizes",
-                        "pixel_values_videos",
-                        "sound_features",
-                        "sound_attention_mask",
-                    )
-                    mm_kwargs = {k: batch[k] for k in mm_keys if batch.get(k) is not None}
-                    with torch.no_grad():
-                        new_batch = model(return_inputs_embeds_only=True, **mm_kwargs)
-                    # Carry over keys that prepare_inputs_embeds_for_cp's
-                    # skip_keys list dropped on input (e.g. attention_mask,
-                    # position_ids) and which are needed downstream.
-                    _dropped_by_skip_keys = {
-                        "input_ids",
-                        "pixel_values",
-                        "image_flags",
-                        "imgs_sizes",
-                        "image_grid_hws",
-                        "image_grid_thw",
-                        "image_sizes",
-                        "pixel_values_videos",
-                        "sound_features",
-                        "sound_attention_mask",
-                    }
-                    for k, v in batch.items():
-                        if k in new_batch or k in _dropped_by_skip_keys:
-                            continue
-                        new_batch[k] = v
-                    batch = new_batch
-                    batch["labels"] = labels
-                    train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
-                    labels = batch.pop("labels")
-
                 with train_ctx():
                     batch = filter_forward_kwargs(model, batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
@@ -1282,6 +1249,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 labels = batch.pop("labels")
                 num_label_tokens = (labels != -100).sum().item()
+
+                # VLM + CP: scatter image/video/audio features into inputs_embeds
+                # on the full un-sharded sequence (mirrors the train path).
+                _model = self.model_parts[0]
+                _cp_active = self.device_mesh and self.device_mesh["cp"].size() > 1
+                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+                    mm_keys = (
+                        "input_ids",
+                        "pixel_values",
+                        "image_flags",
+                        "imgs_sizes",
+                        "pixel_values_videos",
+                        "sound_features",
+                        "sound_attention_mask",
+                    )
+                    mm_kwargs = {k: batch[k] for k in mm_keys if batch.get(k) is not None}
+                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                    _drop = set(mm_keys) | {"image_grid_hws", "image_grid_thw", "image_sizes"}
+                    for k in _drop:
+                        batch.pop(k, None)
+                    batch.update(prepared)
 
                 if (
                     self.device_mesh
