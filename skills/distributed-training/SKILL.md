@@ -1,6 +1,7 @@
 ---
 name: distributed-training
 description: Guide for selecting and configuring distributed training strategies in NeMo AutoModel, including FSDP2, Megatron FSDP, DDP, and parallelism settings.
+when_to_use: Adding or modifying distributed training strategies (FSDP2, HSDP, DDP), debugging multi-GPU or multi-node failures, configuring context or tensor parallelism, or tuning sharding settings.
 ---
 
 # Distributed Training in NeMo AutoModel
