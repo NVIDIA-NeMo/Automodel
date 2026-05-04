@@ -384,10 +384,7 @@ class Gate(nn.Module):
 
         if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
-            # Keep original_scores in gate_precision (fp32 for numerical stability) — it
-            # only feeds _compute_aux_loss, and casting back to bf16 here makes the saved
-            # tensors of that path mismatch their recomputed counterparts under
-            # activation checkpointing (forward saves bf16, recompute produces fp32).
+            original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
@@ -525,6 +522,16 @@ class Gate(nn.Module):
             torch.Tensor: Auxiliary loss for load balancing.
                 Shape is [].
         """
+        # Pin aux-loss arithmetic to fp32. The activation-checkpoint recompute pass
+        # does not replay FSDP2 MixedPrecisionPolicy cast_forward_inputs, so `x` and
+        # anything derived from `x.dtype` (including original_scores in some MoE
+        # configs) can differ between forward and recompute. Doing the cast inside
+        # the AC region — rather than at the Gate level — guarantees the saved
+        # tensors of this region (expert_scores [n_experts] and the aux-loss scalar)
+        # are fp32 on both passes regardless of upstream behavior.
+        original_scores = original_scores.float()
+        expert_load = expert_load.float()
+
         context_length = token_mask.sum()
         expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
 
