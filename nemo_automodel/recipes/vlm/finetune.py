@@ -75,7 +75,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -960,20 +960,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         _model = self.model_parts[0]
         _cp_active = self.dist_setup.cp_size > 1 and not self.pp_enabled
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_keys = (
-                "input_ids",
-                "pixel_values",
-                "image_flags",
-                "imgs_sizes",
-                "pixel_values_videos",
-                "sound_features",
-                "sound_attention_mask",
-            )
-            mm_kwargs = {k: batch[k] for k in mm_keys if batch.get(k) is not None}
+            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
             with torch.no_grad():
                 prepared = _model(_pre_embed_only=True, **mm_kwargs)
-            _drop = set(mm_keys) | {"image_grid_hws", "image_grid_thw", "image_sizes"}
-            for k in _drop:
+            for k in VLM_INPUT_KEYS:
                 batch.pop(k, None)
             batch.update(prepared)
 
@@ -1254,19 +1244,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 _model = self.model_parts[0]
                 _cp_active = self.device_mesh and self.device_mesh["cp"].size() > 1
                 if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-                    mm_keys = (
-                        "input_ids",
-                        "pixel_values",
-                        "image_flags",
-                        "imgs_sizes",
-                        "pixel_values_videos",
-                        "sound_features",
-                        "sound_attention_mask",
-                    )
-                    mm_kwargs = {k: batch[k] for k in mm_keys if batch.get(k) is not None}
+                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
                     prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                    _drop = set(mm_keys) | {"image_grid_hws", "image_grid_thw", "image_sizes"}
-                    for k in _drop:
+                    for k in VLM_INPUT_KEYS:
                         batch.pop(k, None)
                     batch.update(prepared)
 
