@@ -60,7 +60,7 @@ def slurm_time_multiplier(time: str, multiplier: int):
 # Scopes that auto-discover all configs via rglob (no recipe list needed).
 # All other scope/folder combinations read from {scope}_recipes.yml.
 AUTO_DISCOVER_SCOPES = {
-    "release": ["llm_finetune", "vlm_finetune"],
+    "release": ["llm_finetune", "vlm_finetune", "diffusion_finetune"],
     "performance": ["llm_benchmark", "vlm_benchmark"],
 }
 
