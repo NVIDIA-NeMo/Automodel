@@ -1247,8 +1247,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
-                labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
+                num_label_tokens = (batch["labels"] != -100).sum().item()
 
                 # VLM + CP: scatter image/video/audio features into inputs_embeds
                 # on the full un-sharded sequence (mirrors the train path).
@@ -1278,10 +1277,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 ):
                     seq_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
                     batch["position_ids"] = (
-                        torch.arange(0, batch[seq_key].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
+                        torch.arange(0, batch[seq_key].shape[1]).unsqueeze(0).to(self.dist_env.device)
                     )
 
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+                labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
