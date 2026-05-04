@@ -575,6 +575,107 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         return vit_embeds
 
+    def extract_feature_dynamic(
+        self,
+        pixel_values: torch.Tensor,
+        imgs_sizes: "torch.Tensor | list[tuple[int, int]]",
+    ) -> torch.Tensor:
+        """Dynamic-resolution feature extraction (no tile splitting).
+
+        Matches vLLM's dynamic-resolution vision path for Nano v3 VL /
+        Nemotron-Omni (see 3rdparty/vllm/vllm/model_executor/models/
+        nano_nemotron_vl.py). Required when the rollout uses
+        DynamicResolutionImageTiler — tile-based `extract_feature` would
+        produce different embeddings and break rollout/train logprob
+        agreement.
+
+        Unlike vLLM's RADIO port (which supports packed `imgs_sizes=` inputs),
+        the HF RADIO from nvidia/C-RADIOv2-H only accepts a dense
+        `(B, C, H, W)` tensor. We crop each padded image back to its real
+        size and run the vision model per-image, then concatenate features.
+
+        Args:
+            pixel_values: [num_images, C, H_padded, W_padded] batch of
+                dynamically-resized images padded to the batch max (h, w).
+            imgs_sizes: [num_images, 2] actual (h, w) per image (torch tensor
+                of ints) or an equivalent list of tuples.
+
+        Returns:
+            Vision embeddings [sum_num_embeddings_after_pixel_shuffle,
+            llm_hidden_size].
+        """
+        if isinstance(imgs_sizes, torch.Tensor):
+            imgs_sizes_list: list[tuple[int, int]] = [
+                (int(imgs_sizes[i, 0].item()), int(imgs_sizes[i, 1].item())) for i in range(imgs_sizes.shape[0])
+            ]
+        else:
+            imgs_sizes_list = [(int(h), int(w)) for (h, w) in imgs_sizes]
+
+        was_training = self.vision_model.training
+        self.vision_model.eval()
+
+        # Cast to the vision model's expected dtype at the boundary (not at
+        # dataset-load) to match vLLM's normalization-in-fp32 →
+        # cast-to-model-dtype-at-boundary order exactly. Pre-casting in the
+        # data pipeline produced a subtle per-token systematic bias that
+        # showed up as `sampling_importance_ratio` ~0.80 vs mbridge ~0.99.
+        vm_dtype = next(
+            (p.dtype for p in self.vision_model.parameters()),
+            pixel_values.dtype,
+        )
+        if pixel_values.dtype != vm_dtype:
+            pixel_values = pixel_values.to(dtype=vm_dtype)
+
+        per_image_feats: list[torch.Tensor] = []
+        for i, (h, w) in enumerate(imgs_sizes_list):
+            # Crop back to the real resolution before calling RADIO — the
+            # pixel_values tensor is padded to the per-batch (H_padded,
+            # W_padded). Slice both spatial dims.
+            img = pixel_values[i : i + 1, :, :h, :w]
+            out = self.vision_model(img)
+            # HF RADIO returns either a RadioOutput namedtuple or a dict when
+            # adaptors are configured. `.features` is the per-patch features
+            # (N, L, C) layout with feature_fmt='NLC'.
+            feats = getattr(out, "features", None)
+            if feats is None:
+                # Backbone dict variant.
+                feats = out["backbone"].features if isinstance(out, dict) else out[1]
+            feats = feats.to(dtype=torch.bfloat16)
+            # feats: [1, (h//p)*(w//p), C_feat]
+            per_image_feats.append(feats)
+
+        if was_training:
+            self.vision_model.train()
+
+        # Concatenate per-image features along the sequence dim so
+        # `_pixel_shuffle_dynamic_res` can split-and-shuffle them per image.
+        vit_embeds = torch.cat(per_image_feats, dim=-2)
+        vit_embeds = self._pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes_list)
+        vit_embeds = self.vision_projector(vit_embeds)
+
+        return vit_embeds
+
+    def _pixel_shuffle_dynamic_res(self, x: torch.Tensor, imgs_sizes: list[tuple[int, int]]) -> torch.Tensor:
+        """Per-image pixel-shuffle for dynamic-resolution outputs.
+
+        Ported from vLLM's `NanoNemotronVLMultimodal.pixel_shuffle_dynamic_res`.
+        Splits `x` along the sequence dim by per-image patch counts, reshapes
+        each split to (N, H_patches, W_patches, C_feat), applies pixel_shuffle
+        with `downsample_ratio`, and flattens back to a concatenated (N, L', C).
+        """
+        patch_dim = self.patch_size
+        seq_lens = [(h // patch_dim) * (w // patch_dim) for (h, w) in imgs_sizes]
+        splits = torch.split(x, seq_lens, dim=-2)
+        out = []
+        for i, sv in enumerate(splits):
+            h = imgs_sizes[i][0] // patch_dim
+            w = imgs_sizes[i][1] // patch_dim
+            sv = sv.reshape(sv.shape[0], h, w, -1)
+            sv = self.pixel_shuffle(sv, scale_factor=self.downsample_ratio)
+            sv = sv.flatten(1, 2)
+            out.append(sv)
+        return torch.cat(out, dim=-2)
+
     def extract_video_feature(self, pixel_values_videos: torch.Tensor) -> torch.Tensor:
         """Pack ``T = video_temporal_patch_dim`` frames into channels and run the ViT.
 
@@ -653,6 +754,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         image_flags: Optional[torch.LongTensor] = None,
+        imgs_sizes: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
         sound_features: Optional[torch.FloatTensor] = None,
@@ -694,8 +796,50 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         if inputs_embeds is None:
             inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
-        # Process vision inputs
-        if pixel_values is not None and image_flags is not None:
+        # Process vision inputs. We support two mutually-exclusive paths:
+        #
+        #   1) dynamic-resolution (imgs_sizes is not None)
+        #      — matches vLLM's DynamicResolutionImageTiler. Each image is a
+        #        single variable-resolution tensor; extract_feature_dynamic
+        #        emits exactly one contiguous run of embeddings per image.
+        #
+        #   2) tile-based (image_flags is not None)
+        #      — static InternVL-style tiling with one flag per tile. Keeps
+        #        backward compatibility with callers that stick with the
+        #        checkpoint's bundled tile processor.
+        #
+        # When both are None (or pixel_values is None), we skip image
+        # injection and run the LM path on text embeddings only.
+        if pixel_values is not None and imgs_sizes is not None:
+            B, N, C = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(B * N, C)
+            input_ids_flat = input_ids.reshape(B * N)
+            selected = input_ids_flat == self.img_context_token_id
+
+            vit_embeds = self.extract_feature_dynamic(pixel_values, imgs_sizes)
+            vit_embeds = vit_embeds.reshape(-1, C)
+
+            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                logger.info(
+                    f"NemotronOmni (dynamic-res): images={pixel_values.shape[0]}, "
+                    f"imgs_sizes={imgs_sizes.tolist() if isinstance(imgs_sizes, torch.Tensor) else list(imgs_sizes)}, "
+                    f"vit_embeds.shape={tuple(vit_embeds.shape)}, "
+                    f"num_<image>_positions={int(selected.sum().item())}"
+                )
+
+            try:
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds
+            except Exception as e:
+                logger.warning(
+                    f"Shape mismatch (dynamic-res): {e}, "
+                    f"inputs_embeds[selected].shape={inputs_embeds[selected].shape}, "
+                    f"vit_embeds.shape={vit_embeds.shape}"
+                )
+                n_token = int(selected.sum().item())
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
+
+            inputs_embeds = inputs_embeds.reshape(B, N, C)
+        elif pixel_values is not None and image_flags is not None:
             image_flags = image_flags.squeeze(-1)
 
             B, N, C = inputs_embeds.shape

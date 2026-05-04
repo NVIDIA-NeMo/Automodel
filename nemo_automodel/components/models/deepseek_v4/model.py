@@ -340,15 +340,22 @@ class DeepseekV4Model(nn.Module):
         # HF partial_rotary_factor = qk_rope_head_dim / head_dim so cos/sin
         # come out sized to qk_rope_head_dim.
         partial_rotary_factor = float(config.qk_rope_head_dim) / float(config.head_dim)
+        # Reference (``dsv4flash/inference/model.py:519-525``) only applies YaRN
+        # to the compress-rope path: when compress_ratio>0 it uses
+        # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
+        # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
+        rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
+            rope_scaling=None,
         )
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
+            rope_scaling=rope_scaling,
         )
 
     def forward(
