@@ -30,10 +30,10 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
-    linear: torch
+    linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: false
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
