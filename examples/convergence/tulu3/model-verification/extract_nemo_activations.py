@@ -104,7 +104,6 @@ def main():
         cfg_peft=None,
         seed=cfg.get("seed", 42),
         device_mesh=dist_setup.device_mesh,
-        moe_mesh=dist_setup.moe_mesh,
         distributed_config=dist_setup.strategy_config,
         pipeline_config=dist_setup.pipeline_config,
         cfg_moe=dist_setup.moe_config,
