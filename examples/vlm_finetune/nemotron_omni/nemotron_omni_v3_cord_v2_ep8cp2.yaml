@@ -1,8 +1,8 @@
-# NemotronOmni v3 (Reasoning) fine-tuning on CORD-V2 -- ep4cp2 (CP=2 test)
+# NemotronOmni v3 (Reasoning) fine-tuning on CORD-V2 -- ep8cp2 (CP=2 test)
 #
 # Run:
 #   cd automodel-omni
-#   automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_v3_cord_v2_ep4cp2.yaml --nproc-per-node 8
+#   automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_v3_cord_v2_ep8cp2.yaml --nproc-per-node 8
 
 recipe: FinetuneRecipeForVLM
 
