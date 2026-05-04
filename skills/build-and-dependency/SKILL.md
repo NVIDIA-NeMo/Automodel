@@ -29,12 +29,37 @@ docker run --gpus all -it nvcr.io/nvidia/nemo-automodel:26.04
 ### Option 1: NeMo-AutoModel Container (NGC)
 
 The container ships with all dependencies pre-installed at `/opt/Automodel`
-(WORKDIR) with the venv at `/opt/venv`. To develop against your host checkout,
-bind-mount over the installed source:
+(WORKDIR) with the venv at `/opt/venv`. Run as-is:
 
 ```bash
-docker run --gpus all -v $(pwd):/opt/Automodel -it nvcr.io/nvidia/nemo-automodel:26.04
+docker run --gpus all --network=host -it --rm --shm-size=32g \
+    nvcr.io/nvidia/nemo-automodel:26.04 /bin/bash
 ```
+
+#### Mounting your local checkout into the container
+
+To develop against your host checkout, bind-mount it over `/opt/Automodel` to
+override the installed source:
+
+```bash
+docker run --gpus all --network=host -it --rm --shm-size=32g \
+    -v <local-Automodel-path>:/opt/Automodel \
+    nvcr.io/nvidia/nemo-automodel:26.04 /bin/bash
+```
+
+Inside the container, patch `pyproject.toml` / `uv.lock` for the PyTorch base
+image, then re-sync:
+
+```bash
+cd /opt/Automodel
+bash docker/common/update_pyproject_pytorch.sh /opt/Automodel
+uv sync --locked --all-groups --extra all
+```
+
+> **Warning:** the `update_pyproject_pytorch.sh` step is required. Without it,
+> `uv sync` will try to reinstall `torch`, which leads to CUDA version
+> mismatches and TE import failures — uv cannot recognize the torch baked into
+> the PyTorch base container.
 
 ### Option 2: uv (Recommended for Local Development)
 
