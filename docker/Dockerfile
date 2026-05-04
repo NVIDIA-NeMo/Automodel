@@ -62,8 +62,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install TE
-ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.11
+ARG INSTALL_TE=True
+ARG TE_COMMIT=release_v2.14
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
