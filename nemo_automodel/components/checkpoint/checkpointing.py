@@ -643,6 +643,11 @@ class Checkpointer:
             and getattr(mod, "padding_idx", None) is not None
             for mod in model.modules()
         )
+        # Models that know the upcoming load will fully populate every tensor
+        # (e.g. Devstral FP8 via its state_dict_adapter) can opt out of HF's
+        # random init. Skipping also sidesteps stage-divergent DTensor
+        # collectives inside `initialize_weights()` that would hang PP setups.
+        owns_weight_load = bool(getattr(model, "_skip_init_weights_on_load", False))
         skip_initialize_weights = (
             model_class
             in [
@@ -652,6 +657,7 @@ class Checkpointer:
             or is_nemotron_v2
             or is_nemotron_v3_hf
             or has_padding_idx
+            or owns_weight_load
         )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
@@ -924,7 +930,13 @@ class Checkpointer:
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
-            fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
+            pre_shard_hf_state_dict_keys = (
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+            )
+            if pre_shard_hf_state_dict_keys:
+                fqn_to_file_index_mapping = {k: 1 for k in pre_shard_hf_state_dict_keys}
+            else:
+                fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)

@@ -435,6 +435,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     batch_negatives = examples["neg_doc"]
 
     cur_pos_neg_doc_batch = []
+    cur_pos_neg_doc_id_batch = []
 
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
@@ -459,6 +460,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
             cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
+        cur_pos_neg_doc_id_batch.append([d["id"] for d in cur_pos_neg_doc])
 
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []
@@ -505,6 +507,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         "question": questions,
         "doc_text": cur_pos_neg_text_batch,
         "doc_image": cur_pos_neg_image_batch,
+        "doc_id": cur_pos_neg_doc_id_batch,
         "query_instruction": query_instruction_batch,
         "passage_instruction": passage_instruction_batch,
     }

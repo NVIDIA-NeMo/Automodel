@@ -120,6 +120,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
         ),
         (
+            "Mistral3FP8VLMForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.mistral3_vlm.model",
+                "Mistral3FP8VLMForConditionalGeneration",
+            ),
+        ),
+        (
             "NemotronHForCausalLM",
             ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
         ),
@@ -140,6 +147,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
                 "nemo_automodel.components.models.llava_onevision.model",
                 "LLaVAOneVision1_5_ForConditionalGeneration",
             ),
+        ),
+        (
+            "HYV3ForCausalLM",
+            ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
         (
             "Qwen2ForCausalLM",
@@ -182,6 +193,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
+    "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
