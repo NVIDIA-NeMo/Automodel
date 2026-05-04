@@ -872,7 +872,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         *,
         _pre_embed_only: bool = False,
         **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[dict, Tuple, CausalLMOutputWithPast]:
         """Forward pass for training.
 
         This follows the same pattern as the HF NemotronH_Nano_Omni_Reasoning_V3.forward():

@@ -308,9 +308,11 @@ def make_cp_batch_and_ctx(
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(loss_mask)
 
-    # Add padding_mask if available in batch
+    # Add padding_mask if available in batch (track index so post-pad mirror works)
+    padding_mask_idx = None
     if "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
+        padding_mask_idx = len(cp_buffers)
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
@@ -346,6 +348,10 @@ def make_cp_batch_and_ctx(
             batch["input_ids"] = cp_buffers[0]
         batch["labels"] = cp_buffers[1]
         batch["position_ids"] = cp_buffers[2]
+        # padding_mask was sourced from batch, so mirror its padded version back
+        # too so any consumer reading batch["padding_mask"] sees the matched shape.
+        if padding_mask_idx is not None:
+            batch["padding_mask"] = cp_buffers[padding_mask_idx]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

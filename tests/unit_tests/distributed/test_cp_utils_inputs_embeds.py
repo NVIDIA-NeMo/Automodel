@@ -289,6 +289,47 @@ def test_padding_handles_loss_mask_and_padding_mask(monkeypatch):
         assert buf.shape[1] == expected, f"cp_buffers[{i}] not padded to {expected}: shape={tuple(buf.shape)}"
 
 
+def test_padding_mirrors_padding_mask_back_into_batch(monkeypatch):
+    """When padding triggers and the batch had a ``padding_mask``, the padded
+    version must be mirrored back into ``batch["padding_mask"]`` so any
+    downstream consumer reading the batch sees the matched shape (avoids a
+    latent shape-mismatch trap if a future model accepts padding_mask)."""
+    captured = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
+    seq_len = 6  # 6 % 4 = 2 -> pad to 8
+    inputs_embeds = torch.randn(1, seq_len, 8)
+    labels = torch.zeros(1, seq_len, dtype=torch.long)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    padding_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "labels": labels,
+        "position_ids": position_ids,
+        "padding_mask": padding_mask,
+    }
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    expected_padded_len = 8
+    # All four batch entries reflect the padded shape
+    assert batch["inputs_embeds"].shape[1] == expected_padded_len
+    assert batch["labels"].shape[1] == expected_padded_len
+    assert batch["position_ids"].shape[1] == expected_padded_len
+    assert batch["padding_mask"].shape[1] == expected_padded_len
+    # And the mirror is the same object the cp_buffers hold (not a stale copy)
+    pmask_idx = next(
+        i for i, b in enumerate(captured["cp_buffers"]) if b is batch["padding_mask"]
+    )
+    assert pmask_idx >= 3, "padding_mask must come after the primary trio"
+
+
 def test_padding_no_op_when_seq_already_aligned(monkeypatch):
     """seq_len already divisible by cp_size*2 -> no padding needed; buffers
     must be the original objects (identity-preserving)."""
