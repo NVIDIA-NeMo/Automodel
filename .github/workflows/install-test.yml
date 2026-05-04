@@ -19,6 +19,16 @@ jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
 
+  setup-install-image:
+    runs-on: ubuntu-latest
+    outputs:
+      cuda_image: ${{ steps.cfg.outputs.cuda_image }}
+    steps:
+      - id: cfg
+        shell: bash
+        run: |
+          echo "cuda_image=${CUDA_CONTAINER_IMAGE}" >> "$GITHUB_OUTPUT"
+
   pip-test:
     runs-on: ${{ matrix.arch }}
     name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
@@ -64,12 +74,12 @@ jobs:
   ngc-cuda-test-uv:
     runs-on: linux-amd64-cpu16
     name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
-    needs: [pre-flight]
+    needs: [pre-flight, setup-install-image]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     container:
-      image: ${{ env.CUDA_CONTAINER_IMAGE }}
+      image: ${{ needs.setup-install-image.outputs.cuda_image }}
     environment: nemo-ci
     strategy:
       fail-fast: false
@@ -146,9 +156,9 @@ jobs:
     runs-on: linux-amd64-cpu16
     name: Build CUDA wheelhouse - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
     container:
-      image: ${{ env.CUDA_CONTAINER_IMAGE }}
+      image: ${{ needs.setup-install-image.outputs.cuda_image }}
     environment: nemo-ci
-    needs: [pre-flight]
+    needs: [pre-flight, setup-install-image]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
@@ -220,9 +230,9 @@ jobs:
     runs-on: linux-amd64-cpu16
     name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
     container:
-      image: ${{ env.CUDA_CONTAINER_IMAGE }}
+      image: ${{ needs.setup-install-image.outputs.cuda_image }}
     environment: nemo-ci
-    needs: [pre-flight, cuda-wheelhouse]
+    needs: [pre-flight, setup-install-image, cuda-wheelhouse]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
@@ -339,7 +349,7 @@ jobs:
           python-binary: ./venv/bin/python
 
   install-test-summary:
-    needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, ngc-cuda-test-pip, pre-flight]
+    needs: [pip-test, uv-test, ngc-cuda-test-uv, cuda-wheelhouse, ngc-cuda-test-pip, pre-flight, setup-install-image]
     runs-on: ubuntu-latest
     name: Install test summary
     if: |
