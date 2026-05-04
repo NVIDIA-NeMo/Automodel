@@ -951,12 +951,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-        # VLM + CP > 1 (non-PP): scatter image/video/audio features into
-        # inputs_embeds on the full un-sharded sequence before context_parallel
-        # shards along the seq dim. We route through model.__call__ so FSDP2's
-        # forward pre-hook fires and all-gathers the vision tower's sharded
-        # weights (calling prepare_*_for_cp directly skips the hook -> mixed
-        # Tensor/DTensor errors).
+        # Routed through __call__ so FSDP2 forward pre-hook fires and
+        # unshards the vision tower's weights before the embed/scatter.
         _model = self.model_parts[0]
         _cp_active = self.dist_setup.cp_size > 1 and not self.pp_enabled
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
@@ -1049,33 +1045,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with sync_ctx:
-                with train_ctx():
-                    batch = filter_forward_kwargs(model, batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        # use num_logits_to_keep to avoid full logits matrix in memory
-                        out = model(logits_to_keep=1, **batch)
-                        if "hidden_states" not in out:
-                            raise ValueError(
-                                "FusedLinearCrossEntropy requires the model to output hidden states. "
-                                "Set `model.text_config.output_hidden_states=True` in the config."
-                            )
-                    else:
-                        out = model(**batch)
+            with sync_ctx, train_ctx():
+                batch = filter_forward_kwargs(model, batch)
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                    # use num_logits_to_keep to avoid full logits matrix in memory
+                    out = model(logits_to_keep=1, **batch)
+                    if "hidden_states" not in out:
+                        raise ValueError(
+                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            "Set `model.text_config.output_hidden_states=True` in the config."
+                        )
+                else:
+                    out = model(**batch)
 
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=model,
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
-                        num_label_tokens=num_label_tokens,
-                    )
-                    loss_buffer.append(local_loss.clone().detach())
-                    if is_train:
-                        (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                local_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=getattr(out, "logits", out),
+                    labels=labels,
+                    model=model,
+                    hidden_states=out.hidden_states[-1]
+                    if getattr(out, "hidden_states", None) is not None
+                    else None,
+                    num_label_tokens=num_label_tokens,
+                )
+                loss_buffer.append(local_loss.clone().detach())
+                if is_train:
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1239,8 +1234,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                # VLM + CP: scatter image/video/audio features into inputs_embeds
-                # on the full un-sharded sequence (mirrors the train path).
                 _model = self.model_parts[0]
                 _cp_active = self.device_mesh and self.device_mesh["cp"].size() > 1
                 if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
@@ -1249,16 +1242,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     for k in VLM_INPUT_KEYS:
                         batch.pop(k, None)
                     batch.update(prepared)
-
-                if (
-                    self.device_mesh
-                    and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-                ):
-                    seq_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
-                    batch["position_ids"] = (
-                        torch.arange(0, batch[seq_key].shape[1]).unsqueeze(0).to(self.dist_env.device)
-                    )
 
                 train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
