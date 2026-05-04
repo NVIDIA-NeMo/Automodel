@@ -29,7 +29,7 @@ model:
   torch_dtype: torch.bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: te
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
@@ -63,8 +63,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
-  path_or_dataset: naver-clova-ix/cord-v2
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
   split: train
 
 dataloader:
@@ -76,8 +76,8 @@ dataloader:
   drop_last: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
-  path_or_dataset: naver-clova-ix/cord-v2
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
   split: validation
 
 validation_dataloader:
@@ -86,6 +86,11 @@ validation_dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.nemotron_omni_collate_fn
     max_length: 4096
+
+wandb:
+  entity: Nemo-automodel
+  project: huiyingl_workspace
+  name: nomni_v3_medpix_ep8cp1_te
 
 optimizer:
   _target_: torch.optim.AdamW
