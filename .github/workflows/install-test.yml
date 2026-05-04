@@ -11,6 +11,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
   cancel-in-progress: true
 
+env:
+  TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
+  CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
+
 jobs:
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
@@ -65,7 +69,7 @@ jobs:
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     container:
-      image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+      image: ${{ env.CUDA_CONTAINER_IMAGE }}
     environment: nemo-ci
     strategy:
       fail-fast: false
@@ -142,7 +146,7 @@ jobs:
     runs-on: linux-amd64-cpu16
     name: Build CUDA wheelhouse - Python${{ matrix.python-version }} - AMD64/Linux - NGC CUDA
     container:
-      image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+      image: ${{ env.CUDA_CONTAINER_IMAGE }}
     environment: nemo-ci
     needs: [pre-flight]
     if: |
@@ -183,7 +187,7 @@ jobs:
           . ./venv/bin/activate
 
           pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
+          pip install --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
           pip install numpy packaging psutil pybind11 setuptools wheel wheel_stub
 
           mkdir -p "${WHEELHOUSE_DIR}"
@@ -192,7 +196,7 @@ jobs:
             mamba-ssm \
             nv-grouped-gemm \
             transformer-engine-torch \
-            "transformer-engine[pytorch]<=2.11.0"
+            "transformer-engine[pytorch]>=2.14.1"
 
       - name: Verify CUDA wheelhouse contents
         shell: bash -x -e -u -o pipefail {0}
@@ -216,7 +220,7 @@ jobs:
     runs-on: linux-amd64-cpu16
     name: Pip - Python${{ matrix.python-version }}${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }} - AMD64/Linux - NGC CUDA
     container:
-      image: nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+      image: ${{ env.CUDA_CONTAINER_IMAGE }}
     environment: nemo-ci
     needs: [pre-flight, cuda-wheelhouse]
     if: |
@@ -260,7 +264,7 @@ jobs:
           PIP_ARGS=()
 
           if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
-            pip install --find-links "${PIP_FIND_LINKS}" --index-url https://download.pytorch.org/whl/cu128 "torch<=2.8.0"
+            pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
             pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"

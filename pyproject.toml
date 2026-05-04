@@ -235,12 +235,12 @@ liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 
