@@ -224,7 +224,7 @@ constraint-dependencies = [
     "pygments>=2.20.0",
 ]
 override-dependencies = [
-    "nvidia-cudnn-cu12==9.19.0.56; sys_platform == 'linux'"
+    "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
 ]
 prerelease = "allow"
 

@@ -73,7 +73,7 @@ constraints = [
     { name = "urllib3", specifier = ">=2.6.3" },
     { name = "wheel", specifier = ">=0.46.2" },
 ]
-overrides = [{ name = "nvidia-cudnn-cu12", marker = "sys_platform == 'linux'", specifier = "==9.19.0.56" }]
+overrides = [{ name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = "==13.4.1.1" }]
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
@@ -3975,11 +3975,14 @@ wheels = [
 
 [[package]]
 name = "nvidia-cublas"
-version = "13.1.0.3"
+version = "13.4.1.1"
 source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux'" },
+]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e1/a5/fce49e2ae977e0ccc084e5adafceb4f0ac0c8333cb6863501618a7277f67/nvidia_cublas-13.1.0.3-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c86fc7f7ae36d7528288c5d88098edcb7b02c633d262e7ddbb86b0ad91be5df2", size = 542851226, upload-time = "2025-10-09T08:59:04.818Z" },
-    { url = "https://files.pythonhosted.org/packages/e7/44/423ac00af4dd95a5aeb27207e2c0d9b7118702149bf4704c3ddb55bb7429/nvidia_cublas-13.1.0.3-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:ee8722c1f0145ab246bccb9e452153b5e0515fd094c3678df50b2a0888b8b171", size = 423133236, upload-time = "2025-10-09T08:59:32.536Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/d0/4e327087b6026a15d83b31ee1268fa16292e3bb71fb402bbe017bf6649ac/nvidia_cublas-13.4.1.1-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:6351d2d921527479d6d5002e620fe1971d3e10c730b544c02a36d65301efb00d", size = 513048233, upload-time = "2026-04-28T21:25:23.612Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/79/0cefdaa1d9e45018a227bac64a79b92d2733cde28a8fd09c65362de08622/nvidia_cublas-13.4.1.1-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:28c983c8c03aa9a2d7b36cddcef2bfeeea85e13241d77df7622665502159f347", size = 404870806, upload-time = "2026-04-28T21:25:06.483Z" },
 ]
 
 [[package]]
