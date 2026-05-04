@@ -283,6 +283,66 @@ class TestPatchHfModelSentinel:
         assert getattr_after_first is getattr_after_second
 
 
+class TestPatchHfModelStateDictAdapter:
+    """Verify that patch_hf_model attaches a state_dict_adapter for HF-format saves."""
+
+    @staticmethod
+    def _stub_and_import(monkeypatch):
+        for path in (
+            "transformers.models.qwen3_5_moe",
+            "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+            "transformers.models.qwen3_5",
+            "transformers.models.qwen3_5.modeling_qwen3_5",
+        ):
+            if path not in sys.modules:
+                stub = types.ModuleType(path)
+                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+                monkeypatch.setitem(sys.modules, path, stub)
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
+        return patch_hf_model
+
+    def test_attaches_dense_state_dict_adapter(self, fake_model, monkeypatch):
+        """After patching, model.state_dict_adapter rewrites _fp32_params keys for HF saves."""
+        from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
+            Qwen3_5DenseStateDictAdapter,
+        )
+
+        patch_hf_model = self._stub_and_import(monkeypatch)
+        assert not hasattr(fake_model, "state_dict_adapter")
+
+        patch_hf_model(fake_model, cp_enabled=False)
+
+        adapter = getattr(fake_model, "state_dict_adapter", None)
+        assert isinstance(adapter, Qwen3_5DenseStateDictAdapter)
+        # Smoke-check round-trip behaviour on a sample state dict.
+        out = adapter.to_hf({"layers.0.linear_attn._fp32_params.A_log": torch.zeros(4)})
+        assert list(out.keys()) == ["layers.0.linear_attn.A_log"]
+
+    def test_does_not_overwrite_existing_adapter(self, fake_model, monkeypatch):
+        """If a model already has a state_dict_adapter, it is preserved."""
+        patch_hf_model = self._stub_and_import(monkeypatch)
+        sentinel = object()
+        fake_model.state_dict_adapter = sentinel
+
+        patch_hf_model(fake_model, cp_enabled=False)
+
+        assert fake_model.state_dict_adapter is sentinel
+
+    def test_no_adapter_when_no_layers_patched(self, monkeypatch):
+        """Adapter is only attached when at least one GatedDeltaNet layer was patched."""
+        patch_hf_model = self._stub_and_import(monkeypatch)
+
+        model = nn.Module()  # no GatedDeltaNet children at all
+        patch_hf_model(model, cp_enabled=False)
+
+        assert not hasattr(model, "state_dict_adapter")
+
+
 class TestAttachLinearAttnPositionHooks:
     def test_hook_caches_position_ids(self, fake_model):
         """Pre-hook stores position_ids on linear_attn module."""
