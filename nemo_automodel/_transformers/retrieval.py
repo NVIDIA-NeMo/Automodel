@@ -227,11 +227,18 @@ class BiEncoderModel(nn.Module):
 
     _TASK = "embedding"
 
-    def __init__(self, model: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        do_distributed_inbatch_negative: bool = False,
+    ):
         super().__init__()
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
 
     @classmethod
     def build(
@@ -240,6 +247,7 @@ class BiEncoderModel(nn.Module):
         task: str = None,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        do_distributed_inbatch_negative: bool = False,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -254,7 +262,12 @@ class BiEncoderModel(nn.Module):
             model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
 
-        return cls(model=backbone, pooling=pooling, l2_normalize=l2_normalize)
+        return cls(
+            model=backbone,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+        )
 
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)
