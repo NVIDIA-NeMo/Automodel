@@ -145,7 +145,7 @@ What you can expect:
 - ✅ **Extended MoE support** - GPT-OSS, Qwen3 / Qwen3.5 / Qwen3.6 MoE, Qwen-next, MiniMax-M2.x, GLM-4.7 / GLM-5 / GLM-5.1, DeepSeek V3.2 / V4 / V4-Flash, Hy3-preview.
 - ✅ **Dion optimizer** - Distributed Dion optimizer integration.
 - ✅ **Agent-friendly skills** - Curated [`skills/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/skills) for common dev tasks (recipe runs, model onboarding, CI).
-- ✅ **Transformers v5 🤗** - Built on `transformers==5.5.0` with device-mesh driven parallelism.
+- ✅ **Transformers v5 🤗** - Built on latest transformers with device-mesh driven parallelism.
 
 - 🔜 **Muon optimizer** - Muon optimizer support.
 - 🔜 **SonicMoE** - Optimized MoE implementation for faster expert computation.
