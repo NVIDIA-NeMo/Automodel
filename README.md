@@ -124,7 +124,7 @@ What you can expect:
 
 ## Feature Roadmap
 
-✅ _Available now (v0.4.0 / 26.02 container)_ | 🔜 _Coming next_
+✅ _Available now ([v0.4.0](https://pypi.org/project/nemo-automodel/0.4.0/) / [26.04 container](nvcr.io/nvidia/nemo-automodel:26.04))_ | 🔜 _Coming next_
 
 - ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for distributed training.
 - ✅ **HSDP** - Multi-node Hybrid Sharding Data Parallelism based on FSDP2.
