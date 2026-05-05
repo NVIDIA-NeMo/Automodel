@@ -85,5 +85,168 @@ install profile is in [Breaking Changes](breaking-changes.md).
 
 ---
 
+## 0.3.0 (2026-02-26)
+
+### Highlights
+
+- **Transformers v4 / v5 alignment.** New `transformers v4` API support and a
+  v5 refactor for device-mesh-only model init.
+- **Streaming safetensors writer** for faster checkpoint export.
+- **Faster fp8 dequant kernels** with DTensor dequantization fixes for DSv3.
+
+### New Models
+
+- **LLM:** DeepSeek 3.2, Step3p5, Minimax M2, Nano v3 custom, Nemotron Flash,
+  GLM 4.7, Devstral (backported to v4).
+- **MoE / VLM:** Qwen3-VL custom implementation (235B, 30B, 4B/8B configs),
+  Kimi-VL, Kimi K2.5 VL, Qwen3-Omni port via `transformers omni`,
+  Nemotron-Parse VLM.
+
+### Distributed Training
+
+- v5 refactor: device-mesh-only model init.
+- TP plan for Ministral; Ministral3 ported to transformers v4.
+- Pipeline-parallelism validation support.
+- Parallel diffusers `generate`.
+
+### Performance and Kernels
+
+- TE fp8 for models that support it.
+- `GroupedExpertsTE` backend (prerequisite for MoE fp8).
+- TE RoPE fusion for custom MoE models; norm fusion and RoPE cache for dense
+  models.
+- Improved import time.
+
+### PEFT
+
+- DoRA implementation.
+- LoRA support for custom MoEs.
+- LoRA support in Biencoder.
+
+### Datasets and Workflow
+
+- Databricks Deltalake dataset support; consolidation for Databricks.
+- Parquet file support; inline text dataset format.
+- `ColumnMapped`: configurable special tokens, chat-template flags, and
+  answer-only masking.
+- Hard negative mining and biencoder + inline-dataset tests.
+- nsys benchmark support and model-layer name scoping in the CLI.
+- Updated checkpoint auto-loading with explicit `restore_from`.
+- Dion optimizer.
+- Functiongemma + xlam tool-calling recipes.
+
+### Notable Fixes
+
+- `inputs_embeds` passthrough for Nano v3.
+- `from_pretrained` / `from_config` simplification with model-id pass-through.
+- Tied-embedding detection improvements.
+
+---
+
+## 0.2.0 (2025-12-04)
+
+### Highlights
+
+- **Async checkpointing.** Checkpoint refactor with async DCP and HF
+  safetensors backport / consolidation.
+- **Custom MoE optimizations.** FSDP optimizations, packed-sequence + context
+  parallel via TE, configurable router precision, fp32 `lm_head` and
+  fp32 `apply_rope`.
+- **Performance documentation.** New performance-summary doc and benchmarking
+  recipe with configs.
+- **Multinode + cluster guidance.** Multinode configs and updated launcher
+  docs.
+
+### New Models
+
+- **MoE:** Qwen3 MoE custom implementation, Qwen3 Next, GPT-OSS (custom
+  implementation, dequantization, DGX Spark recipe), GLM 4 / 4.5 / 4.6 MoE,
+  GLM 4.5 Air, Moonlight 2L test, Phi 4 (TP plan).
+- **DeepSeek v3** with fp8 base checkpoint loading.
+- **Sequence classification:** Qwen3ForSequenceClassification registered;
+  generic SFT sequence-classification recipe.
+
+### Distributed Training
+
+- VLM EP and Qwen-Omni custom implementation.
+- PP for VLM; PEFT with PP.
+- Sharding optimization for SP / LoRA.
+- `clip_grad_norm` across all parallelism modes.
+- `fully_shard_by_dtype` option.
+- Out-of-tree (OOT) parallelism decorator.
+
+### Performance and Kernels
+
+- Mask creation moved into the data pipeline for better perf.
+- TE attention for GPT-OSS.
+- Faster fp8 dequant; auto-detect base-weights dequant.
+
+### PEFT
+
+- LoRA-aware `ColwiseParallel` / `RowwiseParallel`.
+- LoRA + TE.
+- MFU estimation for LoRA.
+- Additional PEFT LoRA recipes.
+
+### Datasets and Recipes
+
+- Multiturn chat dataset; VLM multiturn chat support.
+- Tool-calling dataset and recipe.
+- Streaming dataset.
+- Multiple validation datasets with per-dataset logging.
+- ColumnMapped: surface truncating + padding options.
+- Configurable max-clip-grad; configurable remote-logging frequency via
+  `step_scheduler`.
+- Validation-loss checkpoint, run-val-at-ckpt, best-ckpt symlink.
+- InternVL recipe; Qwen3-VL 30B recipe; Llama-Embed-Nemotron-8B training.
+
+### Logging and Observability
+
+- MLflow integration.
+- Metric logger with JSONL output.
+- YAML logging-to-stdout improvements.
+
+### Workflow
+
+- Knowledge-distillation custom validation step; `ScopedModuleOffloading` to
+  reduce memory.
+- Model Registry component.
+- SIGTERM handling.
+- `NEMO_ENABLE_USER_MODULES` for user-extension modules.
+- Rank-0 download for custom models.
+- Dereference env vars in YAML.
+
+---
+
+## 0.1.2 (2025-10-23)
+
+Patch release.
+
+- **Fix:** `max_steps` now set inside the constructor (#650).
+- **Fix:** step scheduler switched to zero-based indexing (#627).
+- **Fix:** sample-limit handling for `ColumnMapped` datasets (#521).
+
+---
+
+## 0.1.0 (2025-10-08)
+
+Initial public release of NeMo AutoModel.
+
+### Highlights
+
+- PyTorch-native training framework for LLMs and VLMs with HuggingFace
+  Transformers integration via `NeMoAuto*` wrapper classes.
+- YAML-driven recipes for SFT and PEFT.
+- FSDP2 / HSDP / DDP distributed training with DTensor sharding.
+- Megatron-FSDP available as the default heavy-duty sharding option (replaces
+  the earlier nvFSDP path).
+- Knowledge distillation recipe.
+- MoE component with DeepSeek v3 model implementation.
+- `ColumnMappedTextInstructionDataset` for instruction tuning.
+- Gradient checkpointing.
+- Slurm launcher.
+
+---
+
 For the list of newly supported models per release, see the
 [Model Coverage Release Log](model-coverage/latest-models.md).
