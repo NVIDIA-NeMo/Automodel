@@ -84,7 +84,7 @@ jobs:
         || !(needs.pre-flight.outputs.docs_only == 'true'
              || needs.pre-flight.outputs.is_deployment_workflow == 'true')
       )
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@ca6bda93283f6c3b5684d132dec0d5b33e40d2ef
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@6f5c2545f1d0e1c47ab939ab6ac87079c38fb095
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_automodel
@@ -109,8 +109,6 @@ jobs:
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      SSH_KEY: ${{ secrets.SSH_KEY }}
-      SSH_PWD: ${{ secrets.SSH_PWD }}
       BOT_KEY: ${{ secrets.BOT_KEY }}
       AWS_ASSUME_ROLE_ARN: ${{ secrets.AWS_ASSUME_ROLE_ARN }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
