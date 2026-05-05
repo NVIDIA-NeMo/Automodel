@@ -1,6 +1,8 @@
 # Breaking Changes
 
-## CLI Signature Change
+## 0.4.0 · 26.04
+
+### CLI Signature Change
 
 **Before:**
 
@@ -23,7 +25,7 @@ am <config.yaml> [--nproc-per-node N] [--overrides ...]
 The positional `<command>` and `<domain>` arguments have been removed. The recipe
 class is now specified inside the YAML config via the `recipe._target_` key.
 
-## YAML Config: New Required `recipe` Section
+### YAML Config: New Required `recipe` Section
 
 All YAML configs now require a top-level `recipe:` key:
 
@@ -34,7 +36,7 @@ recipe:
 
 Configs without this key will produce an error with guidance on which target to add.
 
-### Available Recipe Targets
+#### Available Recipe Targets
 
 | Use Case | `_target_` |
 |---|---|
@@ -45,7 +47,7 @@ Configs without this key will produce an error with guidance on which target to 
 | Sequence classification | `nemo_automodel.recipes.llm.train_seq_cls.TrainFinetuneRecipeForSequenceClassification` |
 | Biencoder training | `nemo_automodel.recipes.biencoder.train_biencoder.TrainBiencoderRecipe` |
 
-## Launcher Configuration Moved to YAML
+### Launcher Configuration Moved to YAML
 
 Multi-node launch settings (Kubernetes, NeMo-Run) are now configured
 entirely within the YAML config file rather than through CLI arguments.
@@ -57,7 +59,7 @@ entirely within the YAML config file rather than through CLI arguments.
 
 If none of these sections are present the job runs locally (interactive mode).
 
-## SLURM: Script-Based Submission
+### SLURM: Script-Based Submission
 
 The `slurm:` YAML section and all related fields have been removed.  SLURM
 jobs are now submitted with `sbatch` directly, using a self-contained sbatch
@@ -74,7 +76,7 @@ detects the distributed environment and executes the recipe in-process.
 All cluster-specific configuration lives in the sbatch script where you can
 see and edit it directly.
 
-## Lightweight CLI-Only Install
+### Lightweight CLI-Only Install
 
 A new `automodel[cli]` install extra is available for login nodes or environments
 where you only need to submit jobs (SLURM, k8s, NeMo-Run) without running
@@ -90,14 +92,14 @@ separately (`pip install nemo-run`). If you try to run a local/interactive job
 with the CLI-only install, you will get a clear error message with instructions
 to install the full package.
 
-## CLI Module Lives Inside the Package
+### CLI Module Lives Inside the Package
 
 The CLI entry-point lives at `nemo_automodel/cli/app.py` and is registered as
 the `automodel` / `am` console entry-points. A thin convenience wrapper
 (`app.py`) at the repository root is available for running from a source
 checkout but is **not** installed as part of the package.
 
-## Example Wrapper Scripts Deprecated
+### Example Wrapper Scripts Deprecated
 
 The Python wrapper scripts in `examples/` (for example, `examples/llm_finetune/finetune.py`)
 are deprecated. They now print a deprecation warning and delegate to the recipe
