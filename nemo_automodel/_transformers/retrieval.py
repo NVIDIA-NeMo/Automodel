@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -72,16 +73,21 @@ def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn
     return model
 
 
-def _load_extracted_state_dict(model: nn.Module, extracted_model: nn.Module, task: str) -> None:
-    """Load extracted text weights into a task-specific retrieval model."""
-    target_model = model
-    if task == "score":
-        target_model = getattr(model, "base_model", None)
-        if target_model is None:
-            target_model = getattr(model, "model", None)
-        if target_model is None:
-            raise ValueError(f"Cannot load extracted text weights into {type(model).__name__}; no base model found.")
-    target_model.load_state_dict(extracted_model.state_dict())
+def _load_from_extracted_state(
+    backbone_class: type[PreTrainedModel],
+    config,
+    extracted_model: PreTrainedModel,
+) -> PreTrainedModel:
+    """Load a target backbone from an extracted model's in-memory state dict."""
+    # Use the base HF loader because some retrieval classes override
+    # from_pretrained for path-based checkpoint loading.
+    backbone = PreTrainedModel.from_pretrained.__func__(
+        backbone_class,
+        None,
+        config=config,
+        state_dict=extracted_model.state_dict(),
+    )
+    return _move_to_extracted_dtype(backbone, extracted_model)
 
 
 def _build_backbone_from_extracted_submodel(
@@ -95,47 +101,42 @@ def _build_backbone_from_extracted_submodel(
     text_config = extracted_model.config
     model_type = getattr(text_config, "model_type", "")
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+    has_supported_target = task_map is not None and task in task_map
 
-    if task_map is not None and task not in task_map and task != "score":
+    if task_map is not None and not has_supported_target and task != "score":
         raise ValueError(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
 
-    if task_map is None or task not in task_map:
-        if task != "score":
-            return extracted_model
+    if task == "score" and not has_supported_target:
         config = text_config.__class__.from_dict(text_config.to_dict())
-        attn_implementation = getattr(text_config, "_attn_implementation", None)
-        if attn_implementation is not None:
-            config._attn_implementation = attn_implementation
-        if num_labels is not None:
-            config.num_labels = num_labels
-        backbone = AutoModelForSequenceClassification.from_config(config)
-        _load_extracted_state_dict(backbone, extracted_model, task)
-        return _move_to_extracted_dtype(backbone, extracted_model)
-
-    backbone_class = _get_supported_backbone_class(model_type, task)
-    config_class = getattr(backbone_class, "config_class", None)
-    if config_class is None or not hasattr(text_config, "to_dict"):
+        try:
+            backbone_class = MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING[type(config)]
+        except KeyError as exc:
+            raise ValueError(f"No HuggingFace sequence-classification model found for '{model_type}'.") from exc
+    elif not has_supported_target:
         return extracted_model
+    else:
+        backbone_class = _get_supported_backbone_class(model_type, task)
+        config_class = getattr(backbone_class, "config_class", None)
+        if config_class is None or not hasattr(text_config, "to_dict"):
+            return extracted_model
 
-    config_dict = text_config.to_dict()
-    config_dict.pop("model_type", None)
-    config = config_class(**config_dict)
+        config_dict = text_config.to_dict()
+        config_dict.pop("model_type", None)
+        config = config_class(**config_dict)
 
     attn_implementation = getattr(text_config, "_attn_implementation", None)
     if attn_implementation is not None:
         config._attn_implementation = attn_implementation
-    if pooling is not None:
+    if has_supported_target and pooling is not None:
         config.pooling = pooling
     if num_labels is not None:
         config.num_labels = num_labels
-    if temperature is not None:
+    if has_supported_target and temperature is not None:
         config.temperature = temperature
 
-    backbone = backbone_class(config)
-    _load_extracted_state_dict(backbone, extracted_model, task)
-    return _move_to_extracted_dtype(backbone, extracted_model)
+    return _load_from_extracted_state(backbone_class, config, extracted_model)
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
