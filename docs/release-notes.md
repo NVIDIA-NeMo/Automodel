@@ -4,17 +4,19 @@
 
 ### Highlights
 
-- **New CLI.** `automodel <config.yaml>` replaces the old
-  `automodel <command> <domain> -c <config>` form, with a short alias `am`.
-  See [Breaking Changes](breaking-changes.md) for the full migration guide.
+- **Discrete-diffusion LLMs (dLLM).** SFT and generation support for dLLM
+  models, including Llada.
+- **Embedding and retrieval training.** Reranker training, biencoder datasets
+  loaded directly from the HuggingFace Hub, in-batch negative sampling, and
+  ONNX export for biencoder models.
 - **SkyPilot and NeMo-Run launchers.** Native multi-node launch on cloud
   (SkyPilot, including Kubernetes) and via NeMo-Run, in addition to local and
   SLURM. Launcher selection is driven by YAML sections in the config.
 - **Lightweight CLI install.** `pip install nemo-automodel[cli]` installs only
   `pyyaml` — enough to submit jobs from a login node without pulling in
   PyTorch/CUDA.
-- **Discrete-diffusion LLMs (dLLM).** SFT and generation support for dLLM
-  models, including Llada.
+- **Refreshed CLI.** `automodel <config.yaml>` (alias `am`) replaces the older
+  `automodel <command> <domain> -c <config>` form.
 
 ### New Models
 
