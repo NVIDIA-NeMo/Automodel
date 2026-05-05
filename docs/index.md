@@ -213,6 +213,7 @@ Installation <guides/installation.md>
 Configuration <guides/configuration.md>
 🤗 HF Compatibility <guides/huggingface-api-compatibility.md>
 Repo Structure <repository-structure.md>
+Release Notes <release-notes.md>
 ::::
 
 ::::{toctree}
