@@ -26,3 +26,4 @@ To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 | `cicd` | Commit/PR workflow, CI trigger mechanism, failure investigation |
 | `build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
 | `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
+| `bump-dependency` | Bump a pinned dependency, regenerate `uv.lock` + `uv-pytorch.lock`, open a PR, and watchdog `CICD NeMo` to green |
