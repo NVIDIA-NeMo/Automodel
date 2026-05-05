@@ -100,7 +100,7 @@ jobs:
       no-build-isolation: true
       app-id: ${{ vars.BOT_ID }}
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
-      publish-docs: ${{ inputs.publish-docs || false }}
+      publish-docs: ${{ inputs.publish-docs || true }}
       docs-target-path: nemo/automodel
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
       restrict-to-admins: true
