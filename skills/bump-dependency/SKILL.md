@@ -1,6 +1,6 @@
 ---
 name: bump-dependency
-description: Bump a pinned dependency (TransformerEngine, flash-attn, torch, NRX, or any package in pyproject.toml), regenerate uv.lock and the PyTorch lock, open a PR, and drive it to green by attaching a watchdog to the "CICD NeMo" workflow and quarantining failing functional tests with `@pytest.mark.pleasefixme` until the run is green.
+description: Bump a pinned dependency (TransformerEngine, flash-attn, torch, NRX, or any package in pyproject.toml), regenerate `uv.lock` and `docker/common/uv-pytorch.lock`, open a PR, and drive it to green by attaching a watchdog to the `CICD NeMo` workflow and quarantining failing functional tests with `@pytest.mark.pleasefixme` until the run is green.
 when_to_use: Bumping a dependency pin in `pyproject.toml`, `uv.lock`, or `docker/common/uv-pytorch.lock`, and shepherding the PR to green. 'bump TE', 'bump transformer-engine', 'update TE pin', 'bump torch', 'bump flash-attn', 'update lock file', 'bump dependency PR', 'watch CI for a bump', 'quarantine flaky tests after bump', 'bump base image'.
 ---
 
@@ -8,11 +8,13 @@ when_to_use: Bumping a dependency pin in `pyproject.toml`, `uv.lock`, or `docker
 
 End-to-end workflow for shipping a dependency bump in NeMo AutoModel.
 Optimised for the case where TE, torch, or another GPU-heavy pin moves
-forward — which often surfaces flakes in the L2 + GB200 functional
-matrix that have to be quarantined before the PR can land.
+forward — which often surfaces flakes in the L0 unit + L2 e2e matrix
+(plus its GB200 mirror) that have to be quarantined before the PR can
+land.
 
-The pipeline is always: **edit -> relock (twice) -> push -> watchdog ->
-quarantine on red -> re-trigger by pushing -> repeat until green**.
+The pipeline is always: **edit → relock (twice) → push → watchdog →
+quarantine on red → re-trigger by pushing → repeat until
+`Nemo_CICD_Test` is green**.
 
 ## When to reach for this skill
 
@@ -21,34 +23,29 @@ quarantine on red -> re-trigger by pushing -> repeat until green**.
 - Bumping the base image / `BASE_IMAGE` build arg (touches both
   `pyproject.toml` and `docker/common/uv-pytorch.lock`).
 - Any change that touches `uv.lock` and needs the full L0 unit + L2
-  e2e matrix (and gb200 e2e mirror) to prove out before merge.
+  e2e matrix (and its gb200 mirror) to prove out before merge.
 
-For pure dep additions/removals where the existing lockfile-bot PR is
-acceptable, the scheduled `Generate Uv lock` workflow already handles
-weekly drift — only reach for this skill when you're driving an
-explicit, named bump to green.
+For routine drift, the scheduled `Generate Uv lock` workflow already
+handles weekly bumps — only reach for this skill when you're driving
+an explicit, named bump to green.
 
 ## Required context
 
 Read first, then follow the steps below:
 
 - @CONTRIBUTING.md — uv extras, container workflow, DCO sign-off, the
-  `update_pyproject_pytorch.sh` workaround for the PyTorch base image
-- @skills/build-and-dependency/SKILL.md — `uv sync`/`uv lock`
-  mechanics, the two-lockfile model, container choice
-- @skills/cicd/SKILL.md — how `copy-pr-bot` mirrors PRs onto
-  `pull-request/<N>` and how CI is triggered
-- @skills/testing/SKILL.md — tier semantics and the
-  `@pytest.mark.pleasefixme` quarantine marker (used by
-  `tests/run_test.sh -m "not pleasefixme"`)
+  `update_pyproject_pytorch.sh` workaround for the PyTorch base image.
+- @skills/build-and-dependency/SKILL.md — `uv sync`/`uv lock` mechanics,
+  the two-lockfile model, container choice.
+- @skills/cicd/SKILL.md — `copy-pr-bot` trust, `pull-request/<N>` mirror,
+  `Approve Test Queue` 5-min stall, log/artifact retrieval.
+- @skills/testing/SKILL.md — tier semantics. Note: the
+  `@pytest.mark.pleasefixme` quarantine marker is not documented there
+  yet, so it lives here for now (Step 7).
 
 ## Step 1 — Worktree and edit
 
-```bash
-# From the Automodel repo root
-git worktree add .claude/worktrees/<slug> -b <branch-name> origin/main
-cd .claude/worktrees/<slug>
-```
+Create a worktree off `main` per @CONTRIBUTING.md.
 
 Edit the pin. For a TE bump the canonical knob is in `pyproject.toml`
 under `[project.optional-dependencies]` (verify with
@@ -57,38 +54,21 @@ the `BASE_IMAGE` arg and any container-side pins in `docker/Dockerfile`.
 
 For TE specifically: the GitHub remote uses `release_vX.Y` (underscore),
 not `release/vX.Y`. Verify with
-`git ls-remote https://github.com/NVIDIA/TransformerEngine.git`.
-Use a full SHA for reproducibility unless you explicitly want a moving
+`git ls-remote https://github.com/NVIDIA/TransformerEngine.git`. Pin
+to a full SHA for reproducibility unless you explicitly want a moving
 tip.
 
 ## Step 2 — Regenerate both lockfiles
 
-`uv.lock` is Linux + CUDA only. The repo also tracks
-`docker/common/uv-pytorch.lock`, which is what gets installed in the
-PyTorch base container — bumps that change torch transitively must
-update **both**. The reference for this pattern is
+This repo tracks **two** lockfiles: `uv.lock` (the project lock) and
+`docker/common/uv-pytorch.lock` (the lock that gets installed into the
+PyTorch base container). Bumps that change torch transitively must
+update **both**. The reference for the dance is
 `.github/workflows/uv-lock-generation.yml`.
 
-Build the project image once:
-
-```bash
-docker build -f docker/Dockerfile.ci -t automodel-bump .
-```
-
-Then relock inside it (so resolution sees the same Linux + CUDA wheel
-universe CI sees):
-
-```bash
-docker run --rm \
-  -v $(pwd):/workspace \
-  -w /workspace \
-  -v $HOME/.cache/uv:/root/.cache/uv \
-  automodel-bump \
-  bash -c 'source /opt/venv/env.sh && uv lock'
-```
-
-Then regenerate the PyTorch-base lock (mirrors
-`uv-lock-generation.yml`):
+After acquiring the project image per @skills/build-and-dependency/SKILL.md,
+run `uv lock` inside it for `uv.lock`. Then regenerate the PyTorch-base
+lock:
 
 ```bash
 mv uv.lock uv_main.lock
@@ -97,8 +77,7 @@ docker run --rm -v $(pwd):/workspace -w /workspace automodel-bump \
   bash -c 'source /opt/venv/env.sh && uv lock'
 mv uv.lock docker/common/uv-pytorch.lock
 mv uv_main.lock uv.lock
-# Restore pyproject.toml — update_pyproject_pytorch.sh mutates it.
-git checkout -- pyproject.toml
+git checkout -- pyproject.toml      # update_pyproject_pytorch.sh mutates it
 ```
 
 Confirm only the intended packages moved:
@@ -112,26 +91,25 @@ you can't explain), stop and investigate before pushing.
 
 ## Step 3 — Commit and push
 
+Sign-off + signed-commit + commit-title format per @CONTRIBUTING.md and
+@skills/cicd/SKILL.md. For a bump:
+
 ```bash
 git add pyproject.toml uv.lock docker/common/uv-pytorch.lock
 git commit -S -s -m "build: bump <package> to <ref>"
 git push -u origin <branch-name>
 ```
 
-Commit/PR title format follows the repo's recent merged history:
-`build: bump <package> to <ref>` for the lockfile/dep work, or
-`ci: Bump base pytorch image to <ver>` for image bumps (see #2108).
-Sign-off (`-s`) is required by the DCO check; signed commits (`-S`)
-let `copy-pr-bot` mirror to `pull-request/<N>` without manual
-`/ok to test` for every push.
+Recent merged history uses `build: bump <package> to <ref>` for
+lockfile/dep work and `ci: Bump base pytorch image to <ver>` for image
+bumps (see #2108).
 
 ## Step 4 — Open the PR
 
-PR body goes through a tmpfile to preserve formatting (never HEREDOC
-into `gh pr create --body`). Wrap it in a `<details>` block:
+Title and labels per @CONTRIBUTING.md. The PR body template — durable
+record of the bump:
 
-```bash
-cat > /tmp/pr-body.md <<'EOF'
+```markdown
 <details><summary>Claude summary</summary>
 
 ## What
@@ -152,83 +130,51 @@ Updated <package> <old> -> <new>
 _None yet — will be appended as flakes are identified during CI iteration._
 
 </details>
-EOF
-
-gh pr create \
-  --repo NVIDIA-NeMo/Automodel \
-  --base main \
-  --head <branch-name> \
-  --title "build: bump <package> to <ref>" \
-  --body-file /tmp/pr-body.md \
-  --label "Run CICD"
 ```
 
-There is **no `needs-more-tests` / `full-test-suite` style label** that
-gates the matrix in this repo (the tier-expansion language in
-`@skills/testing/SKILL.md` is aspirational — see
-`.github/workflows/cicd-main.yml`, where the L0 unit + L2 e2e matrix
-runs unconditionally on every PR and is mirrored onto GB200 for org
-members). The `Run CICD` label is the only opt-in signal worth
-applying for a bump.
+There is **no `needs-more-tests` / `full-test-suite` matrix-expand
+label** in this repo: the L0 unit + L2 e2e matrix runs unconditionally
+on every PR (mirrored onto GB200 for org members). Apply `Run CICD` and
+move on.
 
-`gh pr edit` is unreliable. To update a PR's title or body later, use
-the REST API directly:
-
-```bash
-gh api -X PATCH "repos/NVIDIA-NeMo/Automodel/pulls/<N>" \
-  -F "body=@/tmp/pr-body.md"
-
-gh api -X PATCH "repos/NVIDIA-NeMo/Automodel/pulls/<N>" \
-  -f "title=build: bump <package> to <ref>"
-```
+To update the PR title or body later, use `gh api -X PATCH
+"repos/NVIDIA-NeMo/Automodel/pulls/<N>" -F "body=@/tmp/pr-body.md"` —
+never `gh pr edit`.
 
 ## Step 5 — Trigger CI on the exact SHA
 
-`copy-pr-bot` (see `@skills/cicd/SKILL.md`) mirrors trusted-author PRs
-onto `refs/heads/pull-request/<N>`, which is what `CICD NeMo`
-actually triggers on (the `push` filter in `cicd-main.yml`). The
-mirrored run then waits in the `test` GitHub Environment until the
-`Approve Test Queue` cron (`cicd-approve-test-queue.yml`, every 5
-min) lets it past the concurrency gate.
+Trigger mechanics + `pull-request/<N>` mirror branch + the 5-min
+`Approve Test Queue` stall live in @skills/cicd/SKILL.md "How CI Is
+Triggered". For this loop the rule is simple:
 
-For an external contributor, post `/ok to test <full-sha>` on the PR
-the first time and after every new push:
+- Maintainers with signed commits: pushing the new SHA is enough; the
+  mirror is automatic. To force a re-run on a no-op,
+  `git commit --allow-empty -S -s -m "ci: re-trigger"`.
+- External contributors: post `/ok to test $(git rev-parse HEAD)` for
+  every new SHA.
 
-```bash
-SHA=$(git rev-parse HEAD)
-gh pr comment <N> --repo NVIDIA-NeMo/Automodel --body "/ok to test $SHA"
-```
-
-For a maintainer with signed commits, the mirror is automatic — to
-force a re-run after a quarantine fix, just push:
-
-```bash
-git commit --allow-empty -S -s -m "ci: re-trigger"
-git push
-```
-
-Use the **full** SHA (`git rev-parse HEAD`), never the short form.
+Use the **full** SHA — the short form silently fails to match.
 
 ## Step 6 — Attach the watchdog (always; never a cronjob)
 
-For a bump PR you want a single live process that emits per-job
-state changes for the **CICD NeMo** workflow only. Other workflows
+For a bump PR you want a single live process that emits per-job state
+changes for the **`CICD NeMo`** workflow only. Other workflows
 (`build-docs`, `Generate Uv lock`, `copyright-check`, `Install test
-summary`, `detect-secrets`, `claude-review`) are noise here — the
-gate that decides green-or-red for a bump is `CICD NeMo`, and inside
-it the rollup is `Nemo_CICD_Test`.
+summary`, `detect-secrets`, `claude-review`) are noise here — the gate
+that decides green-or-red for a bump is the `Nemo_CICD_Test` rollup
+inside `CICD NeMo`.
 
-**Always attach a watchdog with the Monitor tool. Never schedule
-wakeups or cronjobs for this loop.** A watchdog gives you:
+**Always attach a watchdog with the Monitor tool. Never schedule wakeups
+or cronjobs for this loop.** A watchdog gives you:
 
 - Sub-minute reaction time on every job transition.
-- A single live process — no scattered scheduled-wakeup state to
-  reason about.
+- A single live process — no scattered scheduled-wakeup state to reason
+  about.
 - Natural early termination via `TaskStop` once the run is green.
 
 ### Watchdog script
 
-Save to `/tmp/watchdog-<PR>.sh` and `chmod +x`:
+Save to `/tmp/watchdog-<PR>.sh` and chmod +x:
 
 ```bash
 #!/usr/bin/env bash
@@ -308,38 +254,29 @@ once the run is green.
 
 - Cronjobs run blind — they fire on a clock, not on an event. You'll
   either over-poll (cache miss every wake-up) or miss long stalls.
-- Wakeups can't easily fan out to "tell me whenever a job
-  transitions" — they only resume the agent on a fixed interval.
-- A persistent Monitor surfaces every job edge in real time and
-  exits cleanly when the work is done.
+- Wakeups can't easily fan out to "tell me whenever a job transitions"
+  — they only resume the agent on a fixed interval.
+- A persistent Monitor surfaces every job edge in real time and exits
+  cleanly when the work is done.
 
 ## Step 7 — Quarantine on red, then iterate
 
-When a `JOB <name> -> failure` event fires (excluding `gb200_*`
-optional jobs, several of which already have `is-optional: "true"`
-set in `cicd-main.yml` and won't fail the rollup):
+When a `JOB <name> -> failure` event fires (excluding `gb200_*` jobs
+that already have `is-optional: "true"` in `cicd-main.yml` — those don't
+fail the rollup):
 
-1. Skim the logs to confirm it's a flake / pre-existing issue, not
-   the bump itself:
+1. **Triage the failure — is it the bump or a flake?** Pull logs per
+   @skills/cicd/SKILL.md "CI Failure Investigation". Only quarantine if
+   the failure reproduces on `main` or is clearly unrelated
+   infrastructure. If it's caused by the bump itself, **stop
+   quarantining** — fix or revert. Quarantining a real regression hides
+   the very signal the bump PR exists to surface.
 
-   ```bash
-   RUN_ID=<from "RUN ... STARTED" event>
-   gh run view "$RUN_ID" --repo NVIDIA-NeMo/Automodel --log-failed > /tmp/run.log
-   wc -l /tmp/run.log
-   tail -200 /tmp/run.log
-   ```
-
-   If the failure is caused by the bump (real regression, not a
-   flake), **stop quarantining** — fix the underlying issue or
-   revert the bump. Quarantining a real regression hides the very
-   signal the bump PR exists to surface.
-
-2. Mark the offending pytest function with
-   `@pytest.mark.pleasefixme`. This is the canonical Automodel
-   quarantine mechanism: `tests/run_test.sh` passes
+2. **Quarantine via `@pytest.mark.pleasefixme`.** This is the canonical
+   Automodel quarantine mechanism: `tests/run_test.sh` passes
    `-m "not pleasefixme"` on every CI run, so any test wearing that
-   marker is silently skipped without altering the launcher script
-   or the CI matrix:
+   marker is silently skipped without altering the launcher script or
+   the CI matrix:
 
    ```python
    import pytest
@@ -350,73 +287,60 @@ set in `cicd-main.yml` and won't fail the rollup):
    ```
 
    Map a CI job name (e.g. `gb200_L2_HF_Transformer_VLM` or
-   `L2_HF_Transformer_VLM`) to its test folder:
+   `L2_HF_Transformer_VLM`) to its test folder by looking up the
+   `cicd-e2e-tests` matrix in `.github/workflows/cicd-main.yml`:
 
    - prefix `gb200_` → same test folder, GCP runner mirror
-   - the rest is `L2_<Name>` → look up `test-folder` for that
-     `test-name` in the `cicd-e2e-tests` matrix in
-     `.github/workflows/cicd-main.yml` (e.g.
-     `L2_HF_Transformer_VLM` → `tests/functional_tests/hf_transformer_vlm/`)
+   - the rest is `L2_<Name>` → `test-folder` for that `test-name` in
+     the matrix (e.g. `L2_HF_Transformer_VLM` →
+     `tests/functional_tests/hf_transformer_vlm/`)
 
-   `tests/functional_tests/hf_transformer_vlm/test_hf_transformer_vlm.py`
-   has working examples of `@pytest.mark.pleasefixme` to crib from.
+   See `tests/functional_tests/hf_transformer_vlm/test_hf_transformer_vlm.py`
+   for working `@pytest.mark.pleasefixme` examples to crib from.
 
-3. Append the test to the PR description's **Quarantined tests**
-   section, with a one-line reason and a follow-up tracking link if
-   you have one. This is the durable record of what this bump
-   deferred.
+3. **Append to the PR body's Quarantined tests section** with a
+   one-line reason and a follow-up tracking link if you have one.
 
-4. Commit, push to retrigger:
+4. **Commit and push to retrigger:**
 
    ```bash
    git commit -S -s -m "ci: quarantine flaky <test> for <package> bump"
    git push
+   # External contributors also need:
+   #   gh pr comment <N> --repo NVIDIA-NeMo/Automodel \
+   #     --body "/ok to test $(git rev-parse HEAD)"
    ```
 
-   The push to your branch forwards through `copy-pr-bot` to
-   `pull-request/<N>` and `CICD NeMo` re-fires automatically. If
-   you're an external contributor, also post:
-
-   ```bash
-   SHA=$(git rev-parse HEAD)
-   gh pr comment <N> --repo NVIDIA-NeMo/Automodel --body "/ok to test $SHA"
-   ```
-
-5. Update the PR body via `gh api PATCH` so the quarantine list
+5. **Update the PR body** via `gh api PATCH` so the quarantine list
    stays current.
 
-The watchdog is persistent — it will pick up the new run
-automatically and emit `RUN <id> STARTED` for the new attempt.
+The watchdog is persistent — it picks up the new run automatically and
+emits `RUN <id> STARTED` for the new attempt. Loop back to step 1.
 
 ## Step 8 — Stop when green
 
 `RUN <id> COMPLETED conclusion=success` is the exit condition. Then:
 
 ```bash
-# Sanity check — the protected gates are Nemo_CICD_Test and
-# Nemo_Linting_Test (see branch protection).
 gh pr checks <N> --repo NVIDIA-NeMo/Automodel | awk '{print $2}' | sort | uniq -c
-
-# Tear down
 TaskStop(<watchdog-task-id>)
-
-# Tick the boxes in the PR body
 gh api -X PATCH "repos/NVIDIA-NeMo/Automodel/pulls/<N>" -F "body=@/tmp/pr-body.md"
 ```
+
+The protected gates are `Nemo_CICD_Test` and `Nemo_Linting_Test` — both
+must be green for branch protection to allow merge.
 
 ## Common pitfalls
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `uv lock` resolves a different torch in CI than locally | Local resolved against PyPI wheels; CI installs into the PyTorch base container | Always relock inside the project Docker image (Step 2) |
 | `docker/common/uv-pytorch.lock` not regenerated → CI installs stale torch | Forgot the second `uv lock` after `update_pyproject_pytorch.sh` | Repeat Step 2's second relock; commit both lockfiles |
 | `pyproject.toml` shows uncommitted noise after Step 2 | `update_pyproject_pytorch.sh` mutates `pyproject.toml` in place | `git checkout -- pyproject.toml` after the second relock |
-| CI never starts on a new push | Author isn't trusted → `copy-pr-bot` didn't mirror to `pull-request/<N>` | Sign commits with `-S`, or post `/ok to test $(git rev-parse HEAD)` |
-| Quarantine commit doesn't fire a new `CICD NeMo` run | Empty/no-op commit was filtered out, or the existing run is still in progress (concurrency cancels older runs) | Push a non-empty commit; check `gh run list --workflow "CICD NeMo" --branch pull-request/<N>` |
 | Run sits in `waiting` for ~5 min after every push | `cicd-wait-in-queue` requires the `test` environment, which the `Approve Test Queue` cron approves on a 5-min cadence | Expected — don't try to bypass the queue |
-| Job name doesn't match a folder under `tests/functional_tests/` | `gb200_` prefix is the hardware indicator, not part of the folder | Strip `gb200_`, then look up the matrix entry's `test-folder` in `cicd-main.yml` |
+| Job name doesn't match a folder under `tests/functional_tests/` | `gb200_` prefix is the hardware indicator, not part of the folder | Strip `gb200_`, then look up `test-folder` in `cicd-main.yml` |
 | Wrong TE branch ref (`release/v2.15`) silently resolves nothing | TE uses `release_vX.Y` with an underscore | Verify with `git ls-remote` before locking |
 | `gb200_*` job fails but the rollup is still green | Several gb200 entries are `is-optional: "true"` in `cicd-main.yml` | Don't quarantine an optional gb200 failure unless it persists across reruns |
+| Quarantine commit doesn't fire a new `CICD NeMo` run | Empty/no-op commit was filtered out, or the existing run is still in progress (concurrency cancels older runs) | Push a non-empty commit; check `gh run list --workflow "CICD NeMo" --branch pull-request/<N>` |
 
 ## Anti-patterns
 
@@ -424,16 +348,15 @@ gh api -X PATCH "repos/NVIDIA-NeMo/Automodel/pulls/<N>" -F "body=@/tmp/pr-body.m
 - **Polling all workflows.** Filter to `CICD NeMo` — `build-docs`,
   `copyright-check`, `Install test summary`, `Generate Uv lock`,
   `claude-review`, and `detect-secrets` are all noise for a bump.
-- **Quarantining a real regression** to "make CI green." That
-  defeats the purpose of the bump PR. Only mark
-  `@pytest.mark.pleasefixme` if the failure reproduces on `main` or
-  is clearly unrelated infrastructure.
+- **Quarantining a real regression** to "make CI green." That defeats
+  the purpose of the bump PR. Only mark `@pytest.mark.pleasefixme` if
+  the failure reproduces on `main` or is clearly unrelated
+  infrastructure.
 - **`gh pr edit`** for title/body. Use `gh api PATCH`.
-- **HEREDOC in `gh pr create --body`.** Always go through a tmpfile
-  + `--body-file`.
+- **HEREDOC in `gh pr create --body`.** Always go through a tmpfile +
+  `--body-file`.
 - **Bundling unrelated changes** (feature work, refactors) into a
-  bump PR. Bumps should stay surgical so CI failures attribute
-  cleanly.
+  bump PR. Bumps should stay surgical so CI failures attribute cleanly.
 - **Skipping the second relock** for `docker/common/uv-pytorch.lock`.
-  The two lockfiles are not interchangeable — CI builds the
-  container from the PyTorch lock, not `uv.lock`.
+  The two lockfiles are not interchangeable — CI builds the container
+  from the PyTorch lock, not `uv.lock`.
