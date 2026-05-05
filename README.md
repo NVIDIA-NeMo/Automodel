@@ -60,7 +60,7 @@
 Overview
 ---
 
-Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale training and finetuning for LLMs and VLMs. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+Nemo AutoModel is a Pytorch DTensor‑native SPMD open-source training library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale training and finetuning for LLMs, VLMs, diffusion models, and retrieval models. Designed for flexibility, reproducibility, and scale, NeMo AutoModel enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
 <p align="center">
 <a href="https://github.com/NVIDIA-NeMo/Automodel"><picture>
     <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/refs/heads/main/docs/automodel_diagram.png">
@@ -81,8 +81,6 @@ What you can expect:
 <!-- Please refer to our design documents for more details on the architecture and design philosophy. -->
 
 <!-- NeMo Framework is NVIDIA's GPU accelerated, end-to-end training framework for large language models (LLMs), multi-modal models and speech models. It enables seamless scaling of training (both pretraining and post-training) workloads from single GPU to thousand-node clusters for both 🤗Hugging Face/PyTorch and Megatron models. It includes a suite of libraries and recipe collections to help users train models from end to end. The **AutoModel library ("NeMo AutoModel")** provides GPU-accelerated PyTorch training for 🤗Hugging Face models on **Day-0**. Users can start training and fine-tuning models instantly without conversion delays, scale effortlessly with PyTorch-native parallelisms, optimized custom kernels, and memory-efficient recipes-all while preserving the original checkpoint format for seamless use across the Hugging Face ecosystem. -->
-
-> ⚠️ Note: NeMo AutoModel is under active development. New features, improvements, and documentation updates are released regularly. We are working toward a stable release, so expect the interface to solidify over time. Your feedback and contributions are welcome, and we encourage you to follow along as new updates roll out.
 
 ### Why PyTorch Distributed and SPMD
 
@@ -126,30 +124,34 @@ What you can expect:
 
 ## Feature Roadmap
 
-✅ _Available now_ | 🔜 _Coming in 26.02_
+✅ _Available now (v0.4.0 / 26.02 container)_ | 🔜 _Coming next_
 
 - ✅ **Advanced Parallelism** - PyTorch native FSDP2, TP, CP, and SP for distributed training.
 - ✅ **HSDP** - Multi-node Hybrid Sharding Data Parallelism based on FSDP2.
 - ✅ **Pipeline Support** - Torch-native support for pipelining composable with FSDP2 and DTensor (3D Parallelism).
-- ✅ **Environment Support** - Support for SLURM and interactive training.
-- ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), and PEFT (Parameter Efficient Fine-Tuning).
+- ✅ **Environment Support** - SLURM, interactive, SkyPilot, and Kubernetes (via SkyPilot) launchers.
+- ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), PEFT (LoRA, QLoRA), and QAT (Quantization-Aware Training).
 - ✅ **Pre-training** - Support for model pre-training, including DeepSeekV3.
-- ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs; VLM support will be added post 25.09.
-- ✅ **HuggingFace Integration** - Works with dense models (e.g., Qwen, Llama3, etc) and large MoEs (e.g., DSv3).
+- ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs.
+- ✅ **HuggingFace Integration** - Works with dense models (e.g., Qwen, Llama3, etc) and large MoEs (e.g., DSv3, DSv4).
 - ✅ **Sequence Packing** - Sequence packing for huge training perf gains.
-- ✅ **FP8 and mixed precision** - FP8 support with torchao, requires torch.compile-supported models.
+- ✅ **FP8 and mixed precision** - FP8 support with torchao and Transformer Engine.
 - ✅ **DCP** - Distributed Checkpoint support with SafeTensors output.
-- ✅ **VLM**: Support for finetuning VLMs (e.g., Qwen2-VL, Gemma-3-VL). More families to be included in the future.
-- ✅ **Extended MoE support** - GPT-OSS, Qwen3 (Coder-480B-A35B, etc), Qwen-next.
+- ✅ **VLM** - Finetuning for VLMs (Qwen2.5/3/3.5/3.6 VL, Gemma-3/3n/4 VL, Mistral 3.5/4, LLaVA-OneVision-1.5, Kimi-VL, etc.).
+- ✅ **Omnimodal** - Finetuning for omnimodal MoE models (Nemotron-3-Nano-Omni, Qwen3-Omni).
+- ✅ **Diffusion** - Pretraining and LoRA finetuning for image/video diffusion models (Qwen-Image, FLUX, Wan2.1, Hunyuan).
+- ✅ **dLLM** - Discrete diffusion LM finetuning (LLaDA).
+- ✅ **Retrieval** - Bi-encoder and cross-encoder training with in-batch negative sampling.
+- ✅ **Extended MoE support** - GPT-OSS, Qwen3 / Qwen3.5 / Qwen3.6 MoE, Qwen-next, MiniMax-M2.x, GLM-4.7 / GLM-5 / GLM-5.1, DeepSeek V3.2 / V4 / V4-Flash, Hy3-preview.
+- ✅ **Dion optimizer** - Distributed Dion optimizer integration.
+- ✅ **Agent-friendly skills** - Curated [`skills/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/skills) for common dev tasks (recipe runs, model onboarding, CI).
+- ✅ **Transformers v5 🤗** - Built on `transformers==5.5.0` with device-mesh driven parallelism.
 
-- 🔜 **Transformers v5 🤗** - Support for transformers v5 🤗 with device-mesh driven parallelism.
-- 🔜 **Muon & Dion** - Support for Muon and Dion optimizers.
+- 🔜 **Muon optimizer** - Muon optimizer support.
 - 🔜 **SonicMoE** - Optimized MoE implementation for faster expert computation.
 - 🔜 **FP8 MoE** - FP8 precision training and inference for MoE models.
 - 🔜 **Cudagraph with MoE** - CUDA graph support for MoE layers to reduce kernel launch overhead.
-- 🔜 **Extended VLM Support** - DeepSeek OCR, Qwen3 VL 235B, Kimi-VL, GLM4.5V
-- 🔜 **Extended LLM Support** - QWENCoder 480B Instruct, MiniMax2.1, and more
-- 🔜 **Kubernetes** - Multi-node job launch with k8s.
+- 🔜 **VLM Knowledge Distillation** - Extend KD to VLM and omnimodal models.
 
 
 ## Getting Started
@@ -354,34 +356,44 @@ NeMo-Automodel/
 ├── docker/                         # Container build files
 ├── docs/                           # Documentation and guides
 ├── examples/
-│   ├── benchmark/                  # Benchmarking scripts
-│   ├── llm_finetune/              # LLM finetune YAML configs
-│   ├── llm_kd/                    # LLM knowledge-distillation configs
-│   ├── llm_pretrain/              # LLM pretrain configs
-│   ├── llm_seq_cls/               # LLM sequence classification configs
-│   ├── vlm_finetune/             # VLM finetune configs
-│   └── vlm_generate/             # VLM generation configs
+│   ├── convergence/                # Convergence test configs
+│   ├── diffusion/                  # Diffusion pretrain/finetune configs
+│   ├── dllm_sft/                   # Discrete diffusion LM SFT configs
+│   ├── dllm_generate/              # Discrete diffusion LM generation
+│   ├── llm_benchmark/              # LLM benchmarking configs
+│   ├── llm_finetune/               # LLM finetune YAML configs
+│   ├── llm_kd/                     # LLM knowledge-distillation configs
+│   ├── llm_pretrain/               # LLM pretrain configs
+│   ├── llm_seq_cls/                # LLM sequence classification configs
+│   ├── retrieval/                  # Bi-encoder / cross-encoder configs
+│   ├── vlm_benchmark/              # VLM benchmarking configs
+│   ├── vlm_finetune/               # VLM finetune configs
+│   └── vlm_generate/               # VLM generation configs
 ├── nemo_automodel/
-│   ├── _transformers/             # HF model integrations
-│   ├── components/                # Core library
-│   │   ├── _peft/                 # PEFT implementations (LoRA)
-│   │   ├── attention/             # Attention implementations
-│   │   ├── checkpoint/            # Distributed checkpointing
+│   ├── _diffusers/                 # HF Diffusers integration (NeMoAutoDiffusionPipeline)
+│   ├── _transformers/              # HF Transformers integration
+│   ├── components/                 # Core library
+│   │   ├── _peft/                  # PEFT implementations (LoRA, QLoRA)
+│   │   ├── attention/              # Attention implementations
+│   │   ├── checkpoint/             # Distributed checkpointing
 │   │   ├── config/
-│   │   ├── datasets/              # LLM (HellaSwag, etc.) & VLM datasets
-│   │   ├── distributed/           # FSDP2, Megatron FSDP, Pipelining, etc.
-│   │   ├── launcher/              # Launcher backends (SLURM, k8s, NeMo-Run)
-│   │   ├── loggers/               # Loggers
-│   │   ├── loss/                  # Optimized loss functions
-│   │   ├── models/                # User-defined model examples
-│   │   ├── moe/                   # Optimized kernels for MoE models
-│   │   ├── optim/                 # Optimizer/LR scheduler components
-│   │   ├── quantization/          # FP8
-│   │   ├── training/              # Train utils
-│   │   └── utils/                 # Misc utils
+│   │   ├── datasets/               # LLM, VLM, diffusion, retrieval datasets
+│   │   ├── distributed/            # FSDP2, Megatron FSDP, pipelining, CP, etc.
+│   │   ├── launcher/               # Launcher backends (SLURM, NeMo-Run, SkyPilot)
+│   │   ├── loggers/                # Loggers
+│   │   ├── loss/                   # Optimized loss functions
+│   │   ├── models/                 # User-defined model examples
+│   │   ├── moe/                    # Optimized kernels for MoE models
+│   │   ├── optim/                  # Optimizer/LR scheduler components (incl. Dion)
+│   │   ├── quantization/           # FP8, QAT, QLoRA
+│   │   ├── training/               # Train utils
+│   │   └── utils/                  # Misc utils
 │   ├── recipes/
-│   │   ├── llm/                   # Main LLM train loop
-│   │   └── vlm/                   # Main VLM train loop
+│   │   ├── llm/                    # Main LLM train loop
+│   │   ├── vlm/                    # Main VLM train loop
+│   │   ├── diffusion/              # Diffusion training loop
+│   │   ├── dllm/                   # Discrete diffusion LM training loop
+│   │   └── retrieval/              # Retrieval / biencoder training loop
 │   └── shared/
 ├── tools/                          # Developer tooling
 └── tests/                          # Comprehensive test suite
