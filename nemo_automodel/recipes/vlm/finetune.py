@@ -954,7 +954,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Routed through __call__ so FSDP2 forward pre-hook fires and
         # unshards the vision tower's weights before the embed/scatter.
         _model = self.model_parts[0]
-        _cp_active = self.dist_setup.cp_size > 1 and not self.pp_enabled
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+            and not self.pp_enabled
+        )
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
             mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
             with torch.no_grad():
