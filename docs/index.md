@@ -294,4 +294,5 @@ Pipeline Parallelism <guides/pipelining.md>
 guides/fp8-training.md
 guides/mlflow-logging.md
 API Reference <apidocs/index.rst>
+Breaking Changes <breaking-changes.md>
 ::::

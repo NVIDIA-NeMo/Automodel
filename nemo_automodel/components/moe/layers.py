@@ -522,6 +522,16 @@ class Gate(nn.Module):
             torch.Tensor: Auxiliary loss for load balancing.
                 Shape is [].
         """
+        # Pin aux-loss arithmetic to fp32. The activation-checkpoint recompute pass
+        # does not replay FSDP2 MixedPrecisionPolicy cast_forward_inputs, so `x` and
+        # anything derived from `x.dtype` (including original_scores in some MoE
+        # configs) can differ between forward and recompute. Doing the cast inside
+        # the AC region — rather than at the Gate level — guarantees the saved
+        # tensors of this region (expert_scores [n_experts] and the aux-loss scalar)
+        # are fp32 on both passes regardless of upstream behavior.
+        original_scores = original_scores.float()
+        expert_load = expert_load.float()
+
         context_length = token_mask.sum()
         expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
 
