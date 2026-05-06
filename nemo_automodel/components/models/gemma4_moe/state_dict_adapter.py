@@ -85,6 +85,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         model_prefix = "model." if self._uses_model_prefix else ""
 
         n_experts = self.moe_config.n_routed_experts
+        ep_shard_rank, ep_shard_size = 0, 1
         if device_mesh is not None:
             start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
             rank = (
@@ -92,6 +93,17 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 if "ep" in device_mesh.mesh_dim_names
                 else device_mesh.get_rank()
             )
+            # When ep_shard is part of the moe_mesh (e.g. world_size > ep_size),
+            # create_dtensor_from_local applies Shard(1) on the per-expert tensor's
+            # dim 1, so the *local* shard along that dim must be carved out here
+            # before wrapping. Without this slice the resulting DTensor reports a
+            # global shape inflated by ep_shard_size on dim 1, mismatching the
+            # model parameter's true global shape.
+            if "ep_shard" in device_mesh.mesh_dim_names:
+                ep_shard_sub = state_dict_utils.get_submesh(device_mesh, ("ep_shard",))
+                if ep_shard_sub.size() > 1:
+                    ep_shard_rank = ep_shard_sub.get_local_rank()
+                    ep_shard_size = ep_shard_sub.size()
         else:
             start_expert, end_expert = 0, n_experts
             rank = None
@@ -148,6 +160,22 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             # Slice for EP
             gate_and_up_local = gate_and_up[start_expert:end_expert].to(self.dtype)
             down_local = down[start_expert:end_expert].to(self.dtype)
+
+            # Slice for ep_shard along dim 1 (the dim that create_dtensor_from_local
+            # marks as Shard(1) for ep_shard). For Gemma4 this is hidden_size on
+            # gate_and_up_projs and moe_inter_dim on down_projs.
+            if ep_shard_size > 1:
+                for name, t in (("gate_and_up_projs", gate_and_up_local), ("down_projs", down_local)):
+                    if t.shape[1] % ep_shard_size != 0:
+                        raise ValueError(
+                            f"{name} dim 1 ({t.shape[1]}) is not divisible by ep_shard_size ({ep_shard_size})"
+                        )
+                gate_chunk = gate_and_up_local.shape[1] // ep_shard_size
+                gate_and_up_local = gate_and_up_local[
+                    :, ep_shard_rank * gate_chunk : (ep_shard_rank + 1) * gate_chunk, :
+                ]
+                down_chunk = down_local.shape[1] // ep_shard_size
+                down_local = down_local[:, ep_shard_rank * down_chunk : (ep_shard_rank + 1) * down_chunk, :]
 
             prefix = f"{model_prefix}language_model.{layer_path}"
             state_dict[f"{prefix}.moe.experts.gate_and_up_projs"] = state_dict_utils.create_dtensor_from_local(
@@ -213,6 +241,18 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
 
         return hf_state_dict
 
+    def _to_local_full_cpu(self, w: torch.Tensor) -> torch.Tensor:
+        """Materialise a (possibly DTensor) per-expert weight into a plain CPU tensor.
+
+        For DTensors with a non-trivial residual mesh (e.g. CP/TP shards remain
+        after stripping the EP dim), ``full_tensor()`` is a collective that
+        all-gathers the local shards into a single replicated tensor. For
+        plain tensors this is a no-op aside from dtype/device coercion.
+        """
+        if state_dict_utils.is_dtensor(w):
+            w = w.full_tensor()
+        return w.detach().to(self.dtype).cpu()
+
     def _gather_expert_tensor(
         self,
         tensor: torch.Tensor,
@@ -225,12 +265,14 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 return tensor.to_local()
             return tensor
 
+        # tensor.shape is the global shape for both plain tensors and DTensors;
+        # using .to_local().shape here would incorrectly size the destination to
+        # the per-rank shard size when the residual (non-EP) mesh shards a
+        # non-expert dim (e.g. ep_shard sharding the hidden dim), which would
+        # mismatch the gathered global per-expert weight from full_tensor().
+        # Hence using tensor.shape[1] directly over the previous .to_local().shape
         global_tensor = torch.zeros(
-            (
-                n_experts,
-                tensor.shape[1] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[1],
-                tensor.shape[2] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[2],
-            ),
+            (n_experts, tensor.shape[1], tensor.shape[2]),
             dtype=self.dtype,
             device="cpu",
         )
@@ -242,6 +284,14 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             split_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
             expert_ids = list(range(start_expert, end_expert))
 
+        # When the device mesh has non-EP dims with size > 1 (e.g. cp_size > 1
+        # or tp_size > 1), split_experts_weights_dtensor_aware returns per-expert
+        # DTensors sharded across the residual mesh. all_gather_object cannot
+        # transport DTensors to a plain-tensor copy_ destination, so materialise
+        # the full per-expert weight here via the residual-mesh collective. This
+        # is a no-op when split_weights are already plain tensors.
+        split_weights = [self._to_local_full_cpu(w) for w in split_weights]
+
         if dist.is_initialized() and "ep" in device_mesh.mesh_dim_names:
             try:
                 ep_dim = device_mesh.mesh_dim_names.index("ep")
@@ -250,18 +300,18 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 ep_group = None
 
             if ep_group is not None:
-                payload = (expert_ids, [w.cpu() for w in split_weights])
+                payload = (expert_ids, split_weights)
                 gathered: list[tuple[list[int], list[torch.Tensor]]] = [None] * dist.get_world_size(ep_group)
                 dist.all_gather_object(gathered, payload, group=ep_group)
                 for ids, weights in gathered:
                     for eid, w in zip(ids, weights):
-                        global_tensor[eid].copy_(w.to(self.dtype).cpu())
+                        global_tensor[eid].copy_(w)
             else:
                 for weight, expert_id in zip(split_weights, expert_ids):
-                    global_tensor[expert_id].copy_(weight.to(self.dtype).cpu())
+                    global_tensor[expert_id].copy_(weight)
         else:
             for weight, expert_id in zip(split_weights, expert_ids):
-                global_tensor[expert_id].copy_(weight.to(self.dtype).cpu())
+                global_tensor[expert_id].copy_(weight)
 
         del split_weights, expert_ids
         return global_tensor

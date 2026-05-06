@@ -1912,6 +1912,84 @@ def gemma4_prefix_collate_fn(
     return default_collate_fn(examples, processor, max_length, _post_tokenize_hook=_inject)
 
 
+def gemma4_prefix_thd_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+    cp_size: int = 1,
+) -> Dict[str, torch.Tensor]:
+    """THD-format Gemma4 collator for TE-native context parallelism.
+
+    Wraps ``gemma4_prefix_collate_fn`` to add the THD metadata
+    (``seq_lens``, ``seq_lens_padded``, ``position_ids``, ``qkv_format``)
+    that ``make_cp_batch_for_te`` consumes. Each batch row is treated as a
+    single-sequence "pack" — i.e. no actual sequence packing across samples,
+    but the THD pipeline is still exercised so TE can run its CP-aware
+    rotary + attention kernels.
+
+    Sequence lengths are computed from the per-row attention mask. Padded
+    lengths are rounded up to a multiple of ``2 * cp_size`` (the partitioning
+    factor used by ``tex.thd_get_partitioned_indices``). Pad tokens come from
+    the tokenizer's ``pad_token_id`` for ``input_ids`` and ``-100`` for
+    ``labels`` (so the loss is masked on the pad region).
+
+    Args:
+      examples: Sequence of per-sample dicts produced by the dataset.
+      processor: HuggingFace processor (must expose a tokenizer).
+      max_length: Optional truncation cap forwarded to the inner collator.
+      cp_size: Context-parallel world size. The padded length is rounded up
+        to a multiple of ``2 * cp_size``; for ``cp_size == 1`` this is a
+        no-op (every length is divisible by 2 only if even — we still round
+        up to keep the THD attention happy).
+    """
+    batch = gemma4_prefix_collate_fn(examples, processor, max_length=max_length)
+
+    input_ids: torch.Tensor = batch["input_ids"]
+    labels: torch.Tensor = batch["labels"]
+    attention_mask: Optional[torch.Tensor] = batch.get("attention_mask", None)
+
+    bsz, seqlen = input_ids.shape
+
+    # Pad to a multiple of 2 * cp_size so TE's load-balanced THD partitioning
+    # produces equal-sized halves on every rank.
+    pad_to = max(2 * int(cp_size), 2)
+    new_seqlen = ((seqlen + pad_to - 1) // pad_to) * pad_to
+    if new_seqlen != seqlen:
+        pad_amt = new_seqlen - seqlen
+        tokenizer = getattr(processor, "tokenizer", processor)
+        pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        pad_ids = torch.full((bsz, pad_amt), pad_id, dtype=input_ids.dtype, device=input_ids.device)
+        pad_lbl = torch.full((bsz, pad_amt), -100, dtype=labels.dtype, device=labels.device)
+        input_ids = torch.cat([input_ids, pad_ids], dim=1)
+        labels = torch.cat([labels, pad_lbl], dim=1)
+        if attention_mask is not None:
+            pad_msk = torch.zeros((bsz, pad_amt), dtype=attention_mask.dtype, device=attention_mask.device)
+            attention_mask = torch.cat([attention_mask, pad_msk], dim=1)
+        batch["input_ids"] = input_ids
+        batch["labels"] = labels
+        if attention_mask is not None:
+            batch["attention_mask"] = attention_mask
+
+    # seq_lens_padded uses the FULL row length so cu_seqlens_padded[-1] equals
+    # the total token count (required by the downstream THD pipeline). seq_lens
+    # is the actual non-pad token count per sample (used elsewhere for masking).
+    if attention_mask is not None:
+        seq_lens_actual = attention_mask.sum(dim=1).to(torch.long)
+    else:
+        seq_lens_actual = torch.full((bsz,), new_seqlen, dtype=torch.long)
+    seq_lens_padded = torch.full((bsz, 1), new_seqlen, dtype=torch.long)
+    seq_lens = seq_lens_actual.unsqueeze(1)
+
+    # position_ids restart at 0 within each row's pack.
+    position_ids = torch.arange(new_seqlen, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+
+    batch["seq_lens"] = seq_lens
+    batch["seq_lens_padded"] = seq_lens_padded
+    batch["position_ids"] = position_ids
+    batch["qkv_format"] = "thd"
+    return batch
+
+
 def llava_onevision_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,

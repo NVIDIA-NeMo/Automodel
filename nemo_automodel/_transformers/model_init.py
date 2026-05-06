@@ -769,6 +769,11 @@ def __init_model(
                 _download_model_weights(hf_config, pretrained_model_name_or_path)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
+            # ``config`` is passed positionally below; drop it from kwargs to avoid
+            # a duplicate keyword (e.g. when auto_model.py stamps the config and
+            # forwards it via kwargs["config"]). _filter_kwargs_for_init does not
+            # strip it on classes with **kwargs in __init__.
+            kwargs.pop("config", None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
             init_param_names = _get_init_param_names(model_cls)
