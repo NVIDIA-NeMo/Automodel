@@ -1038,6 +1038,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         pretrained_model_name_or_path: str,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        is_causal: bool = False,
         **kwargs,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
@@ -1049,6 +1050,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
             l2_normalize: Whether to L2-normalize embeddings.
+            is_causal: Whether the encoder forward pass should use causal attention.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1058,6 +1060,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            is_causal=is_causal,
             **kwargs,
         )
 

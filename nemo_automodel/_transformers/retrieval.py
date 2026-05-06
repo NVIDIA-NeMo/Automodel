@@ -153,20 +153,10 @@ def build_encoder_backbone(
     # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
     logger.info(f"Model type '{model_type}' not in SUPPORTED_BACKBONES; falling back to HuggingFace Auto classes")
     if task == "score":
-        model = AutoModelForSequenceClassification.from_pretrained(
+        return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    else:
-        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
-
-    # Make the backbone bidirectional: config flag for mask generation,
-    # module flag for SDPA/FA2 kernel fallback.
-    model.config.is_causal = False
-    for layer in getattr(model, "layers", []):
-        if hasattr(layer, "self_attn"):
-            layer.self_attn.is_causal = False
-
-    return model
+    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
@@ -243,12 +233,14 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        is_causal: bool = False,
     ):
         super().__init__()
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
+        self.is_causal = is_causal
 
     @classmethod
     def build(
@@ -258,6 +250,7 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        is_causal: bool = False,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -269,7 +262,11 @@ class BiEncoderModel(nn.Module):
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
         backbone = build_encoder_backbone(
-            model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
+            model_name_or_path,
+            effective_task,
+            trust_remote_code=trust_remote_code,
+            pooling=pooling,
+            **hf_kwargs,
         )
 
         return cls(
@@ -277,6 +274,7 @@ class BiEncoderModel(nn.Module):
             pooling=pooling,
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+            is_causal=is_causal,
         )
 
     def save_pretrained(self, save_directory: str, **kwargs):
@@ -294,12 +292,16 @@ class BiEncoderModel(nn.Module):
         if not input_dict:
             return None
 
-        if "token_type_ids" not in inspect.getfullargspec(self.model.forward).args and "token_type_ids" in input_dict:
+        forward_spec = inspect.getfullargspec(self.model.forward)
+        if "token_type_ids" not in forward_spec.args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
+        model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels"]}
+        if "is_causal" in forward_spec.args or forward_spec.varkw is not None:
+            model_inputs["is_causal"] = self.is_causal
+
         outputs = self.model(
-            **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
-            is_causal=False,
+            **model_inputs,
             return_dict=True,
             output_hidden_states=True,
         )

@@ -30,7 +30,9 @@ class DummyMesh:
 def _apply_common_mocks(monkeypatch):
     """Mock CUDA-dependent infrastructure so tests run without a GPU."""
     monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
-    monkeypatch.setattr(am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())}))
+    monkeypatch.setattr(
+        am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())})
+    )
     monkeypatch.setattr(am.torch.cuda, "current_device", lambda: 0)
 
 
@@ -70,13 +72,15 @@ def test_from_pretrained_happy_path(monkeypatch):
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
+        is_causal=True,
         some_other_kwarg="x",
     )
     assert isinstance(model, DummyModel)
     # Patches applied
     assert "liger" in model.marker and "sdpa" in model.marker
     # Ensure HF kwargs injected + passthrough of parameters to build
-    assert last_kwargs["attn_implementation"] == "flash_attention_2"
+    assert last_kwargs["attn_implementation"] == am.DEFAULT_ATTN_IMPLEMENTATION
+    assert last_kwargs["is_causal"] is True
     assert last_kwargs["some_other_kwarg"] == "x"
 
 

@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
-from transformers.models.llama.modeling_llama import LlamaModel
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
@@ -140,7 +139,6 @@ def test_bidirectional_attention_is_symmetric():
     )
 
 
-
 # --- Fakes for classification and encoder tests ---
 class FakeOutputs:
     def __init__(self, last_hidden_state=None, hidden_states=None):
@@ -235,9 +233,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             )
 
     lm = NoTTIDLm(hidden=8)
-    model = BiEncoderModel(
-        model=lm, pooling="avg", l2_normalize=True
-    )
+    model = BiEncoderModel(model=lm, pooling="avg", l2_normalize=True)
     # encode removes token_type_ids and normalizes
     q = {
         "input_ids": torch.ones(2, 3, dtype=torch.long),
@@ -279,20 +275,64 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = BiEncoderModel(
-        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
-    )
+    model_no_last = BiEncoderModel(model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True)
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
     )
     assert v2.shape == (2, 8)
 
 
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_encoder_encode_forwards_configured_is_causal(is_causal):
+    class SpyLM(FakeLM):
+        def __init__(self, hidden=16):
+            super().__init__(hidden=hidden)
+            self.forward_kwargs = {}
+
+        def forward(self, input_ids=None, attention_mask=None, return_dict=True, output_hidden_states=True, **kwargs):
+            self.forward_kwargs = dict(kwargs)
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=return_dict,
+                output_hidden_states=output_hidden_states,
+            )
+
+    lm = SpyLM(hidden=8)
+    model = BiEncoderModel(model=lm, pooling="avg", l2_normalize=False, is_causal=is_causal)
+    model.encode(
+        {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)}
+    )
+
+    assert lm.forward_kwargs["is_causal"] is is_causal
+
+
+def test_encoder_encode_skips_is_causal_for_strict_forward():
+    class StrictLM(FakeLM):
+        def forward(self, input_ids=None, attention_mask=None, return_dict=True, output_hidden_states=True):
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=return_dict,
+                output_hidden_states=output_hidden_states,
+            )
+
+    model = BiEncoderModel(model=StrictLM(hidden=8), pooling="avg", l2_normalize=False, is_causal=False)
+    outputs = model.encode(
+        {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)}
+    )
+
+    assert outputs.shape == (2, 8)
+
+
 def test_encoder_build_and_save(tmp_path, monkeypatch):
     # Patch ModelClass.from_pretrained to return FakeLM
     class FakeBidirectionalModel(FakeLM):
+        from_pretrained_kwargs = {}
+
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
+            cls.from_pretrained_kwargs = dict(kwargs)
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
@@ -308,8 +348,11 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
         model_name_or_path=str(model_dir),
         pooling="avg",
         l2_normalize=True,
+        is_causal=True,
     )
     assert isinstance(model, BiEncoderModel)
+    assert model.is_causal is True
+    assert "is_causal" not in FakeBidirectionalModel.from_pretrained_kwargs
     outdir = tmp_path / "save1"
     outdir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(outdir))
@@ -536,10 +579,14 @@ def test_init_encoder_common_name_or_path_for_generic():
 
     # Use a class name that is NOT a retrieval arch
     FakeModel.__name__ = "Qwen3Model"
-    FakeModel = type("Qwen3Model", (nn.Module,), {
-        "__init__": FakeModel.__init__,
-        "config": property(lambda self: self._config),
-    })
+    FakeModel = type(
+        "Qwen3Model",
+        (nn.Module,),
+        {
+            "__init__": FakeModel.__init__,
+            "config": property(lambda self: self._config),
+        },
+    )
     fake = object.__new__(FakeModel)
     nn.Module.__init__(fake)
     fake._config = FakeCfg()
@@ -548,67 +595,3 @@ def test_init_encoder_common_name_or_path_for_generic():
     _init_encoder_common(encoder, fake)
 
     assert encoder.name_or_path == "Qwen/Qwen3-1.7B"
-
-
-# ---------------------------------------------------------------------------
-# is_causal=False refactor: config, forward delegation, encode kwarg,
-# extract_submodel, and generic-path is_causal flags
-# ---------------------------------------------------------------------------
-
-
-def _tiny_bidirec_config(**overrides):
-    defaults = dict(
-        vocab_size=32,
-        hidden_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        intermediate_size=32,
-        pad_token_id=0,
-    )
-    defaults.update(overrides)
-    return LlamaBidirectionalConfig(**defaults)
-
-
-def test_config_is_causal_set_to_false():
-    """config.is_causal must be False after init — required for create_causal_mask
-    to redirect to create_bidirectional_mask in the parent forward()."""
-    cfg = _tiny_bidirec_config()
-    model = LlamaBidirectionalModel(cfg)
-    assert model.config.is_causal is False
-
-
-def test_no_forward_override():
-    """LlamaBidirectionalModel must NOT define its own forward().
-    It relies on the parent LlamaModel.forward() which calls create_causal_mask
-    and respects config.is_causal = False."""
-    assert "forward" not in LlamaBidirectionalModel.__dict__
-    assert LlamaBidirectionalModel.forward is LlamaModel.forward
-
-
-def test_bidirectional_output_via_parent_forward():
-    """Parent forward() should produce bidirectional attention when
-    config.is_causal = False — changing a later token must affect
-    an earlier token's hidden state."""
-    cfg = _tiny_bidirec_config()
-    model = LlamaBidirectionalModel(cfg)
-    model.eval()
-
-    ids_a = torch.tensor([[1, 2, 3, 4]])
-    ids_b = torch.tensor([[1, 2, 3, 5]])  # only last token differs
-    mask = torch.ones_like(ids_a)
-
-    with torch.no_grad():
-        out_a = model(input_ids=ids_a, attention_mask=mask)
-        out_b = model(input_ids=ids_b, attention_mask=mask)
-
-    # In bidirectional attention, changing token 4 affects ALL positions,
-    # including position 0. In causal attention, position 0 would be identical.
-    hidden_a = out_a.last_hidden_state[0, 0]
-    hidden_b = out_b.last_hidden_state[0, 0]
-    assert not torch.allclose(hidden_a, hidden_b, atol=1e-5), (
-        "Position 0 hidden state should differ when a later token changes "
-        "(bidirectional attention). If identical, attention is still causal."
-    )
-
-
