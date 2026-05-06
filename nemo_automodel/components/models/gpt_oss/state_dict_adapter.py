@@ -98,9 +98,17 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 layer_name_to_quantized_weights[layer_name][quantized_name] = value
                 del state_dict[key]
 
-        # dequantize the experts
-        for layer_name, quantized_dict in layer_name_to_quantized_weights.items():
-            dequantized_weights = self._convert_moe_packed_tensors(quantized_dict["blocks"], quantized_dict["scales"])
+        # Dequantize experts one layer at a time, popping each entry from
+        # ``layer_name_to_quantized_weights`` so the quantized blocks/scales
+        # are released as soon as their dequantized output is produced.
+        # Holding the full quantized dict alive through the loop pinned every
+        # layer's blocks/scales until the very end, inflating peak memory.
+        for layer_name in list(layer_name_to_quantized_weights.keys()):
+            quantized_dict = layer_name_to_quantized_weights.pop(layer_name)
+            dequantized_weights = self._convert_moe_packed_tensors(
+                quantized_dict["blocks"], quantized_dict["scales"]
+            )
+            del quantized_dict
             state_dict[layer_name] = dequantized_weights
 
         # clean up the memory
