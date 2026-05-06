@@ -84,20 +84,34 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
     # Prefer nested text modules when present
     _model = get_text_module(_model)
 
-    for _, block in _model.layers.named_children():
+    def _apply_to_block(block):
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
-        if isinstance(moe_module, MoE):
-            # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
-            # local experts directly. It doesn't support DTensor wrapping, so we
-            # skip distribute_module entirely and just initialize token dispatcher.
-            if isinstance(moe_module.experts, GroupedExpertsTE):
-                moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
-            else:
-                parallelize_module(
-                    module=moe_module.experts,
-                    device_mesh=ep_mesh,
-                    parallelize_plan=ExpertParallel(),
-                )
+        if not isinstance(moe_module, MoE):
+            return
+        # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
+        # local experts directly. It doesn't support DTensor wrapping, so we
+        # skip distribute_module entirely and just initialize token dispatcher.
+        if isinstance(moe_module.experts, GroupedExpertsTE):
+            moe_module.experts.init_token_dispatcher(ep_mesh=ep_mesh, moe_mesh=moe_mesh)
+        else:
+            parallelize_module(
+                module=moe_module.experts,
+                device_mesh=ep_mesh,
+                parallelize_plan=ExpertParallel(),
+            )
+
+    for _, block in _model.layers.named_children():
+        _apply_to_block(block)
+
+    # MTP auxiliary head (Multi-Token Prediction) carries its own MoE
+    # sublayers that are not registered under ``model.layers``. Apply EP to
+    # them so their merged-expert tensors share the same DTensor structure
+    # as backbone MoE — this is required for state-dict load/save round-trip
+    # to work without DTensor/torch.Tensor mismatch.
+    mtp_module = getattr(model, "mtp", None)
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        for _, block in mtp_module.layers.named_children():
+            _apply_to_block(block)
 
 
 def apply_ac(
@@ -207,7 +221,7 @@ def apply_fsdp(
     # handle VLM
     _model = get_text_module(_model)
 
-    for _, block in _model.layers.named_children():
+    def _wrap_block(block):
         moe_module = block.moe if hasattr(block, "moe") else block.mlp
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
@@ -227,8 +241,19 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
-
         fully_shard_default(block, ignored_params=ignored_params)
+
+    for _, block in _model.layers.named_children():
+        _wrap_block(block)
+
+    # MTP auxiliary head (Multi-Token Prediction) carries its own MoE
+    # sublayers that live on the outer model (``model.mtp.layers``), not on
+    # ``_model.layers``. Apply the same per-block wrap so MoE expert
+    # parameters are properly excluded from FSDP at this nesting level.
+    mtp_module = getattr(model, "mtp", None)
+    if mtp_module is not None and hasattr(mtp_module, "layers"):
+        for _, block in mtp_module.layers.named_children():
+            _wrap_block(block)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
         fully_shard_default(_model.embed_tokens)

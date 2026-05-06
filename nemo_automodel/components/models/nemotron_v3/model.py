@@ -26,8 +26,13 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.mtp import compute_mtp_loss
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
+from nemo_automodel.components.models.nemotron_v3.mtp import (
+    build_mtp_config_from_hf,
+    build_nemotron_v3_mtp,
+)
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -260,7 +265,13 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         Args:
             config: NemotronH config
             backend: Backend configuration
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments. Recognized keys:
+                ``moe_config``, ``moe_overrides``, ``mtp_loss_scaling_factor``.
+                ``mtp_loss_scaling_factor`` (float, default 0.1) overrides
+                the MTP auxiliary-loss weight; the number of MTP depths and
+                the per-depth pattern are read from the HF config
+                (``num_nextn_predict_layers``,
+                ``mtp_hybrid_override_pattern``).
         """
         super().__init__()
         self.config = config
@@ -269,6 +280,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # Base model
         moe_overrides = kwargs.pop("moe_overrides", None)
         moe_config = kwargs.pop("moe_config", None)
+        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = NemotronV3Model(
             config,
             backend=self.backend,
@@ -286,6 +298,26 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             bias=False,
             dtype=dtype,
         )
+
+        # MTP auxiliary head (Multi-Token Prediction). Built from the HF
+        # config fields ``num_nextn_predict_layers`` and
+        # ``mtp_hybrid_override_pattern`` — both present on the released
+        # Super V3 checkpoint. When the config has no MTP fields, ``self.mtp``
+        # is ``None`` and the model behaves exactly as before.
+        self.mtp_config = build_mtp_config_from_hf(
+            config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+        )
+        if self.mtp_config.enabled:
+            self.mtp = build_nemotron_v3_mtp(
+                config,
+                mtp_config=self.mtp_config,
+                backend=self.backend,
+                moe_config=self.model.moe_config,
+                dtype=dtype,
+            )
+        else:
+            self.mtp = None
 
         # Create state_dict_adapter if enabled (needed to convert HF checkpoints)
         if self.backend.enable_hf_state_dict_adapter:
@@ -418,16 +450,43 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_labels.view(-1),
             )
 
+        # Multi-Token Prediction auxiliary loss. Only computed during
+        # training when MTP is enabled and labels are supplied; the trainer
+        # adds ``out.mtp_loss`` to the main loss before backward (see
+        # ``recipes/llm/train_ft.py``).
+        mtp_loss = None
+        if self.mtp is not None and labels is not None and self.training:
+            per_depth_h = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                embed_fn=self.model.embed_tokens,
+                attention_mask=causal_mask_mapping.get("full_attention")
+                if causal_mask_mapping is not None
+                else attention_mask,
+            )
+            mtp_loss = compute_mtp_loss(
+                per_depth_h,
+                labels=labels,
+                lm_head=self.lm_head,
+                loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+            )
+
         if is_thd:
             logits = logits.unsqueeze(0)
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
         )
+        # ``CausalLMOutputWithPast`` is a ``ModelOutput`` (an OrderedDict-backed
+        # dataclass); attach ``mtp_loss`` as an extra attribute so the trainer
+        # can pick it up via ``getattr(out, "mtp_loss", None)``.
+        out.mtp_loss = mtp_loss
+        return out
 
     @staticmethod
     def _make_causal_mask(
@@ -542,6 +601,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         with buffer_device:
             self.model.initialize_weights(buffer_device=buffer_device)
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.initializer_range)
+            if self.mtp is not None:
+                for sublayer in self.mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
 
         cast_model_to_dtype(self, dtype)
 

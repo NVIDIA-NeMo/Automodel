@@ -1,0 +1,101 @@
+# Super V3 PEFT smoke test with MTP — RESUME-FROM-CHECKPOINT VARIANT.
+#
+# Trains exactly 10 steps and saves a checkpoint at step 5 (and step 10).
+# To verify resume, run twice:
+#   1. Without restore_from: train steps 1-10 from scratch.
+#   2. Add ``checkpoint.restore_from: /adasif/checkpoints/super_v3_mtp_peft_resume/epoch_0_step_5/``
+#      to resume from step 5; trains steps 6-10.
+#
+# After both runs, compare per-step ``loss`` in
+# ``/adasif/checkpoints/super_v3_mtp_peft_resume/training.jsonl`` (the trainer
+# rewrites this between runs, so save Run A's copy elsewhere first).
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  num_epochs: 1
+  global_batch_size: 8
+  local_batch_size: 1
+  max_steps: 10
+  ckpt_every_steps: 5
+  val_every_steps: 100  # never within 10 steps
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  mtp_loss_scaling_factor: 0.1
+
+compile:
+  enabled: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /adasif/checkpoints/super_v3_mtp_peft_resume/
+  model_save_format: safetensors
+  save_consolidated: true
+  # Resume from the step-4 checkpoint (state-after-step-5, zero-indexed).
+  # Run A trained steps 0-9 from scratch; Run B picks up at step 5 and
+  # trains 5-9. Compare Run A's step 5 against Run B's step 5 (first
+  # post-resume step).
+  restore_from: /adasif/checkpoints/super_v3_mtp_peft_resume/epoch_0_step_4/
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*_proj", "*experts*"]
+  dim: 8
+  alpha: 32
+  use_triton: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  num_samples_limit: 4096
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 8
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
