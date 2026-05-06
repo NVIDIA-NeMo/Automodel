@@ -14,9 +14,7 @@
 
 """Shared scaffolding for Multi-Token Prediction (MTP) auxiliary heads.
 
-MTP follows the DeepSeek-V3 design (Liu et al., 2024) and is implemented
-identically by Megatron-LM in
-``megatron/core/transformer/multi_token_prediction.py``. Each MTP "depth"
+MTP follows the DeepSeek-V3 design (Liu et al., 2024). Each MTP "depth"
 predicts one additional future token; per depth the input is rolled left by
 one position, fused with the previous-depth hidden state, and passed through
 an inner block before producing logits via the shared LM head.

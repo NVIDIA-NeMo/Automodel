@@ -23,8 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Megatron-style hybrid layer symbols. Same characters appear in HF
-# Nemotron-H's ``hybrid_override_pattern`` / ``mtp_hybrid_override_pattern``.
+# Hybrid layer symbols matching HF Nemotron-H's ``hybrid_override_pattern``
+# and ``mtp_hybrid_override_pattern``.
 _SYMBOL_TO_BLOCK = {
     "M": "mamba",
     "*": "attention",
@@ -37,7 +37,8 @@ def parse_mtp_layer_pattern(pattern: str) -> list[str]:
     """Parse an MTP layer pattern (e.g. ``"*E"``) into a list of block types.
 
     Args:
-        pattern: Pattern string using Megatron-style symbols ``M``, ``*``, ``-``, ``E``.
+        pattern: Pattern string using symbols ``M`` (mamba), ``*`` (attention),
+            ``-`` (mlp), ``E`` (moe).
 
     Returns:
         List of block type names (``"mamba"``, ``"attention"``, ``"mlp"``, ``"moe"``).
@@ -62,8 +63,8 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
     """Roll a tensor along ``dim`` by ``shifts`` and zero the wrapped slice.
 
     Used to shift ``input_ids`` / ``position_ids`` / ``labels`` left by one
-    position per MTP depth (mirrors the single-GPU, non-CP, non-packed path
-    of Megatron's ``roll_tensor`` in ``multi_token_prediction.py``).
+    position per MTP depth. Single-GPU path only (no CP / packed-sequence
+    handling).
 
     Args:
         t: Input tensor.
@@ -95,8 +96,7 @@ class MTPConfig:
         layer_pattern: Per-depth inner-block pattern, e.g. ``"*E"`` for one
             attention + one MoE sublayer per depth.
         loss_scaling_factor: Coefficient applied to the summed per-depth CE
-            loss (Megatron's ``--mtp-loss-scaling-factor``, default 0.1).
-            The effective per-depth weight is
+            loss (default ``0.1``). The effective per-depth weight is
             ``loss_scaling_factor / num_layers``.
     """
 
@@ -247,15 +247,15 @@ def compute_mtp_loss(
     (mirroring the input-side roll), project ``h_k`` to logits via the shared
     ``lm_head``, and accumulate masked CE. Final loss is
     ``loss_scaling_factor / D * sum_k(CE_k)`` where ``D`` is the number of
-    depths. Mirrors Megatron's ``process_mtp_loss``.
+    depths.
 
     Args:
         per_depth_hidden_states: List of length ``D`` with the per-depth
             hidden states from :meth:`MTPModule.forward`.
         labels: Original (unshifted) labels, ``[B, S]`` or ``[T]``.
         lm_head: Shared output projection (typically ``model.lm_head``).
-        loss_scaling_factor: Scalar multiplier on the summed loss (default
-            ``0.1`` matches Megatron's default).
+        loss_scaling_factor: Scalar multiplier on the summed loss
+            (default ``0.1``).
         ignore_index: Label value masked out of the CE loss.
 
     Returns:

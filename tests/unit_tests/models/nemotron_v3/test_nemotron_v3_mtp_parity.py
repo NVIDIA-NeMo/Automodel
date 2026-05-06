@@ -18,7 +18,7 @@ Three layers of verification:
 
 1. **MTP-loss oracle parity** — recompute the per-depth MTP loss from
    ``MTPModule.forward``'s per-depth hidden states using a hand-written
-   DeepSeek-V3 / Megatron formulation, and assert numerical equivalence with
+   DeepSeek-V3 formulation, and assert numerical equivalence with
    :func:`compute_mtp_loss`. This isolates the loss-aggregation and
    label-rolling logic.
 
@@ -80,8 +80,8 @@ def _build_model(backend, *, mtp_layers, mtp_pattern, dtype=torch.float32, **cfg
 
 
 def _oracle_mtp_loss(per_depth_h, labels, lm_head, scaling_factor, ignore_index=-100):
-    """Independent reimplementation of the MTP loss from the DeepSeek-V3 /
-    Megatron formula. Used as a test oracle.
+    """Independent reimplementation of the MTP loss from the DeepSeek-V3
+    formula. Used as a test oracle.
 
     For depth k=1..D:
       labels_k = roll(labels_{k-1}, -1)
@@ -155,9 +155,9 @@ class TestMTPLossOracleParity:
         loss = compute_mtp_loss(per_depth_h, labels, lm_head, loss_scaling_factor=1.0)
         assert torch.isfinite(loss).item(), f"got non-finite MTP loss: {loss.item()}"
 
-    def test_roll_then_zero_matches_megatron_formula(self):
-        """Cumulative left-roll with trailing-zero fill matches Megatron's
-        ``roll_tensor`` (single-GPU path). Replicates depth-k semantics."""
+    def test_roll_then_zero_cumulative(self):
+        """Cumulative left-roll with trailing-zero fill replicates the
+        depth-k token-shift semantics."""
         labels = torch.arange(10).unsqueeze(0)  # [1, 10]
         # k=1: trailing 1 position zeroed
         d1 = roll_tensor(labels, shifts=-1, dim=-1)

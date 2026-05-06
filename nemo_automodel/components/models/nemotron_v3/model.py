@@ -268,8 +268,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             config: NemotronH config
             backend: Backend configuration
             mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
-                (Megatron's ``--mtp-loss-scaling-factor``). The number of MTP
-                depths and the per-depth pattern are read from the HF config
+                (default ``0.1``). The number of MTP depths and the per-depth
+                pattern are read from the HF config
                 (``num_nextn_predict_layers``,
                 ``mtp_hybrid_override_pattern``).
             **kwargs: Additional arguments. Recognized keys:
