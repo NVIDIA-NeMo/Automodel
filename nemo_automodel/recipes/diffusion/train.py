@@ -438,7 +438,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.model_type = self.cfg.get("model.model_type", None)
         if self.peft_cfg is not None and not self.model_type:
             raise ValueError(
-                "model.model_type must be set when peft config is provided. Options: 'flux', 'wan', 'hunyuan'"
+                "model.model_type must be set when peft config is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
             )
 
         lora_status = (
