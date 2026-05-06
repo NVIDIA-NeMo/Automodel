@@ -562,7 +562,10 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         Returns:
             torch.Tensor: The output tensor.
         """
-        ctx.save_for_backward(aux_loss)
+        # Pin aux_loss dtype so the AC saved/recomputed metadata cannot diverge
+        # regardless of upstream casts. The backward path uses torch.ones_like(aux_loss)
+        # only for shape, so dtype here is behaviorally invisible to gradient flow.
+        ctx.save_for_backward(aux_loss.float())
         return output
 
     @staticmethod
