@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-agnostic Multi-Token Prediction (MTP) scaffolding.
-
-The MTP module owns the depth-iteration loop, token rolling, fusion of the
-previous-depth hidden state with the future-token embedding, and per-depth
-loss computation. Model-specific construction of the inner decoder block is
-delegated to the caller via a sublayer factory.
-"""
+"""Model-agnostic MTP scaffolding: depth iteration, token rolling, and loss."""
 
 from __future__ import annotations
 
@@ -29,14 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Pattern parsing
-# ---------------------------------------------------------------------------
-
-# Layer-type symbols used by Megatron's hybrid layer specs (see
-# ``megatron/core/models/hybrid/hybrid_layer_allocation.py``). HF's
-# Nemotron-H ``configuration_nemotron_h.py`` uses the same characters in
-# ``hybrid_override_pattern`` and ``mtp_hybrid_override_pattern``.
+# Megatron-style hybrid layer symbols. Same characters appear in HF
+# Nemotron-H's ``hybrid_override_pattern`` / ``mtp_hybrid_override_pattern``.
 _SYMBOL_TO_BLOCK = {
     "M": "mamba",
     "*": "attention",
@@ -70,17 +58,12 @@ def parse_mtp_layer_pattern(pattern: str) -> list[str]:
     return blocks
 
 
-# ---------------------------------------------------------------------------
-# Token rolling
-# ---------------------------------------------------------------------------
-
-
 def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tensor:
     """Roll a tensor along ``dim`` by ``shifts`` and zero the wrapped slice.
 
-    Matches Megatron's ``roll_tensor`` (single-GPU, non-CP, non-packed path)
-    in ``multi_token_prediction.py``. Used to shift ``input_ids`` /
-    ``position_ids`` / ``labels`` left by one position per MTP depth.
+    Used to shift ``input_ids`` / ``position_ids`` / ``labels`` left by one
+    position per MTP depth (mirrors the single-GPU, non-CP, non-packed path
+    of Megatron's ``roll_tensor`` in ``multi_token_prediction.py``).
 
     Args:
         t: Input tensor.
@@ -101,11 +84,6 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
         idx = torch.arange(0, n, device=t.device)
     rolled = rolled.index_fill(dim, idx, 0)
     return rolled
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -137,11 +115,6 @@ class MTPConfig:
     @property
     def enabled(self) -> bool:
         return self.num_layers > 0 and self.pattern_length > 0
-
-
-# ---------------------------------------------------------------------------
-# MTP module
-# ---------------------------------------------------------------------------
 
 
 class MTPModule(nn.Module):
@@ -274,8 +247,7 @@ def compute_mtp_loss(
     (mirroring the input-side roll), project ``h_k`` to logits via the shared
     ``lm_head``, and accumulate masked CE. Final loss is
     ``loss_scaling_factor / D * sum_k(CE_k)`` where ``D`` is the number of
-    depths. Mirrors Megatron's ``process_mtp_loss``
-    (``multi_token_prediction.py:615``).
+    depths. Mirrors Megatron's ``process_mtp_loss``.
 
     Args:
         per_depth_hidden_states: List of length ``D`` with the per-depth

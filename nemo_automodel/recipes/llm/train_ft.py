@@ -1426,12 +1426,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
-                # Multi-Token Prediction auxiliary loss is produced by models
-                # that expose an MTP head (e.g. Nemotron Super V3). When
-                # ``out.mtp_loss`` is present, fold it into the main loss so
-                # the single ``local_loss.backward()`` below covers MTP
-                # parameters. ``mtp_loss`` is already scaled by the model's
-                # ``mtp_loss_scaling_factor``.
+                # Fold per-model MTP aux loss (already scaled) into local_loss.
                 mtp_loss = getattr(out, "mtp_loss", None)
                 if mtp_loss is not None:
                     local_loss = local_loss + mtp_loss

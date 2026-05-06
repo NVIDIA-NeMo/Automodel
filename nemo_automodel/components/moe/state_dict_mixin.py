@@ -525,13 +525,16 @@ class MoESplitExpertsStateDictMixin:
         Args:
             fqn: Fully qualified name of the tensor in native format
             tensor: The tensor to convert
+            **kwargs: Optional ``prefix_override: str`` replaces ``self._hf_prefix``
+                in emitted HF keys (used for namespaces outside the main backbone,
+                e.g. ``"mtp."``).
 
         Returns:
             List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
-        prefix = self._hf_prefix
+        prefix = kwargs.get("prefix_override") or self._hf_prefix
         expert_segment = self._expert_path_segment
 
         if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):

@@ -166,12 +166,7 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         # Then merge experts using the mixin method
         merged = self._from_hf_w_merged_experts(renamed_state_dict, device_mesh)
 
-        # Process MTP keys: strip the ``mtp.`` namespace, reuse the standard
-        # expert-merge logic, then re-add ``mtp.`` to the merged output keys.
-        # ``apply_ep`` (``components/moe/parallelizer.py:76``) iterates both
-        # ``model.backbone.layers`` and ``model.mtp.layers``, so MTP MoE
-        # experts are EP-sharded the same way as backbone experts and the
-        # standard ``device_mesh``-aware merge produces matching DTensors.
+        # Re-route MTP keys through the standard merge with prefix stripped.
         if mtp_state_dict:
             stripped: dict[str, Any] = {}
             for key, value in mtp_state_dict.items():
@@ -196,15 +191,12 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         """
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        # MTP keys live in their own ``mtp.*`` namespace. Merged-experts
-        # tensors are split with prefix ``mtp.`` rather than ``backbone.``;
-        # all other MTP keys pass through unchanged.
+        # MTP keys live in their own ``mtp.*`` namespace; route them through
+        # the standard expert-split path with the prefix overridden so
+        # emitted HF keys stay under ``mtp.`` instead of ``backbone.``.
         if fqn.startswith("mtp."):
-            expert_split = self._mtp_convert_merged_expert_to_hf_split(fqn, tensor)
-            if expert_split is not None:
-                result = expert_split
-            else:
-                result = [(fqn, tensor)]
+            expert_split = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, prefix_override="mtp.")
+            result = expert_split if expert_split is not None else [(fqn, tensor)]
             if exclude_key_regex:
                 result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
             return result
@@ -235,73 +227,3 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
 
         return result
-
-    def _mtp_convert_merged_expert_to_hf_split(self, fqn: str, tensor: Any) -> Optional[list[tuple[str, Any]]]:
-        """Split a merged MTP MoE expert tensor into per-expert HF keys.
-
-        Mirrors :meth:`MoESplitExpertsStateDictMixin._convert_single_merged_expert_to_hf_split_experts`
-        but emits keys under the ``mtp.`` namespace instead of ``backbone.``.
-        Returns ``None`` if ``fqn`` does not refer to a merged MTP expert
-        tensor.
-
-        Sharding note: backbone MoE experts are EP-sharded by ``apply_ep``
-        (``components/moe/parallelizer.py:76``), which only iterates
-        ``model.backbone.layers``. MTP MoE experts are never visited by EP,
-        so their tensors arrive here as plain tensors or as DTensors sharded
-        only along DP. ``_split_experts_weights`` requires either a plain
-        tensor or a DTensor with ``ep`` mesh dim, so we materialize
-        non-EP-sharded DTensors via ``full_tensor()`` first.
-        """
-        from nemo_automodel.components.moe.state_dict_utils import is_dtensor
-
-        expert_segment = self._expert_path_segment
-        n_experts = self.moe_config.n_routed_experts
-        inter_dim = self.moe_config.moe_inter_dim
-
-        def _materialize(t):
-            if not is_dtensor(t):
-                return t
-            mesh = t.device_mesh
-            if "ep" in mesh.mesh_dim_names:
-                return t
-            return t.full_tensor()
-
-        if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-            tensor = _materialize(tensor)
-            splits = self._split_experts_weights(tensor, n_experts)
-            result: list[tuple[str, Any]] = []
-            for i, w in enumerate(splits):
-                expert_id = self._last_expert_ids[i]
-                base = f"mtp.layers.{layer_num}.{expert_segment}.{expert_id}"
-                if self._is_gated_moe:
-                    w_gate = w[:, :inter_dim].transpose(0, 1).contiguous()
-                    w_up = w[:, inter_dim:].transpose(0, 1).contiguous()
-                    result.append((f"{base}.gate_proj.weight", w_gate))
-                    result.append((f"{base}.up_proj.weight", w_up))
-                else:
-                    w_up = w.transpose(0, 1).contiguous()
-                    result.append((f"{base}.up_proj.weight", w_up))
-            return result
-
-        if (
-            f".{expert_segment}.down_projs" in fqn
-            and fqn.endswith(".down_projs")
-            and tensor.ndim == 3
-            and tensor.shape[1] == inter_dim
-        ):
-            layer_num = re.search(r"layers\.(\d+)", fqn).group(1)
-            tensor = _materialize(tensor)
-            splits = self._split_experts_weights(tensor, n_experts)
-            result = []
-            for i, w in enumerate(splits):
-                expert_id = self._last_expert_ids[i]
-                result.append(
-                    (
-                        f"mtp.layers.{layer_num}.{expert_segment}.{expert_id}.down_proj.weight",
-                        w.transpose(0, 1).contiguous(),
-                    )
-                )
-            return result
-
-        return None
