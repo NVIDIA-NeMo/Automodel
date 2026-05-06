@@ -114,6 +114,66 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
+        """Both HC expand sites mix residual streams as ``comb.T @ x``."""
+
+        class _FixedHC(torch.nn.Module):
+            def __init__(self, comb):
+                super().__init__()
+                self.register_buffer("comb", comb)
+
+            def compute_weights(self, hidden_streams):
+                bsz, seq, hc_mult = hidden_streams.shape[:3]
+                pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
+                post = torch.zeros_like(pre)
+                return pre, post, self.comb.expand(bsz, seq, -1, -1)
+
+        class _ZeroAttention(torch.nn.Module):
+            def forward(self, hidden_states, **kwargs):
+                return torch.zeros_like(hidden_states), None
+
+        class _ZeroMLP(torch.nn.Module):
+            def forward(self, hidden_states, padding_mask=None):
+                return torch.zeros_like(hidden_states)
+
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[0])
+        model = _make_model(cfg)
+        block = model.model.layers["0"]
+        block.attn_hc = _FixedHC(
+            torch.tensor(
+                [
+                    [1.0, 2.0, 0.0, 1.0],
+                    [0.0, 1.0, 3.0, 0.0],
+                    [4.0, 0.0, 1.0, 2.0],
+                    [0.0, 5.0, 0.0, 1.0],
+                ]
+            )
+        )
+        block.ffn_hc = _FixedHC(
+            torch.tensor(
+                [
+                    [2.0, 0.0, 1.0, 0.0],
+                    [1.0, 3.0, 0.0, 2.0],
+                    [0.0, 1.0, 4.0, 0.0],
+                    [5.0, 0.0, 1.0, 1.0],
+                ]
+            )
+        )
+        block.self_attn = _ZeroAttention()
+        block.mlp = _ZeroMLP()
+        block.input_layernorm = torch.nn.Identity()
+        block.post_attention_layernorm = torch.nn.Identity()
+
+        x = torch.arange(cfg.hc_mult * cfg.hidden_size, dtype=torch.float32).view(1, 1, cfg.hc_mult, cfg.hidden_size)
+        expected = torch.matmul(block.attn_hc.comb.transpose(-1, -2), x)
+        expected = torch.matmul(block.ffn_hc.comb.transpose(-1, -2), expected)
+        wrong_orientation = torch.matmul(block.ffn_hc.comb, torch.matmul(block.attn_hc.comb, x))
+
+        actual = block(x, position_embeddings=(torch.empty(0), torch.empty(0)))
+
+        torch.testing.assert_close(actual, expected)
+        assert not torch.allclose(expected, wrong_orientation)
+
     @_REQUIRES_CUDA
     def test_forward_shape(self):
         """Forward pass produces logits of the right shape."""
