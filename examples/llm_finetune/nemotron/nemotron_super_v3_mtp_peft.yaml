@@ -1,15 +1,8 @@
-# Super V3 PEFT smoke test with Multi-Token Prediction (MTP) auxiliary loss.
-#
 # Super V3 ships MTP weights in its HF checkpoint:
 #   - mtp_hybrid_override_pattern: "*E"   (1 attention + 1 MoE per MTP depth)
 #   - num_nextn_predict_layers: 1         (single MTP depth)
 # Both fields are read directly from the HF config by NemotronHForCausalLM.
 # The training-only ``mtp_loss_scaling_factor`` is supplied here.
-#
-# The default ``target_modules: ["*_proj", "*experts*"]`` already attaches
-# LoRA adapters to every Linear in the MTP block (``eh_proj``, attention
-# ``q/k/v/o_proj``, MoE experts). The loaded MTP base weights stay frozen
-# under PEFT; gradients from ``mtp_loss`` flow through the MTP LoRA adapters.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
