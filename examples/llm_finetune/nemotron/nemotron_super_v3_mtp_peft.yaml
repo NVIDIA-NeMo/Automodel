@@ -25,9 +25,6 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
-  # MTP scaling factor (Megatron's --mtp-loss-scaling-factor; default 0.1).
-  # ``num_nextn_predict_layers`` and ``mtp_hybrid_override_pattern`` are read
-  # from the HF config and do not need to be overridden here.
   mtp_loss_scaling_factor: 0.1
 
 compile:
