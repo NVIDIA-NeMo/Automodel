@@ -354,6 +354,20 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
         if _maybe_dequantize_fp8_for_peft(_hf_native_quant_cfg, peft_config, pretrained_model_name_or_path_or_config):
             kwargs["config"] = _hf_config
+        # Preserve the user's original ``attn_implementation`` request after the
+        # ``te`` -> ``sdpa`` translation above. Custom NeMo model classes (e.g.
+        # gemma4_moe.Gemma4MoEDecoderLayer) need this to opt into TE-native
+        # attention modules at construction time, before SDPA-patching kicks in.
+        # Stamp the top-level config and any nested sub-configs (e.g. text_config,
+        # vision_config on multimodal models) since the per-layer construction
+        # site usually only sees the relevant sub-config.
+        if inject_te_attention:
+            _hf_config._nemo_attn_implementation_request = "te"
+            for _sub_attr in ("text_config", "vision_config", "audio_config"):
+                _sub = getattr(_hf_config, _sub_attr, None)
+                if _sub is not None:
+                    _sub._nemo_attn_implementation_request = "te"
+            kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)

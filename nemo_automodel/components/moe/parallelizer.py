@@ -290,7 +290,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     for _, block in _model.layers.named_children():
         layer_type = getattr(block, "layer_type", "full_attention")
 
-        if layer_type == "full_attention":
+        if layer_type in ("full_attention", "sliding_attention"):
             attn_module = block.self_attn.attn_module
             if not isinstance(attn_module, DotProductAttention):
                 logger.warning(
@@ -298,11 +298,16 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     type(attn_module).__name__,
                 )
                 continue
+            # TE only supports CP + sliding-window attention with cp_comm_type in
+            # {"a2a", "all_gather"} (see TE's context_parallel.py "sliding_window_attn"
+            # assertion). For full-attention layers we keep the caller's choice
+            # (default "p2p", which has the best perf for ring-style CP).
+            layer_cp_comm_type = "a2a" if layer_type == "sliding_attention" else cp_comm_type
             attn_module.set_context_parallel_group(
                 cp_mesh.get_group(),
                 torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
                 _get_cp_stream(),
-                cp_comm_type=cp_comm_type,
+                cp_comm_type=layer_cp_comm_type,
             )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel

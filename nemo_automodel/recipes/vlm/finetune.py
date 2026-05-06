@@ -91,6 +91,52 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 
 
+# Keys that ``make_cp_batch_for_te`` does not preserve through THD sharding but
+# the VLM model.forward still expects (vision-tower inputs, MM token-type ids,
+# image-grid metadata). The recipe pops these off before calling
+# ``make_cp_batch_and_ctx(use_te=True)`` and re-attaches them to the sharded
+# batch afterwards. They are NOT sequence-aligned, so they should be passed
+# through untouched. Image-token positions (which are sequence-aligned via
+# ``input_ids``) are CP-sharded; under CP > 1 the per-rank multimodal merge
+# only sees its local image tokens and image features, which is correct only
+# when image features can be partitioned per rank — see the
+# ``gemma4_26b_a4b_moe_cp.yaml`` docstring for the trade-off.
+_VLM_NON_CP_BATCH_KEYS = (
+    "pixel_values",
+    "image_grid_hws",
+    "image_grid_thw",
+    "mm_token_type_ids",
+    "image_sizes",
+    "n_images_per_sample",
+)
+
+
+def _uses_te_dot_product_attention(model_or_cfg):
+    """Mirror of the LLM recipe helper: detect TE attention from a model or cfg."""
+    if isinstance(model_or_cfg, nn.Module):
+        try:
+            from transformer_engine.pytorch.attention import DotProductAttention
+        except ImportError:
+            return False
+        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
+    return (
+        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
+    )
+
+
+def _uses_thd_collater(cfg_dataloader):
+    """True iff the dataloader's collate_fn produces THD ``seq_lens`` metadata."""
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    cfn = getattr(cfg_dataloader, "collate_fn", None)
+    if cfn is packed_sequence_thd_collater:
+        return True
+    # gemma4_prefix_thd_collate_fn returns a dict that conforms to packed_sequence_thd_collater's
+    # contract (input_ids/labels/position_ids + seq_lens/seq_lens_padded + qkv_format='thd').
+    name = getattr(cfn, "__name__", "")
+    return name in ("gemma4_prefix_thd_collate_fn",)
+
+
 def _get_model_name(cfg_model):
     if cfg_model.get("pretrained_model_name_or_path", None) is not None:
         return cfg_model.pretrained_model_name_or_path
@@ -951,7 +997,29 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        # Determine whether to take the TE-native CP path (THD + TE
+        # DotProductAttention.set_context_parallel_group). Mirror the LLM
+        # recipe gate: requires both a TE attention module on the model AND
+        # a THD-emitting collator on the dataloader.
+        _use_te_cp = _uses_te_dot_product_attention(
+            self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+        ) and _uses_thd_collater(self.cfg.dataloader)
+        # Carry vision/multimodal tensors around the THD shard pass: the
+        # TE batch builder rebuilds the batch dict from scratch and drops
+        # any keys it does not know about.
+        _vlm_aux = {}
+        if _use_te_cp:
+            for _k in _VLM_NON_CP_BATCH_KEYS:
+                if _k in batch:
+                    _vlm_aux[_k] = batch.pop(_k)
+        train_ctx, batch = make_cp_batch_and_ctx(
+            self.device_mesh,
+            batch,
+            use_te=_use_te_cp,
+            padding_token_id=self.tokenizer.pad_token_id if getattr(self, "tokenizer", None) else 0,
+        )
+        if _vlm_aux:
+            batch.update(_vlm_aux)
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1230,7 +1298,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
                     )
 
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
+                _val_use_te_cp = _uses_te_dot_product_attention(self.model_parts[0]) and _uses_thd_collater(
+                    self.cfg.dataloader
+                )
+                _val_vlm_aux = {}
+                if _val_use_te_cp:
+                    for _k in _VLM_NON_CP_BATCH_KEYS:
+                        if _k in batch:
+                            _val_vlm_aux[_k] = batch.pop(_k)
+                train_ctx, batch = make_cp_batch_and_ctx(
+                    self.device_mesh,
+                    batch,
+                    labels,
+                    use_te=_val_use_te_cp,
+                    padding_token_id=self.tokenizer.pad_token_id if getattr(self, "tokenizer", None) else 0,
+                )
+                if _val_vlm_aux:
+                    batch.update(_val_vlm_aux)
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):

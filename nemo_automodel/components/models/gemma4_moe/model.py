@@ -77,9 +77,35 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
+from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .layers import Gemma4MoEAttention
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
+
+# nemo_automodel's custom Gemma4MoEAttention is opt-in: existing configs that set
+# ``backend.attn: te`` but ``attn_implementation: eager`` keep their legacy HF
+# attention path i.e Gemma4Attention(and HF's bidirectional-vision masking). The custom path (i.e Gemma4MoEAttention)
+# is only selected when the user explicitly sets ``attn_implementation: te``
+# AND ``backend.attn`` is one of the _NATIVE_ATTN_BACKENDS. This is required to
+# enable TE-native context parallelism (which only the custom module wires
+# into TE's DotProductAttention via ``set_context_parallel_group``).
+_NATIVE_ATTN_BACKENDS = ("te", "sdpa")
+
+
+def _uses_native_attention(config: Any, backend: BackendConfig) -> bool:
+    if getattr(backend, "attn", None) not in _NATIVE_ATTN_BACKENDS:
+        return False
+    # auto_model.py translates ``attn_implementation="te"`` -> ``"sdpa"`` for HF
+    # model init and stamps the original request on the config as
+    # ``_nemo_attn_implementation_request``. Prefer that sentinel; fall back to
+    # the visible attn_implementation for code paths that bypass auto_model.
+    attn_impl = (
+        getattr(config, "_nemo_attn_implementation_request", None)
+        or getattr(config, "_attn_implementation", None)
+        or getattr(config, "attn_implementation", None)
+    )
+    return attn_impl == "te"
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +215,15 @@ class Gemma4MoEDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.attention_type = config.layer_types[layer_idx]
 
-        # Reuse HF modules
-        self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
+        # Attention backend selection. The custom nemo-automodel attention is required for
+        # TE-native context parallelism (it routes through TE's DotProductAttention
+        # so apply_cp can call set_context_parallel_group on it, and it accepts
+        # cp_size/cp_rank in attn_kwargs for CP-aware RoPE).Otherwise, Gemma4Attention from HF default path is used.
+        self._uses_native_attention = _uses_native_attention(config, backend)
+        if self._uses_native_attention:
+            self.self_attn = Gemma4MoEAttention(config, layer_idx, backend)
+        else:
+            self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
         self.mlp = Gemma4MLP(config, layer_idx)
 
         # Norms
@@ -215,7 +248,8 @@ class Gemma4MoEDecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        position_embeddings: torch.Tensor,
+        position_embeddings: torch.Tensor | None = None,
+        freqs_cis: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         padding_mask: torch.Tensor | None = None,
@@ -227,16 +261,28 @@ class Gemma4MoEDecoderLayer(nn.Module):
         # --- Attention ---
         residual = x
         x = self.input_layernorm(x)
-        x, _ = self.self_attn(
-            hidden_states=x,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
-        )
+        if self._uses_native_attention:
+            # nemo-automodel Gemma4MoEAttention path: TE module handles causal/sliding
+            # masking via its window_size config, so attention_mask is None.
+            # cp_size/cp_rank/cu_seqlens flow through ``kwargs`` -> attn_kwargs.
+            assert freqs_cis is not None, "freqs_cis required for custom nemo-automodel Gemma4MoEAttention"
+            x = self.self_attn(
+                x=x,
+                freqs_cis=freqs_cis,
+                attention_mask=None,
+                **kwargs,
+            )
+        else:
+            x, _ = self.self_attn(
+                hidden_states=x,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
         x = self.post_attention_layernorm(x)
         x = residual + x
 
@@ -327,6 +373,39 @@ class Gemma4MoETextModelBackend(nn.Module):
 
         self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Gemma4RotaryEmbedding(config)
+        self._uses_native_attention = _uses_native_attention(config, backend)
+
+    def _build_freqs_cis_per_type(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute nemo-automodel format ``freqs_cis = concat(cos_half, sin_half)`` per layer type.
+
+        HF Gemma4RotaryEmbedding emits ``(cos, sin)`` of shape ``[*, rotary_dim]``
+        with both halves mirrored (HF rotates via ``rotate_half`` on each half).
+        nemo-automodel's ``apply_rotary_emb`` uses ``[..., rotary_dim/2]`` half-tensors
+        chunked together as ``[cos_half, sin_half]``; the math is equivalent to
+        the HF half-rotation, so we can slice one half and concatenate.
+
+        Under THD the inputs are 2-D (``[T, H]`` / ``[T]``); HF's rotary
+        expects a leading batch dim, so we unsqueeze before the call and
+        squeeze the output afterwards.
+        """
+        is_thd = hidden_states.dim() == 2
+        h_for_rope = hidden_states.unsqueeze(0) if is_thd else hidden_states
+        pos_for_rope = position_ids.unsqueeze(0) if (is_thd and position_ids.dim() == 1) else position_ids
+
+        out: dict[str, torch.Tensor] = {}
+        for layer_type in set(self.config.layer_types):
+            cos, sin = self.rotary_emb(h_for_rope, pos_for_rope, layer_type)
+            half = cos.shape[-1] // 2
+            freqs_cis = torch.cat([cos[..., :half], sin[..., :half]], dim=-1)
+            if is_thd:
+                # [1, T, D] -> [T, D]
+                freqs_cis = freqs_cis.squeeze(0)
+            out[layer_type] = freqs_cis
+        return out
 
     def forward(
         self,
@@ -360,53 +439,89 @@ class Gemma4MoETextModelBackend(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Build causal masks. When use_bidirectional_attention == "vision" (e.g.
-        # gemma-4-26B-A4B, gemma-4-31B), HF uses create_causal_mask_mapping to
-        # build a vision-aware mask where tokens inside the same vision group
-        # attend to each other bidirectionally (not just causally). Missing this
-        # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
-        if getattr(self.config, "use_bidirectional_attention", None) == "vision":
-            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
-
-            causal_mask_mapping = create_causal_mask_mapping(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                pixel_values=pixel_values,
-                is_training=self.training,
-            )
+        if self._uses_native_attention:
+            # nemo_automodel's custom Gemma4MoEAttention attention path: TE/SDPA module owns causal +
+            # sliding-window masking via its own configuration; no explicit
+            # 4-D mask is needed. Under CP+TE the bidirectional vision-mask
+            # path (``use_bidirectional_attention == "vision"``) is skipped:
+            # TE-native CP only supports causal / padding_causal masks. This
+            # trades multimodal mask quality for CP throughput; see the
+            # gemma4_26b_a4b_moe_cp.yaml docstring for the trade-off.
+            causal_mask_mapping = None
+            position_embeddings = None
+            # freqs_cis is built later (after THD squeeze, if applicable) so
+            # the rotary embedding sees the actual shapes the layers will use.
+            freqs_cis_per_type = None
         else:
-            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+            # Build causal masks. When use_bidirectional_attention == "vision" (e.g.
+            # gemma-4-26B-A4B, gemma-4-31B), HF uses create_causal_mask_mapping to
+            # build a vision-aware mask where tokens inside the same vision group
+            # attend to each other bidirectionally (not just causally). Missing this
+            # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+            if getattr(self.config, "use_bidirectional_attention", None) == "vision":
+                from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
 
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+                causal_mask_mapping = create_causal_mask_mapping(
+                    config=self.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    pixel_values=pixel_values,
+                    is_training=self.training,
+                )
+            else:
+                from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-        position_embeddings = {}
-        for layer_type in set(self.config.layer_types):
-            position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
+                mask_kwargs = {
+                    "config": self.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "cache_position": cache_position,
+                    "past_key_values": past_key_values,
+                    "position_ids": position_ids,
+                }
+                causal_mask_mapping = {
+                    "full_attention": create_causal_mask(**mask_kwargs),
+                    "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                }
+
+            position_embeddings = {}
+            for layer_type in set(self.config.layer_types):
+                position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
+            freqs_cis_per_type = None
+
+        # Custom nemo-automodel attention path may consume a pre-built THD batch where input
+        # tensors carry a placeholder batch dim (added by make_cp_batch_for_te)
+        # and ``cu_seqlens`` is forwarded via attn_kwargs. Drop the batch axis
+        # so attention sees [T, H] / [T] tensors and rotary sees the same.
+        if self._uses_native_attention:
+            if "cu_seqlens" in kwargs:
+                hidden_states, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
+                    hidden_states, position_ids, padding_mask, kwargs
+                )
+            freqs_cis_per_type = self._build_freqs_cis_per_type(hidden_states, position_ids)
 
         for decoder_layer in self.layers.values():
-            hidden_states = decoder_layer(
-                hidden_states,
-                position_embeddings=position_embeddings[decoder_layer.attention_type],
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                position_ids=position_ids,
-                padding_mask=padding_mask,
-                **kwargs,
-            )
+            if self._uses_native_attention:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    freqs_cis=freqs_cis_per_type[decoder_layer.attention_type],
+                    attention_mask=None,
+                    position_ids=position_ids,
+                    padding_mask=padding_mask,
+                    **kwargs,
+                )
+            else:
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings[decoder_layer.attention_type],
+                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                    position_ids=position_ids,
+                    padding_mask=padding_mask,
+                    **kwargs,
+                )
 
         hidden_states = self.norm(hidden_states)
 
