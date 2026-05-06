@@ -80,6 +80,61 @@ class Qwen3_5MoeBlock(Block):
         if self.layer_type == "linear_attention":
             self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Mirror :meth:`Block.forward` but thread NEAT-packing kwargs into
+        ``CPAwareGatedDeltaNet``.
+
+        The parent ``Block.forward`` calls ``linear_attn`` with only
+        ``hidden_states`` and ``attention_mask``; for packed sequences the
+        gated_delta_rule kernel additionally needs ``cu_seqlens`` /
+        ``indices`` to reset state at document boundaries (issue #2131).
+        Derived once per forward from the indexed attention mask.
+        """
+        if self.layer_type != "linear_attention":
+            return super().forward(
+                x,
+                freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                position_ids=position_ids,
+                **attn_kwargs,
+            )
+
+        # Local imports to avoid pulling packing utilities into the module
+        # import graph for non-Qwen3.5 callers.
+        from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+
+        cu_seqlens: torch.Tensor | None = None
+        indices: torch.Tensor | None = None
+        if is_indexed_packed_mask(attention_mask):
+            indices_t, cu_seqlens_t, _ = get_unpad_data(attention_mask)
+            cu_seqlens = cu_seqlens_t.to(torch.long)
+            indices = indices_t
+
+        if attention_mask is not None and padding_mask is None:
+            padding_mask = attention_mask.bool().logical_not()
+
+        attn_out = self.linear_attn(
+            hidden_states=self.input_layernorm(x),
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            indices=indices,
+        )
+        x = x + attn_out
+
+        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        return x + mlp_out
+
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
             norm.reset_parameters()

@@ -343,44 +343,29 @@ class TestPatchHfModelStateDictAdapter:
         assert not hasattr(model, "state_dict_adapter")
 
 
-class TestAttachLinearAttnPositionHooks:
-    def test_hook_caches_position_ids(self, fake_model):
-        """Pre-hook stores position_ids on linear_attn module."""
-        from nemo_automodel.components.distributed.cp_utils import attach_linear_attn_position_hooks
+class TestPackingHelpers:
+    """Tests for the indexed-mask helpers used by Qwen3_5DecoderLayerWithPacking."""
 
-        attach_linear_attn_position_hooks(fake_model)
+    def test_is_indexed_packed_mask_detection(self):
+        from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 
-        layer = fake_model.layers[0]
-        pos_ids = torch.arange(10)
+        assert is_indexed_packed_mask(None) is False
+        assert is_indexed_packed_mask(torch.ones(1, 4, dtype=torch.long)) is False
+        assert is_indexed_packed_mask(torch.tensor([[1, 1, 0, 0]])) is False  # 0/1 only
+        assert is_indexed_packed_mask(torch.tensor([[1, 1, 2, 2]])) is True
+        # bool dtype is short-circuited (a bool 1/2 mask isn't a thing).
+        assert is_indexed_packed_mask(torch.tensor([[True, True, False, False]])) is False
 
-        # Simulate decoder layer forward call with position_ids kwarg
-        # The hook fires on the layer (which has linear_attn + layer_type)
-        for hook in layer._forward_pre_hooks.values():
-            hook(layer, (), {"position_ids": pos_ids})
+    def test_cu_seqlens_from_indexed_mask(self):
+        from nemo_automodel.components.models.common.packing import get_unpad_data
 
-        assert layer.linear_attn._cached_position_ids is pos_ids
-
-    def test_hook_deduplication(self, fake_model):
-        """Calling twice does not register duplicate hooks."""
-        from nemo_automodel.components.distributed.cp_utils import attach_linear_attn_position_hooks
-
-        attach_linear_attn_position_hooks(fake_model)
-        n_hooks = len(fake_model.layers[0]._forward_pre_hooks)
-
-        attach_linear_attn_position_hooks(fake_model)
-        assert len(fake_model.layers[0]._forward_pre_hooks) == n_hooks
-
-    def test_no_hook_on_non_linear_attn_layers(self):
-        """Layers without linear_attn don't get hooks."""
-        from nemo_automodel.components.distributed.cp_utils import attach_linear_attn_position_hooks
-
-        model = nn.Module()
-        model.layers = nn.ModuleList([nn.Module()])
-        model.layers[0].self_attn = nn.Linear(4, 4)
-        model.layers[0].layer_type = "full_attention"
-
-        attach_linear_attn_position_hooks(model)
-        assert len(model.layers[0]._forward_pre_hooks) == 0
+        mask = torch.tensor([[1, 1, 2, 2, 2, 0], [1, 1, 1, 1, 0, 0]])
+        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
+        # Per-doc lengths flattened across batch: [2, 3, 4]
+        assert cu_seqlens.tolist() == [0, 2, 5, 9]
+        assert max_seqlen == 4
+        # Non-padding positions in flattened B*T=12 sequence
+        assert indices.tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9]
 
 
 class TestQwen35ParallelizationStrategyRegistration:
@@ -865,19 +850,33 @@ class TestForwardDispatch:
         assert out.shape == (1, 4, _HIDDEN)
 
     def test_forward_passes_cache_params_through(self, monkeypatch):
-        """forward() passes cache_params, cache_position, attention_mask to _forward_no_cp."""
+        """forward() passes cache_params, cache_position, attention_mask, and packing kwargs to _forward_no_cp."""
         mod, _ = _build_forward_module(monkeypatch)
         mod._cp_mesh = None
 
         called_with = {}
         orig_fwd = mod._forward_no_cp
 
-        def _spy(hidden_states, cache_params=None, cache_position=None, attention_mask=None):
+        def _spy(
+            hidden_states,
+            cache_params=None,
+            cache_position=None,
+            attention_mask=None,
+            cu_seqlens=None,
+            indices=None,
+        ):
             called_with["cache_params"] = cache_params
             called_with["cache_position"] = cache_position
             called_with["attention_mask"] = attention_mask
+            called_with["cu_seqlens"] = cu_seqlens
+            called_with["indices"] = indices
             return orig_fwd(
-                hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask
+                hidden_states,
+                cache_params=cache_params,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
+                indices=indices,
             )
 
         mod._forward_no_cp = _spy
@@ -889,6 +888,8 @@ class TestForwardDispatch:
         assert called_with["cache_params"] is None
         assert called_with["cache_position"] is None
         assert called_with["attention_mask"] is mask
+        assert called_with["cu_seqlens"] is None
+        assert called_with["indices"] is None
 
     def test_forward_ignores_extra_cp_kwargs(self, monkeypatch):
         """forward() accepts position_ids, qkv_format, etc. but ignores them on no-CP path."""
