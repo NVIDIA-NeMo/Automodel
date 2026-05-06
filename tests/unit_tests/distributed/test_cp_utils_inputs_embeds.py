@@ -289,6 +289,66 @@ def test_padding_handles_loss_mask_and_padding_mask(monkeypatch):
         assert buf.shape[1] == expected, f"cp_buffers[{i}] not padded to {expected}: shape={tuple(buf.shape)}"
 
 
+def test_padding_mask_pad_value_is_True_not_False(monkeypatch):
+    """Regression: cp-divisor padding extends the seq with positions that are
+    semantically padding.  ``padding_mask`` (bool, ``True`` == "this position
+    is pad") must be padded with ``True``, NOT the dtype-default ``0``/``False``.
+    Otherwise the MoE router treats the cp-pad slots as real tokens and routes
+    them to experts every layer."""
+    captured = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
+    seq_len = 6  # 6 % 4 = 2 -> pad to 8
+    inputs_embeds = torch.randn(1, seq_len, 8)
+    labels = torch.zeros(1, seq_len, dtype=torch.long)
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    # Original padding_mask: 4 real, 2 pad
+    padding_mask = torch.tensor([[False, False, False, False, True, True]])
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "labels": labels,
+        "position_ids": position_ids,
+        "padding_mask": padding_mask,
+    }
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    padded = batch["padding_mask"]
+    assert padded.shape == (1, 8)
+    # Positions 0..3 unchanged
+    assert torch.equal(padded[0, :6], padding_mask[0])
+    # Positions 6, 7 are cp-pad slots -- MUST be True (pad), not False
+    assert bool(padded[0, 6].item()) is True, (
+        "cp-pad slot 6 should be marked as padding (True)"
+    )
+    assert bool(padded[0, 7].item()) is True, (
+        "cp-pad slot 7 should be marked as padding (True)"
+    )
+
+
+def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
+    """If a future caller passes an ``attention_mask`` in the batch, it should
+    pad with ``0`` (HF convention: 1=real, 0=pad) -- NOT with True/dtype-default.
+
+    Today ``cp_utils`` strips ``attention_mask`` at the top of the function so
+    this case is moot, but the PAD_FILL table is the right place to encode the
+    semantic in case the strip is ever revisited.
+    """
+    # Just verify the PAD_FILL table itself maps attention_mask -> False
+    # (the runtime code path is currently unreachable because attention_mask
+    # is popped at line 272).
+    src = open(_cu.__file__).read()
+    assert '"attention_mask": False' in src, (
+        "PAD_FILL must explicitly map attention_mask -> False (HF: 0 = pad)"
+    )
+
+
 def test_padding_mirrors_padding_mask_back_into_batch(monkeypatch):
     """When padding triggers and the batch had a ``padding_mask``, the padded
     version must be mirrored back into ``batch["padding_mask"]`` so any

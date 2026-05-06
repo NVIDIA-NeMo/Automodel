@@ -296,23 +296,28 @@ def make_cp_batch_and_ctx(
 
     labels = batch["labels"]
 
-    # Collect all available tensors for context parallel
+    # Collect all available tensors for context parallel.  We track each
+    # cp_buffer's batch key (when sourced from ``batch``) so the padding pass
+    # below can pick the semantically-correct fill sentinel and mirror the
+    # padded tensor back into ``batch``.  ``loss_mask`` is passed as an arg
+    # (not in batch) so it has no key.
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
     cp_buffers = [primary_seq_tensor, labels, position_ids]
     # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
     cp_no_restore_buffers = {primary_seq_tensor, labels}
+    batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
-    # Add loss_mask if available
+    # Add loss_mask if available (passed as arg, not in batch -> no key)
     if loss_mask is not None:
         cp_buffers.append(loss_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(loss_mask)
 
-    # Add padding_mask if available in batch (track index so post-pad mirror works)
-    padding_mask_idx = None
+    # Add padding_mask if available in batch
     if "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
-        padding_mask_idx = len(cp_buffers)
+        batch_buffer_keys[len(cp_buffers)] = "padding_mask"
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
@@ -321,6 +326,19 @@ def make_cp_batch_and_ctx(
     # context_parallel load balancing). The inputs_embeds path can hit
     # arbitrary seq lengths from the VLM collator, so we pad here rather
     # than relying on dataset-side padding.
+    #
+    # Per-buffer pad sentinels: each tensor's "ignore" value is semantic, not
+    # dtype-derived.  ``labels``/``padding_mask``/``attention_mask`` are all
+    # int/bool but have different ignore conventions.  Falling through to 0
+    # for ``padding_mask`` (== False == "real token") would tell the MoE
+    # router to route the cp-pad slots to experts -- silently wasting capacity
+    # and skewing load-balance loss.
+    PAD_FILL = {
+        "labels": -100,  # CE ignore_index
+        "padding_mask": True,  # bool: True == "this position is pad, ignore"
+        "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
+        # everything else (input_ids, position_ids, ...) -> 0
+    }
     cp_divisor = cp_mesh.size() * 2
     if seq_len % cp_divisor != 0:
         pad_len = cp_divisor - (seq_len % cp_divisor)
@@ -328,30 +346,20 @@ def make_cp_batch_and_ctx(
         for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
             pad_shape = list(buf.shape)
             pad_shape[dim] = pad_len
-            if buf.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            if buf.dtype.is_floating_point:
                 pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
             else:
-                # labels use -100 (ignore_index); position_ids and other ints get 0.
-                fill_val = -100 if (buf is labels) else 0
+                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
                 pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
             old_buf = buf
             cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
             if old_buf in cp_no_restore_buffers:
                 new_no_restore.add(cp_buffers[i])
         cp_no_restore_buffers = new_no_restore
-        # Mirror the padded primary tensor back into the batch so the model
-        # forward sees the padded shape (we already padded labels/position_ids
-        # via cp_buffers, but those are still the original objects in `batch`).
-        if has_inputs_embeds:
-            batch["inputs_embeds"] = cp_buffers[0]
-        else:
-            batch["input_ids"] = cp_buffers[0]
-        batch["labels"] = cp_buffers[1]
-        batch["position_ids"] = cp_buffers[2]
-        # padding_mask was sourced from batch, so mirror its padded version back
-        # too so any consumer reading batch["padding_mask"] sees the matched shape.
-        if padding_mask_idx is not None:
-            batch["padding_mask"] = cp_buffers[padding_mask_idx]
+        # Mirror every batch-sourced cp_buffer back into ``batch`` so any
+        # downstream consumer reading from the dict sees the padded shape.
+        for idx, key in batch_buffer_keys.items():
+            batch[key] = cp_buffers[idx]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
