@@ -185,14 +185,15 @@ def _make_model(backend, *, mtp_layers=0, mtp_pattern="", **cfg_overrides):
 class TestMTPDisabled:
     def test_no_mtp_when_config_omits_fields(self, backend):
         """When num_nextn_predict_layers is 0, self.mtp must be None and
-        forward must not produce an mtp_loss."""
+        forward must not emit per-depth hidden states."""
         model, config = _make_model(backend)
         assert model.mtp is None
 
         model.eval()
         input_ids = torch.randint(0, config.vocab_size, (2, 8))
         out = model(input_ids, labels=input_ids.clone())
-        assert getattr(out, "mtp_loss", None) is None
+        assert getattr(out, "mtp_per_depth_h", None) is None
+        assert getattr(out, "mtp_loss_scaling_factor", None) is None
         assert out.loss is not None
         assert out.logits.shape == (2, 8, config.vocab_size)
 
@@ -219,27 +220,32 @@ class TestMTPEnabled:
         assert hasattr(last, "final_layernorm")
         assert not hasattr(first, "final_layernorm")
 
-    def test_forward_train_emits_mtp_loss(self, backend):
+    def test_forward_train_emits_mtp_per_depth_h(self, backend):
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
         model.train()
         input_ids = torch.randint(0, config.vocab_size, (2, 8))
         labels = input_ids.clone()
         out = model(input_ids, labels=labels)
-        assert out.mtp_loss is not None
-        assert out.mtp_loss.dim() == 0
-        # ``mtp_loss`` must be on the autograd graph so a downstream
-        # ``backward()`` populates gradients on the MTP parameters.
-        assert out.mtp_loss.requires_grad
+        assert out.mtp_per_depth_h is not None
+        assert isinstance(out.mtp_per_depth_h, list)
+        # D=1 in this fixture
+        assert len(out.mtp_per_depth_h) == 1
+        # Each per-depth tensor must be on the autograd graph so the
+        # recipe-side ``calculate_mtp_loss`` produces trainable gradients.
+        assert all(h.requires_grad for h in out.mtp_per_depth_h)
+        assert out.mtp_loss_scaling_factor == 0.1
+        # Main loss is unaffected.
         assert out.loss is not None
         assert out.loss.requires_grad
 
-    def test_forward_eval_skips_mtp_loss(self, backend):
+    def test_forward_eval_skips_mtp_branch(self, backend):
         """At eval (or without labels) MTP must not run."""
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
         model.eval()
         input_ids = torch.randint(0, config.vocab_size, (2, 8))
         out = model(input_ids, labels=input_ids.clone())
-        assert out.mtp_loss is None
+        assert out.mtp_per_depth_h is None
+        assert out.mtp_loss_scaling_factor is None
 
     def test_mtp_backward_populates_mtp_grads(self, backend):
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
@@ -247,8 +253,10 @@ class TestMTPEnabled:
         input_ids = torch.randint(0, config.vocab_size, (2, 8))
         labels = input_ids.clone()
         out = model(input_ids, labels=labels)
-        # Backprop ONLY through mtp_loss to isolate MTP gradients.
-        out.mtp_loss.backward()
+        # Backprop through a sum of per-depth hidden states to isolate MTP grads
+        # (the production path runs them through the configured loss class
+        # via the recipe-side ``calculate_mtp_loss``).
+        sum(h.sum() for h in out.mtp_per_depth_h).backward()
         assert model.mtp.layers[0].enorm.weight.grad is not None
         assert model.mtp.layers[0].hnorm.weight.grad is not None
         assert model.mtp.layers[0].eh_proj.weight.grad is not None

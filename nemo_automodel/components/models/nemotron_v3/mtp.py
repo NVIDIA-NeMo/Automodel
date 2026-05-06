@@ -157,9 +157,9 @@ def build_mtp_config_from_hf(
 
     Args:
         config: HF NemotronH config.
-        loss_scaling_factor: Training-only scaling factor applied to the
-            summed per-depth loss. Not stored on the HF config; supplied by
-            the recipe YAML.
+        loss_scaling_factor: Auxiliary-loss weight applied to the summed
+            per-depth CE (default ``0.1``). Not stored on the HF config;
+            override programmatically when constructing the model.
 
     Returns:
         :class:`MTPConfig`.

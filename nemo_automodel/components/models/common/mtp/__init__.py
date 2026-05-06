@@ -27,7 +27,6 @@ keys) lives in the model's own package.
 from nemo_automodel.components.models.common.mtp.mtp import (
     MTPConfig,
     MTPModule,
-    compute_mtp_loss,
     parse_mtp_layer_pattern,
     roll_tensor,
 )
@@ -35,7 +34,6 @@ from nemo_automodel.components.models.common.mtp.mtp import (
 __all__ = [
     "MTPConfig",
     "MTPModule",
-    "compute_mtp_loss",
     "parse_mtp_layer_pattern",
     "roll_tensor",
 ]

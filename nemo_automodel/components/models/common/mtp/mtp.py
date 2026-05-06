@@ -21,7 +21,6 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Hybrid layer symbols matching HF Nemotron-H's ``hybrid_override_pattern``
 # and ``mtp_hybrid_override_pattern``.
@@ -227,69 +226,3 @@ class MTPModule(nn.Module):
                     hidden_states = sublayer.final_layernorm(hidden_states)
             per_depth_h.append(hidden_states)
         return per_depth_h
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-
-def compute_mtp_loss(
-    per_depth_hidden_states: list[torch.Tensor],
-    labels: torch.LongTensor,
-    lm_head: nn.Linear,
-    loss_scaling_factor: float = 0.1,
-    ignore_index: int = -100,
-) -> torch.Tensor:
-    """Compute the cumulative MTP cross-entropy loss across depths.
-
-    For depth ``k``: cumulatively roll ``labels`` left by ``k`` positions
-    (mirroring the input-side roll), project ``h_k`` to logits via the shared
-    ``lm_head``, and accumulate masked CE. Final loss is
-    ``loss_scaling_factor / D * sum_k(CE_k)`` where ``D`` is the number of
-    depths.
-
-    Args:
-        per_depth_hidden_states: List of length ``D`` with the per-depth
-            hidden states from :meth:`MTPModule.forward`.
-        labels: Original (unshifted) labels, ``[B, S]`` or ``[T]``.
-        lm_head: Shared output projection (typically ``model.lm_head``).
-        loss_scaling_factor: Scalar multiplier on the summed loss
-            (default ``0.1``).
-        ignore_index: Label value masked out of the CE loss.
-
-    Returns:
-        Scalar tensor with ``requires_grad=True`` (provided
-        ``per_depth_hidden_states[*].requires_grad``).
-    """
-    D = len(per_depth_hidden_states)
-    if D == 0:
-        raise ValueError("per_depth_hidden_states must be non-empty")
-
-    cur_labels = labels
-    total = per_depth_hidden_states[0].new_zeros(())
-    for k, h_k in enumerate(per_depth_hidden_states):
-        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
-        # ``roll_tensor`` zero-fills wrapped positions with 0 (a valid token
-        # id). Override those trailing positions with ``ignore_index`` so
-        # they do not contribute to CE.
-        masked_labels = cur_labels.clone()
-        seq_dim = masked_labels.dim() - 1
-        if masked_labels.shape[seq_dim] > 0:
-            n_invalid = min(k + 1, masked_labels.shape[seq_dim])
-            idx = torch.arange(
-                masked_labels.shape[seq_dim] - n_invalid,
-                masked_labels.shape[seq_dim],
-                device=masked_labels.device,
-            )
-            masked_labels = masked_labels.index_fill(seq_dim, idx, ignore_index)
-
-        logits_k = lm_head(h_k)
-        loss_k = F.cross_entropy(
-            logits_k.reshape(-1, logits_k.size(-1)),
-            masked_labels.reshape(-1),
-            ignore_index=ignore_index,
-        )
-        total = total + loss_k
-
-    return total * (loss_scaling_factor / D)

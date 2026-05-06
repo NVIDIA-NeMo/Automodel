@@ -26,7 +26,6 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.common.mtp import compute_mtp_loss
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.mtp import (
@@ -265,13 +264,13 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         """Initialize NemotronV3ForCausalLM.
 
         Args:
-            config: NemotronH config
-            backend: Backend configuration
+            config: NemotronH config.
+            backend: Backend configuration.
             mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
-                (default ``0.1``). The number of MTP depths and the per-depth
-                pattern are read from the HF config
-                (``num_nextn_predict_layers``,
-                ``mtp_hybrid_override_pattern``).
+                (default ``0.1``). Programmatic override only — not exposed
+                as a YAML knob to keep recipe configs auto-detected.
+                ``num_nextn_predict_layers`` and
+                ``mtp_hybrid_override_pattern`` come from the HF config.
             **kwargs: Additional arguments. Recognized keys:
                 ``moe_config``, ``moe_overrides``.
         """
@@ -301,10 +300,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         )
 
         # self.mtp is None when num_nextn_predict_layers is absent or 0.
-        self.mtp_config = build_mtp_config_from_hf(
-            config,
-            loss_scaling_factor=mtp_loss_scaling_factor,
-        )
+        self.mtp_config = build_mtp_config_from_hf(config, loss_scaling_factor=mtp_loss_scaling_factor)
         if self.mtp_config.enabled:
             self.mtp = build_nemotron_v3_mtp(
                 config,
@@ -447,10 +443,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_labels.view(-1),
             )
 
-        # Aux signal; trainer adds out.mtp_loss to local_loss before backward.
-        mtp_loss = None
+        # Per-depth hidden states for the MTP auxiliary head; the recipe
+        # dispatches CE per depth via the configured loss class.
+        mtp_per_depth_h = None
         if self.mtp is not None and labels is not None and self.training:
-            per_depth_h = self.mtp(
+            mtp_per_depth_h = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -458,12 +455,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 attention_mask=causal_mask_mapping.get("full_attention")
                 if causal_mask_mapping is not None
                 else attention_mask,
-            )
-            mtp_loss = compute_mtp_loss(
-                per_depth_h,
-                labels=labels,
-                lm_head=self.lm_head,
-                loss_scaling_factor=self.mtp_config.loss_scaling_factor,
             )
 
         if is_thd:
@@ -476,7 +467,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
         )
-        out.mtp_loss = mtp_loss
+        out.mtp_per_depth_h = mtp_per_depth_h
+        out.mtp_loss_scaling_factor = self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None
         return out
 
     @staticmethod

@@ -2,7 +2,8 @@
 #   - mtp_hybrid_override_pattern: "*E"   (1 attention + 1 MoE per MTP depth)
 #   - num_nextn_predict_layers: 1         (single MTP depth)
 # Both fields are read directly from the HF config by NemotronHForCausalLM.
-# The training-only ``mtp_loss_scaling_factor`` is supplied here.
+# The MTP auxiliary loss is auto-detected at runtime; the only training-time
+# knob is ``model.mtp_loss_scaling_factor`` (shown below).
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -25,6 +26,8 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  # Override the MTP auxiliary-loss weight (default 0.1). The MTP depth and
+  # per-depth pattern are auto-detected from the HF config.
   mtp_loss_scaling_factor: 0.1
 
 compile:

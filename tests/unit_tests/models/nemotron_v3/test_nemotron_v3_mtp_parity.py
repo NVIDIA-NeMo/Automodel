@@ -14,22 +14,19 @@
 
 """Parity tests for the Nemotron-V3 MTP implementation.
 
-Three layers of verification:
+Two layers of verification:
 
-1. **MTP-loss oracle parity** — recompute the per-depth MTP loss from
-   ``MTPModule.forward``'s per-depth hidden states using a hand-written
-   DeepSeek-V3 formulation, and assert numerical equivalence with
-   :func:`compute_mtp_loss`. This isolates the loss-aggregation and
-   label-rolling logic.
-
-2. **State-dict round-trip exactness** — model weights → ``to_hf`` →
+1. **State-dict round-trip exactness** — model weights → ``to_hf`` →
    ``from_hf`` → model weights must be bit-exact for every ``mtp.*`` key
    (including merged-experts gate_and_up_projs / down_projs which split into
    per-expert HF tensors and recombine).
 
-3. **Forward determinism** — calling ``model(input_ids, labels=...)`` twice
-   in a row must produce identical ``out.loss`` and ``out.mtp_loss``
-   (no hidden non-determinism via dropout etc.).
+2. **Forward determinism** — calling ``model(input_ids, labels=...)`` twice
+   in a row must produce identical ``out.logits``, ``out.loss``, and
+   ``out.mtp_per_depth_h`` (no hidden non-determinism via dropout etc.).
+
+Token-rolling semantics are also covered here as a unit-level check on the
+helper used by the recipe-side ``calculate_mtp_loss``.
 
 All tests run on CPU in float32 so they catch bugs that bfloat16 tolerance
 would mask. Use ``MockNemotronV3Config`` from the existing MTP test module.
@@ -39,13 +36,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.mtp import (
-    compute_mtp_loss,
-    roll_tensor,
-)
+from nemo_automodel.components.models.common.mtp import roll_tensor
 from tests.unit_tests.models.nemotron_v3.test_nemotron_v3_mtp import MockNemotronV3Config
 
 
@@ -75,89 +68,16 @@ def _build_model(backend, *, mtp_layers, mtp_pattern, dtype=torch.float32, **cfg
 
 
 # ---------------------------------------------------------------------------
-# Layer 1: MTP loss oracle parity
+# Layer 1: Token-rolling semantics
 # ---------------------------------------------------------------------------
 
 
-def _oracle_mtp_loss(per_depth_h, labels, lm_head, scaling_factor, ignore_index=-100):
-    """Independent reimplementation of the MTP loss from the DeepSeek-V3
-    formula. Used as a test oracle.
-
-    For depth k=1..D:
-      labels_k = roll(labels_{k-1}, -1)
-      logits_k = lm_head(h_k)
-      loss_k   = masked_CE(logits_k, labels_k, ignore the trailing k positions)
-    Total = scaling_factor / D * sum_k(loss_k)
-    """
-    D = len(per_depth_h)
-    rolled = labels
-    total = per_depth_h[0].new_zeros(())
-    for k in range(D):
-        rolled = roll_tensor(rolled, shifts=-1, dim=-1)
-        masked = rolled.clone()
-        S = masked.shape[-1]
-        n_invalid = min(k + 1, S)
-        masked[..., S - n_invalid : S] = ignore_index
-
-        logits = lm_head(per_depth_h[k])
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            masked.reshape(-1),
-            ignore_index=ignore_index,
-        )
-        total = total + loss
-    return total * (scaling_factor / D)
-
-
-class TestMTPLossOracleParity:
-    """Compare ``compute_mtp_loss`` to a hand-rolled oracle.
-
-    Uses synthetic per-depth hidden states and a small random ``lm_head`` so
-    we can exercise the loss aggregation in isolation, without depending on
-    the model's random-init backbone (which can produce NaN logits with
-    untrained tiny weights).
-    """
-
-    @pytest.mark.parametrize("D", [1, 2, 3])
-    @pytest.mark.parametrize("scaling", [0.1, 0.5, 1.0])
-    def test_loss_matches_oracle(self, D, scaling):
-        torch.manual_seed(42)
-        H, V = 64, 128  # hidden, vocab
-        B, S = 2, 16
-
-        # Initialize lm_head with small weights to avoid overflow.
-        lm_head = torch.nn.Linear(H, V, bias=False)
-        torch.nn.init.normal_(lm_head.weight, mean=0.0, std=0.02)
-
-        # Synthetic per-depth hidden states (fp32 → tight tolerance)
-        per_depth_h = [torch.randn(B, S, H) * 0.1 for _ in range(D)]
-        labels = torch.randint(0, V, (B, S))
-
-        actual = compute_mtp_loss(per_depth_h, labels, lm_head, loss_scaling_factor=scaling)
-        expected = _oracle_mtp_loss(per_depth_h, labels, lm_head, scaling)
-
-        assert torch.isfinite(actual).item(), f"actual is non-finite: {actual.item()}"
-        assert torch.isfinite(expected).item(), f"expected is non-finite: {expected.item()}"
-        assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5), (
-            f"MTP loss diverges from oracle: actual={actual.item():.6e}, "
-            f"expected={expected.item():.6e}, diff={(actual - expected).abs().item():.6e}"
-        )
-
-    def test_loss_finite_with_partial_labels(self):
-        """Sanity: with some labels = ignore_index, MTP loss should still be
-        finite (the rolled trailing positions are zero-filled and ignored)."""
-        torch.manual_seed(0)
-        H, V = 32, 64
-        per_depth_h = [torch.randn(1, 8, H) * 0.1]
-        labels = torch.randint(0, V, (1, 8))
-        lm_head = torch.nn.Linear(H, V, bias=False)
-        torch.nn.init.normal_(lm_head.weight, std=0.02)
-        loss = compute_mtp_loss(per_depth_h, labels, lm_head, loss_scaling_factor=1.0)
-        assert torch.isfinite(loss).item(), f"got non-finite MTP loss: {loss.item()}"
+class TestRollTensorCumulative:
+    """``roll_tensor`` is the only shared helper used by the recipe-side
+    ``calculate_mtp_loss`` for label shifting; verify the cumulative
+    depth-k semantics directly."""
 
     def test_roll_then_zero_cumulative(self):
-        """Cumulative left-roll with trailing-zero fill replicates the
-        depth-k token-shift semantics."""
         labels = torch.arange(10).unsqueeze(0)  # [1, 10]
         # k=1: trailing 1 position zeroed
         d1 = roll_tensor(labels, shifts=-1, dim=-1)
@@ -316,11 +236,13 @@ class TestMTPForwardDeterminism:
 
         torch.testing.assert_close(out1.logits, out2.logits, rtol=0.0, atol=0.0, equal_nan=True)
         torch.testing.assert_close(out1.loss, out2.loss, rtol=0.0, atol=0.0, equal_nan=True)
-        torch.testing.assert_close(out1.mtp_loss, out2.mtp_loss, rtol=0.0, atol=0.0, equal_nan=True)
+        assert len(out1.mtp_per_depth_h) == len(out2.mtp_per_depth_h)
+        for h1, h2 in zip(out1.mtp_per_depth_h, out2.mtp_per_depth_h):
+            torch.testing.assert_close(h1, h2, rtol=0.0, atol=0.0, equal_nan=True)
 
     def test_eval_mode_skips_mtp_branch(self, backend):
-        """In eval mode, MTP must not run (out.mtp_loss is None) and the
-        main logits should be unaffected by the MTP module's existence."""
+        """In eval mode, MTP must not run (out.mtp_per_depth_h is None) and
+        the main logits should be unaffected by the MTP module's existence."""
         torch.manual_seed(99)
         with_mtp, config = _build_model(backend, mtp_layers=1, mtp_pattern="*E")
         torch.manual_seed(99)
@@ -343,7 +265,7 @@ class TestMTPForwardDeterminism:
         out_a = with_mtp(input_ids, labels=input_ids.clone())
         out_b = no_mtp(input_ids, labels=input_ids.clone())
 
-        assert out_a.mtp_loss is None  # eval mode skips MTP
-        assert out_b.mtp_loss is None
+        assert out_a.mtp_per_depth_h is None  # eval mode skips MTP
+        assert out_b.mtp_per_depth_h is None
         # Main path identical (NaN-tolerant — tiny random-init model may NaN).
         torch.testing.assert_close(out_a.logits, out_b.logits, rtol=0.0, atol=0.0, equal_nan=True)
