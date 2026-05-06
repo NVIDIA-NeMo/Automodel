@@ -15,6 +15,9 @@
 name: Build container
 
 inputs:
+  container-registry:
+    description: "Container registry to push/pull images"
+    required: true
   dockerfile-path:
     description: "Path to dockerfile to build"
     required: true
@@ -25,9 +28,6 @@ inputs:
     description: "The name of the repo to build container"
     required: true
     type: string
-
-env:
-  container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
 
 runs:
   using: "composite"
@@ -69,8 +69,10 @@ runs:
       shell: bash
       env:
         REPO: ${{ inputs.repo-name }}
+        REGISTRY: ${{ inputs.container-registry }}
       run: |
         echo "REPO_LOWER=${REPO,,}" >> "$GITHUB_ENV"
+        echo "container-registry=${REGISTRY}" >> "$GITHUB_ENV"
 
     - name: Get last merged PR
       shell: bash
