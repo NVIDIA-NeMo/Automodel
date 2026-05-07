@@ -282,7 +282,11 @@ def _chunk_vlm_media(
         # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
         # All images are padded to the same max_patches, so split by image count directly.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
+        # Ceil division so trailing samples are not dropped when batch_size is not
+        # divisible by n_microbatches.  Mirrors torch.tensor.chunk(n) semantics used
+        # by the PP schedule on input_ids/labels — keeps image chunks aligned with
+        # text chunks even on uneven splits.
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -297,7 +301,7 @@ def _chunk_vlm_media(
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
 
-        samples_per_mb = batch_size // n_microbatches
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -315,7 +319,7 @@ def _chunk_vlm_media(
         patch_counts = image_grid.prod(dim=1)
         cumsum = torch.cumsum(patch_counts, dim=0)
 
-        images_per_mb = batch_size // n_microbatches
+        images_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             img_start = mb_idx * images_per_mb
             img_end = min(img_start + images_per_mb, n_images)
