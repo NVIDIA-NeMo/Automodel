@@ -180,7 +180,6 @@ class MTPModule(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        position_ids: torch.LongTensor | None,
         hidden_states: torch.Tensor,
         embed_fn: Callable[[torch.LongTensor], torch.Tensor],
         **block_kwargs,
@@ -190,7 +189,6 @@ class MTPModule(nn.Module):
         Args:
             input_ids: Token ids ``[B, S]`` (or ``[T]`` in THD). Rolled
                 cumulatively left by 1 per depth.
-            position_ids: Position ids matching ``input_ids``, or ``None``.
             hidden_states: Output of the main model's final norm (``h_0``);
                 shape matches the model's residual stream.
             embed_fn: Callable applied to rolled ``input_ids`` to produce the
@@ -207,11 +205,8 @@ class MTPModule(nn.Module):
         P = self.pattern_length
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
-        cur_position_ids = position_ids
         for d in range(D):
             cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
-            if cur_position_ids is not None:
-                cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
 
             decoder_input = embed_fn(cur_input_ids)
             for s in range(P):

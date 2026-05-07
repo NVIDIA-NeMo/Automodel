@@ -21,20 +21,6 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
-@dataclass
-class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
-    """``CausalLMOutputWithPast`` plus declared MTP fields.
-
-    The MTP per-depth hidden states and scaling factor must be regular
-    dataclass fields (rather than dynamically-set attributes) so they survive
-    output-restructuring layers like FSDP2's mixed-precision output cast,
-    which rebuild ``ModelOutput`` instances from declared fields only.
-    """
-
-    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
-    mtp_loss_scaling_factor: Optional[float] = None
-
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -52,6 +38,20 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """``CausalLMOutputWithPast`` plus declared MTP fields.
+
+    The MTP per-depth hidden states and scaling factor must be regular
+    dataclass fields (rather than dynamically-set attributes) so they survive
+    output-restructuring layers like FSDP2's mixed-precision output cast,
+    which rebuild ``ModelOutput`` instances from declared fields only.
+    """
+
+    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
+    mtp_loss_scaling_factor: Optional[float] = None
 
 
 class NemotronV3Model(nn.Module):
@@ -464,7 +464,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if self.mtp is not None and self.training:
             mtp_per_depth_h = self.mtp(
                 input_ids=input_ids,
-                position_ids=position_ids,
                 hidden_states=hidden_states,
                 embed_fn=self.model.embed_tokens,
                 attention_mask=causal_mask_mapping.get("full_attention")
@@ -482,9 +481,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
             mtp_per_depth_h=mtp_per_depth_h,
-            mtp_loss_scaling_factor=(
-                self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None
-            ),
+            mtp_loss_scaling_factor=(self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None),
         )
 
     @staticmethod
