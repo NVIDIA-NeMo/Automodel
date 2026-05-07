@@ -42,9 +42,6 @@ def test_get_model_name_prefers_pretrained_path():
     assert _get_model_name(_Cfg()) is None
 
 
-
-
-
 def _count_trainable(parameters):
     return sum(p.numel() for p in parameters if getattr(p, "requires_grad", False))
 
