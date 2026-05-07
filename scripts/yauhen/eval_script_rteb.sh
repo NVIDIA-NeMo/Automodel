@@ -2,15 +2,14 @@
 set -euo pipefail
 
 
-cd /lustre/fs12/portfolios/llmservice/users/ybabakhin/git/nemo-retriever-research
+cd /lustre/fs12/portfolios/llmservice/users/$SLURM_JOB_USER/git/nemo-retriever-research
 
 echo $HF_HOME
 echo "$@"
 
-/opt/venv/bin/python -m pip install "sentence-transformers>=2.0.0,<4.0.0" beir==2.0.0 mteb[xet]==2.12.0 polars==1.35.2
-# numpy==2.4.3
-
-export TRITON_CACHE_DIR="/lustre/fsw/portfolios/llmservice/users/ybabakhin/triton_cache"
+/opt/venv/bin/python -m pip install "sentence-transformers>=2.0.0,<4.0.0" beir==2.0.0 mteb[xet]==2.10.0 polars==1.35.2
+/opt/venv/bin/python -m pip install transformers==5.5.0
+export TRITON_CACHE_DIR="/lustre/fsw/portfolios/llmservice/users/$SLURM_JOB_USER/triton_cache"
 
 # Dynamically detect number of available GPUs
 NUM_GPUS=$(nvidia-smi -L | wc -l)

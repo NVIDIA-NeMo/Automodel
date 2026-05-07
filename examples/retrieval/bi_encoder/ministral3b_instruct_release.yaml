@@ -29,7 +29,9 @@ step_scheduler:
   local_batch_size: 4
   ckpt_every_steps: 2200
   val_every_steps: 1000
+  log_remote_every_steps: 10
   num_epochs: 1
+  max_steps: null
 
 dist_env:
   backend: nccl
@@ -39,7 +41,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   trust_remote_code: true
-  pooling: avg
+  pooling: last
   l2_normalize: true
   use_liger_kernel: true
   use_sdpa_patching: true
@@ -86,40 +88,47 @@ dataloader:
     n_passages: 5
     seed: 42
     do_shuffle: true
+    max_train_samples: null
+    use_dataset_instruction: false
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512
     p_max_len: 512
     query_prefix: "query:"
     passage_prefix: "passage:"
+    padding: true
     pad_to_multiple_of: 8
+    use_dataset_instruction: false
   shuffle: true
-  num_workers: 0
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
 
-# # Optional: Uncomment to enable validation
-# validation_dataloader:
-#   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-#   dataset:
-#     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-#     model_type: bi_encoder
-#     data_dir_list: 
-#         - /opt/Automodel/miracl_train_en_llama3_1b_4m_512len_eval.json
-#     data_type: eval
-#     n_passages: 5
-#     seed: 42
-#     do_shuffle: false
-#     train_data_select_offset: 0
-#   collate_fn:
-#     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
-#     q_max_len: 512
-#     p_max_len: 512
-#     query_prefix: "query:"
-#     passage_prefix: "passage:"
-#     padding: true
-#     pad_to_multiple_of: 8
-#   batch_size: 2
-#   shuffle: false
-#   num_workers: 0
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    data_dir_list:
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/TextQA_train/miracl_train_en_llama3_1b_4m_512len_eval.json
+    model_type: bi_encoder
+    data_type: eval
+    n_passages: 5
+    seed: 42
+    do_shuffle: false
+    use_dataset_instruction: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    padding: true
+    pad_to_multiple_of: 8
+    use_dataset_instruction: false
+  shuffle: false
+  num_workers: 8
+  drop_last: false
+  pin_memory: true
 
 # LoRA/PEFT configuration
 # Uncomment and configure for LoRA/PEFT
