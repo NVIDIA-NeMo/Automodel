@@ -32,6 +32,8 @@ from nemo_automodel.recipes.vlm.finetune import (
 class _Cfg(SimpleNamespace):
     def get(self, key, default=None):
         return getattr(self, key, default)
+
+
 def test_get_model_name_prefers_pretrained_path():
     cfg = _Cfg(pretrained_model_name_or_path="org/model")
     assert _get_model_name(cfg) == "org/model"
@@ -42,11 +44,9 @@ def test_get_model_name_prefers_pretrained_path():
     assert _get_model_name(_Cfg()) is None
 
 
-
-
-
 def _count_trainable(parameters):
     return sum(p.numel() for p in parameters if getattr(p, "requires_grad", False))
+
 
 @pytest.fixture(autouse=True)
 def _mock_missing_cuda(monkeypatch):
@@ -86,6 +86,7 @@ class DummyOptConfig:
     def __init__(self, lr: float = 0.01):
         self.lr = lr
         self.foreach = None
+
     def instantiate(self, params):
         # Always return an SGD optimizer for the given params
         return torch.optim.SGD(params, lr=self.lr)
@@ -93,11 +94,13 @@ class DummyOptConfig:
     def get(self, key, default):
         return getattr(self, key, default)
 
+
 class DummyModelConfig:
     """Mimics the Hydra/OmegaConf model config with an *instantiate* method."""
 
     def __init__(self):
         from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
         # Add _target_ to make the config valid for VLM finetuning
         self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
@@ -112,12 +115,13 @@ class DummyModelConfig:
 # build_model / build_optimizer
 # -----------------------------------------------------------------------------
 
+
 def test_build_model_and_optimizer_basic():
     """Test basic build_model and build_optimizer for VLM."""
     cfg_model = DummyModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -156,7 +160,7 @@ def test_build_model_passes_freeze_config():
         def to_dict(self):
             return {"freeze_language_model": False, "freeze_vision_tower": True}
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=FreezeConfig(),
@@ -190,7 +194,7 @@ def test_build_model_passes_moe_config_from_parallelizer_config():
     cfg_model = CapturingModelConfig()
     moe_cfg = MoEParallelizerConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -232,7 +236,7 @@ def test_build_model_passes_moe_config_from_dict_like():
 
     cfg_model = CapturingModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -266,7 +270,7 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
 
     cfg_model = CapturingModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -475,10 +479,11 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
 # AutoProcessor exception handling test
 # -----------------------------------------------------------------------------
 
+
 def test_autoprocessor_success():
     """Test successful AutoProcessor creation."""
 
-    with patch('transformers.AutoProcessor') as mock_auto_processor:
+    with patch("transformers.AutoProcessor") as mock_auto_processor:
         mock_processor = MagicMock()
         mock_auto_processor.from_pretrained.return_value = mock_processor
 
@@ -496,11 +501,12 @@ def test_autoprocessor_exception_handling(caplog):
 
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
-    with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-
+    with (
+        patch("transformers.AutoProcessor.from_pretrained") as mock_from_pretrained,
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
+    ):
         # Set up the exception
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
@@ -509,8 +515,11 @@ def test_autoprocessor_exception_handling(caplog):
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
         cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False, "packing": None, "max_length": None,
-            "chat_template": None, "preload_media": False,
+            "pretokenize": False,
+            "packing": None,
+            "max_length": None,
+            "chat_template": None,
+            "preload_media": False,
         }.get(key, default)
 
         cfg_dl = MagicMock()
@@ -544,19 +553,24 @@ def test_autoprocessor_retries_on_layer_types_mismatch():
             raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
         return stub_processor
 
-    with patch('transformers.AutoProcessor.from_pretrained', side_effect=fake_from_pretrained), \
-         patch('nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator',
-               return_value=True) as mock_relax, \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'MagicMock': MagicMock()}):
-
+    with (
+        patch("transformers.AutoProcessor.from_pretrained", side_effect=fake_from_pretrained),
+        patch(
+            "nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator", return_value=True
+        ) as mock_relax,
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"MagicMock": MagicMock()}),
+    ):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
         cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False, "packing": None, "max_length": None,
-            "chat_template": None, "preload_media": False,
+            "pretokenize": False,
+            "packing": None,
+            "max_length": None,
+            "chat_template": None,
+            "preload_media": False,
         }.get(key, default)
 
         cfg_dl = MagicMock()
@@ -590,12 +604,13 @@ def test_autoprocessor_loads_inside_first_rank_per_node():
         call_order.append("autoprocessor")
         return MagicMock()
 
-    with patch('nemo_automodel.recipes.vlm.finetune.FirstRankPerNode', TrackingFirstRankPerNode), \
-         patch('transformers.AutoProcessor.from_pretrained', side_effect=tracking_from_pretrained), \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-
+    with (
+        patch("nemo_automodel.recipes.vlm.finetune.FirstRankPerNode", TrackingFirstRankPerNode),
+        patch("transformers.AutoProcessor.from_pretrained", side_effect=tracking_from_pretrained),
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
+    ):
         cfg_ds = MagicMock()
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
@@ -628,11 +643,12 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         def to_dict(self):
             return {"trust_remote_code": True, "some_param": "value"}
 
-    with patch('transformers.AutoProcessor.from_pretrained') as mock_from_pretrained, \
-         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
-         patch('torch.utils.data.distributed.DistributedSampler'), \
-         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'NoneType': MagicMock()}):
-
+    with (
+        patch("transformers.AutoProcessor.from_pretrained") as mock_from_pretrained,
+        patch("nemo_automodel.components.training.rng.StatefulRNG"),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
+    ):
         # Set up the exception
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
@@ -641,8 +657,11 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         cfg_ds.instantiate.return_value = []
         cfg_ds.path_or_dataset = "test/dataset"
         cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False, "packing": None, "max_length": None,
-            "chat_template": None, "preload_media": False,
+            "pretokenize": False,
+            "packing": None,
+            "max_length": None,
+            "chat_template": None,
+            "preload_media": False,
         }.get(key, default)
 
         cfg_dl = MagicMock()
@@ -687,9 +706,11 @@ def test_build_dataloader_chat_template_applied():
     cfg_dl.get.return_value = None
     cfg_dl.instantiate.return_value = MagicMock()
 
-    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
-         patch("torch.utils.data.distributed.DistributedSampler"), \
-         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+    with (
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
+    ):
         _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
 
     assert built_processor.chat_template == "{{ custom }}"
@@ -715,9 +736,11 @@ def test_build_dataloader_no_chat_template():
     cfg_dl.get.return_value = None
     cfg_dl.instantiate.return_value = MagicMock()
 
-    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor), \
-         patch("torch.utils.data.distributed.DistributedSampler"), \
-         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}):
+    with (
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
+    ):
         _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
 
     assert built_processor.chat_template == "{{ original }}"
@@ -755,6 +778,7 @@ class DummyModelConfigWithAdapter:
 
     def __init__(self):
         from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
         # Add _target_ to make the config valid for VLM finetuning
         self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
 
@@ -785,7 +809,7 @@ def test_vlm_build_model_with_adapter():
 
     cfg_model = NeMoModelConfigWithAdapter()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -816,7 +840,7 @@ def test_vlm_build_model_without_adapter():
 
     cfg_model = NeMoModelConfigNoAdapter()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -849,7 +873,7 @@ def test_vlm_build_model_with_quantization_config():
 
     cfg_model = DummyQuantizedVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -879,7 +903,7 @@ def test_vlm_build_model_without_quantization_config():
 
     cfg_model = DummyNoQuantVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -922,8 +946,6 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
         )
 
 
-
-
 def test_vlm_build_optimizer_disables_foreach_with_tp():
     """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False in VLM."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -949,7 +971,7 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
     mock_device_mesh.mesh_dim_names = ("dp", "tp")
     mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2255,7 +2277,7 @@ def test_build_optimizer_disables_foreach_with_tp():
     mock_device_mesh.mesh_dim_names = ("dp", "tp")
     mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2289,7 +2311,7 @@ def test_vlm_build_model_and_optimizer_return_values():
     cfg_model = NeMoVLMModelConfig()
     cfg_opt = DummyOptConfig(lr=0.01)
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2321,7 +2343,7 @@ def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
 
     cfg_model = NeMoVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         # Should not raise - entry point should be recognized
         model = build_model(
             cfg_model=cfg_model,
@@ -2352,7 +2374,7 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
 
     cfg_model = NeMoVLMModelConfig()
 
-    with patch('nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep', return_value=True):
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
         model = build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2440,8 +2462,12 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         lambda *a, **k: None,
     )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.torch.cuda.reset_peak_memory_stats", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_rank", lambda self, include_cp=False: 0)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_group_size", lambda self, include_cp=False: 1)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_rank", lambda self, include_cp=False: 0
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_dp_group_size", lambda self, include_cp=False: 1
+    )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_cp_group_size", lambda self: 1)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_tp_rank", lambda self: 0)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
@@ -2525,14 +2551,17 @@ class TestChunkVlmMedia:
         n_images_per_sample = torch.tensor([3, 1])
 
         pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=2,
+            n_microbatches=2,
             n_images_per_sample=n_images_per_sample,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 3  # first batch item: 3 images
         assert ig_chunks[1].shape[0] == 1  # second batch item: 1 image
         assert pv_chunks[0].shape[0] == 12  # 3 images * 4 patches
-        assert pv_chunks[1].shape[0] == 4   # 1 image * 4 patches
+        assert pv_chunks[1].shape[0] == 4  # 1 image * 4 patches
 
     def test_legacy_one_image_per_sample(self):
         from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
@@ -2543,7 +2572,10 @@ class TestChunkVlmMedia:
         pixel_values = torch.randn(int(patch_counts.sum()), 64)
 
         pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 2
@@ -2562,7 +2594,10 @@ class TestChunkVlmMedia:
 
         with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
             _chunk_vlm_media(
-                pixel_values, image_grid, batch_size=2, n_microbatches=2,
+                pixel_values,
+                image_grid,
+                batch_size=2,
+                n_microbatches=2,
             )
 
     def test_n_videos_per_sample_packed(self):
