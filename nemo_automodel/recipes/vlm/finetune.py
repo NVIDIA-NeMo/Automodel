@@ -453,7 +453,16 @@ def build_dataloader(
 
             ds_raw = ds
             truncate = cfg_ds.get("truncate", max_length is not None)
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
+
+            post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
+
+            ds = PreTokenizedDatasetWrapper(
+                ds_raw,
+                processor,
+                max_length=max_length,
+                truncate=truncate,
+                post_tokenize_hook=post_tokenize_hook,
+            )
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater

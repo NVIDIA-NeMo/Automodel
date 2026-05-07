@@ -172,6 +172,52 @@ class TestFromHf:
         with pytest.raises(RuntimeError, match="Incomplete expert weights"):
             adapter.from_hf(hf_sd)
 
+    def test_from_hf_slices_ep_shard_feature_dimension(self, adapter, monkeypatch):
+        class FakeShardMesh:
+            def size(self):
+                return 2
+
+            def get_local_rank(self):
+                return 1
+
+            def get_rank(self):
+                return 0
+
+        class FakeDeviceMesh:
+            mesh_dim_names = ("ep_shard", "ep")
+
+        hf_sd = _make_hf_state_dict()
+        gate_up_proj = hf_sd["model.language_model.layers.0.experts.gate_up_proj"]
+        down_proj = hf_sd["model.language_model.layers.0.experts.down_proj"]
+        per_expert_scale = hf_sd["model.language_model.layers.0.router.per_expert_scale"]
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils."
+            "get_expert_range_for_rank_from_mesh",
+            lambda device_mesh, n_experts: (0, n_experts),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils.get_submesh",
+            lambda device_mesh, dims: FakeShardMesh(),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils.create_dtensor_from_local",
+            lambda local_tensor, device_mesh, rank: local_tensor,
+        )
+
+        nemo_sd = adapter.from_hf(hf_sd, device_mesh=FakeDeviceMesh())
+
+        expected_gate_and_up = gate_up_proj.transpose(-2, -1)[:, HIDDEN // 2 :, :]
+        expected_down = (down_proj.transpose(-2, -1) * per_expert_scale[:, None, None])[:, EXPERT_INTER // 2 :, :]
+        torch.testing.assert_close(
+            nemo_sd["model.language_model.layers.0.moe.experts.gate_and_up_projs"],
+            expected_gate_and_up,
+        )
+        torch.testing.assert_close(
+            nemo_sd["model.language_model.layers.0.moe.experts.down_projs"],
+            expected_down,
+        )
+
     def test_without_model_prefix(self, adapter):
         hf_sd = _make_hf_state_dict(with_model_prefix=False)
 
@@ -261,6 +307,42 @@ class TestToHf:
         for key in hf_sd:
             assert "gate_and_up_projs" not in key
             assert "experts.down_projs" not in key
+
+    def test_gather_expert_tensor_materializes_dtensor_slices(self, adapter, monkeypatch):
+        class FakeDTensor:
+            def __init__(self, tensor):
+                self.tensor = tensor
+                self.full_tensor_called = False
+
+            def full_tensor(self):
+                self.full_tensor_called = True
+                return self.tensor
+
+        class FakeDeviceMesh:
+            mesh_dim_names = ("ep",)
+
+        source_tensor = FakeDTensor(torch.empty(0))
+        split_weights = [
+            FakeDTensor(torch.randn(HIDDEN, 2 * EXPERT_INTER)),
+            FakeDTensor(torch.randn(HIDDEN, 2 * EXPERT_INTER)),
+        ]
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils.is_dtensor",
+            lambda tensor: isinstance(tensor, FakeDTensor),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.gemma4_moe.state_dict_adapter.state_dict_utils."
+            "split_experts_weights_dtensor_aware",
+            lambda tensor, n_experts: (split_weights, [0, 1]),
+        )
+
+        gathered = adapter._gather_expert_tensor(source_tensor, FakeDeviceMesh(), N_EXPERTS)
+
+        assert gathered.shape == (N_EXPERTS, HIDDEN, 2 * EXPERT_INTER)
+        torch.testing.assert_close(gathered[0], split_weights[0].tensor)
+        torch.testing.assert_close(gathered[1], split_weights[1].tensor)
+        assert all(weight.full_tensor_called for weight in split_weights)
 
     def test_exclude_key_regex(self, adapter):
         nemo_sd = self._make_nemo_state_dict()
