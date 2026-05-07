@@ -2927,3 +2927,78 @@ class TestNeatPackedVlmCollaterAttnImpl:
         result = neat_packed_vlm_collater([s1, s2], attn_implementation="flash_attention_2")
         assert result["pixel_values"].shape[0] == 3  # 2 + 1
         assert result["image_grid_thw"].shape[0] == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests for public gemma4_inject_thinking_prefix hook
+# ---------------------------------------------------------------------------
+
+
+class _GemmaTokenizerStub:
+    """Encodes the Gemma4 marker/prefix strings to fixed token sequences."""
+
+    pad_token_id = 0
+
+    _MARKER = "<|turn>model\n"
+    _PREFIX = "<|channel>thought\n<channel|>"
+    _MARKER_IDS = [10, 11]
+    _PREFIX_IDS = [20, 21, 22]
+
+    def encode(self, text, add_special_tokens=False):
+        if text == self._MARKER:
+            return list(self._MARKER_IDS)
+        if text == self._PREFIX:
+            return list(self._PREFIX_IDS)
+        return []
+
+
+class _NonGemmaTokenizerStub:
+    """Encodes the Gemma4 marker/prefix to empty (no matching tokens)."""
+
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return []
+
+
+def test_gemma4_inject_thinking_prefix_inserts_after_marker(collate_mod):
+    """Hook injects prefix ids after each <|turn>model\\n marker."""
+    marker = _GemmaTokenizerStub._MARKER_IDS
+    prefix = _GemmaTokenizerStub._PREFIX_IDS
+    # [user...] [marker] [answer]
+    seq = torch.tensor([[1, 2, 3, *marker, 4, 5]])
+    batch = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+
+    out = collate_mod.gemma4_inject_thinking_prefix(batch, _GemmaTokenizerStub())
+    expected = torch.tensor([[1, 2, 3, *marker, *prefix, 4, 5]])
+    assert torch.equal(out["input_ids"], expected)
+    assert out["attention_mask"].shape == expected.shape
+    # injected positions are unmasked (visible)
+    inject_start = 3 + len(marker)
+    inject_end = inject_start + len(prefix)
+    assert (out["attention_mask"][0, inject_start:inject_end] == 1).all()
+
+
+def test_gemma4_inject_thinking_prefix_noop_for_non_gemma_tokenizer(collate_mod):
+    """For tokenizers without the marker/prefix vocab, the batch is returned unchanged."""
+    seq = torch.tensor([[1, 2, 3, 4, 5]])
+    batch = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+
+    out = collate_mod.gemma4_inject_thinking_prefix(batch, _NonGemmaTokenizerStub())
+    assert torch.equal(out["input_ids"], seq)
+
+
+def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mod):
+    """Hook unwraps processor.tokenizer and also accepts a raw tokenizer."""
+
+    class _Processor:
+        tokenizer = _GemmaTokenizerStub()
+
+    marker = _GemmaTokenizerStub._MARKER_IDS
+    seq = torch.tensor([[*marker, 9]])
+    batch_a = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+    batch_b = {"input_ids": seq.clone(), "attention_mask": torch.ones_like(seq)}
+
+    out_proc = collate_mod.gemma4_inject_thinking_prefix(batch_a, _Processor())
+    out_tok = collate_mod.gemma4_inject_thinking_prefix(batch_b, _GemmaTokenizerStub())
+    assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
