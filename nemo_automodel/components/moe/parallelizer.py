@@ -291,7 +291,13 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         layer_type = getattr(block, "layer_type", "full_attention")
 
         if layer_type == "full_attention":
-            attn_module = block.self_attn.attn_module
+            attn_module = getattr(block.self_attn, "attn_module", None)
+            if attn_module is None:
+                logger.warning(
+                    "Skipping TE CP setup for block with attention module that has no attn_module: %s",
+                    type(block.self_attn).__name__,
+                )
+                continue
             if not isinstance(attn_module, DotProductAttention):
                 logger.warning(
                     "Skipping CP setup for block with non-TE attention module: %s",
