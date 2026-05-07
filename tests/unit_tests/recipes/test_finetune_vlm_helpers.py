@@ -1526,6 +1526,90 @@ class TestForwardBackwardStepPP:
         assert model._vlm_chunk_idx is None
         assert len(loss_buffer) == 1
 
+    def test_pp_vlm_chunking_image_and_video_mixed(self, pp_recipe, monkeypatch):
+        """When a batch carries both images and videos, both streams chunk independently
+        but share a single _vlm_chunk_idx initialized once at 0; both clean up to None."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+
+        # n_images_per_sample=[2,0,1,0]: mb0 (samples 0..1) covers images 0..1; mb1 covers image 2.
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3]])  # patch counts: 4, 9, 6
+        pixel_values = torch.randn(int(image_grid_thw.prod(dim=1).sum().item()), 32)
+        n_images_per_sample = torch.tensor([2, 0, 1, 0])
+
+        # n_videos_per_sample=[1,0,2,1]: mb0 covers video 0; mb1 covers videos 1..3.
+        video_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
+        pixel_values_videos = torch.randn(int(video_grid_thw.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+
+            # Both modalities are popped before schedule.step so the schedule never
+            # tries to chunk the misaligned multimodal tensors along dim 0.
+            assert "pixel_values" not in kwargs
+            assert "image_grid_hws" not in kwargs
+            assert "image_grid_thw" not in kwargs
+            assert "pixel_values_videos" not in kwargs
+            assert "video_grid_thw" not in kwargs
+
+            assert len(model._vlm_pixel_values_chunks) == 2
+            assert len(model._vlm_image_grid_hws_chunks) == 2
+            assert model._vlm_image_grid_hws_chunks[0].shape[0] == 2
+            assert model._vlm_image_grid_hws_chunks[1].shape[0] == 1
+            assert model._vlm_pixel_values_chunks[0].shape[0] == 4 + 9
+            assert model._vlm_pixel_values_chunks[1].shape[0] == 6
+
+            assert len(model._vlm_pixel_values_videos_chunks) == 2
+            assert len(model._vlm_video_grid_thw_chunks) == 2
+            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
+            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
+            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
+            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+
+            # Single shared cursor: image-branch sets it to 0 first, video branch resets to 0 again.
+            assert model._vlm_chunk_idx == 0
+
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step.side_effect = step_side_effect
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "n_images_per_sample": n_images_per_sample,
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "n_videos_per_sample": n_videos_per_sample,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_chunks is None
+        assert model._vlm_image_grid_hws_chunks is None
+        assert model._vlm_pixel_values_videos_chunks is None
+        assert model._vlm_video_grid_thw_chunks is None
+        assert model._vlm_chunk_idx is None
+        assert len(loss_buffer) == 1
+
     def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking with image_grid_thw (3D grid) instead of image_grid_hws."""
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
