@@ -13,12 +13,15 @@
 # limitations under the License.
 
 # LoRA fine-tuning recipe for tencent/Hy3-preview (295B MoE, 192 experts top-8).
+# LoRA target: 2 nodes x 8 H100-80GB = 16 GPUs, PP=2 EP=8 DP=8.
+# Estimate: bf16 base weights are ~590 GB total; PP=2 with EP/DP sharding leaves
+# roughly 35-40 GB/rank before activations, while base optimizer state is avoided.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 8
+  global_batch_size: 128
+  local_batch_size: 2
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
@@ -63,8 +66,8 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4
-  ep_size: 32
+  pp_size: 2
+  ep_size: 8
 
   sequence_parallel: false
   activation_checkpointing: true

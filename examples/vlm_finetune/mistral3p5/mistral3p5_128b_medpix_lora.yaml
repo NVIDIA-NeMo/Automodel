@@ -2,7 +2,9 @@
 #
 # =============================================================================
 # Mistral-3.5 medium 128B VLM LoRA fine-tune on MedPix.
-# Multi-node: 8 nodes x 8 H100-80GB = 64 GPUs, TP=8 PP=8, DP=1.
+# LoRA target: 1 node x 8 H100-80GB, TP=4 PP=2, DP=1.
+# Estimate: 128B bf16 base weights are ~256 GB; TP=4 + PP=2 leaves
+# ~32 GB/rank for base weights before activations, with only LoRA optimizer state.
 # Vision tower + multi_modal_projector are frozen; LoRA is applied to the
 # language model linear layers.
 # =============================================================================
@@ -10,8 +12,8 @@
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 64
-  local_batch_size: 8
+  global_batch_size: 16
+  local_batch_size: 2
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
@@ -59,9 +61,9 @@ checkpoint:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 8
+  tp_size: 4
   cp_size: 1
-  pp_size: 8
+  pp_size: 2
   ep_size: 1
 
   sequence_parallel: false

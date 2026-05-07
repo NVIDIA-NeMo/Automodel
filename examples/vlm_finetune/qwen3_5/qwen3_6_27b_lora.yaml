@@ -13,7 +13,9 @@
 # limitations under the License.
 
 # LoRA fine-tuning recipe for Qwen/Qwen3.6-27B on MedPix-VQA.
-# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/qwen3_5/qwen3_6_27b_lora.yaml
+# LoRA memory note: a one-step smoke run used ~16.3 GiB/GPU on 8xH100.
+# With FSDP2 DP sharding, 4xH100 should fit comfortably at the same microbatch.
+# automodel examples/vlm_finetune/qwen3_5/qwen3_6_27b_lora.yaml --nproc-per-node 4
 
 recipe: FinetuneRecipeForVLM
 
