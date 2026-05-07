@@ -97,6 +97,7 @@ dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
     max_length: 2048
     drop_overlong: true
+    preserve_batch_size: true
   drop_last: true
 
 validation_dataset:
@@ -111,6 +112,7 @@ validation_dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
     max_length: 2048
     drop_overlong: true
+    preserve_batch_size: true
 
 optimizer:
   _target_: torch.optim.Adam
