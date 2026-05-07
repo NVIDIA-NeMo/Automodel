@@ -87,6 +87,25 @@ def test_build_position_ids_does_not_override_existing():
     assert torch.equal(batch["position_ids"], original_pos), "position_ids should not be modified"
 
 
+def test_packed_sequence_allowed_mask_isolates_documents():
+    packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]])
+    q_indices = torch.tensor([1, 2, 4])
+    kv_indices = torch.arange(5)
+
+    mask = _cu._packed_sequence_allowed_mask(packed_seq_ids, q_indices, kv_indices)
+
+    expected = torch.tensor(
+        [
+            [
+                [True, True, False, False, False],
+                [False, False, True, True, False],
+                [False, False, False, False, False],
+            ]
+        ]
+    )
+    assert torch.equal(mask, expected)
+
+
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
@@ -175,6 +194,22 @@ def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monke
     assert batch["inputs_embeds"].shape == (1, 2, 8)
     assert batch["per_layer_inputs"].shape == (1, 2, 2, 3)
     assert torch.equal(batch["labels"], torch.tensor([[1, 2]]))
+
+
+def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
+    """Packed document ids should stay aligned with the local CP shard."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+        "_packed_seq_ids": torch.tensor([[1, 1, 2]]),
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+
+    assert torch.equal(batch["input_ids"], torch.tensor([[3, 99]]))
+    assert torch.equal(batch["labels"], torch.tensor([[3, -100]]))
+    assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[2, 0]]))
 
 
 def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):

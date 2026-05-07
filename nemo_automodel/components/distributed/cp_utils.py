@@ -45,6 +45,19 @@ def _is_cp_attention_module_name(name: str) -> bool:
     return not any(part in _NON_TEXT_ATTENTION_PATH_PARTS for part in name.split("."))
 
 
+def _packed_sequence_allowed_mask(
+    packed_seq_ids: torch.Tensor | None,
+    q_indices: torch.Tensor,
+    kv_indices: torch.Tensor,
+) -> torch.Tensor | None:
+    """Build a [B, Q, KV] mask that isolates packed documents."""
+    if packed_seq_ids is None:
+        return None
+    q_pack_ids = packed_seq_ids[:, q_indices]
+    kv_pack_ids = packed_seq_ids[:, kv_indices]
+    return (q_pack_ids[:, :, None] == kv_pack_ids[:, None, :]) & (q_pack_ids[:, :, None] > 0)
+
+
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
     # TODO(@boxiangw): Refractor. Needed for SP support
@@ -204,10 +217,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             torch.distributed.all_gather(parts, tensor, group=_cp_group)
         return torch.cat(tuple(parts), dim=2)
 
-    def _all_gather_token_types(mm_token_type_ids: torch.Tensor | None) -> torch.Tensor | None:
-        if mm_token_type_ids is None:
+    def _all_gather_seq_metadata(metadata: torch.Tensor | None) -> torch.Tensor | None:
+        if metadata is None:
             return None
-        local = mm_token_type_ids.contiguous()
+        local = metadata.contiguous()
         parts = [torch.empty_like(local) for _ in range(_cp_size)]
         torch.distributed.all_gather(parts, local, group=_cp_group)
         return torch.cat(parts, dim=1)
@@ -271,7 +284,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             enable_gqa = True
 
         mm_token_type_ids = getattr(module, "_cp_mm_token_type_ids", None)
-        mm_token_type_ids_full = _all_gather_token_types(mm_token_type_ids)
+        mm_token_type_ids_full = _all_gather_seq_metadata(mm_token_type_ids)
+        packed_seq_ids = getattr(module, "_cp_packed_seq_ids", None)
+        packed_seq_ids_full = _all_gather_seq_metadata(packed_seq_ids)
         vision_group_ids = _vision_group_ids(mm_token_type_ids_full)
         is_sliding = bool(getattr(module, "is_sliding", False))
         sliding_window = getattr(module, "sliding_window", None) if is_sliding else None
@@ -293,6 +308,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             sdpa_mask = (sdpa_allowed.unsqueeze(0) | same_vision_group).unsqueeze(1)
         else:
             sdpa_mask = sdpa_allowed.unsqueeze(0).unsqueeze(0)
+        packed_allowed = _packed_sequence_allowed_mask(packed_seq_ids_full, q_indices, kv_indices)
+        if packed_allowed is not None:
+            sdpa_mask = sdpa_mask & packed_allowed.unsqueeze(1)
 
         try:
             key_for_sdpa = key_full
@@ -363,15 +381,21 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         try:
             from torch.nn.attention.flex_attention import create_block_mask
 
-            if use_vision_bidirectional:
+            if use_vision_bidirectional or packed_seq_ids_full is not None:
 
                 def _cp_mask(batch_idx, head_idx, q_idx, kv_idx):
                     q_global_idx = q_idx + seq_global_start
-                    causal_allowed = _base_mask(q_idx, kv_idx)
-                    q_group = vision_group_ids[batch_idx, q_global_idx]
-                    kv_group = vision_group_ids[batch_idx, kv_idx]
-                    same_vision_group = (q_group == kv_group) & (q_group >= 0)
-                    return causal_allowed | same_vision_group
+                    allowed = _base_mask(q_idx, kv_idx)
+                    if use_vision_bidirectional:
+                        q_group = vision_group_ids[batch_idx, q_global_idx]
+                        kv_group = vision_group_ids[batch_idx, kv_idx]
+                        same_vision_group = (q_group == kv_group) & (q_group >= 0)
+                        allowed = allowed | same_vision_group
+                    if packed_seq_ids_full is not None:
+                        q_pack_id = packed_seq_ids_full[batch_idx, q_global_idx]
+                        kv_pack_id = packed_seq_ids_full[batch_idx, kv_idx]
+                        allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
+                    return allowed
 
                 block_mask_batch = query.shape[0]
             else:
@@ -474,16 +498,39 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     kv_groups = vision_group_ids[:, kv_start:kv_end]
                     same_vision_group = (q_groups[:, :, None] == kv_groups[:, None, :]) & (q_groups[:, :, None] >= 0)
                     allowed = allowed.unsqueeze(0) | same_vision_group
-                    scores = scores.masked_fill(~allowed[:, None, :, :], float("-inf"))
                 else:
-                    scores = scores.masked_fill(~allowed[None, None, :, :], float("-inf"))
+                    allowed = allowed.unsqueeze(0)
+                packed_allowed = _packed_sequence_allowed_mask(packed_seq_ids_full, q_indices, kv_indices)
+                if packed_allowed is not None:
+                    allowed = allowed & packed_allowed
+                scores = scores.masked_fill(~allowed[:, None, :, :], float("-inf"))
 
+                chunk_valid = allowed.any(dim=-1)
                 chunk_max = scores.amax(dim=-1)
-                exp_scores = torch.exp(scores - chunk_max.unsqueeze(-1))
-                chunk_lse = chunk_max + torch.log(exp_scores.sum(dim=-1).clamp(min=1e-9))
+                safe_chunk_max = torch.where(chunk_valid[:, None, :], chunk_max, torch.zeros_like(chunk_max))
+                exp_scores = torch.where(
+                    allowed[:, None, :, :],
+                    torch.exp(scores - safe_chunk_max.unsqueeze(-1)),
+                    torch.zeros_like(scores),
+                )
+                chunk_sum = exp_scores.sum(dim=-1)
+                chunk_lse = torch.where(
+                    chunk_valid[:, None, :],
+                    safe_chunk_max + torch.log(chunk_sum.clamp(min=1e-9)),
+                    torch.full_like(safe_chunk_max, float("-inf")),
+                )
                 new_lse = torch.logaddexp(lse, chunk_lse)
-                alpha = torch.exp(lse - new_lse).unsqueeze(-1)
-                beta = torch.exp(chunk_lse - new_lse).unsqueeze(-1)
+                new_lse_finite = torch.isfinite(new_lse)
+                alpha = torch.where(
+                    torch.isfinite(lse) & new_lse_finite,
+                    torch.exp(lse - new_lse),
+                    torch.zeros_like(lse),
+                ).unsqueeze(-1)
+                beta = torch.where(
+                    torch.isfinite(chunk_lse) & new_lse_finite,
+                    torch.exp(chunk_lse - new_lse),
+                    torch.zeros_like(chunk_lse),
+                ).unsqueeze(-1)
                 out_acc = out_acc * alpha + beta * torch.matmul(exp_scores, v_float[:, :, kv_start:kv_end, :])
                 lse = new_lse
             out = out_acc.to(query.dtype)
@@ -494,14 +541,17 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
     def _pre_hook(module, args, kwargs):
         mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+        packed_seq_ids = kwargs.pop("_packed_seq_ids", None)
         module._cp_mm_token_type_ids = mm_token_type_ids
-        module._cp_manual_allgather_active = mm_token_type_ids is not None
+        module._cp_packed_seq_ids = packed_seq_ids
+        module._cp_manual_allgather_active = mm_token_type_ids is not None or packed_seq_ids is not None
         _active_module["module"] = module
         F_module.scaled_dot_product_attention = _cp_sdpa
         return args, kwargs
 
     def _post_hook(module, inputs, output):
         module._cp_mm_token_type_ids = None
+        module._cp_packed_seq_ids = None
         module._cp_manual_allgather_active = False
         _active_module["module"] = None
         F_module.scaled_dot_product_attention = _original_sdpa
@@ -617,7 +667,9 @@ def make_cp_batch_and_ctx(
     # ring-template CP path cannot represent. Its pre-embed step marks the
     # batch so we use explicit contiguous sequence sharding and let
     # attach_cp_sdpa_hooks all-gather K/V and token types inside attention.
-    manual_allgather = bool(batch.pop("_cp_manual_allgather", False)) or "mm_token_type_ids" in batch
+    manual_allgather = (
+        bool(batch.pop("_cp_manual_allgather", False)) or "mm_token_type_ids" in batch or "_packed_seq_ids" in batch
+    )
 
     # Remove attention_mask from the batch so the model does not attempt to
     # build a local 4D mask with the wrong key length. Preserve padding
@@ -668,6 +720,8 @@ def make_cp_batch_and_ctx(
             batch["position_ids"] = position_ids
             if "mm_token_type_ids" in batch:
                 batch["mm_token_type_ids"] = _pad_tensor_seq_dim_(batch["mm_token_type_ids"], 1, pad_len, 0)
+            if "_packed_seq_ids" in batch:
+                batch["_packed_seq_ids"] = _pad_tensor_seq_dim_(batch["_packed_seq_ids"], 1, pad_len, 0)
             if "per_layer_inputs" in batch:
                 batch["per_layer_inputs"] = _pad_tensor_seq_dim_(batch["per_layer_inputs"], 1, pad_len, 0)
             if loss_mask is not None:
@@ -701,6 +755,7 @@ def make_cp_batch_and_ctx(
         _slice_seq("labels", 1)
         _slice_seq("position_ids", pos_seq_dim)
         _slice_seq("mm_token_type_ids", 1)
+        _slice_seq("_packed_seq_ids", 1)
         _slice_seq("per_layer_inputs", 1)
         _slice_seq("padding_mask", 1)
         if loss_mask is not None:
