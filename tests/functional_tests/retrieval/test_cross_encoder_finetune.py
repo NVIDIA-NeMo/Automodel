@@ -18,6 +18,7 @@ from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "retrieval"
 CROSS_ENCODER_FINETUNE_FILENAME = "L2_Cross_Encoder_Finetune.sh"
+RETRIEVAL_DATALOADER_CHECKPOINT_FILENAME = "L2_Retrieval_Dataloader_Checkpoint.sh"
 
 
 class TestCrossEncoderFinetune:
@@ -26,3 +27,8 @@ class TestCrossEncoderFinetune:
             run_test_script(TEST_FOLDER, CROSS_ENCODER_FINETUNE_FILENAME)
         finally:
             shutil.rmtree("/workspace/output/cross_encoder_inline/", ignore_errors=True)
+
+
+class TestRetrievalDataloaderCheckpoint:
+    def test_retrieval_dataloader_checkpoint(self):
+        run_test_script(TEST_FOLDER, RETRIEVAL_DATALOADER_CHECKPOINT_FILENAME)

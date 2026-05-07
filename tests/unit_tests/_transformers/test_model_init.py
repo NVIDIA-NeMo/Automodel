@@ -26,6 +26,7 @@ from nemo_automodel._transformers.model_init import (
     _has_safetensors,
     _init_model,
     _load_config_with_layer_types_fix,
+    _propagate_torch_dtype_to_subconfigs,
     _resolve_model_dir,
     _setup_bnb_loading_kwargs,
     _stream_load_bnb_weights,
@@ -72,6 +73,61 @@ class TestConsumeConfigOverridesNestedDict:
 
         assert config.some_field == {"key": "val"}
         assert "some_field" not in kwargs
+
+
+class TestPropagateTorchDtypeToSubconfigs:
+    """Nested PretrainedConfig sub-configs must receive the requested torch_dtype."""
+
+    def test_propagates_to_nested_multimodal_subconfigs(self):
+        """Gemma4-style VLM configs expose text/vision/audio sub-configs that all need updating."""
+        from transformers import PretrainedConfig
+
+        text_config = PretrainedConfig()
+        text_config.torch_dtype = torch.bfloat16
+        vision_config = PretrainedConfig()
+        vision_config.torch_dtype = torch.bfloat16
+        audio_config = PretrainedConfig()
+        audio_config.torch_dtype = torch.bfloat16
+
+        top = PretrainedConfig()
+        top.torch_dtype = torch.bfloat16
+        top.text_config = text_config
+        top.vision_config = vision_config
+        top.audio_config = audio_config
+
+        _propagate_torch_dtype_to_subconfigs(top, torch.float32)
+
+        assert top.torch_dtype == torch.float32
+        assert text_config.torch_dtype == torch.float32
+        assert vision_config.torch_dtype == torch.float32
+        assert audio_config.torch_dtype == torch.float32
+
+    def test_ignores_non_config_attributes(self):
+        """Non-config attributes (e.g. plain dicts, ints) must not be traversed or mutated."""
+        from transformers import PretrainedConfig
+
+        top = PretrainedConfig()
+        top.torch_dtype = torch.bfloat16
+        top.some_dict = {"not": "a_config"}
+        top.hidden_size = 4096
+
+        _propagate_torch_dtype_to_subconfigs(top, torch.float32)
+
+        assert top.torch_dtype == torch.float32
+        assert top.some_dict == {"not": "a_config"}
+        assert top.hidden_size == 4096
+
+    def test_handles_cycles(self):
+        """Self-referencing configs must not cause infinite recursion."""
+        from transformers import PretrainedConfig
+
+        top = PretrainedConfig()
+        top.torch_dtype = torch.bfloat16
+        top.self_ref = top
+
+        _propagate_torch_dtype_to_subconfigs(top, torch.float32)
+
+        assert top.torch_dtype == torch.float32
 
 
 class TestBackendDictCoercion:
@@ -437,18 +493,14 @@ class TestLayerTypesFix:
         fake_cls.from_dict.return_value = built
         mock_get_cls.return_value = fake_cls
 
-        result = _load_config_with_layer_types_fix(
-            "stepfun-ai/Step-3.5-Flash", "sdpa", trust_remote_code=True
-        )
+        result = _load_config_with_layer_types_fix("stepfun-ai/Step-3.5-Flash", "sdpa", trust_remote_code=True)
 
         assert result is built
         passed_dict = fake_cls.from_dict.call_args[0][0]
         assert len(passed_dict["layer_types"]) == 45
         assert passed_dict["layer_types"][0] == "full_attention"
         assert fake_cls.from_dict.call_args[1]["attn_implementation"] == "sdpa"
-        mock_get_cls.assert_called_once_with(
-            "configuration_step3p5.Step3p5Config", "stepfun-ai/Step-3.5-Flash"
-        )
+        mock_get_cls.assert_called_once_with("configuration_step3p5.Step3p5Config", "stepfun-ai/Step-3.5-Flash")
 
     @patch("transformers.models.auto.configuration_auto.CONFIG_MAPPING", new_callable=MagicMock)
     @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
@@ -461,9 +513,7 @@ class TestLayerTypesFix:
         fake_cls.from_dict.return_value = "built"
         mock_mapping.get.side_effect = lambda k: fake_cls if k == "step3p5" else None
 
-        result = _load_config_with_layer_types_fix(
-            "some/model", "flash_attention_2", trust_remote_code=False
-        )
+        result = _load_config_with_layer_types_fix("some/model", "flash_attention_2", trust_remote_code=False)
 
         assert result == "built"
         passed_dict = fake_cls.from_dict.call_args[0][0]
@@ -520,6 +570,25 @@ class TestGetHfConfigLayerTypesRetry:
         assert call_kwargs["trust_remote_code"] is True
 
     @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
+    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=True)
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
+    def test_retry_on_strict_dataclass_validation_error(self, mock_from_pretrained, _mock_trust, mock_fix):
+        """huggingface_hub wraps the validator ValueError in a non-ValueError error type."""
+        from huggingface_hub.errors import StrictDataclassClassValidationError
+
+        cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
+        mock_from_pretrained.side_effect = StrictDataclassClassValidationError(
+            validator="validate_layer_type", cause=cause
+        )
+        fixed_cfg = MagicMock()
+        mock_fix.return_value = fixed_cfg
+
+        result = get_hf_config("stepfun-ai/Step-3.5-Flash", "sdpa")
+
+        assert result is fixed_cfg
+        mock_fix.assert_called_once()
+
+    @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
     @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
     def test_unrelated_value_error_is_reraised(self, mock_from_pretrained, _mock_trust, mock_fix):
@@ -532,12 +601,8 @@ class TestGetHfConfigLayerTypesRetry:
     @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
     @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
-    def test_unrecognized_architecture_still_raises_helpful_error(
-        self, mock_from_pretrained, _mock_trust, mock_fix
-    ):
-        mock_from_pretrained.side_effect = ValueError(
-            "Unknown model (fake/model) does not recognize this architecture"
-        )
+    def test_unrecognized_architecture_still_raises_helpful_error(self, mock_from_pretrained, _mock_trust, mock_fix):
+        mock_from_pretrained.side_effect = ValueError("Unknown model (fake/model) does not recognize this architecture")
 
         with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
             get_hf_config("fake/model", "sdpa")

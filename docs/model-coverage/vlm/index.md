@@ -24,16 +24,19 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 |---|---|---|
 | Moonshot AI | [Kimi-VL](moonshotai/kimi-vl.md) | `KimiVLForConditionalGeneration` |
 | Google | [Gemma 3 VL / Gemma 3n](google/gemma3-vl.md) | `Gemma3ForConditionalGeneration` |
+| Google | [Gemma 4](google/gemma4.md) | `Gemma4ForConditionalGeneration` |
 | Qwen / Alibaba Cloud | [Qwen2.5-VL](qwen/qwen2-5-vl.md) | `Qwen2VLForConditionalGeneration`, `Qwen2_5VLForConditionalGeneration` |
 | Qwen / Alibaba Cloud | [Qwen3-VL / Qwen3-VL-MoE](qwen/qwen3-vl.md) | `Qwen3VLForConditionalGeneration` |
 | Qwen / Alibaba Cloud | [Qwen3.5-VL](qwen/qwen3-5-vl.md) | `Qwen3_5VLForConditionalGeneration`, `Qwen3_5MoeVLForConditionalGeneration` |
 | NVIDIA | [Nemotron-Parse](nvidia/nemotron-parse.md) | `NemotronParseForConditionalGeneration` |
 | Mistral AI | [Ministral3 VL](mistralai/ministral3-vl.md) | `Mistral3ForConditionalGeneration` |
 | Mistral AI | [Mistral-Small-4](mistralai/mistral-small-4.md) | `MistralForConditionalGeneration` |
+| Mistral AI | [Mistral Medium 3.5](mistralai/mistral-medium-3-5.md) | `Mistral3ForConditionalGeneration` (FP8) |
 | InternLM / Shanghai AI Lab | [InternVL](internlm/internvl.md) | `InternVLForConditionalGeneration` |
 | Meta | [Llama 4](meta/llama4.md) | `Llama4ForConditionalGeneration` |
 | HuggingFace | [SmolVLM](huggingface/smolvlm.md) | `SmolVLMForConditionalGeneration` |
 | LLaVA | [LLaVA](llava-hf/llava.md) | `LlavaForConditionalGeneration`, `LlavaNextForConditionalGeneration`, `LlavaNextVideoForConditionalGeneration`, `LlavaOnevisionForConditionalGeneration` |
+| lmms-lab | [LLaVA-OneVision 1.5](lmms-lab/llava-onevision.md) | `LlavaOneVisionForConditionalGeneration` |
 
 ## Fine-Tuning
 
@@ -48,14 +51,17 @@ In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` da
 
 moonshotai/kimi-vl
 google/gemma3-vl
+google/gemma4
 qwen/qwen2-5-vl
 qwen/qwen3-vl
 qwen/qwen3-5-vl
 nvidia/nemotron-parse
 mistralai/ministral3-vl
 mistralai/mistral-small-4
+mistralai/mistral-medium-3-5
 internlm/internvl
 meta/llama4
 huggingface/smolvlm
 llava-hf/llava
+lmms-lab/llava-onevision
 ```

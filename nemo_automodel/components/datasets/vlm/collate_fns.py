@@ -496,7 +496,7 @@ def phi4_mm_collate_fn(examples, processor):
         else:
             batch["input_mode"] = 0
 
-    labels = build_labels(
+    labels = build_labels_from_template(
         batch["input_ids"],
         conversations,
         processor,
@@ -742,7 +742,7 @@ def kimi_vl_collate_fn(
 
     batch = processor(**processor_kwargs)
 
-    labels = build_labels(
+    labels = build_labels_from_template(
         batch["input_ids"],
         conversations,
         processor,
@@ -776,54 +776,62 @@ def _expand_image_tokens(
     media_token_id: int,
     merge_kernel_size: Tuple[int, int] = _DEFAULT_MERGE_KERNEL,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Expand single image placeholder tokens to the correct number based on grid_thws.
+    """Expand image placeholder tokens to the correct patch counts based on grid_thws.
 
     For PP, this ensures the sequence length is fixed BEFORE the model forward pass,
     eliminating dynamic sequence expansion inside the model.
 
-    Assumes 1 image per sample (1 placeholder per sequence).
+    Supports both single-image and multi-image samples.  Each placeholder token is
+    expanded to ``(h // merge_h) * (w // merge_w)`` tokens using the corresponding
+    entry in *grid_thws*.  The number of placeholders must match ``grid_thws.shape[0]``.
 
     Args:
-        input_ids: (seq_len,) tensor with 1 media_token_id placeholder
-        attention_mask: (seq_len,) tensor
-        grid_thws: (1, 3) tensor with [t, h, w] for the single image
-        media_token_id: Token ID of the image placeholder
-        merge_kernel_size: Vision tower's patch merge kernel, default (2, 2)
+        input_ids: (seq_len,) tensor containing one ``media_token_id`` per image.
+        attention_mask: (seq_len,) tensor aligned with *input_ids*.
+        grid_thws: (N, 3) tensor with ``[t, h, w]`` for each of the N images.
+        media_token_id: Token ID used as the image placeholder.
+        merge_kernel_size: Vision tower's patch merge kernel, default (2, 2).
 
     Returns:
-        expanded_input_ids: Input IDs with placeholder expanded to N tokens
-        expanded_attention_mask: Attention mask expanded accordingly
+        expanded_input_ids: Input IDs with each placeholder expanded to its patch count.
+        expanded_attention_mask: Attention mask expanded accordingly.
+
+    Raises:
+        ValueError: When the number of placeholders does not match ``grid_thws.shape[0]``.
     """
     merge_h, merge_w = merge_kernel_size
 
-    # Calculate number of image tokens: (h // merge_h) * (w // merge_w)
-    t, h, w = grid_thws[0].tolist()
-    num_image_tokens = (h // merge_h) * (w // merge_w)
-
-    # Find the placeholder position
     placeholder_positions = (input_ids == media_token_id).nonzero(as_tuple=True)[0]
     if len(placeholder_positions) == 0:
-        # No placeholder found, return as-is
         return input_ids, attention_mask
 
-    # For 1 image per sample, there should be exactly 1 placeholder
-    placeholder_pos = placeholder_positions[0].item()
+    n_placeholders = len(placeholder_positions)
+    n_images = grid_thws.shape[0]
+    if n_placeholders != n_images:
+        raise ValueError(
+            f"_expand_image_tokens: found {n_placeholders} placeholder(s) in input_ids "
+            f"but grid_thws has {n_images} row(s). They must match."
+        )
 
-    # Build expanded tensors
-    before = input_ids[:placeholder_pos]
-    after = input_ids[placeholder_pos + 1 :]
+    # Rebuild input_ids and attention_mask by expanding each placeholder in order.
+    # We iterate through the placeholder positions; between consecutive placeholders
+    # we copy the original tokens unchanged.
+    pieces_ids: List[torch.Tensor] = []
+    pieces_mask: List[torch.Tensor] = []
+    cursor = 0
+    for placeholder_pos, (_, h, w) in zip(placeholder_positions.tolist(), grid_thws.tolist()):
+        n_tokens = (int(h) // merge_h) * (int(w) // merge_w)
+        pieces_ids.append(input_ids[cursor:placeholder_pos])
+        pieces_mask.append(attention_mask[cursor:placeholder_pos])
+        pieces_ids.append(torch.full((n_tokens,), media_token_id, dtype=input_ids.dtype))
+        pieces_mask.append(torch.ones(n_tokens, dtype=attention_mask.dtype))
+        cursor = placeholder_pos + 1
 
-    # Expand: replace 1 placeholder with num_image_tokens placeholders
-    expanded_placeholder = torch.full((num_image_tokens,), media_token_id, dtype=input_ids.dtype)
-    expanded_input_ids = torch.cat([before, expanded_placeholder, after])
+    # Append tokens after the last placeholder
+    pieces_ids.append(input_ids[cursor:])
+    pieces_mask.append(attention_mask[cursor:])
 
-    # Expand attention mask similarly
-    before_mask = attention_mask[:placeholder_pos]
-    after_mask = attention_mask[placeholder_pos + 1 :]
-    expanded_mask_tokens = torch.ones(num_image_tokens, dtype=attention_mask.dtype)
-    expanded_attention_mask = torch.cat([before_mask, expanded_mask_tokens, after_mask])
-
-    return expanded_input_ids, expanded_attention_mask
+    return torch.cat(pieces_ids), torch.cat(pieces_mask)
 
 
 def kimi_k25_vl_collate_fn(
@@ -845,6 +853,7 @@ def kimi_k25_vl_collate_fn(
     # Optionally drop overlong samples before processing
     if max_length is not None and drop_overlong:
         conversations, _kept = _drop_overlong_samples(conversations, processor, max_length)
+        examples = [examples[i] for i in _kept]
 
     # Get media token ID
     media_token_id = getattr(processor, "media_placeholder_token_id", None)
@@ -858,6 +867,7 @@ def kimi_k25_vl_collate_fn(
     # Process each sample individually, dropping any that exceed max_length
     # after token expansion.
     kept_conversations = []
+    kept_examples = []
     all_expanded = []
     all_pixel_values = []
     all_grid_thws = []
@@ -909,6 +919,7 @@ def kimi_k25_vl_collate_fn(
                 attention_mask = attention_mask[:max_length]
 
         kept_conversations.append(conversation)
+        kept_examples.append(examples[i])
 
         # Only include image data if all expanded image tokens survived truncation.
         # Partial truncation into image regions would cause a mismatch in the model forward.
@@ -990,6 +1001,11 @@ def kimi_k25_vl_collate_fn(
         processor,
     )
     result["labels"] = labels[:, 1:]
+
+    # Mask fake vision tokens for samples that had fake images injected at dataset level.
+    fake_indices = [i for i, ex in enumerate(kept_examples) if ex.get("_injected_fake")]
+    if fake_indices:
+        mask_fake_vision_tokens_batch(result, processor, fake_indices)
 
     # Shift inputs (remove last token for autoregressive training)
     input_shape = result["input_ids"].shape
@@ -1480,6 +1496,12 @@ def neat_packed_vlm_collater(
     labels = torch.stack([_pad_1d(x["labels"], LABEL_PAD, max_len) for x in batch])
     attention_mask = torch.stack([_pad_1d(x["attention_mask"], 0, max_len) for x in batch])
 
+    def _get_mm_token_type_ids(item):
+        v = item.get("mm_token_type_ids")
+        return v if v is not None else torch.zeros(0, dtype=torch.long)
+
+    mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
+
     if use_flash:
         # Keep indexed [B, S] mask for flash_attn_varlen_func.
         # The patched _get_unpad_data will extract per-document cu_seqlens.
@@ -1510,6 +1532,7 @@ def neat_packed_vlm_collater(
         "labels": labels,
         "position_ids": position_ids,
         "attention_mask": attention_mask_out,
+        "mm_token_type_ids": mm_token_type_ids,
     }
 
     # Store indexed attention mask for loss functions that need per-sample
@@ -1525,7 +1548,7 @@ def neat_packed_vlm_collater(
         if tensors:
             result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
 
-    for key in ("image_grid_thw", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1537,6 +1560,240 @@ def neat_packed_vlm_collater(
         result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
     if any(c > 0 for c in video_counts):
         result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
+
+    return result
+
+
+def nemotron_omni_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+    max_video_frames: int = 8,
+) -> Dict[str, torch.Tensor]:
+    """Collate for NemotronOmni (image / video / audio).
+
+    Defers ``<image>``/``<video>``/``<audio>`` placeholder expansion to the processor;
+    the collate only gathers media into processor kwargs, pads, builds labels, and
+    stacks tensors.
+    """
+    import numpy as np
+    from transformers.video_utils import VideoMetadata
+
+    from nemo_automodel.components.datasets.vlm.utils import _read_video_frames
+
+    conversations = _ensure_rgb([example["conversation"] for example in examples])
+    tokenizer = getattr(processor, "tokenizer", processor)
+    image_token = getattr(processor, "image_token", "<image>")
+    video_token = getattr(processor, "video_token", "<video>")
+
+    sample_audio: Dict[int, np.ndarray] = {}
+    target_sr = getattr(processor, "audio_sampling_rate", 16000)
+    for idx, example in enumerate(examples):
+        audio = example.get("audio")
+        if audio is None:
+            continue
+        if isinstance(audio, tuple) and len(audio) == 2:
+            waveform, sr = audio
+            waveform = np.asarray(waveform, dtype=np.float32)
+            if sr != target_sr:
+                n_out = int(round(len(waveform) * target_sr / sr))
+                waveform = np.interp(
+                    np.linspace(0, len(waveform), n_out, endpoint=False),
+                    np.arange(len(waveform)),
+                    waveform,
+                ).astype(np.float32)
+        else:
+            waveform = np.asarray(audio, dtype=np.float32)
+        sample_audio[idx] = waveform
+
+    all_images: List[List[Any]] = []
+    all_videos: List[Optional[Tuple[List[Any], Optional[VideoMetadata]]]] = []
+    texts: List[str] = []
+
+    for conversation in conversations:
+        conv_images: List[Any] = []
+        conv_video: Optional[Tuple[List[Any], Optional[VideoMetadata]]] = None
+        text_conversation = []
+        for message in conversation:
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    t = item.get("type")
+                    if t == "image":
+                        img = item.get("image")
+                        if img is not None:
+                            conv_images.append(img)
+                            text_parts.append(image_token)
+                    elif t == "video":
+                        vid = item.get("video")
+                        if vid is None:
+                            continue
+                        if isinstance(vid, str):
+                            import decord
+
+                            decord.bridge.set_bridge("native")
+                            total = len(decord.VideoReader(vid))
+                            # Even count required by ``video_temporal_patch_dim=2``.
+                            n = min(max_video_frames, total)
+                            if n % 2 != 0:
+                                n = max(2, n - 1)
+                            frame_idx = torch.linspace(0, total - 1, n).round().long().tolist()
+                            frames, video_fps, indices = _read_video_frames(
+                                vid,
+                                processor=processor,
+                                frame_indices=frame_idx,
+                                return_metadata=True,
+                            )
+                            metadata = VideoMetadata(
+                                total_num_frames=len(frames),
+                                fps=video_fps,
+                                frames_indices=[int(i) for i in indices],
+                            )
+                        elif isinstance(vid, list):
+                            frames = vid
+                            metadata = item.get("metadata")
+                        else:
+                            raise ValueError(f"Unsupported video type: {type(vid)}")
+                        if conv_video is not None:
+                            raise NotImplementedError("Only 1 video per sample is supported")
+                        conv_video = (frames, metadata)
+                        text_parts.append(video_token)
+                    elif t == "text":
+                        text_parts.append(item.get("text", ""))
+                text_conversation.append(
+                    {
+                        "role": message["role"],
+                        "content": "".join(text_parts),
+                    }
+                )
+            else:
+                text_conversation.append(message)
+
+        all_images.append(conv_images)
+        all_videos.append(conv_video)
+        text = tokenizer.apply_chat_template(text_conversation, tokenize=False)
+        texts.append(text)
+
+    all_input_ids: List[torch.Tensor] = []
+    all_attention_masks: List[torch.Tensor] = []
+    sample_pixel_values: Dict[int, Any] = {}
+    sample_pixel_values_videos: Dict[int, Any] = {}
+    sample_sound_clips: Dict[int, Any] = {}
+
+    for i, (text, images, video) in enumerate(zip(texts, all_images, all_videos)):
+        kwargs: Dict[str, Any] = {"text": text, "return_tensors": "pt"}
+        if images:
+            kwargs["images"] = images
+        if video is not None:
+            frames, metadata = video
+            kwargs["videos"] = frames
+            if metadata is not None:
+                kwargs["videos_kwargs"] = {"video_metadata": metadata}
+        if i in sample_audio:
+            kwargs["audio"] = [sample_audio[i]]
+
+        batch_i = processor(**kwargs)
+        all_input_ids.append(batch_i["input_ids"][0])
+        all_attention_masks.append(batch_i["attention_mask"][0])
+
+        if batch_i.get("pixel_values") is not None:
+            sample_pixel_values[i] = batch_i["pixel_values"]
+        if batch_i.get("pixel_values_videos") is not None:
+            sample_pixel_values_videos[i] = batch_i["pixel_values_videos"]
+        if batch_i.get("sound_clips") is not None:
+            sample_sound_clips[i] = batch_i["sound_clips"]
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", None) or 0
+    seq_lengths = [ids.shape[0] for ids in all_input_ids]
+    target_len = max_length if max_length is not None else max(seq_lengths)
+
+    padded_input_ids = []
+    padded_attention_masks = []
+    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+        seq_len = input_ids.shape[0]
+        if seq_len < target_len:
+            pad_len = target_len - seq_len
+            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
+            attn_mask = torch.cat([attn_mask, torch.zeros(pad_len, dtype=attn_mask.dtype)])
+        elif seq_len > target_len:
+            input_ids = input_ids[:target_len]
+            attn_mask = attn_mask[:target_len]
+        padded_input_ids.append(input_ids)
+        padded_attention_masks.append(attn_mask)
+
+    result: Dict[str, Any] = {
+        "input_ids": torch.stack(padded_input_ids),
+        "attention_mask": torch.stack(padded_attention_masks),
+    }
+
+    def _flatten_pv(per_sample_dict: Dict[int, Any]) -> List[torch.Tensor]:
+        flat: List[torch.Tensor] = []
+        for i in range(len(padded_input_ids)):
+            pv = per_sample_dict.get(i)
+            if pv is None:
+                continue
+            if isinstance(pv, torch.Tensor):
+                if pv.dim() == 4:
+                    for k in range(pv.shape[0]):
+                        flat.append(pv[k])
+                else:
+                    flat.append(pv)
+            else:
+                flat.extend(pv)
+        return flat
+
+    flat_images = _flatten_pv(sample_pixel_values)
+    if flat_images:
+        if all(t.shape == flat_images[0].shape for t in flat_images):
+            result["pixel_values"] = torch.stack(flat_images).to(torch.bfloat16)
+        else:
+            # Variable shapes — extract_feature handles list input.
+            result["pixel_values"] = [t.to(torch.bfloat16) for t in flat_images]
+        result["image_flags"] = torch.ones(len(flat_images), 1, dtype=torch.long)
+
+    flat_video_frames = _flatten_pv(sample_pixel_values_videos)
+    if flat_video_frames:
+        if all(t.shape == flat_video_frames[0].shape for t in flat_video_frames):
+            result["pixel_values_videos"] = torch.stack(flat_video_frames).to(torch.bfloat16)
+        else:
+            result["pixel_values_videos"] = [t.to(torch.bfloat16) for t in flat_video_frames]
+
+    if sample_sound_clips:
+        all_waves_np: List[np.ndarray] = []
+        for i in range(len(padded_input_ids)):
+            clips = sample_sound_clips.get(i)
+            if clips is None:
+                continue
+            wave = clips[0] if isinstance(clips, list) else clips
+            if isinstance(wave, torch.Tensor):
+                wave = wave.cpu().numpy()
+            wave = np.asarray(wave, dtype=np.float32).squeeze()
+            all_waves_np.append(wave)
+        if all_waves_np:
+            fe = getattr(processor, "_sound_feature_extractor", None)
+            if fe is None:
+                from transformers import ParakeetFeatureExtractor
+
+                fe = ParakeetFeatureExtractor(sampling_rate=target_sr, feature_size=128)
+                try:
+                    processor._sound_feature_extractor = fe
+                except Exception:
+                    pass
+            audio_inputs = fe(all_waves_np, sampling_rate=target_sr, return_tensors="pt")
+            result["sound_features"] = audio_inputs["input_features"].to(torch.float32)
+            if "attention_mask" in audio_inputs:
+                result["sound_attention_mask"] = audio_inputs["attention_mask"].to(torch.long)
+
+    labels = build_labels(result["input_ids"], conversations, processor)
+    result["labels"] = labels[:, 1:]
+
+    input_shape = result["input_ids"].shape
+    for key, value in list(result.items()):
+        if isinstance(value, torch.Tensor) and value.shape == input_shape:
+            result[key] = value[:, :-1]
 
     return result
 
@@ -1553,13 +1810,6 @@ def _inject_thinking_prefix_tokens(
     tokenizer,
 ) -> Dict[str, torch.Tensor]:
     """Insert ``<|channel>thought\\n<channel|>`` tokens after every ``<|turn>model\\n`` marker.
-
-    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
-    channel prefix before the actual response.  When this prefix is absent from
-    training sequences the model predicts ``<|channel>`` but the label says
-    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
-    as -100 in labels) lets the model see its expected pattern and brings
-    initial loss down to ~3.
 
     Modifies ``input_ids``, ``attention_mask``, and ``mm_token_type_ids``
     (if present).  Additionally, any other 2-D integer tensor whose second
@@ -1635,6 +1885,25 @@ def _inject_thinking_prefix_tokens(
     return batch
 
 
+def gemma4_inject_thinking_prefix(
+    batch: Dict[str, torch.Tensor],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Inject Gemma4's thinking-channel prefix after every assistant turn marker.
+
+    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
+    channel prefix before the actual response.  When this prefix is absent from
+    training sequences the model predicts ``<|channel>`` but the label says
+    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
+    as -100 in labels) lets the model see its expected pattern and brings
+    initial loss down to ~3.
+
+    Safe no-op for non-Gemma4 tokenizers.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    return _inject_thinking_prefix_tokens(batch, tokenizer)
+
+
 def gemma4_prefix_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1644,14 +1913,13 @@ def gemma4_prefix_collate_fn(
 
     Wraps ``default_collate_fn`` and injects ``<|channel>thought\\n<channel|>``
     after every ``<|turn>model\\n`` marker before labels are built.  The injected
-    tokens are automatically masked to -100 by ``build_labels`` (which only
-    unmasks tokens matching the assistant answer text), so the model sees its
+    tokens are automatically masked to -100 by ``build_labels_from_template``
+    (which only unmasks tokens inside assistant turns), so the model sees its
     expected thinking prefix without being penalised for it.
     """
 
     def _inject(batch, proc):
-        tokenizer = getattr(proc, "tokenizer", proc)
-        batch = _inject_thinking_prefix_tokens(batch, tokenizer)
+        batch = gemma4_inject_thinking_prefix(batch, proc)
         if max_length is not None and batch["input_ids"].size(1) > max_length:
             for key in list(batch.keys()):
                 v = batch[key]
@@ -1720,6 +1988,7 @@ COLLATE_FNS = {
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
     "NemotronParseProcessor": nemotron_parse_collate_fn,
+    "NemotronH_Nano_Omni_Reasoning_V3Processor": nemotron_omni_collate_fn,
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,
     "default": default_collate_fn,
 }

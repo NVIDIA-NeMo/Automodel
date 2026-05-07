@@ -34,12 +34,14 @@ def isolated_layer_types_state():
     """Reset module globals and meta-path / sys.modules mutations after each test."""
     saved_patched = lt_mod._PATCHED
     saved_hook_installed = lt_mod._HOOK_INSTALLED
+    saved_validator_relaxed = lt_mod._VALIDATOR_RELAXED
     saved_meta_path = list(sys.meta_path)
     saved_transformers = sys.modules.get("transformers")
     saved_cu = sys.modules.get(lt_mod._TARGET_MODULE)
 
     lt_mod._PATCHED = False
     lt_mod._HOOK_INSTALLED = False
+    lt_mod._VALIDATOR_RELAXED = False
     # The package installs a finder at import time; strip it so each test can
     # reason about the finders it inserts in isolation. The original list is
     # restored verbatim on teardown.
@@ -50,6 +52,7 @@ def isolated_layer_types_state():
     finally:
         lt_mod._PATCHED = saved_patched
         lt_mod._HOOK_INSTALLED = saved_hook_installed
+        lt_mod._VALIDATOR_RELAXED = saved_validator_relaxed
         sys.meta_path[:] = saved_meta_path
         _restore(sys.modules, "transformers", saved_transformers)
         _restore(sys.modules, lt_mod._TARGET_MODULE, saved_cu)
@@ -215,3 +218,59 @@ class TestInstallLayerTypesPatchHook:
         assert lt_mod._PATCHED is True
         for extra in lt_mod.DEFAULT_EXTRA_LAYER_TYPES:
             assert extra in fake_cu.ALLOWED_LAYER_TYPES
+
+
+def _install_fake_pretrained_config_tree():
+    """Register a minimal transformers.PretrainedConfig + subclass with a fake validator."""
+
+    def _boom(self):
+        raise ValueError("`num_hidden_layers` must equal number of layer types")
+
+    _boom.__name__ = "validate_layer_type"
+
+    fake_pkg = types.ModuleType("transformers")
+    fake_pkg.__path__ = []
+
+    class _FakePretrainedConfig:
+        validate_layer_type = _boom
+        __class_validators__ = [_boom]
+
+    class _FakeChildConfig(_FakePretrainedConfig):
+        __class_validators__ = [_boom]
+
+    fake_pkg.PretrainedConfig = _FakePretrainedConfig
+    sys.modules["transformers"] = fake_pkg
+    return _FakePretrainedConfig, _FakeChildConfig, _boom
+
+
+class TestRelaxLayerTypesValidator:
+    def test_replaces_validator_on_base_and_subclass(self, isolated_layer_types_state):
+        base, child, _original = _install_fake_pretrained_config_tree()
+
+        assert lt_mod.relax_layer_types_validator() is True
+
+        assert base.validate_layer_type is lt_mod._noop_validate_layer_type
+        assert base.__class_validators__[0] is lt_mod._noop_validate_layer_type
+        assert child.__class_validators__[0] is lt_mod._noop_validate_layer_type
+
+        instance = child.__new__(child)
+        for v in child.__class_validators__:
+            v(instance)  # must not raise
+
+    def test_idempotent(self, isolated_layer_types_state):
+        _install_fake_pretrained_config_tree()
+
+        assert lt_mod.relax_layer_types_validator() is True
+        assert lt_mod.relax_layer_types_validator() is False
+
+    def test_missing_attribute_is_tolerated(self, isolated_layer_types_state):
+        fake_pkg = types.ModuleType("transformers")
+        fake_pkg.__path__ = []
+
+        class _Bare:
+            pass
+
+        fake_pkg.PretrainedConfig = _Bare
+        sys.modules["transformers"] = fake_pkg
+
+        assert lt_mod.relax_layer_types_validator() is False

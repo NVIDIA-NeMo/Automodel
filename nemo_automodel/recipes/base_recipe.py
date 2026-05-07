@@ -756,6 +756,40 @@ class BaseRecipe:
             tensor = tensor.cpu()
         return tensor
 
+    def _make_progress_bar(self):
+        """Create a tqdm progress bar on rank 0; returns None on other ranks."""
+        if not _is_rank_0():
+            return None
+        from tqdm import tqdm
+
+        return tqdm(
+            total=getattr(self.step_scheduler, "max_steps", None),
+            initial=getattr(self.step_scheduler, "step", 0),
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
+        )
+
+    def _update_progress_bar(self, pbar, metrics: dict) -> None:
+        """Update tqdm bar with loss/lr/tps from a metrics dict (no-op if pbar is None)."""
+        if pbar is None:
+            return
+        postfix = {}
+        for loss_key in ("loss", "Loss/Train_Total"):
+            if loss_key in metrics:
+                postfix["loss"] = f"{metrics[loss_key]:.4f}"
+                break
+        for lr_key in ("lr", "Train/lr"):
+            if lr_key in metrics:
+                postfix["lr"] = f"{metrics[lr_key]:.2e}"
+                break
+        for tps_key in ("tps", "Train/tps"):
+            if tps_key in metrics:
+                postfix["tps"] = f"{metrics[tps_key]:.0f}"
+                break
+        pbar.set_postfix(**postfix)
+        pbar.update(1)
+
 
 def _find_latest_checkpoint(checkpoint_dir):
     """

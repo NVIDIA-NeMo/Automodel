@@ -235,9 +235,14 @@ def patched_backward_maybe_with_nosync(
                 result = perform_backward(backward_type)()
     # If submod is a FSDP module
     elif isinstance(self.submod, FSDPModule):
-        self.submod.set_is_last_backward(False)
-        self.submod.set_reshard_after_backward(False)
-        self.submod.set_requires_gradient_sync(False)
+        if getattr(self, "_reduce_grad_per_microbatch", False):
+            self.submod.set_is_last_backward(True)
+            self.submod.set_reshard_after_backward(True)
+            self.submod.set_requires_gradient_sync(True)
+        else:
+            self.submod.set_is_last_backward(False)
+            self.submod.set_reshard_after_backward(False)
+            self.submod.set_requires_gradient_sync(False)
         result = perform_backward(backward_type)()
         if last_backward:
             # Manually call post backward for FSDP

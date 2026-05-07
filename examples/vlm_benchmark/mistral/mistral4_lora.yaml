@@ -120,3 +120,4 @@ optimizer:
 ci:
   time: "00:20:00"
   nodes: 4
+  known_issue_id: AM-174

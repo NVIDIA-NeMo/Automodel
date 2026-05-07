@@ -17,7 +17,7 @@ import logging
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import lru_cache, reduce
+from functools import lru_cache
 from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
@@ -83,6 +83,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 )
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
+from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
@@ -432,9 +433,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
 
         def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
-            if isinstance(module, nn.ModuleList):
-                for layer_id, child in enumerate(module):
-                    if isinstance(child, nn.ModuleList):
+            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
+                for layer_id, child in items:
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
                         _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
                     else:
                         parallelizer_utils.fully_shard_by_dtype(
@@ -890,6 +892,10 @@ def get_hf_tp_shard_plan(model):
         inner_model = model.model.language_model
         model_prefix = "model.language_model"
 
+    elif model_cls.__name__ == "Qwen3_5ForConditionalGeneration":
+        inner_model = model.model.language_model
+        model_prefix = "model.language_model"
+
     else:
         inner_model = model.model
         model_prefix = "model"
@@ -941,7 +947,13 @@ def get_hf_tp_shard_plan(model):
         if (k == "lm_head" or k == "language_model.lm_head") and v == "colwise_rep":
             translated_plan[k] = ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
         else:
-            translated_plan[k] = translate_to_torch_parallel_style(v)
+            style = translate_to_torch_parallel_style(v)
+            # Translator returns None for styles that should be skipped (e.g.
+            # "replicated_with_grad_allreduce" under FSDP where leaving the
+            # param un-wrapped is equivalent).
+            if style is None:
+                continue
+            translated_plan[k] = style
 
     logger.info(f"Hugging Face tp plan: {translated_plan}")
     return translated_plan
@@ -1002,6 +1014,13 @@ def translate_to_torch_parallel_style(style: str):
         return RowwiseParallel(input_layouts=Replicate())
     elif style == "sequence_parallel":
         return SequenceParallel()
+    elif style == "replicated_with_grad_allreduce":
+        # transformers v5 style for norm weights (q_norm, k_norm, etc.) that are
+        # replicated across TP ranks but need gradient all-reduce. Under FSDP+TP,
+        # leaving the param un-wrapped (no TP style) is equivalent: FSDP handles
+        # grad sync on its DP/DP_shard mesh, and since the param is replicated on
+        # the TP mesh, no TP-level collective is needed in forward.
+        return None
     else:
         raise ValueError(f"Unknown parallel style: {style}")
 
@@ -1241,7 +1260,13 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         ans = []
         for fqn in fqns:
             parts = fqn.split(".")
-            ans.append(reduce(getattr, parts, model))
+            obj = model
+            for part in parts:
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                ans.append(obj)
         return ans
 
     # Gemma3 layer paths depend on transformers version
@@ -1267,7 +1292,19 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
             "vision_tower.vision_model.encoder.layers",
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        # FP8 VLM subclass (own FP8 dequant on top of HF's Mistral3). String-keyed
+        # because NeMo Auto wraps the class via HFCheckpointingMixin into a new
+        # type with the same __name__ but distinct identity, so direct class
+        # comparison misses; the elif `model_cls.__name__ in MAP` check catches it.
+        "Mistral3FP8VLMForConditionalGeneration": [
+            "model.language_model.layers",
+            "model.vision_tower.transformer.layers",
+        ],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+        # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
+        # module load (which would defeat test monkeypatches that stub the
+        # module before first import).
+        "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
@@ -1279,12 +1316,19 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
 
     MODEL_CLS_TO_LAYERS = VLM_MODEL_CLS_TO_LAYERS | LLM_MODEL_CLS_TO_LAYERS
 
+    def _extend_layers(layers, modules):
+        for m in modules:
+            if isinstance(m, nn.ModuleList):
+                layers.extend(m)
+            else:
+                layers.append(m)
+
     model_cls = type(model)
     layers: List[nn.Module] = []
     if model_cls in MODEL_CLS_TO_LAYERS:
-        layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
     elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
-        layers.extend(_reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
+        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM)
         if isinstance(model.model.layers, nn.ModuleDict):
@@ -1377,36 +1421,60 @@ def _get_parallel_plan(
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
     else:
-        base_model_tp_plan = {
-            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-            "lm_head": ColwiseParallel(output_layouts=Replicate()),
-        }
-        if sequence_parallel:
-            base_model_sp_plan = {
-                "model.embed_tokens": VocabParallelEmbedding(
-                    input_layouts=Replicate(),
-                    output_layouts=Shard(1),
-                    use_local_output=False,
-                ),
-                "model.norm": SequenceParallel(),
-                "model.layers.*.input_layernorm": SequenceParallel(),
-                "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                "model.layers.*.post_attention_layernorm": SequenceParallel(),
-                "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
-                "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+        # Try HF's per-model _tp_plan first — it correctly handles multimodal
+        # architectures like Mistral3ForConditionalGeneration whose text layers
+        # live under model.language_model.layers.* and would be missed by the
+        # hardcoded llama-style wildcards below.
+        hf_plan = None
+        try:
+            hf_plan = get_hf_tp_shard_plan(model)
+        except Exception as e:
+            logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
+
+        if hf_plan:
+            model_parallel_plan = hf_plan
+            logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
+        else:
+            base_model_tp_plan = {
+                "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+                "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+                "model.layers.*.self_attn.qkv_proj": ColwiseParallel(),  # Combined QKV projection
+                "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+                "model.layers.*.mlp.gate_up_proj": ColwiseParallel(),  # Fused gate and up projection
+                "model.layers.*.mlp.up_proj": ColwiseParallel(),
+                "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+                "model.layers.*.mlp.down_proj": RowwiseParallel(),
+                "lm_head": ColwiseParallel(output_layouts=Replicate()),
             }
-            base_model_tp_plan.update(base_model_sp_plan)
-        model_parallel_plan = base_model_tp_plan
-        logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
+            if sequence_parallel:
+                base_model_sp_plan = {
+                    "model.embed_tokens": VocabParallelEmbedding(
+                        input_layouts=Replicate(),
+                        output_layouts=Shard(1),
+                        use_local_output=False,
+                    ),
+                    "model.norm": SequenceParallel(),
+                    "model.layers.*.input_layernorm": SequenceParallel(),
+                    "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+                    "model.layers.*.post_attention_layernorm": SequenceParallel(),
+                    "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+                    "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Replicate()),
+                }
+                base_model_tp_plan.update(base_model_sp_plan)
+            model_parallel_plan = base_model_tp_plan
+            logger.info("Using default base TP plan. Compatible with huggingface llama3-style models.")
+
+    # Nemotron-Flash's forward computes `logits / self.lm_head.weight.norm(p=2, dim=1)`.
+    # Under TP, sharding lm_head turns the weight into a DTensor while `logits` is a
+    # plain tensor (output_layouts=Replicate), and the mixed-operand division raises
+    # "aten.div.Tensor got mixed torch.Tensor and DTensor". Drop lm_head from the plan
+    # so its weight stays replicated and the division stays in plain-tensor space.
+    if _is_nemotron_flash_config(getattr(model, "config", None)):
+        for k in ("lm_head", "language_model.lm_head"):
+            if model_parallel_plan.pop(k, None) is not None:
+                logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
 
     return model_parallel_plan
 

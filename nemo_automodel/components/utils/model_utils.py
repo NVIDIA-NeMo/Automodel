@@ -78,6 +78,31 @@ def _supports_seq_lens(model: nn.Module) -> bool:
     return False
 
 
+# Umbrella of multimodal kwarg names used by VLM forwards across families.
+# Mirrors the discovery pattern of ``fake_image._VISION_TOKEN_ID_ATTRS``: every
+# consumer iterates this list and uses whichever keys the live batch contains,
+# so callers don't need a per-model branch. New VLM family -> append its keys.
+VLM_INPUT_KEYS: tuple[str, ...] = (
+    "input_ids",
+    # Image
+    "pixel_values",
+    "image_flags",
+    "imgs_sizes",
+    "image_position_ids",
+    "mm_token_type_ids",
+    "image_grid_hws",
+    "image_grid_thw",
+    "image_sizes",
+    # Video
+    "pixel_values_videos",
+    # Audio / sound
+    "sound_features",
+    "sound_attention_mask",
+    "audio_input_values",
+    "audio_attention_mask",
+)
+
+
 def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     """Drop kwargs that ``model.forward`` does not accept.
 
@@ -270,7 +295,7 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech"])
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech", "sound"])
 
     # Freeze language model backbone
     if freeze_language_model:

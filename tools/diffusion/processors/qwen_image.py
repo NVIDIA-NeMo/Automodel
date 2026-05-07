@@ -41,9 +41,6 @@ class QwenImageProcessor(BaseModelProcessor):
     for text conditioning.
     """
 
-    # Maximum sequence length for Qwen2 text encoder
-    MAX_SEQUENCE_LENGTH = 256
-
     @property
     def model_type(self) -> str:
         return "qwen_image"
@@ -84,11 +81,13 @@ class QwenImageProcessor(BaseModelProcessor):
         models["vae"].eval()
 
         logger.info("  Configuring Qwen2 text encoder...")
-        models["tokenizer"] = pipeline.tokenizer
-        models["text_encoder"] = pipeline.text_encoder.to(device)
-        models["text_encoder"].eval()
+        pipeline.text_encoder.to(device)
+        pipeline.text_encoder.eval()
 
-        del pipeline
+        # Keep pipeline for encode_prompt — it owns the tokenizer, text_encoder,
+        # chat template, and system-token dropping logic.
+        models["pipeline"] = pipeline
+
         torch.cuda.empty_cache()
 
         logger.info("[Qwen-Image] Models loaded successfully!")
@@ -114,12 +113,20 @@ class QwenImageProcessor(BaseModelProcessor):
         vae = models["vae"]
         image_tensor = image_tensor.to(device, dtype=torch.bfloat16)
 
+        # Qwen-Image VAE expects 5D input (B, C, T, H, W) — add frame dim for single image
+        if image_tensor.ndim == 4:
+            image_tensor = image_tensor.unsqueeze(2)
+
         with torch.no_grad():
             latent = vae.encode(image_tensor).latent_dist.sample()
 
-        latent = (latent - vae.config.shift_factor) * vae.config.scaling_factor
+        # Normalize using per-channel latents_mean / latents_std
+        latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
+        latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent.device, latent.dtype)
+        latent = (latent - latents_mean) / latents_std
 
-        return latent.detach().cpu().to(torch.float16).squeeze(0)
+        # Remove frame dim if added, then batch dim → (C, H, W)
+        return latent.detach().cpu().to(torch.float16).squeeze(2).squeeze(0)
 
     def encode_text(
         self,
@@ -128,39 +135,29 @@ class QwenImageProcessor(BaseModelProcessor):
         device: str,
     ) -> Dict[str, torch.Tensor]:
         """
-        Encode text using Qwen2 text encoder.
+        Encode text using the QwenImagePipeline's encode_prompt.
+
+        Delegates to the diffusers pipeline which applies the correct chat
+        template, tokenization, system-token dropping, and attention masking.
 
         Args:
             prompt: Text prompt
-            models: Dict containing tokenizer and text_encoder
+            models: Dict containing 'pipeline' (QwenImagePipeline)
             device: Device to use
 
         Returns:
             Dict containing:
                 - prompt_embeds: Qwen2 hidden states [1, seq_len, hidden_dim]
-                - text_tokens: Token IDs
         """
-        tokenizer = models["tokenizer"]
-        text_encoder = models["text_encoder"]
-
-        tokens = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.MAX_SEQUENCE_LENGTH,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        device_type = "cuda" if "cuda" in device else "cpu"
-        input_ids = tokens.input_ids.to(device_type)
+        pipeline = models["pipeline"]
 
         with torch.no_grad():
-            output = text_encoder(input_ids, output_hidden_states=False)
-
-        prompt_embeds = output.last_hidden_state
+            prompt_embeds, _ = pipeline.encode_prompt(
+                prompt=prompt,
+                device=device,
+            )
 
         return {
-            "text_tokens": tokens["input_ids"].cpu(),
             "prompt_embeds": prompt_embeds.detach().cpu().to(torch.bfloat16),
         }
 
@@ -185,12 +182,18 @@ class QwenImageProcessor(BaseModelProcessor):
             vae = models["vae"]
             device_type = "cuda" if "cuda" in device else "cpu"
 
-            latent = latent.unsqueeze(0).to(device).float()
+            # (C, H, W) → (B, C, T, H, W) for Qwen-Image VAE
+            latent = latent.unsqueeze(0).unsqueeze(2).to(device).float()
 
             with torch.no_grad(), autocast(device_type=device_type, dtype=torch.float32):
-                latent = latent / vae.config.scaling_factor
+                # Denormalize: reverse (latent - mean) / std
+                latents_mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(device, latent.dtype)
+                latents_std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, latent.dtype)
+                latent = latent * latents_std + latents_mean
                 decoded = vae.decode(latent).sample
 
+            # decoded is 5D (B, C, T, H, W) — take first frame
+            decoded = decoded[:, :, 0]
             _, c, h, w = decoded.shape
             if c != 3:
                 return False
@@ -225,7 +228,6 @@ class QwenImageProcessor(BaseModelProcessor):
             # Image latent
             "latent": latent,
             # Text embeddings
-            "text_tokens": text_encodings["text_tokens"],
             "prompt_embeds": text_encodings["prompt_embeds"],
             # Metadata
             "original_resolution": metadata["original_resolution"],

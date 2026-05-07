@@ -334,6 +334,40 @@ def test_freeze_audio_tower_false_keeps_speech_trainable(audio_model):
     assert _all_requires_grad(audio_model.speech_adapter)
 
 
+@pytest.fixture()
+def sound_model() -> nn.Module:
+    """Model with a NemotronOmni-style ``sound_*`` submodule."""
+
+    class SoundModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.sound_encoder = nn.Linear(4, 4)
+            self.sound_projection = nn.Linear(4, 4)
+            self.language_head = nn.Linear(4, 4)
+
+        def forward(self, x):
+            pass
+
+    return SoundModel()
+
+
+def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
+    """``freeze_audio_tower=True`` must also freeze NemotronOmni's ``sound_*`` modules."""
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+
+    assert not _any_requires_grad(sound_model.sound_encoder)
+    assert not _any_requires_grad(sound_model.sound_projection)
+    assert _all_requires_grad(sound_model.language_head)
+
+
+def test_freeze_audio_tower_false_keeps_sound_trainable(sound_model):
+    """Sound modules stay trainable when audio freeze is off."""
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+
+    assert _all_requires_grad(sound_model.sound_encoder)
+    assert _all_requires_grad(sound_model.sound_projection)
+
+
 # =============================================================================
 # Tests for cast_mixed_dtype_params_to_bf16
 # =============================================================================

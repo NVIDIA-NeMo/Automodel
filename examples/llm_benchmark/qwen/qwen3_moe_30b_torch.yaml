@@ -106,5 +106,5 @@ optimizer:
 
 
 ci:
-  time: "00:15:00"
+  time: "00:30:00"
   nodes: 1
