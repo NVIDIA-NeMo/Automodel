@@ -333,8 +333,6 @@ SUPPORTED_BACKBONES = {
     "llama_bidirec": _LLAMA_TASKS,
     "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
-    # Mistral3-VL Hub configs use top-level model_type "mistral3" (language is nested under text_config).
-    "mistral3": _MINISTRAL3_BIDIREC_TASKS,
 }
 
 
