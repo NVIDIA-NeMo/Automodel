@@ -466,6 +466,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 embed_fn=self.model.embed_tokens,
+                position_ids=position_ids,
                 attention_mask=causal_mask_mapping.get("full_attention")
                 if causal_mask_mapping is not None
                 else attention_mask,

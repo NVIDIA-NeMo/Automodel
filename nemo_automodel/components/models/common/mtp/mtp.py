@@ -182,6 +182,7 @@ class MTPModule(nn.Module):
         input_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         embed_fn: Callable[[torch.LongTensor], torch.Tensor],
+        position_ids: torch.LongTensor | None = None,
         **block_kwargs,
     ) -> list[torch.Tensor]:
         """Iterate over MTP depths and return per-depth hidden states.
@@ -194,6 +195,12 @@ class MTPModule(nn.Module):
             embed_fn: Callable applied to rolled ``input_ids`` to produce the
                 future-token embedding (typically the model's input embedding
                 layer).
+            position_ids: Position ids matching ``input_ids``. When supplied,
+                rolled cumulatively per depth in lockstep with ``input_ids``
+                (so slot ``t`` carries the original position of the rolled
+                token) and forwarded to each sublayer via ``block_kwargs``.
+                Required for RoPE-using sublayers; ignored by sublayers that
+                don't consume it.
             **block_kwargs: Forwarded to each sublayer's ``__call__`` (e.g.
                 ``attention_mask``).
 
@@ -205,13 +212,18 @@ class MTPModule(nn.Module):
         P = self.pattern_length
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
+        cur_position_ids = position_ids
         for d in range(D):
             cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+            if cur_position_ids is not None:
+                cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
 
             decoder_input = embed_fn(cur_input_ids)
             for s in range(P):
                 sublayer = self.layers[d * P + s]
                 kwargs = dict(block_kwargs)
+                if cur_position_ids is not None:
+                    kwargs["position_ids"] = cur_position_ids
                 if s == 0:
                     kwargs["embed_input"] = decoder_input
                 hidden_states = sublayer(hidden_states, **kwargs)
