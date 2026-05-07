@@ -75,7 +75,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -951,6 +951,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
+        # Routed through __call__ so FSDP2 forward pre-hook fires and
+        # unshards the vision tower's weights before the embed/scatter.
+        _model = self.model_parts[0]
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+            and not self.pp_enabled
+        )
+        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+            with torch.no_grad():
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            for k in VLM_INPUT_KEYS:
+                batch.pop(k, None)
+            batch.update(prepared)
+
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
@@ -1033,7 +1050,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            with sync_ctx, train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1218,19 +1235,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+
+                _model = self.model_parts[0]
+                _cp_active = (
+                    self.device_mesh is not None
+                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+                    and self.device_mesh["cp"].size() > 1
+                    and not self.pp_enabled
+                )
+                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                    with torch.no_grad():
+                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                    for k in VLM_INPUT_KEYS:
+                        batch.pop(k, None)
+                    batch.update(prepared)
+
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
-
-                if (
-                    self.device_mesh
-                    and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-                ):
-                    batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
-                    )
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
