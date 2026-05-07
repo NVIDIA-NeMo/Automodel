@@ -2,10 +2,10 @@
 #
 # =============================================================================
 # Mistral-3.5 medium 128B VLM LoRA fine-tune on MedPix.
-# LoRA target: 2 nodes x 8 H100-80GB = 16 GPUs, TP=8 PP=2, DP=1.
+# LoRA target: 2 nodes x 8 H100-80GB = 16 GPUs, TP=4 PP=4, DP=1.
 # FP8-native Mistral Medium 3.5 currently dequantizes to BF16 when PEFT is
-# enabled. Single-node TP=8 peaks near 80 GB/rank during load; PP=2 halves the
-# text-layer footprint per rank while keeping tensor parallelism within 8-way.
+# enabled. Single-node TP=8 peaks near 80 GB/rank during load; TP=4 PP=4
+# lowers per-rank text-layer load while keeping the job on 16 GPUs.
 # Vision tower + multi_modal_projector are frozen; LoRA is applied to the
 # language model linear layers.
 # =============================================================================
@@ -14,7 +14,7 @@ recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 16
-  local_batch_size: 2
+  local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
@@ -62,9 +62,9 @@ checkpoint:
 distributed:
   strategy: fsdp2
   dp_size: none
-  tp_size: 8
+  tp_size: 4
   cp_size: 1
-  pp_size: 2
+  pp_size: 4
   ep_size: 1
 
   sequence_parallel: false
