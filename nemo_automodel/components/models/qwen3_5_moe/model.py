@@ -181,9 +181,9 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             else:
                 raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
 
-        # If we have pixel values and a vision encoder, go through the full HF
+        # If we have visual pixel values and a vision encoder, go through the full HF
         # VL forward (vision encoding + multimodal scatter + text).
-        if pixel_values is not None and self.visual is not None:
+        if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
             return super().forward(
                 input_ids=None,
                 attention_mask=attention_mask,
@@ -491,23 +491,25 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     ):
         # PP VLM support: retrieve pixel_values from stored chunks if not passed
         pixel_values = kwargs.get("pixel_values", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            image_token_id = self.config.image_token_id
-            vision_start_token_id = self.config.vision_start_token_id
-            has_media_tokens = input_ids is not None and (
-                (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
-            )
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        image_token_id = self.config.image_token_id
+        vision_start_token_id = self.config.vision_start_token_id
+        has_media_tokens = input_ids is not None and (
+            (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
+        )
 
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        consumed_vlm_chunk = False
+
+        if pixel_values is None and has_media_tokens:
+            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            if image_chunks is not None and chunk_idx < len(image_chunks):
+                pixel_values = image_chunks[chunk_idx]
+                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
+                    image_grid_hws = image_grid_chunks[chunk_idx]
                     if image_grid_hws is not None and image_grid_hws.numel() > 0:
                         if image_grid_hws.shape[-1] == 2:
                             ones = torch.ones(
@@ -516,9 +518,25 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                             image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
                         else:
                             image_grid_thw = image_grid_hws
-                    kwargs["pixel_values"] = pixel_values
-                    kwargs["image_grid_thw"] = image_grid_thw
-                    self._vlm_chunk_idx = chunk_idx + 1
+                kwargs["pixel_values"] = pixel_values
+                kwargs["image_grid_thw"] = image_grid_thw
+                consumed_vlm_chunk = True
+
+        if pixel_values_videos is None and has_media_tokens:
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if video_chunks is not None and chunk_idx < len(video_chunks):
+                video_chunk = video_chunks[chunk_idx]
+                if video_chunk.numel() > 0:
+                    pixel_values_videos = video_chunk
+                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
+                        video_grid_thw = video_grid_chunks[chunk_idx]
+                    kwargs["pixel_values_videos"] = pixel_values_videos
+                    kwargs["video_grid_thw"] = video_grid_thw
+                consumed_vlm_chunk = True
+
+        if consumed_vlm_chunk:
+            self._vlm_chunk_idx = chunk_idx + 1
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(

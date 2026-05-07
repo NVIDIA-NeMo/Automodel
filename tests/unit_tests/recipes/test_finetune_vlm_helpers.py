@@ -1473,6 +1473,59 @@ class TestForwardBackwardStepPP:
         # Verify loss was computed
         assert len(loss_buffer) == 1
 
+    def test_pp_vlm_chunking_videos_uses_video_grid_and_counts(self, pp_recipe, monkeypatch):
+        """Video tensors are chunked by per-sample video counts before schedule.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        batch_size = 4
+        video_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])
+        pixel_values_videos = torch.randn(int(video_grid_thw.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            assert "pixel_values_videos" not in kwargs
+            assert "video_grid_thw" not in kwargs
+            assert len(model._vlm_pixel_values_videos_chunks) == 2
+            assert len(model._vlm_video_grid_thw_chunks) == 2
+            assert model._vlm_video_grid_thw_chunks[0].shape[0] == 1
+            assert model._vlm_video_grid_thw_chunks[1].shape[0] == 3
+            assert model._vlm_pixel_values_videos_chunks[0].shape[0] == 4
+            assert model._vlm_pixel_values_videos_chunks[1].shape[0] == 9 + 6 + 16
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step.side_effect = step_side_effect
+
+        batch = {
+            "labels": torch.randint(0, 100, (batch_size, 10)),
+            "input_ids": torch.randint(0, 100, (batch_size, 10)),
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "n_videos_per_sample": n_videos_per_sample,
+        }
+        loss_buffer = []
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=40,
+            num_batches=1,
+            is_train=True,
+        )
+
+        model = pp_recipe.model_parts[0]
+        assert model._vlm_pixel_values_videos_chunks is None
+        assert model._vlm_video_grid_thw_chunks is None
+        assert model._vlm_chunk_idx is None
+        assert len(loss_buffer) == 1
+
     def test_pp_vlm_chunking_with_image_grid_thw(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking with image_grid_thw (3D grid) instead of image_grid_hws."""
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
@@ -2427,6 +2480,28 @@ class TestChunkVlmMedia:
             _chunk_vlm_media(
                 pixel_values, image_grid, batch_size=2, n_microbatches=2,
             )
+
+    def test_n_videos_per_sample_packed(self):
+        """The media chunk helper also handles video grids/counts."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        video_grid = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])
+        pixel_values_videos = torch.randn(int(video_grid.prod(dim=1).sum().item()), 64)
+        n_videos_per_sample = torch.tensor([1, 0, 2, 1])
+
+        pv_chunks, vg_chunks = _chunk_vlm_media(
+            pixel_values_videos,
+            video_grid,
+            batch_size=4,
+            n_microbatches=2,
+            n_images_per_sample=n_videos_per_sample,
+        )
+
+        assert len(pv_chunks) == 2
+        assert vg_chunks[0].shape[0] == 1
+        assert vg_chunks[1].shape[0] == 3
+        assert pv_chunks[0].shape[0] == 4
+        assert pv_chunks[1].shape[0] == 9 + 6 + 16
 
 
 # -----------------------------------------------------------------------------
