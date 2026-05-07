@@ -199,7 +199,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate(
                 device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
                 peft_config=self.peft_config,
             )

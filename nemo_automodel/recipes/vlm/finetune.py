@@ -110,7 +110,6 @@ def build_model(
     cfg_fp8=None,
     cfg_compile=None,
     device_mesh=None,
-    moe_mesh=None,
     distributed_config=None,
     pipeline_config=None,
     cfg_moe=None,
@@ -126,7 +125,6 @@ def build_model(
         kwargs = {
             "peft_config": cfg_peft,
             "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
@@ -788,7 +786,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh,
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -804,7 +801,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
             cfg_moe=self.dist_setup.moe_config,

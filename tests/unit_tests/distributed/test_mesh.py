@@ -17,11 +17,11 @@
 Dict-parsing tests live in ``tests/unit_tests/recipes/test_dist_setup.py``.
 """
 
+from unittest.mock import Mock
+
 import pytest
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
-from unittest.mock import Mock
-
 from nemo_automodel.components.distributed.mesh import (
     STRATEGY_MAP,
     MeshAxisName,
@@ -31,7 +31,6 @@ from nemo_automodel.components.distributed.mesh import (
 )
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
 
 # ---------------------------------------------------------------------------
 # MeshContext – defaults (no mesh attached)
@@ -284,3 +283,4 @@ class TestIntegration:
     )
     def test_backend_configuration(self, strategy_config):
         _validate_distributed_setup(MeshContext(strategy_config=strategy_config))
+
