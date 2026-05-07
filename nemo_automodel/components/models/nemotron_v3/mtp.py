@@ -89,6 +89,31 @@ class NemotronV3MTPSublayer(NemotronV3Block):
                 eps=config.layer_norm_epsilon,
             )
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        embed_input: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run optional fusion (first sublayer of a depth), the base block, and
+        optional final_layernorm (last sublayer of a depth).
+
+        Keeping the fusion + final-norm calls inside the sublayer's own forward
+        ensures FSDP2's pre-forward unshard hook fires for every parameter we
+        touch, so children like ``enorm``/``hnorm``/``eh_proj``/``final_layernorm``
+        are never accessed while their weights are still sharded DTensors.
+        """
+        if self.has_fusion:
+            assert embed_input is not None, "first MTP sublayer requires embed_input"
+            e = self.enorm(embed_input)
+            h = self.hnorm(hidden_states)
+            hidden_states = self.eh_proj(torch.cat([e, h], dim=-1))
+        hidden_states = super().forward(hidden_states, **kwargs)
+        if self.has_final_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+        return hidden_states
+
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         """Initialize sublayer weights, including fusion modules when present."""

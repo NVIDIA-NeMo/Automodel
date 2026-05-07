@@ -213,16 +213,12 @@ class MTPModule(nn.Module):
             if cur_position_ids is not None:
                 cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
 
+            decoder_input = embed_fn(cur_input_ids)
             for s in range(P):
                 sublayer = self.layers[d * P + s]
+                kwargs = dict(block_kwargs)
                 if s == 0:
-                    decoder_input = embed_fn(cur_input_ids)
-                    e = sublayer.enorm(decoder_input)
-                    h = sublayer.hnorm(hidden_states)
-                    fused = torch.cat([e, h], dim=-1)
-                    hidden_states = sublayer.eh_proj(fused)
-                hidden_states = sublayer(hidden_states, **block_kwargs)
-                if s == P - 1:
-                    hidden_states = sublayer.final_layernorm(hidden_states)
+                    kwargs["embed_input"] = decoder_input
+                hidden_states = sublayer(hidden_states, **kwargs)
             per_depth_h.append(hidden_states)
         return per_depth_h

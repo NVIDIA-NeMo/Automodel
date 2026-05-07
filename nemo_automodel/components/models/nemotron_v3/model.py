@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -19,6 +20,20 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
+@dataclass
+class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """``CausalLMOutputWithPast`` plus declared MTP fields.
+
+    The MTP per-depth hidden states and scaling factor must be regular
+    dataclass fields (rather than dynamically-set attributes) so they survive
+    output-restructuring layers like FSDP2's mixed-precision output cast,
+    which rebuild ``ModelOutput`` instances from declared fields only.
+    """
+
+    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
+    mtp_loss_scaling_factor: Optional[float] = None
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -446,7 +461,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # Per-depth hidden states for the MTP auxiliary head; the recipe
         # dispatches CE per depth via the configured loss class.
         mtp_per_depth_h = None
-        if self.mtp is not None and labels is not None and self.training:
+        if self.mtp is not None and self.training:
             mtp_per_depth_h = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -460,16 +475,17 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if is_thd:
             logits = logits.unsqueeze(0)
 
-        out = CausalLMOutputWithPast(
+        return NemotronHCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=(hidden_states,) if output_hidden_states else None,
             attentions=None,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=(
+                self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None
+            ),
         )
-        out.mtp_per_depth_h = mtp_per_depth_h
-        out.mtp_loss_scaling_factor = self.mtp_config.loss_scaling_factor if mtp_per_depth_h is not None else None
-        return out
 
     @staticmethod
     def _make_causal_mask(
