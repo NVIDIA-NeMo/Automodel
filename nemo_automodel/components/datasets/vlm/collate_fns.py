@@ -1236,16 +1236,11 @@ def default_collate_fn(
     processor,
     max_length: Optional[int] = None,
     drop_overlong: bool = False,
-    preserve_batch_size: bool = False,
     _post_tokenize_hook=None,
 ) -> Dict[str, torch.Tensor]:
     """Default collate function for multimodal VLM datasets.
 
     Args:
-        preserve_batch_size: When ``drop_overlong`` removes samples, repeat
-            kept samples to preserve the original batch size. This is useful
-            for pipeline-parallel schedules that require a fixed number of
-            microbatches.
         _post_tokenize_hook: Optional callable ``(batch, processor) -> batch``
             invoked right after ``apply_chat_template`` and before
             ``build_labels``.  Used by model-specific collate wrappers
@@ -1259,15 +1254,8 @@ def default_collate_fn(
 
     # Optionally drop overlong samples before processing
     if max_length is not None and drop_overlong:
-        target_batch_size = len(conversations)
         conversations, kept = _drop_overlong_samples(conversations, processor, max_length)
         examples = [examples[i] for i in kept]
-        if preserve_batch_size and len(conversations) < target_batch_size:
-            kept_count = len(conversations)
-            for i in range(target_batch_size - kept_count):
-                fill_idx = i % kept_count
-                conversations.append(conversations[fill_idx])
-                examples.append(examples[fill_idx])
 
     processor_kwargs = {
         "tokenize": True,

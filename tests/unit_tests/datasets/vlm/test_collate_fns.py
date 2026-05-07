@@ -2580,40 +2580,6 @@ def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_q
     assert captured_kwargs.get("padding") == "max_length"
 
 
-def test_default_collate_fn_preserves_batch_size_after_drop_overlong(collate_mod, fake_qwen_utils, monkeypatch):
-    """Dropped overlong samples can be backfilled for fixed-size PP batches."""
-    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
-    monkeypatch.setattr(
-        collate_mod,
-        "build_labels_from_template",
-        lambda input_ids, conversations, processor: torch.zeros_like(input_ids),
-    )
-
-    short_conv = [{"role": "user", "content": [{"type": "text", "text": "x" * 10}]}]
-    long_conv = [{"role": "user", "content": [{"type": "text", "text": "x" * 100}]}]
-    captured = {}
-
-    class PreserveProcessor(_DropTestProcessor):
-        def apply_chat_template(self, convs, tokenize=False, **kwargs):
-            if tokenize:
-                captured["tokenized_batch_size"] = len(convs)
-                captured["truncation"] = kwargs.get("truncation")
-                return {"input_ids": torch.arange(1, 5).unsqueeze(0).repeat(len(convs), 1)}
-            return super().apply_chat_template(convs, tokenize=tokenize, **kwargs)
-
-    batch = collate_mod.default_collate_fn(
-        [{"conversation": short_conv}, {"conversation": long_conv}],
-        PreserveProcessor(),
-        max_length=50,
-        drop_overlong=True,
-        preserve_batch_size=True,
-    )
-
-    assert captured["tokenized_batch_size"] == 2
-    assert captured["truncation"] is False
-    assert batch["input_ids"].shape[0] == 2
-
-
 def test_estimate_media_tokens_with_pil_image(collate_mod):
     """Verify _estimate_media_tokens estimates tokens from PIL image dimensions."""
     img = PILImage.new("RGB", (560, 560))  # 560x560 image
