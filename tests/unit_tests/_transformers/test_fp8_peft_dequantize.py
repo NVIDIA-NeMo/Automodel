@@ -173,3 +173,74 @@ class TestMetaDeviceWithNativeQuantConfig:
             hf_native_quant_cfg=None,
         )
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: kwargs["config"] injection gated on is_hf_model (issue #2164)
+# ---------------------------------------------------------------------------
+
+
+class TestKwargsConfigInjectionGate:
+    """Tests for the is_hf_model gate on kwargs["config"] = _hf_config injection.
+
+    Custom models receive _hf_config positionally in model_init.py:783 via
+    model_cls(hf_config, *model_args, **kwargs); injecting config into kwargs
+    causes a TypeError ("got multiple values for argument 'config'"). The gate
+    suppresses the injection for the custom-model path while preserving the
+    in-place dequantize=True mutation needed by the HF path.
+    """
+
+    @staticmethod
+    def _apply_gate(hf_native_quant_cfg, peft_config, pretrained_path, is_hf_model, hf_config_obj):
+        """Replicate the gated kwargs["config"] injection from _build_model."""
+        kwargs: dict = {}
+        if _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
+            if is_hf_model:
+                kwargs["config"] = hf_config_obj
+        return kwargs
+
+    def test_hf_model_fp8_peft_injects_config_kwarg(self):
+        """HF path needs config in kwargs so HF.from_pretrained sees the dequantize mutation."""
+        quant_cfg = {"quant_method": "fp8", "dequantize": False}
+        hf_config = MagicMock()
+        hf_config.quantization_config = quant_cfg
+
+        kwargs = self._apply_gate(quant_cfg, MagicMock(), "some-model", is_hf_model=True, hf_config_obj=hf_config)
+
+        assert "config" in kwargs
+        assert kwargs["config"] is hf_config
+        assert quant_cfg["dequantize"] is True
+
+    def test_custom_model_fp8_peft_does_not_inject_config_kwarg(self):
+        """Custom-model path receives hf_config positionally; injecting config would TypeError (#2164)."""
+        quant_cfg = {"quant_method": "fp8", "dequantize": False}
+        hf_config = MagicMock()
+        hf_config.quantization_config = quant_cfg
+
+        kwargs = self._apply_gate(quant_cfg, MagicMock(), "some-model", is_hf_model=False, hf_config_obj=hf_config)
+
+        assert "config" not in kwargs
+        # Dequantize mutation must still be applied so the custom path sees it via the
+        # positional hf_config argument.
+        assert quant_cfg["dequantize"] is True
+
+    def test_no_peft_does_not_inject_regardless_of_is_hf_model(self):
+        """When PEFT is not configured, no injection happens on either path."""
+        quant_cfg = {"quant_method": "fp8", "dequantize": False}
+        hf_config = MagicMock()
+
+        kwargs_hf = self._apply_gate(quant_cfg, None, "some-model", is_hf_model=True, hf_config_obj=hf_config)
+        kwargs_custom = self._apply_gate(quant_cfg, None, "some-model", is_hf_model=False, hf_config_obj=hf_config)
+
+        assert "config" not in kwargs_hf
+        assert "config" not in kwargs_custom
+        assert quant_cfg["dequantize"] is False
+
+    def test_non_fp8_quant_does_not_inject(self):
+        """Non-FP8 quant configs (e.g. GPTQ) are not the FP8+PEFT case; no injection."""
+        quant_cfg = {"quant_method": "gptq", "bits": 4}
+        hf_config = MagicMock()
+
+        kwargs = self._apply_gate(quant_cfg, MagicMock(), "some-model", is_hf_model=True, hf_config_obj=hf_config)
+
+        assert "config" not in kwargs
