@@ -21,6 +21,30 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
+_NON_TEXT_ATTENTION_PATH_PARTS = {
+    "audio_encoder",
+    "audio_model",
+    "audio_tower",
+    "image_encoder",
+    "image_model",
+    "image_tower",
+    "video_encoder",
+    "video_model",
+    "video_tower",
+    "vision_encoder",
+    "vision_model",
+    "vision_tower",
+    "visual",
+    "visual_model",
+}
+
+
+def _is_cp_attention_module_name(name: str) -> bool:
+    if not name.endswith("self_attn"):
+        return False
+    return not any(part in _NON_TEXT_ATTENTION_PATH_PARTS for part in name.split("."))
+
+
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
     # TODO(@boxiangw): Refractor. Needed for SP support
@@ -104,109 +128,104 @@ def create_context_parallel_ctx(
 def attach_context_parallel_hooks(model: torch.nn.Module):
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 
-    Context parallelism shards the sequence across ranks via manual slicing;
-    each rank sees a local sub-sequence, so explicit 4D attention masks would
-    have mismatched shapes.  This function registers a hook on every
-    ``self_attn`` sub-module that strips the ``attention_mask`` kwarg and sets
-    ``is_causal=True`` instead, letting SDPA handle causal masking internally.
+    Context parallelism shards Q/K/V on the sequence dimension as DTensors,
+    so explicit 4D attention masks would have mismatched shapes.  This function
+    registers a hook on every ``self_attn`` sub-module that strips the
+    ``attention_mask`` kwarg and sets ``is_causal=True`` instead, letting
+    SDPA handle causal masking internally.
 
     Based on ``accelerate.big_modeling._attach_context_parallel_hooks``.
     """
 
     def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
+        if getattr(_module, "_cp_uses_sdpa_hook", False):
+            module_kwargs["attention_mask"] = None
+            module_kwargs["is_causal"] = True
+            return module_args, module_kwargs
         if "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
             module_kwargs["is_causal"] = True
         return module_args, module_kwargs
 
     for name, module in model.named_modules():
-        if name.endswith("self_attn"):
+        if _is_cp_attention_module_name(name):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
 def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
-    """Inject CP-aware SDPA into self_attn modules for CP>1 correctness.
+    """Inject CP-aware SDPA into self-attention modules.
 
-    Replaces F.scaled_dot_product_attention during each self_attn forward with a
-    manual all-gather ring-attention implementation that avoids PyTorch's internal
-    DTensor-based ring attention (which has a mixed torch.Tensor/DTensor bug in some
-    PyTorch versions).
+    Generic non-TE models keep PyTorch DTensor ``context_parallel``: this hook
+    only re-wraps local Q/K/V tensors so DTensor SDPA dispatch can run the
+    existing all-gather/ring path.
 
-    Algorithm (all-gather variant):
-      1. All-gather K and V from all CP ranks → full-sequence K_full, V_full.
-      2. Build a per-rank boolean causal mask: Q[i] (global position cp_rank*S_local+i)
-         may attend to K[j] iff j ≤ cp_rank*S_local+i.
-      3. Call the original SDPA with plain tensors and the custom mask.
-
-    Gradients: K and V all-gathers use torch.distributed.nn.functional.all_gather
-    when available (differentiable; backward = reduce-scatter).  Falls back to the
-    non-differentiable dist.all_gather otherwise (still correct for a smoke test).
+    Gemma4 batches marked by ``prepare_model_inputs_for_cp`` use a manual path
+    instead. The batch is sliced contiguously on the sequence dimension; at the
+    SDPA call site we all-gather K/V and token types, build the local-query /
+    global-key multimodal mask, and return the local output shard.
 
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
     """
+    import logging
+    import math
+
     import torch.nn.functional as F_module
+    from torch.distributed.tensor import DTensor, Shard
 
     _original_sdpa = F_module.scaled_dot_product_attention
     _cp_group = cp_mesh.get_group()
     _cp_size = cp_mesh.size()
+    _active_module = {"module": None}
+    _log = logging.getLogger(__name__)
 
-    # Prefer differentiable all_gather; fall back to non-differentiable.
     try:
         from torch.distributed.nn.functional import all_gather as _dist_all_gather
 
         _use_differentiable_ag = True
     except (ImportError, AttributeError):
+        _dist_all_gather = None
         _use_differentiable_ag = False
 
-    # Lazily compile flex_attention once per process. Without torch.compile(),
-    # flex_attention runs an eager path that materialises the full
-    # [B, nH, S_local, S_full] scores matrix — which defeats its purpose and
-    # OOMs on long sequences. torch.compile() generates the fused tiled kernel
-    # that gives O(N) memory.
     _flex_attn_compiled = {"fn": None}
 
     def _get_compiled_flex_attn():
         if _flex_attn_compiled["fn"] is None:
-            from torch.nn.attention.flex_attention import flex_attention as _flex_attn
+            from torch.nn.attention.flex_attention import flex_attention
 
-            _flex_attn_compiled["fn"] = torch.compile(_flex_attn, dynamic=False)
+            _flex_attn_compiled["fn"] = torch.compile(flex_attention, dynamic=False)
         return _flex_attn_compiled["fn"]
 
-    def _all_gather_seq(t):
-        """All-gather tensor t along dim=2 (seq dim), returning the full tensor."""
-        t = t.contiguous()
+    def _all_gather_seq(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.contiguous()
         if _use_differentiable_ag:
-            parts = _dist_all_gather(t, group=_cp_group)
+            parts = _dist_all_gather(tensor, group=_cp_group)
         else:
-            parts = [torch.empty_like(t) for _ in range(_cp_size)]
-            torch.distributed.all_gather(parts, t, group=_cp_group)
-        return torch.cat(parts, dim=2)
+            parts = [torch.empty_like(tensor) for _ in range(_cp_size)]
+            torch.distributed.all_gather(parts, tensor, group=_cp_group)
+        return torch.cat(tuple(parts), dim=2)
+
+    def _all_gather_token_types(mm_token_type_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if mm_token_type_ids is None:
+            return None
+        local = mm_token_type_ids.contiguous()
+        parts = [torch.empty_like(local) for _ in range(_cp_size)]
+        torch.distributed.all_gather(parts, local, group=_cp_group)
+        return torch.cat(parts, dim=1)
+
+    def _vision_group_ids(mm_token_type_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if mm_token_type_ids is None:
+            return None
+        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+        prev_is_vision = torch.roll(is_vision, shifts=1, dims=-1)
+        prev_is_vision[..., 0] = False
+        new_vision_starts = is_vision & ~prev_is_vision
+        group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+        return torch.where(is_vision, group_ids, torch.full_like(group_ids, -1))
 
     @torch._dynamo.disable
     def _cp_sdpa(
         query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
     ):
-        try:
-            from torch.distributed.tensor import DTensor
-
-            if isinstance(query, DTensor):
-                # Fallback: already a DTensor (shouldn't happen with our plain-tensor
-                # manual-slice approach, but handle gracefully).
-                out = _original_sdpa(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    dropout_p=dropout_p,
-                    is_causal=is_causal,
-                    scale=scale,
-                    enable_gqa=enable_gqa,
-                    **kwargs,
-                )
-                return out.to_local() if isinstance(out, DTensor) else out
-        except ImportError:
-            pass
-
         if _cp_size <= 1:
             return _original_sdpa(
                 query,
@@ -220,84 +239,159 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 **kwargs,
             )
 
+        module = _active_module["module"]
+        if not bool(getattr(module, "_cp_manual_allgather_active", False)):
+            if not isinstance(query, DTensor):
+                query = DTensor.from_local(query, device_mesh=cp_mesh, placements=[Shard(2)])
+                key = DTensor.from_local(key, device_mesh=cp_mesh, placements=[Shard(2)])
+                value = DTensor.from_local(value, device_mesh=cp_mesh, placements=[Shard(2)])
+            out = _original_sdpa(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                **kwargs,
+            )
+            return out.to_local() if isinstance(out, DTensor) else out
+
         cp_rank = torch.distributed.get_rank(group=_cp_group)
-        S_local = key.shape[2]
+        seq_local = key.shape[2]
+        seq_global_start = cp_rank * seq_local
 
-        # All-gather K and V to get full-sequence tensors.
-        key_full = _all_gather_seq(key)  # [B, nH, S_full, D]
-        val_full = _all_gather_seq(value)  # [B, nH, S_full, D]
-        S_full = key_full.shape[2]
+        key_full = _all_gather_seq(key)
+        value_full = _all_gather_seq(value)
+        seq_full = key_full.shape[2]
 
-        # Pad head_dim to the nearest power of 2 so Flash Attention accepts it.
-        # Models like Gemma4 26B-A4B and 31B use non-power-of-2 head_dim (e.g. 168)
-        # which Flash rejects, causing fallback to MATH backend that materialises the
-        # full [B, nKVH, S_local, S_full] float32 attention matrix and OOMs on long
-        # sequences.  Padding to the next power of 2 (e.g. 256) forces Flash; we pass
-        # the original scale so attention scores are unaffected by the padded zeros.
         orig_head_dim = query.shape[-1]
-        pad_to = 1 << (orig_head_dim - 1).bit_length()  # next power of 2
-        if pad_to != orig_head_dim:
-            import math as _math
-
-            import torch.nn.functional as _F
-
-            pad_len = pad_to - orig_head_dim
-            query = _F.pad(query, (0, pad_len))
-            key_full = _F.pad(key_full, (0, pad_len))
-            val_full = _F.pad(val_full, (0, pad_len))
-            if scale is None:
-                scale = 1.0 / _math.sqrt(orig_head_dim)
-
-        # Auto-enable GQA when Q and KV head counts differ (e.g. Gemma4 26B MoE: 32 vs 8).
-        # Flash Attention rejects mismatched head counts unless enable_gqa=True.
         if query.shape[1] != key_full.shape[1]:
             enable_gqa = True
 
-        query = query.contiguous()
+        mm_token_type_ids = getattr(module, "_cp_mm_token_type_ids", None)
+        mm_token_type_ids_full = _all_gather_token_types(mm_token_type_ids)
+        vision_group_ids = _vision_group_ids(mm_token_type_ids_full)
+        is_sliding = bool(getattr(module, "is_sliding", False))
+        sliding_window = getattr(module, "sliding_window", None) if is_sliding else None
+        use_vision_bidirectional = is_sliding and vision_group_ids is not None
 
-        # Primary path: flex_attention (PyTorch 2.5+), compiled.
-        # flex_attention uses a Flash-Attention-style tiled algorithm — O(N) memory, no
-        # O(N²) materialisation — and accepts arbitrary per-rank causal block masks.
-        # MUST be run via torch.compile(): the eager path materialises the full scores
-        # matrix and OOMs on long sequences.
+        q_indices = torch.arange(seq_local, device=query.device) + seq_global_start
+        kv_indices = torch.arange(seq_full, device=query.device)
+        if is_causal:
+            sdpa_allowed = kv_indices.unsqueeze(0) <= q_indices.unsqueeze(1)
+        else:
+            sdpa_allowed = torch.ones(seq_local, seq_full, dtype=torch.bool, device=query.device)
+        if sliding_window is not None:
+            sdpa_allowed = sdpa_allowed & ((q_indices.unsqueeze(1) - kv_indices.unsqueeze(0)) < sliding_window)
+
+        if use_vision_bidirectional:
+            q_groups = vision_group_ids[:, q_indices]
+            kv_groups = vision_group_ids[:, kv_indices]
+            same_vision_group = (q_groups[:, :, None] == kv_groups[:, None, :]) & (q_groups[:, :, None] >= 0)
+            sdpa_mask = (sdpa_allowed.unsqueeze(0) | same_vision_group).unsqueeze(1)
+        else:
+            sdpa_mask = sdpa_allowed.unsqueeze(0).unsqueeze(0)
+
+        try:
+            key_for_sdpa = key_full
+            value_for_sdpa = value_full
+            if query.shape[1] != key_full.shape[1]:
+                if query.shape[1] % key_full.shape[1] != 0:
+                    raise RuntimeError(
+                        f"Cannot expand KV heads for GQA: query heads={query.shape[1]}, kv heads={key_full.shape[1]}"
+                    )
+                repeat_factor = query.shape[1] // key_full.shape[1]
+                key_for_sdpa = key_full.repeat_interleave(repeat_factor, dim=1)
+                value_for_sdpa = value_full.repeat_interleave(repeat_factor, dim=1)
+            out = _original_sdpa(
+                query,
+                key_for_sdpa,
+                value_for_sdpa,
+                attn_mask=sdpa_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+                scale=scale,
+                **kwargs,
+            )
+            if not getattr(_cp_sdpa, "_sdpa_ok_logged", False):
+                _log.info(
+                    "CP using SDPA all-gather. Q=%s K=%s cp_rank=%s",
+                    tuple(query.shape),
+                    tuple(key_full.shape),
+                    cp_rank,
+                )
+                _cp_sdpa._sdpa_ok_logged = True
+            return out
+        except Exception as sdpa_err:
+            if not getattr(_cp_sdpa, "_sdpa_err_logged", False):
+                _log.warning(
+                    "CP SDPA all-gather failed; trying compiled flex_attention. "
+                    "Q=%s K=%s V=%s cp_rank=%s seq_local=%s seq_full=%s error=%s: %s",
+                    tuple(query.shape),
+                    tuple(key_full.shape),
+                    tuple(value_full.shape),
+                    cp_rank,
+                    seq_local,
+                    seq_full,
+                    type(sdpa_err).__name__,
+                    sdpa_err,
+                )
+                _cp_sdpa._sdpa_err_logged = True
+
+        padded_head_dim = 1 << (orig_head_dim - 1).bit_length()
+        if padded_head_dim != orig_head_dim:
+            pad_len = padded_head_dim - orig_head_dim
+            query = F_module.pad(query, (0, pad_len))
+            key_full = F_module.pad(key_full, (0, pad_len))
+            value_full = F_module.pad(value_full, (0, pad_len))
+            if scale is None:
+                scale = 1.0 / math.sqrt(orig_head_dim)
+
+        def _base_mask(q_idx, kv_idx):
+            q_global_idx = q_idx + seq_global_start
+            if not is_causal:
+                allowed = torch.ones_like(q_global_idx >= kv_idx)
+            else:
+                allowed = kv_idx <= q_global_idx
+            if sliding_window is not None:
+                allowed = allowed & ((q_global_idx - kv_idx) < sliding_window)
+            return allowed
+
         out = None
         try:
-            from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
+            from torch.nn.attention.flex_attention import create_block_mask
 
-            _r = cp_rank
-            _sl = S_local
+            if use_vision_bidirectional:
 
-            def _cp_causal_mask(b, h, q_idx, kv_idx):
-                # rank r holds global tokens [r*S_local, (r+1)*S_local).
-                # Token q_i (local) = global token r*S_local + q_i, which can attend to
-                # any key position k where k <= r*S_local + q_i.
-                return q_idx + _r * _sl >= kv_idx
+                def _cp_mask(batch_idx, head_idx, q_idx, kv_idx):
+                    q_global_idx = q_idx + seq_global_start
+                    causal_allowed = _base_mask(q_idx, kv_idx)
+                    q_group = vision_group_ids[batch_idx, q_global_idx]
+                    kv_group = vision_group_ids[batch_idx, kv_idx]
+                    same_vision_group = (q_group == kv_group) & (q_group >= 0)
+                    return causal_allowed | same_vision_group
 
-            _block_mask = _create_block_mask(
-                _cp_causal_mask,
-                B=None,
+                block_mask_batch = query.shape[0]
+            else:
+
+                def _cp_mask(batch_idx, head_idx, q_idx, kv_idx):
+                    return _base_mask(q_idx, kv_idx)
+
+                block_mask_batch = None
+
+            block_mask = create_block_mask(
+                _cp_mask,
+                B=block_mask_batch,
                 H=None,
-                Q_LEN=S_local,
-                KV_LEN=S_full,
+                Q_LEN=seq_local,
+                KV_LEN=seq_full,
                 device=query.device,
             )
-            # flex_attention requires enable_gqa=True when Q and KV head counts
-            # differ (e.g. Gemma4 31B: 32 Q heads, 16 KV heads).  Our _cp_sdpa
-            # already sets this flag above for the SDPA fallback; pass the same
-            # value through here.
-            #
-            # Gemma4 31B has a decoder layer variant with head_dim=512.  The
-            # Triton flex_attention template picks block sizes (BLOCK_M/BLOCK_N)
-            # based on defaults tuned for head_dim <= 128; with head_dim=512 the
-            # required shared memory (~200 KB) exceeds A100's 163 KB limit and
-            # the kernel refuses to compile ("No valid triton configs").  Shrink
-            # the blocks and the pipeline depth when head_dim is large so the
-            # kernel fits.  Leave defaults for small head_dim (faster).
-            # NOTE: kernel_options was added in PyTorch 2.6; on older versions
-            # we fall back to a retry without it (may still work if enough SRAM).
-            _kernel_options = None
+            flex_kwargs = {"block_mask": block_mask, "scale": scale, "enable_gqa": enable_gqa}
             if query.shape[-1] >= 256:
-                _kernel_options = {
+                flex_kwargs["kernel_options"] = {
                     "BLOCK_M": 32,
                     "BLOCK_N": 32,
                     "BLOCK_M1": 32,
@@ -307,118 +401,121 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     "num_stages": 1,
                     "num_warps": 4,
                 }
-            _flex_kw = {"block_mask": _block_mask, "scale": scale, "enable_gqa": enable_gqa}
-            if _kernel_options is not None:
-                _flex_kw["kernel_options"] = _kernel_options
             try:
-                out = _get_compiled_flex_attn()(query, key_full, val_full, **_flex_kw)
-            except TypeError as _te:
-                # PyTorch < 2.6: kernel_options not supported; retry without it.
-                if "kernel_options" in str(_te) and "kernel_options" in _flex_kw:
-                    _flex_kw.pop("kernel_options")
-                    out = _get_compiled_flex_attn()(query, key_full, val_full, **_flex_kw)
+                out = _get_compiled_flex_attn()(query.contiguous(), key_full, value_full, **flex_kwargs)
+            except TypeError as exc:
+                if "kernel_options" in str(exc) and "kernel_options" in flex_kwargs:
+                    flex_kwargs.pop("kernel_options")
+                    out = _get_compiled_flex_attn()(query.contiguous(), key_full, value_full, **flex_kwargs)
                 else:
                     raise
             if not getattr(_cp_sdpa, "_flex_ok_logged", False):
-                import logging as _logging
-
-                _logging.getLogger(__name__).info(
-                    "CP using flex_attention (compiled). shapes: Q=%s K_full=%s head_dim=%s->%s cp_rank=%s",
+                _log.info(
+                    "CP using compiled flex_attention all-gather. Q=%s K=%s head_dim=%s->%s cp_rank=%s",
                     tuple(query.shape),
                     tuple(key_full.shape),
                     orig_head_dim,
-                    pad_to,
+                    padded_head_dim,
                     cp_rank,
                 )
                 _cp_sdpa._flex_ok_logged = True
-        except Exception as _flex_err:
-            # Surface the failure once per process so we know *why* we fell back.
+        except Exception as flex_err:
             if not getattr(_cp_sdpa, "_flex_err_logged", False):
-                import logging
-                import traceback as _tb
-
-                _log = logging.getLogger(__name__)
                 _log.warning(
-                    "CP flex_attention path failed; falling back to chunked O(N) attention. "
-                    "shapes: Q=%s K_full=%s V_full=%s scale=%s head_dim_pad=%s->%s "
-                    "cp_rank=%s S_local=%s S_full=%s | %s: %s",
+                    "CP flex_attention all-gather failed; using chunked attention fallback. "
+                    "Q=%s K=%s V=%s cp_rank=%s seq_local=%s seq_full=%s error=%s: %s",
                     tuple(query.shape),
                     tuple(key_full.shape),
-                    tuple(val_full.shape),
-                    scale,
-                    orig_head_dim,
-                    pad_to,
+                    tuple(value_full.shape),
                     cp_rank,
-                    S_local,
-                    S_full,
-                    type(_flex_err).__name__,
-                    _flex_err,
+                    seq_local,
+                    seq_full,
+                    type(flex_err).__name__,
+                    flex_err,
                 )
-                _log.warning("CP flex_attention traceback:\n%s", _tb.format_exc())
                 _cp_sdpa._flex_err_logged = True
             out = None
 
         if out is None:
-            # Fallback: chunked online-softmax attention — O(N) memory.
-            # Processes KV in blocks of KV_CHUNK and accumulates via the
-            # log-sum-exp trick (same algorithm as FlashAttention but in pure
-            # PyTorch ops).  Works for arbitrary head_dim and GQA; never OOMs
-            # on long sequences.  Slower than flex_attention (no fused kernel)
-            # but correct and memory-safe.
-            import math as _math
+            attn_scale = scale if scale is not None else 1.0 / math.sqrt(query.shape[-1])
+            num_q_heads = query.shape[1]
+            num_kv_heads = key_full.shape[1]
+            if num_q_heads != num_kv_heads:
+                if num_q_heads % num_kv_heads != 0:
+                    raise RuntimeError(
+                        f"Cannot expand KV heads for GQA: query heads={num_q_heads}, kv heads={num_kv_heads}"
+                    )
+                repeat_factor = num_q_heads // num_kv_heads
+                key_for_attn = key_full.repeat_interleave(repeat_factor, dim=1)
+                value_for_attn = value_full.repeat_interleave(repeat_factor, dim=1)
+            else:
+                key_for_attn = key_full
+                value_for_attn = value_full
 
-            _D = query.shape[-1]
-            _sc = scale if scale is not None else 1.0 / _math.sqrt(_D)
-            _nH = query.shape[1]
-            _nKV = key_full.shape[1]
-            _B = query.shape[0]
-            _k_exp = key_full.expand(_B, _nH, S_full, _D).contiguous() if (_nKV != _nH) else key_full
-            _v_exp = val_full.expand(_B, _nH, S_full, _D).contiguous() if (_nKV != _nH) else val_full
-            _KV_CHUNK = 256
-            _q_global_start = cp_rank * S_local
-            _q_f = query.float()
-            _k_f = _k_exp.float()
-            _v_f = _v_exp.float()
-            _out_acc = torch.zeros(_B, _nH, S_local, _D, dtype=torch.float32, device=query.device)
-            _lse = torch.full((_B, _nH, S_local), float("-inf"), dtype=torch.float32, device=query.device)
-            for _kvs in range(0, S_full, _KV_CHUNK):
-                _kve = min(_kvs + _KV_CHUNK, S_full)
-                _kc = _k_f[:, :, _kvs:_kve, :]
-                _vc = _v_f[:, :, _kvs:_kve, :]
-                _sc_mat = torch.matmul(_q_f, _kc.transpose(-2, -1)) * _sc
-                _qi = torch.arange(S_local, device=query.device) + _q_global_start
-                _ki = torch.arange(_kvs, _kve, device=query.device)
-                _sc_mat = _sc_mat.masked_fill(~(_qi.unsqueeze(1) >= _ki.unsqueeze(0))[None, None], float("-inf"))
-                _cmax = _sc_mat.amax(dim=-1)
-                _exp = torch.exp(_sc_mat - _cmax.unsqueeze(-1))
-                _clse = _cmax + torch.log(_exp.sum(-1).clamp(min=1e-9))
-                _new_lse = torch.logaddexp(_lse, _clse)
-                _alpha = torch.exp(_lse - _new_lse).unsqueeze(-1)
-                _beta = torch.exp(_clse - _new_lse).unsqueeze(-1)
-                _out_acc = _out_acc * _alpha + _beta * torch.matmul(_exp, _vc)
-                _lse = _new_lse
-            out = _out_acc.to(query.dtype)
+            q_float = query.float()
+            k_float = key_for_attn.float()
+            v_float = value_for_attn.float()
+            batch_size, num_heads, _, head_dim = q_float.shape
+            out_acc = torch.zeros(batch_size, num_heads, seq_local, head_dim, dtype=torch.float32, device=query.device)
+            lse = torch.full((batch_size, num_heads, seq_local), float("-inf"), dtype=torch.float32, device=query.device)
+            q_indices = torch.arange(seq_local, device=query.device) + seq_global_start
+            kv_chunk = 256
 
-        if pad_to != orig_head_dim:
+            for kv_start in range(0, seq_full, kv_chunk):
+                kv_end = min(kv_start + kv_chunk, seq_full)
+                kv_indices = torch.arange(kv_start, kv_end, device=query.device)
+                scores = torch.matmul(q_float, k_float[:, :, kv_start:kv_end, :].transpose(-2, -1)) * attn_scale
+
+                allowed = kv_indices.unsqueeze(0) <= q_indices.unsqueeze(1)
+                if sliding_window is not None:
+                    allowed = allowed & ((q_indices.unsqueeze(1) - kv_indices.unsqueeze(0)) < sliding_window)
+                if use_vision_bidirectional:
+                    q_groups = vision_group_ids[:, q_indices]
+                    kv_groups = vision_group_ids[:, kv_start:kv_end]
+                    same_vision_group = (q_groups[:, :, None] == kv_groups[:, None, :]) & (q_groups[:, :, None] >= 0)
+                    allowed = allowed.unsqueeze(0) | same_vision_group
+                    scores = scores.masked_fill(~allowed[:, None, :, :], float("-inf"))
+                else:
+                    scores = scores.masked_fill(~allowed[None, None, :, :], float("-inf"))
+
+                chunk_max = scores.amax(dim=-1)
+                exp_scores = torch.exp(scores - chunk_max.unsqueeze(-1))
+                chunk_lse = chunk_max + torch.log(exp_scores.sum(dim=-1).clamp(min=1e-9))
+                new_lse = torch.logaddexp(lse, chunk_lse)
+                alpha = torch.exp(lse - new_lse).unsqueeze(-1)
+                beta = torch.exp(chunk_lse - new_lse).unsqueeze(-1)
+                out_acc = out_acc * alpha + beta * torch.matmul(exp_scores, v_float[:, :, kv_start:kv_end, :])
+                lse = new_lse
+            out = out_acc.to(query.dtype)
+
+        if padded_head_dim != orig_head_dim:
             out = out[..., :orig_head_dim]
         return out
 
     def _pre_hook(module, args, kwargs):
+        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+        module._cp_mm_token_type_ids = mm_token_type_ids
+        module._cp_manual_allgather_active = mm_token_type_ids is not None
+        _active_module["module"] = module
         F_module.scaled_dot_product_attention = _cp_sdpa
         return args, kwargs
 
     def _post_hook(module, inputs, output):
+        module._cp_mm_token_type_ids = None
+        module._cp_manual_allgather_active = False
+        _active_module["module"] = None
         F_module.scaled_dot_product_attention = _original_sdpa
 
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
     for name, module in model.named_modules():
-        if name.endswith("self_attn"):
+        if _is_cp_attention_module_name(name):
             # Hook on the inner attention module so the hook fires during both
             # the original forward AND gradient-checkpointing recompute.
             # CheckpointWrapper's recompute bypasses __call__ (and thus pre-hooks
             # on the wrapper itself), so we must hook on the wrapped module directly.
             target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            target._cp_uses_sdpa_hook = True
             target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
             # always_call=True ensures _original_sdpa is restored even if the forward raises.
             target.register_forward_hook(_post_hook, always_call=True)
@@ -444,6 +541,27 @@ def attach_linear_attn_position_hooks(model: torch.nn.Module):
                 mod._linear_attn_pos_hook_registered = True
 
 
+def _pad_tensor_seq_dim_(tensor: torch.Tensor, seq_dim: int, pad_len: int, value: float | int = 0) -> torch.Tensor:
+    if pad_len <= 0:
+        return tensor
+    pad_shape = list(tensor.shape)
+    pad_shape[seq_dim] = pad_len
+    pad = torch.full(pad_shape, value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((tensor, pad), dim=seq_dim)
+
+
+def _pad_position_ids_seq_dim_(position_ids: torch.Tensor, seq_dim: int, pad_len: int) -> torch.Tensor:
+    if pad_len <= 0:
+        return position_ids
+    last_position = position_ids.select(seq_dim, position_ids.shape[seq_dim] - 1).unsqueeze(seq_dim)
+    increment_shape = [1] * position_ids.ndim
+    increment_shape[seq_dim] = pad_len
+    increments = torch.arange(1, pad_len + 1, device=position_ids.device, dtype=position_ids.dtype).view(
+        increment_shape
+    )
+    return torch.cat((position_ids, last_position + increments), dim=seq_dim)
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -454,29 +572,18 @@ def make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
 ):
     """
-    Build a CP context manager and shard a batch across CP ranks.
-
-    If the input device_mesh is None or the CP submesh size is 1, this is a no-op.
-
-    Sequence tensors (input_ids / inputs_embeds, labels, position_ids, etc.) are
-    sliced into contiguous per-rank shards along the sequence dimension.  No DTensor
-    wrapping is performed; all CP communication happens inside ``_cp_sdpa`` via an
-    explicit all-gather of K/V followed by a compiled flex_attention call with a
-    per-rank causal block mask.
+    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
+    of the context_parallel submesh is 1, this function is effectively a no-op.
 
     Args:
-        device_mesh: The global device mesh; a ``"cp"`` sub-mesh is extracted from it.
-        batch (dict[str, torch.Tensor]): Input batch.  Modified in-place and returned.
-        loss_mask (torch.Tensor or None): Optional loss mask; if provided it is sliced
-            and written back to ``batch["loss_mask"]``.
-        use_te (bool): If True, delegate to ``make_cp_batch_for_te`` (THD format).
-        padding_token_id (int): Token id used for sequence-length padding.
-        num_chunks (int): Number of chunks for TE path.
-        seq_lens_padding_value (int): Padding value for ``seq_lens`` in TE path.
+        cp_mesh (DeviceMesh): The device mesh for context parallel.
+        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
     Returns:
-        tuple(contextmanager, dict[str, torch.Tensor]): A ``nullcontext`` (no CP
-        context manager is required with this approach) and the sharded batch.
+        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
+        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
+        returned by `create_context_parallel_ctx`. The batch has also been passed to
+        `create_context_parallel_ctx` and is accordingly sharded.
     """
     from contextlib import nullcontext
 
@@ -506,102 +613,154 @@ def make_cp_batch_and_ctx(
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
 
+    # Gemma4 needs a local-query/global-key attention mask that PyTorch's
+    # ring-template CP path cannot represent. Its pre-embed step marks the
+    # batch so we use explicit contiguous sequence sharding and let
+    # attach_cp_sdpa_hooks all-gather K/V and token types inside attention.
+    manual_allgather = bool(batch.pop("_cp_manual_allgather", False)) or "mm_token_type_ids" in batch
+
     # Remove attention_mask from the batch so the model does not attempt to
-    # build a 4D causal mask (which would have mismatched shapes with
-    # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook
-    # (registered by attach_context_parallel_hooks) will set is_causal=True
-    # so that SDPA handles causal masking internally.
-    batch.pop("attention_mask", None)
+    # build a local 4D mask with the wrong key length. Preserve padding
+    # semantics for modules such as MoE.
+    attention_mask = batch.pop("attention_mask", None)
+    if attention_mask is not None and "padding_mask" not in batch:
+        if attention_mask.ndim == 4:
+            diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+            batch["padding_mask"] = diagonal.logical_not() if attention_mask.dtype == torch.bool else diagonal != 0
+        else:
+            batch["padding_mask"] = attention_mask.bool().logical_not()
 
-    # Determine whether the caller pre-computed inputs_embeds (CP+VLM path)
-    # or is passing raw input_ids.  inputs_embeds has shape [B, S, H];
-    # input_ids has shape [B, S].
-    _has_embeds = "inputs_embeds" in batch
-    _seq_key = "inputs_embeds" if _has_embeds else "input_ids"
+    # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
+    # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    primary_seq_tensor = batch[primary_key]
+    seq_len = primary_seq_tensor.shape[1]
 
-    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed).
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        _ref = batch[_seq_key]
-        _seq_len = _ref.shape[1]
-        batch["position_ids"] = torch.arange(0, _seq_len).unsqueeze(0).to(_ref.device)
+        batch["position_ids"] = torch.arange(0, seq_len).unsqueeze(0).to(primary_seq_tensor.device)
 
-    seq_tensor = batch[_seq_key]
     position_ids = batch["position_ids"]
-
-    # Determine correct seq dim for CP sharding
-    # mRoPE: [3, B, S] → shard on dim 2; standard: [B, S] → shard on dim 1
     pos_seq_dim = 2 if position_ids.ndim == 3 else 1
 
-    labels = batch["labels"]
+    labels = batch.get("labels")
+    if labels is None and loss_mask is not None:
+        labels = loss_mask
+        loss_mask = None
+    if labels is None:
+        raise KeyError("Context parallelism requires `labels` in the batch, or labels passed as `loss_mask`.")
 
-    # PyTorch CP load balancer requires seq_length % (cp_size * 2) == 0.
-    # The autoregressive shift in pad_collate_fn reduces seq_length by 1, so
-    # a max_length that is a power-of-2 (e.g. 8192) becomes 8191 which may
-    # not satisfy the constraint.  Pad to the next valid multiple here so the
-    # caller does not need to worry about alignment.
-    _cp_size = cp_mesh.size()
-    _required = _cp_size * 2
-    _pad_len = (-seq_tensor.shape[1]) % _required
-    if _pad_len:
-        import torch.nn.functional as _F
+    if manual_allgather:
+        cp_size = cp_mesh.size()
+        pad_len = (-seq_len) % (2 * cp_size)
+        if pad_len:
+            if "input_ids" in batch:
+                batch["input_ids"] = _pad_tensor_seq_dim_(batch["input_ids"], 1, pad_len, padding_token_id)
+            if "inputs_embeds" in batch:
+                batch["inputs_embeds"] = _pad_tensor_seq_dim_(batch["inputs_embeds"], 1, pad_len, 0)
+            labels = _pad_tensor_seq_dim_(labels, 1, pad_len, -100)
+            position_ids = _pad_position_ids_seq_dim_(position_ids, pos_seq_dim, pad_len)
+            batch["position_ids"] = position_ids
+            if "mm_token_type_ids" in batch:
+                batch["mm_token_type_ids"] = _pad_tensor_seq_dim_(batch["mm_token_type_ids"], 1, pad_len, 0)
+            if "per_layer_inputs" in batch:
+                batch["per_layer_inputs"] = _pad_tensor_seq_dim_(batch["per_layer_inputs"], 1, pad_len, 0)
+            if loss_mask is not None:
+                loss_mask = _pad_tensor_seq_dim_(loss_mask, 1, pad_len, 0)
+            if "padding_mask" in batch:
+                batch["padding_mask"] = _pad_tensor_seq_dim_(batch["padding_mask"], 1, pad_len, True)
 
-        if _has_embeds:
-            # inputs_embeds: [B, S, H] → pad seq dim (second-to-last)
-            seq_tensor = _F.pad(seq_tensor, (0, 0, 0, _pad_len))
-        else:
-            seq_tensor = _F.pad(seq_tensor, (0, _pad_len), value=0)
-        batch[_seq_key] = seq_tensor
-        labels = _F.pad(labels, (0, _pad_len), value=-100)
+        # Manual sequence slicing. Every CP rank in the same CP group starts
+        # from the same full batch, then keeps one contiguous sequence shard.
         batch["labels"] = labels
-        if "mm_token_type_ids" in batch:
-            batch["mm_token_type_ids"] = _F.pad(batch["mm_token_type_ids"], (0, _pad_len), value=0)
-        if "per_layer_inputs" in batch:
-            batch["per_layer_inputs"] = _F.pad(batch["per_layer_inputs"], (0, 0, 0, 0, 0, _pad_len))
-        if pos_seq_dim == 1:
-            _extra = position_ids[:, -1:] + torch.arange(1, _pad_len + 1, device=position_ids.device)
-            position_ids = torch.cat([position_ids, _extra], dim=1)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
         else:
-            _extra = position_ids[:, :, -1:] + torch.arange(1, _pad_len + 1, device=position_ids.device).view(1, 1, -1)
-            position_ids = torch.cat([position_ids, _extra], dim=2)
-        batch["position_ids"] = position_ids
+            cp_rank = getattr(cp_mesh, "get_local_rank", lambda: 0)()
+        seq_len = batch[primary_key].shape[1]
+        if seq_len % cp_size != 0:
+            raise ValueError(f"CP sequence length must be divisible by cp_size after padding, got {seq_len=} {cp_size=}")
+        local_seq_len = seq_len // cp_size
+        seq_start = cp_rank * local_seq_len
+        seq_end = seq_start + local_seq_len
 
-    # Manual sequence slicing: each CP rank takes its contiguous shard.
-    # This avoids the "mixed torch.Tensor and DTensor" crash that occurs when
-    # context_parallel propagates DTensor activations through the full model
-    # and PyTorch's CP attention inner_fn ends up with mixed types (DTensor Q
-    # from the propagated hidden-states vs plain K/V after allgather).
-    # All activations outside the SDPA call remain plain tensors; the CP
-    # communication is done entirely inside _cp_sdpa (see
-    # attach_cp_sdpa_hooks) via an explicit all-gather of K/V across the CP
-    # group followed by a single compiled flex_attention call with a
-    # per-rank causal block mask.  No DTensor dispatch is involved.
-    cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
-    S_total = seq_tensor.shape[1]
-    S_local = S_total // _cp_size
-    _s = cp_rank * S_local
-    _e = _s + S_local
+        def _slice_seq(key: str, seq_dim: int = 1) -> None:
+            if key not in batch:
+                return
+            slices = [slice(None)] * batch[key].ndim
+            slices[seq_dim] = slice(seq_start, seq_end)
+            batch[key] = batch[key][tuple(slices)].contiguous()
 
-    batch[_seq_key] = seq_tensor[:, _s:_e].contiguous()
-    batch["labels"] = labels[:, _s:_e].contiguous()
-    if pos_seq_dim == 1:
-        batch["position_ids"] = position_ids[:, _s:_e].contiguous()
-    else:
-        batch["position_ids"] = position_ids[:, :, _s:_e].contiguous()
-    if "mm_token_type_ids" in batch:
-        batch["mm_token_type_ids"] = batch["mm_token_type_ids"][:, _s:_e].contiguous()
-    if "per_layer_inputs" in batch:
-        batch["per_layer_inputs"] = batch["per_layer_inputs"][:, _s:_e].contiguous()
+        _slice_seq("input_ids", 1)
+        _slice_seq("inputs_embeds", 1)
+        _slice_seq("labels", 1)
+        _slice_seq("position_ids", pos_seq_dim)
+        _slice_seq("mm_token_type_ids", 1)
+        _slice_seq("per_layer_inputs", 1)
+        _slice_seq("padding_mask", 1)
+        if loss_mask is not None:
+            batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
+
+        return nullcontext, batch
+
+    # Generic non-TE CP path: keep PyTorch context_parallel's load-balanced
+    # all-gather implementation from main.
+    cp_buffers = [primary_seq_tensor, labels, position_ids]
+    cp_seq_dims = [1, 1, pos_seq_dim]
+    cp_no_restore_buffers = {primary_seq_tensor, labels}
+    batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
     if loss_mask is not None:
-        loss_mask = loss_mask[:, _s:_e].contiguous()
-        batch["loss_mask"] = loss_mask
+        cp_buffers.append(loss_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(loss_mask)
 
     if "padding_mask" in batch:
-        batch["padding_mask"] = batch["padding_mask"][:, _s:_e].contiguous()
+        batch_buffer_keys[len(cp_buffers)] = "padding_mask"
+        cp_buffers.append(batch["padding_mask"])
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(batch["padding_mask"])
 
-    # No CP context manager needed: the CP all-gather + masked attention is
-    # performed inline inside attach_cp_sdpa_hooks' _cp_sdpa wrapper.
-    return nullcontext, batch
+    PAD_FILL = {
+        "labels": -100,
+        "padding_mask": True,
+        "attention_mask": False,
+    }
+    cp_divisor = cp_mesh.size() * 2
+    if seq_len % cp_divisor != 0:
+        pad_len = cp_divisor - (seq_len % cp_divisor)
+        new_no_restore = set()
+        for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
+            pad_shape = list(buf.shape)
+            pad_shape[dim] = pad_len
+            if buf.dtype.is_floating_point:
+                pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
+            else:
+                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
+                pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
+            old_buf = buf
+            cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
+            if old_buf in cp_no_restore_buffers:
+                new_no_restore.add(cp_buffers[i])
+        cp_no_restore_buffers = new_no_restore
+        for idx, key in batch_buffer_keys.items():
+            batch[key] = cp_buffers[idx]
+
+    cp_ctx = create_context_parallel_ctx(
+        cp_mesh=cp_mesh,
+        cp_buffers=cp_buffers,
+        cp_seq_dims=cp_seq_dims,
+        cp_no_restore_buffers=cp_no_restore_buffers,
+        cp_rotate_method="allgather",  # TODO: expose through cfg
+    )
+    enable_loss_parallel: bool = False
+    enable_compiled_autograd: bool = False
+    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
 
 
 def make_cp_batch_for_te(
