@@ -16,6 +16,7 @@ Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, incl
 - **Qwen3.5-VL-4B**: 4B dense model
 - **Qwen3.5-VL-9B**: 9B dense model
 - **Qwen3.5-MoE**: large MoE variant (35B+)
+- **Qwen3.6-27B**: 27B dense model
 - **Qwen3.6-35B-A3B**: next-generation MoE variant (35B total, 3B active)
 
 ## Architectures
@@ -31,6 +32,7 @@ Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, incl
 | {download}`qwen3_5_9b.yaml <../../../../examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml>` | MedPix-VQA | SFT — Qwen3.5-VL 9B on MedPix |
 | {download}`qwen3_5_moe_medpix.yaml <../../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml>` | MedPix-VQA | SFT — Qwen3.5-MoE on MedPix |
 | {download}`qwen3_5_35b.yaml <../../../../examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml>` | MedPix-VQA | SFT — Qwen3.5 35B on MedPix |
+| {download}`qwen3_6_27b.yaml <../../../../examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml>` | MedPix-VQA | SFT — Qwen3.6-27B on MedPix |
 | {download}`qwen3_6_35b.yaml <../../../../examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml>` | MedPix-VQA | SFT — Qwen3.6 35B-A3B on MedPix |
 
 

@@ -41,9 +41,10 @@ class QwenImageAdapter(ModelAdapter):
     Qwen-Image transformer forward interface:
     - hidden_states: Packed latents [B, num_patches, C*4]
     - encoder_hidden_states: Qwen2 text embeddings [B, seq_len, hidden_dim]
+    - encoder_hidden_states_mask: Attention mask (None for flash attention)
     - timestep: Normalized timesteps [0, 1]
-    - img_ids: Image positional embeddings [num_patches, 3]
-    - txt_ids: Text positional embeddings [B, seq_len, 3]
+    - img_shapes: List of image shape tuples [[(1, h//2, w//2)]] per sample
+    - guidance: Optional guidance scale embedding [B]
     """
 
     def __init__(
@@ -95,26 +96,6 @@ class QwenImageAdapter(ModelAdapter):
 
         return latents
 
-    def _prepare_latent_image_ids(
-        self,
-        batch_size: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """
-        Prepare positional IDs for image latents.
-
-        Returns tensor of shape [(H//2)*(W//2), 3] containing (0, y, x).
-        """
-        latent_image_ids = torch.zeros(height // 2, width // 2, 3)
-        latent_image_ids[..., 1] = torch.arange(height // 2)[:, None]
-        latent_image_ids[..., 2] = torch.arange(width // 2)[None, :]
-
-        latent_image_ids = latent_image_ids.reshape(-1, 3)
-        return latent_image_ids.to(device=device, dtype=dtype)
-
     def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:
         """
         Prepare inputs for Qwen-Image model from FlowMatchingContext.
@@ -142,22 +123,29 @@ class QwenImageAdapter(ModelAdapter):
         # Pack latents for patch-based transformer
         packed_latents = self._pack_latents(noisy_latents)
 
-        # Prepare positional IDs for image patches
-        img_ids = self._prepare_latent_image_ids(batch_size, height, width, device, dtype)
+        # Build img_shapes: [[(1, h_latent//2, w_latent//2)]] per sample
+        # height/width are already in latent space (after VAE), divide by 2 for patch grouping
+        img_shapes = [[(1, height // 2, width // 2)]] * batch_size
 
-        # Text positional IDs (zeros, model uses learned text positions)
-        text_seq_len = text_embeddings.shape[1]
-        txt_ids = torch.zeros(batch_size, text_seq_len, 3, device=device, dtype=dtype)
+        # No explicit mask needed — preprocessed embeddings are max-length padded,
+        # and flash attention does not support explicit attention masks.
+        encoder_hidden_states_mask = None
 
         # Normalize timesteps to [0, 1]
         timesteps = context.timesteps.to(dtype) / 1000.0
 
+        # Guidance embedding (only when model supports it)
+        guidance = None
+        if self.use_guidance_embeds:
+            guidance = torch.tensor([self.guidance_scale], device=device, dtype=dtype).expand(batch_size)
+
         inputs = {
             "hidden_states": packed_latents,
             "encoder_hidden_states": text_embeddings,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
             "timestep": timesteps,
-            "img_ids": img_ids,
-            "txt_ids": txt_ids,
+            "img_shapes": img_shapes,
+            "guidance": guidance,
             "_original_shape": (batch_size, channels, height, width),
         }
 
@@ -175,9 +163,10 @@ class QwenImageAdapter(ModelAdapter):
         model_pred = model(
             hidden_states=inputs["hidden_states"],
             encoder_hidden_states=inputs["encoder_hidden_states"],
+            encoder_hidden_states_mask=inputs["encoder_hidden_states_mask"],
             timestep=inputs["timestep"],
-            img_ids=inputs["img_ids"],
-            txt_ids=inputs["txt_ids"],
+            img_shapes=inputs["img_shapes"],
+            guidance=inputs["guidance"],
             return_dict=False,
         )
 

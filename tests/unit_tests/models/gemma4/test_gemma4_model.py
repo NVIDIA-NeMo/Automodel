@@ -26,6 +26,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4MoEDecoderLayer,
     Gemma4MoEModel,
     Gemma4MoETextModelBackend,
+    _derive_padding_mask,
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
@@ -426,6 +427,24 @@ class TestGemma4MoETextModelBackend:
         new_emb = torch.nn.Embedding(100, text_config.hidden_size)
         model.set_input_embeddings(new_emb)
         assert model.embed_tokens is new_emb
+
+
+class TestDerivePaddingMask:
+    pytestmark = []
+
+    def test_2d_zeros_are_padding(self):
+        mask = torch.tensor([[1, 1, 0, 0]])
+        assert _derive_padding_mask(mask).tolist() == [[False, False, True, True]]
+
+    def test_4d_bool_false_diagonal_is_padding(self):
+        mask = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+        mask[0, 0, 2, 2] = False
+        assert _derive_padding_mask(mask).tolist() == [[False, False, True]]
+
+    def test_4d_additive_neginf_diagonal_is_padding(self):
+        mask = torch.zeros(1, 1, 3, 3)
+        mask[0, 0, 1, 1] = float("-inf")
+        assert _derive_padding_mask(mask).tolist() == [[False, True, False]]
 
 
 # ---------------------------------------------------------------------------

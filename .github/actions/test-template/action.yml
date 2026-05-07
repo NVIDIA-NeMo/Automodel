@@ -34,19 +34,6 @@ inputs:
     description: "Run tests on CPU only"
     required: false
     default: "false"
-  azure-client-id:
-    description: "Azure Client ID"
-    required: true
-  azure-tenant-id:
-    description: "Azure Tenant ID"
-    required: true
-  azure-subscription-id:
-    description: "Azure Subscription ID"
-    required: true
-  has-azure-credentials:
-    description: "Has Azure credentials"
-    required: false
-    default: "false"
   PAT:
     description: "GitHub Personal Access Token"
     required: true
@@ -63,34 +50,9 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install Azure CLI
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      shell: bash
-      run: |
-        echo "::group::Install Azure CLI"
-        for i in 1 2 3; do
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
-          echo "Attempt $i failed, retrying in 10s..."
-          sleep 10
-        done
-        echo "::endgroup::"
-
-    - name: Azure Login
-      if: ${{ inputs.has-azure-credentials == 'true' }}
-      uses: azure/login@v2
-      with:
-        client-id: ${{ inputs.azure-client-id }}
-        tenant-id: ${{ inputs.azure-tenant-id }}
-        subscription-id: ${{ inputs.azure-subscription-id }}
-
-    - name: Azure ACR Login
-      shell: bash
-      run: |
-        az acr login --name nemoci
-
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
-      if: ${{ contains(inputs.runner, 'aws') }}
+      if: ${{ contains(inputs.runner, 'aws') || contains(inputs.runner, 'gcp') }}
       run: |
         for i in 1 2 3; do
           apt-get update && apt-get install -y uuid-runtime && break
@@ -172,6 +134,7 @@ runs:
     - name: Run main script
       uses: nick-fields/retry@v3
       id: run-main-script
+      continue-on-error: ${{ inputs.is-optional == 'true' }}
       with:
         timeout_seconds: ${{ steps.create.outputs.timeout_in_seconds }}
         max_attempts: 3
@@ -195,17 +158,26 @@ runs:
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
+        IS_ALLOWED_FAILURE=false
 
         if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
-          echo "::warning::Test failed but is marked optional — treating as success."
-          IS_SUCCESS=true
+          IS_ALLOWED_FAILURE=true
         fi
 
         echo "::group::Coverage report"
         docker exec -t nemo_container_${{ github.run_id }} /opt/venv/bin/coverage report -i || true
         echo "::endgroup::"
 
-        if [[ "$IS_SUCCESS" == "true" ]]; then
+        if [[ "$IS_ALLOWED_FAILURE" == "true" ]]; then
+          echo -e "\033[1;33m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;33m║                                                                          ║\033[0m"
+          echo -e "\033[1;33m║   ⚠️   ALLOWED FAILURE  (exit code: ${EXIT_CODE})                        ║\033[0m"
+          echo -e "\033[1;33m║   ${{ inputs.test-folder }}\033[0m"
+          echo -e "\033[1;33m║                                                                          ║\033[0m"
+          echo -e "\033[1;33m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
+          echo "::warning title=Result::⚠️ ${{ inputs.test-folder }} — ALLOWED FAILURE (exit $EXIT_CODE)"
+          exit 0
+        elif [[ "$IS_SUCCESS" == "true" ]]; then
           echo -e "\033[1;32m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
           echo -e "\033[1;32m║                                                                          ║\033[0m"
           echo -e "\033[1;32m║   ✅  PASSED                                                             ║\033[0m"

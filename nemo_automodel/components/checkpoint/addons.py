@@ -65,7 +65,7 @@ class ConsolidatedHFAddon:
         # Perform save operations on rank 0
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir)
+            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
             # save the config.json file
             if hasattr(model_part, "config"):
                 v4_compatible = kwargs.get("v4_compatible", False)
@@ -77,7 +77,21 @@ class ConsolidatedHFAddon:
                 _maybe_strip_quantization_config(model_part)
                 with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
                     if hasattr(model_part.config, "to_json_string"):
-                        f.write(model_part.config.to_json_string())
+                        # Use ``use_diff=False`` so the full config (not the
+                        # diff against class defaults) is serialized. For
+                        # remote-code configs registered via
+                        # ``register_for_auto_class`` (e.g. DeciLM /
+                        # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
+                        # ``to_diff_dict`` sees the class-level ``model_type``
+                        # attribute as equal to the class default and drops
+                        # it from the serialized JSON. Reloading via
+                        # ``AutoConfig.from_pretrained`` on the resulting
+                        # consolidated directory then raises
+                        # ``Unrecognized model ... Should have a 'model_type'
+                        # key``. Writing the full dict guarantees
+                        # ``model_type``, ``architectures`` and ``auto_map``
+                        # land in the saved config regardless of class defaults.
+                        f.write(model_part.config.to_json_string(use_diff=False))
                     else:
                         # Diffusers models use FrozenDict for config instead of PretrainedConfig
                         json.dump(dict(model_part.config), f, indent=2, default=str)
@@ -160,7 +174,8 @@ class PeftAddon:
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, model_path)
+            model_part = model_state.model[0] if model_state is not None else None
+            _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
@@ -247,7 +262,14 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
         the full PEFT configuration.
     """
     PEFT_KEYS = {"dim", "alpha"}
-    return {k: v for k, v in peft_config.to_dict().items() if k not in PEFT_KEYS}
+    result = {}
+    for k, v in peft_config.to_dict().items():
+        if k in PEFT_KEYS:
+            continue
+        if isinstance(v, torch.dtype):
+            v = str(v)
+        result[k] = v
+    return result
 
 
 def _is_qwen3_moe(model: nn.Module) -> bool:
@@ -408,22 +430,101 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, c
         json.dump(cfg, f, indent=2)
 
 
-def _maybe_save_custom_model_code(original_model_path: str | None, hf_metadata_dir: str) -> None:
+def _maybe_save_custom_model_code(
+    original_model_path: str | None,
+    hf_metadata_dir: str,
+    model_part: nn.Module | None = None,
+) -> None:
     """
     Save the custom model code if it exists. This function preserves the original directory structure.
+
+    When ``original_model_path`` is a local dir, copy its ``.py`` files. When it is an HF
+    hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
+    code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
+    consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
+    ``trust_remote_code=True``.
     """
-    if original_model_path is None:
+    copied: set[str] = set()
+
+    def _copy_py_tree(src_dir: str) -> None:
+        for src_path in glob.glob(os.path.join(src_dir, "**", "*.py"), recursive=True):
+            if os.path.basename(src_path) == "__init__.py":
+                continue
+            rel_path = os.path.relpath(src_path, src_dir)
+            dst_path = os.path.join(hf_metadata_dir, rel_path)
+            if dst_path in copied:
+                continue
+            os.makedirs(os.path.dirname(dst_path) or hf_metadata_dir, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            copied.add(dst_path)
+
+    if original_model_path is not None:
+        if os.path.isfile(original_model_path):
+            dst_path = os.path.join(hf_metadata_dir, os.path.basename(original_model_path))
+            os.makedirs(hf_metadata_dir, exist_ok=True)
+            shutil.copy2(original_model_path, dst_path)
+            copied.add(dst_path)
+        elif os.path.isdir(original_model_path):
+            _copy_py_tree(original_model_path)
+
+    # Fallback: HF hub id path — resolve custom code via the model class's module file.
+    # Needed for trust_remote_code models (e.g. Nemotron-Flash) so reloads from the
+    # consolidated dir have has_local_code=True and don't require trust_remote_code.
+    if model_part is not None and not copied:
+        custom_dirs: set[str] = set()
+        for cls in _iter_custom_code_classes(model_part):
+            try:
+                import inspect
+
+                src_file = inspect.getfile(cls)
+            except (TypeError, OSError):
+                continue
+            module_name = getattr(cls, "__module__", "") or ""
+            if not module_name.startswith("transformers_modules."):
+                continue
+            custom_dirs.add(os.path.dirname(src_file))
+        for src_dir in custom_dirs:
+            _copy_py_tree(src_dir)
+
+
+def _iter_custom_code_classes(model_part: nn.Module):
+    """Yield classes referenced by ``config.auto_map`` (and the model's own class).
+
+    Walks the full MRO so wrappers like FSDP2 (which add mixins / rename the
+    top-level class) don't hide the original ``transformers_modules.*`` class.
+    """
+    seen: set[type] = set()
+    custom_pkg = ""
+    for base in type(model_part).__mro__:
+        mod = getattr(base, "__module__", "") or ""
+        if mod.startswith("transformers_modules."):
+            if base not in seen:
+                seen.add(base)
+                yield base
+            # Record the package path to resolve auto_map entries relative to it.
+            if not custom_pkg:
+                custom_pkg = ".".join(mod.split(".")[:-1])
+
+    config = getattr(model_part, "config", None)
+    auto_map = getattr(config, "auto_map", None) if config is not None else None
+    if not isinstance(auto_map, dict) or not custom_pkg:
         return
-    if os.path.isfile(original_model_path):
-        pattern = original_model_path
-    elif os.path.isdir(original_model_path):
-        pattern = os.path.join(original_model_path, "**", "*.py")
-    else:
-        return
-    for src_path in glob.glob(pattern, recursive=True):
-        rel_path = os.path.relpath(src_path, original_model_path)
-        if os.path.basename(src_path) == "__init__.py":
-            continue
-        dst_path = os.path.join(hf_metadata_dir, rel_path)
-        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-        shutil.copy2(src_path, dst_path)
+    import importlib
+
+    for value in auto_map.values():
+        candidates = value if isinstance(value, (list, tuple)) else [value]
+        for ref in candidates:
+            if not isinstance(ref, str) or "." not in ref:
+                continue
+            module_path, class_name = ref.rsplit(".", 1)
+            # auto_map entries are like "modeling_nemotron_flash.NemotronFlashForCausalLM";
+            # the module lives under the same transformers_modules package as the model class.
+            full_module = f"{custom_pkg}.{module_path}"
+            try:
+                mod = importlib.import_module(full_module)
+                target = getattr(mod, class_name, None)
+            except Exception:
+                continue
+            if isinstance(target, type) and target not in seen:
+                seen.add(target)
+                yield target

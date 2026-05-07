@@ -103,6 +103,8 @@ ci:
   vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:35:00"
+  known_issue_id: AM-154
+  allow_failure: true
   checkpoint_robustness:
     hf_kl_threshold: 1e-3
     tokenizer_name: microsoft/phi-4

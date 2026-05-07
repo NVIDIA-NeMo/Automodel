@@ -149,7 +149,7 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    seq_len = 6
+    seq_len = 8  # divisible by cp_size*2 to skip the cp-divisor padding path
     # mRoPE position_ids: [3, B, S] — temporal, height, width
     position_ids_3d = torch.arange(3 * 1 * seq_len).view(3, 1, seq_len)
     batch = {

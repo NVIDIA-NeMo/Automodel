@@ -1385,6 +1385,143 @@ def test_apply_ac_explicit_params_override_config(monkeypatch):
     assert captured_num_experts == 64
 
 
+def test_apply_ac_derives_from_llm_config(monkeypatch):
+    """VLM nests LM config under llm_config (not text_config) — apply_ac must fall back to it."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for hs in [128, 256, 512, 1024]:
+            for ne in [8, 16, 32, 64]:
+                rhs = type("Mat", (), {"shape": (hs, ne)})()
+                if policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs) == P.CheckpointPolicy.MUST_SAVE:
+                    captured_hidden_size = hs
+                    captured_num_experts = ne
+                    break
+            if captured_hidden_size is not None:
+                break
+        return "CTX"
+
+    def fake_wrapper(block, preserve_rng_state, context_fn=None):
+        if context_fn is not None:
+            context_fn()
+        return block
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=fake_wrapper))
+
+    class LLMConfig:
+        hidden_size = 512
+        num_experts = 32
+
+    # No text_config and no top-level hidden_size/num_experts — must come from llm_config.
+    class Config:
+        llm_config = LLMConfig()
+
+    class ModelWithLLMConfig:
+        def __init__(self):
+            self.config = Config()
+            self.layers = LayerContainer([DummyBlock()])
+
+    P.apply_ac(ModelWithLLMConfig(), ignore_router=True)
+
+    assert captured_hidden_size == 512
+    assert captured_num_experts == 32
+
+
+def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
+    """When both text_config and llm_config define hidden_size/num_experts, text_config wins."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    captured_hidden_size = None
+    captured_num_experts = None
+
+    def fake_create_selective_checkpoint_contexts(policy_cb):
+        nonlocal captured_hidden_size, captured_num_experts
+        torch_stub = sys.modules["torch"]
+        for hs in [128, 256, 512, 1024]:
+            for ne in [8, 16, 32, 64]:
+                rhs = type("Mat", (), {"shape": (hs, ne)})()
+                if policy_cb(None, torch_stub.ops.aten.mm.default, object(), rhs) == P.CheckpointPolicy.MUST_SAVE:
+                    captured_hidden_size = hs
+                    captured_num_experts = ne
+                    break
+            if captured_hidden_size is not None:
+                break
+        return "CTX"
+
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]))
+
+    class TextConfig:
+        hidden_size = 256
+        num_experts = 16
+
+    class LLMConfig:
+        hidden_size = 1024
+        num_experts = 64
+
+    class Config:
+        text_config = TextConfig()
+        llm_config = LLMConfig()
+
+    class ModelBoth:
+        def __init__(self):
+            self.config = Config()
+            self.layers = LayerContainer([DummyBlock()])
+
+    P.apply_ac(ModelBoth(), ignore_router=True)
+
+    assert captured_hidden_size == 256
+    assert captured_num_experts == 16
+
+
+def test_apply_ac_routes_through_get_text_module(monkeypatch):
+    """For VLMs, apply_ac must wrap layers under the text sub-module (LM), not the outer wrapper."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class LM:
+        def __init__(self, blocks):
+            self.layers = LayerContainer(blocks)
+
+    class VLMInner:
+        def __init__(self, lm_blocks, vit_blocks):
+            self.language_model = LM(lm_blocks)
+            # distractor: vision tower also has .layers — must NOT be wrapped.
+            self.vision_tower = type("ViT", (), {"layers": LayerContainer(vit_blocks)})()
+            # The inner module also exposes .layers (would be hit pre-fix), but
+            # get_text_module redirects past it.
+            self.layers = LayerContainer([DummyBlock(), DummyBlock(), DummyBlock()])
+
+    class VLMOuter:
+        def __init__(self, lm_blocks, vit_blocks):
+            self.config = type("Cfg", (), {"hidden_size": 256, "num_experts": 16})()
+            self.model = VLMInner(lm_blocks, vit_blocks)
+
+    # Override get_text_module to drill into language_model (mimics the real helper).
+    def vlm_get_text_module(m):
+        return m.language_model if hasattr(m, "language_model") else m
+
+    monkeypatch.setattr(P, "get_text_module", vlm_get_text_module)
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: b))
+
+    lm_blocks = [DummyBlock(), DummyBlock()]
+    vit_blocks = [DummyBlock(), DummyBlock(), DummyBlock(), DummyBlock()]
+    model = VLMOuter(lm_blocks, vit_blocks)
+
+    P.apply_ac(model, ignore_router=True)
+
+    # LM layers should be re-registered (wrapped); vision_tower and inner.layers untouched.
+    assert set(model.model.language_model.layers.registered.keys()) == {"0", "1"}
+    assert model.model.vision_tower.layers.registered == {}
+    assert model.model.layers.registered == {}
+
+
 def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
     """Test that parallelize_model passes ignore_router_for_ac to apply_ac."""
     P = _import_parallelizer_with_stubs(monkeypatch)

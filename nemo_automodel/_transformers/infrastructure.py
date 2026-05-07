@@ -201,6 +201,12 @@ def _instantiate_pipeline(
     config_dict = config.to_dict()
     config_dict.pop("loss_fn", None)
 
+    # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
+    # the same knob controls grad-sync behavior under PP.
+    strategy_config = getattr(mesh, "strategy_config", None)
+    if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
+        config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
+
     return AutoPipeline(
         world_mesh=mesh.device_mesh,
         moe_mesh=mesh.moe_mesh,
@@ -347,6 +353,7 @@ def apply_model_infrastructure(
     cache_dir=None,
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
+    inject_te_attention: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -382,6 +389,9 @@ def apply_model_infrastructure(
             model init (e.g., by HF's from_pretrained on a real device, which also
             handles BnB quantization atomically). When True, checkpoint loading in
             this function is skipped. Default: False.
+        inject_te_attention: When True, inject TransformerEngine DotProductAttention
+            into all ``self_attn`` modules of HF models (has no effect on custom
+            models that already use TE via BackendConfig). Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -423,6 +433,14 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+
+    # Inject TE attention into HF models when requested.
+    # Done after PEFT (so projection shapes are final) and before sharding
+    # (so TE modules are included in the FSDP unit).
+    if inject_te_attention and not _uses_te_attention(model):
+        from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
+
+        _inject_te(model)
 
     # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks

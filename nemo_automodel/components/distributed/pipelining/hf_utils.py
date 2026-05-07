@@ -50,7 +50,9 @@ def get_text_module(model: nn.Module) -> nn.Module:
     for attr_name in TEXT_MODULE_ATTRS:
         if hasattr(model, attr_name):
             nested = getattr(model, attr_name)
-            if nested is not None:
+            # Only descend into a real submodule; Mock-only attrs from tests
+            # (which hasattr() accepts) are not nn.Module and should be skipped.
+            if nested is not None and isinstance(nested, nn.Module):
                 return nested
     return model
 
@@ -71,12 +73,17 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         causal_mask_mapping: Optional[dict] = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        # For VLM models the text components (embed_tokens, layers, norm) live on a
+        # nested text module (e.g. model.language_model) rather than directly on self.
+        # get_text_module returns self when no nesting exists (e.g. LlamaModel).
+        text_module = get_text_module(self)
+
         # Embeddings handling
         if inputs_embeds is None:
-            if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
+            if hasattr(text_module, "embed_tokens") and text_module.embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = self.embed_tokens(input_ids)
+                inputs_embeds = text_module.embed_tokens(input_ids)
             else:
                 if (
                     input_ids is not None
@@ -144,9 +151,9 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         if rotary_emb is not None:
             position_embeddings = rotary_emb(hidden_states, position_ids)
 
-        if hasattr(self, "layers") and self.layers is not None:
+        if hasattr(text_module, "layers") and text_module.layers is not None:
             # Works for dict-like or list-like containers
-            layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
                 if hasattr(decoder_layer, "attention_type"):
@@ -165,8 +172,8 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 )
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
-        if hasattr(self, "norm") and self.norm is not None:
-            hidden_states = self.norm(hidden_states)
+        if hasattr(text_module, "norm") and text_module.norm is not None:
+            hidden_states = text_module.norm(hidden_states)
 
         if model_class_name == "PipelineStage":
             return hidden_states
@@ -442,6 +449,123 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     return pipeline_forward_gemma4_vlm
 
 
+def create_pipeline_forward_mistral3_vlm() -> Callable:
+    """Pipeline-compatible forward for Mistral3ForConditionalGeneration (VLM top-level).
+
+    Stage 0: embeds text tokens, runs vision_tower + multi_modal_projector for
+    image tokens, merges image features into inputs_embeds via
+    ``get_placeholder_mask``/``masked_scatter``, then calls the patched language
+    model. Non-first stages: passes hidden states straight through the patched
+    language model. Last stage: applies lm_head.
+
+    Mirrors the generic CausalLM PP forward but adds the Mistral3 vision path
+    so ``pixel_values``/``image_sizes`` reach ``get_image_features`` on stage 0.
+    Without this, the generic CausalLM path never touches vision_tower and
+    image tokens are embedded as garbage text tokens.
+    """
+
+    def pipeline_forward_mistral3_vlm(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
+        vision_feature_layer=None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        inner = self.model
+        lang_model = inner.language_model
+        embed_tokens = getattr(lang_model, "embed_tokens", None)
+        is_first_stage = embed_tokens is not None
+
+        # PP VLM: under the training loop, pixel_values and image_sizes are
+        # popped from the batch before schedule.step() and pre-chunked onto
+        # stage0_model._vlm_pixel_values_chunks (and _vlm_image_grid_hws_chunks
+        # for image_sizes). Retrieve the current microbatch's chunk here so
+        # vision_tower actually receives its inputs. Mirrors the Gemma4 VLM
+        # path at create_pipeline_forward_gemma4_vlm().
+        if pixel_values is None and is_first_stage:
+            chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            has_media_tokens = (
+                input_ids is not None
+                and hasattr(self.config, "image_token_id")
+                and (input_ids == self.config.image_token_id).any()
+            )
+            if chunks is not None and has_media_tokens:
+                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+                if chunk_idx < len(chunks):
+                    pixel_values = chunks[chunk_idx]
+                    grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                    if grid_chunks is not None and chunk_idx < len(grid_chunks):
+                        image_sizes = grid_chunks[chunk_idx]
+                    self._vlm_chunk_idx = chunk_idx + 1
+
+        if is_first_stage:
+            if inputs_embeds is None:
+                inputs_embeds = embed_tokens(input_ids)
+
+            vision_tower = getattr(inner, "vision_tower", None)
+            if vision_tower is not None and pixel_values is not None:
+                # HF's outer Mistral3ForConditionalGeneration.forward resolves
+                # `vision_feature_layer` from config via @merge_with_config_defaults.
+                # Our patched forward bypasses that decorator, so we must pull the
+                # config default explicitly — otherwise None flows through to
+                # `get_image_features` and the selected hidden state can differ.
+                if vision_feature_layer is None:
+                    vision_feature_layer = getattr(self.config, "vision_feature_layer", None)
+                image_features = inner.get_image_features(
+                    pixel_values=pixel_values,
+                    vision_feature_layer=vision_feature_layer,
+                    image_sizes=image_sizes,
+                    return_dict=True,
+                ).pooler_output
+                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                special_image_mask = inner.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        else:
+            # Non-first stage: input_ids carries hidden states from the previous PP stage.
+            if inputs_embeds is None:
+                if input_ids is not None and input_ids.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
+                    inputs_embeds = input_ids
+                else:
+                    raise ValueError("Expected float hidden states for non-first PP stage")
+
+        if cache_position is None and inputs_embeds is not None:
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        hidden_states = lang_model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        if not isinstance(hidden_states, torch.Tensor):
+            hidden_states = hidden_states.last_hidden_state
+
+        if hasattr(self, "lm_head") and self.lm_head is not None:
+            return self.lm_head(hidden_states)
+        return hidden_states
+
+    return pipeline_forward_mistral3_vlm
+
+
+def _is_mistral3_vlm(model: torch.nn.Module) -> bool:
+    """Return True for Mistral3ForConditionalGeneration (Pixtral + Ministral3)."""
+    config = getattr(model, "config", None)
+    return config is not None and getattr(config, "model_type", None) == "mistral3"
+
+
 def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
     """Return True only for Gemma4 VLM variants.
 
@@ -483,6 +607,14 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
             text_backbone.forward = types.MethodType(create_pipeline_forward_gemma4_text(), text_backbone)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_gemma4_vlm(), model)
+    elif inner_model is not None and text_backbone is not None and _is_mistral3_vlm(model):
+        # Mistral3 VLM (Pixtral + Ministral3 text): route pixel_values/image_sizes
+        # through vision_tower on stage 0 and let the text backbone use the
+        # generic inner PP forward.
+        if patch_inner_model:
+            text_backbone.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), text_backbone)
+        if patch_causal_lm_model:
+            model.forward = types.MethodType(create_pipeline_forward_mistral3_vlm(), model)
     elif inner_model is not None:
         if patch_inner_model:
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
