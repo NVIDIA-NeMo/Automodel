@@ -153,8 +153,8 @@ class DeepseekV4Block(nn.Module):
             rotary_compress=rotary_compress,
         )
         dtype = x.dtype
-        # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
-        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
+        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
         # --- MLP site: same pattern ---
         pre, post, comb = self.ffn_hc.compute_weights(x)
@@ -165,7 +165,7 @@ class DeepseekV4Block(nn.Module):
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()

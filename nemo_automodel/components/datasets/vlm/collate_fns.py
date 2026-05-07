@@ -1496,6 +1496,12 @@ def neat_packed_vlm_collater(
     labels = torch.stack([_pad_1d(x["labels"], LABEL_PAD, max_len) for x in batch])
     attention_mask = torch.stack([_pad_1d(x["attention_mask"], 0, max_len) for x in batch])
 
+    def _get_mm_token_type_ids(item):
+        v = item.get("mm_token_type_ids")
+        return v if v is not None else torch.zeros(0, dtype=torch.long)
+
+    mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
+
     if use_flash:
         # Keep indexed [B, S] mask for flash_attn_varlen_func.
         # The patched _get_unpad_data will extract per-document cu_seqlens.
@@ -1526,6 +1532,7 @@ def neat_packed_vlm_collater(
         "labels": labels,
         "position_ids": position_ids,
         "attention_mask": attention_mask_out,
+        "mm_token_type_ids": mm_token_type_ids,
     }
 
     # Store indexed attention mask for loss functions that need per-sample
@@ -1541,7 +1548,7 @@ def neat_packed_vlm_collater(
         if tensors:
             result[key] = torch.cat(tensors, dim=0).to(torch.bfloat16)
 
-    for key in ("image_grid_thw", "video_grid_thw", "second_per_grid_ts"):
+    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1804,13 +1811,6 @@ def _inject_thinking_prefix_tokens(
 ) -> Dict[str, torch.Tensor]:
     """Insert ``<|channel>thought\\n<channel|>`` tokens after every ``<|turn>model\\n`` marker.
 
-    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
-    channel prefix before the actual response.  When this prefix is absent from
-    training sequences the model predicts ``<|channel>`` but the label says
-    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
-    as -100 in labels) lets the model see its expected pattern and brings
-    initial loss down to ~3.
-
     Modifies ``input_ids``, ``attention_mask``, and ``mm_token_type_ids``
     (if present).  Additionally, any other 2-D integer tensor whose second
     dimension matches ``input_ids`` is extended with zeros so that sequence
@@ -1885,6 +1885,25 @@ def _inject_thinking_prefix_tokens(
     return batch
 
 
+def gemma4_inject_thinking_prefix(
+    batch: Dict[str, torch.Tensor],
+    processor,
+) -> Dict[str, torch.Tensor]:
+    """Inject Gemma4's thinking-channel prefix after every assistant turn marker.
+
+    Gemma4 31B / 26B-A4B MoE instruction-tuned models always emit a thinking-
+    channel prefix before the actual response.  When this prefix is absent from
+    training sequences the model predicts ``<|channel>`` but the label says
+    answer text, inflating initial loss to ~9.  Injecting the prefix (masked
+    as -100 in labels) lets the model see its expected pattern and brings
+    initial loss down to ~3.
+
+    Safe no-op for non-Gemma4 tokenizers.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    return _inject_thinking_prefix_tokens(batch, tokenizer)
+
+
 def gemma4_prefix_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1900,8 +1919,7 @@ def gemma4_prefix_collate_fn(
     """
 
     def _inject(batch, proc):
-        tokenizer = getattr(proc, "tokenizer", proc)
-        batch = _inject_thinking_prefix_tokens(batch, tokenizer)
+        batch = gemma4_inject_thinking_prefix(batch, proc)
         if max_length is not None and batch["input_ids"].size(1) > max_length:
             for key in list(batch.keys()):
                 v = batch[key]
