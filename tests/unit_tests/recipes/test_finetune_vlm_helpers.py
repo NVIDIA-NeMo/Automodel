@@ -2432,3 +2432,133 @@ class TestChunkVlmMedia:
         assert len(pv_chunks) == 2
         assert pv_chunks[0].shape[0] == 12  # all in first
         assert pv_chunks[1].shape[0] == 0   # empty
+
+
+# -----------------------------------------------------------------------------
+# get_rope_index forwarding tests for build_dataloader
+#
+# Guard against a regression where the VLM recipe forgot to pass
+# get_rope_index to neat_pack_dataset_vlm, silently degrading mRoPE to
+# plain 1D positions for packed Qwen2.5-VL / Qwen3-VL training.
+# -----------------------------------------------------------------------------
+
+
+def _make_packing_cfg(pack_size=128):
+    cfg = MagicMock()
+    cfg.pack_size = pack_size
+    cfg.pretokenize = True
+    cfg.max_length = pack_size
+    cfg.get.side_effect = lambda key, default=None: {
+        "pack_size": pack_size,
+        "drop_long_samples": True,
+        "max_packs": None,
+        "packing_ratio": 1.0,
+        "balance_media_tokens": True,
+        "collate_max_length": None,
+        "post_tokenize_hook_fn": None,
+    }.get(key, default)
+    return cfg
+
+
+def _make_dataset_cfg():
+    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
+    cfg.get.side_effect = lambda key, default=None: {
+        "path_or_dataset": None,
+        "truncate": True,
+    }.get(key, default)
+    cfg.path_or_dataset = None
+    cfg.instantiate.return_value = []
+    return cfg
+
+
+def _patches_for_packing(neat_pack_side_effect):
+    processor = MagicMock()
+    processor.tokenizer.pad_token_id = 0
+    processor.chat_template = "{{ x }}"
+    return processor, [
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch(
+            "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
+            side_effect=neat_pack_side_effect,
+        ),
+        patch("nemo_automodel.components.models.common.packing.configure_packing"),
+        patch(
+            "nemo_automodel.components.models.common.packing.get_attn_implementation",
+            return_value="sdpa",
+        ),
+    ]
+
+
+def test_build_dataloader_forwards_get_rope_index_to_packing():
+    """get_rope_index passed to build_dataloader must reach neat_pack_dataset_vlm."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    sentinel = MagicMock(name="get_rope_index")
+    captured = {}
+
+    def fake_neat_pack(*args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+            get_rope_index=sentinel,
+        )
+
+    assert captured.get("get_rope_index") is sentinel, (
+        "build_dataloader must forward get_rope_index to neat_pack_dataset_vlm; "
+        f"got kwargs={list(captured.keys())}"
+    )
+
+
+def test_build_dataloader_default_get_rope_index_is_none():
+    """When the model does not expose get_rope_index, packing must receive None."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    captured = {}
+
+    def fake_neat_pack(*args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+        )
+
+    assert "get_rope_index" in captured, (
+        "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
+    )
+    assert captured["get_rope_index"] is None
