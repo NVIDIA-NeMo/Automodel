@@ -109,6 +109,7 @@ ci:
   time: "00:45:00"
   vllm_deploy: true
   recipe_owner: adil-a
+  known_issue_id: AM-149
   checkpoint_robustness:
     trust_remote_code: true
     kl_threshold: 1e-2

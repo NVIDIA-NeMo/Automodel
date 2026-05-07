@@ -111,3 +111,4 @@ freeze_config:
 
 ci:
   recipe_owner: athitten
+  time: "00:20:00"

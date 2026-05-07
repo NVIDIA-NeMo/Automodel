@@ -33,6 +33,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_
 # Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
+    _extract_model_layers,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
@@ -1517,3 +1518,193 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable.assert_called_once_with(
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
+
+
+class TestExtractModelLayers:
+    """Tests for ``_extract_model_layers`` flattening of ModuleList results.
+
+    Covers the PR that replaced ``layers.extend(_reduce_attrs(...))`` with a
+    helper that flattens ModuleList elements so each decoder layer ends up as
+    its own list entry (what AC wrapping expects), while leaving non-ModuleList
+    results (e.g. ModuleDict after PP split) appended as-is.
+    """
+
+    def _make_layers(self, n: int) -> nn.ModuleList:
+        return nn.ModuleList([_FakeLayer() for _ in range(n)])
+
+    @staticmethod
+    def _bare_instance(cls):
+        """Instantiate an HF model class without running HF ``__init__``.
+
+        Needed because ``MODEL_CLS_TO_LAYERS`` is keyed by exact class identity
+        (no subclass match), but the real classes require a config to
+        construct. ``__new__`` + manual ``nn.Module.__init__`` gives us an
+        instance where ``type(model) is cls`` while skipping the expensive
+        construction path.
+        """
+        obj = cls.__new__(cls)
+        nn.Module.__init__(obj)
+        return obj
+
+    def test_class_keyed_single_fqn_flattens_modulelist(self):
+        """GPT2LMHeadModel entry ``["transformer.h"]`` → individual layers.
+
+        Before the fix, ``layers.extend(_reduce_attrs(...))`` put the ModuleList
+        itself into ``layers`` as one element; hasattr(layer, 'mlp') then failed
+        and AC silently skipped every layer. Flattening must restore the
+        per-layer elements so the AC loop can wrap them.
+        """
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+        model = self._bare_instance(GPT2LMHeadModel)
+        transformer = nn.Module()
+        layers = self._make_layers(3)
+        transformer.h = layers
+        model.transformer = transformer
+
+        result = _extract_model_layers(model)
+
+        assert len(result) == 3, f"expected 3 flat layers, got {len(result)}"
+        assert all(r is layers[i] for i, r in enumerate(result)), (
+            "result should be the individual decoder layer objects, not a ModuleList container"
+        )
+        assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_string_keyed_arm_flattens_modulelist(self):
+        """``NemotronHForCausalLM`` is string-keyed in MODEL_CLS_TO_LAYERS.
+
+        Hits the ``model_cls.__name__ in MODEL_CLS_TO_LAYERS`` branch.
+        """
+
+        class NemotronHForCausalLM(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                backbone = nn.Module()
+                backbone.layers = layers
+                self.backbone = backbone
+
+        layers = self._make_layers(4)
+        result = _extract_model_layers(NemotronHForCausalLM(layers))
+
+        assert len(result) == 4
+        assert all(r is layers[i] for i, r in enumerate(result))
+
+    def test_multi_fqn_flattens_each_modulelist(self):
+        """Qwen2.5-VL entry ``["language_model.layers", "visual.blocks"]``.
+
+        Both FQNs resolve to ModuleLists; both must be flattened so all decoder
+        and vision blocks appear as individual elements in the final list.
+        """
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+        )
+
+        model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
+        lang = self._make_layers(5)
+        vis = self._make_layers(2)
+        language_model = nn.Module()
+        language_model.layers = lang
+        model.language_model = language_model
+        visual = nn.Module()
+        visual.blocks = vis
+        model.visual = visual
+
+        result = _extract_model_layers(model)
+
+        assert len(result) == 7
+        assert [id(r) for r in result[:5]] == [id(item) for item in lang]
+        assert [id(r) for r in result[5:]] == [id(item) for item in vis]
+        assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_non_modulelist_element_appended_as_single_entry(self):
+        """PP post-split: ``_reduce_attrs`` returns a ModuleDict.
+
+        A ModuleDict is NOT an nn.ModuleList, so ``_extend_layers`` must fall
+        through to ``layers.append(m)`` and keep it as a single element —
+        same behaviour as before the fix (the AC loop then skips it via
+        hasattr, which is the expected PP-path behaviour and handled
+        elsewhere for the happy PP case).
+        """
+        from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+
+        model = self._bare_instance(GPT2LMHeadModel)
+        layer_dict = nn.ModuleDict({"0": _FakeLayer(), "1": _FakeLayer()})
+        transformer = nn.Module()
+        transformer.h = layer_dict
+        model.transformer = transformer
+
+        result = _extract_model_layers(model)
+
+        # ModuleDict is not flattened — it stays as one element.
+        assert len(result) == 1
+        assert result[0] is layer_dict
+
+    def test_fallback_branch_still_handles_modulelist(self):
+        """Non-MODEL_CLS_TO_LAYERS models hit the ``hasattr(model.model, 'layers')``
+        fallback, which is unchanged by the PR. Guard against accidental regression.
+        """
+
+        class GenericCausalLM(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                inner = nn.Module()
+                inner.layers = layers
+                self.model = inner
+
+        layers = self._make_layers(2)
+        result = _extract_model_layers(GenericCausalLM(layers))
+        assert len(result) == 2
+        assert all(r is layers[i] for i, r in enumerate(result))
+
+    def test_fallback_branch_handles_moduledict(self):
+        """Fallback branch already normalises ModuleDict via ``.values()``."""
+
+        class GenericCausalLM(nn.Module):
+            def __init__(self, layer_dict):
+                super().__init__()
+                inner = nn.Module()
+                inner.layers = layer_dict
+                self.model = inner
+
+        layer_dict = nn.ModuleDict({"0": _FakeLayer(), "1": _FakeLayer(), "2": _FakeLayer()})
+        result = _extract_model_layers(GenericCausalLM(layer_dict))
+        assert len(result) == 3
+        assert [id(r) for r in result] == [id(v) for v in layer_dict.values()]
+
+    def test_string_keyed_mistral3_fp8_vlm(self):
+        """The ``"Mistral3FP8VLMForConditionalGeneration"`` string-key entry
+        catches the runtime class produced by ``_get_mixin_wrapped_class``
+        (``HFCheckpointingMixin``), which has the same ``__name__`` as our
+        custom class but a distinct identity. Without this entry, the model
+        falls through to the largest-ModuleList heuristic and crashes.
+
+        Validates the elif ``model_cls.__name__ in MODEL_CLS_TO_LAYERS`` branch.
+        """
+
+        class Mistral3FP8VLMForConditionalGeneration(nn.Module):
+            """Stand-in named exactly like the registered string key —
+            mirrors the wrapper class that NeMo Auto creates at runtime."""
+
+            def __init__(self):
+                super().__init__()
+                inner = nn.Module()
+                lang = nn.Module()
+                lang.layers = self._mklayers(3)
+                inner.language_model = lang
+                vt = nn.Module()
+                tx = nn.Module()
+                tx.layers = self._mklayers(2)
+                vt.transformer = tx
+                inner.vision_tower = vt
+                self.model = inner
+
+            @staticmethod
+            def _mklayers(n):
+                return nn.ModuleList([_FakeLayer() for _ in range(n)])
+
+        model = Mistral3FP8VLMForConditionalGeneration()
+        result = _extract_model_layers(model)
+
+        # 3 text-decoder + 2 vision tower layers, all flattened.
+        assert len(result) == 5
+        assert not any(isinstance(r, nn.ModuleList) for r in result)

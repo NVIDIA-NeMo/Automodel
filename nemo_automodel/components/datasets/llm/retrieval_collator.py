@@ -12,11 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
 from transformers.file_utils import PaddingStrategy
+
+
+def _doc_id_str_to_int64(doc_id: str) -> int:
+    """Stable 63-bit int for corpus doc id strings (for in-batch duplicate masking)."""
+    h = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
+    return int.from_bytes(h, "little", signed=False) & ((1 << 63) - 1)
+
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding
@@ -192,6 +200,18 @@ class BiEncoderCollator:
         # Add dummy labels (required by some training frameworks)
         labels = torch.zeros(len(query_features), dtype=torch.long)
         merged_batch_dict["labels"] = labels
+
+        # Per-passage corpus doc ids (positive + negatives, flattened in d_input_ids
+        # order) for distributed in-batch same-doc negative masking. Top-level key
+        # so it bypasses the q_/d_ unpacking in the trainer.
+        if batch and batch[0].get("doc_id") is not None:
+            doc_id_flat: List[str] = []
+            for x in batch:
+                doc_id_flat.extend(x["doc_id"])
+            merged_batch_dict["passage_doc_ids"] = torch.tensor(
+                [_doc_id_str_to_int64(s) for s in doc_id_flat],
+                dtype=torch.long,
+            )
 
         return merged_batch_dict
 

@@ -75,7 +75,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -223,14 +223,20 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         save_consolidated=True,
         is_peft=is_peft,
     )
+    user_cfg = {}
     if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        user_cfg = cfg_ckpt.to_dict()
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
         )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
 
@@ -392,9 +398,28 @@ def build_dataloader(
                 try:
                     processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
                 except Exception as e:
-                    # Some models do not provide an AutoProcessor
-                    processor = None
-                    logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
+                    # AutoProcessor.from_pretrained internally loads AutoConfig. Configs
+                    # whose layer_types length differs from num_hidden_layers trip
+                    # validate_layer_type. The processor itself doesn't depend on
+                    # layer_types, so relax the validator and retry once before giving up.
+                    err = str(e)
+                    if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                        from nemo_automodel._transformers.v4_patches.layer_types import (
+                            relax_layer_types_validator,
+                        )
+
+                        relax_layer_types_validator()
+                        try:
+                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
+                        except Exception as retry_exc:
+                            processor = None
+                            logging.warning(
+                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
+                            )
+                    else:
+                        # Some models do not provide an AutoProcessor
+                        processor = None
+                        logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
 
             chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
             # Update chat_template if chat_template is given
@@ -428,7 +453,16 @@ def build_dataloader(
 
             ds_raw = ds
             truncate = cfg_ds.get("truncate", max_length is not None)
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
+
+            post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
+
+            ds = PreTokenizedDatasetWrapper(
+                ds_raw,
+                processor,
+                max_length=max_length,
+                truncate=truncate,
+                post_tokenize_hook=post_tokenize_hook,
+            )
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -439,7 +473,7 @@ def build_dataloader(
                     ds,
                     pack_size=packing_cfg.get("pack_size", max_length),
                     padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
-                    drop_long_samples=packing_cfg.get("drop_long_samples", False),
+                    drop_long_samples=packing_cfg.get("drop_long_samples", True),
                     max_packs=packing_cfg.get("max_packs", None),
                     ds_raw=ds_raw,
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
@@ -866,33 +900,39 @@ class FinetuneRecipeForVLM(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batch_idx, batches in enumerate(self.step_scheduler):
-                log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                # log
-                self.log_train_metrics(log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batch_idx, batches in enumerate(self.step_scheduler):
+                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # log
+                    self.log_train_metrics(log_data)
+                    self._update_progress_bar(pbar, log_data.metrics)
 
-                val_loss = {}
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    if self.pp_enabled:
-                        logger.warning("Validation is not supported for pipeline parallelism")
-                    else:
-                        val_log_data = self._run_validation_epoch(self.val_dataloader)
-                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                        self.log_val_metrics(val_log_data)
-                    for mp in self.model_parts:
-                        mp.train()
+                    val_loss = {}
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        if self.pp_enabled:
+                            logger.warning("Validation is not supported for pipeline parallelism")
+                        else:
+                            val_log_data = self._run_validation_epoch(self.val_dataloader)
+                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_log_data)
+                        for mp in self.model_parts:
+                            mp.train()
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        log_data.metrics["loss"],
-                        val_loss,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            log_data.metrics["loss"],
+                            val_loss,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
@@ -920,46 +960,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
-        # When CP is active, pre-compute inputs_embeds (text embed + image
-        # feature merge) on the full unsharded sequence before CP scatters
-        # input_ids to local shards.  Without this, image-token positions land
-        # on only one CP rank while pixel_values stays full-size on all ranks,
-        # causing HF's token-count check to fail.
-        _cp_mesh = (
-            self.device_mesh["cp"]
-            if (self.device_mesh is not None and "cp" in getattr(self.device_mesh, "mesh_dim_names", {}))
-            else None
+        # Routed through __call__ so FSDP2 forward pre-hook fires and
+        # unshards the vision tower's weights before the embed/scatter.
+        _model = self.model_parts[0]
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+            and not self.pp_enabled
         )
-        _cp_active = _cp_mesh is not None and _cp_mesh.size() > 1
-        if _cp_active and "pixel_values" in batch:
-            _model = self.model_parts[0]
-            if hasattr(_model, "prepare_model_inputs_for_cp") or hasattr(_model, "prepare_inputs_embeds_for_cp"):
-                # Call through model.__call__ so FSDP2 pre-forward hook fires and
-                # all-gathers sharded parameters (embed_tokens weight) to Replicate
-                # placement before the embedding lookup.  Calling the method directly
-                # bypasses the hook and causes a mixed DTensor/plain-tensor error.
-                # NOTE: gradients from image encoding are NOT tracked here — the
-                # vision encoder weights receive no gradient updates via this path.
-                # If the vision encoder must be trainable, image encoding must be
-                # moved inside the per-rank CP forward pass instead.
-                prepared_inputs = _model(
-                    input_ids=batch["input_ids"],
-                    pixel_values=batch.get("pixel_values"),
-                    image_position_ids=batch.get("image_position_ids"),
-                    mm_token_type_ids=batch.get("mm_token_type_ids"),
-                    _pre_embed_only=True,
-                )
-                if isinstance(prepared_inputs, torch.Tensor):
-                    prepared_inputs = {"inputs_embeds": prepared_inputs}
-
-                batch.pop("input_ids", None)
-                batch.pop("pixel_values", None)
-                batch.pop("image_position_ids", None)
-                batch.pop("pixel_values_videos", None)
-                batch.pop("image_grid_thw", None)
-                batch.pop("video_grid_thw", None)
-                batch.pop("n_images_per_sample", None)
-                batch.update(prepared_inputs)
+        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+            with torch.no_grad():
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            for k in VLM_INPUT_KEYS:
+                batch.pop(k, None)
+            batch.update(prepared)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
@@ -1043,7 +1059,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            with sync_ctx, train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1174,7 +1190,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             # PP uses sum reduction per microbatch (no internal normalization).
             # Divide by num_label_tokens to get the mean loss, same as non-PP.
-            reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss / num_label_tokens if num_label_tokens > 0 else reporting_loss * 0.0
             reporting_loss = reporting_loss.float().to(self.dist_env.device)
             # Send loss to first rank from the last PP stage of rank0's mesh coords.
             # This avoids picking a global-rank sender from a different EP/PP group.
@@ -1228,19 +1244,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+
+                _model = self.model_parts[0]
+                _cp_active = (
+                    self.device_mesh is not None
+                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+                    and self.device_mesh["cp"].size() > 1
+                    and not self.pp_enabled
+                )
+                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                    with torch.no_grad():
+                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                    for k in VLM_INPUT_KEYS:
+                        batch.pop(k, None)
+                    batch.update(prepared)
+
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
-
-                if (
-                    self.device_mesh
-                    and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-                ):
-                    batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
-                    )
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):

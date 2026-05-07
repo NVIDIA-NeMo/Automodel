@@ -48,6 +48,8 @@ DTYPE_MAP = {
     "I64": torch.int64,
     "BF16": torch.bfloat16,
     "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
 }
 
 HF_DCP_VERSION: float = 1.0

@@ -643,6 +643,11 @@ class Checkpointer:
             and getattr(mod, "padding_idx", None) is not None
             for mod in model.modules()
         )
+        # Models that know the upcoming load will fully populate every tensor
+        # (e.g. Devstral FP8 via its state_dict_adapter) can opt out of HF's
+        # random init. Skipping also sidesteps stage-divergent DTensor
+        # collectives inside `initialize_weights()` that would hang PP setups.
+        owns_weight_load = bool(getattr(model, "_skip_init_weights_on_load", False))
         skip_initialize_weights = (
             model_class
             in [
@@ -652,6 +657,7 @@ class Checkpointer:
             or is_nemotron_v2
             or is_nemotron_v3_hf
             or has_padding_idx
+            or owns_weight_load
         )
         if not skip_initialize_weights:
             for _, module in model.named_modules():
@@ -924,7 +930,13 @@ class Checkpointer:
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
-            fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
+            pre_shard_hf_state_dict_keys = (
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+            )
+            if pre_shard_hf_state_dict_keys:
+                fqn_to_file_index_mapping = {k: 1 for k in pre_shard_hf_state_dict_keys}
+            else:
+                fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
@@ -986,7 +998,15 @@ class Checkpointer:
             Configured storage reader or None for other formats.
         """
         if self.config.model_save_format == SerializationFormat.SAFETENSORS or is_init_step:
-            if key_mapping is None:
+            # The upstream HuggingFaceStorageReader delegates dtype decoding to
+            # safetensors.torch._TYPES, which does not yet recognize the FP8
+            # scale dtypes emitted by some quantized HF checkpoints (e.g.
+            # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
+            # read_metadata → DCP ends up with metadata=None on every rank).
+            # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
+            # so prefer it for base-model HF loads. Mid-training DCP loads may
+            # still use the faster upstream reader.
+            if key_mapping is None and not is_init_step:
                 try:
                     from torch.distributed.checkpoint.hf_storage import (
                         HuggingFaceStorageReader as _UpstreamHFReader,

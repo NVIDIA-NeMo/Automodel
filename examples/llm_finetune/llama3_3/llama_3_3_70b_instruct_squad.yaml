@@ -102,3 +102,4 @@ lr_scheduler:
 
 ci:
   recipe_owner: akoumpa
+  nodes: 4

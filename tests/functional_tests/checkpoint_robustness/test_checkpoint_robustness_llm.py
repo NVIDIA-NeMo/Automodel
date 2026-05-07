@@ -35,6 +35,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _MODELS_REQUIRING_BUFFER_REINIT,
+    _reinit_non_persistent_buffers,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -64,6 +68,7 @@ def _extract_custom_args(argv):
         "--check_phantom_keys",
         "--check_resume",
         "--hf_device_map_auto",
+        "--skip_hf_reload",
     }
     custom = {}
     remaining = []
@@ -148,14 +153,31 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
     """
     schedule = trainer.pp.info.schedule
     pp_batch_size = trainer.pipeline_config.pp_batch_size
-    seq_len = len(input_ids)
+    orig_seq_len = len(input_ids)
+
+    # PP recv buffer shapes are locked at first forward. r0.4.0 lacks
+    # AutoPipeline.update_seq_len (added in #1689) to resize on the fly, so
+    # discover the locked seq_len from the stages and pad input_ids to match
+    # for the forward pass. Captured logits are sliced back to orig_seq_len.
+    def _discover_pp_seq_len() -> int:
+        pp_seq_len = getattr(trainer.pp, "pp_seq_len", None)
+        if pp_seq_len:
+            return pp_seq_len
+        for stage in getattr(trainer.pp.info, "stages", None) or ():
+            for meta in getattr(stage, "inputs_meta", None) or ():
+                if meta.ndim >= 2 and meta.shape[1] > 0:
+                    return meta.shape[1]
+        ds_seq_length = trainer.cfg.get("dataset.seq_length", None)
+        return ds_seq_length or orig_seq_len
+
+    pp_seq_len = _discover_pp_seq_len()
+    if orig_seq_len < pp_seq_len:
+        input_ids = list(input_ids) + [0] * (pp_seq_len - orig_seq_len)
 
     # Replicate the prompt to pp_batch_size so the schedule's batch split is valid.
     ids = torch.tensor([input_ids] * pp_batch_size, device=device, dtype=torch.long)
     attention_mask = torch.ones_like(ids)
     targets = torch.zeros_like(ids) if trainer.pp.info.has_last_stage else None
-
-    trainer.pp.update_seq_len(seq_len)
 
     captured = [None]
 
@@ -186,9 +208,9 @@ def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
         vocab_size = getattr(getattr(config, "text_config", None), "vocab_size", None)
     assert vocab_size is not None, "could not resolve vocab_size from model config"
 
-    buf = torch.zeros((1, seq_len, vocab_size), device=device, dtype=torch.float32)
+    buf = torch.zeros((1, orig_seq_len, vocab_size), device=device, dtype=torch.float32)
     if trainer.pp.info.has_last_stage and captured[0] is not None:
-        buf.copy_(captured[0][:1])
+        buf.copy_(captured[0][:1, :orig_seq_len, :])
 
     pp_mesh = trainer.device_mesh["pp"]
     pp_group = pp_mesh.get_group()
@@ -214,6 +236,31 @@ def _get_logits(model, input_ids, device, trainer=None) -> torch.Tensor:
         return logits.float().cpu()
 
 
+def _reinit_rotary_per_module(model, default_device):
+    """Recompute DeciLM / Gemma3 style non-persistent rotary buffers on each
+    module's own device.
+
+    HF `from_pretrained` in transformers 5.x leaves ``inv_freq`` uninitialized
+    for models whose rotary buffers are computed in ``__init__`` and never
+    saved to the state dict (e.g. nemotron-nas, gemma3). With
+    ``device_map='auto'`` each rotary module can live on a different GPU, so
+    we drive the recompute per-module using its own inv_freq device rather
+    than a single fixed device.
+    """
+    model_type = getattr(model.config, "model_type", None)
+    if model_type not in _MODELS_REQUIRING_BUFFER_REINIT:
+        return model
+    for mod in model.modules():
+        inv = getattr(mod, "inv_freq", None)
+        if inv is None:
+            continue
+        mod_device = inv.device
+        if mod_device.type == "meta":
+            mod_device = next((p.device for p in mod.parameters()), default_device)
+        _reinit_non_persistent_buffers(mod, mod_device, model_type=model_type)
+    return model
+
+
 def _fix_meta_rotary_embeddings(model):
     """Re-materialize RotaryEmbedding tensors stuck on meta device.
 
@@ -234,6 +281,78 @@ def _fix_meta_rotary_embeddings(model):
     return model
 
 
+def _prepopulate_hf_dynamic_modules_cache(local_dir: Path | str) -> None:
+    """Copy every ``.py`` from ``local_dir`` into HF's dynamic-modules cache.
+
+    Works around a transformers<=5.5.x bug in the local-dir branch of
+    ``dynamic_module_utils.get_cached_module_file``: it only copies the
+    modeling file's *direct* relative imports into
+    ``HF_MODULES_CACHE/transformers_modules/<submodule>/``. Transitive
+    imports (e.g. ``fused_mha_with_cache.py`` imports ``.triton_attention``)
+    are later discovered by ``get_relative_import_files`` at module-load
+    time and fail with ``FileNotFoundError`` because they never got copied.
+
+    Pre-seeding the cache dir with all ``.py`` files from the consolidated
+    dir makes the filecmp-gated copies no-ops and ensures every transitive
+    import is resolvable.
+    """
+    import shutil
+
+    try:
+        from transformers.dynamic_module_utils import (
+            HF_MODULES_CACHE,
+            TRANSFORMERS_DYNAMIC_MODULE_NAME,
+            _sanitize_module_name,
+        )
+    except ImportError:
+        return
+
+    local_dir = Path(local_dir)
+    if not local_dir.is_dir():
+        return
+    submodule = _sanitize_module_name(local_dir.name)
+    dst = Path(HF_MODULES_CACHE) / TRANSFORMERS_DYNAMIC_MODULE_NAME / submodule
+    dst.mkdir(parents=True, exist_ok=True)
+    for src_py in local_dir.rglob("*.py"):
+        if src_py.name == "__init__.py":
+            continue
+        rel = src_py.relative_to(local_dir)
+        dst_py = dst / rel
+        dst_py.parent.mkdir(parents=True, exist_ok=True)
+        if not dst_py.exists():
+            shutil.copy2(src_py, dst_py)
+
+
+def _tp_size_from_argv(argv) -> int:
+    """Peek at --distributed.tp_size / --config YAML without constructing the cfg.
+
+    Returns 1 if no TP setting is found. Used before cfg parsing to pick a
+    reasonable default kl_threshold.
+    """
+    for i, a in enumerate(argv):
+        if a == "--distributed.tp_size" and i + 1 < len(argv):
+            try:
+                return int(argv[i + 1])
+            except (TypeError, ValueError):
+                return 1
+    config_path = None
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            config_path = argv[i + 1]
+            break
+    if config_path:
+        try:
+            import yaml
+
+            with open(config_path) as f:
+                raw_cfg = yaml.safe_load(f) or {}
+            tp = (raw_cfg.get("distributed") or {}).get("tp_size", 1)
+            return int(tp) if tp is not None else 1
+        except Exception:
+            pass
+    return 1
+
+
 def _rank0() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
@@ -247,7 +366,15 @@ def test_checkpoint_robustness():
     """Train -> checkpoint -> reload automodel from consolidated -> reload vanilla HF, compare logits."""
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
-    kl_threshold = float(custom_args.get("kl_threshold", "0"))
+    # When tensor parallelism is active the forward pass uses row-parallel
+    # all-reduces and cuBLASLt plan caches whose order of accumulation is
+    # process-dependent; this produces ULP-level bf16 drift between the
+    # trainer's and restored model's logits even with bit-identical weights.
+    # Use a small tolerance when TP>1; keep strict 0 otherwise so real
+    # save/load regressions in non-TP setups still fail.
+    _tp_size = _tp_size_from_argv(config_argv)
+    _default_kl_threshold = "1e-5" if _tp_size > 1 else "0"
+    kl_threshold = float(custom_args.get("kl_threshold", _default_kl_threshold))
     hf_kl_threshold = float(custom_args.get("hf_kl_threshold", "5e-3"))
     cross_tp_size = int(custom_args.get("cross_tp_size", "0"))
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
@@ -261,6 +388,7 @@ def test_checkpoint_robustness():
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
+    skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
 
     input_ids = _get_input_ids(tokenizer_name)
 
@@ -294,6 +422,21 @@ def test_checkpoint_robustness():
 
     is_peft = hasattr(cfg, "peft")
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
+    # Some FP8-quantized checkpoints (e.g. ministral3) require dequantize=True
+    # at load time to avoid a Triton-only FP8 matmul kernel dispatch in the
+    # vanilla HF forward pass (Phase 4).  Materialise the yaml quantization
+    # sub-tree into an HF config object here so Phase 4 can forward it
+    # to `from_pretrained` — passing the raw ConfigNode directly would
+    # trip transformers' internal deepcopy (triggers ConfigNode.__getattr__
+    # on `__setstate__`, which then fails recursively).
+    _raw_qc = getattr(cfg.model, "quantization_config", None)
+    if _raw_qc is not None and hasattr(_raw_qc, "instantiate"):
+        try:
+            original_quantization_config = _raw_qc.instantiate()
+        except Exception:
+            original_quantization_config = None
+    else:
+        original_quantization_config = _raw_qc
 
     del trainer
     gc.collect()
@@ -316,11 +459,15 @@ def test_checkpoint_robustness():
     # Pre-populate HF dynamic module cache on rank 0 to prevent filesystem races
     # when all ranks simultaneously load trust_remote_code models from local paths.
     # On shared filesystems (e.g. Lustre), concurrent shutil.copy2 calls from
-    # multiple ranks cause PermissionError.
+    # multiple ranks cause PermissionError. Also seed all transitive .py
+    # imports so transformers' local-dir branch (which only copies direct
+    # imports of the modeling file) doesn't fail on files imported
+    # indirectly (e.g. Nemotron-Flash's triton_attention.py).
     if not is_peft:
         if _rank0():
             from transformers import AutoConfig
 
+            _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
             try:
                 AutoConfig.from_pretrained(str(consolidated_dir), trust_remote_code=True)
             except Exception:
@@ -351,25 +498,72 @@ def test_checkpoint_robustness():
     torch.cuda.empty_cache()
     _barrier()  # ensure all ranks free memory before rank 0 loads HF model
 
-    if _rank0():
+    if skip_hf_reload:
+        if _rank0():
+            print("[Phase 4] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
+    elif _rank0():
+        from contextlib import nullcontext
+
         from transformers import AutoModelForCausalLM
 
+        # Nemotron-Flash's custom ``LlamaRotaryEmbedding.__init__`` does
+        # ``torch.arange(...).to(device)`` which blows up under transformers 5.x's
+        # unconditional ``torch.device("meta")`` init context. Wrap HF loads in
+        # ``no_hf_meta_device`` so the model is built on a real device; we rely on
+        # this only for trust_remote_code models since standard HF models init
+        # correctly under meta.
+        try:
+            from nemo_automodel._transformers.model_init import no_hf_meta_device
+
+            _no_meta = no_hf_meta_device() if trust_remote_code else nullcontext()
+        except ImportError:
+            _no_meta = nullcontext()
+
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
+        # Nemotron-Flash's config ships ``attn_implementation="fused_mha"`` which
+        # transformers 5.x rejects in ``_check_and_adjust_attn_implementation``
+        # (only ``eager`` + registered ALL_ATTENTION_FUNCTIONS keys are accepted).
+        # Force a universally accepted impl; Nemotron-Flash routes
+        # ``flash_attention_2`` through its own fused path internally.
+        if trust_remote_code and "attn_implementation" not in hf_kwargs:
+            hf_kwargs["attn_implementation"] = "flash_attention_2"
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
         if hf_device_map_auto:
             hf_kwargs["device_map"] = "auto"
+        if original_quantization_config is not None:
+            hf_kwargs["quantization_config"] = original_quantization_config
 
         if is_peft:
             from peft import PeftModel
 
-            if hf_device_map_auto:
-                base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
-            else:
-                base_model = _fix_meta_rotary_embeddings(
-                    AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
-                ).to(device)
+            with _no_meta:
+                if hf_device_map_auto:
+                    base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                else:
+                    base_model = _fix_meta_rotary_embeddings(
+                        AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                    ).to(device)
+            # Re-init non-persistent rotary buffers for ``model_type`` values
+            # in ``_MODELS_REQUIRING_BUFFER_REINIT`` (``nemotron-nas``,
+            # ``gemma3``) — their ``inv_freq`` is computed in ``__init__`` and
+            # never written to the checkpoint; meta-device init leaves
+            # garbage values after ``from_pretrained``.
+            _reinit_rotary_per_module(base_model, device)
+            # For Nemotron-Flash (``model_type=="nemotron_flash"``) the
+            # ``inv_freq`` buffer also lands garbage under HF load but its
+            # NTK formula is non-standard, so route through the dedicated
+            # ``fix_rotary_embeddings`` patch which installs Flash's own NTK
+            # formula and mirrors Flash's native forward.
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+
+                if should_fix_rotary_embeddings([base_model]):
+                    fix_rotary_embeddings([base_model])
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt_step_dir / "model"))
             hf_logits = _get_logits(peft_model, input_ids, device)
 
@@ -390,12 +584,27 @@ def test_checkpoint_robustness():
 
             del peft_model, base_model
         else:
-            if hf_device_map_auto:
-                hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
-            else:
-                hf_model = _fix_meta_rotary_embeddings(
-                    AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
-                ).to(device)
+            _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
+            with _no_meta:
+                if hf_device_map_auto:
+                    hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                else:
+                    hf_model = _fix_meta_rotary_embeddings(
+                        AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                    ).to(device)
+            # Re-init non-persistent rotary buffers for nemotron-nas / gemma3
+            # (``_MODELS_REQUIRING_BUFFER_REINIT`` allow-list). See PEFT branch
+            # above for details.
+            _reinit_rotary_per_module(hf_model, device)
+            # For Nemotron-Flash: install NTK inv_freq via dedicated patch.
+            if trust_remote_code:
+                from nemo_automodel._transformers.v4_patches.rotary import (
+                    fix_rotary_embeddings,
+                    should_fix_rotary_embeddings,
+                )
+
+                if should_fix_rotary_embeddings([hf_model]):
+                    fix_rotary_embeddings([hf_model])
             hf_logits = _get_logits(hf_model, input_ids, device)
             del hf_model
 

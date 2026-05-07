@@ -379,6 +379,98 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     assert recipe.optimizer[0].zero_grad_called
 
 
+def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
+    """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu", rank=0, is_main=False)
+    # No "pp" in dim_names -> src_rank = mesh.reshape(-1)[-1].item(). With rank != src_rank
+    # and is_main=False, neither distributed send nor recv branch fires.
+    recipe.device_mesh = SimpleNamespace(mesh=torch.tensor([1]), mesh_dim_names=("dp",))
+    recipe.moe_mesh = None
+    recipe.loss_fn = object()
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = True
+    recipe.optimizer = [_DummyOptimizer()]
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+    recipe.cfg = _Cfg(fp8=None)
+    recipe.lr_scheduler = None
+    recipe.timestamp = 0.0
+    recipe.distributed_config = None
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    recipe._get_cp_group_size = lambda: 1
+
+    # Build a batch whose (labels != -100).sum() == num_label_tokens_in_batch.
+    seq = [1] * num_label_tokens_in_batch + [-100] * (4 - num_label_tokens_in_batch)
+    batches = [
+        {
+            "labels": torch.tensor([seq]),
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        }
+    ]
+    return recipe, batches
+
+
+def _patch_pp_optim_step_dependencies(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: None,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: None,
+    )
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_pp_zero_label_tokens_no_nan(monkeypatch):
+    """Regression for PR #1985: PP reporting loss must be 0.0 (not NaN) when num_label_tokens=0.
+
+    With pipeline parallelism enabled, _run_train_optim_step divides reporting_loss by
+    num_label_tokens. If every label in the batch is the ignore_index (-100), the divisor
+    is zero and the reported metric would be NaN without the guard at finetune.py:1136.
+    """
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=0)
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        # Mirror the PP path: append a finite per-microbatch sum loss. With the guard,
+        # this must still yield reporting_loss == 0.0.
+        loss_buffer.append(torch.tensor(5.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert isinstance(metrics, MetricsSample)
+    assert metrics.metrics["num_label_tokens"] == 0
+    loss = metrics.metrics["loss"]
+    assert loss == loss, f"reporting loss must not be NaN, got {loss}"
+    assert loss == 0.0, f"reporting loss must be 0.0 when num_label_tokens=0, got {loss}"
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
+    """PP reporting loss is the summed microbatch loss divided by num_label_tokens."""
+    recipe, batches = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=4)
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        loss_buffer.append(torch.tensor(8.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert metrics.metrics["num_label_tokens"] == 4
+    assert metrics.metrics["loss"] == pytest.approx(8.0 / 4)
+
+
 # -----------------------------------------------------------------------------
 # AutoProcessor exception handling test
 # -----------------------------------------------------------------------------
@@ -434,6 +526,48 @@ def test_autoprocessor_exception_handling(caplog):
         assert processor is None
         mock_from_pretrained.assert_called_once_with("test/model")
 
+
+def test_autoprocessor_retries_on_layer_types_mismatch():
+    """On StrictDataclassClassValidationError from validate_layer_type,
+    relax the validator globally and retry AutoProcessor.from_pretrained once."""
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    stub_processor = MagicMock()
+    calls = {"n": 0}
+
+    def fake_from_pretrained(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
+            raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
+        return stub_processor
+
+    with patch('transformers.AutoProcessor.from_pretrained', side_effect=fake_from_pretrained), \
+         patch('nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator',
+               return_value=True) as mock_relax, \
+         patch('nemo_automodel.components.training.rng.StatefulRNG'), \
+         patch('torch.utils.data.distributed.DistributedSampler'), \
+         patch('nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS', {'MagicMock': MagicMock()}):
+
+        cfg_ds = MagicMock()
+        cfg_ds.instantiate.return_value = []
+        cfg_ds.path_or_dataset = "test/dataset"
+        cfg_ds.get.side_effect = lambda key, default=None: {
+            "pretokenize": False, "packing": None, "max_length": None,
+            "chat_template": None, "preload_media": False,
+        }.get(key, default)
+
+        cfg_dl = MagicMock()
+        cfg_dl.get.return_value = None
+        cfg_dl.instantiate.return_value = MagicMock()
+
+        dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "stepfun-ai/Step-3.5-Flash", None, None, 123, 1)
+
+        assert processor is stub_processor
+        assert calls["n"] == 2
+        mock_relax.assert_called_once()
 
 
 def test_autoprocessor_loads_inside_first_rank_per_node():
@@ -1040,20 +1174,35 @@ class TestBuildCheckpointConfig:
         assert config.save_consolidated is False
         assert config.is_peft is True
 
-    def test_build_checkpoint_config_rejects_peft_with_torch_save(self):
-        """Test that PEFT with torch_save format raises error."""
+    def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
+        """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+        from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
+            "checkpoint_dir": "/user/ckpt/",
+            # torch_save-specific / incompatible options that must be discarded:
+            "save_consolidated": False,
+            "is_async": True,
         }
 
-        with pytest.raises(ValueError, match="PEFT checkpointing is not supported for torch_save"):
-            build_checkpoint_config(
+        with caplog.at_level("WARNING", logger="nemo_automodel.recipes.vlm.finetune"):
+            config = build_checkpoint_config(
                 cfg_ckpt=cfg_ckpt,
                 cache_dir=None,
                 model_repo_id="org/model",
                 is_peft=True,
             )
+
+        assert any("discarding" in rec.message.lower() for rec in caplog.records)
+        assert config.is_peft is True
+        assert config.model_save_format == SerializationFormat.SAFETENSORS
+        # checkpoint_dir is preserved from the user config
+        assert config.checkpoint_dir == "/user/ckpt/"
+        # other user-provided torch_save options are discarded (defaults restored)
+        assert config.save_consolidated is True
+        assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
         """Test that HF_HUB_CACHE is used when cache_dir is None."""

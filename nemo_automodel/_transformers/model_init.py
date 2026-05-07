@@ -29,6 +29,11 @@ from contextlib import contextmanager
 import torch
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, PretrainedConfig
+
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
 from transformers.modeling_utils import PreTrainedModel
 
 # For models that still accesses config.pad_token_id after v5 removes it in PretrainedConfig
@@ -143,6 +148,36 @@ def local_torch_dtype(
         torch.set_default_dtype(original_dtype)
 
 
+def _propagate_torch_dtype_to_subconfigs(hf_config, torch_dtype: torch.dtype) -> None:
+    """Recursively set ``torch_dtype`` on ``hf_config`` and all nested sub-configs.
+
+    Multimodal configs (e.g. ``Gemma4ForConditionalGeneration``) hold nested
+    sub-configs such as ``text_config``, ``vision_config``, and ``audio_config``.
+    During model construction, HF builds sub-modules via
+    ``AutoModel.from_config(sub_config)``, which reads ``torch_dtype`` from the
+    sub-config rather than the parent. Without propagation, those sub-modules
+    keep the checkpoint dtype while directly instantiated ``nn.Linear`` modules
+    take the requested default dtype, producing a mixed-dtype model that FSDP2's
+    uniform-original-dtype check rejects.
+
+    Args:
+        hf_config: The top-level HuggingFace config to update in place.
+        torch_dtype: The dtype to assign to every nested ``PretrainedConfig``.
+    """
+    seen: set[int] = set()
+
+    def _recurse(cfg) -> None:
+        if id(cfg) in seen:
+            return
+        seen.add(id(cfg))
+        cfg.torch_dtype = torch_dtype
+        for value in vars(cfg).values():
+            if isinstance(value, PretrainedConfig):
+                _recurse(value)
+
+    _recurse(hf_config)
+
+
 def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     """
     Check if a HuggingFace config is compatible with our custom model implementation.
@@ -205,7 +240,7 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
-        except ValueError as e:
+        except (ValueError, StrictDataclassClassValidationError) as e:
             err = str(e)
             if "does not recognize this architecture" in err:
                 raise ValueError(
@@ -220,7 +255,9 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
                 ) from e
             # Some upstream configs (e.g. stepfun-ai/Step-3.5-Flash) ship
             # layer_types longer than num_hidden_layers, which newer transformers
-            # versions reject during config instantiation. Fix the raw dict and retry.
+            # versions reject during config instantiation. huggingface_hub wraps
+            # the validator's ValueError in StrictDataclassClassValidationError
+            # (not a ValueError subclass), so both exception types must be caught.
             if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
                 hf_config = _load_config_with_layer_types_fix(
                     pretrained_model_name_or_path,
@@ -643,6 +680,15 @@ def __init_model(
     )
     architectures = get_architectures(hf_config)
 
+    # Propagate the user-requested dtype to the top-level config and every nested
+    # sub-config (text/vision/audio). Multimodal models like Gemma4 build their
+    # sub-towers via AutoModel.from_config(sub_config), which reads torch_dtype
+    # from the sub-config; without this, sub-towers stay at the checkpoint dtype
+    # while directly instantiated modules (lm_head, embed_vision, embed_audio)
+    # take the requested dtype, tripping FSDP2's uniform-dtype check.
+    if torch_dtype != "auto":
+        _propagate_torch_dtype_to_subconfigs(hf_config, torch_dtype)
+
     # Streaming BnB loading: when quantization is requested and we're loading from a
     # pretrained checkpoint, use streaming quantization to avoid materializing the full
     # bf16 model in memory. This is critical for unified-memory systems (DGX Spark)
@@ -733,9 +779,6 @@ def __init_model(
                 from nemo_automodel.components.models.common.utils import BackendConfig
 
                 kwargs["backend"] = BackendConfig(**kwargs["backend"])
-            # Override config's torch_dtype with user-requested dtype so model __init__ uses correct dtype
-            if torch_dtype != "auto":
-                hf_config.torch_dtype = torch_dtype
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 return True, model_cls(hf_config, *model_args, **kwargs)
 

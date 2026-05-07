@@ -288,29 +288,35 @@ class TrainBiEncoderRecipe(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            # The step scheduler yields a list of batches for gradient accumulation
-            for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
-                self.log_train_metrics(train_log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                # The step scheduler yields a list of batches for gradient accumulation
+                for batches in self.step_scheduler:
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
-                val_loss = None
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    val_log_data = self._run_validation_epoch(self.val_dataloader)
-                    self.log_val_metrics(val_log_data)
-                    val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
-                    for mp in self.model_parts:
-                        mp.train()
+                    val_loss = None
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        self.log_val_metrics(val_log_data)
+                        val_loss = {"val_loss": val_log_data.metrics["val_loss"]}
+                        for mp in self.model_parts:
+                            mp.train()
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_loss=train_log_data.metrics["loss"],
-                        val_loss=val_loss,
-                    )
-                self._maybe_collect_garbage()
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_loss=train_log_data.metrics["loss"],
+                            val_loss=val_loss,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
@@ -341,9 +347,39 @@ class TrainBiEncoderRecipe(BaseRecipe):
             p_reps = model(passage)
 
             n_passages = self.train_n_passages
-            scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-            if model.l2_normalize:
-                scores = scores / self.temperature
+            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
+                if getattr(model, "pooling", None) == "colbert":
+                    raise NotImplementedError("Distributed in-batch negatives are not implemented for ColBERT pooling.")
+                from nemo_automodel.components.models.common.inbatch_neg_utils import (
+                    dist_gather_tensor,
+                    mask_gathered_passages_same_doc_as_positive,
+                )
+
+                local_bs = q_reps.shape[0]
+                dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+                rank = torch.distributed.get_rank() if dist_initialized else 0
+                world_size = torch.distributed.get_world_size() if dist_initialized else 1
+                all_p = dist_gather_tensor(p_reps)
+                expected_p = world_size * local_bs * n_passages
+                assert all_p.shape[0] == expected_p, f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                scores = torch.mm(q_reps, all_p.t())
+                labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
+                if model.l2_normalize:
+                    scores = scores / self.temperature
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if passage_doc_ids is not None:
+                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
+                    mask_gathered_passages_same_doc_as_positive(
+                        scores,
+                        all_doc_ids,
+                        train_n_passages=n_passages,
+                        rank=rank,
+                        local_batch_size=local_bs,
+                    )
+            else:
+                scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                if model.l2_normalize:
+                    scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
 
             loss_buffer.append(loss.clone().detach())
