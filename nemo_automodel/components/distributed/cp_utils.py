@@ -271,11 +271,23 @@ def make_cp_batch_and_ctx(
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
+    # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
+    # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    if has_inputs_embeds:
+        primary_seq_tensor = batch["inputs_embeds"]
+    else:
+        primary_seq_tensor = batch["input_ids"]
+    seq_len = primary_seq_tensor.shape[1]
+
     # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
+        batch["position_ids"] = torch.arange(0, seq_len).unsqueeze(0).to(primary_seq_tensor.device)
 
-    input_ids = batch["input_ids"]
     position_ids = batch["position_ids"]
 
     # Determine correct seq dim for CP sharding
@@ -284,12 +296,19 @@ def make_cp_batch_and_ctx(
 
     labels = batch["labels"]
 
-    # Collect all available tensors for context parallel
-    cp_buffers = [input_ids, labels, position_ids]
+    # Collect all available tensors for context parallel.  We track each
+    # cp_buffer's batch key (when sourced from ``batch``) so the padding pass
+    # below can pick the semantically-correct fill sentinel and mirror the
+    # padded tensor back into ``batch``.  ``loss_mask`` is passed as an arg
+    # (not in batch) so it has no key.
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    cp_buffers = [primary_seq_tensor, labels, position_ids]
+    # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
-    cp_no_restore_buffers = {input_ids, labels}
+    cp_no_restore_buffers = {primary_seq_tensor, labels}
+    batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
-    # Add loss_mask if available
+    # Add loss_mask if available (passed as arg, not in batch -> no key)
     if loss_mask is not None:
         cp_buffers.append(loss_mask)
         cp_seq_dims.append(1)
@@ -298,9 +317,49 @@ def make_cp_batch_and_ctx(
     # Add padding_mask if available in batch
     if "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
+        batch_buffer_keys[len(cp_buffers)] = "padding_mask"
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
+
+    # Pad sequence length to be divisible by 2 * cp_size (required by
+    # context_parallel load balancing). The inputs_embeds path can hit
+    # arbitrary seq lengths from the VLM collator, so we pad here rather
+    # than relying on dataset-side padding.
+    #
+    # Per-buffer pad sentinels: each tensor's "ignore" value is semantic, not
+    # dtype-derived.  ``labels``/``padding_mask``/``attention_mask`` are all
+    # int/bool but have different ignore conventions.  Falling through to 0
+    # for ``padding_mask`` (== False == "real token") would tell the MoE
+    # router to route the cp-pad slots to experts -- silently wasting capacity
+    # and skewing load-balance loss.
+    PAD_FILL = {
+        "labels": -100,  # CE ignore_index
+        "padding_mask": True,  # bool: True == "this position is pad, ignore"
+        "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
+        # everything else (input_ids, position_ids, ...) -> 0
+    }
+    cp_divisor = cp_mesh.size() * 2
+    if seq_len % cp_divisor != 0:
+        pad_len = cp_divisor - (seq_len % cp_divisor)
+        new_no_restore = set()
+        for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
+            pad_shape = list(buf.shape)
+            pad_shape[dim] = pad_len
+            if buf.dtype.is_floating_point:
+                pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
+            else:
+                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
+                pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
+            old_buf = buf
+            cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
+            if old_buf in cp_no_restore_buffers:
+                new_no_restore.add(cp_buffers[i])
+        cp_no_restore_buffers = new_no_restore
+        # Mirror every batch-sourced cp_buffer back into ``batch`` so any
+        # downstream consumer reading from the dict sees the padded shape.
+        for idx, key in batch_buffer_keys.items():
+            batch[key] = cp_buffers[idx]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
