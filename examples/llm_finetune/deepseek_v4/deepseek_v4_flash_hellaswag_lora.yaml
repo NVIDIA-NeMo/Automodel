@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # LoRA fine-tuning recipe for deepseek-ai/DeepSeek-V4-Flash on HellaSwag.
-# LoRA target: 2 nodes x 8 H100-80GB = 16 GPUs, PP=2 EP=8 DP=8.
-# Estimate: routed-expert bf16 weights are ~550 GB; PP=2 and EP=8 leave
-# roughly 35 GB/rank for expert weights before activations and non-expert shards.
+# LoRA target: 4 nodes x 8 H100-80GB = 32 GPUs, PP=1 EP=32 DP=32.
+# Estimate: routed-expert bf16 weights are ~550 GB; EP=32 gives 8 routed
+# experts/rank and avoids full base optimizer state.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -23,7 +23,7 @@ seed: 1234
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 2
+  local_batch_size: 1
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 1
@@ -33,20 +33,11 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 2
-  ep_size: 8
+  pp_size: 1
+  ep_size: 32
 
   sequence_parallel: false
   activation_checkpointing: false
-
-  pipeline:
-    pp_schedule: interleaved1f1b
-    pp_microbatch_size: 1
-    layers_per_stage: 2
-    round_virtual_stages_to_pp_multiple: down
-    scale_grads_in_schedule: false
-    patch_inner_model: false
-    patch_causal_lm_model: false
 
   moe:
     reshard_after_forward: false
