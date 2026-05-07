@@ -14,9 +14,9 @@
 
 """Tests for FP8 model + PEFT dequantization logic."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from nemo_automodel._transformers.auto_model import _maybe_dequantize_fp8_for_peft
+from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass, _maybe_dequantize_fp8_for_peft
 
 # ---------------------------------------------------------------------------
 # Tests: FP8 + PEFT auto-dequantize
@@ -189,6 +189,81 @@ class TestKwargsConfigInjectionGate:
     suppresses the injection for the custom-model path while preserving the
     in-place dequantize=True mutation needed by the HF path.
     """
+
+    @staticmethod
+    def _make_build_kwargs(is_hf_model):
+        """Minimal kwargs for running _build_model through the FP8+PEFT gate."""
+        mesh = MagicMock()
+        mesh.tp_size = 1
+        mesh.cp_size = 1
+        return dict(
+            is_hf_model=is_hf_model,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            sdpa_method=None,
+            torch_dtype="auto",
+            attn_implementation="eager",
+            quantization_config=None,
+            force_hf=False,
+            model_wrapper=None,
+            autopipeline=None,
+            parallelize_fn=None,
+            qat_quantizer=None,
+            mesh=mesh,
+            loss_fn=None,
+            peft_config=MagicMock(),
+            fp8_config=None,
+            compile_config=None,
+            load_base_model=True,
+        )
+
+    @staticmethod
+    def _run_build_model_with_native_fp8(is_hf_model):
+        quant_cfg = {"quant_method": "fp8", "dequantize": False}
+        hf_config = MagicMock()
+        hf_config.quantization_config = quant_cfg
+        sentinel_model = MagicMock()
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=hf_config),
+            patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            mock_init.return_value = (not is_hf_model, sentinel_model)
+            result = _BaseNeMoAutoModelClass._build_model(
+                "some-model",
+                **TestKwargsConfigInjectionGate._make_build_kwargs(is_hf_model),
+            )
+
+        return quant_cfg, hf_config, result, sentinel_model, mock_init
+
+    def test_build_model_hf_fp8_peft_injects_config_kwarg(self):
+        """_build_model should pass mutated config through kwargs for HF from_pretrained."""
+        quant_cfg, hf_config, result, sentinel_model, mock_init = self._run_build_model_with_native_fp8(
+            is_hf_model=True
+        )
+
+        assert result is sentinel_model
+        assert mock_init.call_args.kwargs["config"] is hf_config
+        assert quant_cfg["dequantize"] is True
+
+    def test_build_model_custom_fp8_peft_does_not_inject_config_kwarg(self):
+        """_build_model should not pass duplicate config kwargs for custom model init."""
+        quant_cfg, _hf_config, result, sentinel_model, mock_init = self._run_build_model_with_native_fp8(
+            is_hf_model=False
+        )
+
+        assert result is sentinel_model
+        assert "config" not in mock_init.call_args.kwargs
+        assert quant_cfg["dequantize"] is True
 
     @staticmethod
     def _apply_gate(hf_native_quant_cfg, peft_config, pretrained_path, is_hf_model, hf_config_obj):
