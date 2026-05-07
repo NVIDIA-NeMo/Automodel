@@ -75,19 +75,20 @@ fi
 echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME  LoRA=$IS_LORA"
 
 # ============================================
-# Stage 1: Download dataset
+# Stage 1: Resolve dataset
 # ============================================
 echo "============================================"
-echo "[data] Downloading dataset..."
+echo "[data] Resolving dataset..."
 echo "============================================"
 if [ "$MEDIA_TYPE" = "image" ]; then
+    RAW_DIR="$DATA_DIR/raw"
     uv run --extra diffusion python -c "
 from datasets import load_dataset
 from pathlib import Path
 import json
 
 ds = load_dataset('diffusers/tuxemon', split='train')
-out_dir = Path('$DATA_DIR/raw')
+out_dir = Path('$RAW_DIR')
 out_dir.mkdir(parents=True, exist_ok=True)
 
 jsonl_entries = []
@@ -104,11 +105,13 @@ with open(jsonl_path, 'w') as jf:
 print(f'Extracted {len(ds)} images to {out_dir}')
 "
 else
-    uv run --extra diffusion python -c "
+    # snapshot_download into HF_HUB_CACHE (no local_dir) so the dataset persists
+    # across CI runs; preprocessing reads it directly from the snapshot path.
+    RAW_DIR=$(uv run --extra diffusion python -c "
 from huggingface_hub import snapshot_download
-snapshot_download('modal-labs/dissolve', repo_type='dataset', local_dir='$DATA_DIR/raw')
-print('Dataset downloaded successfully')
-"
+print(snapshot_download('modal-labs/dissolve', repo_type='dataset'))
+" | tail -1)
+    echo "[data] Dataset resolved at: $RAW_DIR"
 fi
 
 # ============================================
@@ -119,13 +122,13 @@ echo "[preprocess] Converting ${MEDIA_TYPE}s to latents..."
 echo "============================================"
 if [ "$MEDIA_TYPE" = "image" ]; then
     uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess image \
-        --image_dir "$DATA_DIR/raw" \
+        --image_dir "$RAW_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
         $PREPROCESS_EXTRA_ARGS
 else
     uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess video \
-        --video_dir "$DATA_DIR/raw" \
+        --video_dir "$RAW_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
         --resolution_preset 512p \
