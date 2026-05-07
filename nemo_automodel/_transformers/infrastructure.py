@@ -565,11 +565,20 @@ def apply_model_infrastructure(
     if autopipeline is None:
         print_trainable_parameters(model)  # Once model's been sharded
         # Ensure model is on the correct device.
-        # Skip when checkpoint was loaded post-shard (params are already on the
-        # target device) to avoid triggering FSDP's reset_sharded_param which
-        # fails on tied parameters (e.g. lm_head/embed_tokens with TP>1).
+        # Skip only when params are actually sharded (any DTensor in the model)
+        # AND the checkpoint was loaded post-shard. Calling model.to(device) on
+        # sharded params triggers FSDP's reset_sharded_param, which fails on
+        # tied parameters (e.g. lm_head/embed_tokens with TP>1).
         # See: https://github.com/pytorch/pytorch/issues/151085
-        if not should_load_checkpoint:
+        # In unsharded cases (single-GPU, DDP, or any combination of TP/DP/CP/EP
+        # that left params as plain tensors), model.to(device) must still run so
+        # that persistent buffers not present in the checkpoint (e.g. Gemma4's
+        # Gemma4ClippableLinear input_min/max, Gemma4TextDecoderLayer
+        # layer_scalar) reach the GPU.
+        from torch.distributed.tensor import DTensor
+
+        has_sharded_params = any(isinstance(p, DTensor) for p in model.parameters())
+        if not (should_load_checkpoint and has_sharded_params):
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
@@ -591,17 +600,14 @@ def apply_model_infrastructure(
             attach_linear_attn_position_hooks,
         )
 
-        # cp_mesh is needed by attach_cp_sdpa_hooks for both compiled and non-compiled
-        # CP.  We now use manual sequence slicing + attach_cp_sdpa_hooks for all CP>1
-        # cases; context_parallel (DTensor-throughout) is no longer used because it
-        # causes "mixed DTensor/plain tensor" errors in PyTorch's CP attention inner_fn.
-        cp_mesh_for_sdpa = mesh.device_mesh["cp"]
+        cp_mesh = mesh.device_mesh["cp"]
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
+            mp._cp_enabled = True
             attach_context_parallel_hooks(mp)
             attach_linear_attn_position_hooks(mp)
-            attach_cp_sdpa_hooks(mp, cp_mesh_for_sdpa)
+            attach_cp_sdpa_hooks(mp, cp_mesh)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model

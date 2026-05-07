@@ -2106,6 +2106,34 @@ def test_apply_cp_skips_non_te_attention(monkeypatch):
     P.apply_cp(model, cp_mesh)
 
 
+def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
+    """Gemma4 HF attention has no attn_module; PyTorch CP hooks handle it later."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    class Gemma4StyleBlock:
+        layer_type = "full_attention"
+
+        def __init__(self):
+            self.self_attn = _FakeAttnModule()
+            self.mlp = object()
+
+    model = DummyModel([Gemma4StyleBlock()])
+    cp_mesh = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+    cp_mesh.get_group.assert_not_called()
+
+
 def _setup_te_and_dist_stubs(monkeypatch, DotProductAttention):
     """Register TE and torch.distributed stubs needed by apply_cp."""
     te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
