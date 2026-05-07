@@ -478,6 +478,31 @@ def eager_attention_with_sink(
     return torch.matmul(probs, value_states).transpose(1, 2).contiguous(), probs
 
 
+def _build_indexer_topk_compressed_mask(
+    attention_mask: torch.Tensor,
+    indexer_topk: torch.Tensor,
+    n_pooled: int,
+) -> torch.Tensor:
+    """Build the additive compressed-position mask for Indexer-selected pool IDs."""
+    min_val = torch.finfo(attention_mask.dtype).min
+    indexer_topk = indexer_topk.to(device=attention_mask.device)
+    batch, seq_len = indexer_topk.shape[:2]
+    valid = indexer_topk != -1  # [B, S, K]
+    safe_idx = indexer_topk.clamp(min=0)
+    indicator_counts = torch.zeros(
+        (batch, seq_len, n_pooled),
+        dtype=torch.int32,
+        device=attention_mask.device,
+    )
+    indicator_counts.scatter_add_(-1, safe_idx, valid.to(torch.int32))
+    indicator = indicator_counts > 0
+    return torch.where(
+        indicator,
+        torch.zeros((), dtype=attention_mask.dtype, device=attention_mask.device),
+        torch.full((), min_val, dtype=attention_mask.dtype, device=attention_mask.device),
+    )  # [B, S, P]
+
+
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -873,19 +898,10 @@ class DeepseekV4Attention(nn.Module):
             if attention_mask is not None and n_pooled > 0:
                 min_val = torch.finfo(attention_mask.dtype).min
                 if indexer_topk is not None:
-                    valid = indexer_topk != -1  # [B, S, K]
-                    safe_idx = indexer_topk.clamp(min=0)
-                    indicator = torch.zeros(
-                        (batch, seq_len, n_pooled),
-                        dtype=torch.bool,
-                        device=full_kv.device,
-                    )
-                    indicator.scatter_(-1, safe_idx, valid)
-                    compressed_mask = torch.where(
-                        indicator,
-                        torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
-                        torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
-                    )  # [B, S, P]
+                    # OR-aggregate via scatter_add_: clamping -1 to 0 collides
+                    # with valid index 0, and scatter_'s duplicate-index order
+                    # is unspecified, so use count-then-threshold instead.
+                    compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled)
                 else:
                     q_pos = torch.arange(seq_len, device=full_kv.device)
                     p_pos = torch.arange(n_pooled, device=full_kv.device)
