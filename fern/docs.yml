@@ -50,14 +50,14 @@ experimental:
   basepath-aware: true
 
 versions:
-  - display-name: Latest
-    slug: latest
-    path: ./versions/latest.yml
-    availability: stable
   - display-name: nightly
     slug: nightly
     path: ./versions/nightly.yml
     availability: beta
+  - display-name: Latest
+    slug: latest
+    path: ./versions/latest.yml
+    availability: stable
   - display-name: "0.4.0 · 26.04"
     slug: v0.4
     path: ./versions/v0.4.yml
