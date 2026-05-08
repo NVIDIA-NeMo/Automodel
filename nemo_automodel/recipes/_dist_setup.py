@@ -196,7 +196,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     }
 
 
-def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
+def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext:
     """Parse ``cfg.distributed`` and create device meshes.
 
     This is the main entry-point called by recipes.  It converts the
@@ -205,12 +205,18 @@ def setup_distributed(cfg: Any, world_size: int) -> MeshContext:
 
     Args:
         cfg: Top-level config (must have a ``distributed`` key).
-        world_size: Total number of processes in the job.
+        world_size: Total number of processes in the job. If ``None`` (default),
+            the value is auto-detected from ``torch.distributed`` if initialized,
+            or from the ``WORLD_SIZE`` environment variable, falling back to ``1``.
 
     Returns:
         A :class:`MeshContext` with device meshes attached.
     """
+    from nemo_automodel.components.distributed.init_utils import get_world_size_safe
     from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
+
+    if world_size is None:
+        world_size = get_world_size_safe()
 
     cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
     parsed = parse_distributed_section(cfg_dict)
