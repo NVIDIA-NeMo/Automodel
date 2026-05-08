@@ -12,7 +12,13 @@ Unified skill for adding, updating, moving, and removing pages on the NeMo AutoM
 
 **ALL docs edits happen under `fern/`.** The legacy Sphinx tree at `docs/` is read-only reference; do not add new pages there. New pages, release notes, migration guides — everything belongs under `fern/versions/nightly/pages/`.
 
-**`nightly` is the canonical content tree.** All edits land in `fern/versions/nightly/pages/`. `latest.yml` and `v0.4.yml` are nav copies whose `path:` lines also point at `./nightly/pages/...` — they're aliases until we cut a real frozen v0.4.0 snapshot from the tag. A single edit therefore flows to all three URL slugs (`/nightly/...`, `/latest/...`, `/v0.4/...`). **Do not duplicate pages across version folders.** When the next GA cuts (e.g. `v0.5`), `cp -r versions/nightly versions/v0.5` produces the frozen snapshot and `versions/latest.yml` is repointed at it.
+**Two real content trees, plus a GA alias YAML.**
+
+- `fern/versions/nightly/pages/` — bleeding-edge tree. Every PR lands here. Mounted at the `nightly` URL slug via `nightly.yml`.
+- `fern/versions/v0.4/pages/` — frozen 0.4.0 GA snapshot. Independent copy of every page. Only changes via deliberate back-port. Mounted at the `v0.4` URL slug via `v0.4.yml`.
+- `fern/versions/latest.yml` — GA alias. Its `path:` lines mount the current GA's content (today: `./v0.4/pages/...`). Repointed at the next GA's tree when one is cut.
+
+The two trees were byte-for-byte identical at the moment 0.4.0 shipped (today, just after the migration), but they will diverge as nightly accumulates post-release edits and v0.4 stays frozen. **Default editing target is `nightly/`.** Only touch `v0.4/` for explicit back-ports — call out the divergence in the PR description.
 
 **Sidebar fidelity rule.** Section captions, page titles, and Model Coverage child ordering must match the **published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/latest** verbatim. Don't silently shorten a title or reorder siblings — the docs PM and content engineers diff against the published site and any drift is treated as a regression. If you want a shorter sidebar label, change the toctree-derived display name in the source — never just retitle in the MDX.
 
@@ -26,10 +32,11 @@ fern/
 ├── assets/                       # Logos and shared SVGs (NVIDIA_dark/light/symbol)
 ├── components/                   # BadgeLinks.tsx, Tag.tsx, CustomFooter.tsx
 ├── versions/
-│   ├── nightly.yml               # CANONICAL nav — bleeding-edge, edited every PR
-│   ├── latest.yml                # GA alias — copy of nightly.yml; sync after every nav edit
-│   ├── v0.4.yml                  # Frozen GA pin — copy of nightly.yml until a real v0.4.0 snapshot is migrated
-│   └── nightly/pages/            # MDX content (130+ pages) — single source of truth
+│   ├── nightly.yml               # Nav for bleeding-edge — paths → ./nightly/pages/
+│   ├── nightly/pages/            # Bleeding-edge MDX (edited every PR)
+│   ├── v0.4.yml                  # Nav for frozen 0.4.0 — paths → ./v0.4/pages/
+│   ├── v0.4/pages/               # Frozen 0.4.0 MDX (back-ports only)
+│   └── latest.yml                # GA alias — paths → ./v0.4/pages/ today; repointed at next GA cut
 └── product-docs/                 # GENERATED Python API reference (gitignored)
 ```
 
@@ -66,7 +73,7 @@ fern/versions/nightly/pages/get-started/installation.mdx     /latest/get-started
      slug: <short-url-segment>
    ```
 
-4. **Sync the aliases:** `cp fern/versions/nightly.yml fern/versions/latest.yml && cp fern/versions/nightly.yml fern/versions/v0.4.yml`.
+4. **Sync the aliases:** `cp fern/versions/nightly.yml fern/versions/latest.yml && sed -i '' 's|./nightly/pages/|./v0.4/pages/|g' fern/versions/latest.yml`.
 5. `make docs-check` (runs `fern check`) and verify URL resolves on `make docs` preview.
 
 ### Update a page
@@ -116,7 +123,7 @@ Request: *"Add a fine-tuning guide for Qwen3.6 under Recipes & E2E Examples."*
      slug: qwen3-6-finetune
    ```
 
-3. `cp fern/versions/nightly.yml fern/versions/latest.yml && cp fern/versions/nightly.yml fern/versions/v0.4.yml`.
+3. `cp fern/versions/nightly.yml fern/versions/latest.yml && sed -i '' 's|./nightly/pages/|./v0.4/pages/|g' fern/versions/latest.yml`.
 4. `make docs-check` then `make docs` to preview at `http://localhost:3002/latest/recipes-e2e-examples/qwen3-6-finetune`.
 
 ### Worked example: rename a slug with a redirect
@@ -264,7 +271,7 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | Old Sphinx URL breaks | Add a `redirects:` entry in `fern/docs.yml`; the redirect generator already handles `/index.html` and `.html` legacy forms |
 | Image not rendering | Use relative path (`./image.png`) for page-scoped images, not root-relative (`/image.png`) |
 | Sidebar caption looks shortened vs published site | Compare against `docs.nvidia.com/nemo/automodel/latest` and restore the verbatim title in `versions/nightly.yml` |
-| `latest.yml` or `v0.4.yml` drift from `nightly.yml` | Re-sync: `cp fern/versions/nightly.yml fern/versions/latest.yml && cp fern/versions/nightly.yml fern/versions/v0.4.yml` |
+| `latest.yml` or `v0.4.yml` drift from `nightly.yml` | Re-sync: `cp fern/versions/nightly.yml fern/versions/latest.yml && sed -i '' 's|./nightly/pages/|./v0.4/pages/|g' fern/versions/latest.yml` |
 
 ## Key references
 
