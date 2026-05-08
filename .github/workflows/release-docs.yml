@@ -93,7 +93,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.74.0
+          ref: 0796c2c2b65085259f4d14c02aa5853ff5c487a5
           path: FW-CI-templates
 
       - uses: ./FW-CI-templates/.github/actions/publish-docs
