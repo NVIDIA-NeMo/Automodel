@@ -15,11 +15,12 @@
 # pylint: disable=line-too-long
 """Tests for consolidated HF safetensors checkpointing for LLM."""
 
-from pathlib import Path
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import patch
 
+import datasets
 import torch
 import torch.distributed.tensor
 
@@ -27,7 +28,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
-import datasets
 datasets.disable_caching()
 
 

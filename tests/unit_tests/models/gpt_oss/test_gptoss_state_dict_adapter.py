@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 from unittest.mock import Mock, patch
+
+import torch
 from transformers import GptOssConfig
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
-
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
+
 
 class TestApplyKeyMapping:
     def _make_adapter(self):

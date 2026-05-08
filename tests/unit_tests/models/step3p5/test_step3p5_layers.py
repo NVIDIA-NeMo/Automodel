@@ -26,7 +26,6 @@ from nemo_automodel.components.models.step3p5.layers import (
     Step3p5RotaryEmbedding,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 

@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
-from unittest.mock import MagicMock
 
-import pytest
 import torch
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 

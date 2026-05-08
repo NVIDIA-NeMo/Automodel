@@ -27,12 +27,12 @@ from nemo_automodel.components.models.kimi_k25_vl.model import (
     KimiK25VLModel,
     KimiK25VLMultiModalProjector,
     Learnable2DInterpPosEmbDividedFixed,
+    MoonVision3dPatchEmbed,
     MoonViT3dConfig,
     MoonViT3dEncoder,
     MoonViT3dEncoderLayer,
     MoonViT3dMLP,
     MoonViT3dPretrainedModel,
-    MoonVision3dPatchEmbed,
     Rope2DPosEmbRepeated,
     _apply_rope_vision,
     get_1d_sincos_pos_embed,
@@ -1552,6 +1552,7 @@ class TestVisionAttentionFlash:
     def test_vision_attention_flash_signature(self):
         """Test vision_attention_flash has expected signature."""
         import inspect
+
         from nemo_automodel.components.models.kimi_k25_vl.model import vision_attention_flash
 
         sig = inspect.signature(vision_attention_flash)

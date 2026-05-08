@@ -14,7 +14,7 @@
 
 """Unit tests for the HYV3 Block / HYV3Model / HYV3ForCausalLM layers."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -29,7 +29,6 @@ from nemo_automodel.components.models.hy_v3.model import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

@@ -14,7 +14,6 @@
 import math
 from typing import Any, Dict, List
 
-import pytest
 import torch
 
 import nemo_automodel.components.datasets.llm.retrieval_collator as rc

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn

@@ -284,3 +284,46 @@ class TestIntegration:
     def test_backend_configuration(self, strategy_config):
         _validate_distributed_setup(MeshContext(strategy_config=strategy_config))
 
+
+
+# ---------------------------------------------------------------------------
+# Test Moe Mesh Derivation
+# ---------------------------------------------------------------------------
+
+
+class TestMoeMeshDerivation:
+    def _make_mock_mesh_with_ep(self):
+        """Mock device_mesh that has EP dims in _flatten_mapping."""
+        ep_mesh = Mock()
+        ep_mesh.mesh_dim_names = ("ep",)
+
+        root = Mock()
+        root.mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
+        root._flatten_mapping = {"ep": ep_mesh}
+        root._get_root_mesh = Mock(return_value=root)
+
+        mesh = Mock()
+        mesh.mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
+        mesh._flatten_mapping = {"ep": ep_mesh}
+        mesh._get_root_mesh = Mock(return_value=root)
+        return mesh, ep_mesh
+
+    def test_moe_mesh_derived_automatically_from_device_mesh(self):
+        """moe_mesh is derived in __post_init__. Caller does not need to pass it"""
+        mesh, ep_mesh = self._make_mock_mesh_with_ep()
+        ctx = MeshContext.from_meshes(mesh)
+        assert ctx.moe_mesh is ep_mesh
+
+    def test_moe_mesh_none_when_no_ep_dims(self):
+        """moe_mesh stays None when device_mesh has no EP dimension."""
+        mesh = Mock()
+        mesh.mesh_dim_names = ("dp_shard", "cp", "tp")
+        mesh._get_root_mesh = Mock(return_value=mesh)
+        mesh._flatten_mapping = {}
+        ctx = MeshContext.from_meshes(mesh)
+        assert ctx.moe_mesh is None 
+
+    def test_moe_mesh_none_when_no_device_mesh(self):
+        """moe_mesh stays None when device_mesh is None."""
+        ctx = MeshContext.from_meshes(None)
+        assert ctx.moe_mesh is None

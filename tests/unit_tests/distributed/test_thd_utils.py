@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import pytest
+import torch
 
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd, split_batch_into_thd_chunks
 

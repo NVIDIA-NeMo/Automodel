@@ -26,7 +26,6 @@ from nemo_automodel.components.flow_matching.time_shift_utils import (
     time_shift,
 )
 
-
 # =============================================================================
 # TestTimeShift
 # =============================================================================

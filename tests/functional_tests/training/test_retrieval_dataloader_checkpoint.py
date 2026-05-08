@@ -37,7 +37,6 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.retrieval.train_bi_encoder import build_dataloader
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
