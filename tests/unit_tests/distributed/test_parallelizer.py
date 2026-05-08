@@ -1525,8 +1525,9 @@ class TestExtractModelLayers:
 
     Covers the PR that replaced ``layers.extend(_reduce_attrs(...))`` with a
     helper that flattens ModuleList elements so each decoder layer ends up as
-    its own list entry (what AC wrapping expects), while leaving non-ModuleList
-    results (e.g. ModuleDict after PP split) appended as-is.
+    its own list entry (what AC wrapping expects). PP splitting represents kept
+    layer subsets as ModuleDicts, and those layer containers should be flattened
+    the same way.
     """
 
     def _make_layers(self, n: int) -> nn.ModuleList:
@@ -1616,14 +1617,13 @@ class TestExtractModelLayers:
         assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
 
-    def test_non_modulelist_element_appended_as_single_entry(self):
+    def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.
 
-        A ModuleDict is NOT an nn.ModuleList, so ``_extend_layers`` must fall
-        through to ``layers.append(m)`` and keep it as a single element —
-        same behaviour as before the fix (the AC loop then skips it via
-        hasattr, which is the expected PP-path behaviour and handled
-        elsewhere for the happy PP case).
+        The pipeline splitter replaces a ModuleList with a numeric-key
+        ModuleDict. ``_extract_model_layers`` must still return individual
+        layers so AC, TP follow-up logic, and FSDP layer handling see the same
+        shape as the unsplit path.
         """
         from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 
@@ -1635,9 +1635,8 @@ class TestExtractModelLayers:
 
         result = _extract_model_layers(model)
 
-        # ModuleDict is not flattened — it stays as one element.
-        assert len(result) == 1
-        assert result[0] is layer_dict
+        assert len(result) == 2
+        assert [id(r) for r in result] == [id(v) for v in layer_dict.values()]
 
     def test_fallback_branch_still_handles_modulelist(self):
         """Non-MODEL_CLS_TO_LAYERS models hit the ``hasattr(model.model, 'layers')``
@@ -1670,6 +1669,17 @@ class TestExtractModelLayers:
         result = _extract_model_layers(GenericCausalLM(layer_dict))
         assert len(result) == 3
         assert [id(r) for r in result] == [id(v) for v in layer_dict.values()]
+
+    def test_heuristic_ignores_named_moduledict(self):
+        """The unknown-model heuristic should not treat arbitrary ModuleDicts as layers."""
+
+        class UnknownWithAdapterRegistry(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.adapters = nn.ModuleDict({"default": nn.Linear(4, 4)})
+
+        with pytest.raises(ValueError, match="no ModuleList or ModuleDict found"):
+            _extract_model_layers(UnknownWithAdapterRegistry())
 
     def test_string_keyed_mistral3_fp8_vlm(self):
         """The ``"Mistral3FP8VLMForConditionalGeneration"`` string-key entry
