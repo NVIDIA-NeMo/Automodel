@@ -335,7 +335,8 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             )
             if not getattr(_cp_sdpa, "_sdpa_ok_logged", False):
                 _log.info(
-                    "CP using SDPA all-gather. Q=%s K=%s cp_rank=%s",
+                    "CP using %sSDPA all-gather. Q=%s K=%s cp_rank=%s",
+                    "packed full-mask " if packed_seq_ids_full is not None else "",
                     tuple(query.shape),
                     tuple(key_full.shape),
                     cp_rank,
@@ -490,7 +491,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 kv_indices = torch.arange(kv_start, kv_end, device=query.device)
                 scores = torch.matmul(q_float, k_float[:, :, kv_start:kv_end, :].transpose(-2, -1)) * attn_scale
 
-                allowed = kv_indices.unsqueeze(0) <= q_indices.unsqueeze(1)
+                if is_causal:
+                    allowed = kv_indices.unsqueeze(0) <= q_indices.unsqueeze(1)
+                else:
+                    allowed = torch.ones(seq_local, kv_end - kv_start, dtype=torch.bool, device=query.device)
                 if sliding_window is not None:
                     allowed = allowed & ((q_indices.unsqueeze(1) - kv_indices.unsqueeze(0)) < sliding_window)
                 if use_vision_bidirectional:
@@ -528,7 +532,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 ).unsqueeze(-1)
                 beta = torch.where(
                     torch.isfinite(chunk_lse) & new_lse_finite,
-                    torch.exp(chunk_lse - new_lse),
+                    torch.exp(safe_chunk_max - new_lse),
                     torch.zeros_like(chunk_lse),
                 ).unsqueeze(-1)
                 out_acc = out_acc * alpha + beta * torch.matmul(exp_scores, v_float[:, :, kv_start:kv_end, :])
@@ -736,6 +740,7 @@ def make_cp_batch_and_ctx(
             cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
         else:
             cp_rank = getattr(cp_mesh, "get_local_rank", lambda: 0)()
+
         seq_len = batch[primary_key].shape[1]
         if seq_len % cp_size != 0:
             raise ValueError(f"CP sequence length must be divisible by cp_size after padding, got {seq_len=} {cp_size=}")
