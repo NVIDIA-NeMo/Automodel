@@ -50,7 +50,7 @@ experimental:
   basepath-aware: true
 
 versions:
-  - display-name: nightly
+  - display-name: Nightly
     slug: nightly
     path: ./versions/nightly.yml
     availability: beta

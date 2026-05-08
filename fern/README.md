@@ -119,7 +119,7 @@ Repository source paths like `examples/llm_finetune/foo.yaml` or `nemo_automodel
 
 | display-name | slug | availability | path |
 |---|---|---|---|
-| `nightly` | `nightly` | `beta` | `./versions/nightly.yml` |
+| `Nightly` | `nightly` | `beta` | `./versions/nightly.yml` |
 | `Latest` | `latest` | `stable` | `./versions/latest.yml` |
 | `0.4.0 · 26.04` | `v0.4` | `stable` | `./versions/v0.4.yml` |
 
