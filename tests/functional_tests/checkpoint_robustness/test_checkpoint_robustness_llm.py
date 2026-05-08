@@ -526,7 +526,23 @@ def test_checkpoint_robustness():
         # Force a universally accepted impl; Nemotron-Flash routes
         # ``flash_attention_2`` through its own fused path internally.
         if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = "flash_attention_2"
+            # Nemotron-H (hybrid Mamba+attention) crashes inside
+            # ``flash_attn_varlen_func`` with ``vectorized_gather_kernel`` index
+            # OOB when HF routes its remote-code attention through the
+            # ``flash_attention_2`` varlen path. Fall back to ``sdpa`` for that
+            # model family so Phase 4 can verify the consolidated checkpoint
+            # against vanilla HF — sdpa uses PyTorch's optimized SDPA (still
+            # flash-backed when available) and skips HF's varlen routing.
+            _hf_attn_impl = "flash_attention_2"
+            try:
+                from transformers import AutoConfig as _ProbeAutoConfig
+                _probe_path = original_pretrained_path if is_peft else str(consolidated_dir)
+                _probe_cfg = _ProbeAutoConfig.from_pretrained(_probe_path, trust_remote_code=True)
+                if getattr(_probe_cfg, "model_type", None) == "nemotron_h":
+                    _hf_attn_impl = "sdpa"
+            except Exception:
+                pass
+            hf_kwargs["attn_implementation"] = _hf_attn_impl
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
@@ -743,6 +759,17 @@ def test_checkpoint_robustness():
     from nemo_automodel.components.distributed.init_utils import destroy_global_state
 
     atexit.unregister(destroy_global_state)
+
+    # Force-exit immediately. Even with destroy_global_state unregistered, PyTorch's
+    # internal atexit handlers (e.g. _python_exit, ProcessGroupNCCL watchdog shutdown)
+    # and DTensor/FSDP destructors can still issue collectives on the default PG during
+    # interpreter teardown. With MoE+EP this races between ranks (some still running
+    # pytest's AST assertion-rewriting machinery while others are issuing ALLREDUCE),
+    # causing a non-deterministic ~50% hang. os._exit(0) bypasses all Python finalizers
+    # so the OS can reclaim resources without entering NCCL.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

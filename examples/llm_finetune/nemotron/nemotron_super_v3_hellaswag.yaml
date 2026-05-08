@@ -103,8 +103,12 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   recipe_owner: adil-a
-  time: "00:25:00"
-  known_issue_id: AM-156
+  # Wall covers both the finetune phase (~5 min) and the checkpoint-robustness
+  # phase that runs in the same SLURM allocation. The robustness phase loads
+  # the 120 B HF model on rank 0 (~3 min) and runs forwards on top of the
+  # FSDP+EP setup, which together take ~20 min on H100 — bump from 25 min so
+  # there's headroom for queue + variance.
+  time: "00:45:00"
   checkpoint_robustness:
     hf_kl_threshold: 7e-2
     experts_implementation: grouped_mm
@@ -115,3 +119,9 @@ ci:
     step_scheduler.global_batch_size: 64
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
+    # Phase 4 reloads the 120B HF model on rank 0 with device_map=auto. While
+    # other ranks wait at the post-Phase-4 _barrier(), the default 60 s NCCL
+    # collective timeout (dist_env.timeout_minutes=1) trips long before the
+    # rank-0 HF load finishes (>2 min for 120B). Bump to 30 min for the
+    # robustness run only — normal training keeps the tight default.
+    dist_env.timeout_minutes: 30
