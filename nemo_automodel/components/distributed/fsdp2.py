@@ -15,11 +15,14 @@
 import logging
 from typing import Optional
 
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
+    _extract_model_layers,
+    _get_parallel_plan,
     fsdp2_strategy_parallelize,
 )
 
@@ -53,6 +56,55 @@ def _patch_is_packed_sequence_for_training() -> None:
         _fa_utils._is_packed_sequence_patched = True
     except (ImportError, AttributeError):
         pass
+
+def _apply_activation_checkpointing_single_gpu(model) -> None:
+    """Apply activation checkpointing for single-GPU training.
+
+    Mirrors the logic in ``fsdp2_strategy_parallelize`` so that models which
+    don't set ``supports_gradient_checkpointing`` (e.g. Gemma4) still get
+    sub-module-level checkpoint wrapping instead of crashing (required for 
+    larger gemma4 models lora run on single DGX Spark GPU)
+    """
+    if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+        try:
+            model.config.use_cache = False
+        except Exception:
+            pass
+
+    _use_hf_native_grad_ckpt = False
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
+
+        layers = _extract_model_layers(model)
+        _use_hf_native_grad_ckpt = (
+            bool(layers)
+            and layers[0].__class__.__module__.startswith("transformers.")
+            and isinstance(layers[0], _HFGradLayer)
+            and getattr(model, "supports_gradient_checkpointing", False)
+            and hasattr(model, "gradient_checkpointing_enable")
+        )
+    except (ImportError, Exception):
+        layers = None
+
+    if _use_hf_native_grad_ckpt:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+    else:
+        if layers is None:
+            try:
+                layers = _extract_model_layers(model)
+            except Exception:
+                logger.error("Model does not support gradient checkpointing and layer extraction failed.")
+                return
+        for i, layer in enumerate(layers):
+            if hasattr(layer, "mlp"):
+                layers[i].mlp = checkpoint_wrapper(layer.mlp)
+            if hasattr(layer, "self_attn"):
+                layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)
+            if hasattr(layer, "input_layernorm"):
+                layers[i].input_layernorm = checkpoint_wrapper(layers[i].input_layernorm)
+            if hasattr(layer, "post_attention_layernorm"):
+                layers[i].post_attention_layernorm = checkpoint_wrapper(layers[i].post_attention_layernorm)
+        logger.info("Applied sub-module activation checkpointing for single-GPU training.")
 
 
 class FSDP2Manager:
@@ -115,10 +167,7 @@ class FSDP2Manager:
         if get_world_size_safe() == 1:
             logger.info("World size is 1, skipping parallelization.")
             if self.activation_checkpointing:
-                if hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable()
-                else:
-                    logger.error("Model does not support gradient checkpointing.")
+                _apply_activation_checkpointing_single_gpu(model)
             return model
 
         if self.config.patch_is_packed_sequence:
