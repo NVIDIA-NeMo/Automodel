@@ -102,8 +102,8 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
   Nemotron-3-Nano-30B-A3B, Nemotron Flash 1B, GLM-4.7,
   Devstral-Small-2-24B.
 - **MoE / VLM / Omni:** Qwen3-VL (4B/8B), Qwen3-VL-MoE (30B/235B),
-  Kimi-VL, Kimi-K2.5 VL, Qwen3-Omni, Nemotron-Parse VLM,
-  InternVL3.5-4B, Ministral3 (3B/8B/14B), Phi-4-multimodal.
+  Kimi-VL, Kimi-K2.5 VL, Nemotron-Parse VLM, InternVL3.5-4B,
+  Ministral3 (3B/8B/14B), Phi-4-multimodal.
 
 ### Distributed Training
 
@@ -165,13 +165,14 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 - **MoE:** Qwen3 MoE custom implementation, Qwen3 Next, GPT-OSS (custom
   implementation, dequantization, DGX Spark recipe), GLM 4 / 4.5 / 4.6 MoE,
   GLM 4.5 Air, Moonlight 2L test, Phi 4 (TP plan).
+- **Omni / VLM:** Qwen3-Omni OOTB recipe and custom implementation.
 - **DeepSeek v3** with fp8 base checkpoint loading.
 - **Sequence classification:** Qwen3ForSequenceClassification registered;
   generic SFT sequence-classification recipe.
 
 ### Distributed Training
 
-- VLM EP and Qwen-Omni custom implementation.
+- VLM expert-parallel recipe support.
 - PP for VLM; PEFT with PP.
 - Sharding optimization for SP / LoRA.
 - `clip_grad_norm` across all parallelism modes.
