@@ -10,9 +10,9 @@ Unified skill for adding, updating, moving, and removing pages on the NeMo AutoM
 
 ## Scope rule
 
-**ALL docs edits happen under `fern/`.** The legacy Sphinx tree at `docs/` is read-only reference; do not add new pages there. New pages, release notes, migration guides — everything belongs under `fern/versions/v0.4/pages/`.
+**ALL docs edits happen under `fern/`.** The legacy Sphinx tree at `docs/` is read-only reference; do not add new pages there. New pages, release notes, migration guides — everything belongs under `fern/versions/nightly/pages/`.
 
-**Single canonical content tree.** Unlike NeMo Gym (which historically maintained two parallel version trees), AutoModel keeps one canonical content tree at `fern/versions/v0.4/pages/`. Three nav YAMLs (`v0.4.yml`, `latest.yml`, `nightly.yml`) all point at the same MDX files, so a single edit flows to all three URL slugs (`/v0.4/...`, `/latest/...`, `/nightly/...`). **Do not duplicate pages across version folders.**
+**`nightly` is the canonical content tree.** All edits land in `fern/versions/nightly/pages/`. `latest.yml` and `v0.4.yml` are nav copies whose `path:` lines also point at `./nightly/pages/...` — they're aliases until we cut a real frozen v0.4.0 snapshot from the tag. A single edit therefore flows to all three URL slugs (`/nightly/...`, `/latest/...`, `/v0.4/...`). **Do not duplicate pages across version folders.** When the next GA cuts (e.g. `v0.5`), `cp -r versions/nightly versions/v0.5` produces the frozen snapshot and `versions/latest.yml` is repointed at it.
 
 **Sidebar fidelity rule.** Section captions, page titles, and Model Coverage child ordering must match the **published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/latest** verbatim. Don't silently shorten a title or reorder siblings — the docs PM and content engineers diff against the published site and any drift is treated as a regression. If you want a shorter sidebar label, change the toctree-derived display name in the source — never just retitle in the MDX.
 
@@ -26,17 +26,17 @@ fern/
 ├── assets/                       # Logos and shared SVGs (NVIDIA_dark/light/symbol)
 ├── components/                   # BadgeLinks.tsx, Tag.tsx, CustomFooter.tsx
 ├── versions/
-│   ├── v0.4.yml                  # CANONICAL nav for the v0.4 train
-│   ├── latest.yml                # GA alias — copy of v0.4.yml; sync after every nav edit
-│   ├── nightly.yml               # Bleeding-edge alias — currently mirrors v0.4
-│   └── v0.4/pages/               # MDX content (130+ pages)
+│   ├── nightly.yml               # CANONICAL nav — bleeding-edge, edited every PR
+│   ├── latest.yml                # GA alias — copy of nightly.yml; sync after every nav edit
+│   ├── v0.4.yml                  # Frozen GA pin — copy of nightly.yml until a real v0.4.0 snapshot is migrated
+│   └── nightly/pages/            # MDX content (130+ pages) — single source of truth
 └── product-docs/                 # GENERATED Python API reference (gitignored)
 ```
 
 ```
 File                                                      URL
 ─────────────────────────────────────────────────────────  ────────────────────────────────────────────
-fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-started/installation
+fern/versions/nightly/pages/get-started/installation.mdx     /latest/get-started/installation
                                                           /v0.4/get-started/installation
                                                           /nightly/get-started/installation
 ```
@@ -45,7 +45,7 @@ fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-started/in
 
 ### Add a page
 
-1. Gather: title, target section, filename (kebab-case `.mdx`), subdirectory under `fern/versions/v0.4/pages/`.
+1. Gather: title, target section, filename (kebab-case `.mdx`), subdirectory under `fern/versions/nightly/pages/`.
 2. Create the MDX with frontmatter:
 
    ```mdx
@@ -58,23 +58,23 @@ fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-started/in
    <body — typically no leading `# H1`; Fern renders the title automatically>
    ```
 
-3. Add a `- page:` entry to `fern/versions/v0.4.yml` under the right `section:`, with an explicit `slug:` if the desired URL differs from the slugified title:
+3. Add a `- page:` entry to `fern/versions/nightly.yml` under the right `section:`, with an explicit `slug:` if the desired URL differs from the slugified title:
 
    ```yaml
    - page: "<Page Title>"
-     path: ./v0.4/pages/<subdir>/<filename>.mdx
+     path: ./nightly/pages/<subdir>/<filename>.mdx
      slug: <short-url-segment>
    ```
 
-4. **Sync the aliases:** `cp fern/versions/v0.4.yml fern/versions/latest.yml && cp fern/versions/v0.4.yml fern/versions/nightly.yml`.
+4. **Sync the aliases:** `cp fern/versions/nightly.yml fern/versions/latest.yml && cp fern/versions/nightly.yml fern/versions/v0.4.yml`.
 5. `make docs-check` (runs `fern check`) and verify URL resolves on `make docs` preview.
 
 ### Update a page
 
-1. Locate by path, title, or keyword: `grep -rn "<keyword>" fern/versions/v0.4/pages/ --include="*.mdx"`.
+1. Locate by path, title, or keyword: `grep -rn "<keyword>" fern/versions/nightly/pages/ --include="*.mdx"`.
 2. **Content only** — edit the single MDX file. There is no mirror to maintain (latest/nightly serve the same content).
-3. **Title change** — update the frontmatter `title:` and (if the page is in `versions/v0.4.yml`) update the `- page:` entry's display label. Re-sync `latest.yml` and `nightly.yml`.
-4. **Section move** — `git mv` the file, update `path:` in `versions/v0.4.yml`, fix incoming links, re-sync aliases.
+3. **Title change** — update the frontmatter `title:` and (if the page is in `versions/nightly.yml`) update the `- page:` entry's display label. Re-sync `latest.yml` and `v0.4.yml`.
+4. **Section move** — `git mv` the file, update `path:` in `versions/nightly.yml`, fix incoming links, re-sync aliases.
 5. **Slug change** — change `slug:` in the YAML (or rename the file and let the default slug update). Add a `redirects:` entry in `docs.yml` so the old URL keeps working.
 
 ### Redirect quirks
@@ -87,9 +87,9 @@ Three things to watch when editing `redirects:` in `fern/docs.yml`:
 
 ### Remove a page
 
-1. Find incoming links: `grep -rn "<filename>" fern/versions/v0.4/pages/ --include="*.mdx"`.
-2. `git rm fern/versions/v0.4/pages/<path>.mdx`.
-3. Remove the `- page:` block from `versions/v0.4.yml` (and re-sync `latest.yml` / `nightly.yml`).
+1. Find incoming links: `grep -rn "<filename>" fern/versions/nightly/pages/ --include="*.mdx"`.
+2. `git rm fern/versions/nightly/pages/<path>.mdx`.
+3. Remove the `- page:` block from `versions/nightly.yml` (and re-sync `latest.yml` / `nightly.yml`).
 4. Fix or delete incoming links.
 5. Add a redirect in `docs.yml` if the URL was public.
 
@@ -97,7 +97,7 @@ Three things to watch when editing `redirects:` in `fern/docs.yml`:
 
 Request: *"Add a fine-tuning guide for Qwen3.6 under Recipes & E2E Examples."*
 
-1. Create `fern/versions/v0.4/pages/guides/llm/qwen3-6-finetune.mdx`:
+1. Create `fern/versions/nightly/pages/guides/llm/qwen3-6-finetune.mdx`:
 
    ```mdx
    ---
@@ -108,22 +108,22 @@ Request: *"Add a fine-tuning guide for Qwen3.6 under Recipes & E2E Examples."*
    This guide walks through fine-tuning Qwen3.6 with NeMo AutoModel...
    ```
 
-2. Add to `fern/versions/v0.4.yml` under the `Recipes & E2E Examples` section, slotted in publication-order with the other fine-tune entries:
+2. Add to `fern/versions/nightly.yml` under the `Recipes & E2E Examples` section, slotted in publication-order with the other fine-tune entries:
 
    ```yaml
    - page: "Fine-Tune Qwen3.6"
-     path: ./v0.4/pages/guides/llm/qwen3-6-finetune.mdx
+     path: ./nightly/pages/guides/llm/qwen3-6-finetune.mdx
      slug: qwen3-6-finetune
    ```
 
-3. `cp fern/versions/v0.4.yml fern/versions/latest.yml && cp fern/versions/v0.4.yml fern/versions/nightly.yml`.
+3. `cp fern/versions/nightly.yml fern/versions/latest.yml && cp fern/versions/nightly.yml fern/versions/v0.4.yml`.
 4. `make docs-check` then `make docs` to preview at `http://localhost:3002/latest/recipes-e2e-examples/qwen3-6-finetune`.
 
 ### Worked example: rename a slug with a redirect
 
 Request: *"Rename `/recipes-e2e-examples/sft-peft` to `/recipes-e2e-examples/fine-tuning`."*
 
-1. Edit `versions/v0.4.yml`, change the `slug:` on the SFT & PEFT entry from `sft-peft` to `fine-tuning`.
+1. Edit `versions/nightly.yml`, change the `slug:` on the SFT & PEFT entry from `sft-peft` to `fine-tuning`.
 2. Add a redirect to `fern/docs.yml`:
 
    ```yaml
@@ -132,8 +132,8 @@ Request: *"Rename `/recipes-e2e-examples/sft-peft` to `/recipes-e2e-examples/fin
        destination: "/:version/recipes-e2e-examples/fine-tuning"
    ```
 
-3. `grep -rn "/recipes-e2e-examples/sft-peft" fern/versions/v0.4/pages/` and update incoming body links.
-4. Re-sync `latest.yml` and `nightly.yml`.
+3. `grep -rn "/recipes-e2e-examples/sft-peft" fern/versions/nightly/pages/` and update incoming body links.
+4. Re-sync `latest.yml` and `v0.4.yml`.
 
 ## Content guidelines
 
@@ -233,11 +233,11 @@ The preview-comment + publish jobs require the `DOCS_FERN_TOKEN` org secret (alr
 
 When NeMo AutoModel ships a new GA (e.g. `v0.5`):
 
-1. `cp -r fern/versions/v0.4 fern/versions/v0.5` — frozen snapshot of the previous "latest" content.
-2. `cp fern/versions/v0.4.yml fern/versions/v0.5.yml` and rewrite `./v0.4/` path prefixes to `./v0.5/`.
+1. `cp -r fern/versions/nightly fern/versions/v0.5` — frozen snapshot of the bleeding-edge tree at release.
+2. `cp fern/versions/nightly.yml fern/versions/v0.5.yml` and rewrite `./nightly/` path prefixes to `./v0.5/`.
 3. Update `fern/versions/latest.yml` to point at the new train: `cp fern/versions/v0.5.yml fern/versions/latest.yml`. (`latest` is the auto-bumping GA alias.)
 4. In `fern/docs.yml` `versions:`, add a new frozen-pin entry (`display-name: "0.5.0 · 26.07"`, `slug: v0.5`, `availability: stable`) and keep the previous pin (`v0.4`) for permalink stability.
-5. `fern/versions/v0.4/pages/` continues to back the v0.4 frozen-pin URL slug; new edits land in `fern/versions/v0.5/pages/` (re-sync `latest.yml` after each).
+5. `fern/versions/nightly/pages/` keeps moving forward as the bleeding-edge tree; the new `fern/versions/v0.5/pages/` is the frozen GA snapshot and only changes via deliberate back-port.
 6. Promote `nightly` to `availability: stable` if and when its content tree gets cut over.
 7. Tag `docs/v0.5.0` and push to publish.
 
@@ -263,17 +263,17 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | `JSX expressions must have one parent element` | Wrap multi-element JSX in `<>...</>` or a `<div>` |
 | Old Sphinx URL breaks | Add a `redirects:` entry in `fern/docs.yml`; the redirect generator already handles `/index.html` and `.html` legacy forms |
 | Image not rendering | Use relative path (`./image.png`) for page-scoped images, not root-relative (`/image.png`) |
-| Sidebar caption looks shortened vs published site | Compare against `docs.nvidia.com/nemo/automodel/latest` and restore the verbatim title in `versions/v0.4.yml` |
-| `latest.yml` and `v0.4.yml` drift | Re-sync: `cp fern/versions/v0.4.yml fern/versions/latest.yml` (and same for `nightly.yml`) |
+| Sidebar caption looks shortened vs published site | Compare against `docs.nvidia.com/nemo/automodel/latest` and restore the verbatim title in `versions/nightly.yml` |
+| `latest.yml` or `v0.4.yml` drift from `nightly.yml` | Re-sync: `cp fern/versions/nightly.yml fern/versions/latest.yml && cp fern/versions/nightly.yml fern/versions/v0.4.yml` |
 
 ## Key references
 
 | File | Purpose |
 |---|---|
 | `fern/docs.yml` | Site config — `instances`, `versions`, `redirects`, `libraries`, theme |
-| `fern/versions/v0.4.yml` | Canonical nav tree |
-| `fern/versions/{latest,nightly}.yml` | Aliases — content copies of `v0.4.yml` |
-| `fern/versions/v0.4/pages/` | MDX content (130+ pages) |
+| `fern/versions/nightly.yml` | Canonical nav tree |
+| `fern/versions/{latest,v0.4}.yml` | Aliases — content copies of `nightly.yml` |
+| `fern/versions/nightly/pages/` | MDX content (130+ pages) |
 | `fern/components/` | `BadgeLinks.tsx`, `Tag.tsx`, `CustomFooter.tsx` |
 | `fern/main.css` | Theme overrides — NVIDIA green, badge spacing |
 | `fern/README.md` | Human-facing orientation |
