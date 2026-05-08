@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import binascii
 import io
 import logging
 from typing import Iterable
+from urllib.parse import unquote, urlparse
+from urllib.request import urlopen
 
 import torch
 from PIL import Image
@@ -53,6 +57,38 @@ def _resolve_lmdb_image(path):
     if data is None:
         raise KeyError(f"Key '{key}' not found in LMDB database '{lmdb_path}'")
     return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _decode_image_data_url(value: str) -> Image.Image:
+    """Decode a ``data:image/...;base64,...`` URL into a RGB PIL image."""
+    header, sep, payload = value.partition(",")
+    if sep != "," or ";base64" not in header:
+        raise ValueError("Only base64 image data URLs are supported")
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("Invalid base64 image data URL") from exc
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _load_remote_image(value: str) -> Image.Image:
+    """Load an image from an HTTP(S) URL."""
+    with urlopen(value, timeout=30) as response:
+        data = response.read()
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _load_image_from_string(value: str) -> Image.Image:
+    if value.startswith("data:image/"):
+        return _decode_image_data_url(value)
+    if value.startswith(("http://", "https://")):
+        return _load_remote_image(value)
+    if value.startswith("file://"):
+        parsed = urlparse(value)
+        return Image.open(unquote(parsed.path)).convert("RGB")
+    if "::" in value:
+        return _resolve_lmdb_image(value)
+    return Image.open(value).convert("RGB")
 
 
 def _read_video_frames(video_path, processor=None, frame_indices=None, return_metadata=False):
@@ -172,10 +208,7 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
             if media_type == "image":
                 img = item.get("image")
                 if isinstance(img, str):
-                    if "::" in img:
-                        item["image"] = _resolve_lmdb_image(img)
-                    else:
-                        item["image"] = Image.open(img).convert("RGB")
+                    item["image"] = _load_image_from_string(img)
                 elif isinstance(img, Image.Image):
                     item["image"] = img.convert("RGB")
             elif media_type == "video":

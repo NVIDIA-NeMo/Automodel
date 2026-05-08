@@ -27,6 +27,11 @@ sys.modules["torch.distributed.run"] = mock.MagicMock()
 import nemo_automodel.cli.app as module
 import nemo_automodel.cli.utils as utils
 
+DATA_URL_IMAGE = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mP8z8BQDwAFgwJ/lzTRVwAAAABJRU5ErkJggg=="
+)
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -192,8 +197,16 @@ def test_build_parser_accepts_config(tmp_path):
     cfg.write_text("foo: bar")
     parser = module.build_parser()
     args, _ = parser.parse_known_args([str(cfg)])
-    assert args.config == cfg
+    assert args.inputs == [str(cfg)]
     assert args.nproc_per_node is None
+
+
+def test_build_parser_accepts_quick_lora_inputs(tmp_path):
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"messages": []}\n')
+    parser = module.build_parser()
+    args, _ = parser.parse_known_args(["Qwen/Qwen2.5-1.5B-Instruct", str(data)])
+    assert args.inputs == ["Qwen/Qwen2.5-1.5B-Instruct", str(data)]
 
 
 def test_build_parser_nproc_per_node(tmp_path):
@@ -202,6 +215,48 @@ def test_build_parser_nproc_per_node(tmp_path):
     parser = module.build_parser()
     args, _ = parser.parse_known_args([str(cfg), "--nproc-per-node=4"])
     assert args.nproc_per_node == 4
+
+
+def test_quick_lora_config_uses_openai_chat_dataset(tmp_path):
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"messages": []}\n')
+
+    config = module.build_lora_config("Qwen/Qwen2.5-1.5B-Instruct", str(data), nproc_per_node=4)
+
+    assert config["recipe"] == "TrainFinetuneRecipeForNextTokenPrediction"
+    assert config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert config["dataset"]["_target_"] == "nemo_automodel.components.datasets.llm.chat_dataset.OpenAIChatDataset"
+    assert config["dataset"]["path_or_dataset_id"] == str(data.resolve())
+    assert config["peft"]["_target_"] == "nemo_automodel.components._peft.lora.PeftConfig"
+    assert config["step_scheduler"]["global_batch_size"] % 4 == 0
+
+
+def test_quick_lora_config_auto_detects_vlm_dataset(tmp_path):
+    data = tmp_path / "vlm.jsonl"
+    data.write_text(
+        '{"messages": [{"role": "user", "content": ['
+        '{"type": "text", "text": "What is shown?"}, '
+        f'{{"type": "image_url", "image_url": {{"url": "{DATA_URL_IMAGE}"}}}}'
+        ']}, {"role": "assistant", "content": "A tiny image."}]}\n'
+    )
+
+    config = module.build_lora_config("Qwen/Qwen2.5-VL-3B-Instruct", str(data), nproc_per_node=2)
+
+    assert config["recipe"] == "FinetuneRecipeForVLM"
+    assert config["model"]["_target_"] == "nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained"
+    assert config["processor"]["pretrained_model_name_or_path"] == "Qwen/Qwen2.5-VL-3B-Instruct"
+    assert config["dataset"]["_target_"] == (
+        "nemo_automodel.components.datasets.vlm.datasets.make_openai_vlm_chat_dataset"
+    )
+    assert config["dataset"]["path_or_dataset"] == str(data.resolve())
+    assert config["peft"]["exclude_modules"]
+    assert "shuffle" not in config["dataloader"]
+    assert config["step_scheduler"]["global_batch_size"] % 2 == 0
+
+
+def test_quick_lora_config_rejects_missing_local_jsonl():
+    with pytest.raises(FileNotFoundError, match="Training data file was not found"):
+        module.build_lora_config("Qwen/Qwen2.5-1.5B-Instruct", "missing.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +370,69 @@ def test_main_passes_extra_args(monkeypatch, recipe_yaml):
     )
     module.main()
     assert "--model.pretrained_model_name_or_path=foo" in launched["extra"]
+
+
+def test_main_quick_lora_generates_config_and_dispatches(monkeypatch, tmp_path):
+    data = tmp_path / "train.jsonl"
+    data.write_text('{"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}\n')
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "automodel",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            str(data),
+            "--step_scheduler.max_steps=2",
+        ],
+    )
+    monkeypatch.setattr(module, "_infer_local_worker_count", lambda nproc: 4)
+    monkeypatch.setattr(
+        module,
+        "resolve_recipe_name",
+        lambda raw: "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction",
+    )
+
+    launched = {}
+
+    def fake_parse_args_and_load_config(config_path, argv=None):
+        generated = yaml.safe_load(Path(config_path).read_text())
+        launched["generated_config"] = generated
+        launched["parse_argv"] = argv
+        launched["generated_path"] = Path(config_path)
+        return {"parsed": True}
+
+    class FakeInteractiveLauncher:
+        def launch(self, config, config_path, recipe_target, nproc, extra):
+            launched["config"] = config
+            launched["config_path_exists_during_launch"] = Path(config_path).exists()
+            launched["recipe_target"] = recipe_target
+            launched["nproc"] = nproc
+            launched["extra"] = extra
+            return 0
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.config._arg_parser.parse_args_and_load_config",
+        fake_parse_args_and_load_config,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.launcher.interactive.InteractiveLauncher",
+        FakeInteractiveLauncher,
+    )
+
+    result = module.main()
+
+    assert result == 0
+    assert launched["config"] == {"parsed": True}
+    assert launched["config_path_exists_during_launch"] is True
+    assert not launched["generated_path"].exists()
+    assert launched["generated_config"]["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert launched["generated_config"]["dataset"]["_target_"] == (
+        "nemo_automodel.components.datasets.llm.chat_dataset.OpenAIChatDataset"
+    )
+    assert launched["generated_config"]["dataset"]["path_or_dataset_id"] == str(data.resolve())
+    assert launched["generated_config"]["step_scheduler"]["global_batch_size"] == 8
+    assert "--step_scheduler.max_steps=2" in launched["parse_argv"]
+    assert "--step_scheduler.max_steps=2" in launched["extra"]
+    assert launched["nproc"] is None
 
 
 # ---------------------------------------------------------------------------

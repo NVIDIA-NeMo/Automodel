@@ -156,6 +156,33 @@ What you can expect:
 
 ## Getting Started
 
+For the shortest local LoRA run, install the package and pass a Hugging Face model id plus an OpenAI-format chat JSONL file:
+
+```bash
+pip install nemo-automodel
+automodel Qwen/Qwen2.5-1.5B-Instruct examples/quickstart/openai_chat.jsonl
+```
+
+The shorthand command builds a default LoRA SFT config, uses `OpenAIChatDataset` for rows shaped like `{"messages": [...]}`, and launches on all GPUs available on the node. Multiturn transcripts are supported because the full `messages` list is passed through the model chat template.
+
+Sample data: [`examples/quickstart/openai_chat.jsonl`](examples/quickstart/openai_chat.jsonl).
+
+For VLM fine-tuning, use the same command shape with OpenAI-style image or video content parts. AutoModel detects multimodal rows and routes them to the VLM recipe:
+
+```bash
+automodel Qwen/Qwen2.5-VL-3B-Instruct examples/quickstart/openai_vlm_chat.jsonl
+```
+
+VLM sample data: [`examples/quickstart/openai_vlm_chat.jsonl`](examples/quickstart/openai_vlm_chat.jsonl).
+
+You can still override generated settings:
+
+```bash
+automodel Qwen/Qwen2.5-1.5B-Instruct examples/quickstart/openai_chat.jsonl --step_scheduler.max_steps=100
+```
+
+Prompt/completion and arbitrary column-mapped datasets remain available through explicit YAML recipes.
+
 We recommend using **uv** for reproducible Python environments.
 
 ```bash
@@ -178,7 +205,7 @@ uv run python -c "import nemo_automodel; print('NeMo AutoModel ready')"
 
 
 ### Run a Recipe
-All recipes are launched via the `automodel` CLI (or its short alias `am`). Each YAML config specifies the recipe class and all training parameters:
+For full control, pass an explicit YAML recipe to the `automodel` CLI (or its short alias `am`). Each YAML config specifies the recipe class and all training parameters:
 ```bash
 # LLM example: multi-GPU fine-tuning with FSDP2
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --nproc-per-node 8

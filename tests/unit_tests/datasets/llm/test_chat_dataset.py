@@ -21,6 +21,10 @@ import nemo_automodel.components.datasets.llm.chat_dataset as tcd
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 
 
+def test_openai_chat_dataset_alias_preserves_chat_dataset_behavior():
+    assert issubclass(tcd.OpenAIChatDataset, tcd.ChatDataset)
+
+
 def test_is_hf_repo_id_and_as_iter_and_normalize():
     # _is_hf_repo_id basic behavior
     assert tcd._is_hf_repo_id("org/name") is True

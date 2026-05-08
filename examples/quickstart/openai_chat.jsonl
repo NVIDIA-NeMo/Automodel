@@ -1,0 +1,2 @@
+{"messages":[{"role":"system","content":"You are a concise assistant."},{"role":"user","content":"Give one reason to use LoRA."},{"role":"assistant","content":"LoRA trains small adapters, so fine-tuning uses less memory."}]}
+{"messages":[{"role":"user","content":"Turn this into a title: memory efficient fine tuning"},{"role":"assistant","content":"Memory-Efficient Fine-Tuning"},{"role":"user","content":"Make it more specific."},{"role":"assistant","content":"Memory-Efficient Fine-Tuning with LoRA"}]}
