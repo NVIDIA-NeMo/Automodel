@@ -20,12 +20,11 @@
 
 ### New Models
 
-- **LLM:** GLM 5, Minimax M2.5, Step-3.5-Flash, Devstral 24B, Nemotron Nano
-  4B/8B.
+- **LLM:** GLM-5, MiniMax-M2.5, Nemotron Super v3, Nemotron Nano 4B/8B.
 - **MoE / VLM:** Qwen3.5-MoE (397B-A17B, 35B-A3B).
 - **VLM:** Gemma 4, Mistral Small 4, Qwen3.5 small dense models.
-- **Multimodal / Omni:** Nemotron-3-Nano-Omni.
-- **Diffusion:** Wan multi-resolution, LoRA for diffusion.
+- **Diffusion:** FLUX.1-dev, Wan 2.1 T2V, HunyuanVideo 1.5; Wan
+  multi-resolution and LoRA recipes for diffusion.
 
 ### Distributed Training
 
@@ -99,11 +98,12 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 
 ### New Models
 
-- **LLM:** DeepSeek 3.2, Step3p5, Minimax M2, Nano v3 custom, Nemotron Flash,
-  GLM 4.7, Devstral (backported to v4).
-- **MoE / VLM:** Qwen3-VL custom implementation (235B, 30B, 4B/8B configs),
-  Kimi-VL, Kimi K2.5 VL, Qwen3-Omni port via `transformers omni`,
-  Nemotron-Parse VLM.
+- **LLM:** DeepSeek V3.2, Step-3.5-Flash, MiniMax-M2.1,
+  Nemotron-3-Nano-30B-A3B, Nemotron Flash 1B, GLM-4.7,
+  Devstral-Small-2-24B.
+- **MoE / VLM / Omni:** Qwen3-VL (4B/8B), Qwen3-VL-MoE (30B/235B),
+  Kimi-VL, Kimi-K2.5 VL, Qwen3-Omni, Nemotron-Parse VLM,
+  InternVL3.5-4B, Ministral3 (3B/8B/14B), Phi-4-multimodal.
 
 ### Distributed Training
 
