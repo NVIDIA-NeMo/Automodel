@@ -824,17 +824,25 @@ class TestQwen3VLMoeForConditionalGenerationPPGuard:
         assert captured_kwargs["attention_mask"] is None
 
     def test_video_token_id_is_151656(self, vl_config, backend_config, moe_config, device):
-        """Test that video token ID 151656 (not 151652) is used for media token detection."""
+        """Test that video token ID 151656 (not 151652) is used for media token detection.
+
+        After the PP video chunking refactor, image and video chunks live on
+        separate attributes (``_vlm_pixel_values_chunks`` /
+        ``_vlm_image_grid_hws_chunks`` for images,
+        ``_vlm_pixel_values_videos_chunks`` / ``_vlm_video_grid_thw_chunks``
+        for videos). A video token in ``input_ids`` must therefore consume a
+        video chunk, not an image chunk.
+        """
         model = Qwen3VLMoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         model_dtype = next(model.parameters()).dtype
 
         # input_ids with video token 151656
         input_ids = torch.tensor([[1, 151656, 2, 3]], device=device)
 
-        pixel_values_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
-        image_grid_hws_chunk = torch.tensor([[2, 2]], device=device)
-        model._vlm_pixel_values_chunks = [pixel_values_chunk]
-        model._vlm_image_grid_hws_chunks = [image_grid_hws_chunk]
+        pixel_values_videos_chunk = torch.randn(8, 3, 2, 2, device=device, dtype=model_dtype)
+        video_grid_thw_chunk = torch.tensor([[1, 2, 2]], device=device)
+        model._vlm_pixel_values_videos_chunks = [pixel_values_videos_chunk]
+        model._vlm_video_grid_thw_chunks = [video_grid_thw_chunk]
         model._vlm_chunk_idx = 0
 
         with patch.object(model.model, "forward") as mock_forward:
