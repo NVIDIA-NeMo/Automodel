@@ -24,7 +24,7 @@
   4B/8B.
 - **MoE / VLM:** Qwen3.5-MoE (397B-A17B, 35B-A3B).
 - **VLM:** Gemma 4, Mistral Small 4, Qwen3.5 small dense models.
-- **Multimodal / Omni:** Nemotron-Omni.
+- **Multimodal / Omni:** Nemotron-3-Nano-Omni.
 - **Diffusion:** Wan multi-resolution, LoRA for diffusion.
 
 ### Distributed Training
