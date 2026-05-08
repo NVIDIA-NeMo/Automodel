@@ -1,6 +1,6 @@
 # Release Notes
 
-## 0.4.0 · 26.04 (2026-04-28)
+## 0.4.0 · 26.04 (2026-04-28) · [PyPI](https://pypi.org/project/nemo-automodel/0.4.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.4.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.04.00)
 
 ### Highlights
 
@@ -10,21 +10,21 @@
   loaded directly from the HuggingFace Hub, in-batch negative sampling, and
   ONNX export for biencoder models.
 - **SkyPilot launcher.** Native multi-node launch on cloud (SkyPilot,
-  including Kubernetes), in addition to local and SLURM. Launcher selection
-  is driven by YAML sections in the config.
-- **Lightweight CLI install.** `pip install nemo-automodel[cli]` installs only
-  `pyyaml` — enough to submit jobs from a login node without pulling in
-  PyTorch/CUDA.
+  including Kubernetes), in addition to local interactive runs. SkyPilot and
+  NeMo-Run launchers are selected with YAML sections in the config; SLURM jobs
+  use the `sbatch slurm.sub` workflow.
+- **CLI install profile.** The `nemo-automodel[cli]` extra declares `pyyaml`
+  beyond the package's base dependencies for job-submission configs.
 - **Refreshed CLI.** `automodel <config.yaml>` (alias `am`) replaces the older
   `automodel <command> <domain> -c <config>` form.
 
 ### New Models
 
-- **LLM:** Gemma 4, Mistral 4, Mistral Medium 3.5, GLM 5, Minimax M2.5,
-  Step-3.5-Flash, Devstral 24B, Nemotron Nano 4B/8B.
-- **MoE:** Qwen3.5-MoE (30B-A3B, 35B), GPT-OSS 20B, Moonlight 16B.
-- **Dense:** Qwen3.5 small dense models.
-- **Multimodal / Omni:** Qwen3-Omni port, Nemotron-Omni, Phi4MM audio.
+- **LLM:** GLM 5, Minimax M2.5, Step-3.5-Flash, Devstral 24B, Nemotron Nano
+  4B/8B.
+- **MoE / VLM:** Qwen3.5-MoE (397B-A17B, 35B-A3B).
+- **VLM:** Gemma 4, Mistral Small 4, Qwen3.5 small dense models.
+- **Multimodal / Omni:** Nemotron-Omni.
 - **Diffusion:** Wan multi-resolution, LoRA for diffusion.
 
 ### Distributed Training
@@ -54,10 +54,10 @@
 
 ### Recipes and Workflow
 
-- New recipes for Gemma 4 (LoRA), Nemotron Nano 4B SQuAD, Mistral 4, Tulu-3
-  E2E convergence, GPT-OSS 20B / Moonlight 16B convergence, and reranker /
-  biencoder training.
-- MFU logging across train recipes.
+- New recipes for Gemma 4 (LoRA), Nemotron Nano 4B SQuAD, Mistral Small 4,
+  Tulu-3 E2E convergence, GPT-OSS 20B / Moonlight 16B convergence, and
+  reranker / biencoder training.
+- MFU logging for LLM and dLLM train recipes.
 - Native Comet ML experiment tracking.
 - NEFTune noisy embeddings for instruction fine-tuning.
 - Scheduler-driven manual garbage collection.
@@ -66,7 +66,8 @@
 ### Checkpointing
 
 - `v4_compatible` checkpoint format.
-- Diffusion training jobs default to safetensors checkpoint format.
+- Diffusion full fine-tuning and pretraining examples use safetensors
+  checkpoint format; diffusion LoRA examples use `torch_save`.
 - QLoRA / LoRA loading robustness; tied-weight handling moved out of
   `_init_model`.
 
@@ -81,13 +82,13 @@
 
 ### Breaking Changes
 
-A migration guide for the new CLI, the required `recipe._target_` YAML
-section, the SLURM `sbatch`-script workflow, and the `nemo-automodel[cli]`
-install profile is in [Breaking Changes](breaking-changes.md).
+A migration guide for the new CLI, the `recipe` YAML section, the SLURM
+`sbatch`-script workflow, and the `nemo-automodel[cli]` install profile is in
+[Breaking Changes](breaking-changes.md).
 
 ---
 
-## 0.3.0 (2026-02-26)
+## 0.3.0 · 26.02 (2026-02-26) · [PyPI](https://pypi.org/project/nemo-automodel/0.3.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.3.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.02.00)
 
 ### Highlights
 
@@ -145,7 +146,7 @@ install profile is in [Breaking Changes](breaking-changes.md).
 
 ---
 
-## 0.2.0 (2025-12-04)
+## 0.2.0 · 25.11 (2025-12-04) · [PyPI](https://pypi.org/project/nemo-automodel/0.2.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.2.0) · [NGC Docker](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=25.11.00)
 
 ### Highlights
 
@@ -220,7 +221,7 @@ install profile is in [Breaking Changes](breaking-changes.md).
 
 ---
 
-## 0.1.2 (2025-10-23)
+## 0.1.2 (2025-10-23) · [PyPI](https://pypi.org/project/nemo-automodel/0.1.2/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.1.2)
 
 Patch release.
 
@@ -230,7 +231,7 @@ Patch release.
 
 ---
 
-## 0.1.0 (2025-10-08)
+## 0.1.0 (2025-10-08) · [PyPI](https://pypi.org/project/nemo-automodel/0.1.0/) · [GH](https://github.com/NVIDIA-NeMo/Automodel/releases/tag/v0.1.0)
 
 Initial public release of NeMo AutoModel.
 
