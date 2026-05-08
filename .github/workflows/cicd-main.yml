@@ -664,20 +664,3 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
-
-  cleanup-taint-node:
-    runs-on: ${{ needs.pre-flight.outputs.runner_prefix }}
-    needs:
-      - pre-flight
-      - Nemo_CICD_Test
-      - Coverage
-      - Coverage_Fake
-    if: |
-      always()
-      && !cancelled()
-      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
-    steps:
-      - name: Taint node for cleanup
-        if: contains(runner.name, 'ephemeral')
-        shell: bash
-        run: taint-node.sh
