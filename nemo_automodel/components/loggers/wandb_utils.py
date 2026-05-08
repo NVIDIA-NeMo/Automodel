@@ -14,6 +14,41 @@
 import logging
 from typing import Any
 
+import wandb
+from wandb import Settings
+
+
+def _get_model_name(cfg_model: Any) -> str | None:
+    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        return cfg_model.pretrained_model_name_or_path
+    elif cfg_model.get("config", None) is not None:
+        if isinstance(cfg_model.config, str):
+            return cfg_model.config
+        return cfg_model.config.get("pretrained_model_name_or_path", None)
+    else:
+        return None
+
+
+def build_wandb(cfg: Any) -> wandb.Run:
+    """Instantiate wandb and return the run.
+
+    Args:
+        cfg: Configuration containing a wandb section.
+
+    Returns:
+        Initialized wandb run.
+    """
+    assert cfg.get("wandb", None) is not None
+    kwargs = cfg.wandb.to_dict()
+    if kwargs.get("name", "") == "":
+        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
+    run = wandb.init(
+        **kwargs,
+        config=cfg.to_dict(),
+        settings=Settings(silent=True),
+    )
+    return run
+
 
 def suppress_wandb_log_messages() -> None:
     """

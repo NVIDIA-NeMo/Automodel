@@ -29,19 +29,17 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 import wandb
-from huggingface_hub import constants as hf_constants
 from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-from wandb import Settings
 
 from nemo_automodel._transformers import (
     NeMoAutoModelForCausalLM,
@@ -49,25 +47,27 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForMultimodalLM,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint import build_checkpoint_config
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
+from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loggers.wandb_utils import build_wandb, suppress_wandb_log_messages
+from nemo_automodel.components.loss import build_loss_fn
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim import build_lr_scheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training import build_step_scheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     prepare_for_final_backward,
@@ -81,8 +81,6 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
-
-    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
 
@@ -200,57 +198,6 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         optimizer.append(tmp_optimizer)
 
     return optimizer
-
-
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
-    """Build a checkpoint configuration.
-
-    Args:
-        cfg_ckpt: Configuration for checkpointing.
-        cache_dir: Cache directory for the model.
-        model_repo_id: Model repository ID.
-        is_peft: Whether the model is PEFT.
-
-    Returns:
-        The instantiated checkpoint configuration.
-    """
-    ckpt_kwargs = dict(
-        enabled=True,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=True,
-        is_peft=is_peft,
-    )
-    user_cfg = {}
-    if cfg_ckpt is not None:
-        user_cfg = cfg_ckpt.to_dict()
-        user_cfg.pop("restore_from", None)
-    if is_peft and user_cfg.get("model_save_format") == "torch_save":
-        logger.warning(
-            "PEFT checkpointing is not supported for `torch_save` format; "
-            "discarding user checkpoint config and using safetensors defaults "
-            "(preserving `checkpoint_dir` if set)."
-        )
-        if "checkpoint_dir" in user_cfg:
-            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
-    else:
-        ckpt_kwargs |= user_cfg
-    checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-    return checkpoint_config
-
-
-def build_loss_fn(cfg_loss):
-    """Build a loss function.
-
-    Args:
-        cfg_loss: Loss function configuration.
-
-    Returns:
-        The instantiated loss function.
-    """
-    return cfg_loss.instantiate()
 
 
 def _chunk_vlm_media(
@@ -527,128 +474,6 @@ def build_dataloader(
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
         ), processor
-
-
-def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
-    """Build and initialize distributed training resources.
-
-    Args:
-        cfg_dist: Configuration for distributed training.
-
-    Returns:
-        Distributed training information from initialize_distributed.
-    """
-    backend = cfg_dist.get("backend", "nccl")
-    timeout = cfg_dist.get("timeout_minutes", 1)
-    return initialize_distributed(backend=backend, timeout_minutes=timeout)
-
-
-def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
-    """Build the step scheduler.
-
-    Args:
-        cfg: configuration for the StepScheduler class.
-        dataloader: the training dataloader, used for extracting the epoch_len (in batches).
-        dp_group_size: the size of the data parallel group.
-        micro_batch_size: the size of the micro batch.
-
-    Returns:
-        StepScheduler: the configured StepScheduler.
-    """
-    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
-    default_kwargs = dict(
-        num_epochs=10,
-        global_batch_size=32,
-        local_batch_size=local_batch_size,
-        dp_size=dp_group_size,
-        ckpt_every_steps=100,
-        dataloader=dataloader,
-    )
-    if cfg is not None:
-        default_kwargs |= cfg.to_dict()
-    return StepScheduler(**default_kwargs)
-
-
-def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamScheduler] | None:  # noqa: F821
-    """Build the learning rate scheduler.
-
-    Args:
-        cfg: Configuration for the OptimizerParamScheduler.
-        optimizer: The optimizer to be scheduled.
-        step_scheduler: The step scheduler to extract training parameters.
-
-    Returns:
-        OptimizerParamScheduler: The configured learning rate scheduler, or None if not configured.
-    """
-    if cfg is None:
-        return None
-
-    # Calculate total steps for the training run
-    total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
-
-    optimizer_param_schedulers = []
-    user_kwargs = cfg.to_dict()
-    default_kwargs = dict(
-        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-        lr_decay_steps=total_steps,
-        lr_decay_style="cosine",
-        wd_incr_steps=total_steps,
-        wd_incr_style="constant",
-    )
-
-    if not isinstance(optimizer, list):
-        optimizer = [optimizer]
-
-    for opt in optimizer:
-        base_lr = opt.param_groups[0]["lr"]
-        default_kwargs.update(
-            dict(
-                optimizer=opt,
-                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
-                max_lr=base_lr,
-                min_lr=base_lr * 0.01,  # End at 1% of base LR
-                start_wd=opt.param_groups[0].get("weight_decay", 0.0),
-                end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            )
-        )
-        default_kwargs.update(user_kwargs)
-        optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
-
-    logger.info(
-        f"Building LR scheduler with total_steps={total_steps}, "
-        f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
-        f"decay_style={default_kwargs['lr_decay_style']}"
-    )
-
-    return optimizer_param_schedulers
-
-
-def build_wandb(cfg) -> wandb.Run:
-    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
-
-    Args:
-        cfg: Configuration for wandb.
-
-    Returns:
-        The wandb instance.
-    """
-    assert cfg.get("wandb", None) is not None
-    kwargs = cfg.wandb.to_dict()
-    if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
-    run = wandb.init(
-        **kwargs,
-        config=cfg.to_dict(),
-        settings=Settings(silent=True),
-    )
-    return run
 
 
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:

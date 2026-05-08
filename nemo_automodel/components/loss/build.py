@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.loggers.wandb_utils import build_wandb
+from __future__ import annotations
 
-__all__ = ["build_wandb"]
+from typing import Any
+
+
+def build_loss_fn(cfg_loss: Any) -> Any:
+    """Build a loss function.
+
+    Args:
+        cfg_loss: Loss function configuration.
+
+    Returns:
+        Instantiated loss function.
+    """
+    return cfg_loss.instantiate()
