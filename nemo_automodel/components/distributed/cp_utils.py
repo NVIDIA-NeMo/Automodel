@@ -288,8 +288,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         packed_seq_ids = getattr(module, "_cp_packed_seq_ids", None)
         packed_seq_ids_full = _all_gather_seq_metadata(packed_seq_ids)
         vision_group_ids = _vision_group_ids(mm_token_type_ids_full)
-        is_sliding = bool(getattr(module, "is_sliding", False))
-        sliding_window = getattr(module, "sliding_window", None) if is_sliding else None
+        # HF Gemma4TextAttention marks sliding layers by setting sliding_window;
+        # it does not expose an is_sliding flag.
+        sliding_window = getattr(module, "sliding_window", None)
+        is_sliding = sliding_window is not None
         use_vision_bidirectional = is_sliding and vision_group_ids is not None
 
         q_indices = torch.arange(seq_local, device=query.device) + seq_global_start
@@ -311,6 +313,14 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         packed_allowed = _packed_sequence_allowed_mask(packed_seq_ids_full, q_indices, kv_indices)
         if packed_allowed is not None:
             sdpa_mask = sdpa_mask & packed_allowed.unsqueeze(1)
+        empty_query_rows = ~sdpa_mask.any(dim=-1, keepdim=True)
+        sdpa_mask_for_kernel = sdpa_mask
+        if empty_query_rows.any():
+            # Boolean SDPA backward can produce NaNs when a query row is
+            # completely masked. Padding rows are ignored by the loss, so point
+            # them at a dummy key for the kernel and zero their outputs.
+            sdpa_mask_for_kernel = sdpa_mask.clone()
+            sdpa_mask_for_kernel[..., :1] = sdpa_mask_for_kernel[..., :1] | empty_query_rows
 
         try:
             key_for_sdpa = key_full
@@ -327,12 +337,14 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 query,
                 key_for_sdpa,
                 value_for_sdpa,
-                attn_mask=sdpa_mask,
+                attn_mask=sdpa_mask_for_kernel,
                 dropout_p=dropout_p,
                 is_causal=False,
                 scale=scale,
                 **kwargs,
             )
+            if empty_query_rows.any():
+                out = out.masked_fill(empty_query_rows, 0)
             if not getattr(_cp_sdpa, "_sdpa_ok_logged", False):
                 _log.info(
                     "CP using %sSDPA all-gather. Q=%s K=%s cp_rank=%s",
