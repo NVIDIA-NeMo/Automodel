@@ -1,0 +1,335 @@
+navigation:
+  - section: "Get Started"
+    contents:
+      - page: "About NeMo AutoModel"
+        path: ./v0.4/pages/about/index.mdx
+        slug: about
+      - page: "Key Features and Concepts"
+        path: ./v0.4/pages/about/key-features.mdx
+        slug: key-features
+      - page: "Install NeMo AutoModel"
+        path: ./v0.4/pages/guides/installation.mdx
+        slug: installation
+      - page: "YAML Configuration"
+        path: ./v0.4/pages/guides/configuration.mdx
+        slug: configuration
+      - page: "🤗 Transformers API Compatibility"
+        path: ./v0.4/pages/guides/huggingface-api-compatibility.mdx
+        slug: hf-compatibility
+      - page: "Repository Structure"
+        path: ./v0.4/pages/repository-structure.mdx
+        slug: repo-structure
+  - section: "Announcements"
+    contents:
+      - page: "Announcements"
+        path: ./v0.4/pages/announcements.mdx
+  - section: "NeMo AutoModel Performance"
+    slug: performance
+    contents:
+      - page: "Performance Summary"
+        path: ./v0.4/pages/performance-summary.mdx
+        slug: performance-summary
+  - section: "Model Coverage"
+    contents:
+      - page: "Model Coverage Overview"
+        path: ./v0.4/pages/model-coverage/overview.mdx
+        slug: overview
+      - page: "Model Release Log"
+        path: ./v0.4/pages/model-coverage/latest-models.mdx
+        slug: release-log
+      - section: "Large Language Models (LLMs)"
+        slug: large-language-models
+        contents:
+          - page: "Overview"
+            path: ./v0.4/pages/model-coverage/llm/index.mdx
+            slug: overview
+          - page: "Llama"
+            path: ./v0.4/pages/model-coverage/llm/meta/llama.mdx
+          - page: "Gemma"
+            path: ./v0.4/pages/model-coverage/llm/google/gemma.mdx
+          - page: "Qwen2"
+            path: ./v0.4/pages/model-coverage/llm/qwen/qwen2.mdx
+          - page: "Qwen2 MoE"
+            path: ./v0.4/pages/model-coverage/llm/qwen/qwen2-moe.mdx
+          - page: "Qwen3"
+            path: ./v0.4/pages/model-coverage/llm/qwen/qwen3.mdx
+          - page: "Qwen3 MoE"
+            path: ./v0.4/pages/model-coverage/llm/qwen/qwen3-moe.mdx
+          - page: "Qwen3-Next"
+            path: ./v0.4/pages/model-coverage/llm/qwen/qwen3-next.mdx
+          - page: "DeepSeek"
+            path: ./v0.4/pages/model-coverage/llm/deepseek-ai/deepseek.mdx
+          - page: "DeepSeek-V3"
+            path: ./v0.4/pages/model-coverage/llm/deepseek-ai/deepseek-v3.mdx
+          - page: "DeepSeek-V4 Flash"
+            path: ./v0.4/pages/model-coverage/llm/deepseek-ai/dsv4-flash.mdx
+          - page: "Mistral"
+            path: ./v0.4/pages/model-coverage/llm/mistralai/mistral.mdx
+          - page: "Mixtral"
+            path: ./v0.4/pages/model-coverage/llm/mistralai/mixtral.mdx
+          - page: "Ministral3 / Devstral"
+            path: ./v0.4/pages/model-coverage/llm/mistralai/ministral3.mdx
+          - page: "Phi"
+            path: ./v0.4/pages/model-coverage/llm/microsoft/phi.mdx
+          - page: "Phi-3 / Phi-4"
+            path: ./v0.4/pages/model-coverage/llm/microsoft/phi3.mdx
+          - page: "Phi-3-Small"
+            path: ./v0.4/pages/model-coverage/llm/microsoft/phi3-small.mdx
+          - page: "Nemotron / Minitron"
+            path: ./v0.4/pages/model-coverage/llm/nvidia/nemotron.mdx
+          - page: "Nemotron-H"
+            path: ./v0.4/pages/model-coverage/llm/nvidia/nemotron-h.mdx
+          - page: "Nemotron-Flash"
+            path: ./v0.4/pages/model-coverage/llm/nvidia/nemotron-flash.mdx
+          - page: "Nemotron-Super (Llama-3.3-Nemotron-Super-49B)"
+            path: ./v0.4/pages/model-coverage/llm/nvidia/nemotron-super.mdx
+          - page: "ChatGLM"
+            path: ./v0.4/pages/model-coverage/llm/thudm/chatglm.mdx
+          - page: "GLM-4"
+            path: ./v0.4/pages/model-coverage/llm/thudm/glm4.mdx
+          - page: "GLM-4 MoE (GLM-4.5 / GLM-4.7)"
+            path: ./v0.4/pages/model-coverage/llm/thudm/glm4-moe.mdx
+          - page: "GLM-5 MoE (DSA)"
+            path: ./v0.4/pages/model-coverage/llm/thudm/glm5-moe-dsa.mdx
+          - page: "Granite"
+            path: ./v0.4/pages/model-coverage/llm/ibm/granite.mdx
+          - page: "Granite MoE"
+            path: ./v0.4/pages/model-coverage/llm/ibm/granite-moe.mdx
+          - page: "Bamba"
+            path: ./v0.4/pages/model-coverage/llm/ibm/bamba.mdx
+          - page: "OLMo"
+            path: ./v0.4/pages/model-coverage/llm/allenai/olmo.mdx
+          - page: "OLMo2"
+            path: ./v0.4/pages/model-coverage/llm/allenai/olmo2.mdx
+          - page: "OLMoE"
+            path: ./v0.4/pages/model-coverage/llm/allenai/olmoe.mdx
+          - page: "GPT-OSS"
+            path: ./v0.4/pages/model-coverage/llm/openai/gpt-oss.mdx
+          - page: "GPT-2"
+            path: ./v0.4/pages/model-coverage/llm/openai/gpt2.mdx
+          - page: "GPT-J"
+            path: ./v0.4/pages/model-coverage/llm/eleutherai/gpt-j.mdx
+          - page: "GPT-NeoX / Pythia"
+            path: ./v0.4/pages/model-coverage/llm/eleutherai/gpt-neox.mdx
+          - page: "StarCoder"
+            path: ./v0.4/pages/model-coverage/llm/bigcode/starcoder.mdx
+          - page: "StarCoder2"
+            path: ./v0.4/pages/model-coverage/llm/bigcode/starcoder2.mdx
+          - page: "Aquila / Aquila2"
+            path: ./v0.4/pages/model-coverage/llm/baai/aquila.mdx
+          - page: "Baichuan / Baichuan2"
+            path: ./v0.4/pages/model-coverage/llm/baichuan-inc/baichuan.mdx
+          - page: "Command-R"
+            path: ./v0.4/pages/model-coverage/llm/cohere/command-r.mdx
+          - page: "Falcon"
+            path: ./v0.4/pages/model-coverage/llm/tiiuae/falcon.mdx
+          - page: "EXAONE"
+            path: ./v0.4/pages/model-coverage/llm/lgai-exaone/exaone.mdx
+          - page: "InternLM"
+            path: ./v0.4/pages/model-coverage/llm/internlm/internlm.mdx
+          - page: "Jais"
+            path: ./v0.4/pages/model-coverage/llm/inceptionai/jais.mdx
+          - page: "MiniMax-M2"
+            path: ./v0.4/pages/model-coverage/llm/minimax/minimax-m2.mdx
+          - page: "MiniCPM"
+            path: ./v0.4/pages/model-coverage/llm/openbmb/minicpm.mdx
+          - page: "Moonlight"
+            path: ./v0.4/pages/model-coverage/llm/moonshotai/moonlight.mdx
+          - page: "Seed (ByteDance)"
+            path: ./v0.4/pages/model-coverage/llm/bytedance-seed/seed.mdx
+          - page: "Solar Pro"
+            path: ./v0.4/pages/model-coverage/llm/upstage/solar.mdx
+          - page: "Orion"
+            path: ./v0.4/pages/model-coverage/llm/orionstar/orion.mdx
+          - page: "StableLM"
+            path: ./v0.4/pages/model-coverage/llm/stabilityai/stablelm.mdx
+          - page: "Step-3.5"
+            path: ./v0.4/pages/model-coverage/llm/stepfun-ai/step-3-5.mdx
+          - page: "GritLM"
+            path: ./v0.4/pages/model-coverage/llm/parasail-ai/gritlm.mdx
+          - page: "Hy3-preview"
+            path: ./v0.4/pages/model-coverage/llm/tencent/hy3.mdx
+      - section: "Vision Language Models (VLMs)"
+        slug: vision-language-models
+        contents:
+          - page: "Overview"
+            path: ./v0.4/pages/model-coverage/vlm/index.mdx
+            slug: overview
+          - page: "Kimi-VL"
+            path: ./v0.4/pages/model-coverage/vlm/moonshotai/kimi-vl.mdx
+          - page: "Gemma 3 VL / Gemma 3n"
+            path: ./v0.4/pages/model-coverage/vlm/google/gemma3-vl.mdx
+          - page: "Gemma 4"
+            path: ./v0.4/pages/model-coverage/vlm/google/gemma4.mdx
+          - page: "Qwen2.5-VL"
+            path: ./v0.4/pages/model-coverage/vlm/qwen/qwen2-5-vl.mdx
+          - page: "Qwen3-VL / Qwen3-VL-MoE"
+            path: ./v0.4/pages/model-coverage/vlm/qwen/qwen3-vl.mdx
+          - page: "Qwen3.5-VL"
+            path: ./v0.4/pages/model-coverage/vlm/qwen/qwen3-5-vl.mdx
+          - page: "Nemotron-Parse"
+            path: ./v0.4/pages/model-coverage/vlm/nvidia/nemotron-parse.mdx
+          - page: "Ministral3 VL"
+            path: ./v0.4/pages/model-coverage/vlm/mistralai/ministral3-vl.mdx
+          - page: "Mistral Medium 3.5"
+            path: ./v0.4/pages/model-coverage/vlm/mistralai/mistral-medium-3-5.mdx
+          - page: "Mistral-Small-4"
+            path: ./v0.4/pages/model-coverage/vlm/mistralai/mistral-small-4.mdx
+          - page: "InternVL"
+            path: ./v0.4/pages/model-coverage/vlm/internlm/internvl.mdx
+          - page: "Llama 4"
+            path: ./v0.4/pages/model-coverage/vlm/meta/llama4.mdx
+          - page: "LLaVA-OneVision"
+            path: ./v0.4/pages/model-coverage/vlm/lmms-lab/llava-onevision.mdx
+          - page: "SmolVLM"
+            path: ./v0.4/pages/model-coverage/vlm/huggingface/smolvlm.mdx
+          - page: "LLaVA"
+            path: ./v0.4/pages/model-coverage/vlm/llava-hf/llava.mdx
+      - section: "Omni Models"
+        slug: omni
+        contents:
+          - page: "Overview"
+            path: ./v0.4/pages/model-coverage/omni/index.mdx
+            slug: overview
+          - page: "Qwen3-Omni"
+            path: ./v0.4/pages/model-coverage/omni/qwen/qwen3-omni.mdx
+          - page: "Phi-4-multimodal"
+            path: ./v0.4/pages/model-coverage/omni/microsoft/phi4-multimodal.mdx
+          - page: "Nemotron-Omni"
+            path: ./v0.4/pages/model-coverage/omni/nvidia/nemotron-omni.mdx
+      - section: "Diffusion Models"
+        slug: diffusion
+        contents:
+          - page: "Overview"
+            path: ./v0.4/pages/model-coverage/diffusion/index.mdx
+            slug: overview
+          - page: "Wan 2.1 T2V"
+            path: ./v0.4/pages/model-coverage/diffusion/wan-ai/wan2-1-t2v.mdx
+          - page: "FLUX.1-dev"
+            path: ./v0.4/pages/model-coverage/diffusion/black-forest-labs/flux.mdx
+          - page: "HunyuanVideo 1.5"
+            path: ./v0.4/pages/model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
+          - page: "Qwen-Image"
+            path: ./v0.4/pages/model-coverage/diffusion/qwen/qwen-image.mdx
+  - section: "Recipes & E2E Examples"
+    contents:
+      - page: "Recipes and End-to-End Examples"
+        path: ./v0.4/pages/guides/overview.mdx
+        slug: overview
+      - page: "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel"
+        path: ./v0.4/pages/guides/llm/finetune.mdx
+        slug: sft-peft
+      - page: "Function Calling with NeMo AutoModel using FunctionGemma"
+        path: ./v0.4/pages/guides/llm/toolcalling.mdx
+        slug: function-calling
+      - page: "Knowledge Distillation with NeMo AutoModel"
+        path: ./v0.4/pages/guides/llm/knowledge-distillation.mdx
+        slug: knowledge-distillation
+      - page: "Fine-Tune Large MoE LLMs"
+        path: ./v0.4/pages/guides/llm/large-moe-finetune.mdx
+        slug: large-moe-fine-tuning
+      - page: "DeepSeek V4 Flash"
+        path: ./v0.4/pages/guides/llm/dsv4-flash.mdx
+        slug: deepseek-v4-flash
+      - page: "Hy3-preview"
+        path: ./v0.4/pages/guides/llm/hy3.mdx
+        slug: hy3-preview
+      - page: "Pretraining Megatron Core Datasets with NeMo AutoModel"
+        path: ./v0.4/pages/guides/llm/pretraining.mdx
+        slug: pretraining
+      - page: "LLM Pre-Training with NeMo AutoModel"
+        path: ./v0.4/pages/guides/llm/nanogpt-pretraining.mdx
+        slug: nanogpt-pretraining
+      - page: "Sequence Classification (SFT/PEFT) with NeMo AutoModel"
+        path: ./v0.4/pages/guides/llm/sequence-classification.mdx
+        slug: sequence-classification
+      - page: "Fine-Tune Gemma 3 and Gemma 3n"
+        path: ./v0.4/pages/guides/omni/gemma3-3n.mdx
+        slug: gemma-3-3n
+      - page: "Fine-Tuning Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide"
+        path: ./v0.4/pages/guides/vlm/gemma4.mdx
+        slug: gemma-4
+      - page: "Fine-Tune Qwen3.5-VL"
+        path: ./v0.4/pages/guides/vlm/qwen3-5.mdx
+        slug: qwen3-5-vl
+      - page: "Nemotron-Omni"
+        path: ./v0.4/pages/guides/vlm/nemotron-omni.mdx
+        slug: nemotron-omni
+      - page: "Mistral Medium 3.5 VL"
+        path: ./v0.4/pages/guides/vlm/mistral-medium-3-5.mdx
+        slug: mistral-medium-3-5
+      - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
+        path: ./v0.4/pages/guides/diffusion/finetune.mdx
+        slug: diffusion-fine-tuning
+      - page: "dLLM Fine-Tuning"
+        path: ./v0.4/pages/guides/dllm/finetune.mdx
+        slug: dllm-fine-tuning
+      - page: "Quantization-Aware Training (QAT) in NeMo Automodel"
+        path: ./v0.4/pages/guides/quantization-aware-training.mdx
+        slug: qat
+      - page: "Model Training on Databricks"
+        path: ./v0.4/pages/guides/llm/databricks.mdx
+        slug: databricks
+  - section: "Datasets"
+    contents:
+      - page: "Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo AutoModel"
+        path: ./v0.4/pages/guides/dataset-overview.mdx
+        slug: overview
+      - page: "Integrate Your Own Text Dataset"
+        path: ./v0.4/pages/guides/llm/dataset.mdx
+        slug: text-dataset
+      - page: "Retrieval Dataset (Embedding Fine-tuning)"
+        path: ./v0.4/pages/guides/llm/retrieval-dataset.mdx
+        slug: retrieval-dataset
+      - page: "Use the ColumnMappedTextInstructionDataset"
+        path: ./v0.4/pages/guides/llm/column-mapped-text-instruction-dataset.mdx
+        slug: columnmapped-dataset
+      - page: "Use the ColumnMappedTextInstructionIterableDataset (Streaming)"
+        path: ./v0.4/pages/guides/llm/column-mapped-text-instruction-iterable-dataset.mdx
+        slug: columnmapped-iterable
+      - page: "Integrate Your Own Multi-Modal Dataset"
+        path: ./v0.4/pages/guides/vlm/dataset.mdx
+        slug: multi-modal-dataset
+      - page: "Diffusion Dataset Preparation"
+        path: ./v0.4/pages/guides/diffusion/dataset.mdx
+        slug: diffusion-dataset
+  - section: "Job Launchers"
+    contents:
+      - page: "Job Launchers"
+        path: ./v0.4/pages/launcher/overview.mdx
+        slug: overview
+      - page: "Run on Your Local Workstation"
+        path: ./v0.4/pages/launcher/local-workstation.mdx
+        slug: local-workstation
+      - page: "Run on a Cluster"
+        path: ./v0.4/pages/launcher/slurm.mdx
+        slug: slurm-cluster
+      - page: "Run with NeMo-Run"
+        path: ./v0.4/pages/launcher/nemo-run.mdx
+        slug: nemo-run
+      - page: "Run on Any Cloud with SkyPilot"
+        path: ./v0.4/pages/launcher/skypilot.mdx
+        slug: skypilot
+      - page: "SkyPilot k8s"
+        path: ./v0.4/pages/launcher/skypilot-kubernetes.mdx
+        slug: skypilot-k8s
+  - section: "Development"
+    contents:
+      - page: "Checkpointing in NeMo Automodel"
+        path: ./v0.4/pages/guides/checkpointing.mdx
+        slug: checkpointing
+      - page: "Gradient (Activation) Checkpointing in NeMo AutoModel"
+        path: ./v0.4/pages/guides/gradient-checkpointing.mdx
+        slug: gradient-checkpointing
+      - page: "Pipeline Parallelism with AutoPipeline"
+        path: ./v0.4/pages/guides/pipelining.mdx
+        slug: pipeline-parallelism
+      - page: "FP8 Training in NeMo AutoModel"
+        path: ./v0.4/pages/guides/fp8-training.mdx
+        slug: fp8-training
+      - page: "MLflow Logging in NeMo AutoModel"
+        path: ./v0.4/pages/guides/mlflow-logging.mdx
+        slug: mlflow-logging
+      - page: "Breaking Changes"
+        path: ./v0.4/pages/breaking-changes.mdx
+        slug: breaking-changes
