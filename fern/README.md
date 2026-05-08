@@ -9,11 +9,45 @@ The legacy Sphinx tree under `../docs/` remains in place for reference until the
 | What | Where |
 |---|---|
 | Published site | https://docs.nvidia.com/nemo/automodel |
-| Latest preview (`/latest/`) | https://nemo-automodel.docs.buildwithfern.com/nemo/automodel/latest |
-| Fern dashboard | https://app.buildwithfern.com (NVIDIA org) |
+| Fern dashboard | https://dashboard.buildwithfern.com (NVIDIA org) |
 | Skill for agents | [`../skills/fern-docs/SKILL.md`](../skills/fern-docs/SKILL.md) |
 | CI workflows | [`../.github/workflows/fern-docs-*.yml`](../.github/workflows/) |
 | Make targets | [`../Makefile`](../Makefile) |
+
+## Quickstart
+
+First time on this machine:
+
+```bash
+# 1. Install the Fern CLI globally (one-time)
+npm install -g fern-api
+# or use it ad-hoc via:  npx -y fern-api@latest <subcommand>
+
+# 2. Provision your Fern account + CLI auth (one-time per machine).
+#    Walks you through the dashboard sign-in step before running `fern login`.
+make docs-login
+
+# 3. Build the API library reference and start the local dev server
+make docs           # http://localhost:3002
+
+# 4. (Optional) validate config + MDX without booting the server
+make docs-check
+```
+
+**`make docs-login` is load-bearing.** Skip it and `fern docs md generate` returns `HTTP 403: User does not belong to organization` — the CLI's `fern login` flow alone is *not* enough; Fern requires that you sign in to the dashboard first so your account record exists in Fern's user DB. See [NeMo Gym #1185](https://github.com/NVIDIA-NeMo/Gym/issues/1185) for the ugly version of that bug.
+
+### Fern CLI + docs reference
+
+| Resource | Link |
+|---|---|
+| Fern docs (overview, writing, configuration) | https://buildwithfern.com/learn/docs |
+| Fern CLI reference | https://buildwithfern.com/learn/cli |
+| MDX components (Cards, Callouts, Tabs, …) | https://buildwithfern.com/learn/docs/writing-content/components |
+| Frontmatter fields | https://buildwithfern.com/learn/docs/writing-content/frontmatter |
+| Versioning | https://buildwithfern.com/learn/docs/building-your-docs/versioning |
+| Redirects | https://buildwithfern.com/learn/docs/configuration/site-level-settings#redirects-configuration |
+| `libraries:` (Python autodoc) | https://buildwithfern.com/learn/docs/api-references/library-reference |
+| Fern Slack (NVIDIA) | `#fern` |
 
 ## Layout
 
@@ -54,11 +88,7 @@ make docs-preview   # shared preview URL on *.docs.buildwithfern.com (needs DOCS
 make docs-publish   # trigger the `Publish Fern Docs` workflow on origin/main
 ```
 
-First-time setup — sign the Fern CLI in to the NVIDIA org once via Google SSO:
-
-```bash
-fern login   # opens browser → @nvidia.com Google account
-```
+For first-time-on-this-machine setup, see the [Quickstart](#quickstart) above — `make docs-login` walks through dashboard provisioning + `fern login` together.
 
 `fern docs md generate` (run by `make docs`) populates `fern/product-docs/` from the `nemo_automodel` package source declared in the `libraries:` block of `docs.yml`. Without it, a cold `fern docs dev` will fail with `Folder not found: ./product-docs/...`. Re-run only when the upstream Python source changes — for prose-only iteration, `cd fern && fern docs dev` alone is enough.
 
