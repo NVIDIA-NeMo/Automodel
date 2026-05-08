@@ -2912,6 +2912,13 @@ class TestNeatPackedVlmCollaterAttnImpl:
         # SDPA produces 4D block-causal mask
         assert result["attention_mask"].ndim == 4
 
+    def test_single_sequence_preserves_packed_seq_ids(self):
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(4, 0)]
+        result = neat_packed_vlm_collater(batch, max_length=6, attn_implementation="sdpa")
+        assert torch.equal(result["_packed_seq_ids"], torch.tensor([[1, 1, 1, 1, 0, 0]]))
+
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
