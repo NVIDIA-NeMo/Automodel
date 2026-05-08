@@ -106,3 +106,9 @@ The VLM sample uses inline `data:image/...` URLs so it can run as a
 self-contained format example. Real datasets can use relative image paths,
 absolute paths, HTTP(S) URLs, or supported image content parts such as
 `image_url`, `input_image`, and `image`.
+
+## Next Steps
+
+- [LLM SFT and PEFT guide](../../docs/guides/llm/finetune.md)
+- [VLM dataset guide](../../docs/guides/vlm/dataset.md)
+- [Quickstart guide](../../docs/guides/quickstart.md)
