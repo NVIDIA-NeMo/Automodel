@@ -77,6 +77,14 @@ fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-started/in
 4. **Section move** — `git mv` the file, update `path:` in `versions/v0.4.yml`, fix incoming links, re-sync aliases.
 5. **Slug change** — change `slug:` in the YAML (or rename the file and let the default slug update). Add a `redirects:` entry in `docs.yml` so the old URL keeps working.
 
+### Redirect quirks
+
+Three things to watch when editing `redirects:` in `fern/docs.yml`:
+
+1. **`:path*` does NOT match the empty-path case.** `/<basepath>/v0.4/:path*/index.html` will *not* match `/<basepath>/v0.4/index.html` (where `:path*` would have to be empty). Each version-root `index.html` needs its own explicit rule. NeMo Curator (NVIDIA-NeMo/Curator#1938) discovered this when their version-root URLs 404'd. AutoModel ships explicit rules for `latest`, `v0.4`, `nightly`, and the legacy `0.4` form — when you add a new version slug, add four new explicit rules: `<slug>/index.html`, `<slug>/index`, plus the same two for any legacy form (e.g. `0.5` → `v0.5`).
+2. **Order matters.** Specific rules must come before catch-alls — Fern uses first-match. Slot new rules *before* the `:path*/index.html` and `:path*.html` catch-alls.
+3. **Don't ship `redirects: []`** then re-run the redirect generator on top — it replaces the whole `redirects:` block. Edit by hand or back up the existing rules first.
+
 ### Remove a page
 
 1. Find incoming links: `grep -rn "<filename>" fern/versions/v0.4/pages/ --include="*.mdx"`.

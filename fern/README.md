@@ -165,6 +165,7 @@ PR titles follow Conventional Commits (e.g. `docs(fern): add gemma4 fine-tuning 
 | `JSX expressions must have one parent element` | Wrap multi-element JSX in `<>...</>` or a `<div>` |
 | Card badges have no spacing | Use `<Tag>` (NeMo AutoModel landing pattern), not raw HTML; spacing is in `main.css` |
 | Old Sphinx URL breaks | Add a `redirects:` entry in `docs.yml` |
+| `<basepath>/<version>/index.html` 404s but deep paths work | `:path*` does not match the empty-path case ([NVIDIA-NeMo/Curator#1938](https://github.com/NVIDIA-NeMo/Curator/pull/1938)). Each version-root `index.html` needs its own explicit redirect rule — slot before the `:path*/index.html` catch-all |
 
 ## Reference
 
