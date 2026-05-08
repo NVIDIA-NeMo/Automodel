@@ -333,3 +333,10 @@ navigation:
       - page: "Breaking Changes"
         path: ./v0.4/pages/breaking-changes.mdx
         slug: breaking-changes
+      - section: "API Reference"
+        slug: api-reference
+        contents:
+          - page: "Overview"
+            path: ./v0.4/pages/api-reference/index.mdx
+            slug: overview
+          - folder: ../product-docs/nemo-automodel/Full-Library-Reference

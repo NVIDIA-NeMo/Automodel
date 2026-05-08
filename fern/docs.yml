@@ -35,6 +35,15 @@ css:
 navbar-links:
 - type: github
   value: https://github.com/NVIDIA-NeMo/Automodel
+libraries:
+  nemo-automodel:
+    input:
+      git: https://github.com/NVIDIA-NeMo/Automodel
+      subpath: nemo_automodel
+    output:
+      path: ./product-docs/nemo-automodel/Full-Library-Reference
+    lang: python
+
 experimental:
   mdx-components:
   - ./components
