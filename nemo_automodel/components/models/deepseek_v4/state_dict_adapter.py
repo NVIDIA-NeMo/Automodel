@@ -228,17 +228,23 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """Convert HF checkpoint to internal format.
 
         Steps:
-          1. Split MTP layers (index >= num_hidden_layers) from backbone keys.
-          2. Dequantize FP8 weights (scale suffix is either `.scale` or `_scale_inv`).
+          1. Split MTP layers (index >= num_hidden_layers) from backbone keys
+             and renumber them as ``layers.{k}.*`` so the standard pipeline
+             (dequantize / aggregate-experts / rename) handles them too.
+          2. Dequantize FP8 / FP4 weights for both backbone and MTP.
           3. Aggregate per-expert routed weights into stacked tensors.
-          4. Rename remaining backbone keys using the HF -> internal mapping table.
-          5. Map MTP keys: ``layers.{N+k}.*`` -> ``mtp.layers.{k}.*``.
+          4. Rename keys using the HF -> internal mapping table.
+          5. Re-prefix MTP keys: ``model.layers.{k}.*`` -> ``mtp.layers.{k}.*``.
         """
         N = self.config.num_hidden_layers
         num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
         _layer_re = re.compile(r"^layers\.(\d+)\.")
 
-        # Split MTP keys from backbone keys before dequantization.
+        # Split MTP keys from backbone keys.  MTP layers in HF format are
+        # ``layers.{N+k}.*`` — renumber them to ``layers.{k}.*`` so we can run
+        # them through the same dequantize / aggregate / rename pipeline as
+        # the backbone (FP4 routed experts and FP8 attention projections live
+        # under MTP too, so they need the same handling).
         mtp_hf: dict[str, Any] = {}
         if num_mtp > 0:
             backbone_hf: dict[str, Any] = {}
@@ -246,7 +252,10 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 val = hf_state_dict[key]
                 m = _layer_re.match(key)
                 if m and int(m.group(1)) >= N:
-                    mtp_hf[key] = val
+                    orig_idx = int(m.group(1))
+                    mtp_depth = orig_idx - N
+                    renumbered = f"layers.{mtp_depth}." + key[m.end() :]
+                    mtp_hf[renumbered] = val
                 else:
                     backbone_hf[key] = val
             hf_state_dict = backbone_hf
@@ -255,18 +264,24 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         hf_state_dict = self._aggregate_experts(hf_state_dict, device_mesh)
         state_dict = self._rename_all(hf_state_dict)
 
-        # Process MTP layers: layers.{N+k}.* -> mtp.layers.{k}.*
-        for key, val in mtp_hf.items():
-            m = _layer_re.match(key)
-            if not m:
-                continue
-            orig_idx = int(m.group(1))
-            mtp_depth = orig_idx - N
-            # Apply backbone renames to the key (reuses _HF_TO_INTERNAL_RENAMES).
-            renamed = _rename_hf_key(key)
-            # renamed is now "model.layers.{orig_idx}.*" -> replace with "mtp.layers.{mtp_depth}.*"
-            renamed = renamed.replace(f"model.layers.{orig_idx}.", f"mtp.layers.{mtp_depth}.")
-            state_dict[renamed] = val
+        if mtp_hf:
+            mtp_hf = self._dequantize(mtp_hf)
+            mtp_hf = self._aggregate_experts(mtp_hf, device_mesh)
+            mtp_renamed = self._rename_all(mtp_hf)
+            for key, val in mtp_renamed.items():
+                # After _rename_all, layer-indexed keys are in one of two forms:
+                #   - ``model.layers.{k}.*`` if a rename rule matched (norms,
+                #     attn, mlp, experts, hc), or
+                #   - ``layers.{k}.*`` if no rule matched — V4 MTP fusion-only
+                #     modules (``eh_proj`` / ``enorm`` / ``hnorm`` /
+                #     ``final_layernorm``) have no specific rename rule.
+                # Re-prefix both forms into the ``mtp.layers.{k}.*`` namespace.
+                if key.startswith("model.layers."):
+                    state_dict["mtp" + key[len("model") :]] = val
+                elif key.startswith("layers."):
+                    state_dict["mtp." + key] = val
+                else:
+                    state_dict[key] = val
 
         return state_dict
 
@@ -554,48 +569,22 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 return new_key
         return key
 
-    @staticmethod
-    def _apply_inverse_rename(fqn: str, layer_idx: int) -> str:
-        """Apply inverse backbone renames for a given layer index.
-
-        Converts internal ``model.layers.{i}.*`` key back to the HF on-disk format
-        ``layers.{i}.*``, mirroring the reverse direction of ``_HF_TO_INTERNAL_RENAMES``.
-
-        Args:
-            fqn: Internal fully-qualified name (``model.layers.{i}.*``).
-            layer_idx: The layer index to substitute.
-
-        Returns:
-            HF-format key string.
-        """
-        i = layer_idx
-        fqn = fqn.replace(f"model.layers.{i}.input_layernorm.", f"layers.{i}.attn_norm.")
-        fqn = fqn.replace(f"model.layers.{i}.post_attention_layernorm.", f"layers.{i}.ffn_norm.")
-        fqn = fqn.replace(f"model.layers.{i}.self_attn.sinks", f"layers.{i}.attn.attn_sink")
-        fqn = fqn.replace(f"model.layers.{i}.self_attn.", f"layers.{i}.attn.")
-        fqn = fqn.replace(f"model.layers.{i}.mlp.gate.e_score_correction_bias", f"layers.{i}.ffn.gate.bias")
-        fqn = fqn.replace(f"model.layers.{i}.mlp.gate.", f"layers.{i}.ffn.gate.")
-        fqn = fqn.replace(f"model.layers.{i}.mlp.", f"layers.{i}.ffn.")
-        fqn = re.sub(rf"model\.layers\.{i}\.attn_hc\.(fn|base|scale)", rf"layers.{i}.hc_attn_\1", fqn)
-        fqn = re.sub(rf"model\.layers\.{i}\.ffn_hc\.(fn|base|scale)", rf"layers.{i}.hc_ffn_\1", fqn)
-        fqn = fqn.replace(f"model.layers.{i}.", f"layers.{i}.")
-        return fqn
-
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
-        # Handle MTP keys: "mtp.layers.{k}.*" -> "layers.{N+k}.*"
+        # MTP keys (``mtp.layers.{k}.*``) share the same on-disk layout as
+        # backbone layers ``layers.{N+k}.*``, so rewrite the fqn into the
+        # equivalent backbone-internal form and run it through the standard
+        # split / rename / quantize pipeline.  This keeps expert splitting,
+        # FP4/FP8 quantization, and exclude-key filtering symmetric with the
+        # ``from_hf`` path instead of bypassing them.
+        mtp_hf_idx: int | None = None
         if fqn.startswith("mtp."):
             N = self.config.num_hidden_layers
-            rest = fqn[len("mtp.") :]  # "layers.{k}.rest"
+            rest = fqn[len("mtp.") :]
             m = re.match(r"^layers\.(\d+)\.", rest)
-            if m:
-                k = int(m.group(1))
-                suffix = rest[m.end() :]
-                hf_idx = N + k
-                internal_prefix = f"model.layers.{hf_idx}."
-                internal_fqn = internal_prefix + suffix
-                hf_fqn = self._apply_inverse_rename(internal_fqn, hf_idx)
-                return [(hf_fqn, tensor)]
-            return [(fqn, tensor)]
+            if m is None:
+                return [(fqn, tensor)]
+            mtp_hf_idx = N + int(m.group(1))
+            fqn = f"model.layers.{mtp_hf_idx}." + rest[m.end() :]
 
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
@@ -608,6 +597,18 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
 
         # Rename internal keys to HF keys
         result = [(self._internal_key_to_hf(k), v) for k, v in result]
+
+        if mtp_hf_idx is not None:
+            # MTP fusion-only modules (``eh_proj`` / ``enorm`` / ``hnorm`` /
+            # ``final_layernorm``) have no entry in ``_INTERNAL_TO_HF_RENAMES``,
+            # so they leave ``_internal_key_to_hf`` still carrying the
+            # ``model.layers.{N+k}.*`` prefix.  Strip ``model.`` here so they
+            # land at the HF-side ``layers.{N+k}.*`` like every other MTP key.
+            internal_prefix = f"model.layers.{mtp_hf_idx}."
+            hf_prefix = f"layers.{mtp_hf_idx}."
+            result = [
+                (hf_prefix + k[len(internal_prefix) :] if k.startswith(internal_prefix) else k, v) for k, v in result
+            ]
 
         if quantization:
             quantized = []

@@ -198,3 +198,165 @@ class TestDeepSeekV4StateDictAdapterToHF:
         assert adapter._is_non_quantized("ffn.gate.bias")
         assert adapter._is_non_quantized("ffn.gate.tid2eid")
         assert adapter._is_non_quantized("attn.attn_sink")
+
+
+class TestDeepSeekV4StateDictAdapterMTPRoundTrip:
+    """Cover the MTP-layer path on both directions of the adapter.
+
+    The HF on-disk format places MTP layers at ``layers.{N+k}.*``; internally
+    the model stores them under ``mtp.layers.{k}.*``.  These tests pin the
+    contract that:
+      * dequantization runs over MTP layers too (FP8 attention + FP4 experts);
+      * routed-expert weights aggregate into ``mtp.layers.{k}.mlp.experts.*``;
+      * the inverse path under ``to_hf`` produces ``layers.{N+k}.*`` keys
+        and goes through expert splitting + the standard rename.
+    """
+
+    def test_from_hf_renames_mtp_layer(self):
+        adapter = _make_adapter(num_nextn_predict_layers=2)
+        N = adapter.config.num_hidden_layers  # 4
+        # layer N (depth 0) has a plain attn projection — covers the simple
+        # rename branch of the MTP path.
+        sd = {
+            "embed.weight": torch.zeros(256, 64),
+            f"layers.{N}.attn.wq_a.weight": torch.randn(32, 64),
+            f"layers.{N}.attn_norm.weight": torch.ones(64),
+            f"layers.{N + 1}.ffn_norm.weight": torch.ones(64),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        # Backbone-side keys still rename normally.
+        assert "model.embed_tokens.weight" in out
+        # MTP keys now live under mtp.layers.{k}.* with internal sub-paths.
+        assert "mtp.layers.0.self_attn.wq_a.weight" in out
+        assert "mtp.layers.0.input_layernorm.weight" in out
+        assert "mtp.layers.1.post_attention_layernorm.weight" in out
+        # And the original layers.{N+k}.* keys are gone.
+        assert f"layers.{N}.attn.wq_a.weight" not in out
+
+    def test_from_hf_dequantizes_mtp_fp8(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        weight_fp8 = torch.zeros(32, 64, dtype=torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        sd = {
+            f"layers.{N}.attn.wq_a.weight": weight_fp8,
+            f"layers.{N}.attn.wq_a.scale": scale,
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        # Weight should be dequantized to the adapter dtype (float32 here)
+        # and the standalone .scale companion key should be gone.
+        assert "mtp.layers.0.self_attn.wq_a.weight" in out
+        assert out["mtp.layers.0.self_attn.wq_a.weight"].dtype == torch.float32
+        assert all(not k.endswith(".scale") for k in out)
+
+    def test_from_hf_aggregates_mtp_experts(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        n_experts = adapter.moe_config.n_routed_experts
+        inter_dim = 32
+        hidden = 64
+        sd: dict[str, torch.Tensor] = {}
+        for eid in range(n_experts):
+            sd[f"layers.{N}.ffn.experts.{eid}.w1.weight"] = torch.randn(inter_dim, hidden)
+            sd[f"layers.{N}.ffn.experts.{eid}.w3.weight"] = torch.randn(inter_dim, hidden)
+            sd[f"layers.{N}.ffn.experts.{eid}.w2.weight"] = torch.randn(hidden, inter_dim)
+        out = adapter.from_hf(sd, device_mesh=None)
+        # Aggregation must land under the MTP namespace, not on the backbone.
+        assert "mtp.layers.0.mlp.experts.gate_and_up_projs" in out
+        assert "mtp.layers.0.mlp.experts.down_projs" in out
+        assert "model.layers.4.mlp.experts.gate_and_up_projs" not in out
+        gate_up = out["mtp.layers.0.mlp.experts.gate_and_up_projs"]
+        down = out["mtp.layers.0.mlp.experts.down_projs"]
+        assert gate_up.shape == (n_experts, hidden, 2 * inter_dim)
+        assert down.shape == (n_experts, inter_dim, hidden)
+
+    def test_to_hf_renames_mtp_attention_key(self):
+        adapter = _make_adapter(num_nextn_predict_layers=2)
+        N = adapter.config.num_hidden_layers
+        # Non-quantized branch: the rename should drop ``mtp.`` and add
+        # ``N+k`` to the layer index, then run through ``_internal_key_to_hf``.
+        pairs = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.1.self_attn.wq_a.weight",
+            torch.zeros(32, 64),
+            quantization=False,
+        )
+        assert len(pairs) == 1
+        hf_key, _ = pairs[0]
+        assert hf_key == f"layers.{N + 1}.attn.wq_a.weight"
+
+    def test_to_hf_splits_mtp_experts(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        n_experts = adapter.moe_config.n_routed_experts
+        hidden, inter = 64, 32
+        gate_up = torch.randn(n_experts, hidden, 2 * inter)
+        pairs = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.0.mlp.experts.gate_and_up_projs", gate_up, quantization=False
+        )
+        keys = {k for k, _ in pairs}
+        # Every per-expert key must use the HF-side ``layers.{N+0}.*`` prefix,
+        # not the internal ``mtp.*`` namespace.
+        assert f"layers.{N}.ffn.experts.0.w1.weight" in keys
+        assert f"layers.{N}.ffn.experts.0.w3.weight" in keys
+        assert all(not k.startswith("mtp.") for k in keys)
+
+    def test_to_hf_quantizes_mtp_attention_weight(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        pairs = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.0.self_attn.wq_a.weight",
+            torch.randn(32, 64),
+            quantization=True,
+        )
+        keys_to_dtypes = {k: v.dtype for k, v in pairs}
+        # Quantization must emit both the FP8 weight and the FP32 scale,
+        # symmetric with backbone behaviour.
+        assert keys_to_dtypes[f"layers.{N}.attn.wq_a.weight"] == torch.float8_e4m3fn
+        assert keys_to_dtypes[f"layers.{N}.attn.wq_a.scale"] == torch.float32
+
+    def test_from_hf_renames_mtp_fusion_only_keys(self):
+        """V4 MTP fusion modules (``eh_proj`` / ``enorm`` / ``hnorm`` /
+        ``final_layernorm``) have no specific rename rule but still need to
+        land under the ``mtp.layers.{k}.*`` namespace, otherwise DCP load
+        misses them and the MTP head trains from random init.
+        """
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        sd = {
+            f"layers.{N}.eh_proj.weight": torch.randn(64, 128),
+            f"layers.{N}.enorm.weight": torch.ones(64),
+            f"layers.{N}.hnorm.weight": torch.ones(64),
+            f"layers.{N}.final_layernorm.weight": torch.ones(64),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        assert "mtp.layers.0.eh_proj.weight" in out
+        assert "mtp.layers.0.enorm.weight" in out
+        assert "mtp.layers.0.hnorm.weight" in out
+        assert "mtp.layers.0.final_layernorm.weight" in out
+        # And the original ``layers.{N}.*`` keys must NOT leak through —
+        # those would dangle in the DCP load and cause "extra keys" errors.
+        assert f"layers.{N}.eh_proj.weight" not in out
+
+    def test_to_hf_renames_mtp_fusion_only_keys(self):
+        """Inverse direction of ``test_from_hf_renames_mtp_fusion_only_keys``:
+        ``mtp.layers.{k}.eh_proj.weight`` must export to
+        ``layers.{N+k}.eh_proj.weight`` with no leftover ``model.`` prefix.
+        """
+        adapter = _make_adapter(num_nextn_predict_layers=2)
+        N = adapter.config.num_hidden_layers
+        for internal_suffix, expected_suffix in [
+            ("eh_proj.weight", "eh_proj.weight"),
+            ("enorm.weight", "enorm.weight"),
+            ("hnorm.weight", "hnorm.weight"),
+            ("final_layernorm.weight", "final_layernorm.weight"),
+        ]:
+            pairs = adapter.convert_single_tensor_to_hf(
+                f"mtp.layers.1.{internal_suffix}",
+                torch.zeros(64, 64),
+                quantization=False,
+            )
+            assert len(pairs) == 1
+            hf_key, _ = pairs[0]
+            assert hf_key == f"layers.{N + 1}.{expected_suffix}", (
+                f"unexpected key {hf_key!r} for internal suffix {internal_suffix!r}"
+            )

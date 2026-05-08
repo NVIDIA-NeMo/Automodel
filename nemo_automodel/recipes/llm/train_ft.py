@@ -160,6 +160,36 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     return 1
 
 
+def _mtp_is_enabled(cfg, model_parts) -> bool:
+    """Return True if Multi-Token Prediction is enabled for this run.
+
+    Checks both signals because either may be missing depending on how the
+    model was constructed:
+
+      * YAML override / explicit DeepseekV4Config: the
+        ``model.config.num_nextn_predict_layers`` field is the user-facing
+        knob and is present on the cfg before any model is built.
+      * Constructed model: V4's ``ForCausalLM.__init__`` materializes
+        ``self.mtp_config``.  Walking ``modules()`` catches it on the root
+        or on any submodule that retained the attribute after wrapping.
+
+    The module walk alone isn't sufficient: pipeline-parallel wrapping can
+    replace the V4 root with a stage container that no longer exposes
+    ``mtp_config``, in which case only the cfg lookup catches MTP.
+    """
+    n = int(cfg.get("model.config.num_nextn_predict_layers", 0) or 0)
+    if n > 0:
+        return True
+    for mp in model_parts:
+        if mp is None:
+            continue
+        for sub in mp.modules():
+            mc = getattr(sub, "mtp_config", None)
+            if mc is not None and getattr(mc, "enabled", False):
+                return True
+    return False
+
+
 def build_model(
     cfg_model,
     cfg_peft,
@@ -1141,6 +1171,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
+        # Pipeline parallelism does not currently aggregate the Multi-Token
+        # Prediction (MTP) auxiliary loss through the schedule, so the MTP
+        # head would silently receive no gradients.  Block the combination
+        # here rather than train a model whose MTP weights never update.
+        # TODO(deepseek-v4-mtp): wire MTP loss through the PP schedule in a
+        # follow-up PR; tracked separately from this MTP-on-FSDP/DDP change.
+        if self.pp_enabled and _mtp_is_enabled(self.cfg, self.model_parts):
+            raise NotImplementedError(
+                "Multi-Token Prediction (MTP) is not yet supported under "
+                "pipeline parallelism: the PP schedule does not aggregate the "
+                "auxiliary MTP loss, so the MTP head would not receive gradients. "
+                "PP + MTP wiring is intentionally deferred to a follow-up PR. "
+                "For now, disable MTP (set model.config.num_nextn_predict_layers=0) "
+                "or run without pipeline parallelism."
+            )
+
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
@@ -1422,6 +1468,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
+            # TODO(deepseek-v4-mtp): MTP auxiliary loss is currently not wired
+            # through the PP schedule (the non-PP branch below adds it via
+            # ``calculate_mtp_loss`` on ``out.mtp_per_depth_h``).  PP + MTP is
+            # blocked at recipe ``setup()`` for now and will be enabled in a
+            # follow-up PR that hooks the per-depth hidden states into the
+            # last-stage loss aggregation.
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
