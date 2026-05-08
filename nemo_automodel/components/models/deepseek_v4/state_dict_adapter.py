@@ -228,13 +228,47 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """Convert HF checkpoint to internal format.
 
         Steps:
-          1. Dequantize FP8 weights (scale suffix is either `.scale` or `_scale_inv`).
-          2. Aggregate per-expert routed weights into stacked tensors.
-          3. Rename remaining keys using the HF -> internal mapping table.
+          1. Split MTP layers (index >= num_hidden_layers) from backbone keys.
+          2. Dequantize FP8 weights (scale suffix is either `.scale` or `_scale_inv`).
+          3. Aggregate per-expert routed weights into stacked tensors.
+          4. Rename remaining backbone keys using the HF -> internal mapping table.
+          5. Map MTP keys: ``layers.{N+k}.*`` -> ``mtp.layers.{k}.*``.
         """
+        N = self.config.num_hidden_layers
+        num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
+        _layer_re = re.compile(r"^layers\.(\d+)\.")
+
+        # Split MTP keys from backbone keys before dequantization.
+        mtp_hf: dict[str, Any] = {}
+        if num_mtp > 0:
+            backbone_hf: dict[str, Any] = {}
+            for key in list(hf_state_dict.keys()):
+                val = hf_state_dict[key]
+                m = _layer_re.match(key)
+                if m and int(m.group(1)) >= N:
+                    mtp_hf[key] = val
+                else:
+                    backbone_hf[key] = val
+            hf_state_dict = backbone_hf
+
         hf_state_dict = self._dequantize(hf_state_dict)
         hf_state_dict = self._aggregate_experts(hf_state_dict, device_mesh)
-        return self._rename_all(hf_state_dict)
+        state_dict = self._rename_all(hf_state_dict)
+
+        # Process MTP layers: layers.{N+k}.* -> mtp.layers.{k}.*
+        for key, val in mtp_hf.items():
+            m = _layer_re.match(key)
+            if not m:
+                continue
+            orig_idx = int(m.group(1))
+            mtp_depth = orig_idx - N
+            # Apply backbone renames to the key (reuses _HF_TO_INTERNAL_RENAMES).
+            renamed = _rename_hf_key(key)
+            # renamed is now "model.layers.{orig_idx}.*" -> replace with "mtp.layers.{mtp_depth}.*"
+            renamed = renamed.replace(f"model.layers.{orig_idx}.", f"mtp.layers.{mtp_depth}.")
+            state_dict[renamed] = val
+
+        return state_dict
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Dequantize FP8 weights.  Handles both `.scale` and `_scale_inv` suffixes."""
@@ -520,7 +554,49 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 return new_key
         return key
 
+    @staticmethod
+    def _apply_inverse_rename(fqn: str, layer_idx: int) -> str:
+        """Apply inverse backbone renames for a given layer index.
+
+        Converts internal ``model.layers.{i}.*`` key back to the HF on-disk format
+        ``layers.{i}.*``, mirroring the reverse direction of ``_HF_TO_INTERNAL_RENAMES``.
+
+        Args:
+            fqn: Internal fully-qualified name (``model.layers.{i}.*``).
+            layer_idx: The layer index to substitute.
+
+        Returns:
+            HF-format key string.
+        """
+        i = layer_idx
+        fqn = fqn.replace(f"model.layers.{i}.input_layernorm.", f"layers.{i}.attn_norm.")
+        fqn = fqn.replace(f"model.layers.{i}.post_attention_layernorm.", f"layers.{i}.ffn_norm.")
+        fqn = fqn.replace(f"model.layers.{i}.self_attn.sinks", f"layers.{i}.attn.attn_sink")
+        fqn = fqn.replace(f"model.layers.{i}.self_attn.", f"layers.{i}.attn.")
+        fqn = fqn.replace(f"model.layers.{i}.mlp.gate.e_score_correction_bias", f"layers.{i}.ffn.gate.bias")
+        fqn = fqn.replace(f"model.layers.{i}.mlp.gate.", f"layers.{i}.ffn.gate.")
+        fqn = fqn.replace(f"model.layers.{i}.mlp.", f"layers.{i}.ffn.")
+        fqn = re.sub(rf"model\.layers\.{i}\.attn_hc\.(fn|base|scale)", rf"layers.{i}.hc_attn_\1", fqn)
+        fqn = re.sub(rf"model\.layers\.{i}\.ffn_hc\.(fn|base|scale)", rf"layers.{i}.hc_ffn_\1", fqn)
+        fqn = fqn.replace(f"model.layers.{i}.", f"layers.{i}.")
+        return fqn
+
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        # Handle MTP keys: "mtp.layers.{k}.*" -> "layers.{N+k}.*"
+        if fqn.startswith("mtp."):
+            N = self.config.num_hidden_layers
+            rest = fqn[len("mtp.") :]  # "layers.{k}.rest"
+            m = re.match(r"^layers\.(\d+)\.", rest)
+            if m:
+                k = int(m.group(1))
+                suffix = rest[m.end() :]
+                hf_idx = N + k
+                internal_prefix = f"model.layers.{hf_idx}."
+                internal_fqn = internal_prefix + suffix
+                hf_fqn = self._apply_inverse_rename(internal_fqn, hf_idx)
+                return [(hf_fqn, tensor)]
+            return [(fqn, tensor)]
+
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 

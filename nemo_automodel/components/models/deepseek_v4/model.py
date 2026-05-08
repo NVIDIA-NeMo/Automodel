@@ -42,6 +42,7 @@ Compress-ratio sliding-window attention is not yet implemented.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -68,6 +69,23 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class DeepseekV4CausalLMOutput:
+    """Output of DeepseekV4ForCausalLM.forward.
+
+    Attributes:
+        logits: ``[B, S, vocab_size]`` next-token prediction logits.
+        mtp_per_depth_h: Per-depth MTP hidden states (training mode only).
+            List of length ``num_nextn_predict_layers``, each ``[B, S, hidden]``.
+            ``None`` when MTP is disabled or in eval mode.
+        mtp_loss_scaling_factor: Coefficient for the MTP auxiliary loss.
+    """
+
+    logits: torch.Tensor
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float = 0.1
 
 
 class DeepseekV4Block(nn.Module):
@@ -520,6 +538,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.config = config
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
+        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = DeepseekV4Model(
             config,
             backend=self.backend,
@@ -541,6 +560,26 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             )
 
+        # MTP construction (import inside __init__ to avoid circular imports).
+        from nemo_automodel.components.models.deepseek_v4.mtp import (  # noqa: PLC0415
+            build_deepseek_v4_mtp,
+            build_mtp_config_from_hf,
+        )
+
+        self.mtp_config = build_mtp_config_from_hf(config, loss_scaling_factor=mtp_loss_scaling_factor)
+        if self.mtp_config.enabled:
+            self.mtp = build_deepseek_v4_mtp(
+                config=config,
+                mtp_config=self.mtp_config,
+                backend=self.backend,
+                moe_config=self.model.moe_config,
+                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+                rotary_emb=self.model.rotary_emb,
+                rotary_emb_compress=self.model.rotary_emb_compress,
+            )
+        else:
+            self.mtp = None
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -561,24 +600,55 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> "DeepseekV4CausalLMOutput":
+        thd_mode = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if thd_mode:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
             attention_mask = None
 
-        logits = self.model(
+        hidden_states = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(logits) if self.lm_head else logits
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+        logits = self.lm_head(hidden_states) if self.lm_head else hidden_states
+        if thd_mode:
             logits = logits.unsqueeze(0)
-        return logits
+
+        mtp_per_depth_h = None
+        if self.mtp is not None and self.training:
+            # hidden_states is [B, S, hidden] after hc_head+norm — correct MTP input.
+            seq_len = hidden_states.shape[1]
+            batch_size = hidden_states.shape[0]
+            if position_ids is None:
+                position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
+            sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
+            mtp_attn_mask = build_causal_padding_mask(
+                attention_mask,
+                seq_len=seq_len,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+                batch_size=batch_size,
+                sliding_window=sliding_window,
+            )
+            mtp_per_depth_h = self.mtp(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                embed_fn=self.model.embed_tokens,
+                position_ids=position_ids,
+                attention_mask=mtp_attn_mask,
+                padding_mask=padding_mask,
+            )
+
+        return DeepseekV4CausalLMOutput(
+            logits=logits,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+        )
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()
@@ -600,6 +670,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
+        if self.mtp is not None:
+            for sublayer in self.mtp.layers:
+                sublayer.init_weights(buffer_device=buffer_device)
         cast_model_to_dtype(self, dtype)
 
 
