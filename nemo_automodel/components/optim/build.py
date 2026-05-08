@@ -17,9 +17,67 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import torch
+
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
+
+
+def _fully_shard_megatron_optimizer(model_part: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    from nemo_automodel.components.distributed import megatron_fsdp
+
+    if not megatron_fsdp.HAS_MEGATRON_FSDP:
+        return optimizer
+    return megatron_fsdp.fully_shard_optimizer(model_part, optimizer)
+
+
+def build_optimizer(model: torch.nn.Module, cfg_opt: Any, distributed_config: Any, device_mesh: Any):
+    """Build optimizers for a model or model parts.
+
+    Args:
+        model: The model to build optimizers for.
+        cfg_opt: Optimizer configuration.
+        distributed_config: Distributed strategy configuration.
+        device_mesh: Device mesh used for tensor/data parallelism.
+
+    Returns:
+        List of optimizers, one per model part.
+    """
+    # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
+    # optimizers like TE FusedAdam that accept dtype kwargs.
+    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
+        val = getattr(cfg_opt, attr, None)
+        if isinstance(val, str):
+            setattr(cfg_opt, attr, dtype_from_str(val))
+
+    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
+        # TP does not support foreach
+        cfg_opt.foreach = False
+
+    optimizer = []
+    has_dion_optimizer = is_dion_optimizer(cfg_opt)
+    for part in getattr(model, "parts", [model]):
+        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
+        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        # TODO(@akoumparouli): no branching for building the optimizer, refactor.
+        if has_dion_optimizer:
+            tmp_optimizer = build_dion_optimizer(
+                cfg_opt=cfg_opt,
+                model=part,
+                distributed_mesh=device_mesh,
+            )
+        else:
+            tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
+        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
+            assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
+            tmp_optimizer = _fully_shard_megatron_optimizer(part, tmp_optimizer)
+        optimizer.append(tmp_optimizer)
+
+    return optimizer
 
 
 def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any) -> list[OptimizerParamScheduler] | None:

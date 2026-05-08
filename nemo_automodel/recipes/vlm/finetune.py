@@ -34,8 +34,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn as nn
 import wandb
-from megatron_fsdp import MegatronFSDP
-from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
@@ -64,7 +62,7 @@ from nemo_automodel.components.loss import build_loss_fn
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim import build_lr_scheduler
+from nemo_automodel.components.optim import build_lr_scheduler, build_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training import build_step_scheduler
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -168,36 +166,6 @@ def build_model(
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
     return model
-
-
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
-    """Build an optimizer for the model.
-
-    Args:
-        model: The model to build an optimizer for.
-        cfg_opt: The configuration for the optimizer.
-        distributed_config: The distributed configuration.
-        device_mesh: The device mesh.
-    """
-    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
-
-    optimizer = []
-    for part in getattr(model, "parts", [model]):
-        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
-        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
-            # Only call fully_shard_optimizer when the model was actually wrapped
-            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
-            # MegatronFSDP wrapping and the parameters won't carry the required
-            # _megatron_fsdp_model attribute.
-            if isinstance(part, MegatronFSDP):
-                fully_shard_optimizer(tmp_optimizer)
-        optimizer.append(tmp_optimizer)
-
-    return optimizer
 
 
 def _chunk_vlm_media(

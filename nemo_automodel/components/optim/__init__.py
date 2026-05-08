@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .build import build_lr_scheduler
+from .build import build_lr_scheduler, build_optimizer
 from .scheduler import OptimizerParamScheduler
 from .utils import build_dion_optimizer, is_dion_optimizer
 
 __all__ = [
     "OptimizerParamScheduler",
     "build_lr_scheduler",
+    "build_optimizer",
     "build_dion_optimizer",
     "is_dion_optimizer",
 ]

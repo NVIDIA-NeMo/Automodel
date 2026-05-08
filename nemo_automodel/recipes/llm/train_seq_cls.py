@@ -29,7 +29,7 @@ from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import build_wandb, suppress_wandb_log_messages
-from nemo_automodel.components.optim import build_lr_scheduler
+from nemo_automodel.components.optim import build_lr_scheduler, build_optimizer
 from nemo_automodel.components.training import build_step_scheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
@@ -41,7 +41,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     _get_model_name,
     build_dataloader,
     build_model,
-    build_optimizer,
 )
 
 logger = logging.getLogger(__name__)

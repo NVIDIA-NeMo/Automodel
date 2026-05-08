@@ -59,7 +59,6 @@ from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -72,8 +71,7 @@ from nemo_automodel.components.loss import build_loss_fn
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim import build_lr_scheduler
-from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.components.optim import build_lr_scheduler, build_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training import build_step_scheduler
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -98,7 +96,6 @@ from nemo_automodel.components.utils.model_utils import (
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
-from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -301,48 +298,6 @@ def build_model(
         logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     return model
-
-
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
-    """Build an optimizer for the model.
-
-    Args:
-        model: The model to build an optimizer for.
-        cfg_opt: The configuration for the optimizer.
-        distributed_config: The distributed configuration.
-        device_mesh: The device mesh.
-    """
-    # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
-    # optimizers like TE FusedAdam that accept dtype kwargs.
-    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
-        val = getattr(cfg_opt, attr, None)
-        if isinstance(val, str):
-            setattr(cfg_opt, attr, dtype_from_str(val))
-
-    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
-
-    optimizer = []
-    has_dion_optimizer = is_dion_optimizer(cfg_opt)
-    for part in getattr(model, "parts", [model]):
-        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        # TODO(@akoumparouli): no branching for building the optimizer, refactor.
-        if has_dion_optimizer:
-            tmp_optimizer = build_dion_optimizer(
-                cfg_opt=cfg_opt,
-                model=part,
-                distributed_mesh=device_mesh,
-            )
-        else:
-            tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
-        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
-            assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
-            tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
-        optimizer.append(tmp_optimizer)
-
-    return optimizer
 
 
 def compute_trust_remote_code_from_model(cfg_model):
