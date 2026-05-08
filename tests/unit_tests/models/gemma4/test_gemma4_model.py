@@ -26,6 +26,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4MoEDecoderLayer,
     Gemma4MoEModel,
     Gemma4MoETextModelBackend,
+    _build_packed_gemma4_causal_mask_mapping,
     _derive_padding_mask,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -445,6 +446,30 @@ class TestDerivePaddingMask:
         mask = torch.zeros(1, 1, 3, 3)
         mask[0, 0, 1, 1] = float("-inf")
         assert _derive_padding_mask(mask).tolist() == [[False, True, False]]
+
+
+class TestPackedGemma4MaskMapping:
+    pytestmark = []
+
+    def test_sliding_only_adds_same_image_bidirectional_edges(self):
+        packed_seq_ids = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 0]])
+        mm_token_type_ids = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]])
+
+        mapping = _build_packed_gemma4_causal_mask_mapping(
+            packed_seq_ids,
+            mm_token_type_ids,
+            dtype=torch.float32,
+            sliding_window=2,
+        )
+        full_allowed = mapping["full_attention"]
+        sliding_allowed = mapping["sliding_attention"]
+
+        assert not full_allowed[0, 0, 1, 2]
+        assert sliding_allowed[0, 0, 1, 2]
+
+        assert not sliding_allowed[0, 0, 3, 0]
+        assert not sliding_allowed[0, 0, 5, 1]
+        assert not sliding_allowed[0, 0, 7, 7]
 
 
 # ---------------------------------------------------------------------------

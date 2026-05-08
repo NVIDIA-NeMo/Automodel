@@ -304,6 +304,65 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.bool().logical_not()
 
 
+def _vision_group_ids(mm_token_type_ids: torch.Tensor) -> torch.Tensor:
+    """Return per-image-block ids for Gemma4 vision tokens, or -1 for text/padding."""
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
+    is_prev_vision[..., 0] = False
+    new_vision_starts = is_vision & ~is_prev_vision
+    group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+    return torch.where(is_vision, group_ids, -1)
+
+
+def _build_packed_gemma4_causal_mask_mapping(
+    packed_seq_ids: torch.Tensor,
+    mm_token_type_ids: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    sliding_window: int | None,
+) -> dict[str, torch.Tensor]:
+    """Build Gemma4 full/sliding masks for packed VLM sequences.
+
+    ``packed_seq_ids`` contains 1-based document ids and 0 for padding.
+    Full-attention layers remain plain packed causal attention. Sliding layers
+    also include Gemma4's same-image-token bidirectional edges.
+    """
+    if packed_seq_ids.ndim != 2:
+        raise ValueError(f"_packed_seq_ids must be a 2D [B, S] tensor, got shape={tuple(packed_seq_ids.shape)}")
+    if mm_token_type_ids.shape != packed_seq_ids.shape:
+        raise ValueError(
+            "mm_token_type_ids must have the same shape as _packed_seq_ids, "
+            f"got {tuple(mm_token_type_ids.shape)} vs {tuple(packed_seq_ids.shape)}"
+        )
+
+    batch_size, seq_len = packed_seq_ids.shape
+    device = packed_seq_ids.device
+    positions = torch.arange(seq_len, device=device)
+    q_positions = positions.view(1, seq_len, 1)
+    kv_positions = positions.view(1, 1, seq_len)
+
+    valid_q = packed_seq_ids[:, :, None] > 0
+    valid_kv = packed_seq_ids[:, None, :] > 0
+    same_doc = (packed_seq_ids[:, :, None] == packed_seq_ids[:, None, :]) & valid_q & valid_kv
+    causal = kv_positions <= q_positions
+
+    full_mask = same_doc & causal
+    sliding_mask = full_mask
+    if sliding_window is not None:
+        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
+
+    vision_group_ids = _vision_group_ids(mm_token_type_ids)
+    same_vision_group = (vision_group_ids[:, :, None] == vision_group_ids[:, None, :]) & (
+        vision_group_ids[:, :, None] >= 0
+    )
+    sliding_mask = (sliding_mask | same_vision_group) & same_doc
+
+    return {
+        "full_attention": full_mask.view(batch_size, 1, seq_len, seq_len),
+        "sliding_attention": sliding_mask.view(batch_size, 1, seq_len, seq_len),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Text model backend
 # ---------------------------------------------------------------------------
@@ -387,6 +446,10 @@ class Gemma4MoETextModelBackend(nn.Module):
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache not supported for the Gemma4 MoE backend.")
 
+        packed_seq_ids = kwargs.get("_packed_seq_ids")
+        if not cp_enabled:
+            kwargs.pop("_packed_seq_ids", None)
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -419,6 +482,13 @@ class Gemma4MoETextModelBackend(nn.Module):
             # length.  Pass no mask here; the hook rebuilds the local-query /
             # global-key Gemma4 mask from mm_token_type_ids.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
+        elif use_vision_bidirectional_mask and packed_seq_ids is not None:
+            causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
+                packed_seq_ids.to(device=inputs_embeds.device),
+                mm_token_type_ids.to(device=inputs_embeds.device),
+                dtype=inputs_embeds.dtype,
+                sliding_window=getattr(self.config, "sliding_window", None),
+            )
         elif use_vision_bidirectional_mask:
             from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
 
