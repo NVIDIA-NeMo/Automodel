@@ -233,6 +233,34 @@ class TestDeepSeekV4StateDictAdapterMTPRoundTrip:
         # And the original layers.{N+k}.* keys are gone.
         assert f"layers.{N}.attn.wq_a.weight" not in out
 
+    def test_from_hf_renames_mtp_layer_with_model_prefix(self):
+        """HF V4 safetensors emit MTP layer keys as ``model.layers.{N+k}.*``
+        (with the ``model.`` prefix) for self_attn / mlp / norms. Prior to the
+        prefix-aware regex fix, those keys silently fell into the backbone
+        bucket and were dropped at DCP load — the MTP head trained from
+        random init. This regression locks in that the prefixed form is
+        recognized and routed to the ``mtp.layers.{k}.*`` namespace.
+        """
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        # The exact rename target for ``self_attn.*`` depends on V4's
+        # internal-vs-HF mapping; use an attn key that has an internal alias
+        # (``attn.wq_a`` -> ``self_attn.wq_a``) plus two layernorms.
+        sd = {
+            f"model.layers.{N}.attn.wq_a.weight": torch.randn(32, 64),
+            f"model.layers.{N}.input_layernorm.weight": torch.ones(64),
+            f"model.layers.{N}.post_attention_layernorm.weight": torch.ones(64),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        assert "mtp.layers.0.self_attn.wq_a.weight" in out
+        assert "mtp.layers.0.input_layernorm.weight" in out
+        assert "mtp.layers.0.post_attention_layernorm.weight" in out
+        # The original ``model.layers.{N}.*`` keys must NOT leak through —
+        # the model has no ``model.layers.{N}`` (only 0..N-1), so any leftover
+        # would silently drop and the MTP weights would never load.
+        assert f"model.layers.{N}.input_layernorm.weight" not in out
+        assert f"model.layers.{N}.attn.wq_a.weight" not in out
+
     def test_from_hf_dequantizes_mtp_fp8(self):
         adapter = _make_adapter(num_nextn_predict_layers=1)
         N = adapter.config.num_hidden_layers

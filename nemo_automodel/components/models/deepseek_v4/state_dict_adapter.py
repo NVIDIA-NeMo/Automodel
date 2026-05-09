@@ -238,21 +238,26 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """
         N = self.config.num_hidden_layers
         num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
-        _layer_re = re.compile(r"^layers\.(\d+)\.")
+        # HF V4 emits both prefixed (``model.layers.{N+k}.*`` for self_attn /
+        # mlp / norms) and unprefixed (``layers.{N+k}.*`` for V4 fusion-only
+        # modules eh_proj / enorm / hnorm / final_layernorm) MTP keys, so the
+        # split regex must accept either form.
+        _layer_re = re.compile(r"^(model\.)?layers\.(\d+)\.")
 
         # Split MTP keys from backbone keys.  MTP layers in HF format are
-        # ``layers.{N+k}.*`` — renumber them to ``layers.{k}.*`` so we can run
-        # them through the same dequantize / aggregate / rename pipeline as
-        # the backbone (FP4 routed experts and FP8 attention projections live
-        # under MTP too, so they need the same handling).
+        # ``[model.]layers.{N+k}.*`` — strip the optional ``model.`` prefix
+        # and renumber to ``layers.{k}.*`` so we can run them through the
+        # same dequantize / aggregate / rename pipeline as the backbone
+        # (FP4 routed experts and FP8 attention projections live under MTP
+        # too, so they need the same handling).
         mtp_hf: dict[str, Any] = {}
         if num_mtp > 0:
             backbone_hf: dict[str, Any] = {}
             for key in list(hf_state_dict.keys()):
                 val = hf_state_dict[key]
                 m = _layer_re.match(key)
-                if m and int(m.group(1)) >= N:
-                    orig_idx = int(m.group(1))
+                if m and int(m.group(2)) >= N:
+                    orig_idx = int(m.group(2))
                     mtp_depth = orig_idx - N
                     renumbered = f"layers.{mtp_depth}." + key[m.end() :]
                     mtp_hf[renumbered] = val
