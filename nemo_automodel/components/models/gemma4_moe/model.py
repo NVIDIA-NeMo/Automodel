@@ -246,6 +246,21 @@ class Gemma4MoEDecoderLayer(nn.Module):
         # --- Attention ---
         residual = x
         x = self.input_layernorm(x)
+        attn_kwargs = kwargs
+        if getattr(self.config, "_attn_implementation", None) == "flex_attention" and "kernel_options" not in kwargs:
+            attn_kwargs = {
+                **kwargs,
+                "kernel_options": {
+                    "BLOCK_M": 32,
+                    "BLOCK_N": 32,
+                    "BLOCK_M1": 32,
+                    "BLOCK_N1": 32,
+                    "BLOCK_M2": 32,
+                    "BLOCK_N2": 32,
+                    "num_stages": 1,
+                    "num_warps": 4,
+                },
+            }
         x, _ = self.self_attn(
             hidden_states=x,
             position_embeddings=position_embeddings,
@@ -255,8 +270,10 @@ class Gemma4MoEDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             mm_token_type_ids=mm_token_type_ids,
-            **kwargs,
+            **attn_kwargs,
         )
+        if getattr(self.config, "_attn_implementation", None) == "flex_attention" and padding_mask is not None:
+            x = x.masked_fill(padding_mask[..., None], 0)
         x = self.post_attention_layernorm(x)
         x = residual + x
 
