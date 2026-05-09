@@ -586,14 +586,25 @@ def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
     return getattr(text_config, "model_type", None) == "gemma4"
 
 
+def model_keeps_self_forward(model: torch.nn.Module) -> bool:
+    """Return True when *model* opts out of pipeline-aware forward patching.
+
+    Used by the pipeline split call site to skip ``patch_hf_model_for_pp``
+    entirely for models whose own ``forward`` is already PP-aware (typically
+    because it pulls pixel_values out of ``self._vlm_pixel_values_chunks``
+    set by the training loop). Currently set on Qwen3-VL-MoE, Qwen3.5-MoE,
+    KimiVL, and Kimi-K2.5-VL.
+    """
+    return bool(getattr(type(model), "_pp_keep_self_forward", False))
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 
-    - VLMs whose model class declares ``_pp_keep_self_forward = True``
-      (e.g. Qwen3-VL-MoE, KimiVL, Kimi-K2.5-VL, Qwen3.5-MoE): preserve the
-      model's own ``forward`` because it already fetches per-microbatch
-      ``pixel_values`` from ``_vlm_pixel_values_chunks``. Replacing it with
-      the generic CausalLM forward would silently bypass the vision tower.
+    The caller is responsible for skipping this function when the model
+    opts out via ``model_keeps_self_forward(model)``. This function itself
+    only branches on the patch *flavor*:
+
     - Gemma4 VLM (``config.model_type == 'gemma4'`` with a nested text
       backbone at ``model.model.language_model``): patch the text backbone
       and VLM outer with Gemma4-specific VLM-aware forwards.
@@ -605,13 +616,6 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
     """
     inner_model = getattr(model, "model", None)
     text_backbone = getattr(inner_model, "language_model", None) if inner_model is not None else None
-
-    # Models that opt out of forward replacement entirely. Their own forward
-    # is already PP-aware (typically because it pulls pixel_values out of
-    # ``self._vlm_pixel_values_chunks`` set by the training loop). Patching
-    # would shadow that logic at the instance level and break vision routing.
-    if getattr(type(model), "_pp_keep_self_forward", False):
-        return
 
     if inner_model is not None and text_backbone is not None and _is_gemma4_vlm(model):
         # Gemma4 VLM: the text backbone needs sliding/full-attention RoPE

@@ -24,6 +24,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     create_pipeline_forward_causal_lm,
     create_pipeline_forward_inner,
     init_hf_model_buffers,
+    model_keeps_self_forward,
     patch_hf_model_for_pp,
     validate_hf_model_for_pipeline_support,
 )
@@ -392,36 +393,25 @@ class TestPatchHfModelForPp:
         assert model.model.language_model.forward.__func__.__name__ == "pipeline_forward_gemma4_text"
         assert model.forward.__func__.__name__ == "pipeline_forward_gemma4_vlm"
 
-    def test_patch_respects_pp_keep_self_forward(self):
-        """VLMs declaring _pp_keep_self_forward must keep their own forward intact.
+    def test_model_keeps_self_forward_helper(self):
+        """``model_keeps_self_forward`` reflects the class-level opt-out flag.
 
         Regression for the silent-vision bug where chunk-aware VLMs (Qwen3-VL-MoE,
         KimiVL, Kimi-K2.5-VL, Qwen3.5-MoE) had their pixel_values-fetching forward
-        replaced by the generic CausalLM forward, causing vision_tower to never run.
+        replaced by the generic CausalLM forward, causing vision_tower to never
+        run. The fix splits responsibility: the model class declares the flag,
+        and the pipeline build call site uses ``model_keeps_self_forward`` to
+        decide whether to invoke ``patch_hf_model_for_pp`` at all.
         """
 
-        class _Inner(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.language_model = nn.Module()
-
-        class _ChunkAwareVLM(nn.Module):
+        class _OptedIn(nn.Module):
             _pp_keep_self_forward = True
 
-            def __init__(self):
-                super().__init__()
-                self.config = Mock(model_type="qwen3_vl_moe", text_config=None)
-                self.model = _Inner()
+        class _Default(nn.Module):
+            pass
 
-        model = _ChunkAwareVLM()
-
-        patch_hf_model_for_pp(model, patch_inner_model=True, patch_causal_lm_model=True)
-
-        # Patcher must not install an instance-level ``forward`` attribute on
-        # either the outer or inner model. (nn.Module's ``forward`` is a class
-        # method; instance-level patching would put it in ``__dict__``.)
-        assert "forward" not in model.__dict__, "outer forward was unexpectedly replaced"
-        assert "forward" not in model.model.__dict__, "inner forward was unexpectedly replaced"
+        assert model_keeps_self_forward(_OptedIn()) is True
+        assert model_keeps_self_forward(_Default()) is False
 
 
 class TestInitHfModelBuffers:
