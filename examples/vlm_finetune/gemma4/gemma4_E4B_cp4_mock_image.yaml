@@ -53,7 +53,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-E4B-it
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
   torch_dtype: torch.bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
