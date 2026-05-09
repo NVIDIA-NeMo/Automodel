@@ -355,7 +355,7 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
             # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
-            scores = torch.sqrt(F.softplus(scores.float())).to(scores.dtype)
+            scores = torch.sqrt(F.softplus(scores.float()))
             original_scores = scores
 
             if self.e_score_correction_bias is not None:
