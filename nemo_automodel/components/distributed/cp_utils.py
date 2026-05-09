@@ -308,6 +308,9 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             return allowed
 
         out = None
+        empty_query_rows = None
+        if packed_seq_ids_full is not None:
+            empty_query_rows = packed_seq_ids_full[:, q_indices] <= 0
 
         try:
             from torch.nn.attention.flex_attention import create_block_mask
@@ -326,6 +329,10 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                         q_pack_id = packed_seq_ids_full[batch_idx, q_global_idx]
                         kv_pack_id = packed_seq_ids_full[batch_idx, kv_idx]
                         allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
+                        # Padding query rows have no semantic attention target, but
+                        # kernels need at least one valid key.  Point them at a dummy
+                        # key and zero the output after attention.
+                        allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
                     return allowed
 
                 block_mask_batch = query.shape[0]
@@ -378,6 +385,8 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                     )
                 else:
                     raise
+            if empty_query_rows is not None and empty_query_rows.any():
+                out = out.masked_fill(empty_query_rows[:, None, :, None], 0)
             if padded_head_dim != orig_head_dim:
                 out = out[..., :orig_head_dim]
             if not getattr(_cp_sdpa, "_flex_ok_logged", False):
