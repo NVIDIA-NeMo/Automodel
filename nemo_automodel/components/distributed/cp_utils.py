@@ -205,7 +205,7 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         if _flex_attn_compiled["fn"] is None:
             from torch.nn.attention.flex_attention import flex_attention
 
-            _flex_attn_compiled["fn"] = torch.compile(flex_attention, dynamic=False)
+            _flex_attn_compiled["fn"] = torch.compile(flex_attention, dynamic=True)
         return _flex_attn_compiled["fn"]
 
     def _all_gather_seq(tensor: torch.Tensor) -> torch.Tensor:
