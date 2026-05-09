@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek V4 Multi-Token Prediction (MTP) sublayer and builder.
+"""DeepSeek V4 Multi-Token Prediction (MTP) blocks.
 
-MTP blocks are standard pre-norm attention + MoE blocks — NO HC machinery.
-The main backbone produces [B, S, hidden] hidden states (after hc_head + norm),
-which are what the MTP blocks receive as input.
+The released DSV4-Flash checkpoint stores MTP under ``mtp.{depth}.*``.  Each
+MTP depth mirrors the reference ``MTPBlock``:
 
-Key design points:
-  - DeepseekV4MTPSublayer does not use HC (Hyper-Connection) machinery.
-  - compress_ratios is forced to None for MTP attention layers (indices beyond
-    the backbone layer count would IndexError otherwise).
-  - Rotary embeddings are shared references from the main model (not
-    registered as submodules to avoid polluting the state dict).
-  - Each MTP depth uses one attention sublayer + one MoE sublayer (pattern "*E").
+  - fuse the future-token embedding and the backbone HC stream with
+    ``e_proj(embed) + h_proj(hidden)``;
+  - run one HC-enabled DSV4 attention + MoE block;
+  - collapse the HC stream with an MTP-local ``hc_head`` and ``norm`` before
+    the shared LM head computes the auxiliary CE loss.
 """
 
 from __future__ import annotations
@@ -35,31 +32,27 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
-from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule
-from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Attention
+from nemo_automodel.components.models.common.mtp import MTPConfig, roll_tensor
+from nemo_automodel.components.models.deepseek_v4.layers import (
+    DeepseekV4Attention,
+    DeepseekV4HyperConnection,
+    DeepseekV4HyperHead,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 
 
-class DeepseekV4MTPSublayer(nn.Module):
-    """Single MTP sublayer for DeepSeek V4.
-
-    One sublayer corresponds to one position in the per-depth pattern. For the
-    ``"*E"`` pattern, sublayer 0 is the attention block (with fusion) and
-    sublayer 1 is the MoE block (with final norm).
+class DeepseekV4MTPBlock(nn.Module):
+    """One DSV4 MTP depth.
 
     Args:
-        config: DeepseekV4Config for the main model.
-        layer_idx: Global layer index (>= num_hidden_layers for MTP layers).
-        moe_config: MoEConfig shared with backbone MoE blocks.
-        backend: BackendConfig for kernel selection.
+        config: Main DSV4 config.
+        layer_idx: Global layer index used by the attention implementation.
+        moe_config: Shared MoE config.
+        backend: BackendConfig for kernels/modules.
         dtype: Model dtype.
-        rotary_emb: Shared reference to the main model's rotary embedding.
-        rotary_emb_compress: Shared reference to the compress rotary embedding.
-        has_fusion: Whether this sublayer is the first in its depth (owns
-            enorm/hnorm/eh_proj for fusing embed + hidden).
-        has_final_norm: Whether this sublayer is the last in its depth (owns
-            final_layernorm).
+        rotary_emb: Shared main rotary embedding module.
+        rotary_emb_compress: Shared compressor rotary embedding module.
     """
 
     def __init__(
@@ -71,37 +64,49 @@ class DeepseekV4MTPSublayer(nn.Module):
         dtype: torch.dtype,
         rotary_emb,
         rotary_emb_compress,
-        has_fusion: bool,
-        has_final_norm: bool,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.config = config
         H = config.hidden_size
         eps = config.rms_norm_eps
-        model_dtype = dtype
 
-        self.has_fusion = has_fusion
-        self.has_final_norm = has_final_norm
+        self.e_proj = initialize_linear_module(backend.linear, H, H, bias=False, dtype=dtype)
+        self.h_proj = initialize_linear_module(backend.linear, H, H, bias=False, dtype=dtype)
+        self.enorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
+        self.hnorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
 
-        if has_fusion:
-            self.enorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=model_dtype)
-            self.hnorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=model_dtype)
-            self.eh_proj = initialize_linear_module(backend.linear, 2 * H, H, bias=False, dtype=model_dtype)
-
-        # Patch config: force compress_ratio=0 for MTP attention (indices beyond
-        # compress_ratios list would IndexError in DeepseekV4Attention.__init__).
-        mtp_cfg = copy.copy(config)
-        mtp_cfg.compress_ratios = None
-        self.self_attn = DeepseekV4Attention(mtp_cfg, layer_idx=layer_idx, backend=backend)
-
+        mtp_attn_cfg = copy.copy(config)
+        ratios = getattr(config, "compress_ratios", None)
+        if ratios is None:
+            mtp_attn_cfg.compress_ratios = None
+        else:
+            ratios = list(ratios)
+            if layer_idx >= len(ratios):
+                ratios.extend([0] * (layer_idx + 1 - len(ratios)))
+            mtp_attn_cfg.compress_ratios = ratios
+        self.self_attn = DeepseekV4Attention(mtp_attn_cfg, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=model_dtype)
-        self.post_attention_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=model_dtype)
+        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
+        self.post_attention_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
 
-        if has_final_norm:
-            self.final_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=model_dtype)
+        hc_kwargs = dict(
+            hc_mult=config.hc_mult,
+            hidden_size=H,
+            hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
+            hc_eps=float(config.hc_eps),
+            rms_norm_eps=float(eps),
+        )
+        self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
+        self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
+        self.hc_head = DeepseekV4HyperHead(
+            hc_mult=config.hc_mult,
+            hidden_size=H,
+            hc_eps=float(config.hc_eps),
+            rms_norm_eps=float(eps),
+        )
+        self.norm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
 
-        # Store rotary refs WITHOUT registering as submodules so they do not
-        # appear in state_dict() or named_parameters().
         object.__setattr__(self, "_rotary_emb", rotary_emb)
         object.__setattr__(self, "_rotary_emb_compress", rotary_emb_compress)
 
@@ -109,106 +114,145 @@ class DeepseekV4MTPSublayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        embed_input: torch.Tensor | None = None,
+        embed_input: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        **_ignored,
-    ) -> torch.Tensor:
-        """Forward pass for one MTP sublayer.
+        **attn_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one MTP depth.
 
         Args:
-            hidden_states: ``[B, S, hidden]`` tensor from the previous sublayer
-                (or from the backbone's final norm for depth 0, sublayer 0).
-            embed_input: ``[B, S, hidden]`` future-token embedding (only for
-                the first sublayer of each depth, i.e. ``has_fusion=True``).
-            position_ids: ``[B, S]`` position indices for RoPE.
-            attention_mask: 4D additive causal mask ``[B, 1, S, S]``.
-            padding_mask: Boolean padding mask for MoE routing.
-            **_ignored: Extra kwargs forwarded from MTPModule but unused here.
+            hidden_states: HC stream ``[B, S, hc_mult, H]``.
+            embed_input: Future-token embeddings ``[B, S, H]``.
 
         Returns:
-            Updated ``[B, S, hidden]`` hidden state.
+            Tuple of ``(next_hc_stream, prediction_hidden)`` where
+            ``prediction_hidden`` is ``[B, S, H]`` and should be projected by
+            the shared LM head for the MTP loss.
         """
-        if self.has_fusion:
-            assert embed_input is not None, "embed_input required for fusion sublayer"
-            e = self.enorm(embed_input)
-            h = self.hnorm(hidden_states)
-            hidden_states = self.eh_proj(torch.cat([e, h], dim=-1))
+        if hidden_states.dim() != 4:
+            raise ValueError(f"DSV4 MTP expects HC hidden state [B,S,hc,H], got {tuple(hidden_states.shape)}")
 
-        # Compute position embeddings from position_ids.
-        if position_ids is not None:
-            position_embeddings = self._rotary_emb(hidden_states, position_ids)
-            position_embeddings_compress = self._rotary_emb_compress(hidden_states, position_ids)
-        else:
-            seq_len = hidden_states.shape[1]
-            pid = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(hidden_states.shape[0], -1)
-            position_embeddings = self._rotary_emb(hidden_states, pid)
-            position_embeddings_compress = self._rotary_emb_compress(hidden_states, pid)
+        e = self.e_proj(self.enorm(embed_input)).unsqueeze(2)
+        h = self.h_proj(self.hnorm(hidden_states))
+        hidden_states = e + h
 
-        # Attention sub-block (pre-norm residual).
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states,
+        if position_ids is None:
+            seq_len = embed_input.shape[1]
+            position_ids = torch.arange(seq_len, device=embed_input.device).unsqueeze(0).expand(embed_input.shape[0], -1)
+        position_embeddings = self._rotary_emb(embed_input, position_ids)
+        position_embeddings_compress = self._rotary_emb_compress(embed_input, position_ids)
+
+        pre, post, comb = self.attn_hc.compute_weights(hidden_states)
+        collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
+        attn_out, _ = self.self_attn(
+            hidden_states=self.input_layernorm(collapsed),
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_embeddings_compress=position_embeddings_compress,
             rotary_compress=self._rotary_emb_compress,
+            **attn_kwargs,
         )
-        hidden_states = residual + hidden_states
+        dtype = hidden_states.dtype
+        hidden_states = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(dtype), hidden_states
+        )
 
-        # MoE sub-block (pre-norm residual).
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, padding_mask)
-        hidden_states = residual + hidden_states
+        pre, post, comb = self.ffn_hc.compute_weights(hidden_states)
+        collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
+        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
+        hidden_states = post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(dtype), hidden_states
+        )
 
-        if self.has_final_norm:
-            hidden_states = self.final_layernorm(hidden_states)
-
-        return hidden_states
+        prediction_hidden = self.norm(self.hc_head(hidden_states))
+        return hidden_states, prediction_hidden
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        """Initialize sublayer weights.
-
-        Args:
-            buffer_device: Device to use for buffer initialization. Defaults
-                to CPU if not provided.
-        """
-        init_std = float(getattr(self.self_attn.config, "initializer_range", 0.02))
-        if self.has_fusion:
-            self.enorm.reset_parameters()
-            self.hnorm.reset_parameters()
-            if buffer_device is not None:
-                with buffer_device:
-                    nn.init.trunc_normal_(self.eh_proj.weight, mean=0.0, std=init_std)
-            else:
-                nn.init.trunc_normal_(self.eh_proj.weight, mean=0.0, std=init_std)
+        init_std = float(getattr(self.config, "initializer_range", 0.02))
+        self.enorm.reset_parameters()
+        self.hnorm.reset_parameters()
         self.input_layernorm.reset_parameters()
         self.post_attention_layernorm.reset_parameters()
-        self.self_attn.init_weights(buffer_device or torch.device("cpu"))
-        self.mlp.init_weights(buffer_device or torch.device("cpu"))
-        if self.has_final_norm:
-            self.final_layernorm.reset_parameters()
+        self.norm.reset_parameters()
+        target_device = buffer_device or torch.device("cpu")
+        with target_device:
+            nn.init.trunc_normal_(self.e_proj.weight, mean=0.0, std=init_std)
+            nn.init.trunc_normal_(self.h_proj.weight, mean=0.0, std=init_std)
+        self.self_attn.init_weights(target_device)
+        self.mlp.init_weights(target_device)
+
+
+class DeepseekV4MTPModule(nn.Module):
+    """DSV4 MTP stack, one :class:`DeepseekV4MTPBlock` per prediction depth."""
+
+    def __init__(
+        self,
+        config,
+        mtp_config: MTPConfig,
+        backend: BackendConfig,
+        moe_config: MoEConfig,
+        dtype: torch.dtype,
+        rotary_emb,
+        rotary_emb_compress,
+    ):
+        super().__init__()
+        if not mtp_config.enabled:
+            raise ValueError("DeepseekV4MTPModule constructed with disabled MTPConfig")
+        self.mtp_config = mtp_config
+        base_layer_idx = config.num_hidden_layers
+        self.layers = nn.ModuleList(
+            [
+                DeepseekV4MTPBlock(
+                    config=config,
+                    layer_idx=base_layer_idx + depth,
+                    moe_config=moe_config,
+                    backend=backend,
+                    dtype=dtype,
+                    rotary_emb=rotary_emb,
+                    rotary_emb_compress=rotary_emb_compress,
+                )
+                for depth in range(mtp_config.num_layers)
+            ]
+        )
+
+    @property
+    def num_depths(self) -> int:
+        return self.mtp_config.num_layers
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        embed_fn,
+        position_ids: torch.LongTensor | None = None,
+        **block_kwargs,
+    ) -> list[torch.Tensor]:
+        per_depth_h: list[torch.Tensor] = []
+        cur_input_ids = input_ids
+        for block in self.layers:
+            cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+            decoder_input = embed_fn(cur_input_ids)
+            kwargs = dict(block_kwargs)
+            if position_ids is not None:
+                kwargs["position_ids"] = position_ids
+            hidden_states, prediction_hidden = block(
+                hidden_states,
+                embed_input=decoder_input,
+                input_ids=cur_input_ids,
+                **kwargs,
+            )
+            per_depth_h.append(prediction_hidden)
+        return per_depth_h
 
 
 def build_mtp_config_from_hf(config, *, loss_scaling_factor: float = 0.1) -> MTPConfig:
-    """Build an MTPConfig from a DeepseekV4Config.
-
-    Args:
-        config: DeepseekV4Config instance.
-        loss_scaling_factor: Coefficient applied to the summed MTP CE loss.
-
-    Returns:
-        MTPConfig with ``num_layers`` from ``config.num_nextn_predict_layers``
-        and ``layer_pattern="*E"`` (one attention + one MoE sublayer per depth).
-    """
+    """Build an MTPConfig from a DeepseekV4Config."""
     num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
-    # Each MTP depth = 1 attention sublayer + 1 MoE sublayer -> pattern "*E".
-    pattern = "*E" if num_layers > 0 else ""
-    return MTPConfig(num_layers=num_layers, layer_pattern=pattern, loss_scaling_factor=loss_scaling_factor)
+    return MTPConfig(num_layers=num_layers, layer_pattern="*" if num_layers > 0 else "", loss_scaling_factor=loss_scaling_factor)
 
 
 def build_deepseek_v4_mtp(
@@ -219,35 +263,14 @@ def build_deepseek_v4_mtp(
     dtype: torch.dtype,
     rotary_emb,
     rotary_emb_compress,
-) -> MTPModule:
-    """Construct an MTPModule for DeepSeek V4.
-
-    Args:
-        config: DeepseekV4Config for the main model.
-        mtp_config: MTPConfig describing depth count and pattern.
-        backend: BackendConfig for kernel selection.
-        moe_config: MoEConfig shared with the backbone.
-        dtype: Model dtype.
-        rotary_emb: Shared reference to the main model's rotary embedding.
-        rotary_emb_compress: Shared reference to the compress rotary embedding.
-
-    Returns:
-        Constructed MTPModule with all sublayers initialized.
-    """
-    base_layer_idx = config.num_hidden_layers
-
-    def factory(*, global_idx, depth, sublayer_idx, block_type, has_fusion, has_final_norm):
-        del depth, block_type  # V4 MTP always uses attention+MoE regardless of pattern symbol
-        return DeepseekV4MTPSublayer(
-            config=config,
-            layer_idx=base_layer_idx + global_idx,
-            moe_config=moe_config,
-            backend=backend,
-            dtype=dtype,
-            rotary_emb=rotary_emb,
-            rotary_emb_compress=rotary_emb_compress,
-            has_fusion=(sublayer_idx == 0),
-            has_final_norm=(sublayer_idx == mtp_config.pattern_length - 1),
-        )
-
-    return MTPModule(mtp_config=mtp_config, sublayer_factory=factory)
+) -> DeepseekV4MTPModule:
+    """Construct DSV4 MTP blocks."""
+    return DeepseekV4MTPModule(
+        config=config,
+        mtp_config=mtp_config,
+        backend=backend,
+        moe_config=moe_config,
+        dtype=dtype,
+        rotary_emb=rotary_emb,
+        rotary_emb_compress=rotary_emb_compress,
+    )

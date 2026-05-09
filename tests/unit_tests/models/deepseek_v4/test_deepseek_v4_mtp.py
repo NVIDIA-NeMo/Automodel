@@ -21,9 +21,10 @@ Run:
         tests/unit_tests/models/deepseek_v4/test_deepseek_v4_mtp.py -v -s
 """
 
+import types
+
 import pytest
 import torch
-
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
@@ -108,13 +109,13 @@ class TestMTPConfig:
         assert mtp_config.layer_pattern == ""
 
     def test_mtp_config_enabled(self):
-        """num_nextn_predict_layers=1 -> mtp_config.enabled == True, pattern == '*E'."""
+        """num_nextn_predict_layers=1 -> mtp_config.enabled == True."""
         cfg = _tiny_config(num_nextn_predict_layers=1)
         mtp_config = build_mtp_config_from_hf(cfg)
         assert mtp_config.enabled
         assert mtp_config.num_layers == 1
-        assert mtp_config.layer_pattern == "*E"
-        assert mtp_config.pattern_length == 2  # one attn + one MoE sublayer
+        assert mtp_config.layer_pattern == "*"
+        assert mtp_config.pattern_length == 1  # one full DSV4 MTP block per depth
 
 
 class TestModelMTPConstruction:
@@ -127,15 +128,46 @@ class TestModelMTPConstruction:
     def test_model_has_mtp_when_configured(self):
         """With num_nextn_predict_layers=1 -> model.mtp is not None.
 
-        Pattern '*E' has 2 sublayers per depth, 1 depth -> 2 total sublayers.
+        DSV4 MTP has one full HC-enabled MTP block per depth.
         """
         cfg = _tiny_config(num_nextn_predict_layers=1)
         model = _make_model(cfg)
         assert model.mtp is not None
-        assert len(model.mtp.layers) == 2  # pattern_length=2, num_layers=1
+        assert len(model.mtp.layers) == 1
 
 
 class TestMTPForward:
+    def test_mtp_rolls_input_ids_not_position_ids(self):
+        """MTP predicts future tokens but uses the current sequence positions."""
+        cfg = _tiny_config(num_nextn_predict_layers=1)
+        model = _make_model(cfg)
+        block = model.mtp.layers[0]
+
+        captured = {}
+
+        def fake_forward(self, hidden_states, *, embed_input, input_ids=None, position_ids=None, **kwargs):
+            del self, embed_input, kwargs
+            captured["input_ids"] = input_ids.detach().clone()
+            captured["position_ids"] = position_ids.detach().clone()
+            return hidden_states, hidden_states.mean(dim=2)
+
+        block.forward = types.MethodType(fake_forward, block)
+
+        input_ids = torch.tensor([[10, 11, 12, 13]])
+        position_ids = torch.arange(input_ids.shape[-1]).unsqueeze(0)
+        hidden_states = torch.zeros(1, input_ids.shape[-1], cfg.hc_mult, cfg.hidden_size)
+
+        out = model.mtp(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            embed_fn=model.model.embed_tokens,
+            position_ids=position_ids,
+        )
+
+        assert len(out) == 1
+        assert captured["input_ids"].tolist() == [[11, 12, 13, 0]]
+        assert captured["position_ids"].tolist() == [[0, 1, 2, 3]]
+
     @_REQUIRES_CUDA
     def test_forward_eval_no_mtp_output(self):
         """In eval mode, mtp_per_depth_h should be None."""
@@ -170,7 +202,7 @@ class TestMTPForward:
 
     @_REQUIRES_CUDA
     def test_mtp_gradient_backprop(self):
-        """MTP hidden states are differentiable; eh_proj gradient is non-None."""
+        """MTP hidden states are differentiable; e_proj gradient is non-None."""
         cfg = _tiny_config(num_nextn_predict_layers=1)
         model = _make_model(cfg)
         model.train()
@@ -182,9 +214,8 @@ class TestMTPForward:
         # Backward through MTP head only.
         out.mtp_per_depth_h[0].sum().backward()
 
-        # The first sublayer (sublayer 0) owns eh_proj (fusion layer).
-        eh_proj_weight = model.mtp.layers[0].eh_proj.weight
-        assert eh_proj_weight.grad is not None, "eh_proj.weight.grad is None after backward"
+        e_proj_weight = model.mtp.layers[0].e_proj.weight
+        assert e_proj_weight.grad is not None, "e_proj.weight.grad is None after backward"
 
     @_REQUIRES_CUDA
     def test_logits_is_tensor(self):

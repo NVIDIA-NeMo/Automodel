@@ -384,8 +384,9 @@ class DeepseekV4Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        return_hc_hidden: bool = False,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # PP-aware forward (same pattern as DeepseekV3Model.forward).
         # Stage 0 of pipeline parallelism owns ``embed_tokens`` and receives
         # raw token ids; subsequent stages have ``embed_tokens=None`` and
@@ -460,6 +461,8 @@ class DeepseekV4Model(nn.Module):
                 **attn_kwargs,
             )
 
+        mtp_hc_hidden = h if return_hc_hidden else None
+
         # Reduce hc_mult copies -> [B,S,dim] via the learned HC head, then
         # apply the shared RMSNorm.  Both modules live ONLY on the last PP
         # stage (intermediate stages keep h at 4D so the next stage can
@@ -468,6 +471,10 @@ class DeepseekV4Model(nn.Module):
             h = self.hc_head(h)
         if getattr(self, "norm", None) is not None:
             h = self.norm(h)
+        if return_hc_hidden:
+            if mtp_hc_hidden is None:
+                raise ValueError("return_hc_hidden requested before HC stream was available")
+            return h, mtp_hc_hidden
         return h
 
     def update_moe_gate_bias(self) -> None:
@@ -608,20 +615,28 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             )
             attention_mask = None
 
-        hidden_states = self.model(
+        use_mtp = self.mtp is not None and self.training
+        model_out = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            return_hc_hidden=use_mtp,
             **attn_kwargs,
         )
+        if use_mtp:
+            hidden_states, mtp_hc_hidden = model_out
+        else:
+            hidden_states = model_out
+            mtp_hc_hidden = None
         logits = self.lm_head(hidden_states) if self.lm_head else hidden_states
         if thd_mode:
             logits = logits.unsqueeze(0)
 
         mtp_per_depth_h = None
-        if self.mtp is not None and self.training:
-            # hidden_states is [B, S, hidden] after hc_head+norm — correct MTP input.
+        if use_mtp:
+            # MTP consumes the pre-final-head HC stream [B, S, hc_mult, hidden]
+            # and returns collapsed per-depth [B, S, hidden] tensors for CE.
             seq_len = hidden_states.shape[1]
             batch_size = hidden_states.shape[0]
             if position_ids is None:
@@ -637,7 +652,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             )
             mtp_per_depth_h = self.mtp(
                 input_ids=input_ids,
-                hidden_states=hidden_states,
+                hidden_states=mtp_hc_hidden,
                 embed_fn=self.model.embed_tokens,
                 position_ids=position_ids,
                 attention_mask=mtp_attn_mask,
