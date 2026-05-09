@@ -320,6 +320,8 @@ def _build_packed_gemma4_causal_mask_mapping(
     *,
     dtype: torch.dtype,
     sliding_window: int | None,
+    as_additive: bool = False,
+    as_block_mask: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build Gemma4 full/sliding masks for packed VLM sequences.
 
@@ -335,11 +337,57 @@ def _build_packed_gemma4_causal_mask_mapping(
             f"got {tuple(mm_token_type_ids.shape)} vs {tuple(packed_seq_ids.shape)}"
         )
 
+    if as_additive and as_block_mask:
+        raise ValueError("Only one of as_additive and as_block_mask may be set.")
+
     batch_size, seq_len = packed_seq_ids.shape
     device = packed_seq_ids.device
     positions = torch.arange(seq_len, device=device)
     q_positions = positions.view(1, seq_len, 1)
     kv_positions = positions.view(1, 1, seq_len)
+
+    vision_group_ids = _vision_group_ids(mm_token_type_ids)
+
+    if as_block_mask:
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        def _full_mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+            q_pack_id = packed_seq_ids[batch_idx, q_idx]
+            kv_pack_id = packed_seq_ids[batch_idx, kv_idx]
+            allowed = (q_pack_id == kv_pack_id) & (q_pack_id > 0) & (kv_idx <= q_idx)
+            return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
+
+        def _sliding_mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+            q_pack_id = packed_seq_ids[batch_idx, q_idx]
+            kv_pack_id = packed_seq_ids[batch_idx, kv_idx]
+            same_doc = (q_pack_id == kv_pack_id) & (q_pack_id > 0)
+            allowed = same_doc & (kv_idx <= q_idx)
+            if sliding_window is not None:
+                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
+            q_group = vision_group_ids[batch_idx, q_idx]
+            kv_group = vision_group_ids[batch_idx, kv_idx]
+            same_vision_group = (q_group == kv_group) & (q_group >= 0)
+            allowed = (allowed | same_vision_group) & same_doc
+            return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
+
+        return {
+            "full_attention": create_block_mask(
+                _full_mask_mod,
+                B=batch_size,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=device,
+            ),
+            "sliding_attention": create_block_mask(
+                _sliding_mask_mod,
+                B=batch_size,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=device,
+            ),
+        }
 
     valid_q = packed_seq_ids[:, :, None] > 0
     valid_kv = packed_seq_ids[:, None, :] > 0
@@ -351,15 +399,22 @@ def _build_packed_gemma4_causal_mask_mapping(
     if sliding_window is not None:
         sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
 
-    vision_group_ids = _vision_group_ids(mm_token_type_ids)
     same_vision_group = (vision_group_ids[:, :, None] == vision_group_ids[:, None, :]) & (
         vision_group_ids[:, :, None] >= 0
     )
     sliding_mask = (sliding_mask | same_vision_group) & same_doc
 
+    full_mask = full_mask.view(batch_size, 1, seq_len, seq_len)
+    sliding_mask = sliding_mask.view(batch_size, 1, seq_len, seq_len)
+
+    if as_additive:
+        min_dtype = torch.finfo(dtype).min
+        full_mask = torch.where(full_mask, torch.zeros((), dtype=dtype, device=device), min_dtype)
+        sliding_mask = torch.where(sliding_mask, torch.zeros((), dtype=dtype, device=device), min_dtype)
+
     return {
-        "full_attention": full_mask.view(batch_size, 1, seq_len, seq_len),
-        "sliding_attention": sliding_mask.view(batch_size, 1, seq_len, seq_len),
+        "full_attention": full_mask,
+        "sliding_attention": sliding_mask,
     }
 
 
@@ -488,6 +543,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 mm_token_type_ids.to(device=inputs_embeds.device),
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
+                as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
             )
         elif use_vision_bidirectional_mask:
             from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
