@@ -163,6 +163,8 @@ def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list
     """
     Prepend `prefix` once to every key in-place (inverse of `_drop_outer_prefix`).
     """
+    if not skip_keys:
+        return
     for k in list(sd.keys()):
         if not k.startswith(prefix) and k not in skip_keys:
             sd[prefix + k] = sd.pop(k)

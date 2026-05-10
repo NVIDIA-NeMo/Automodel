@@ -31,7 +31,7 @@ def get_latest_version(package_name: str) -> Optional[str]:
         latest_version: Latest version string of the package in pypi
     """
     url = f"https://pypi.org/pypi/{package_name}/json"
-    response = requests.get(url)
+    response = requests.get(url, timeout=10.0)
 
     if response.status_code == 200:
         data = response.json()
