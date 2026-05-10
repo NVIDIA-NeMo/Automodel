@@ -35,6 +35,18 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGated
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
 
 
+def apply_model_runtime_patches(model, mesh=None):
+    """Apply Qwen3.5 runtime patches after model construction.
+
+    The GatedDeltaNet wrapper is needed for both distributed training and
+    single-GPU packed-sequence runs, so it must run before sharding or first
+    forward rather than only from the FSDP parallelization strategy.
+    """
+    cp_enabled = getattr(mesh, "cp_size", 1) > 1
+    patch_hf_model(model, cp_enabled=cp_enabled)
+    return model
+
+
 class _AllGatherConcatFn(Function):
     """All-gather + concat with autograd-safe backward.
 

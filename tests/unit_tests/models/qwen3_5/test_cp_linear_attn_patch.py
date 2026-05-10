@@ -140,6 +140,23 @@ class TestPatchHfModel:
         # __getattr__ should resolve to the NEW tensor, not the old one
         assert la.A_log is new_tensor
 
+    def test_apply_model_runtime_patches_uses_mesh_cp_size(self, fake_model, monkeypatch):
+        """Runtime hook maps MeshContext cp_size to patch_hf_model cp_enabled."""
+        self._stub_qwen3_5_modules(monkeypatch)
+
+        cp_mod_key = "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn"
+        if cp_mod_key in sys.modules:
+            monkeypatch.delitem(sys.modules, cp_mod_key)
+
+        import nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn as cp_linear_attn
+
+        mesh = types.SimpleNamespace(cp_size=2)
+
+        with patch.object(cp_linear_attn, "patch_hf_model") as mock_patch:
+            assert cp_linear_attn.apply_model_runtime_patches(fake_model, mesh=mesh) is fake_model
+
+        mock_patch.assert_called_once_with(fake_model, cp_enabled=True)
+
 
 class TestFp32ParamHolder:
     """Tests for _Fp32ParamHolder forward (gate computation)."""
