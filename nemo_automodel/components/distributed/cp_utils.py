@@ -503,10 +503,10 @@ def make_cp_batch_and_ctx(
     # Gemma4 needs a local-query/global-key attention mask that PyTorch's
     # ring-template CP path cannot represent. Its pre-embed step marks the
     # batch so we use explicit contiguous sequence sharding and let
-    # attach_cp_sdpa_hooks all-gather K/V and token types inside attention.
-    manual_allgather = (
-        bool(batch.pop("_cp_manual_allgather", False)) or "mm_token_type_ids" in batch or "_packed_seq_ids" in batch
-    )
+    # attach_cp_sdpa_hooks all-gather K/V and token metadata inside attention.
+    # Metadata such as mm_token_type_ids or _packed_seq_ids does not select this
+    # path by itself because other VLMs can carry those fields.
+    manual_allgather = bool(batch.pop("_cp_manual_allgather", False))
 
     # Remove attention_mask from the batch so the model does not attempt to
     # build a local 4D mask with the wrong key length. Preserve padding
