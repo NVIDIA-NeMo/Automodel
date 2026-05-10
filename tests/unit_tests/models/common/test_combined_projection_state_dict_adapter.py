@@ -17,14 +17,10 @@
 from types import SimpleNamespace
 
 import torch
-from transformers import LlamaConfig
 
-from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
-from nemo_automodel.components.checkpoint.addons import _extract_target_modules
 from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
     CombinedProjectionStateDictAdapter,
 )
-from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 
 
 def _make_config(
@@ -40,6 +36,11 @@ def _make_config(
         num_key_value_heads=num_key_value_heads,
         hidden_size=hidden_size,
     )
+
+
+def _as_dict(fqn_tensors):
+    """Convert adapter tuple output to a state dict."""
+    return dict(fqn_tensors)
 
 
 class TestCombinedProjectionLoRASplitting:
@@ -244,6 +245,159 @@ class TestCombinedProjectionLoRASplitting:
         assert not any("qkv_proj" in k for k in hf_sd)
 
 
+class TestCombinedProjectionSingleTensorConversion:
+    """Tests that single-tensor conversion matches full state-dict conversion."""
+
+    def _adapter(self, **kwargs):
+        return CombinedProjectionStateDictAdapter(_make_config(**kwargs))
+
+    def test_qkv_weight_matches_to_hf(self):
+        """qkv_proj.weight should split to q/k/v exactly like to_hf()."""
+        adapter = self._adapter(
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=8,
+        )
+        q_weight = torch.randn(8, 3)
+        k_weight = torch.randn(4, 3)
+        v_weight = torch.randn(4, 3)
+        qkv_weight = adapter._interleave_qkv(q_weight, k_weight, v_weight)
+        key = "model.layers.0.self_attn.qkv_proj.weight"
+
+        single_tensor_sd = _as_dict(adapter.convert_single_tensor_to_hf(key, qkv_weight))
+        full_sd = adapter.to_hf({key: qkv_weight})
+
+        assert single_tensor_sd.keys() == full_sd.keys()
+        for converted_key, converted_tensor in single_tensor_sd.items():
+            torch.testing.assert_close(converted_tensor, full_sd[converted_key])
+
+    def test_qkv_bias_splits(self):
+        """qkv_proj.bias should split using the grouped QKV layout."""
+        adapter = self._adapter(
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=8,
+        )
+        q_bias = torch.arange(8, dtype=torch.float32)
+        k_bias = torch.arange(4, dtype=torch.float32) + 10
+        v_bias = torch.arange(4, dtype=torch.float32) + 20
+        qkv_bias = adapter._interleave_qkv(q_bias, k_bias, v_bias)
+
+        result = _as_dict(
+            adapter.convert_single_tensor_to_hf(
+                "model.layers.0.self_attn.qkv_proj.bias",
+                qkv_bias,
+            )
+        )
+
+        torch.testing.assert_close(result["model.layers.0.self_attn.q_proj.bias"], q_bias)
+        torch.testing.assert_close(result["model.layers.0.self_attn.k_proj.bias"], k_bias)
+        torch.testing.assert_close(result["model.layers.0.self_attn.v_proj.bias"], v_bias)
+
+    def test_gate_up_weight_and_bias_split(self):
+        """gate_up_proj tensors should split to gate/up projections."""
+        adapter = self._adapter(num_hidden_layers=1)
+        gate_weight = torch.randn(6, 3)
+        up_weight = torch.randn(6, 3)
+        gate_up_weight = adapter._interleave_gate_up(gate_weight, up_weight)
+        gate_bias = torch.arange(6, dtype=torch.float32)
+        up_bias = torch.arange(6, dtype=torch.float32) + 10
+        gate_up_bias = adapter._interleave_gate_up(gate_bias, up_bias)
+
+        weight_result = _as_dict(
+            adapter.convert_single_tensor_to_hf(
+                "model.layers.0.mlp.gate_up_proj.weight",
+                gate_up_weight,
+            )
+        )
+        bias_result = _as_dict(
+            adapter.convert_single_tensor_to_hf(
+                "model.layers.0.mlp.gate_up_proj.bias",
+                gate_up_bias,
+            )
+        )
+
+        torch.testing.assert_close(weight_result["model.layers.0.mlp.gate_proj.weight"], gate_weight)
+        torch.testing.assert_close(weight_result["model.layers.0.mlp.up_proj.weight"], up_weight)
+        torch.testing.assert_close(bias_result["model.layers.0.mlp.gate_proj.bias"], gate_bias)
+        torch.testing.assert_close(bias_result["model.layers.0.mlp.up_proj.bias"], up_bias)
+
+    def test_qkv_lora_a_duplicated_and_lora_b_split(self):
+        """Single-tensor conversion should preserve PEFT-prefixed LoRA semantics."""
+        adapter = self._adapter(
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=8,
+        )
+        lora_a = torch.randn(2, 3)
+        q_lora_b = torch.randn(8, 2)
+        k_lora_b = torch.randn(4, 2)
+        v_lora_b = torch.randn(4, 2)
+        qkv_lora_b = adapter._interleave_qkv(q_lora_b, k_lora_b, v_lora_b)
+
+        lora_a_result = _as_dict(
+            adapter.convert_single_tensor_to_hf(
+                "base_model.model.model.layers.0.self_attn.qkv_proj.lora_A.default.weight",
+                lora_a,
+            )
+        )
+        lora_b_result = _as_dict(
+            adapter.convert_single_tensor_to_hf(
+                "base_model.model.model.layers.0.self_attn.qkv_proj.lora_B.default.weight",
+                qkv_lora_b,
+            )
+        )
+
+        torch.testing.assert_close(
+            lora_a_result["base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"],
+            lora_a,
+        )
+        torch.testing.assert_close(
+            lora_a_result["base_model.model.model.layers.0.self_attn.k_proj.lora_A.default.weight"],
+            lora_a,
+        )
+        torch.testing.assert_close(
+            lora_a_result["base_model.model.model.layers.0.self_attn.v_proj.lora_A.default.weight"],
+            lora_a,
+        )
+        torch.testing.assert_close(
+            lora_b_result["base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight"],
+            q_lora_b,
+        )
+        torch.testing.assert_close(
+            lora_b_result["base_model.model.model.layers.0.self_attn.k_proj.lora_B.default.weight"],
+            k_lora_b,
+        )
+        torch.testing.assert_close(
+            lora_b_result["base_model.model.model.layers.0.self_attn.v_proj.lora_B.default.weight"],
+            v_lora_b,
+        )
+
+    def test_exclude_regex_filters_input_key(self):
+        """Excluded tensors should return no converted entries."""
+        adapter = self._adapter(num_hidden_layers=1)
+
+        result = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.self_attn.qkv_proj._extra_state",
+            torch.randn(1),
+            exclude_key_regex=r".*_extra_state.*",
+        )
+
+        assert result == []
+
+    def test_passthrough_key(self):
+        """Non-combined tensors should pass through unchanged."""
+        adapter = self._adapter(num_hidden_layers=1)
+        tensor = torch.randn(5, 7)
+
+        result = adapter.convert_single_tensor_to_hf("model.embed_tokens.weight", tensor)
+
+        assert result == [("model.embed_tokens.weight", tensor)]
+
+
 # ---------------------------------------------------------------------------
 # Functional test: 2-layer Llama model + LoRA → simulate save → verify split
 # ---------------------------------------------------------------------------
@@ -261,6 +415,14 @@ class TestLlamaLoRAFunctionalSplit:
     @staticmethod
     def _make_tiny_llama():
         """Return a 2-layer Llama model with LoRA on qkv_proj + gate_up_proj."""
+        from transformers import LlamaConfig
+
+        from nemo_automodel.components._peft.lora import (
+            PeftConfig,
+            apply_lora_to_linear_modules,
+        )
+        from nemo_automodel.components.models.llama.model import LlamaForCausalLM
+
         config = LlamaConfig(
             num_hidden_layers=2,
             num_attention_heads=4,
@@ -418,6 +580,8 @@ class TestLlamaLoRAFunctionalSplit:
 
     def test_extract_target_modules_returns_split_names(self):
         """_extract_target_modules should emit HF-compatible split names."""
+        from nemo_automodel.components.checkpoint.addons import _extract_target_modules
+
         model, _ = self._make_tiny_llama()
         target_modules = _extract_target_modules(model)
 

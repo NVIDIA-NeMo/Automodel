@@ -366,6 +366,97 @@ class CombinedProjectionStateDictAdapter:
 
         return hf_state_dict
 
+    @staticmethod
+    def _filter_excluded_keys(
+        fqn_tensors: list[tuple[str, Any]],
+        exclude_key_regex: Optional[str] = None,
+    ) -> list[tuple[str, Any]]:
+        """Apply the same post-conversion exclusion semantics as to_hf()."""
+        if not exclude_key_regex:
+            return fqn_tensors
+        return [(key, value) for key, value in fqn_tensors if not re.match(exclude_key_regex, key)]
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Convert a single tensor from native format to HuggingFace format.
+
+        Args:
+            fqn: Fully qualified name of the tensor in native format.
+            tensor: Tensor to convert.
+            **kwargs: Additional conversion arguments. Supports
+                ``exclude_key_regex`` for filtering converted keys.
+
+        Returns:
+            List of ``(fqn, tensor)`` tuples in HuggingFace format. A single
+            native combined-projection tensor may split into multiple HF tensors.
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        if exclude_key_regex and re.match(exclude_key_regex, fqn):
+            return []
+
+        if ".self_attn.qkv_proj." in fqn:
+            prefix, suffix = fqn.split(".self_attn.qkv_proj.", 1)
+            if "lora_A" in suffix:
+                converted = [
+                    (f"{prefix}.self_attn.q_proj.{suffix}", tensor),
+                    (f"{prefix}.self_attn.k_proj.{suffix}", tensor.clone()),
+                    (f"{prefix}.self_attn.v_proj.{suffix}", tensor.clone()),
+                ]
+            elif suffix == "bias":
+                qkv_bias, orig = self._gather_1d_bias(tensor)
+                q_bias, k_bias, v_bias = self._deinterleave_qkv(qkv_bias)
+                converted = [
+                    (
+                        f"{prefix}.self_attn.q_proj.{suffix}",
+                        self._restore_1d_bias(q_bias, orig),
+                    ),
+                    (
+                        f"{prefix}.self_attn.k_proj.{suffix}",
+                        self._restore_1d_bias(k_bias, orig),
+                    ),
+                    (
+                        f"{prefix}.self_attn.v_proj.{suffix}",
+                        self._restore_1d_bias(v_bias, orig),
+                    ),
+                ]
+            else:
+                q_tensor, k_tensor, v_tensor = self._deinterleave_qkv(tensor)
+                converted = [
+                    (f"{prefix}.self_attn.q_proj.{suffix}", q_tensor),
+                    (f"{prefix}.self_attn.k_proj.{suffix}", k_tensor),
+                    (f"{prefix}.self_attn.v_proj.{suffix}", v_tensor),
+                ]
+            return self._filter_excluded_keys(converted, exclude_key_regex)
+
+        if ".mlp.gate_up_proj." in fqn:
+            prefix, suffix = fqn.split(".mlp.gate_up_proj.", 1)
+            if "lora_A" in suffix:
+                converted = [
+                    (f"{prefix}.mlp.gate_proj.{suffix}", tensor),
+                    (f"{prefix}.mlp.up_proj.{suffix}", tensor.clone()),
+                ]
+            elif suffix == "bias":
+                gate_up_bias, orig = self._gather_1d_bias(tensor)
+                gate_bias, up_bias = self._deinterleave_gate_up(gate_up_bias)
+                converted = [
+                    (
+                        f"{prefix}.mlp.gate_proj.{suffix}",
+                        self._restore_1d_bias(gate_bias, orig),
+                    ),
+                    (
+                        f"{prefix}.mlp.up_proj.{suffix}",
+                        self._restore_1d_bias(up_bias, orig),
+                    ),
+                ]
+            else:
+                gate_tensor, up_tensor = self._deinterleave_gate_up(tensor)
+                converted = [
+                    (f"{prefix}.mlp.gate_proj.{suffix}", gate_tensor),
+                    (f"{prefix}.mlp.up_proj.{suffix}", up_tensor),
+                ]
+            return self._filter_excluded_keys(converted, exclude_key_regex)
+
+        return self._filter_excluded_keys([(fqn, tensor)], exclude_key_regex)
+
     def _split_remaining_combined_projection_keys(self, hf_state_dict: dict[str, Any]) -> None:
         """Split any remaining combined-projection keys in-place.
 
