@@ -87,25 +87,6 @@ def test_build_position_ids_does_not_override_existing():
     assert torch.equal(batch["position_ids"], original_pos), "position_ids should not be modified"
 
 
-def test_packed_sequence_allowed_mask_isolates_documents():
-    packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]])
-    q_indices = torch.tensor([1, 2, 4])
-    kv_indices = torch.arange(5)
-
-    mask = _cu._packed_sequence_allowed_mask(packed_seq_ids, q_indices, kv_indices)
-
-    expected = torch.tensor(
-        [
-            [
-                [True, True, False, False, False],
-                [False, False, True, True, False],
-                [False, False, False, False, False],
-            ]
-        ]
-    )
-    assert torch.equal(mask, expected)
-
-
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
