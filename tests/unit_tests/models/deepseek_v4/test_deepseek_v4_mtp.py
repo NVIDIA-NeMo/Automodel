@@ -168,6 +168,70 @@ class TestMTPForward:
         assert captured["input_ids"].tolist() == [[11, 12, 13, 0]]
         assert captured["position_ids"].tolist() == [[0, 1, 2, 3]]
 
+    def test_pp_first_stage_propagates_shifted_mtp_embeddings(self):
+        """First PP stage sends shifted token embeddings as auxiliary activations."""
+        cfg = _tiny_config(num_nextn_predict_layers=1)
+        model = _make_model(cfg)
+        model.train()
+        model.lm_head = None
+        model.mtp = None
+
+        with torch.no_grad():
+            model.model.embed_tokens.weight.copy_(
+                torch.arange(cfg.vocab_size * cfg.hidden_size, dtype=torch.float32).view(
+                    cfg.vocab_size, cfg.hidden_size
+                )
+            )
+
+        def fake_backbone(self, input_ids, **kwargs):
+            del self, input_ids, kwargs
+            return torch.ones(1, 4, cfg.hc_mult, cfg.hidden_size)
+
+        model.model.forward = types.MethodType(fake_backbone, model.model)
+
+        input_ids = torch.tensor([[10, 11, 12, 13]])
+        out = model(input_ids)
+
+        assert isinstance(out, tuple)
+        assert len(out) == 2
+        assert out[0].shape == (1, 4, cfg.hc_mult, cfg.hidden_size)
+        expected_ids = torch.tensor([[11, 12, 13, 0]])
+        torch.testing.assert_close(out[1], model.model.embed_tokens(expected_ids))
+
+    def test_pp_final_stage_uses_propagated_mtp_embeddings(self):
+        """Final PP stage computes MTP from the carried embeddings, not a local embed table."""
+        cfg = _tiny_config(num_nextn_predict_layers=1)
+        model = _make_model(cfg)
+        model.train()
+        model.model.embed_tokens = None
+        captured = {}
+
+        def fake_backbone(self, input_ids, return_hc_hidden=False, **kwargs):
+            del self, kwargs
+            assert return_hc_hidden is True
+            batch, seq = input_ids.shape[:2]
+            hidden = torch.ones(batch, seq, cfg.hidden_size)
+            hc_hidden = torch.ones(batch, seq, cfg.hc_mult, cfg.hidden_size) * 2
+            return hidden, hc_hidden
+
+        def fake_mtp(self, **kwargs):
+            captured.update(kwargs)
+            return [kwargs["hidden_states"].mean(dim=2)]
+
+        model.model.forward = types.MethodType(fake_backbone, model.model)
+        model.mtp.forward = types.MethodType(fake_mtp, model.mtp)
+
+        activation = torch.zeros(1, 4, cfg.hc_mult, cfg.hidden_size)
+        mtp_embed = torch.randn(1, 4, cfg.hidden_size)
+        out = model(activation, mtp_embed)
+
+        assert isinstance(out, tuple)
+        assert len(out) == 2
+        torch.testing.assert_close(captured["embed_inputs"][0], mtp_embed)
+        assert "input_ids" not in captured
+        assert "embed_fn" not in captured
+        assert out[1].shape == (1, 4, cfg.hidden_size)
+
     @_REQUIRES_CUDA
     def test_forward_eval_no_mtp_output(self):
         """In eval mode, mtp_per_depth_h should be None."""
@@ -258,6 +322,67 @@ class TestMTPStateDict:
         sd = model.state_dict()
         mtp_rotary_keys = [k for k in sd if "mtp" in k and "rotary" in k]
         assert not mtp_rotary_keys, f"Unexpected MTP rotary keys in state_dict: {mtp_rotary_keys}"
+
+
+class TestPipelineHooks:
+    def test_customize_pipeline_stage_modules_keeps_dsv4_dependencies(self):
+        cfg = _tiny_config(num_nextn_predict_layers=1)
+        model = _make_model(cfg)
+        stages = [
+            ["model.embed_tokens", "model.layers.0", "model.rotary_emb"],
+            ["model.layers.1", "model.norm", "lm_head", "model.rotary_emb"],
+        ]
+
+        out = model.customize_pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
+
+        for stage_modules in out:
+            assert "model.rotary_emb_compress" in stage_modules
+        assert "model.hc_head" not in out[0]
+        assert "model.hc_head" in out[-1]
+        assert "mtp" not in out[0]
+        assert "mtp" in out[-1]
+
+    def test_pipeline_stage_metas_for_mtp_first_middle_and_final_stages(self):
+        cfg = _tiny_config(num_nextn_predict_layers=2)
+
+        first = _make_model(cfg)
+        first.lm_head = None
+        first.model.norm = None
+        first.mtp = None
+        first_inputs, first_outputs = first.get_pipeline_stage_metas(
+            is_first=True, microbatch_size=2, seq_len=16, dtype=torch.float16
+        )
+        assert first_inputs[0].shape == (2, 16)
+        assert first_inputs[0].dtype == torch.long
+        assert len(first_outputs) == 3
+        assert first_outputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
+        assert first_outputs[1].shape == (2, 16, cfg.hidden_size)
+
+        middle = _make_model(cfg)
+        middle.model.embed_tokens = None
+        middle.lm_head = None
+        middle.model.norm = None
+        middle.mtp = None
+        middle_inputs, middle_outputs = middle.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.float16
+        )
+        assert len(middle_inputs) == 3
+        assert middle_inputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
+        assert middle_inputs[1].shape == (2, 16, cfg.hidden_size)
+        assert len(middle_outputs) == 3
+        assert middle_outputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
+
+        final = _make_model(cfg)
+        final.model.embed_tokens = None
+        final_inputs, final_outputs = final.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=2, seq_len=16, dtype=torch.float16
+        )
+        assert len(final_inputs) == 3
+        assert final_inputs[0].shape == (2, 16, cfg.hc_mult, cfg.hidden_size)
+        assert len(final_outputs) == 3
+        assert final_outputs[0].shape == (2, 16, cfg.vocab_size)
+        assert final_outputs[1].shape == (2, 16, cfg.hidden_size)
+        assert final_outputs[2].shape == (2, 16, cfg.hidden_size)
 
 
 if __name__ == "__main__":

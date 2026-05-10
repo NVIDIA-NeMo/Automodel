@@ -599,15 +599,104 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Keep DSV4 non-layer PP dependencies with the stages that need them."""
+
+        text_model = text_model or self.model
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+
+        def append_once(modules: list[str], fqn: str) -> None:
+            if fqn not in modules:
+                modules.append(fqn)
+
+        if getattr(text_model, "rotary_emb_compress", None) is not None:
+            for modules in stage_modules:
+                append_once(modules, f"{layers_prefix}rotary_emb_compress")
+        if getattr(text_model, "hc_head", None) is not None:
+            append_once(stage_modules[-1], f"{layers_prefix}hc_head")
+        if self.mtp is not None:
+            append_once(stage_modules[-1], "mtp")
+
+        return stage_modules
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return PP input/output meta tensors for DSV4's HC and MTP contract."""
+
+        hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
+        hc_hidden_shape = (microbatch_size, seq_len, self.config.hc_mult, self.config.hidden_size)
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+
+        def meta(shape: tuple[int, ...]) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=dtype)
+
+        def append_mtp_metas(primary: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            mtp_metas = (meta(hidden_shape) for _ in range(mtp_depth))
+            return (primary, *mtp_metas)
+
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
+
+        if self.lm_head is not None:
+            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
+        elif getattr(self.model, "norm", None) is not None:
+            output_meta = meta(hidden_shape)
+        else:
+            output_meta = meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape)
+
+        return inputs_meta, append_mtp_metas(output_meta)
+
+    def _is_pipeline_parallel_stage(self) -> bool:
+        if self.lm_head is None:
+            return True
+        if getattr(self.model, "embed_tokens", None) is None:
+            return True
+        try:
+            return len(self.model.layers) != int(self.config.num_hidden_layers)
+        except TypeError:
+            return False
+
+    def _build_mtp_embed_inputs_for_pp(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if getattr(self.model, "embed_tokens", None) is None:
+            raise ValueError("First PP stage must own embed_tokens to build MTP embeddings")
+        if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
+            raise ValueError("First PP stage must receive token ids to build MTP embeddings")
+
+        from nemo_automodel.components.models.common.mtp import roll_tensor  # noqa: PLC0415
+
+        cur_input_ids = input_ids
+        embeds = []
+        for _ in range(self.mtp_config.num_layers):
+            cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+            embeds.append(self.model.embed_tokens(cur_input_ids))
+        return tuple(embeds)
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        *,
+        *mtp_embed_inputs: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> "DeepseekV4CausalLMOutput":
+    ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
+        is_pp_stage = self._is_pipeline_parallel_stage()
+        pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
+
         thd_mode = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
         if thd_mode:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
@@ -633,8 +722,15 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if thd_mode:
             logits = logits.unsqueeze(0)
 
+        if pp_mtp_enabled and self.lm_head is None:
+            if not mtp_embed_inputs:
+                mtp_embed_inputs = self._build_mtp_embed_inputs_for_pp(input_ids)
+            return (logits, *mtp_embed_inputs)
+
         mtp_per_depth_h = None
         if use_mtp:
+            if is_pp_stage and not mtp_embed_inputs:
+                raise ValueError("Final PP stage requires propagated MTP embeddings")
             # MTP consumes the pre-final-head HC stream [B, S, hc_mult, hidden]
             # and returns collapsed per-depth [B, S, hidden] tensors for CE.
             seq_len = hidden_states.shape[1]
@@ -650,14 +746,27 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 batch_size=batch_size,
                 sliding_window=sliding_window,
             )
-            mtp_per_depth_h = self.mtp(
-                input_ids=input_ids,
-                hidden_states=mtp_hc_hidden,
-                embed_fn=self.model.embed_tokens,
-                position_ids=position_ids,
-                attention_mask=mtp_attn_mask,
-                padding_mask=padding_mask,
-            )
+            mtp_kwargs = {
+                "hidden_states": mtp_hc_hidden,
+                "position_ids": position_ids,
+                "attention_mask": mtp_attn_mask,
+                "padding_mask": padding_mask,
+            }
+            if mtp_embed_inputs:
+                mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
+            else:
+                mtp_kwargs["input_ids"] = input_ids
+                mtp_kwargs["embed_fn"] = self.model.embed_tokens
+            mtp_per_depth_h = self.mtp(**mtp_kwargs)
+        elif pp_mtp_enabled and self.lm_head is not None:
+            mtp_per_depth_h = [hidden_states.new_empty(hidden_states.shape) for _ in range(self.mtp_config.num_layers)]
+
+        if is_pp_stage:
+            if pp_mtp_enabled:
+                if self.training and self.mtp is None:
+                    raise ValueError("Final PP stage has MTP enabled but does not own the MTP module")
+                return (logits, *mtp_per_depth_h)
+            return logits
 
         return DeepseekV4CausalLMOutput(
             logits=logits,

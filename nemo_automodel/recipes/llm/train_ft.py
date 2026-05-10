@@ -75,6 +75,7 @@ from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
@@ -97,6 +98,8 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
     filter_forward_kwargs,
+    get_lm_head_module,
+    get_lm_head_weight,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -848,21 +851,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
         labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
+        lm_head = get_lm_head_weight(model)
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),
@@ -934,9 +923,12 @@ def calculate_mtp_loss(
                 num_label_tokens=num_label_tokens,
             )
         else:
+            lm_head = get_lm_head_module(model)
+            if lm_head is None:
+                raise ValueError("lm_head module not found in model")
             depth_loss = calculate_loss(
                 loss_fn,
-                logits=model.get_output_embeddings()(h_k),
+                logits=lm_head(h_k),
                 labels=masked,
                 model=model,
                 num_label_tokens=num_label_tokens,
@@ -944,6 +936,44 @@ def calculate_mtp_loss(
         total = total + depth_loss
 
     return total * (scaling_factor / D)
+
+
+class PipelineCausalLMLoss(nn.Module):
+    """Pipeline schedule loss that can add DSV4 MTP auxiliary CE on the last stage."""
+
+    def __init__(self, loss_fn: nn.Module, model: nn.Module):
+        super().__init__()
+        self.loss_fn = loss_fn
+        self.model = model
+
+    def forward(self, output, labels: torch.Tensor) -> torch.Tensor:
+        logits = getattr(output, "logits", output)
+        hidden_states = get_final_hidden_states(output)
+        mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
+        scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
+
+        if isinstance(output, tuple):
+            logits = output[0]
+            hidden_states = None
+            mtp_per_depth_h = list(output[1:]) if len(output) > 1 else None
+            scaling_factor = get_mtp_loss_scaling_factor(self.model)
+
+        loss = calculate_loss(
+            self.loss_fn,
+            logits=logits,
+            labels=labels,
+            model=self.model,
+            hidden_states=hidden_states,
+        )
+        if mtp_per_depth_h is not None and self.model.training:
+            loss = loss + calculate_mtp_loss(
+                self.loss_fn,
+                mtp_per_depth_h=mtp_per_depth_h,
+                labels=labels,
+                model=self.model,
+                scaling_factor=scaling_factor,
+            )
+        return loss
 
 
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
@@ -1171,21 +1201,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
-        # Pipeline parallelism does not currently aggregate the Multi-Token
-        # Prediction (MTP) auxiliary loss through the schedule, so the MTP
-        # head would silently receive no gradients.  Block the combination
-        # here rather than train a model whose MTP weights never update.
-        # TODO(deepseek-v4-mtp): wire MTP loss through the PP schedule in a
-        # follow-up PR; tracked separately from this MTP-on-FSDP/DDP change.
-        if self.pp_enabled and _mtp_is_enabled(self.cfg, self.model_parts):
-            raise NotImplementedError(
-                "Multi-Token Prediction (MTP) is not yet supported under "
-                "pipeline parallelism: the PP schedule does not aggregate the "
-                "auxiliary MTP loss, so the MTP head would not receive gradients. "
-                "PP + MTP wiring is intentionally deferred to a follow-up PR. "
-                "For now, disable MTP (set model.config.num_nextn_predict_layers=0) "
-                "or run without pipeline parallelism."
-            )
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
@@ -1334,6 +1351,36 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         else:
             wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
 
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
+        mtp_config = getattr(last_stage_model, "mtp_config", None)
+        mtp_enabled = bool(mtp_config is not None and getattr(mtp_config, "enabled", False))
+        mtp_depth = int(getattr(mtp_config, "num_layers", 0) or 0) if mtp_config is not None else 0
+        mtp_msg = (
+            "PP MTP support active: "
+            f"rank={self.dist_env.rank}, "
+            f"pp_has_last_stage={self.pp.info.has_last_stage}, "
+            f"owns_mtp_module={getattr(last_stage_model, 'mtp', None) is not None}, "
+            f"mtp_enabled={mtp_enabled}, "
+            f"mtp_depth={mtp_depth}, "
+            f"mtp_loss_scaling_factor={get_mtp_loss_scaling_factor(last_stage_model)}, "
+            f"schedule_loss={type(self.pp.info.schedule._loss_fn).__name__}"
+        )
+        logger.info(mtp_msg)
+        if self.cfg.get("debug_mtp_pp", False):
+            print(f"[MTP-PP-DEBUG] {mtp_msg}", flush=True)
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1468,12 +1515,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
-            # TODO(deepseek-v4-mtp): MTP auxiliary loss is currently not wired
-            # through the PP schedule (the non-PP branch below adds it via
-            # ``calculate_mtp_loss`` on ``out.mtp_per_depth_h``).  PP + MTP is
-            # blocked at recipe ``setup()`` for now and will be enabled in a
-            # follow-up PR that hooks the per-depth hidden states into the
-            # last-stage loss aggregation.
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
