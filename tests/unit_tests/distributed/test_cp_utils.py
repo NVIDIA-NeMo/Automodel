@@ -146,6 +146,7 @@ def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3]]),
         "labels": torch.tensor([[1, 2, 3]]),
         "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
@@ -154,6 +155,37 @@ def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
     assert batch["input_ids"][0, -1].item() == 99
     assert batch["labels"][0, -1].item() == -100
     assert batch["mm_token_type_ids"][0, -1].item() == 0
+
+
+def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual_allgather(monkeypatch):
+    """VLM metadata alone should not opt non-Gemma4 models into manual all-gather CP."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    calls = {}
+
+    def fake_create_context_parallel_ctx(**kwargs):
+        calls["cp_buffers"] = kwargs["cp_buffers"]
+        return "cp_ctx"
+
+    def fake_get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_context=None):
+        calls["cp_context"] = cp_context
+        return contextlib.nullcontext
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", fake_create_context_parallel_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", fake_get_train_context)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+    }
+
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+
+    assert ctx_obj is contextlib.nullcontext
+    assert calls["cp_context"] == "cp_ctx"
+    assert len(calls["cp_buffers"]) == 3
+    assert torch.equal(new_batch["input_ids"], torch.tensor([[1, 2, 3, 4]]))
+    assert torch.equal(new_batch["mm_token_type_ids"], torch.tensor([[0, 1, 1, 0]]))
 
 
 def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monkeypatch):
@@ -167,6 +199,7 @@ def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monke
         "labels": labels,
         "per_layer_inputs": per_layer_inputs,
         "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch)
@@ -184,6 +217,7 @@ def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3]]),
         "labels": torch.tensor([[1, 2, 3]]),
         "_packed_seq_ids": torch.tensor([[1, 1, 2]]),
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
