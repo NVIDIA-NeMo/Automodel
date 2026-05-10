@@ -115,17 +115,28 @@ class Qwen3_5MoeBlock(Block):
 
         cu_seqlens: torch.Tensor | None = None
         indices: torch.Tensor | None = None
+        linear_attn_mask = attention_mask
+        packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
         if is_indexed_packed_mask(attention_mask):
-            indices_t, cu_seqlens_t, _ = get_unpad_data(attention_mask)
+            packing_mask = attention_mask
+        elif is_indexed_packed_mask(packed_seq_ids):
+            packing_mask = packed_seq_ids
+        else:
+            packing_mask = None
+
+        if packing_mask is not None:
+            indices_t, cu_seqlens_t, _ = get_unpad_data(packing_mask)
             cu_seqlens = cu_seqlens_t.to(torch.long)
             indices = indices_t
+            linear_attn_mask = packing_mask
 
-        if attention_mask is not None and padding_mask is None:
-            padding_mask = attention_mask.bool().logical_not()
+        if linear_attn_mask is not None and padding_mask is None:
+            padding_mask = linear_attn_mask.bool().logical_not()
 
+        normed_x = self.input_layernorm(x)
         attn_out = self.linear_attn(
-            hidden_states=self.input_layernorm(x),
-            attention_mask=attention_mask,
+            hidden_states=normed_x,
+            attention_mask=linear_attn_mask,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
             indices=indices,

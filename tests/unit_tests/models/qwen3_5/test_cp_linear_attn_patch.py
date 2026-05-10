@@ -49,11 +49,10 @@ class TestPatchHfModel:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
 
     def test_fp32_params_moved_to_holder(self, fake_model, monkeypatch):
         """Float32 bare params are moved into _fp32_params submodule via real patch_hf_model."""
@@ -384,6 +383,46 @@ class TestPackingHelpers:
         # Non-padding positions in flattened B*T=12 sequence
         assert indices.tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9]
 
+    def test_dense_decoder_uses_packed_seq_ids_for_sdpa_linear_attention(self):
+        """Linear attention gets indexed packed ids even when full attention uses a 4D SDPA mask."""
+        from nemo_automodel.components.models.qwen3_5.decoder_layer import Qwen3_5DecoderLayerWithPacking
+
+        class RecorderLinearAttn(nn.Module):
+            layer_idx = 0
+
+            def __init__(self):
+                super().__init__()
+                self.called_with = None
+
+            def forward(self, **kwargs):
+                self.called_with = kwargs
+                return kwargs["hidden_states"]
+
+        layer = Qwen3_5DecoderLayerWithPacking.__new__(Qwen3_5DecoderLayerWithPacking)
+        nn.Module.__init__(layer)
+        layer.layer_type = "linear_attention"
+        layer.input_layernorm = nn.Identity()
+        layer.linear_attn = RecorderLinearAttn()
+        layer.post_attention_layernorm = nn.Identity()
+        layer.mlp = nn.Identity()
+
+        hidden_states = torch.zeros(1, 5, 4)
+        sdpa_mask = torch.ones(1, 1, 5, 5, dtype=torch.bool).tril()
+        packed_seq_ids = torch.tensor([[1, 1, 2, 2, 2]])
+
+        layer(
+            hidden_states,
+            position_embeddings=(torch.empty(0), torch.empty(0)),
+            attention_mask=sdpa_mask,
+            position_ids=torch.arange(5).unsqueeze(0),
+            _packed_seq_ids=packed_seq_ids,
+        )
+
+        called = layer.linear_attn.called_with
+        assert called["attention_mask"] is packed_seq_ids
+        assert called["cu_seqlens"].tolist() == [0, 2, 5]
+        assert called["indices"].tolist() == [0, 1, 2, 3, 4]
+
 
 class TestQwen35ParallelizationStrategyRegistration:
     def test_strategy_registered(self):
@@ -415,11 +454,10 @@ class TestQwen35ParallelizationStrategyParallelize:
             "transformers.models.qwen3_5",
             "transformers.models.qwen3_5.modeling_qwen3_5",
         ):
-            if path not in sys.modules:
-                stub = types.ModuleType(path)
-                stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
-                stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
-                monkeypatch.setitem(sys.modules, path, stub)
+            stub = types.ModuleType(path)
+            stub.Qwen3_5MoeGatedDeltaNet = _FakeGatedDeltaNet
+            stub.Qwen3_5GatedDeltaNet = _FakeGatedDeltaNet
+            monkeypatch.setitem(sys.modules, path, stub)
 
     @pytest.fixture()
     def mock_device_mesh(self):

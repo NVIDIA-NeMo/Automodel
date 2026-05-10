@@ -66,16 +66,26 @@ class Qwen3_5DecoderLayerWithPacking(Qwen3_5DecoderLayer):
         if self.layer_type == "linear_attention":
             cu_seqlens: torch.Tensor | None = None
             indices: torch.Tensor | None = None
+            linear_attn_mask = attention_mask
+            packed_seq_ids = kwargs.get("_packed_seq_ids")
             if is_indexed_packed_mask(attention_mask):
-                indices_t, cu_seqlens_t, _ = get_unpad_data(attention_mask)
+                packing_mask = attention_mask
+            elif is_indexed_packed_mask(packed_seq_ids):
+                packing_mask = packed_seq_ids
+            else:
+                packing_mask = None
+
+            if packing_mask is not None:
+                indices_t, cu_seqlens_t, _ = get_unpad_data(packing_mask)
                 indices = indices_t
                 cu_seqlens = cu_seqlens_t.to(torch.long)
+                linear_attn_mask = packing_mask
 
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 cache_position=cache_position,
-                attention_mask=attention_mask,
+                attention_mask=linear_attn_mask,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 indices=indices,
