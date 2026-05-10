@@ -103,6 +103,31 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
 )
 
 
+MULTIMODAL_MODULE_PATH_PARTS: frozenset[str] = frozenset(
+    {
+        "audio_encoder",
+        "audio_model",
+        "audio_tower",
+        "image_encoder",
+        "image_model",
+        "image_tower",
+        "video_encoder",
+        "video_model",
+        "video_tower",
+        "vision_encoder",
+        "vision_model",
+        "vision_tower",
+        "visual",
+        "visual_model",
+    }
+)
+
+
+def is_multimodal_module_path(name: str) -> bool:
+    """Return true if a dotted module path is inside a multimodal encoder/tower."""
+    return any(part in MULTIMODAL_MODULE_PATH_PARTS for part in name.split("."))
+
+
 def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     """Drop kwargs that ``model.forward`` does not accept.
 
