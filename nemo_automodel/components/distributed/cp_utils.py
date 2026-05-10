@@ -19,30 +19,13 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
-
-
-_NON_TEXT_ATTENTION_PATH_PARTS = {
-    "audio_encoder",
-    "audio_model",
-    "audio_tower",
-    "image_encoder",
-    "image_model",
-    "image_tower",
-    "video_encoder",
-    "video_model",
-    "video_tower",
-    "vision_encoder",
-    "vision_model",
-    "vision_tower",
-    "visual",
-    "visual_model",
-}
+from nemo_automodel.components.utils.model_utils import is_multimodal_module_path
 
 
 def _is_cp_attention_module_name(name: str) -> bool:
     if not name.endswith("self_attn"):
         return False
-    return not any(part in _NON_TEXT_ATTENTION_PATH_PARTS for part in name.split("."))
+    return not is_multimodal_module_path(name)
 
 
 def _packed_sequence_allowed_mask(
