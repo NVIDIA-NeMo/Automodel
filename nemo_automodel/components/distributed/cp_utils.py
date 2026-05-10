@@ -28,19 +28,6 @@ def _is_cp_attention_module_name(name: str) -> bool:
     return not is_multimodal_module_path(name)
 
 
-def _packed_sequence_allowed_mask(
-    packed_seq_ids: torch.Tensor | None,
-    q_indices: torch.Tensor,
-    kv_indices: torch.Tensor,
-) -> torch.Tensor | None:
-    """Build a [B, Q, KV] mask that isolates packed documents."""
-    if packed_seq_ids is None:
-        return None
-    q_pack_ids = packed_seq_ids[:, q_indices]
-    kv_pack_ids = packed_seq_ids[:, kv_indices]
-    return (q_pack_ids[:, :, None] == kv_pack_ids[:, None, :]) & (q_pack_ids[:, :, None] > 0)
-
-
 def _build_position_ids(batch, device):
     """Add position_ids to the batch only if they are missing."""
     # TODO(@boxiangw): Refractor. Needed for SP support
@@ -290,7 +277,6 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 allowed = allowed & ((q_global_idx - kv_idx) < sliding_window)
             return allowed
 
-        out = None
         empty_query_rows = None
         if packed_seq_ids_full is not None:
             empty_query_rows = packed_seq_ids_full[:, q_indices] <= 0
@@ -384,178 +370,11 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
                 _cp_sdpa._flex_ok_logged = True
             return out
         except Exception as flex_err:
-            if not getattr(_cp_sdpa, "_flex_err_logged", False):
-                _log.warning(
-                    "CP flex_attention all-gather failed; trying dense SDPA fallback. "
-                    "Q=%s K=%s V=%s cp_rank=%s seq_local=%s seq_full=%s error=%s: %s",
-                    tuple(query.shape),
-                    tuple(key_full.shape),
-                    tuple(value_full.shape),
-                    cp_rank,
-                    seq_local,
-                    seq_full,
-                    type(flex_err).__name__,
-                    flex_err,
-                )
-                _cp_sdpa._flex_err_logged = True
-            out = None
-
-        kv_indices = torch.arange(seq_full, device=query.device)
-        if is_causal:
-            sdpa_allowed = kv_indices.unsqueeze(0) <= q_indices.unsqueeze(1)
-        else:
-            sdpa_allowed = torch.ones(seq_local, seq_full, dtype=torch.bool, device=query.device)
-        if sliding_window is not None:
-            sdpa_allowed = sdpa_allowed & ((q_indices.unsqueeze(1) - kv_indices.unsqueeze(0)) < sliding_window)
-
-        if use_vision_bidirectional:
-            q_groups = vision_group_ids[:, q_indices]
-            kv_groups = vision_group_ids[:, kv_indices]
-            same_vision_group = (q_groups[:, :, None] == kv_groups[:, None, :]) & (q_groups[:, :, None] >= 0)
-            sdpa_mask = (sdpa_allowed.unsqueeze(0) | same_vision_group).unsqueeze(1)
-        else:
-            sdpa_mask = sdpa_allowed.unsqueeze(0).unsqueeze(0)
-        packed_allowed = _packed_sequence_allowed_mask(packed_seq_ids_full, q_indices, kv_indices)
-        if packed_allowed is not None:
-            sdpa_mask = sdpa_mask & packed_allowed.unsqueeze(1)
-        empty_sdpa_rows = ~sdpa_mask.any(dim=-1, keepdim=True)
-        sdpa_mask_for_kernel = sdpa_mask
-        if empty_sdpa_rows.any():
-            # Boolean SDPA backward can produce NaNs when a query row is
-            # completely masked. Padding rows are ignored by the loss, so point
-            # them at a dummy key for the kernel and zero their outputs.
-            sdpa_mask_for_kernel = sdpa_mask.clone()
-            sdpa_mask_for_kernel[..., :1] = sdpa_mask_for_kernel[..., :1] | empty_sdpa_rows
-
-        try:
-            key_for_sdpa = key_full
-            value_for_sdpa = value_full
-            if query.shape[1] != key_full.shape[1]:
-                if query.shape[1] % key_full.shape[1] != 0:
-                    raise RuntimeError(
-                        f"Cannot expand KV heads for GQA: query heads={query.shape[1]}, kv heads={key_full.shape[1]}"
-                    )
-                repeat_factor = query.shape[1] // key_full.shape[1]
-                key_for_sdpa = key_full.repeat_interleave(repeat_factor, dim=1)
-                value_for_sdpa = value_full.repeat_interleave(repeat_factor, dim=1)
-            out = _original_sdpa(
-                query,
-                key_for_sdpa,
-                value_for_sdpa,
-                attn_mask=sdpa_mask_for_kernel,
-                dropout_p=dropout_p,
-                is_causal=False,
-                scale=scale,
-                **kwargs,
-            )
-            if empty_sdpa_rows.any():
-                out = out.masked_fill(empty_sdpa_rows, 0)
-            if not getattr(_cp_sdpa, "_sdpa_ok_logged", False):
-                _log.info(
-                    "CP using dense SDPA all-gather fallback. Q=%s K=%s cp_rank=%s",
-                    tuple(query.shape),
-                    tuple(key_full.shape),
-                    cp_rank,
-                )
-                _cp_sdpa._sdpa_ok_logged = True
-            return out
-        except Exception as sdpa_err:
-            if not getattr(_cp_sdpa, "_sdpa_err_logged", False):
-                _log.warning(
-                    "CP dense SDPA all-gather failed; using chunked attention fallback. "
-                    "Q=%s K=%s V=%s cp_rank=%s seq_local=%s seq_full=%s error=%s: %s",
-                    tuple(query.shape),
-                    tuple(key_full.shape),
-                    tuple(value_full.shape),
-                    cp_rank,
-                    seq_local,
-                    seq_full,
-                    type(sdpa_err).__name__,
-                    sdpa_err,
-                )
-                _cp_sdpa._sdpa_err_logged = True
-
-        if out is None:
-            attn_scale = scale if scale is not None else 1.0 / math.sqrt(query.shape[-1])
-            num_q_heads = query.shape[1]
-            num_kv_heads = key_full.shape[1]
-            if num_q_heads != num_kv_heads:
-                if num_q_heads % num_kv_heads != 0:
-                    raise RuntimeError(
-                        f"Cannot expand KV heads for GQA: query heads={num_q_heads}, kv heads={num_kv_heads}"
-                    )
-                repeat_factor = num_q_heads // num_kv_heads
-                key_for_attn = key_full.repeat_interleave(repeat_factor, dim=1)
-                value_for_attn = value_full.repeat_interleave(repeat_factor, dim=1)
-            else:
-                key_for_attn = key_full
-                value_for_attn = value_full
-
-            q_float = query.float()
-            k_float = key_for_attn.float()
-            v_float = value_for_attn.float()
-            batch_size, num_heads, _, head_dim = q_float.shape
-            out_acc = torch.zeros(batch_size, num_heads, seq_local, head_dim, dtype=torch.float32, device=query.device)
-            lse = torch.full((batch_size, num_heads, seq_local), float("-inf"), dtype=torch.float32, device=query.device)
-            q_indices = torch.arange(seq_local, device=query.device) + seq_global_start
-            kv_chunk = 256
-
-            for kv_start in range(0, seq_full, kv_chunk):
-                kv_end = min(kv_start + kv_chunk, seq_full)
-                kv_indices = torch.arange(kv_start, kv_end, device=query.device)
-                scores = torch.matmul(q_float, k_float[:, :, kv_start:kv_end, :].transpose(-2, -1)) * attn_scale
-
-                if is_causal:
-                    allowed = kv_indices.unsqueeze(0) <= q_indices.unsqueeze(1)
-                else:
-                    allowed = torch.ones(seq_local, kv_end - kv_start, dtype=torch.bool, device=query.device)
-                if sliding_window is not None:
-                    allowed = allowed & ((q_indices.unsqueeze(1) - kv_indices.unsqueeze(0)) < sliding_window)
-                if use_vision_bidirectional:
-                    q_groups = vision_group_ids[:, q_indices]
-                    kv_groups = vision_group_ids[:, kv_start:kv_end]
-                    same_vision_group = (q_groups[:, :, None] == kv_groups[:, None, :]) & (q_groups[:, :, None] >= 0)
-                    allowed = allowed.unsqueeze(0) | same_vision_group
-                else:
-                    allowed = allowed.unsqueeze(0)
-                packed_allowed = _packed_sequence_allowed_mask(packed_seq_ids_full, q_indices, kv_indices)
-                if packed_allowed is not None:
-                    allowed = allowed & packed_allowed
-                scores = scores.masked_fill(~allowed[:, None, :, :], float("-inf"))
-
-                chunk_valid = allowed.any(dim=-1)
-                chunk_max = scores.amax(dim=-1)
-                safe_chunk_max = torch.where(chunk_valid[:, None, :], chunk_max, torch.zeros_like(chunk_max))
-                exp_scores = torch.where(
-                    allowed[:, None, :, :],
-                    torch.exp(scores - safe_chunk_max.unsqueeze(-1)),
-                    torch.zeros_like(scores),
-                )
-                chunk_sum = exp_scores.sum(dim=-1)
-                chunk_lse = torch.where(
-                    chunk_valid[:, None, :],
-                    safe_chunk_max + torch.log(chunk_sum.clamp(min=1e-9)),
-                    torch.full_like(safe_chunk_max, float("-inf")),
-                )
-                new_lse = torch.logaddexp(lse, chunk_lse)
-                new_lse_finite = torch.isfinite(new_lse)
-                alpha = torch.where(
-                    torch.isfinite(lse) & new_lse_finite,
-                    torch.exp(lse - new_lse),
-                    torch.zeros_like(lse),
-                ).unsqueeze(-1)
-                beta = torch.where(
-                    torch.isfinite(chunk_lse) & new_lse_finite,
-                    torch.exp(safe_chunk_max - new_lse),
-                    torch.zeros_like(chunk_lse),
-                ).unsqueeze(-1)
-                out_acc = out_acc * alpha + beta * torch.matmul(exp_scores, v_float[:, :, kv_start:kv_end, :])
-                lse = new_lse
-            out = out_acc.to(query.dtype)
-
-        if padded_head_dim != orig_head_dim:
-            out = out[..., :orig_head_dim]
-        return out
+            raise RuntimeError(
+                "Gemma4 manual CP all-gather requires FlexAttention. "
+                f"FlexAttention failed for Q={tuple(query.shape)} K={tuple(key_full.shape)} "
+                f"V={tuple(value_full.shape)} cp_rank={cp_rank} seq_local={seq_local} seq_full={seq_full}."
+            ) from flex_err
 
     def _pre_hook(module, args, kwargs):
         mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
