@@ -317,17 +317,13 @@ def _precompute_stage_shapes(
             # First stage receives input_ids: [mb, seq_len] int64
             stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            stage.inputs_meta = (
-                torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),
-            )
+            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         if has_lm_head:
             # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            primary_output_meta = torch.empty(
-                microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype
-            )
+            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
         else:
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)

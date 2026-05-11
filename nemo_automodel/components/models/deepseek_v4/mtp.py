@@ -141,7 +141,9 @@ class DeepseekV4MTPBlock(nn.Module):
 
         if position_ids is None:
             seq_len = embed_input.shape[1]
-            position_ids = torch.arange(seq_len, device=embed_input.device).unsqueeze(0).expand(embed_input.shape[0], -1)
+            position_ids = (
+                torch.arange(seq_len, device=embed_input.device).unsqueeze(0).expand(embed_input.shape[0], -1)
+            )
         position_embeddings = self._rotary_emb(embed_input, position_ids)
         position_embeddings_compress = self._rotary_emb_compress(embed_input, position_ids)
 
@@ -235,9 +237,7 @@ class DeepseekV4MTPModule(nn.Module):
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         if embed_inputs is not None and len(embed_inputs) != len(self.layers):
-            raise ValueError(
-                f"Expected {len(self.layers)} MTP embedding tensors, got {len(embed_inputs)}"
-            )
+            raise ValueError(f"Expected {len(self.layers)} MTP embedding tensors, got {len(embed_inputs)}")
         if embed_inputs is None and (cur_input_ids is None or embed_fn is None):
             raise ValueError("MTP requires either embed_inputs or both input_ids and embed_fn")
 
@@ -263,7 +263,9 @@ class DeepseekV4MTPModule(nn.Module):
 def build_mtp_config_from_hf(config, *, loss_scaling_factor: float = 0.1) -> MTPConfig:
     """Build an MTPConfig from a DeepseekV4Config."""
     num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
-    return MTPConfig(num_layers=num_layers, layer_pattern="*" if num_layers > 0 else "", loss_scaling_factor=loss_scaling_factor)
+    return MTPConfig(
+        num_layers=num_layers, layer_pattern="*" if num_layers > 0 else "", loss_scaling_factor=loss_scaling_factor
+    )
 
 
 def build_deepseek_v4_mtp(
