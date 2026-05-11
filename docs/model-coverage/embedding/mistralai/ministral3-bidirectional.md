@@ -64,7 +64,7 @@ cd Automodel
 **3. Run the recipe** from inside the repo (point any Llama bi-encoder recipe at a Ministral3 checkpoint, or write a recipe targeting `mistralai/Ministral-3-3B-Base-2512`):
 
 ```bash
-automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
 ```
 
 See the [Installation Guide](../../../guides/installation.md).

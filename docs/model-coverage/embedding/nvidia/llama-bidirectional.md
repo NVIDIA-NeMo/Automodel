@@ -71,7 +71,7 @@ cd Automodel
 **3. Run the recipe** from inside the repo:
 
 ```bash
-automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
 ```
 
 :::{dropdown} Run with Docker
@@ -93,7 +93,7 @@ cd /opt/Automodel
 **3. Run the recipe**:
 
 ```bash
-automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
 ```
 :::
 
