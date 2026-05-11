@@ -122,7 +122,7 @@ See the [full benchmark results](performance-summary.md) for configuration detai
 
 ## Advanced Topics
 
-Parallelism, precision, checkpointing strategies and experiment tracking.
+Parallelism, precision, checkpointing strategies, and experiment tracking.
 
 ::::{grid} 1 2 2 3
 :gutter: 1 1 1 2
@@ -234,7 +234,7 @@ performance-summary.md
 Overview <model-coverage/overview.md>
 Release Log <model-coverage/latest-models.md>
 Large Language Models <model-coverage/llm/index.md>
-Vison Language Models <model-coverage/vlm/index.md>
+Vision Language Models <model-coverage/vlm/index.md>
 Omni <model-coverage/omni/index.md>
 Diffusion <model-coverage/diffusion/index.md>
 ::::

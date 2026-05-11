@@ -7,11 +7,11 @@
 - **Discrete-diffusion LLMs (dLLM).** SFT and generation support for dLLM
   models, including Llada.
 - **Embedding and retrieval training.** Reranker training, biencoder datasets
-  loaded directly from the HuggingFace Hub, in-batch negative sampling, and
+  loaded directly from the Hugging Face Hub, in-batch negative sampling, and
   ONNX export for biencoder models.
 - **SkyPilot launcher.** Native multi-node launch on cloud (SkyPilot,
   including Kubernetes), in addition to local interactive runs. SkyPilot and
-  NeMo-Run launchers are selected with YAML sections in the config; SLURM jobs
+  NeMo Run launchers are selected with YAML sections in the config; SLURM jobs
   use the `sbatch slurm.sub` workflow.
 - **CLI install profile.** The `nemo-automodel[cli]` extra declares `pyyaml`
   beyond the package's base dependencies for job-submission configs.
@@ -110,7 +110,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 - v5 refactor: device-mesh-only model init.
 - TP plan for Ministral; Ministral3 ported to transformers v4.
 - Pipeline-parallelism validation support.
-- Parallel diffusers `generate`.
+- Parallel diffusers `generate()`.
 
 ### Performance and Kernels
 
@@ -128,7 +128,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 
 ### Datasets and Workflow
 
-- Databricks Deltalake dataset support; consolidation for Databricks.
+- Databricks Delta Lake dataset support; consolidation for Databricks.
 - Parquet file support; inline text dataset format.
 - `ColumnMapped`: configurable special tokens, chat-template flags, and
   answer-only masking.
@@ -153,7 +153,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 - **Async checkpointing.** Checkpoint refactor with async DCP and HF
   safetensors backport / consolidation.
 - **Custom MoE optimizations.** FSDP optimizations, packed-sequence + context
-  parallel via TE, configurable router precision, fp32 `lm_head` and
+  parallel through TE, configurable router precision, fp32 `lm_head` and
   fp32 `apply_rope`.
 - **Performance documentation.** New performance-summary doc and benchmarking
   recipe with configs.
@@ -181,7 +181,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 
 ### Performance and Kernels
 
-- Mask creation moved into the data pipeline for better perf.
+- Mask creation moved into the data pipeline for better performance.
 - TE attention for GPT-OSS.
 - Faster fp8 dequant; auto-detect base-weights dequant.
 
@@ -199,7 +199,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 - Streaming dataset.
 - Multiple validation datasets with per-dataset logging.
 - ColumnMapped: surface truncating + padding options.
-- Configurable max-clip-grad; configurable remote-logging frequency via
+- Configurable max-clip-grad; configurable remote-logging frequency using 
   `step_scheduler`.
 - Validation-loss checkpoint, run-val-at-ckpt, best-ckpt symlink.
 - InternVL recipe; Qwen3-VL 30B recipe; Llama-Embed-Nemotron-8B training.
@@ -238,7 +238,7 @@ Initial public release of NeMo AutoModel.
 
 ### Highlights
 
-- PyTorch-native training framework for LLMs and VLMs with HuggingFace
+- PyTorch-native training framework for LLMs and VLMs with Hugging Face
   Transformers integration via `NeMoAuto*` wrapper classes.
 - YAML-driven recipes for SFT and PEFT.
 - FSDP2 / HSDP / DDP distributed training with DTensor sharding.
@@ -248,7 +248,7 @@ Initial public release of NeMo AutoModel.
 - MoE component with DeepSeek v3 model implementation.
 - `ColumnMappedTextInstructionDataset` for instruction tuning.
 - Gradient checkpointing.
-- Slurm launcher.
+- SLURM launcher.
 
 ---
 
