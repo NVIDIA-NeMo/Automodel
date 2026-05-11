@@ -149,6 +149,22 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
             gate_and_up_local = gate_and_up[start_expert:end_expert].to(self.dtype)
             down_local = down[start_expert:end_expert].to(self.dtype)
 
+            # Slice for EP_SHARD across the feature dimension before wrapping as DTensor.
+            if device_mesh is not None and "ep_shard" in device_mesh.mesh_dim_names:
+                ep_shard_mesh = state_dict_utils.get_submesh(device_mesh, ("ep_shard",))
+                ep_shard_size = ep_shard_mesh.size()
+                if ep_shard_size > 1:
+                    ep_shard_rank = ep_shard_mesh.get_local_rank()
+                    gate_shard_size = gate_and_up_local.shape[1] // ep_shard_size
+                    gate_start = ep_shard_rank * gate_shard_size
+                    gate_end = gate_start + gate_shard_size
+                    gate_and_up_local = gate_and_up_local[:, gate_start:gate_end, :]
+
+                    down_shard_size = down_local.shape[1] // ep_shard_size
+                    down_start = ep_shard_rank * down_shard_size
+                    down_end = down_start + down_shard_size
+                    down_local = down_local[:, down_start:down_end, :]
+
             prefix = f"{model_prefix}language_model.{layer_path}"
             state_dict[f"{prefix}.moe.experts.gate_and_up_projs"] = state_dict_utils.create_dtensor_from_local(
                 gate_and_up_local, device_mesh, rank
@@ -225,22 +241,24 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 return tensor.to_local()
             return tensor
 
+        if state_dict_utils.is_dtensor(tensor):
+            split_weights, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(tensor, n_experts)
+            # Individual expert weights may still be DTensors sharded over ep_shard.
+            # Materialize them before object gather/copy into the CPU HF tensor.
+            local_weights = [
+                (weight.full_tensor() if state_dict_utils.is_dtensor(weight) else weight).to(self.dtype).cpu()
+                for weight in split_weights
+            ]
+        else:
+            start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+            expert_ids = list(range(start_expert, end_expert))
+            local_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
+
         global_tensor = torch.zeros(
-            (
-                n_experts,
-                tensor.shape[1] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[1],
-                tensor.shape[2] if not state_dict_utils.is_dtensor(tensor) else tensor.to_local().shape[2],
-            ),
+            (n_experts, local_weights[0].shape[0], local_weights[0].shape[1]),
             dtype=self.dtype,
             device="cpu",
         )
-
-        if state_dict_utils.is_dtensor(tensor):
-            split_weights, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(tensor, n_experts)
-        else:
-            start_expert, end_expert = state_dict_utils.get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
-            split_weights = [tensor[i].to(self.dtype).cpu() for i in range(tensor.shape[0])]
-            expert_ids = list(range(start_expert, end_expert))
 
         if dist.is_initialized() and "ep" in device_mesh.mesh_dim_names:
             try:
@@ -250,20 +268,20 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 ep_group = None
 
             if ep_group is not None:
-                payload = (expert_ids, [w.cpu() for w in split_weights])
+                payload = (expert_ids, local_weights)
                 gathered: list[tuple[list[int], list[torch.Tensor]]] = [None] * dist.get_world_size(ep_group)
                 dist.all_gather_object(gathered, payload, group=ep_group)
                 for ids, weights in gathered:
                     for eid, w in zip(ids, weights):
                         global_tensor[eid].copy_(w.to(self.dtype).cpu())
             else:
-                for weight, expert_id in zip(split_weights, expert_ids):
-                    global_tensor[expert_id].copy_(weight.to(self.dtype).cpu())
+                for weight, expert_id in zip(local_weights, expert_ids):
+                    global_tensor[expert_id].copy_(weight)
         else:
-            for weight, expert_id in zip(split_weights, expert_ids):
-                global_tensor[expert_id].copy_(weight.to(self.dtype).cpu())
+            for weight, expert_id in zip(local_weights, expert_ids):
+                global_tensor[expert_id].copy_(weight)
 
-        del split_weights, expert_ids
+        del local_weights, expert_ids
         return global_tensor
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
