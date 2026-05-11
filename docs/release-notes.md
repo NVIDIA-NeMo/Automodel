@@ -41,7 +41,8 @@
 - fp32 RMSNorm backend and `cast_model_to_dtype` controls.
 - TP-aware KD loss with distributed softmax and T² scaling.
 - FlashOptim optimizer integration.
-- Packed sequences for Qwen3.5-MoE with EP+PP; chat datasets with THD,
+- Sequence-packing updates: Qwen3.5-MoE VLM neat-packing recipe with EP+PP;
+   generic THD collation for chat datasets; CP/BSHD padding fixes.
   BSHD+CP, and padding fixes.
 
 ### PEFT
