@@ -22,7 +22,7 @@ import pytest
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
-from nemo_automodel.recipes._dist_setup import parse_distributed_section
+from nemo_automodel.recipes._dist_setup import parse_distributed_section, setup_distributed
 
 # ---------------------------------------------------------------------------
 # Basic dict parsing
@@ -394,3 +394,64 @@ class TestNoneParallelismValues:
     def test_ep_size_none_discards_moe_dict(self):
         result = parse_distributed_section({"ep_size": None, "moe": {"ignore_router_for_ac": True}})
         assert result["moe_config"] is None
+
+
+# ---------------------------------------------------------------------------
+# setup_distributed: world_size auto-detection
+# ---------------------------------------------------------------------------
+
+
+class TestSetupDistributedWorldSizeAutoDetect:
+    """``setup_distributed`` accepts an optional ``world_size`` and auto-detects
+    it from ``torch.distributed`` / ``WORLD_SIZE`` when not provided."""
+
+    @pytest.fixture
+    def patched_mesh(self, monkeypatch):
+        """Stub create_device_mesh to capture the world_size it receives."""
+        captured: dict = {}
+
+        def fake_create_device_mesh(strategy_config, **kwargs):
+            captured.update(kwargs)
+            return ("device_mesh_sentinel", None)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.mesh_utils.create_device_mesh",
+            fake_create_device_mesh,
+        )
+        # MeshContext.__post_init__ runs full validation against real meshes; bypass it.
+        monkeypatch.setattr(
+            "nemo_automodel.recipes._dist_setup.MeshContext",
+            lambda **kw: kw,
+        )
+        return captured
+
+    def test_explicit_world_size_used(self, patched_mesh):
+        setup_distributed({"strategy": "fsdp2"}, world_size=4)
+        assert patched_mesh["world_size"] == 4
+
+    def test_auto_detect_from_env(self, monkeypatch, patched_mesh):
+        """Falls back to WORLD_SIZE env var when torch.distributed is not initialized."""
+        import torch
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        setup_distributed({"strategy": "fsdp2"})
+        assert patched_mesh["world_size"] == 8
+
+    def test_auto_detect_defaults_to_one(self, monkeypatch, patched_mesh):
+        """Falls back to 1 when neither torch.distributed nor WORLD_SIZE is set."""
+        import torch
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+        setup_distributed({"strategy": "fsdp2"})
+        assert patched_mesh["world_size"] == 1
+
+    def test_auto_detect_from_torch_distributed(self, monkeypatch, patched_mesh):
+        """Prefers torch.distributed.get_world_size() when initialized."""
+        import torch
+
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 16)
+        setup_distributed({"strategy": "fsdp2"})
+        assert patched_mesh["world_size"] == 16
