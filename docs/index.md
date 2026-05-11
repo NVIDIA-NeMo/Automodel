@@ -281,7 +281,7 @@ Diffusion Dataset <guides/diffusion/dataset.md>
 Overview <launcher/overview.md>
 Local Workstation <launcher/local-workstation.md>
 SLURM Cluster <launcher/slurm.md>
-NeMo-Run <launcher/nemo-run.md>
+NeMo Run <launcher/nemo-run.md>
 SkyPilot <launcher/skypilot.md>
 SkyPilot k8s <launcher/skypilot-kubernetes.md>
 ::::
