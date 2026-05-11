@@ -38,7 +38,6 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 | `cls` | First token hidden state |
 | `last` | Last non-padding token hidden state |
 | `weighted_avg` | Weighted average of token hidden states |
-| `colbert` | No pooling — token-level embeddings (ColBERT-style) |
 
 ## Example HF Models
 
