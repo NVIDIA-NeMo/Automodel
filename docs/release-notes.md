@@ -70,7 +70,7 @@
 - QLoRA / LoRA loading robustness; tied-weight handling moved out of
   `_init_model`.
 
-### Notable Fixes
+### Fixes
 
 - FSDP2 meta-device crash for Qwen3.5 GatedDeltaNet fp32 params.
 - Activation checkpointing silently skipped on registered VLMs (ModuleList
@@ -138,7 +138,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 - Dion optimizer.
 - Functiongemma + xlam tool-calling recipes.
 
-### Notable Fixes
+### Fixes
 
 - `inputs_embeds` passthrough for Nano v3.
 - `from_pretrained` / `from_config` simplification with model-id pass-through.
