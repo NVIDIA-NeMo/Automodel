@@ -27,7 +27,7 @@ from tqdm import tqdm
 from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
-from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
+from nemo_automodel.components.distributed import build_distributed
 
 logger = logging.getLogger(__name__)
 
@@ -72,20 +72,6 @@ MINING_DEFAULTS = {
     # Attention implementation for model loading
     "attn_implementation": None,  # None = use model default; "sdpa", "flash_attention_2", "eager"
 }
-
-
-def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
-    """Build and initialize distributed resources.
-
-    Args:
-        cfg_dist: Configuration for distributed environment.
-
-    Returns:
-        Distributed environment information from initialize_distributed.
-    """
-    backend = cfg_dist.get("backend", "nccl")
-    timeout = cfg_dist.get("timeout_minutes", 1)
-    return initialize_distributed(backend=backend, timeout_minutes=timeout)
 
 
 def _load_npz_array(path: Path) -> np.ndarray:
