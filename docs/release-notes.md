@@ -42,8 +42,7 @@
 - TP-aware KD loss with distributed softmax and T² scaling.
 - FlashOptim optimizer integration.
 - Sequence-packing updates: Qwen3.5-MoE VLM neat-packing recipe with EP+PP;
-   generic THD collation for chat datasets; CP/BSHD padding fixes.
-  BSHD+CP, and padding fixes.
+  Generic THD collation for chat datasets; CP/BSHD padding fixes.
 
 ### PEFT
 
