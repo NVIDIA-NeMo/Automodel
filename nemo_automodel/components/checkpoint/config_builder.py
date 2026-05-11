@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from huggingface_hub import constants as hf_constants
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_checkpoint_config(
-    cfg_ckpt: Any,
+    checkpoint_kwargs: Mapping[str, Any] | None,
     cache_dir: str | None,
     model_repo_id: str | None,
     is_peft: bool,
@@ -34,7 +35,7 @@ def build_checkpoint_config(
     """Build a checkpoint configuration.
 
     Args:
-        cfg_ckpt: Configuration for checkpointing.
+        checkpoint_kwargs: Optional keyword overrides for checkpointing.
         cache_dir: Cache directory for the model.
         model_repo_id: Model repository ID.
         is_peft: Whether the model is PEFT.
@@ -54,8 +55,8 @@ def build_checkpoint_config(
         is_peft=is_peft,
     )
     user_cfg = {}
-    if cfg_ckpt is not None:
-        user_cfg = cfg_ckpt.to_dict()
+    if checkpoint_kwargs is not None:
+        user_cfg = dict(checkpoint_kwargs)
         user_cfg.pop("restore_from", None)
     if is_peft and user_cfg.get("model_save_format") == "torch_save":
         logger.warning(

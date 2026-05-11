@@ -50,7 +50,6 @@ from nemo_automodel._transformers.infrastructure import (
 )
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint import build_checkpoint_config
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
@@ -65,15 +64,11 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
-from nemo_automodel.components.loggers.wandb_utils import build_wandb, suppress_wandb_log_messages
-from nemo_automodel.components.loss import build_loss_fn
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim import build_lr_scheduler, build_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training import build_step_scheduler
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
@@ -92,6 +87,15 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_seq_lens,
     filter_forward_kwargs,
     resolve_trust_remote_code,
+)
+from nemo_automodel.recipes._component_builders import (
+    build_checkpoint_config,
+    build_loss_fn,
+    build_lr_scheduler,
+    build_mlflow,
+    build_optimizer,
+    build_step_scheduler,
+    build_wandb,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe

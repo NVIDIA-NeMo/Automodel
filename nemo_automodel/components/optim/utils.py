@@ -31,10 +31,9 @@ except Exception as e:  # pragma: no cover - handled at runtime
 logger = logging.getLogger(__name__)
 
 
-def is_dion_optimizer(cfg_opt: Any) -> bool:
-    target = getattr(cfg_opt, "_target_", None)
-    name = getattr(target, "__name__", "")
-    module = getattr(target, "__module__", "")
+def is_dion_optimizer(optimizer_factory: Any) -> bool:
+    name = getattr(optimizer_factory, "__name__", "")
+    module = getattr(optimizer_factory, "__module__", "")
     return module.startswith("dion") or name in {"Dion", "Dion2", "Muon", "NorMuon"}
 
 
@@ -149,7 +148,8 @@ def _get_dion_mesh(distributed_mesh: Any) -> Any:
 
 
 def build_dion_optimizer(
-    cfg_opt: Any,
+    optimizer_factory: Any,
+    optimizer_kwargs: dict[str, Any],
     model: nn.Module,
     distributed_mesh: Optional[Any] = None,
 ) -> Any:
@@ -157,7 +157,8 @@ def build_dion_optimizer(
     Build a Dion-family optimizer with parameter grouping.
 
     Args:
-        cfg_opt: ConfigNode for the optimizer.
+        optimizer_factory: Dion-family optimizer class or factory.
+        optimizer_kwargs: Keyword arguments for the optimizer factory.
         model: Model whose parameters are to be optimized.
         distributed_mesh: Optional DeviceMesh for FSDP/TP.
         process_group: Optional ProcessGroup for DDP.
@@ -165,9 +166,8 @@ def build_dion_optimizer(
     if _import_error:
         raise RuntimeError("Failed to import Dion. Please install Dion.") from _import_error
 
-    target = cfg_opt._target_
-
-    cfg_dict = cfg_opt.to_dict()
+    target = optimizer_factory
+    cfg_dict = dict(optimizer_kwargs)
 
     no_compile = cfg_dict.pop("no_compile", False)
     if no_compile:

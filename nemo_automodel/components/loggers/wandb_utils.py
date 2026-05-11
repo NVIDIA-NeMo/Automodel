@@ -12,39 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import wandb
 from wandb import Settings
 
 
-def _get_model_name(cfg_model: Any) -> str | None:
-    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
-        return cfg_model.pretrained_model_name_or_path
-    elif cfg_model.get("config", None) is not None:
-        if isinstance(cfg_model.config, str):
-            return cfg_model.config
-        return cfg_model.config.get("pretrained_model_name_or_path", None)
-    else:
-        return None
-
-
-def build_wandb(cfg: Any) -> wandb.Run:
+def build_wandb(
+    wandb_kwargs: Mapping[str, Any],
+    run_config: Mapping[str, Any] | None = None,
+    model_name: str | None = None,
+) -> wandb.Run:
     """Instantiate wandb and return the run.
 
     Args:
-        cfg: Configuration containing a wandb section.
+        wandb_kwargs: Keyword arguments passed to wandb.init.
+        run_config: Optional run configuration logged to wandb.
+        model_name: Optional model name used to derive the run name.
 
     Returns:
         Initialized wandb run.
     """
-    assert cfg.get("wandb", None) is not None
-    kwargs = cfg.wandb.to_dict()
-    if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
+    kwargs = dict(wandb_kwargs)
+    if kwargs.get("name", "") == "" and model_name:
+        kwargs["name"] = "_".join(model_name.split("/")[-2:])
     run = wandb.init(
         **kwargs,
-        config=cfg.to_dict(),
+        config=dict(run_config) if run_config is not None else None,
         settings=Settings(silent=True),
     )
     return run
