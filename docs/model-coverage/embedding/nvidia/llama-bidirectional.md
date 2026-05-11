@@ -110,3 +110,4 @@ See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/fi
 NVIDIA trained and released the `Llama Nemotron Embedding 1B` model, which leverages a bidirectional attention mechanism for multilingual and cross-lingual question–answer retrieval. The model supports long documents (up to 8,192 tokens) and dynamic embedding sizes via Matryoshka embeddings. For more details, see the model card on Hugging Face.
 
 - [nvidia/llama-nemotron-embed-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2)
+- [nvidia/llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b)
