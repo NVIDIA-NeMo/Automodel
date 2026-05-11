@@ -14,16 +14,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 
-def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+def build_step_scheduler(
+    scheduler_kwargs: Mapping[str, Any] | None,
+    dataloader: Any,
+    dp_group_size: int,
+    local_batch_size: int,
+) -> StepScheduler:
     """Build the step scheduler.
 
     Args:
-        cfg: Configuration for the StepScheduler class.
+        scheduler_kwargs: Optional keyword overrides for StepScheduler.
         dataloader: The training dataloader, used for extracting the epoch_len in batches.
         dp_group_size: The size of the data parallel group.
         local_batch_size: The size of the local batch.
@@ -31,7 +37,6 @@ def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_ba
     Returns:
         Configured StepScheduler.
     """
-    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
     default_kwargs = dict(
         num_epochs=10,
         global_batch_size=32,
@@ -40,6 +45,6 @@ def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_ba
         ckpt_every_steps=100,
         dataloader=dataloader,
     )
-    if cfg is not None:
-        default_kwargs |= cfg.to_dict()
+    if scheduler_kwargs is not None:
+        default_kwargs |= dict(scheduler_kwargs)
     return StepScheduler(**default_kwargs)

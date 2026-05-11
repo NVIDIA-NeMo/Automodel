@@ -30,10 +30,11 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.wandb_utils import build_wandb, suppress_wandb_log_messages
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.recipes._component_builders import build_wandb
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 

@@ -14,16 +14,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from typing import Any
 
 
-def build_loss_fn(cfg_loss: Any) -> Any:
+def build_loss_fn(loss_factory: Callable[..., Any], loss_kwargs: Mapping[str, Any] | None = None) -> Any:
     """Build a loss function.
 
     Args:
-        cfg_loss: Loss function configuration.
+        loss_factory: Callable or class that creates the loss function.
+        loss_kwargs: Optional keyword arguments passed to the loss factory.
 
     Returns:
         Instantiated loss function.
     """
-    return cfg_loss.instantiate()
+    return loss_factory(**dict(loss_kwargs or {}))

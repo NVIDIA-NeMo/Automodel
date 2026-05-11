@@ -23,17 +23,6 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 
 
-class DummyCfgOpt:
-    """Minimal config shim compatible with build_dion_optimizer()."""
-
-    def __init__(self, target, d: dict):
-        self._target_ = target
-        self._d = dict(d)
-
-    def to_dict(self):
-        return dict(self._d)
-
-
 class TinyModel(nn.Module):
     def __init__(self, with_lm_head=True, with_bias=False):
         super().__init__()
@@ -78,41 +67,26 @@ class TestIsDionOptimizer:
     def test_returns_true_for_dion_module(self):
         from nemo_automodel.components.optim.utils import is_dion_optimizer
 
-        class _Cfg:
-            class _target_:
-                __name__ = "SomeOpt"
-                __module__ = "dion.optimizers"
-
-        assert is_dion_optimizer(_Cfg()) is True
+        optimizer_factory = type("SomeOpt", (), {"__module__": "dion.optimizers"})
+        assert is_dion_optimizer(optimizer_factory) is True
 
     def test_returns_true_for_known_names(self):
         from nemo_automodel.components.optim.utils import is_dion_optimizer
 
         for name in ("Dion", "Dion2", "Muon", "NorMuon"):
-
-            class _Cfg:
-                pass
-
-            _Cfg._target_ = type(name, (), {"__name__": name, "__module__": "some.module"})
-            assert is_dion_optimizer(_Cfg()) is True, f"Expected True for {name}"
+            optimizer_factory = type(name, (), {"__module__": "some.module"})
+            assert is_dion_optimizer(optimizer_factory) is True, f"Expected True for {name}"
 
     def test_returns_false_for_non_dion(self):
         from nemo_automodel.components.optim.utils import is_dion_optimizer
 
-        class _Cfg:
-            class _target_:
-                __name__ = "Adam"
-                __module__ = "torch.optim"
-
-        assert is_dion_optimizer(_Cfg()) is False
+        optimizer_factory = type("Adam", (), {"__module__": "torch.optim"})
+        assert is_dion_optimizer(optimizer_factory) is False
 
     def test_returns_false_when_no_target(self):
         from nemo_automodel.components.optim.utils import is_dion_optimizer
 
-        class _Cfg:
-            pass
-
-        assert is_dion_optimizer(_Cfg()) is False
+        assert is_dion_optimizer(object()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +246,12 @@ class TestBuildDionOptimizer:
         monkeypatch.setattr(optim_utils, "_import_error", None, raising=False)
         if model is None:
             model = TinyModel()
-        cfg = DummyCfgOpt(target_cls, cfg_dict)
-        return optim_utils.build_dion_optimizer(cfg_opt=cfg, model=model, distributed_mesh=mesh)
+        return optim_utils.build_dion_optimizer(
+            optimizer_factory=target_cls,
+            optimizer_kwargs=cfg_dict,
+            model=model,
+            distributed_mesh=mesh,
+        )
 
     def test_passes_distributed_mesh(self, monkeypatch):
         captured = {}
@@ -315,9 +293,12 @@ class TestBuildDionOptimizer:
             def __init__(self, param_groups):
                 pass
 
-        cfg = DummyCfgOpt(Target, {"lr": 1e-3})
         with pytest.raises(RuntimeError, match="Failed to import Dion"):
-            optim_utils.build_dion_optimizer(cfg_opt=cfg, model=TinyModel())
+            optim_utils.build_dion_optimizer(
+                optimizer_factory=Target,
+                optimizer_kwargs={"lr": 1e-3},
+                model=TinyModel(),
+            )
 
     def test_adjust_lr_forwarded(self, monkeypatch):
         captured = {}
@@ -534,17 +515,21 @@ class TestBuildOptimizerDionBranch:
         sentinel_mesh.mesh_dim_names = ("dp",)
         build_calls = []
 
-        class FakeCfgOpt:
-            foreach = True
+        def fake_optimizer_factory(**kwargs):
+            raise AssertionError("Dion branch should not call regular optimizer factory")
 
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda cfg: True)
+        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: True)
         monkeypatch.setattr(
             optim_build_mod,
             "build_dion_optimizer",
-            lambda cfg_opt, model, distributed_mesh: (build_calls.append((model, distributed_mesh)) or "fake_dion_opt"),
+            lambda optimizer_factory, optimizer_kwargs, model, distributed_mesh: (
+                build_calls.append((model, distributed_mesh)) or "fake_dion_opt"
+            ),
         )
 
-        optimizers = optim_build_mod.build_optimizer(model, FakeCfgOpt(), None, sentinel_mesh)
+        optimizers = optim_build_mod.build_optimizer(
+            model, fake_optimizer_factory, {"foreach": True}, None, sentinel_mesh
+        )
 
         assert optimizers == ["fake_dion_opt"]
         assert len(build_calls) == 1
@@ -558,17 +543,19 @@ class TestBuildOptimizerDionBranch:
         model = self._make_parts_model()
         build_calls = []
 
-        class FakeCfgOpt:
-            foreach = True
+        def fake_optimizer_factory(**kwargs):
+            raise AssertionError("Dion branch should not call regular optimizer factory")
 
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda cfg: True)
+        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: True)
         monkeypatch.setattr(
             optim_build_mod,
             "build_dion_optimizer",
-            lambda cfg_opt, model, distributed_mesh: (build_calls.append(model) or f"opt_for_{id(model)}"),
+            lambda optimizer_factory, optimizer_kwargs, model, distributed_mesh: (
+                build_calls.append(model) or f"opt_for_{id(model)}"
+            ),
         )
 
-        optimizers = optim_build_mod.build_optimizer(model, FakeCfgOpt(), None, None)
+        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, {"foreach": True}, None, None)
 
         assert len(build_calls) == 2
         assert build_calls[0] is model.parts[0]
@@ -582,16 +569,13 @@ class TestBuildOptimizerDionBranch:
         model = self._make_simple_model()
         instantiate_calls = []
 
-        class FakeCfgOpt:
-            foreach = True
+        def fake_optimizer_factory(params=None, **kwargs):
+            instantiate_calls.append(params)
+            return "regular_opt"
 
-            def instantiate(self, params=None):
-                instantiate_calls.append(params)
-                return "regular_opt"
+        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda cfg: False)
-
-        optimizers = optim_build_mod.build_optimizer(model, FakeCfgOpt(), None, None)
+        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, {"foreach": True}, None, None)
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
@@ -604,16 +588,13 @@ class TestBuildOptimizerDionBranch:
         model = self._make_parts_model()
         instantiate_calls = []
 
-        class FakeCfgOpt:
-            foreach = True
+        def fake_optimizer_factory(params=None, **kwargs):
+            instantiate_calls.append(params)
+            return f"opt_{len(instantiate_calls)}"
 
-            def instantiate(self, params=None):
-                instantiate_calls.append(params)
-                return f"opt_{len(instantiate_calls)}"
+        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda cfg: False)
-
-        optimizers = optim_build_mod.build_optimizer(model, FakeCfgOpt(), None, None)
+        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, {"foreach": True}, None, None)
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2

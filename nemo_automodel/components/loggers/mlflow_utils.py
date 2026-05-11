@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import torch
@@ -192,16 +193,22 @@ class MLflowLogger:
         logger.info("MLflow run ended successfully")
 
 
-def build_mlflow(cfg: Any) -> "MLflowLogger":
+def build_mlflow(
+    mlflow_kwargs: Mapping[str, Any],
+    model_name: str | None = None,
+    step_scheduler_kwargs: Mapping[str, Any] | None = None,
+) -> "MLflowLogger":
     """Build MLflow logger from configuration.
 
     Args:
-        cfg: Configuration object containing MLflow settings
+        mlflow_kwargs: Keyword arguments for MLflow logger setup.
+        model_name: Optional model name to include as a tag.
+        step_scheduler_kwargs: Optional scheduler metadata to include as tags.
 
     Returns:
         MLflowLogger instance
     """
-    mlflow_config = cfg.get("mlflow", {})
+    mlflow_config = dict(mlflow_kwargs)
     if not mlflow_config:
         raise ValueError("MLflow configuration not found in config")
 
@@ -209,15 +216,15 @@ def build_mlflow(cfg: Any) -> "MLflowLogger":
     experiment_name = mlflow_config.get("experiment_name", "automodel-experiment")
     run_name = mlflow_config.get("run_name", "")
     tracking_uri = mlflow_config.get("tracking_uri", None)
-    tags = mlflow_config.get("tags", {}).to_dict()
+    tags = dict(mlflow_config.get("tags", {}) or {})
     artifact_location = mlflow_config.get("artifact_location", None)
 
-    if hasattr(cfg, "model") and hasattr(cfg.model, "pretrained_model_name_or_path"):
-        tags["model"] = cfg.model.pretrained_model_name_or_path
+    if model_name is not None:
+        tags["model"] = model_name
 
-    if hasattr(cfg, "step_scheduler"):
-        tags["global_batch_size"] = str(cfg.step_scheduler.get("global_batch_size", "unknown"))
-        tags["local_batch_size"] = str(cfg.step_scheduler.get("local_batch_size", "unknown"))
+    if step_scheduler_kwargs is not None:
+        tags["global_batch_size"] = str(step_scheduler_kwargs.get("global_batch_size", "unknown"))
+        tags["local_batch_size"] = str(step_scheduler_kwargs.get("local_batch_size", "unknown"))
 
     return MLflowLogger(
         experiment_name=experiment_name,
