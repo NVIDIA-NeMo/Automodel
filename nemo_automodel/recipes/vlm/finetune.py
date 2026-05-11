@@ -326,13 +326,20 @@ def _chunk_vlm_media(
             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
             pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
     else:
-        pixel_values_chunks.append(pixel_values)
-        image_grid_chunks.append(image_grid)
-        for _ in range(n_microbatches - 1):
-            pixel_values_chunks.append(pixel_values[:0])
-            image_grid_chunks.append(image_grid[:0])
-        logging.warning(
-            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+        # No layout matched. Previously this branch logged a warning and gave all
+        # images to mb0 with empty tensors for mb1..N, but trailing microbatches
+        # whose text still contains media tokens would then scatter into empty
+        # pixel_values — silent corruption. Fail loudly so the calling collate is
+        # forced to provide n_images_per_sample (or align n_images with batch_size)
+        # instead of training on broken data.
+        raise ValueError(
+            "VLM PP chunking cannot align pixel_values with the batch: "
+            f"pixel_values.shape={tuple(pixel_values.shape)}, "
+            f"image_grid.shape={tuple(image_grid.shape)}, "
+            f"n_images={n_images}, batch_size={batch_size}, "
+            f"n_images_per_sample={'set' if n_images_per_sample is not None else 'None'}. "
+            "Either ensure pixel_values has shape [batch_size, ...] (one media tensor per "
+            "sample) or pass n_images_per_sample so the chunker can map images to samples."
         )
 
     return pixel_values_chunks, image_grid_chunks

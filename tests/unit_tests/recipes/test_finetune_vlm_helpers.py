@@ -1518,10 +1518,9 @@ class TestForwardBackwardStepPP:
         # Verify loss was computed
         assert len(loss_buffer) == 1
 
-    def test_pp_vlm_chunking_mismatched_images_and_batch(self, pp_recipe, monkeypatch, caplog):
-        """Test VLM chunking when n_images != batch_size (fallback path)."""
-        import logging
-
+    def test_pp_vlm_chunking_mismatched_images_raises(self, pp_recipe, monkeypatch):
+        """When n_images != batch_size with no n_images_per_sample, _forward_backward_step
+        now bubbles up a ValueError from the chunker instead of silently emptying mb1..N."""
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
@@ -1530,7 +1529,6 @@ class TestForwardBackwardStepPP:
         )
 
         batch_size = 4
-        n_images = 2  # Different from batch_size
         image_grid_hws = torch.tensor([[2, 2], [3, 3]])
         total_patches = 4 + 9
         pixel_values = torch.randn(total_patches, 3, 14, 14)
@@ -1543,7 +1541,7 @@ class TestForwardBackwardStepPP:
         }
         loss_buffer = []
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
             pp_recipe._forward_backward_step(
                 idx=0,
                 batch=batch,
@@ -1552,9 +1550,6 @@ class TestForwardBackwardStepPP:
                 num_batches=1,
                 is_train=True,
             )
-
-        # Should log warning about mismatched images
-        assert any("giving all images to first microbatch" in record.message for record in caplog.records)
 
     def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
@@ -2419,19 +2414,19 @@ class TestChunkVlmMedia:
         assert pv_chunks[0].shape[0] == 4 + 9  # first 2 images
         assert pv_chunks[1].shape[0] == 4 + 9  # last 2 images
 
-    def test_fallback_mismatched_images(self):
-        """When n_images != batch_size and no n_images_per_sample, all go to first mb."""
+    def test_fallback_mismatched_images_raises(self):
+        """n_images != batch_size with no n_images_per_sample now raises rather
+        than silently emptying mb1..N (which previously caused trailing microbatches
+        to scatter media tokens into empty pixel_values)."""
         from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
 
         image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2]])
         pixel_values = torch.randn(12, 64)  # 3 images but batch_size=2
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
-        )
-        assert len(pv_chunks) == 2
-        assert pv_chunks[0].shape[0] == 12  # all in first
-        assert pv_chunks[1].shape[0] == 0   # empty
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
+            _chunk_vlm_media(
+                pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            )
 
 
 # -----------------------------------------------------------------------------
