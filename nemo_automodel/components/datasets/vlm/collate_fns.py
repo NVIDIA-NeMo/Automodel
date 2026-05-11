@@ -871,6 +871,10 @@ def kimi_k25_vl_collate_fn(
     all_expanded = []
     all_pixel_values = []
     all_grid_thws = []
+    # Per-sample image counts, kept in lockstep with all_expanded so that
+    # n_images_per_sample length matches batch_size downstream. Samples that
+    # are text-only or whose image region was orphaned by truncation get 0.
+    per_sample_image_count: List[int] = []
 
     for i, conversation in enumerate(conversations):
         # Collect medias for this conversation
@@ -923,12 +927,14 @@ def kimi_k25_vl_collate_fn(
 
         # Only include image data if all expanded image tokens survived truncation.
         # Partial truncation into image regions would cause a mismatch in the model forward.
+        sample_image_count = 0
         if grid_thws is not None:
             merge_h, merge_w = _DEFAULT_MERGE_KERNEL
             expected_image_tokens = sum(int((h // merge_h) * (w // merge_w)) for _, h, w in grid_thws.tolist())
             actual_image_tokens = (input_ids == media_token_id).sum().item()
             if actual_image_tokens == expected_image_tokens:
                 all_grid_thws.append(grid_thws)
+                sample_image_count = int(grid_thws.shape[0])
                 if "pixel_values" in sample_batch:
                     all_pixel_values.append(sample_batch["pixel_values"])
             else:
@@ -943,6 +949,7 @@ def kimi_k25_vl_collate_fn(
                 "attention_mask": attention_mask,
             }
         )
+        per_sample_image_count.append(sample_image_count)
 
     if not all_expanded:
         raise ValueError(
@@ -990,9 +997,10 @@ def kimi_k25_vl_collate_fn(
         result["grid_thws"] = torch.cat(all_grid_thws, dim=0)
         # Also add as image_grid_hws for PP chunking in finetune.py
         result["image_grid_hws"] = result["grid_thws"][:, 1:]  # [N, 3] -> [N, 2] (drop temporal dim, keep H,W)
-        # Per-sample image counts for PP chunking
-        image_counts = [g.shape[0] for g in all_grid_thws]
-        result["n_images_per_sample"] = torch.tensor(image_counts, dtype=torch.long)
+        # Per-sample image counts for PP chunking. Length must equal batch_size,
+        # so include zeros for text-only samples and for samples whose image
+        # region was orphaned by truncation.
+        result["n_images_per_sample"] = torch.tensor(per_sample_image_count, dtype=torch.long)
 
     # Build labels
     labels = build_labels_from_template(

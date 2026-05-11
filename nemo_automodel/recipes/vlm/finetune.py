@@ -263,6 +263,7 @@ def build_dataloader(
     local_batch_size,
     cfg_model=None,
     cfg_ps=None,
+    get_rope_index=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -277,6 +278,11 @@ def build_dataloader(
         cfg_model: Model configuration (used to detect attention backend).
         cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
             When provided, takes precedence over ``dataset.packing``.
+        get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
+            VLM neat packing computes mRoPE 3D position IDs per sample so packed
+            mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
+            position semantics across pack boundaries instead of falling back to
+            plain 1D positions.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -394,6 +400,7 @@ def build_dataloader(
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
                     processor=processor,
                     balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
+                    get_rope_index=get_rope_index,
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
@@ -625,6 +632,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        # Extract mRoPE position-id builder from the model so VLM neat packing can
+        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
+        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -635,6 +647,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             cfg_model=self.cfg.model,
             cfg_ps=self.cfg.get("packed_sequence", None),
+            get_rope_index=get_rope_index,
         )
 
         # Build validation dataloader if the config provides it
@@ -648,6 +661,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                get_rope_index=get_rope_index,
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")

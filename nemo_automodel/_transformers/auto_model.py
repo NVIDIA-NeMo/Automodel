@@ -353,7 +353,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         _hf_native_quant_cfg = getattr(_hf_config, "quantization_config", None)
         if _maybe_dequantize_fp8_for_peft(_hf_native_quant_cfg, peft_config, pretrained_model_name_or_path_or_config):
-            kwargs["config"] = _hf_config
+            # Only HF's from_pretrained needs `config` in kwargs (it would otherwise
+            # re-read config from disk and lose the in-memory dequantize=True mutation).
+            # Custom models receive _hf_config positionally in model_init.py and would
+            # collide with kwargs["config"] (issue #2164).
+            if is_hf_model:
+                kwargs["config"] = _hf_config
 
         # Use meta device initialization when:
         # - Not using MegatronFSDPManager or DDPManager (they handle their own initialization)

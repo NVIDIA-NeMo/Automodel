@@ -17,23 +17,22 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
     CrossEncoderModel,
-    configure_encoder_metadata,
     _init_encoder_common,
+    configure_encoder_metadata,
     pool,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
-from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
