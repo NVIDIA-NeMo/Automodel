@@ -1518,10 +1518,9 @@ class TestForwardBackwardStepPP:
         # Verify loss was computed
         assert len(loss_buffer) == 1
 
-    def test_pp_vlm_chunking_mismatched_images_and_batch(self, pp_recipe, monkeypatch, caplog):
-        """Test VLM chunking when n_images != batch_size (fallback path)."""
-        import logging
-
+    def test_pp_vlm_chunking_mismatched_images_raises(self, pp_recipe, monkeypatch):
+        """When n_images != batch_size with no n_images_per_sample, _forward_backward_step
+        now bubbles up a ValueError from the chunker instead of silently emptying mb1..N."""
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
@@ -1530,7 +1529,6 @@ class TestForwardBackwardStepPP:
         )
 
         batch_size = 4
-        n_images = 2  # Different from batch_size
         image_grid_hws = torch.tensor([[2, 2], [3, 3]])
         total_patches = 4 + 9
         pixel_values = torch.randn(total_patches, 3, 14, 14)
@@ -1543,7 +1541,7 @@ class TestForwardBackwardStepPP:
         }
         loss_buffer = []
 
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
             pp_recipe._forward_backward_step(
                 idx=0,
                 batch=batch,
@@ -1552,9 +1550,6 @@ class TestForwardBackwardStepPP:
                 num_batches=1,
                 is_train=True,
             )
-
-        # Should log warning about mismatched images
-        assert any("giving all images to first microbatch" in record.message for record in caplog.records)
 
     def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
@@ -2419,16 +2414,146 @@ class TestChunkVlmMedia:
         assert pv_chunks[0].shape[0] == 4 + 9  # first 2 images
         assert pv_chunks[1].shape[0] == 4 + 9  # last 2 images
 
-    def test_fallback_mismatched_images(self):
-        """When n_images != batch_size and no n_images_per_sample, all go to first mb."""
+    def test_fallback_mismatched_images_raises(self):
+        """n_images != batch_size with no n_images_per_sample now raises rather
+        than silently emptying mb1..N (which previously caused trailing microbatches
+        to scatter media tokens into empty pixel_values)."""
         from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
 
         image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2]])
         pixel_values = torch.randn(12, 64)  # 3 images but batch_size=2
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+        with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
+            _chunk_vlm_media(
+                pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            )
+
+
+# -----------------------------------------------------------------------------
+# get_rope_index forwarding tests for build_dataloader
+#
+# Guard against a regression where the VLM recipe forgot to pass
+# get_rope_index to neat_pack_dataset_vlm, silently degrading mRoPE to
+# plain 1D positions for packed Qwen2.5-VL / Qwen3-VL training.
+# -----------------------------------------------------------------------------
+
+
+def _make_packing_cfg(pack_size=128):
+    cfg = MagicMock()
+    cfg.pack_size = pack_size
+    cfg.pretokenize = True
+    cfg.max_length = pack_size
+    cfg.get.side_effect = lambda key, default=None: {
+        "pack_size": pack_size,
+        "drop_long_samples": True,
+        "max_packs": None,
+        "packing_ratio": 1.0,
+        "balance_media_tokens": True,
+        "collate_max_length": None,
+        "post_tokenize_hook_fn": None,
+    }.get(key, default)
+    return cfg
+
+
+def _make_dataset_cfg():
+    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
+    cfg.get.side_effect = lambda key, default=None: {
+        "path_or_dataset": None,
+        "truncate": True,
+    }.get(key, default)
+    cfg.path_or_dataset = None
+    cfg.instantiate.return_value = []
+    return cfg
+
+
+def _patches_for_packing(neat_pack_side_effect):
+    processor = MagicMock()
+    processor.tokenizer.pad_token_id = 0
+    processor.chat_template = "{{ x }}"
+    return processor, [
+        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
+        patch("torch.utils.data.distributed.DistributedSampler"),
+        patch(
+            "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
+            side_effect=neat_pack_side_effect,
+        ),
+        patch("nemo_automodel.components.models.common.packing.configure_packing"),
+        patch(
+            "nemo_automodel.components.models.common.packing.get_attn_implementation",
+            return_value="sdpa",
+        ),
+    ]
+
+
+def test_build_dataloader_forwards_get_rope_index_to_packing():
+    """get_rope_index passed to build_dataloader must reach neat_pack_dataset_vlm."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    sentinel = MagicMock(name="get_rope_index")
+    captured = {}
+
+    def fake_neat_pack(*args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+            get_rope_index=sentinel,
         )
-        assert len(pv_chunks) == 2
-        assert pv_chunks[0].shape[0] == 12  # all in first
-        assert pv_chunks[1].shape[0] == 0   # empty
+
+    assert captured.get("get_rope_index") is sentinel, (
+        "build_dataloader must forward get_rope_index to neat_pack_dataset_vlm; "
+        f"got kwargs={list(captured.keys())}"
+    )
+
+
+def test_build_dataloader_default_get_rope_index_is_none():
+    """When the model does not expose get_rope_index, packing must receive None."""
+    from contextlib import ExitStack
+
+    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+
+    captured = {}
+
+    def fake_neat_pack(*args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+
+    with ExitStack() as stack:
+        for cm in ctx_managers:
+            stack.enter_context(cm)
+        build_dataloader(
+            _make_dataset_cfg(),
+            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            "test/model",
+            None,
+            None,
+            42,
+            1,
+            cfg_ps=_make_packing_cfg(pack_size=64),
+        )
+
+    assert "get_rope_index" in captured, (
+        "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
+    )
+    assert captured["get_rope_index"] is None

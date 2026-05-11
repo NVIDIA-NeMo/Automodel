@@ -549,3 +549,17 @@ def patch_hf_model(model, cp_enabled=False):
             patched,
             cp_enabled,
         )
+
+        # Attach a state_dict_adapter so saved checkpoints hide the
+        # ``_fp32_params`` wrapping and remain HF-loadable directly.
+        # Use dynamic import to avoid pulling ``components.checkpoint`` into
+        # this file's static import graph: ``cp_linear_attn`` is reached from
+        # ``components.distributed.parallelizer`` and the adapter inherits
+        # from ``components.checkpoint.state_dict_adapter``, which would
+        # otherwise create a forbidden ``distributed -> checkpoint`` chain
+        # under the import-linter ``independence`` contract.
+        if not hasattr(model, "state_dict_adapter"):
+            import importlib
+
+            adapter_module = importlib.import_module("nemo_automodel.components.models.qwen3_5.state_dict_adapter")
+            model.state_dict_adapter = adapter_module.Qwen3_5DenseStateDictAdapter()
