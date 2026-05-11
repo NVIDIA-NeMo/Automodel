@@ -15,6 +15,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
@@ -59,7 +60,7 @@ def slurm_time_multiplier(time: str, multiplier: int):
 # Scopes that auto-discover all configs via rglob (no recipe list needed).
 # All other scope/folder combinations read from {scope}_recipes.yml.
 AUTO_DISCOVER_SCOPES = {
-    "release": ["llm_finetune", "vlm_finetune"],
+    "release": ["llm_finetune", "vlm_finetune", "diffusion_finetune"],
     "performance": ["llm_benchmark", "vlm_benchmark"],
 }
 
@@ -241,9 +242,17 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
     if not yml_configs:
         raise Exception(f"No yml configurations were found under {automodel_dir}/examples/{test_folder}")
 
+    # Skip missing recipes so one bad reference doesn't abort the whole pipeline.
+    existing_configs = []
+    for config in yml_configs:
+        if (Path(automodel_dir) / config).is_file():
+            existing_configs.append(config)
+        else:
+            print(f"WARNING: recipe not found, skipping: {config}", file=sys.stderr)
+
     pipeline = {"include": ["automodel/automodel_ci_template.yml"]}
 
-    for config in yml_configs:
+    for config in existing_configs:
         model_name = config.parent.name
         config_name = config.stem
 

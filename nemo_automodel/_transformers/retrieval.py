@@ -22,12 +22,121 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
+
+
+def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
+    """Extract a nested submodel from a loaded model using a dotted attribute path."""
+    extracted_model = model
+    for attr in extract_submodel.split("."):
+        extracted_model = getattr(extracted_model, attr)
+    if not hasattr(extracted_model, "config"):
+        raise ValueError(
+            f"Extracted submodel at '{extract_submodel}' has no .config attribute. "
+            f"The submodel must be a PreTrainedModel for save/reload to work. "
+            f"Got {type(extracted_model).__name__}."
+        )
+    return extracted_model
+
+
+def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module] | None:
+    """Return the registered retrieval backbone class for a model type and task."""
+    task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+    if task_map is None:
+        return None
+
+    arch_name = task_map.get(task)
+    if arch_name is None:
+        raise ValueError(
+            f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
+        )
+
+    if arch_name not in ModelRegistry.model_arch_name_to_cls:
+        raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
+
+    logger.info(f"Using {arch_name} from registry")
+    return ModelRegistry.model_arch_name_to_cls[arch_name]
+
+
+def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn.Module:
+    """Move a newly-built model to the dtype used by the extracted model."""
+    for parameter in extracted_model.parameters():
+        return model.to(dtype=parameter.dtype)
+    for buffer in extracted_model.buffers():
+        return model.to(dtype=buffer.dtype)
+    return model
+
+
+def _load_from_extracted_state(
+    backbone_class: type[PreTrainedModel],
+    config,
+    extracted_model: PreTrainedModel,
+) -> PreTrainedModel:
+    """Load a target backbone from an extracted model's in-memory state dict."""
+    # Use the base HF loader because some retrieval classes override
+    # from_pretrained for path-based checkpoint loading.
+    backbone = PreTrainedModel.from_pretrained.__func__(
+        backbone_class,
+        None,
+        config=config,
+        state_dict=extracted_model.state_dict(),
+    )
+    return _move_to_extracted_dtype(backbone, extracted_model)
+
+
+def _build_backbone_from_extracted_submodel(
+    extracted_model: PreTrainedModel,
+    task: str,
+    pooling: Optional[str],
+    num_labels: Optional[int],
+    temperature: Optional[float],
+) -> PreTrainedModel:
+    """Build a task-specific retrieval backbone from an extracted text submodel."""
+    text_config = extracted_model.config
+    model_type = getattr(text_config, "model_type", "")
+    task_map = SUPPORTED_BACKBONES.get(model_type.lower())
+    has_supported_target = task_map is not None and task in task_map
+
+    if task_map is not None and not has_supported_target and task != "score":
+        raise ValueError(
+            f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
+        )
+
+    if task == "score" and not has_supported_target:
+        config = text_config.__class__.from_dict(text_config.to_dict())
+        try:
+            backbone_class = MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING[type(config)]
+        except KeyError as exc:
+            raise ValueError(f"No HuggingFace sequence-classification model found for '{model_type}'.") from exc
+    elif not has_supported_target:
+        return extracted_model
+    else:
+        backbone_class = _get_supported_backbone_class(model_type, task)
+        config_class = getattr(backbone_class, "config_class", None)
+        if config_class is None or not hasattr(text_config, "to_dict"):
+            return extracted_model
+
+        config_dict = text_config.to_dict()
+        config_dict.pop("model_type", None)
+        config = config_class(**config_dict)
+
+    attn_implementation = getattr(text_config, "_attn_implementation", None)
+    if attn_implementation is not None:
+        config._attn_implementation = attn_implementation
+    if has_supported_target and pooling is not None:
+        config.pooling = pooling
+    if num_labels is not None:
+        config.num_labels = num_labels
+    if has_supported_target and temperature is not None:
+        config.temperature = temperature
+
+    return _load_from_extracted_state(backbone_class, config, extracted_model)
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
@@ -100,15 +209,25 @@ def build_encoder_backbone(
     task: str,
     trust_remote_code: bool = False,
     pooling: Optional[str] = None,
+    extract_submodel: Optional[str] = None,
+    num_labels: Optional[int] = None,
+    temperature: Optional[float] = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
 
-    For model types listed in :data:`SUPPORTED_BACKBONES`, resolves the
-    custom bidirectional architecture class from :class:`ModelRegistry`.
-    For all other model types, falls back to
-    ``AutoModel.from_pretrained`` (or ``AutoModelForSequenceClassification``
-    for the ``"score"`` task).
+    When ``extract_submodel`` is set, loads the parent model with HuggingFace
+    Auto classes and extracts the dotted path. For supported extracted text
+    backbones, it then builds the registered retrieval class for the requested
+    task (bidirectional base model for ``"embedding"``, sequence-classification
+    wrapper for ``"score"``). For unsupported extracted text backbones, it
+    returns the extracted model for ``"embedding"`` and wraps it with
+    ``AutoModelForSequenceClassification`` for ``"score"``.
+
+    Without ``extract_submodel``, model types listed in
+    :data:`SUPPORTED_BACKBONES` resolve to custom bidirectional classes from
+    :class:`ModelRegistry`; all other model types fall back to HuggingFace Auto
+    classes.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -117,6 +236,10 @@ def build_encoder_backbone(
         pooling: Bi-encoder pooling strategy for registry backbones (e.g. Llama bidirectional)
             that accept it on ``from_pretrained``. Must not be forwarded to standard HF models
             (e.g. Qwen3) loaded via ``AutoModel``; those only receive ``**hf_kwargs``.
+        extract_submodel: Dotted attribute path to extract from the loaded model
+            (e.g. ``"language_model"`` to extract the text backbone from a VLM).
+        num_labels: Number of labels for reranking/classification backbones.
+        temperature: Optional retrieval score temperature for custom retrieval backbones.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -129,28 +252,34 @@ def build_encoder_backbone(
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
-    task_map = SUPPORTED_BACKBONES.get(model_type.lower())
-    if task_map is not None:
-        arch_name = task_map.get(task)
-        if arch_name is None:
-            raise ValueError(
-                f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
-            )
+    if extract_submodel is not None:
+        logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
+        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+        extracted_model = _extract_submodel(model, extract_submodel)
+        return _build_backbone_from_extracted_submodel(
+            extracted_model,
+            task=task,
+            pooling=pooling,
+            num_labels=num_labels,
+            temperature=temperature,
+        )
 
-        if arch_name not in ModelRegistry.model_arch_name_to_cls:
-            raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
-
-        BidirectionalModelClass = ModelRegistry.model_arch_name_to_cls[arch_name]
-        logger.info(f"Using {arch_name} from registry")
-
+    BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
+    if BidirectionalModelClass is not None:
         if pooling is not None:
             hf_kwargs["pooling"] = pooling
+        if num_labels is not None:
+            hf_kwargs["num_labels"] = num_labels
+        if temperature is not None:
+            hf_kwargs["temperature"] = temperature
         return BidirectionalModelClass.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
 
     # Fallback: use HuggingFace Auto classes for model types not in SUPPORTED_BACKBONES
     logger.info(f"Model type '{model_type}' not in SUPPORTED_BACKBONES; falling back to HuggingFace Auto classes")
+    if task == "score" and num_labels is not None:
+        hf_kwargs["num_labels"] = num_labels
     if task == "score":
         return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
@@ -196,9 +325,14 @@ _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
 }
+_MINISTRAL3_BIDIREC_TASKS = {
+    "embedding": "Ministral3BidirectionalModel",
+}
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
+    "ministral3": _MINISTRAL3_BIDIREC_TASKS,
+    "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
 }
 
 
@@ -219,11 +353,18 @@ class BiEncoderModel(nn.Module):
 
     _TASK = "embedding"
 
-    def __init__(self, model: PreTrainedModel, pooling: str = "avg", l2_normalize: bool = True):
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        pooling: str = "avg",
+        l2_normalize: bool = True,
+        do_distributed_inbatch_negative: bool = False,
+    ):
         super().__init__()
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
 
     @classmethod
     def build(
@@ -232,6 +373,7 @@ class BiEncoderModel(nn.Module):
         task: str = None,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        do_distributed_inbatch_negative: bool = False,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -246,7 +388,12 @@ class BiEncoderModel(nn.Module):
             model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
 
-        return cls(model=backbone, pooling=pooling, l2_normalize=l2_normalize)
+        return cls(
+            model=backbone,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
+            do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+        )
 
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)

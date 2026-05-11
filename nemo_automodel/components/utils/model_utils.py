@@ -78,6 +78,31 @@ def _supports_seq_lens(model: nn.Module) -> bool:
     return False
 
 
+# Umbrella of multimodal kwarg names used by VLM forwards across families.
+# Mirrors the discovery pattern of ``fake_image._VISION_TOKEN_ID_ATTRS``: every
+# consumer iterates this list and uses whichever keys the live batch contains,
+# so callers don't need a per-model branch. New VLM family -> append its keys.
+VLM_INPUT_KEYS: tuple[str, ...] = (
+    "input_ids",
+    # Image
+    "pixel_values",
+    "image_flags",
+    "imgs_sizes",
+    "image_position_ids",
+    "mm_token_type_ids",
+    "image_grid_hws",
+    "image_grid_thw",
+    "image_sizes",
+    # Video
+    "pixel_values_videos",
+    # Audio / sound
+    "sound_features",
+    "sound_attention_mask",
+    "audio_input_values",
+    "audio_attention_mask",
+)
+
+
 def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     """Drop kwargs that ``model.forward`` does not accept.
 
@@ -270,7 +295,7 @@ def apply_parameter_freezing(model, freeze_config):
 
     # Freeze audio tower
     if freeze_audio_tower:
-        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech"])
+        _freeze_module_by_attribute_and_patterns(model, "audio_tower", ["audio", "audio_encoder", "speech", "sound"])
 
     # Freeze language model backbone
     if freeze_language_model:
@@ -361,8 +386,13 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     3. Converts max_seqlen from tensor to scalar if needed
 
     Args:
-        input_ids (torch.Tensor): Input token IDs with shape [1, total_tokens] or
-            [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+        input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
+            or [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+            ``None`` is permitted when the caller is feeding the model via
+            ``inputs_embeds`` instead — embeddings are squeezed inside the model
+            forward (the ``squeezed_for_thd`` branch in ``NemotronHModel.forward``
+            and analogous code paths), so this helper has nothing to squeeze and
+            simply returns ``None`` for the ``input_ids`` slot.
         position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
             The first dimension will be squeezed.
         padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
@@ -410,7 +440,8 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         This function modifies attn_kwargs in-place. If you need to preserve the original
         dictionary, pass a copy.
     """
-    input_ids = input_ids.squeeze(0)
+    if input_ids is not None:
+        input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
     if isinstance(padding_mask, torch.Tensor):
         padding_mask = padding_mask.squeeze(0)

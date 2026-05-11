@@ -31,6 +31,7 @@ NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/doc
 | NVIDIA | [Nemotron-Parse](nvidia/nemotron-parse.md) | `NemotronParseForConditionalGeneration` |
 | Mistral AI | [Ministral3 VL](mistralai/ministral3-vl.md) | `Mistral3ForConditionalGeneration` |
 | Mistral AI | [Mistral-Small-4](mistralai/mistral-small-4.md) | `MistralForConditionalGeneration` |
+| Mistral AI | [Mistral Medium 3.5](mistralai/mistral-medium-3-5.md) | `Mistral3ForConditionalGeneration` (FP8) |
 | InternLM / Shanghai AI Lab | [InternVL](internlm/internvl.md) | `InternVLForConditionalGeneration` |
 | Meta | [Llama 4](meta/llama4.md) | `Llama4ForConditionalGeneration` |
 | HuggingFace | [SmolVLM](huggingface/smolvlm.md) | `SmolVLMForConditionalGeneration` |
@@ -57,6 +58,7 @@ qwen/qwen3-5-vl
 nvidia/nemotron-parse
 mistralai/ministral3-vl
 mistralai/mistral-small-4
+mistralai/mistral-medium-3-5
 internlm/internvl
 meta/llama4
 huggingface/smolvlm

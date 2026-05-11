@@ -75,7 +75,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -223,14 +223,20 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         save_consolidated=True,
         is_peft=is_peft,
     )
+    user_cfg = {}
     if cfg_ckpt is not None:
-        cfg_ckpt = cfg_ckpt.to_dict()
-        cfg_ckpt.pop("restore_from", None)
-        ckpt_kwargs |= cfg_ckpt
-    if ckpt_kwargs.get("is_peft", False) and ckpt_kwargs.get("model_save_format") == "torch_save":
-        raise ValueError(
-            "PEFT checkpointing is not supported for torch_save format. Save using `safetensors` format instead."
+        user_cfg = cfg_ckpt.to_dict()
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
         )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
 
@@ -320,13 +326,20 @@ def _chunk_vlm_media(
             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
             pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
     else:
-        pixel_values_chunks.append(pixel_values)
-        image_grid_chunks.append(image_grid)
-        for _ in range(n_microbatches - 1):
-            pixel_values_chunks.append(pixel_values[:0])
-            image_grid_chunks.append(image_grid[:0])
-        logging.warning(
-            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+        # No layout matched. Previously this branch logged a warning and gave all
+        # images to mb0 with empty tensors for mb1..N, but trailing microbatches
+        # whose text still contains media tokens would then scatter into empty
+        # pixel_values — silent corruption. Fail loudly so the calling collate is
+        # forced to provide n_images_per_sample (or align n_images with batch_size)
+        # instead of training on broken data.
+        raise ValueError(
+            "VLM PP chunking cannot align pixel_values with the batch: "
+            f"pixel_values.shape={tuple(pixel_values.shape)}, "
+            f"image_grid.shape={tuple(image_grid.shape)}, "
+            f"n_images={n_images}, batch_size={batch_size}, "
+            f"n_images_per_sample={'set' if n_images_per_sample is not None else 'None'}. "
+            "Either ensure pixel_values has shape [batch_size, ...] (one media tensor per "
+            "sample) or pass n_images_per_sample so the chunker can map images to samples."
         )
 
     return pixel_values_chunks, image_grid_chunks
@@ -342,6 +355,7 @@ def build_dataloader(
     local_batch_size,
     cfg_model=None,
     cfg_ps=None,
+    get_rope_index=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -356,6 +370,11 @@ def build_dataloader(
         cfg_model: Model configuration (used to detect attention backend).
         cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
             When provided, takes precedence over ``dataset.packing``.
+        get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
+            VLM neat packing computes mRoPE 3D position IDs per sample so packed
+            mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
+            position semantics across pack boundaries instead of falling back to
+            plain 1D positions.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -447,7 +466,16 @@ def build_dataloader(
 
             ds_raw = ds
             truncate = cfg_ds.get("truncate", max_length is not None)
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
+
+            post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
+
+            ds = PreTokenizedDatasetWrapper(
+                ds_raw,
+                processor,
+                max_length=max_length,
+                truncate=truncate,
+                post_tokenize_hook=post_tokenize_hook,
+            )
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -464,6 +492,7 @@ def build_dataloader(
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
                     processor=processor,
                     balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
+                    get_rope_index=get_rope_index,
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
@@ -817,6 +846,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        # Extract mRoPE position-id builder from the model so VLM neat packing can
+        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
+        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -827,6 +861,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             cfg_model=self.cfg.model,
             cfg_ps=self.cfg.get("packed_sequence", None),
+            get_rope_index=get_rope_index,
         )
 
         # Build validation dataloader if the config provides it
@@ -840,6 +875,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                get_rope_index=get_rope_index,
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
@@ -945,6 +981,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k, v in batch.items()
         }
 
+        # Routed through __call__ so FSDP2 forward pre-hook fires and
+        # unshards the vision tower's weights before the embed/scatter.
+        _model = self.model_parts[0]
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+            and not self.pp_enabled
+        )
+        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+            with torch.no_grad():
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            for k in VLM_INPUT_KEYS:
+                batch.pop(k, None)
+            batch.update(prepared)
+
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
@@ -1027,7 +1080,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            with sync_ctx, train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1212,19 +1265,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+
+                _model = self.model_parts[0]
+                _cp_active = (
+                    self.device_mesh is not None
+                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+                    and self.device_mesh["cp"].size() > 1
+                    and not self.pp_enabled
+                )
+                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                    with torch.no_grad():
+                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                    for k in VLM_INPUT_KEYS:
+                        batch.pop(k, None)
+                    batch.update(prepared)
+
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
-
-                if (
-                    self.device_mesh
-                    and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-                ):
-                    batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
-                    )
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):

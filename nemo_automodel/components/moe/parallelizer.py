@@ -118,9 +118,11 @@ def apply_ac(
     # Derive hidden_size and num_experts from model.config if not provided
     if hidden_size is None:
         cfg = getattr(model, "config", None)
-        # VLM models nest language model config under text_config
-        hidden_size = getattr(getattr(cfg, "text_config", None), "hidden_size", None) or getattr(
-            cfg, "hidden_size", None
+        # VLM models nest language model config under text_config or llm_config
+        hidden_size = (
+            getattr(getattr(cfg, "text_config", None), "hidden_size", None)
+            or getattr(getattr(cfg, "llm_config", None), "hidden_size", None)
+            or getattr(cfg, "hidden_size", None)
         )
         if hidden_size is None:
             raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
@@ -131,7 +133,7 @@ def apply_ac(
             num_experts = _inner.moe_config.n_routed_experts
         else:
             cfg = getattr(model, "config", None)
-            text_cfg = getattr(cfg, "text_config", cfg)
+            text_cfg = getattr(cfg, "text_config", None) or getattr(cfg, "llm_config", None) or cfg
             for attr in ["num_experts", "moe_num_experts", "n_routed_experts", "num_local_experts"]:
                 if text_cfg is not None and hasattr(text_cfg, attr):
                     num_experts = getattr(text_cfg, attr)
@@ -155,6 +157,7 @@ def apply_ac(
         _model = model.model
     else:
         _model = model
+    _model = get_text_module(_model)
     for layer_id, block in _model.layers.named_children():
         if ignore_router:
             block = ptd_checkpoint_wrapper(

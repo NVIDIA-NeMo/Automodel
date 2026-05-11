@@ -153,8 +153,8 @@ class DeepseekV4Block(nn.Module):
             rotary_compress=rotary_compress,
         )
         dtype = x.dtype
-        # Expand: new_stream[h] = post[h] * attn_out + Σ_k comb[h,k] * x[k]
-        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
+        x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
         # --- MLP site: same pattern ---
         pre, post, comb = self.ffn_hc.compute_weights(x)
@@ -165,7 +165,7 @@ class DeepseekV4Block(nn.Module):
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.to(dtype), x)
+        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
     def init_weights(self, buffer_device: torch.device) -> None:
         self.input_layernorm.reset_parameters()
@@ -340,15 +340,22 @@ class DeepseekV4Model(nn.Module):
         # HF partial_rotary_factor = qk_rope_head_dim / head_dim so cos/sin
         # come out sized to qk_rope_head_dim.
         partial_rotary_factor = float(config.qk_rope_head_dim) / float(config.head_dim)
+        # Reference (``dsv4flash/inference/model.py:519-525``) only applies YaRN
+        # to the compress-rope path: when compress_ratio>0 it uses
+        # ``original_seq_len=args.original_seq_len`` and theta=compress_rope_theta;
+        # otherwise ``original_seq_len=0`` (YaRN disabled) and theta=rope_theta.
+        rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = DeepseekV4RotaryEmbedding(
             rope_theta=float(config.rope_theta),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
+            rope_scaling=None,
         )
         self.rotary_emb_compress = DeepseekV4RotaryEmbedding(
             rope_theta=float(getattr(config, "compress_rope_theta", 160000.0) or 160000.0),
             head_dim=int(config.head_dim),
             partial_rotary_factor=partial_rotary_factor,
+            rope_scaling=rope_scaling,
         )
 
     def forward(

@@ -1195,23 +1195,30 @@ def validate_tp_mesh(model, tp_mesh):
     )
 
 
-def _find_largest_module_list(model: nn.Module) -> Optional[nn.ModuleList]:
+def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList, nn.ModuleDict]]:
     """
-    Heuristic function to find the largest nn.ModuleList in a model.
+    Heuristic function to find the largest layer container in a model.
 
-    This function recursively traverses the model to find all nn.ModuleList instances
-    and returns the one with the most modules. This is useful as a fallback when
-    the model architecture is unknown, since transformer layers are typically
-    organized in ModuleLists.
+    This function recursively traverses the model to find all nn.ModuleList and
+    pipeline-split nn.ModuleDict instances and returns the one with the most
+    modules. This is useful as a fallback when the model architecture is unknown,
+    since transformer layers are typically organized in ModuleLists. Pipeline
+    splitting converts ModuleLists to ModuleDicts keyed by original layer index.
 
     Args:
         model (nn.Module): The model to search through.
 
     Returns:
-        Optional[nn.ModuleList]: The largest ModuleList found, or None if no ModuleList exists.
+        Optional[Union[nn.ModuleList, nn.ModuleDict]]: The largest layer container found, or None.
     """
-    largest_module_list = None
+    largest_module_list: Optional[Union[nn.ModuleList, nn.ModuleDict]] = None
     largest_size = 0
+
+    def _is_pp_layer_module_dict(module: nn.ModuleDict) -> bool:
+        # functional.py converts split ModuleLists to ModuleDicts with stringified
+        # numeric indices. Avoid treating arbitrary named ModuleDicts (for example
+        # adapter registries) as transformer layer containers in the heuristic path.
+        return all(key.isdigit() for key in module.keys())
 
     def _recursive_search(module: nn.Module, path: str = ""):
         nonlocal largest_module_list, largest_size
@@ -1219,12 +1226,14 @@ def _find_largest_module_list(model: nn.Module) -> Optional[nn.ModuleList]:
         for name, child in module.named_children():
             current_path = f"{path}.{name}" if path else name
 
-            if isinstance(child, nn.ModuleList):
+            if isinstance(child, nn.ModuleList) or (
+                isinstance(child, nn.ModuleDict) and _is_pp_layer_module_dict(child)
+            ):
                 current_size = len(child)
                 if current_size > largest_size:
                     largest_size = current_size
                     largest_module_list = child
-                    logger.debug(f"Found ModuleList at {current_path} with {current_size} modules")
+                    logger.debug(f"Found {type(child).__name__} at {current_path} with {current_size} modules")
 
             # Continue recursive search
             _recursive_search(child, current_path)
@@ -1232,9 +1241,9 @@ def _find_largest_module_list(model: nn.Module) -> Optional[nn.ModuleList]:
     _recursive_search(model)
 
     if largest_module_list is not None:
-        logger.info(f"Largest ModuleList found with {largest_size} modules")
+        logger.info(f"Largest layer container found with {largest_size} modules")
     else:
-        logger.warning("No ModuleList found in the model")
+        logger.warning("No ModuleList or ModuleDict found in the model")
 
     return largest_module_list
 
@@ -1292,6 +1301,14 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
             "vision_tower.vision_model.encoder.layers",
         ],
         Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        # FP8 VLM subclass (own FP8 dequant on top of HF's Mistral3). String-keyed
+        # because NeMo Auto wraps the class via HFCheckpointingMixin into a new
+        # type with the same __name__ but distinct identity, so direct class
+        # comparison misses; the elif `model_cls.__name__ in MAP` check catches it.
+        "Mistral3FP8VLMForConditionalGeneration": [
+            "model.language_model.layers",
+            "model.vision_tower.transformer.layers",
+        ],
         Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
         # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
         # module load (which would defeat test monkeypatches that stub the
@@ -1312,6 +1329,8 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         for m in modules:
             if isinstance(m, nn.ModuleList):
                 layers.extend(m)
+            elif isinstance(m, nn.ModuleDict):
+                layers.extend(m.values())
             else:
                 layers.append(m)
 
@@ -1330,15 +1349,20 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     elif hasattr(model, "layers"):
         layers.extend(model.layers)
     else:
-        # Use heuristic to find the largest ModuleList in the model
+        # Use heuristic to find the largest layer container in the model.
         logger.warning(f"Unknown model type: {model_cls}. Using heuristic to find transformer layers.")
         largest_module_list = _find_largest_module_list(model)
         if largest_module_list is None:
-            # If no ModuleList found, still raise an exception
+            # If no layer container is found, still raise an exception.
             print(model)
-            raise ValueError(f"Unknown model type: {model_cls} and no ModuleList found in model structure")
+            raise ValueError(
+                f"Unknown model type: {model_cls} and no ModuleList or ModuleDict found in model structure"
+            )
 
-        layers.extend(largest_module_list)
+        if isinstance(largest_module_list, nn.ModuleDict):
+            layers.extend(largest_module_list.values())
+        else:
+            layers.extend(largest_module_list)
         logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
 
     assert all(isinstance(m, nn.Module) for m in layers), "layers shoudl be nn.Module instances"
