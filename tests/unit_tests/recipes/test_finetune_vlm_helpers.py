@@ -1209,7 +1209,7 @@ class TestBuildCheckpointConfig:
             "is_async": True,
         }
 
-        with caplog.at_level("WARNING", logger="nemo_automodel.recipes.vlm.finetune"):
+        with caplog.at_level("WARNING", logger="nemo_automodel.components.checkpoint.config_builder"):
             config = build_checkpoint_config(
                 cfg_ckpt=cfg_ckpt,
                 cache_dir=None,

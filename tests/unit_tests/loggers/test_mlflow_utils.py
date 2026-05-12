@@ -135,48 +135,17 @@ def test_build_mlflow_starts_run_and_sets_expected_tags(monkeypatch):
     # Import after stubbing mlflow
     from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 
-    # Minimal config stubs
-    class Tags:
-        def __init__(self, data):
-            self._d = data
-
-        def to_dict(self):
-            return dict(self._d)
-
-    class MlflowCfg:
-        def __init__(self):
-            self._data = {
-                "experiment_name": "automodel-exp",
-                "run_name": "run-A",
-                "tracking_uri": "file:///tmp/mlruns",
-                "artifact_location": "/tmp/mlruns",
-                "tags": Tags({"task": "finetune"}),
-            }
-
-        def get(self, key, default=None):
-            return self._data.get(key, default)
-
-    class StepSchedulerCfg:
-        def get(self, key, default=None):
-            return {"global_batch_size": 64, "local_batch_size": 8}.get(key, default)
-
-    class ModelCfg:
-        pretrained_model_name_or_path = "dummy/model"
-
-    class Cfg:
-        def __init__(self):
-            self.mlflow = MlflowCfg()
-            self.model = ModelCfg()
-            self.step_scheduler = StepSchedulerCfg()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-        def to_dict(self):
-            return {"foo": "bar"}
-
-    cfg = Cfg()
-    logger = build_mlflow(cfg)
+    logger = build_mlflow(
+        {
+            "experiment_name": "automodel-exp",
+            "run_name": "run-A",
+            "tracking_uri": "file:///tmp/mlruns",
+            "artifact_location": "/tmp/mlruns",
+            "tags": {"task": "finetune"},
+        },
+        model_name="dummy/model",
+        step_scheduler_kwargs={"global_batch_size": 64, "local_batch_size": 8},
+    )
     assert logger is not None
     # Ensure start_run was invoked with enriched tags
     assert calls["start_run"], "mlflow.start_run should have been called"
