@@ -115,3 +115,79 @@ def test_vlm_kd_teacher_forward_uses_scoped_offloading_when_enabled(monkeypatch)
     assert len(loss_buffer) == 1
     assert len(recipe._ce_loss_buffer) == 1
     assert len(recipe._kd_loss_buffer) == 1
+
+
+class _Cfg:
+    def __init__(self, **values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+@pytest.mark.parametrize(
+    "cfg_overrides, expected_offload, expected_device",
+    [
+        ({}, False, "cuda:0"),
+        ({"offload_teacher_model": False}, False, "cuda:0"),
+        ({"offload_teacher_model": True}, True, "cpu"),
+    ],
+)
+def test_setup_sets_offload_flag_and_teacher_device(
+    monkeypatch, cfg_overrides, expected_offload, expected_device
+):
+    captured = {}
+
+    def fake_build_teacher_model(**kwargs):
+        captured["build_teacher_kwargs"] = kwargs
+        return _Teacher()
+
+    def fake_build_kd_loss_fn(cfg_kd):
+        captured["kd_cfg"] = cfg_kd
+        return _KD()
+
+    def fake_super_setup(self):
+        captured["super_setup_called"] = True
+
+    monkeypatch.setattr(vlm_kd, "_verify_tokenizer_compatibility", lambda *a, **k: None)
+    monkeypatch.setattr(vlm_kd, "_build_teacher_model", fake_build_teacher_model)
+    monkeypatch.setattr(vlm_kd, "_build_kd_loss_fn", fake_build_kd_loss_fn)
+    monkeypatch.setattr(vlm_kd.FinetuneRecipeForVLM, "setup", fake_super_setup)
+
+    recipe = vlm_kd.KnowledgeDistillationRecipeForVLM.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
+    recipe.cfg = _Cfg(
+        model={"pretrained_model_name_or_path": "student"},
+        teacher_model={"pretrained_model_name_or_path": "teacher"},
+        seed=7,
+        **cfg_overrides,
+    )
+    recipe.dist_env = SimpleNamespace(device="cuda:0")
+    recipe.device_mesh = None
+    recipe.moe_mesh = None
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.pp_enabled = False
+
+    recipe.setup()
+
+    assert captured["super_setup_called"] is True
+    assert recipe._offload_teacher_model is expected_offload
+    assert captured["build_teacher_kwargs"]["device"] == expected_device
+    assert captured["build_teacher_kwargs"]["seed"] == 7
+    assert recipe.kd_ratio == 0.5
+    assert recipe._ce_loss_buffer == []
+    assert recipe._kd_loss_buffer == []
+
+
+def test_setup_raises_when_pipeline_parallelism_enabled(monkeypatch):
+    monkeypatch.setattr(vlm_kd, "_verify_tokenizer_compatibility", lambda *a, **k: None)
+    monkeypatch.setattr(vlm_kd.FinetuneRecipeForVLM, "setup", lambda self: None)
+
+    recipe = vlm_kd.KnowledgeDistillationRecipeForVLM.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
+    recipe.cfg = _Cfg(
+        model={"pretrained_model_name_or_path": "student"},
+        teacher_model={"pretrained_model_name_or_path": "teacher"},
+    )
+    recipe.pp_enabled = True
+
+    with pytest.raises(NotImplementedError):
+        recipe.setup()
