@@ -199,7 +199,7 @@ A migration guide for the new CLI, the `recipe` YAML section, the SLURM
 - Streaming dataset.
 - Multiple validation datasets with per-dataset logging.
 - ColumnMapped: surface truncating + padding options.
-- Configurable max-clip-grad; configurable remote-logging frequency using
+- Configurable max-clip-grad; configurable remote-logging frequency using 
   `step_scheduler`.
 - Validation-loss checkpoint, run-val-at-ckpt, best-ckpt symlink.
 - InternVL recipe; Qwen3-VL 30B recipe; Llama-Embed-Nemotron-8B training.
