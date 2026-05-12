@@ -360,11 +360,7 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
     # Training step override
     # ------------------------------------------------------------------
 
-    def _run_train_optim_step(
-        self,
-        batches: list,
-        max_grad_norm: Optional[float] = None,
-    ) -> MetricsSample:
+    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute one DFlash training step across all microbatches.
 
         Target forwards are pre-computed for all microbatches (no-grad),
@@ -390,6 +386,9 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
             num_predicted_tokens += int(block_mask.sum().item())
             num_tokens_in_batch += input_ids.numel()
 
+        num_predicted_tokens = self._dp_allreduce(
+            torch.tensor(num_predicted_tokens, dtype=torch.long)
+        ).item()
         num_tokens_in_batch = self._dp_allreduce(
             torch.tensor(num_tokens_in_batch, dtype=torch.long)
         ).item()
@@ -471,9 +470,11 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
                 "Train/mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "Train/tps": tps,
                 "Train/tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                "Train/mfu": None,
                 "Train/tokens_per_step": num_tokens_in_batch,
+                "Train/supervised_tokens": num_predicted_tokens,
                 "Train/block_size": self.dflash_block_size,
-                "Train/mode": "dflash",
+                "Train/mode": self.dllm_mode,
             },
         )
 
@@ -482,7 +483,7 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _run_validation_epoch(self, val_dataloader) -> MetricsSample:
+    def _run_validation_epoch(self, val_dataloader):
         """Run one DFlash validation pass."""
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
@@ -541,7 +542,7 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
     # Logging override
     # ------------------------------------------------------------------
 
-    def log_train_metrics(self, log_data) -> None:
+    def log_train_metrics(self, log_data):
         """Log DFlash-specific training metrics."""
         if not self.dist_env.is_main:
             return
@@ -559,16 +560,19 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
 
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step %d | epoch %d | loss %.4f | dflash_loss %.4f | "
-            "grad_norm %.4f | lr %.2e | mem %.2f GiB | tps %.2f",
-            log_data.step,
-            log_data.epoch,
-            log_data.metrics["Loss/Train_Total"],
-            log_data.metrics["Loss/Train_DFlash"],
-            log_data.metrics["Train/grad_norm"],
-            log_data.metrics["Train/lr"],
-            log_data.metrics["Train/mem"],
-            log_data.metrics["Train/tps"],
+            "step {} | epoch {} | loss {:.4f} | dflash_loss {:.4f} | grad_norm {:.4f} | "
+            "lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | mode {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["Loss/Train_Total"],
+                log_data.metrics["Loss/Train_DFlash"],
+                log_data.metrics["Train/grad_norm"],
+                log_data.metrics["Train/lr"],
+                log_data.metrics["Train/mem"],
+                log_data.metrics["Train/tps"],
+                log_data.metrics["Train/tps_per_gpu"],
+                log_data.metrics["Train/mode"],
+            )
         )
         torch.cuda.reset_peak_memory_stats()
 
@@ -578,14 +582,14 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
 # ---------------------------------------------------------------------------
 
 
-def main(config_path: str | None = None) -> None:
+def main(config_path=None):
     """Main entry point for DFlash SFT recipe."""
     if config_path is None:
         config_path = "examples/dllm_sft/dflash_sft.yaml"
     cfg = parse_args_and_load_config(config_path)
-    recipe = DFlashSFTRecipe(cfg)
-    recipe.setup()
-    recipe.run_train_validation_loop()
+    trainer = DFlashSFTRecipe(cfg)
+    trainer.setup()
+    trainer.run_train_validation_loop()
 
 
 if __name__ == "__main__":
