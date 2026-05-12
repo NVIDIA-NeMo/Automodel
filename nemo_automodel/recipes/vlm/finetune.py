@@ -282,7 +282,11 @@ def _chunk_vlm_media(
         # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
         # All images are padded to the same max_patches, so split by image count directly.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
+        # Ceil division so trailing samples are not dropped when batch_size is not
+        # divisible by n_microbatches.  Mirrors torch.tensor.chunk(n) semantics used
+        # by the PP schedule on input_ids/labels — keeps image chunks aligned with
+        # text chunks even on uneven splits.
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -297,7 +301,7 @@ def _chunk_vlm_media(
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
 
-        samples_per_mb = batch_size // n_microbatches
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -315,7 +319,7 @@ def _chunk_vlm_media(
         patch_counts = image_grid.prod(dim=1)
         cumsum = torch.cumsum(patch_counts, dim=0)
 
-        images_per_mb = batch_size // n_microbatches
+        images_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             img_start = mb_idx * images_per_mb
             img_end = min(img_start + images_per_mb, n_images)
@@ -1026,6 +1030,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 image_sizes = batch.pop("image_sizes", None)
                 image_position_ids = batch.pop("image_position_ids", None)
                 n_images_per_sample = batch.pop("n_images_per_sample", None)
+                pixel_values_videos = batch.pop("pixel_values_videos", None)
+                video_grid_thw = batch.pop("video_grid_thw", None)
+                n_videos_per_sample = batch.pop("n_videos_per_sample", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
                 if image_grid is None and image_sizes is not None:
@@ -1050,6 +1057,30 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
                     stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
                     stage0_model._vlm_chunk_idx = 0
+                elif pixel_values is not None:
+                    batch["pixel_values"] = pixel_values
+
+                if self.pp.info.has_first_stage and pixel_values_videos is not None and video_grid_thw is not None:
+                    stage0_model = self.model_parts[0]
+                    n_microbatches = self.pp._info.schedule._n_microbatches
+                    batch_size = input_ids.shape[0]
+
+                    pixel_values_videos_chunks, video_grid_thw_chunks = _chunk_vlm_media(
+                        pixel_values_videos,
+                        video_grid_thw,
+                        batch_size,
+                        n_microbatches,
+                        n_images_per_sample=n_videos_per_sample,
+                    )
+
+                    stage0_model._vlm_pixel_values_videos_chunks = pixel_values_videos_chunks
+                    stage0_model._vlm_video_grid_thw_chunks = video_grid_thw_chunks
+                    stage0_model._vlm_chunk_idx = 0
+                else:
+                    if pixel_values_videos is not None:
+                        batch["pixel_values_videos"] = pixel_values_videos
+                    if video_grid_thw is not None:
+                        batch["video_grid_thw"] = video_grid_thw
 
                 if self.pp.info.has_first_stage:
                     self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
@@ -1061,6 +1092,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model = self.model_parts[0]
                     stage0_model._vlm_pixel_values_chunks = None
                     stage0_model._vlm_image_grid_hws_chunks = None
+                    stage0_model._vlm_chunk_idx = None
+                if self.pp.info.has_first_stage and pixel_values_videos is not None and video_grid_thw is not None:
+                    stage0_model = self.model_parts[0]
+                    stage0_model._vlm_pixel_values_videos_chunks = None
+                    stage0_model._vlm_video_grid_thw_chunks = None
                     stage0_model._vlm_chunk_idx = None
 
             if self.pp.info.has_last_stage:
