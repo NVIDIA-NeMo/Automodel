@@ -1,6 +1,7 @@
 ---
 name: model-onboarding
 description: Guide for onboarding new model families into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
+when_to_use: Adding a new model architecture (LLM, VLM, MoE, diffusion, retrieval, etc.) to NeMo AutoModel, implementing combined projections, registering a model, or adding capability flags.
 ---
 
 # Adding Model Support to NeMo AutoModel

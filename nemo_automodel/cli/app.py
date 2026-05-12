@@ -121,7 +121,7 @@ def main():
             "  recipe:\n"
             "    _target_: nemo_automodel.recipes.llm.train_ft."
             "TrainFinetuneRecipeForNextTokenPrediction\n\n"
-            "See BREAKING_CHANGES.md for the full list of available recipe targets."
+            "See docs/BREAKING_CHANGES.md for the full list of available recipe targets."
         )
         sys.exit(1)
 

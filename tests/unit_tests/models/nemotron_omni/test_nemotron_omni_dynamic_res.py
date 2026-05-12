@@ -204,10 +204,7 @@ def test_forward_dynamic_res_branch_fills_image_slots():
          [img, img, img, txt, txt, txt]],
         dtype=torch.long,
     )
-    # Pre-compute embeddings so we can verify text positions are untouched.
-    inputs_embeds = torch.randn(2, 6, hidden)
     text_mask = (input_ids != img)
-    expected_text = inputs_embeds[text_mask].clone()
 
     # Two images, padded to 12x12. img 1 real size 8x8, img 2 real size 4x12.
     # After dynamic pixel-shuffle:
@@ -217,9 +214,16 @@ def test_forward_dynamic_res_branch_fills_image_slots():
     pixel_values = torch.zeros(2, 3, 12, 12)
     imgs_sizes = torch.tensor([[8, 8], [4, 12]], dtype=torch.long)
 
+    # Pre-compute the *expected* text embeddings (what embed_tokens will emit
+    # for the text positions before any scatter touches them).
+    pre_scatter = model.language_model.get_input_embeddings()(input_ids)
+    expected_text = pre_scatter[text_mask].clone()
+
+    # Don't pass inputs_embeds — forward should compute them internally then
+    # apply the dynamic-res scatter.  (Caller-supplied inputs_embeds is the CP
+    # path: post-prepare embeds, forward must NOT re-scatter.)
     model(
         input_ids=input_ids,
-        inputs_embeds=inputs_embeds.clone(),
         pixel_values=pixel_values,
         imgs_sizes=imgs_sizes,
     )
@@ -228,12 +232,11 @@ def test_forward_dynamic_res_branch_fills_image_slots():
     assert final is not None
     assert final.shape == (2, 6, hidden)
 
-    # Text positions must equal the original embeddings (no overwrite).
+    # Text positions must equal the unsalted embed_tokens output.
     torch.testing.assert_close(final[text_mask], expected_text.to(final.dtype))
 
-    # Image positions should NOT be the original random embeddings — they were
-    # zero-multiplied and replaced.
-    assert not torch.allclose(final[~text_mask].float(), inputs_embeds[~text_mask])
+    # Image positions must have been replaced by vit_embeds (≠ embed_tokens).
+    assert not torch.allclose(final[~text_mask].float(), pre_scatter[~text_mask])
 
 
 def test_forward_prefers_dynamic_res_over_image_flags_when_both_present():
@@ -259,14 +262,14 @@ def test_forward_prefers_dynamic_res_over_image_flags_when_both_present():
     model.extract_feature = spy_tile
 
     input_ids = torch.tensor([[5, 18, 18, 18, 18]], dtype=torch.long)
-    inputs_embeds = torch.randn(1, 5, hidden)
     pixel_values = torch.zeros(1, 3, 8, 8)
     imgs_sizes = torch.tensor([[8, 8]], dtype=torch.long)
     image_flags = torch.tensor([[1]], dtype=torch.long)
 
+    # Don't pass inputs_embeds — caller-supplied embeds is the CP path which
+    # skips the multimodal scatter; this test wants the scatter to fire.
     model(
         input_ids=input_ids,
-        inputs_embeds=inputs_embeds,
         pixel_values=pixel_values,
         imgs_sizes=imgs_sizes,
         image_flags=image_flags,

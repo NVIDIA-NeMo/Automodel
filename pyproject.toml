@@ -37,7 +37,11 @@ name = "nemo-automodel"
 dynamic = ["version"]
 readme = "README.md"
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
-maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+maintainers = [
+    { name = "Alexandros Koumparoulis", email = "akoumparouli@nvidia.com" },
+    { name = "Huiying Li", email = "huiyingl@nvidia.com" },
+    { name = "NVIDIA", email = "nemo-toolkit@nvidia.com" },
+]
 requires-python = ">=3.10"
 classifiers = [
     # How mature is this project? Common values are
@@ -48,7 +52,7 @@ classifiers = [
     #  5 - Production/Stable
     #  6 - Mature
     #  7 - Inactive
-    'Development Status :: 4 - Beta',
+    'Development Status :: 5 - Production/Stable',
     # Indicate who your project is intended for
     'Intended Audience :: Developers',
     'Intended Audience :: Science/Research',
@@ -316,8 +320,6 @@ omit = [
     "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
     # Weird file suddenly appearing in coverage
     "_remote_module_non_scriptable",
-    # deleted file; may still appear in coverage data from cache
-    "nemo_automodel/_transformers/retrieval.py",
 ]
 
 [tool.ruff]

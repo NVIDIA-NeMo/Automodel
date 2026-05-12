@@ -43,12 +43,14 @@ class Ministral3BidirectionalModel(Ministral3Model):
         1. Setting is_causal=False on all attention layers
         2. Using a bidirectional attention mask instead of causal mask
 
-    Loading from a Mistral3 VLM checkpoint (e.g. mistralai/Ministral-3-3B-Base-2512 or
-    mistralai/Ministral-3-3B-Instruct-2512) is handled automatically: the language
-    model weights are extracted from the VLM.
+    Loading a Mistral3 VLM checkpoint (e.g. ``mistralai/Ministral-3-3B-Base-2512``
+    or ``mistralai/Ministral-3-3B-Instruct-2512``) requires extracting the language
+    tower; this is driven by the recipe YAML via
+    ``extract_submodel: language_model`` and handled by
+    :func:`nemo_automodel._transformers.retrieval.build_encoder_backbone`.
 
-    Text-only checkpoints (e.g. mistralai/Ministral-3B-Instruct) load with the usual
-    ``from_pretrained`` path when the Hub config has no nested ``text_config``.
+    Text-only checkpoints (e.g. ``mistralai/Ministral-3B-Instruct``) load directly
+    via the standard ``from_pretrained`` path with no extraction needed.
     """
 
     config_class = Ministral3BidirectionalConfig
@@ -57,53 +59,6 @@ class Ministral3BidirectionalModel(Ministral3Model):
         super().__init__(config)
         for layer in self.layers:
             layer.self_attn.is_causal = False
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load from either a bidirectional text checkpoint or a Mistral3 VLM checkpoint.
-
-        When the checkpoint is a VLM (config has text_config), the language model
-        weights are extracted automatically. Otherwise, the checkpoint is loaded
-        directly as a text-only model.
-        """
-        logger.info(f"Loading Ministral3BidirectionalModel from {pretrained_model_name_or_path}")
-        hub_config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=kwargs.get("trust_remote_code", False),
-        )
-
-        text_cfg = getattr(hub_config, "text_config", None)
-        if text_cfg is not None:
-            return cls._from_vlm_checkpoint(pretrained_model_name_or_path, hub_config, **kwargs)
-        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
-    @classmethod
-    def _from_vlm_checkpoint(cls, model_name_or_path, vlm_config, **kwargs):
-        """Extract and load the language model from a VLM checkpoint."""
-        torch_dtype = kwargs.get("torch_dtype", None)
-        attn_implementation = kwargs.get("attn_implementation", None)
-
-        logger.info(f"Loading VLM from {model_name_or_path} to extract language model weights")
-        vlm = AutoModel.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-        )
-        state_dict = vlm.language_model.state_dict()
-        del vlm
-
-        text_config_dict = vlm_config.text_config.to_dict()
-        text_config = cls.config_class(**text_config_dict)
-        if attn_implementation is not None:
-            text_config._attn_implementation = attn_implementation
-
-        model = cls(text_config)
-        model.load_state_dict(state_dict)
-        if torch_dtype is not None:
-            dtype = getattr(torch, torch_dtype) if isinstance(torch_dtype, str) else torch_dtype
-            model = model.to(dtype)
-
-        return model
 
     def forward(
         self,
@@ -161,7 +116,6 @@ class Ministral3BidirectionalModel(Ministral3Model):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,

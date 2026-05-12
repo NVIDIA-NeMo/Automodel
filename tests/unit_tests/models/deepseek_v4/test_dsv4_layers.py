@@ -28,10 +28,23 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4HyperConnection,
     DeepseekV4RotaryEmbedding,
     _apply_partial_rope_interleaved,
+    _build_indexer_topk_compressed_mask,
     _yarn_correction_dim,
     _yarn_correction_range,
     _yarn_linear_ramp,
 )
+
+
+class TestDeepseekV4AttentionMask:
+    def test_indexer_topk_mask_preserves_pool_zero_with_clamped_invalid_entries(self):
+        """A valid pool index 0 must survive duplicate writes from clamped ``-1`` slots."""
+        attention_mask = torch.zeros(1, 1, 1, 1)
+        indexer_topk = torch.tensor([[[2, 0, -1, -1]]])
+
+        min_val = torch.finfo(attention_mask.dtype).min
+        expected_compressed_mask = torch.tensor([[[[0.0, min_val, 0.0, min_val, min_val]]]])
+        compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled=5).unsqueeze(1)
+        torch.testing.assert_close(compressed_mask, expected_compressed_mask)
 
 
 class TestDeepseekV4GroupedLinear:
