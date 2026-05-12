@@ -61,7 +61,9 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
     name_or_path: deepseek-ai/DeepSeek-V4-Flash
-    num_nextn_predict_layers: 1
+    # Keep standard finetuning MTP-free by default. Set to 1 to enable
+    # DeepSeek-V4 Flash MTP training with the auxiliary loss below.
+    num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
   # DeepSeek-V4 uses 0.3 for most pretraining, then 0.1 during LR decay.
