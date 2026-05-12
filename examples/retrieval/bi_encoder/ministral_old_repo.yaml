@@ -1,0 +1,163 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# To run this recipe, please use the following command:
+# python examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+# Or with torchrun for multi-GPU:
+# torchrun --nproc-per-node=8 examples/biencoder/finetune.py --config examples/biencoder/llama3_2_1b_biencoder.yaml
+
+seed: 42
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 4
+  ckpt_every_steps: 2200
+  val_every_steps: 1000
+  num_epochs: 1
+
+model:
+  _target_: nemo_automodel.components.models.biencoder.NeMoAutoModelBiencoder.from_pretrained
+  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Base-2512
+  model_architecture: ministral3_bidirectional
+  share_encoder: true
+  add_linear_pooler: false
+  out_dimension: null
+  do_gradient_checkpointing: false
+  train_n_passages: 5
+  eval_negative_size: 4
+  pooling: last
+  l2_normalize: true
+  t: 0.02
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Base-2512
+  padding_side: left
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    data_dir_list:
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_ar_llama3_1b_4m_512len.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_en_llama3_1b_4m_512len.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_es_llama3_1b_4m_512len.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_fa_llama3_1b_4m_512len.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_fr_llama3_1b_4m_512len.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_id_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_bn_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_sw_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_zh_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_hi_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_ru_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_ja_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_ko_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_te_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_th_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/miracl_train_fi_ronaya_llama.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/nqsh_shuffled_50k.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.ar.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.de.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.es.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.hi.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.zh.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mldr_en_perc95_small.json
+    data_type: train
+    train_n_passages: 5
+    eval_negative_size: 4
+    seed: 42
+    do_shuffle: true
+    max_train_samples: null
+    train_data_select_offset: 0
+    use_dataset_instruction: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    padding: true
+    pad_to_multiple_of: 8
+    use_dataset_instruction: false
+    add_eos_token: false
+  shuffle: true
+  num_workers: 8
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    data_dir_list:
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/TextQA_train/miracl_train_en_llama3_1b_4m_512len_eval.json
+    data_type: eval
+    train_n_passages: 5
+    eval_negative_size: 4
+    seed: 42
+    do_shuffle: true
+    max_train_samples: null
+    train_data_select_offset: 0
+    use_dataset_instruction: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.RetrievalBiencoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    padding: true
+    pad_to_multiple_of: 8
+    use_dataset_instruction: false
+    add_eos_token: false
+  batch_size: 2
+  shuffle: false
+  num_workers: 8
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 5.0e-6
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+# Learning rate scheduler
+lr_scheduler:
+  lr_warmup_steps: 100
+  lr_decay_style: linear
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/ybabakhin/model_checkpoints/debug_ministral3
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+wandb:
+  project: rteb-text-embedding
+  entity: nvidia-merlin
+  name: baseline_ministral3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30

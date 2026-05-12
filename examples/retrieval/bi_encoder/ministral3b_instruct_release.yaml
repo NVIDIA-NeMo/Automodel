@@ -29,7 +29,7 @@ step_scheduler:
   local_batch_size: 4
   ckpt_every_steps: 2200
   val_every_steps: 1000
-  log_remote_every_steps: 10
+  log_remote_every_steps: 1
   num_epochs: 1
   max_steps: null
 
@@ -49,11 +49,9 @@ model:
   attn_implementation: flash_attention_2
 
 tokenizer:
-  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  _target_: transformers.AutoTokenizer.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
-  add_eos_token: false
   padding_side: left
-  force_hf: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

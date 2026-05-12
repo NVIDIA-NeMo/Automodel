@@ -1,5 +1,5 @@
 python3 submit_nemo_run.py \
-    --experiment_name ministral3_3b_bidirectional_last_explicit_config \
+    --experiment_name ministral3_3b_bidirectional_last_explicit_config_fresh_pull_tokenizer \
     --num_nodes 4 \
     --checkpoint_directory /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints \
     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh \
