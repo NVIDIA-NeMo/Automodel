@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
@@ -114,6 +115,71 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_reference_fp32_parameters_survive_bf16_cast(self):
+        cfg = _tiny_config(num_hidden_layers=3, num_hash_layers=0, compress_ratios=[0, 4, 0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        expected_fp32 = (
+            "attn_hc.fn",
+            "attn_hc.base",
+            "attn_hc.scale",
+            "ffn_hc.fn",
+            "ffn_hc.base",
+            "ffn_hc.scale",
+            "hc_head.hc_fn",
+            "hc_head.hc_base",
+            "hc_head.hc_scale",
+            "self_attn.sinks",
+            "self_attn.compressor.wkv",
+            "self_attn.compressor.wgate",
+            "self_attn.compressor.ape",
+            "self_attn.compressor.indexer.wkv",
+            "self_attn.compressor.indexer.wgate",
+            "self_attn.compressor.indexer.ape",
+            "lm_head",
+        )
+        matched = []
+        for name, param in model.named_parameters():
+            if any(keyword in name for keyword in expected_fp32):
+                matched.append(name)
+                assert param.dtype == torch.float32, name
+
+        assert matched
+        assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+
+    def test_hash_gate_tid2eid_matches_reference_int32_dtype(self):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+
+        gate = model.model.layers["0"].mlp.gate
+        assert gate.tid2eid.dtype == torch.int32
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert gate.tid2eid.dtype == torch.int32
+
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
         """Both HC expand sites mix residual streams as ``comb.T @ x``."""
 

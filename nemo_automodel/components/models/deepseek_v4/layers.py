@@ -116,19 +116,20 @@ def _apply_partial_rope_interleaved(
     """
     rd = rope_head_dim
     half = rd // 2
+    input_dtype = x.dtype
     nope, rope = x[..., :-rd], x[..., -rd:]
     # Pair-reshape last dim: [..., rd] -> [..., rd/2, 2]
-    rope_pairs = rope.unflatten(-1, (-1, 2))
+    rope_pairs = rope.float().unflatten(-1, (-1, 2))
     a, b = rope_pairs[..., 0], rope_pairs[..., 1]  # [..., rd/2]
-    c = cos[..., :half]
-    s = sin[..., :half]
+    c = cos[..., :half].float()
+    s = sin[..., :half].float()
     # Broadcast c/s up to ``a``'s rank by inserting a head dim before S.
     while c.ndim < a.ndim:
         c = c.unsqueeze(1)
         s = s.unsqueeze(1)
     new_a = a * c - b * s
     new_b = a * s + b * c
-    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2)
+    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2).to(input_dtype)
     return torch.cat([nope, new_rope], dim=-1)
 
 
@@ -540,9 +541,11 @@ class DeepseekV4Indexer(nn.Module):
         layer_idx: int,
         start_pos: int,
     ) -> torch.LongTensor:
+        input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
-        kv = self.wkv(hidden_states)
-        gate = self.wgate(hidden_states)
+        hidden_states_fp32 = hidden_states.float()
+        kv = self.wkv(hidden_states_fp32)
+        gate = self.wgate(hidden_states_fp32)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
         )
@@ -554,7 +557,7 @@ class DeepseekV4Indexer(nn.Module):
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
-            )
+            ).to(input_dtype)
         )
         if new_pooled.shape[1] > 0:
             positions = _rope_pool_positions(
@@ -610,9 +613,11 @@ class DeepseekV4Compressor(nn.Module):
         layer_idx: int,
         start_pos: int,
     ) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
-        kv = self.wkv(hidden_states)
-        gate = self.wgate(hidden_states)
+        hidden_states_fp32 = hidden_states.float()
+        kv = self.wkv(hidden_states_fp32)
+        gate = self.wgate(hidden_states_fp32)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
@@ -624,7 +629,7 @@ class DeepseekV4Compressor(nn.Module):
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
-            )
+            ).to(input_dtype)
         )
         positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
         cos, sin = rotary(new_pooled, positions)

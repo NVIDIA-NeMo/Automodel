@@ -206,10 +206,11 @@ class DeepseekV4HashGate(nn.Module):
         # Token-id -> expert-id lookup table.  Registered as a persistent
         # buffer (not a Parameter) because FSDP's param-sharding path rejects
         # int tensors via .requires_grad_(), and the table is non-trainable
-        # anyway.  Dtype matches the V4 Flash checkpoint on-disk layout (I64).
+        # anyway.  Dtype matches the V4 Flash inference implementation and
+        # checkpoint on-disk layout (I32).
         self.register_buffer(
             "tid2eid",
-            torch.zeros(config.vocab_size, self.topk, dtype=torch.int64),
+            torch.zeros(config.vocab_size, self.topk, dtype=torch.int32),
             persistent=True,
         )
         # Kept for API compat with the generic Gate (e.g. optimizer sync paths
@@ -486,7 +487,15 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         "hc_head.hc_fn",
         "hc_head.hc_base",
         "hc_head.hc_scale",
+        "self_attn.sinks",
+        "self_attn.compressor.wkv",
+        "self_attn.compressor.wgate",
+        "self_attn.compressor.ape",
+        "self_attn.compressor.indexer.wkv",
+        "self_attn.compressor.indexer.wgate",
+        "self_attn.compressor.indexer.ape",
         "e_score_correction_bias",
+        "lm_head",
     ]
 
     @classmethod
@@ -531,7 +540,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            dtype=torch.float32,
         )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
@@ -575,7 +584,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(logits) if self.lm_head else logits
+        logits = self.lm_head(logits.float()) if self.lm_head else logits
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             logits = logits.unsqueeze(0)
         return logits

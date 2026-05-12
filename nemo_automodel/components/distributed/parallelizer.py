@@ -472,6 +472,44 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
+class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
+    """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        original_fn = globals().get("apply_fsdp2_sharding_recursively")
+        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
+
+        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
+            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
+                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
+                for _, child in items:
+                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
+                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
+                    else:
+                        parallelizer_utils.fully_shard_by_dtype(
+                            child,
+                            mesh,
+                            mp_policy,
+                            offload_policy,
+                        )
+            else:
+                for _, sub in module.named_children():
+                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+
+        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
+        try:
+            result = super().parallelize(
+                model,
+                device_mesh,
+                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+                **kwargs,
+            )
+        finally:
+            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+
+        return result
+
+
 class WanParallelizationStrategy(ParallelizationStrategy):
     """Parallelization strategy for Wan-style transformer modules used in Diffusers.
 
@@ -617,6 +655,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
