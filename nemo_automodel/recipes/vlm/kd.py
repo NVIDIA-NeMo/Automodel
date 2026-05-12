@@ -56,7 +56,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import ScopedModuleOffloading, count_tail_padding
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, filter_forward_kwargs
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
 
@@ -154,6 +154,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if self.pp_enabled:
             raise NotImplementedError("Pipeline parallelism is not supported for VLM knowledge distillation yet.")
 
+        self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
+        teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
+
         self.teacher_model = _build_teacher_model(
             cfg_teacher=self.cfg.get("teacher_model", None),
             cfg_freeze=self.cfg.get("teacher_freeze_config", None),
@@ -161,7 +164,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
-            device=self.dist_env.device,
+            device=teacher_device,
         )
 
         logger.info("Teacher Model: " + str(self.teacher_model))
@@ -225,10 +228,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         with sync_ctx, train_ctx():
             # Teacher forward (no grad) — free intermediates immediately.
-            with torch.no_grad():
+            with (
+                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                torch.no_grad(),
+            ):
                 teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
                 teacher_out = self.teacher_model(**teacher_batch)
-                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
+                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
                 del teacher_out, teacher_batch
 
             # Student forward.
