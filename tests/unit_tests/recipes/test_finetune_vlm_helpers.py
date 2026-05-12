@@ -2481,16 +2481,18 @@ class TestChunkVlmMedia:
         assert [c.shape[0] for c in ig_chunks] == [2, 2, 1]
         assert sum(c.shape[0] for c in ig_chunks) == batch_size
 
-    def test_uneven_batch_size_gemma4_branch_covers_all_samples(self):
-        """Gemma4 branch (3D pixel_values + n_images_per_sample) must also use ceil."""
+    def test_uneven_batch_size_gemma4_multi_image_branch_covers_all_samples(self):
+        """Gemma4 multi-image branch (3D pixel_values + counts) must also use ceil."""
         from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
 
-        # 7 samples, exactly 1 image each, padded patches per image (Gemma4-style).
+        # 7 samples across 3 microbatches: ceil(7/3)=3, expect sample splits [3, 3, 1].
+        # Image counts per split are [2 + 1 + 0, 3 + 1 + 2, 1] = [3, 6, 1].
         batch_size, n_microbatches = 7, 3
         max_patches = 4
-        image_grid = torch.tensor([[1, 2, 2]] * batch_size)
-        pixel_values = torch.randn(batch_size, max_patches, 64)  # 3D
-        n_images_per_sample = torch.tensor([1] * batch_size)
+        n_images_per_sample = torch.tensor([2, 1, 0, 3, 1, 2, 1])
+        n_images = int(n_images_per_sample.sum().item())
+        image_grid = torch.tensor([[1, 2, 2]] * n_images)
+        pixel_values = torch.randn(n_images, max_patches, 64)  # 3D, one row per image.
 
         pv_chunks, ig_chunks = _chunk_vlm_media(
             pixel_values,
@@ -2501,8 +2503,9 @@ class TestChunkVlmMedia:
         )
 
         assert len(ig_chunks) == n_microbatches
-        assert [c.shape[0] for c in pv_chunks] == [3, 3, 1]
-        assert sum(c.shape[0] for c in pv_chunks) == batch_size
+        assert [c.shape[0] for c in ig_chunks] == [3, 6, 1]
+        assert [c.shape[0] for c in pv_chunks] == [3, 6, 1]
+        assert sum(c.shape[0] for c in pv_chunks) == n_images
 
 
 # -----------------------------------------------------------------------------
