@@ -89,6 +89,37 @@ def _kl_forward_tp(
     return ce_local  # shape: [valid_tokens]
 
 
+def _kl_forward_chunked(
+    t_logits: torch.Tensor,
+    s_logits: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Compute per-token sum(P * log Q) in chunks to reduce peak memory.
+
+    Processes ``chunk_size`` tokens at a time so that only one chunk's worth of the
+    ``[chunk_size, vocab_size]`` fp32 probability matrix is live at any moment.
+
+    Args:
+        t_logits: Teacher logits, shape ``[num_valid_tokens, vocab_size]``.
+        s_logits: Student logits, shape ``[num_valid_tokens, vocab_size]``.
+        chunk_size: Number of tokens per chunk.
+
+    Returns:
+        Per-token sum(P * log Q), shape ``[num_valid_tokens]``.
+    """
+    num_tokens = t_logits.shape[0]
+    kl_parts: list[torch.Tensor] = []
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        t_chunk = t_logits[start:end]
+        s_chunk = s_logits[start:end]
+        teacher_prob = F.softmax(t_chunk, dim=-1, dtype=torch.float32)
+        student_logprob = F.log_softmax(s_chunk, dim=-1, dtype=torch.float32)
+        inf_mask = torch.isinf(s_chunk)
+        kl_parts.append(torch.masked_fill(teacher_prob * student_logprob, inf_mask, 0).sum(-1))
+    return torch.cat(kl_parts, dim=0)
+
+
 class KDLoss(nn.Module):
     """Forward KL divergence loss for knowledge distillation.
 
@@ -108,6 +139,10 @@ class KDLoss(nn.Module):
         tp_group: Explicit TP process group.  When ``None`` (default) the group is inferred from
             the DTensor placement of ``student_logits``, or the non-TP path is used for plain
             tensors.
+        chunk_size: When positive, valid tokens are processed in chunks of this size to avoid
+            materializing the full ``[num_valid_tokens, vocab_size]`` probability matrix in fp32.
+            Reduces peak memory at the cost of slightly more kernel launches.  ``0`` (default)
+            disables chunking.  Ignored when using the TP path.
     """
 
     def __init__(
@@ -116,12 +151,14 @@ class KDLoss(nn.Module):
         temperature: float = 1.0,
         fp32_upcast: bool = True,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        chunk_size: int = 0,
     ):
         super().__init__()
         self.ignore_index = ignore_index
         self.temperature = temperature
         self.fp32_upcast = fp32_upcast
         self.tp_group = tp_group
+        self.chunk_size = chunk_size
 
     def forward(
         self,
@@ -191,12 +228,11 @@ class KDLoss(nn.Module):
         # Compute per-token negative cross-entropy: sum(P * log Q).
         if tp_group is not None:
             kl_per_token = _kl_forward_tp(t_logits, s_logits, tp_group)
+        elif self.chunk_size > 0:
+            kl_per_token = _kl_forward_chunked(t_logits, s_logits, self.chunk_size)
         else:
             teacher_prob = F.softmax(t_logits, dim=-1, dtype=torch.float32)
             student_logprob = F.log_softmax(s_logits, dim=-1, dtype=torch.float32)
-            # mask out infinities originating *only* from student logits
-            # (teacher logits infs are extremely rare and do not
-            # affect gradients w.r.t. student parameters).
             inf_mask = torch.isinf(s_logits)
             kl_per_token = torch.masked_fill(teacher_prob * student_logprob, inf_mask, 0).sum(-1).view(-1)
 
