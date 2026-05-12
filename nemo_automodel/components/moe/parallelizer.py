@@ -181,6 +181,8 @@ def apply_fsdp(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
 ):
+    """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
+
     if isinstance(lm_head_precision, str):
         lm_head_precision = dtype_from_str(lm_head_precision, default=None)
 
@@ -273,6 +275,8 @@ def apply_fsdp(
 
 
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
+    """Configure context parallelism for attention and MoE layers."""
+
     from transformer_engine.pytorch.attention import DotProductAttention
 
     if hasattr(model, "model") and model.model is not None:
@@ -350,6 +354,8 @@ def parallelize_model(
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
 ):
+    """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
+
     assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
         "Tensor parallelism not supported for custom MoE models"
     )

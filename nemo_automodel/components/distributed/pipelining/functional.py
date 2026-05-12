@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 class ParallelizeFnProtocol(Protocol):
+    """Callable protocol for applying distributed parallelism to a model."""
+
     def __call__(
         self,
         model: torch.nn.Module,
@@ -63,6 +65,7 @@ def scale_grads_by_divisor(
     stages: list[PipelineStage],
     divisor: int,
 ) -> None:
+    """Scale pipeline stage gradients by a common divisor when supported."""
     for stage in stages:
         if hasattr(stage, "scale_grads"):
             stage.scale_grads(divisor)
@@ -171,6 +174,7 @@ def calculate_virtual_stages(
     is_single_stage_schedule: bool,
     round_to_pp_multiple: str | None = None,
 ) -> tuple[int, int]:
+    """Calculate virtual pipeline stages and layers per stage."""
     if layers_per_stage is not None:
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
