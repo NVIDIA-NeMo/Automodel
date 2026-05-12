@@ -14,12 +14,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, MutableMapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, MutableMapping
 from typing import Any
 
 import torch
-import torch.nn as nn
+
+VLM_PP_MEDIA_KEY = "_vlm_pp_media_chunks"
 
 _VLM_MEDIA_KEYS = (
     "pixel_values",
@@ -41,12 +41,12 @@ def chunk_vlm_media(
     n_microbatches: int,
     n_images_per_sample: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Split VLM pixel values and image metadata into PP microbatch chunks.
+    """Split VLM pixel values and media metadata into PP microbatch chunks.
 
     Handles four layouts:
     1. ``[N, C, H, W]`` with ``N == batch_size`` -- one full image per sample.
     2. ``[N, max_patches, D]`` with ``N == batch_size`` -- padded patches per image.
-    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
+    3. Flat patches ``[total_patches, D]`` with per-sample media counts from
        ``n_images_per_sample``.
     4. Flat patches with ``n_images == batch_size`` -- legacy one-image-per-sample.
     """
@@ -71,7 +71,7 @@ def chunk_vlm_media(
             pixel_values_chunks.append(pixel_values[img_start:img_end])
             image_grid_chunks.append(image_grid[img_start:img_end])
     elif n_images_per_sample is not None:
-        # General flat-patch layout: map samples -> images -> patches.
+        # General flat-patch layout: map samples -> media entries -> patches.
         patch_counts = image_grid.prod(dim=1)
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
@@ -118,16 +118,6 @@ def chunk_vlm_media(
     return pixel_values_chunks, image_grid_chunks
 
 
-def _get_pp_n_microbatches(pp: Any) -> int:
-    schedule = getattr(getattr(pp, "info", None), "schedule", None)
-    n_microbatches = getattr(schedule, "_n_microbatches", None)
-    if n_microbatches is None:
-        n_microbatches = getattr(schedule, "n_microbatches", None)
-    if n_microbatches is None:
-        raise RuntimeError("Unable to determine PP schedule n_microbatches for VLM media chunking.")
-    return int(n_microbatches)
-
-
 def _select_image_grid(
     image_grid_hws: torch.Tensor | None,
     image_grid_thw: torch.Tensor | None,
@@ -143,23 +133,24 @@ def _select_image_grid(
     return image_position_ids
 
 
-@contextmanager
-def stage_vlm_media_for_pp(
-    pp: Any,
-    model_parts: Sequence[nn.Module],
+def prepare_vlm_media_for_pp(
     batch: MutableMapping[str, Any],
-    input_ids: torch.Tensor,
-) -> Iterator[MutableMapping[str, Any]]:
-    """Stage VLM media tensors for the first pipeline stage during a PP schedule call.
+    *,
+    batch_size: int,
+    n_microbatches: int,
+) -> MutableMapping[str, Any]:
+    """Move VLM media tensors into pre-chunked PP media storage on the batch.
 
-    PyTorch PP chunks normal tensor args by batch rows. VLM media tensors may be
-    flat patch streams or per-image tensors, so Automodel splits them by sample
-    ownership and stores per-microbatch chunks on the first stage model for the
-    VLM-aware forward path to consume.
+    This is intended to run from VLM collate/dataloader code when PP is enabled.
+    The returned batch no longer carries raw media tensors that PyTorch PP would
+    chunk by row incorrectly; instead it carries ``VLM_PP_MEDIA_KEY`` with
+    per-microbatch media chunks.
     """
+    if n_microbatches < 1:
+        raise ValueError(f"n_microbatches must be >= 1, got {n_microbatches}")
+
     if not any(key in batch for key in _VLM_MEDIA_KEYS):
-        yield batch
-        return
+        return batch
 
     pixel_values = batch.pop("pixel_values", None)
     image_grid_hws = batch.pop("image_grid_hws", None)
@@ -171,59 +162,73 @@ def stage_vlm_media_for_pp(
     video_grid_thw = batch.pop("video_grid_thw", None)
     n_videos_per_sample = batch.pop("n_videos_per_sample", None)
 
-    stage0_model: nn.Module | None = None
-    staged = False
     image_grid = _select_image_grid(image_grid_hws, image_grid_thw, image_sizes, image_position_ids)
+    pp_media: dict[str, list[torch.Tensor]] = {}
 
     if pixel_values is not None and image_grid is None:
         raise ValueError(
-            "VLM PP staging requires media metadata with pixel_values. Expected one of "
+            "VLM PP media prep requires media metadata with pixel_values. Expected one of "
             "image_grid_hws, image_grid_thw, image_sizes, or image_position_ids."
         )
 
     if pixel_values_videos is not None and video_grid_thw is None:
-        raise ValueError("VLM PP staging requires video_grid_thw with pixel_values_videos.")
+        raise ValueError("VLM PP media prep requires video_grid_thw with pixel_values_videos.")
 
-    if getattr(pp.info, "has_first_stage", False):
-        stage0_model = model_parts[0]
-
-    if stage0_model is not None and pixel_values is not None and image_grid is not None:
+    if pixel_values is not None and image_grid is not None:
         pixel_values_chunks, image_grid_chunks = chunk_vlm_media(
             pixel_values,
             image_grid,
-            batch_size=input_ids.shape[0],
-            n_microbatches=_get_pp_n_microbatches(pp),
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
             n_images_per_sample=n_images_per_sample,
         )
+        pp_media["pixel_values"] = pixel_values_chunks
+        pp_media["image_grid_hws"] = image_grid_chunks
 
-        stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-        stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
-        stage0_model._vlm_chunk_idx = 0
-        staged = True
-
-    if stage0_model is not None and pixel_values_videos is not None and video_grid_thw is not None:
+    if pixel_values_videos is not None and video_grid_thw is not None:
         pixel_values_videos_chunks, video_grid_thw_chunks = chunk_vlm_media(
             pixel_values_videos,
             video_grid_thw,
-            batch_size=input_ids.shape[0],
-            n_microbatches=_get_pp_n_microbatches(pp),
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
             n_images_per_sample=n_videos_per_sample,
         )
+        pp_media["pixel_values_videos"] = pixel_values_videos_chunks
+        pp_media["video_grid_thw"] = video_grid_thw_chunks
 
-        stage0_model._vlm_pixel_values_videos_chunks = pixel_values_videos_chunks
-        stage0_model._vlm_video_grid_thw_chunks = video_grid_thw_chunks
-        stage0_model._vlm_chunk_idx = 0
-        staged = True
+    if pp_media:
+        batch[VLM_PP_MEDIA_KEY] = pp_media
 
-    try:
-        yield batch
-    finally:
-        if staged and stage0_model is not None:
-            stage0_model._vlm_pixel_values_chunks = None
-            stage0_model._vlm_image_grid_hws_chunks = None
-            stage0_model._vlm_pixel_values_videos_chunks = None
-            stage0_model._vlm_video_grid_thw_chunks = None
-            stage0_model._vlm_chunk_idx = None
+    return batch
 
 
-__all__ = ["chunk_vlm_media", "stage_vlm_media_for_pp"]
+def wrap_vlm_collate_for_pp(
+    collate_fn: Callable[[Any], MutableMapping[str, Any]],
+    *,
+    n_microbatches: int,
+) -> Callable[[Any], MutableMapping[str, Any]]:
+    """Wrap a VLM collate function so it prepares media tensors for PP."""
+
+    def wrapper(examples):
+        batch = collate_fn(examples)
+        if not isinstance(batch, MutableMapping):
+            return batch
+        if not any(key in batch for key in _VLM_MEDIA_KEYS):
+            return batch
+        if "input_ids" not in batch:
+            raise ValueError("VLM PP media prep requires input_ids to infer the local batch size.")
+        return prepare_vlm_media_for_pp(
+            batch,
+            batch_size=batch["input_ids"].shape[0],
+            n_microbatches=n_microbatches,
+        )
+
+    return wrapper
+
+
+__all__ = [
+    "VLM_PP_MEDIA_KEY",
+    "chunk_vlm_media",
+    "prepare_vlm_media_for_pp",
+    "wrap_vlm_collate_for_pp",
+]

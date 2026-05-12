@@ -867,64 +867,6 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
     assert len(pp_info.schedule.eval_calls) == 0, "schedule.eval() should not be called for training"
 
 
-def test_forward_backward_step_pp_stages_vlm_media(monkeypatch):
-    """Test that train_ft PP path can stage VLM media before schedule.step()."""
-    from contextlib import nullcontext
-
-    pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
-    pp_info.schedule._n_microbatches = 2
-    recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-    model = nn.Module()
-    object.__setattr__(recipe, "model_parts", [model])
-
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, **kwargs: (nullcontext, batch),
-    )
-
-    captured = {}
-
-    def step(*args, **kwargs):
-        captured["pixel_chunks"] = model._vlm_pixel_values_chunks
-        captured["grid_chunks"] = model._vlm_image_grid_hws_chunks
-        captured["chunk_idx"] = model._vlm_chunk_idx
-        captured["kwargs"] = kwargs
-        if kwargs["losses"] is not None:
-            kwargs["losses"].append(torch.tensor(0.5))
-
-    pp_info.schedule.step = step
-
-    pixel_values = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
-    image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-        "labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-        "pixel_values": pixel_values,
-        "image_grid_thw": image_grid_thw,
-    }
-
-    recipe._forward_backward_step(
-        idx=0,
-        batch=batch,
-        loss_buffer=[],
-        num_label_tokens=None,
-        num_batches=1,
-        is_train=True,
-    )
-
-    assert len(captured["pixel_chunks"]) == 2
-    assert torch.equal(captured["pixel_chunks"][0], pixel_values[:1])
-    assert torch.equal(captured["pixel_chunks"][1], pixel_values[1:])
-    assert torch.equal(captured["grid_chunks"][0], image_grid_thw[:1])
-    assert torch.equal(captured["grid_chunks"][1], image_grid_thw[1:])
-    assert captured["chunk_idx"] == 0
-    assert "pixel_values" not in captured["kwargs"]
-    assert "image_grid_thw" not in captured["kwargs"]
-    assert model._vlm_pixel_values_chunks is None
-    assert model._vlm_image_grid_hws_chunks is None
-    assert model._vlm_chunk_idx is None
-
-
 def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monkeypatch):
     """Test schedule.eval() without input_ids when not on first stage."""
     from contextlib import nullcontext

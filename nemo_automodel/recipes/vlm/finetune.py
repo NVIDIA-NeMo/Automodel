@@ -28,7 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -53,10 +53,11 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
+from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.pipelining import AutoPipeline, stage_vlm_media_for_pp
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -253,6 +254,47 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
+def _move_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device) if v is not None else None for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device) for v in value)
+    return value
+
+
+@contextmanager
+def stage_prepared_vlm_media_for_pp(pp, model_parts, pp_media):
+    """Attach dataloader-prepared VLM media chunks to stage 0 for one PP call."""
+    stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
+    staged = False
+
+    if stage0_model is not None:
+        if "pixel_values" in pp_media:
+            stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
+            stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
+            staged = True
+        if "pixel_values_videos" in pp_media:
+            stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
+            stage0_model._vlm_video_grid_thw_chunks = pp_media.get("video_grid_thw")
+            staged = True
+        if staged:
+            stage0_model._vlm_chunk_idx = 0
+
+    try:
+        yield
+    finally:
+        if staged and stage0_model is not None:
+            stage0_model._vlm_pixel_values_chunks = None
+            stage0_model._vlm_image_grid_hws_chunks = None
+            stage0_model._vlm_pixel_values_videos_chunks = None
+            stage0_model._vlm_video_grid_thw_chunks = None
+            stage0_model._vlm_chunk_idx = None
+
+
 def build_dataloader(
     cfg_ds,
     cfg_dl,
@@ -264,6 +306,7 @@ def build_dataloader(
     cfg_model=None,
     cfg_ps=None,
     get_rope_index=None,
+    pp_n_microbatches=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -283,6 +326,8 @@ def build_dataloader(
             mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
             position semantics across pack boundaries instead of falling back to
             plain 1D positions.
+        pp_n_microbatches: When set, wrap collate so VLM media tensors are
+            pre-chunked for this many PP microbatches before entering the train loop.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -445,6 +490,9 @@ def build_dataloader(
 
         if hasattr(ds, "robust_collate"):
             collate_fn = ds.robust_collate(collate_fn)
+
+        if pp_n_microbatches is not None:
+            collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
@@ -758,6 +806,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
         # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
         get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+        pp_n_microbatches = None
+        if self.pp_enabled:
+            pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
@@ -770,6 +821,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_model=self.cfg.model,
             cfg_ps=self.cfg.get("packed_sequence", None),
             get_rope_index=get_rope_index,
+            pp_n_microbatches=pp_n_microbatches,
         )
 
         # Build validation dataloader if the config provides it
@@ -880,14 +932,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
+        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
         # Routed through __call__ so FSDP2 forward pre-hook fires and
         # unshards the vision tower's weights before the embed/scatter.
@@ -924,8 +969,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 input_ids = batch.pop("input_ids")
                 self.pp.update_seq_len(input_ids.shape[1])
+                pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
 
-                with stage_vlm_media_for_pp(self.pp, self.model_parts, batch, input_ids):
+                with stage_prepared_vlm_media_for_pp(self.pp, self.model_parts, pp_media):
                     if self.pp.info.has_first_stage:
                         self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
                     else:

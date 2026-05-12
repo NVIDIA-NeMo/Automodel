@@ -66,7 +66,7 @@ from nemo_automodel.components.distributed.init_utils import (
 )
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
-from nemo_automodel.components.distributed.pipelining import AutoPipeline, stage_vlm_media_for_pp
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -1376,22 +1376,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
 
-                # This shared VLM media staging helper is a no-op for LLM batches.
-                with stage_vlm_media_for_pp(
-                    self.pp, getattr(self, "model_parts", ()), batch_filtered, input_ids
-                ) as pp_batch:
-                    if is_train:
-                        # Use step for training (forward + backward)
-                        if self.pp.info.has_first_stage:
-                            self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **pp_batch)
-                        else:
-                            self.pp.info.schedule.step(target=targets, losses=losses, **pp_batch)
+                if is_train:
+                    # Use step for training (forward + backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
                     else:
-                        # Use eval for validation (forward only, no backward)
-                        if self.pp.info.has_first_stage:
-                            self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **pp_batch)
-                        else:
-                            self.pp.info.schedule.eval(target=targets, losses=losses, **pp_batch)
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
+                else:
+                    # Use eval for validation (forward only, no backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))

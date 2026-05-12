@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed.pipelining.vlm_utils import chunk_vlm_media
+from nemo_automodel.components.datasets.vlm.pp_media import chunk_vlm_media, prepare_vlm_media_for_pp
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
@@ -1415,6 +1415,14 @@ def _create_pp_recipe(model=None):
     return recipe
 
 
+def _prepare_pp_vlm_batch(batch, n_microbatches=2):
+    return prepare_vlm_media_for_pp(
+        batch,
+        batch_size=batch["input_ids"].shape[0],
+        n_microbatches=n_microbatches,
+    )
+
+
 class TestForwardBackwardStepPP:
     """Tests for _forward_backward_step with pipeline parallelism enabled."""
 
@@ -1461,7 +1469,6 @@ class TestForwardBackwardStepPP:
         )
 
         batch_size = 4
-        n_images = 4
         # image_grid_hws: 4 images, each with different patch counts
         image_grid_hws = torch.tensor([[2, 2], [3, 3], [2, 3], [4, 4]])  # patch counts: 4, 9, 6, 16
         total_patches = 4 + 9 + 6 + 16  # = 35
@@ -1473,6 +1480,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
         captured_chunks = {}
 
@@ -1548,6 +1556,7 @@ class TestForwardBackwardStepPP:
             "video_grid_thw": video_grid_thw,
             "n_videos_per_sample": n_videos_per_sample,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1630,6 +1639,7 @@ class TestForwardBackwardStepPP:
             "video_grid_thw": video_grid_thw,
             "n_videos_per_sample": n_videos_per_sample,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1659,7 +1669,6 @@ class TestForwardBackwardStepPP:
         )
 
         batch_size = 4
-        n_images = 4
         # image_grid_thw: 4 images with T, H, W dimensions (uses .prod(dim=1) for patch counts)
         image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 3], [1, 4, 4]])  # patch counts: 4, 9, 6, 16
         total_patches = 4 + 9 + 6 + 16  # = 35
@@ -1671,6 +1680,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,  # Using thw instead of hws
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1713,6 +1723,7 @@ class TestForwardBackwardStepPP:
             "image_grid_thw": image_grid_thw,
             "n_images_per_sample": torch.tensor([1, 1]),
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
         captured_chunks = {}
 
@@ -1742,16 +1753,8 @@ class TestForwardBackwardStepPP:
         assert pp_recipe.model_parts[0]._vlm_pixel_values_chunks is None
         assert len(loss_buffer) == 1
 
-    def test_pp_vlm_chunking_mismatched_images_raises(self, pp_recipe, monkeypatch):
-        """When n_images != batch_size with no n_images_per_sample, _forward_backward_step
-        now bubbles up a ValueError from the chunker instead of silently emptying mb1..N."""
-        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
-
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
-        )
-
+    def test_pp_vlm_chunking_mismatched_images_raises(self):
+        """When media cannot be aligned to samples, VLM PP data prep raises."""
         batch_size = 4
         image_grid_hws = torch.tensor([[2, 2], [3, 3]])
         total_patches = 4 + 9
@@ -1763,17 +1766,9 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
         }
-        loss_buffer = []
 
         with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
-            pp_recipe._forward_backward_step(
-                idx=0,
-                batch=batch,
-                loss_buffer=loss_buffer,
-                num_label_tokens=40,
-                num_batches=1,
-                is_train=True,
-            )
+            _prepare_pp_vlm_batch(batch)
 
     def test_pp_vlm_chunking_with_image_sizes(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking with image_sizes fallback (e.g., Mistral4-style)."""
@@ -1796,6 +1791,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_sizes": image_sizes,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
@@ -1834,6 +1830,7 @@ class TestForwardBackwardStepPP:
             "pixel_values": pixel_values,
             "image_grid_hws": image_grid_hws,
         }
+        _prepare_pp_vlm_batch(batch)
         loss_buffer = []
 
         pp_recipe._forward_backward_step(
