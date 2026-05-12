@@ -434,6 +434,10 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
+
     @classmethod
     def from_config(
         cls,
