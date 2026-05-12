@@ -108,8 +108,19 @@ class MDLMStrategy(DLLMStrategy):
         return batch
 
 
+class DFlashStrategy(MDLMStrategy):
+    """Placeholder strategy for DFlash mode.
+
+    The actual DFlash training logic (dual-model forward, anchor masking,
+    decay loss) lives in :class:`~nemo_automodel.recipes.dllm.train_dflash.DFlashSFTRecipe`.
+    This entry exists only so ``DiffusionLMSFTRecipe.setup()`` accepts
+    ``dllm.mode: dflash`` without raising an unknown-mode error.
+    """
+
+
 DLLM_STRATEGIES: Dict[str, type] = {
     "mdlm": MDLMStrategy,
+    "dflash": DFlashStrategy,
 }
 
 
