@@ -2714,8 +2714,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
         )
 
     assert captured.get("get_rope_index") is sentinel, (
-        "build_dataloader must forward get_rope_index to neat_pack_dataset_vlm; "
-        f"got kwargs={list(captured.keys())}"
+        f"build_dataloader must forward get_rope_index to neat_pack_dataset_vlm; got kwargs={list(captured.keys())}"
     )
 
 
@@ -2747,7 +2746,5 @@ def test_build_dataloader_default_get_rope_index_is_none():
             cfg_ps=_make_packing_cfg(pack_size=64),
         )
 
-    assert "get_rope_index" in captured, (
-        "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
-    )
+    assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
