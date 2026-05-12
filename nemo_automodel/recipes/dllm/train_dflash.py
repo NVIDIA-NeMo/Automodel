@@ -123,6 +123,26 @@ class DFlashSFTRecipe(DiffusionLMSFTRecipe):
 
     def setup(self):
         """Build all components, then load and freeze the target model."""
+        # Ensure parent's dllm setup can resolve mask_token_id even when neither
+        # the YAML nor the base tokenizer (Qwen3) define one. DFlash uses
+        # <|MASK|> as a virtual mask token; we add it to the tokenizer here so
+        # the parent sees a valid integer and won't raise.
+        if self.cfg.get("dllm.mask_token_id") is None:
+            from transformers import AutoTokenizer
+            dflash_cfg = self.cfg.get("dflash", None)
+            tok_id = (
+                dflash_cfg.get("target_model_id") if dflash_cfg else None
+            ) or self.cfg.get("model.pretrained_model_name_or_path")
+            if tok_id is not None:
+                try:
+                    _tok = AutoTokenizer.from_pretrained(tok_id, trust_remote_code=True)
+                    if _tok.mask_token_id is None:
+                        _tok.add_special_tokens({"mask_token": "<|MASK|>"})
+                    self.cfg.set_by_dotted("dllm.mask_token_id", int(_tok.mask_token_id))
+                    logger.info("DFlash: resolved mask_token_id=%d from %s", _tok.mask_token_id, tok_id)
+                except Exception as e:
+                    logger.warning("Could not resolve mask_token_id from %s: %s", tok_id, e)
+
         # Parent sets up: dist_env, draft model (self.model_parts), optimizer,
         # dataloader, tokenizer, step_scheduler, checkpointer, and dLLM fields.
         super().setup()
