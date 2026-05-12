@@ -1,0 +1,118 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NeMo Bench source workload: gpt-debug.yaml
+# Effective source settings: module=gpt_oss, config=gpt_oss_debugmodel,
+# tp=1, pp=1, cp=1, ep=1, total_gpus=8, local_batch_size=8, global_batch_size=64,
+# steps=50, seq_len=4096.
+#
+# To run this recipe:
+#   automodel examples/llm_pretrain/nb/gpt-debug.yaml --nproc-per-node 8
+# Replace the MegatronPretraining dataset paths with processed C4-compatible data before a real run.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 50
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.GptOssConfig
+    architectures:
+    - GptOssForCausalLM
+    vocab_size: 2048
+    hidden_size: 256
+    intermediate_size: 2880
+    num_hidden_layers: 4
+    num_attention_heads: 64
+    num_key_value_heads: 8
+    head_dim: 64
+    num_local_experts: 8
+    num_experts_per_tok: 4
+    max_position_embeddings: 4096
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: flex
+    linear: torch
+    rms_norm: torch
+    experts: torch
+    dispatcher: torch
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: false
+checkpoint:
+  enabled: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/c4_test/processed_data_*_text_document*
+  index_mapping_dir: /path/to/c4_test/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+  seq_length: 4096
+  split: 0.99, 0.01, 0.00
+  splits_to_build: train
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/c4_test/processed_data_*_text_document*
+  index_mapping_dir: /path/to/c4_test/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+  seq_length: 4096
+  split: 0.99, 0.01, 0.00
+  splits_to_build: validation
+  num_val_samples: 1024
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0008
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1e-8
+  weight_decay: 0.1
