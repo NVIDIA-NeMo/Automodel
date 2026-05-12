@@ -220,3 +220,90 @@ def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
             num_batches=1,
             is_train=False,
         )
+
+
+class _WeightOnlyEmbedding(nn.Module):
+    """Embedding-like module exposing only ``weight`` (no ``embedding_dim``)."""
+
+    def __init__(self, num_embeddings: int, hidden: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_embeddings, hidden))
+
+
+class _ModelWithWeightOnlyEmbedding(nn.Module):
+    def __init__(self, hidden: int):
+        super().__init__()
+        self._emb = _WeightOnlyEmbedding(5, hidden)
+
+    def get_input_embeddings(self):
+        return self._emb
+
+
+class _ModelWithDegenerateEmbedding(nn.Module):
+    """Embedding lookup returns something with no usable shape info."""
+
+    def __init__(self):
+        super().__init__()
+
+    def get_input_embeddings(self):
+        # No embedding_dim and weight is 1-D, so both inner checks fail.
+        emb = nn.Module()
+        emb.weight = nn.Parameter(torch.empty(4))
+        return emb
+
+
+class _ModelWithTextConfig(nn.Module):
+    def __init__(self, text_hidden: int, outer_hidden: int | None = None):
+        super().__init__()
+        self.config = SimpleNamespace(
+            text_config=SimpleNamespace(hidden_size=text_hidden),
+            hidden_size=outer_hidden,
+        )
+
+
+class _ModelWithOuterConfigOnly(nn.Module):
+    def __init__(self, outer_hidden: int):
+        super().__init__()
+        # No text_config attribute at all.
+        self.config = SimpleNamespace(hidden_size=outer_hidden)
+
+
+class _ModelWithNoEmbeddingOrConfig(nn.Module):
+    pass
+
+
+def test_get_model_input_embedding_dim_uses_embedding_dim_when_available():
+    model = _StudentVLM(hidden_size=17)
+    assert vlm_kd._get_model_input_embedding_dim(model) == 17
+
+
+def test_get_model_input_embedding_dim_falls_back_to_weight_shape():
+    model = _ModelWithWeightOnlyEmbedding(hidden=13)
+    assert vlm_kd._get_model_input_embedding_dim(model) == 13
+
+
+def test_get_model_input_embedding_dim_prefers_text_config_hidden_size():
+    model = _ModelWithDegenerateEmbedding()
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=21),
+        hidden_size=999,
+    )
+    assert vlm_kd._get_model_input_embedding_dim(model) == 21
+
+
+def test_get_model_input_embedding_dim_uses_outer_config_when_no_text_config():
+    model = _ModelWithOuterConfigOnly(outer_hidden=19)
+    assert vlm_kd._get_model_input_embedding_dim(model) == 19
+
+
+def test_get_model_input_embedding_dim_returns_none_when_unknown():
+    model = _ModelWithNoEmbeddingOrConfig()
+    assert vlm_kd._get_model_input_embedding_dim(model) is None
+
+
+def test_validate_cp_pre_embed_skips_when_teacher_hidden_size_unknown(monkeypatch):
+    monkeypatch.setattr(vlm_kd, "_get_model_input_embedding_dim", lambda model: None)
+    inputs_embeds = torch.zeros(1, 4, 8)
+    teacher = _ModelWithNoEmbeddingOrConfig()
+    # Should be a no-op (no exception) when teacher hidden size cannot be inferred.
+    assert vlm_kd._validate_cp_pre_embed_teacher_compatibility(inputs_embeds, teacher) is None
