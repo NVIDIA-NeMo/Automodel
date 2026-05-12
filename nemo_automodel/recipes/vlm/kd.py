@@ -55,8 +55,15 @@ from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.components.training.utils import ScopedModuleOffloading, count_tail_padding
+from nemo_automodel.components.training.utils import (
+    ScopedModuleOffloading,
+    count_tail_padding,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
+)
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, filter_forward_kwargs
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
 
@@ -328,6 +335,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
+        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(self._get_dp_group_size(include_cp=True)))
+
         loss_buffer: list[torch.Tensor] = []
 
         num_tokens_in_batch = torch.tensor(
@@ -337,27 +346,38 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+
         for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
 
-        grad_norm = 0
-        if max_grad_norm is not None:
-            if not self.device_mesh or self.device_mesh["tp"].size() == 1:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model_parts[0].parameters() if p.requires_grad], max_grad_norm
-                )
-                if hasattr(grad_norm, "full_tensor"):
-                    grad_norm = grad_norm.full_tensor()
-
-            if isinstance(grad_norm, torch.Tensor):
-                grad_norm = grad_norm.item()
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm=max_grad_norm,
+            model_parts=self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self.pp_enabled,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp" if self.pp_enabled else None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+        )
 
         self.checkpointer.maybe_wait_for_staging()
         for opt in self.optimizer:
             opt.step()
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
 
         if self.lr_scheduler is not None:
             for scheduler in self.lr_scheduler:
@@ -397,7 +417,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
                 "tps": tps,
-                "tps_per_gpu": tps / max(self._get_dp_group_size(), 1),
+                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
                 "num_tokens_per_step": num_tokens_in_batch,
                 "num_label_tokens": num_label_tokens,
                 "kd_ratio": self.kd_ratio,
