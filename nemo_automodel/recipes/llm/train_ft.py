@@ -1376,6 +1376,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
 
+                # This shared VLM media staging helper is a no-op for LLM batches.
                 with stage_vlm_media_for_pp(
                     self.pp, getattr(self, "model_parts", ()), batch_filtered, input_ids
                 ) as pp_batch:
