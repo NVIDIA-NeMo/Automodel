@@ -54,7 +54,14 @@ class _Model(nn.Module):
 
 
 @pytest.mark.cuda(False)
-def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch):
+@pytest.mark.parametrize(
+    ("pp_enabled", "expected_aux_scale"),
+    [
+        (False, 4.0),
+        (True, 3.0),
+    ],
+)
+def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled, expected_aux_scale):
     calls = {
         "prepare": [],
         "final": [],
@@ -84,7 +91,7 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch):
     model = _Model()
     optimizer = _Optimizer()
     recipe.model_parts = [model]
-    recipe.pp_enabled = False
+    recipe.pp_enabled = pp_enabled
     recipe.device_mesh = None
     recipe.moe_mesh = SimpleNamespace(mesh_dim_names=("ep",))
     recipe.optimizer = [optimizer]
@@ -118,25 +125,25 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch):
     metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
 
     assert isinstance(metrics, MetricsSample)
-    assert calls["prepare"] == [([model], False)]
-    assert calls["final"] == [([model], False)]
+    assert calls["prepare"] == [([model], pp_enabled)]
+    assert calls["final"] == [([model], pp_enabled)]
     assert calls["forward"] == [(0, 3, 2, True), (1, 3, 2, True)]
     assert calls["scale"] == [
         {
             "max_grad_norm": 1.0,
             "model_parts": [model],
             "norm_type": 2.0,
-            "pp_enabled": False,
+            "pp_enabled": pp_enabled,
             "device_mesh": None,
             "moe_mesh": recipe.moe_mesh,
             "ep_axis_name": "ep",
-            "pp_axis_name": None,
+            "pp_axis_name": "pp" if pp_enabled else None,
             "foreach": True,
             "num_label_tokens": 3,
             "dp_group_size": 4,
         }
     ]
-    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(4.0)
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(expected_aux_scale)
     assert optimizer.step_called
     assert optimizer.zero_grad_set_to_none is True
     assert model.update_moe_gate_bias_called

@@ -335,7 +335,12 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(self._get_dp_group_size(include_cp=True)))
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
 
         loss_buffer: list[torch.Tensor] = []
 
