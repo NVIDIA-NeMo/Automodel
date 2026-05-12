@@ -28,6 +28,9 @@ _VLM_MEDIA_KEYS = (
     "image_sizes",
     "image_position_ids",
     "n_images_per_sample",
+    "pixel_values_videos",
+    "video_grid_thw",
+    "n_videos_per_sample",
 )
 
 
@@ -58,7 +61,8 @@ def chunk_vlm_media(
     elif pixel_values.dim() == 3 and n_images_per_sample is not None:
         # Multi-image padded-patch layout: split by image counts per sample.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
+        # Match torch.chunk-style uneven splits so trailing samples are not dropped.
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -72,7 +76,7 @@ def chunk_vlm_media(
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
 
-        samples_per_mb = batch_size // n_microbatches
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -90,7 +94,7 @@ def chunk_vlm_media(
         patch_counts = image_grid.prod(dim=1)
         cumsum = torch.cumsum(patch_counts, dim=0)
 
-        images_per_mb = batch_size // n_microbatches
+        images_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             img_start = mb_idx * images_per_mb
             img_end = min(img_start + images_per_mb, n_images)
@@ -163,6 +167,9 @@ def stage_vlm_media_for_pp(
     image_sizes = batch.pop("image_sizes", None)
     image_position_ids = batch.pop("image_position_ids", None)
     n_images_per_sample = batch.pop("n_images_per_sample", None)
+    pixel_values_videos = batch.pop("pixel_values_videos", None)
+    video_grid_thw = batch.pop("video_grid_thw", None)
+    n_videos_per_sample = batch.pop("n_videos_per_sample", None)
 
     stage0_model: nn.Module | None = None
     staged = False
@@ -174,8 +181,13 @@ def stage_vlm_media_for_pp(
             "image_grid_hws, image_grid_thw, image_sizes, or image_position_ids."
         )
 
-    if getattr(pp.info, "has_first_stage", False) and pixel_values is not None and image_grid is not None:
+    if pixel_values_videos is not None and video_grid_thw is None:
+        raise ValueError("VLM PP staging requires video_grid_thw with pixel_values_videos.")
+
+    if getattr(pp.info, "has_first_stage", False):
         stage0_model = model_parts[0]
+
+    if stage0_model is not None and pixel_values is not None and image_grid is not None:
         pixel_values_chunks, image_grid_chunks = chunk_vlm_media(
             pixel_values,
             image_grid,
@@ -189,12 +201,28 @@ def stage_vlm_media_for_pp(
         stage0_model._vlm_chunk_idx = 0
         staged = True
 
+    if stage0_model is not None and pixel_values_videos is not None and video_grid_thw is not None:
+        pixel_values_videos_chunks, video_grid_thw_chunks = chunk_vlm_media(
+            pixel_values_videos,
+            video_grid_thw,
+            batch_size=input_ids.shape[0],
+            n_microbatches=_get_pp_n_microbatches(pp),
+            n_images_per_sample=n_videos_per_sample,
+        )
+
+        stage0_model._vlm_pixel_values_videos_chunks = pixel_values_videos_chunks
+        stage0_model._vlm_video_grid_thw_chunks = video_grid_thw_chunks
+        stage0_model._vlm_chunk_idx = 0
+        staged = True
+
     try:
         yield batch
     finally:
         if staged and stage0_model is not None:
             stage0_model._vlm_pixel_values_chunks = None
             stage0_model._vlm_image_grid_hws_chunks = None
+            stage0_model._vlm_pixel_values_videos_chunks = None
+            stage0_model._vlm_video_grid_thw_chunks = None
             stage0_model._vlm_chunk_idx = None
 
 
