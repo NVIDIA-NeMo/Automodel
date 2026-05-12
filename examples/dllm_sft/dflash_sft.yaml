@@ -70,19 +70,22 @@ distributed:
   autocast_dtype: bfloat16
   offload_policy: null
 
+# Required by DiffusionLMSFTRecipe parent — mode must be 'dflash'.
+dllm:
+  mode: dflash
+  mask_token_id: null
+  eps: 0.001
+  supervise_padding: true
+
 # DFlash-specific configuration.
 # target_model_id: frozen causal LM whose hidden states condition the draft.
 # block_size 0 reads from the draft model config (16 for *-b16 drafts).
 # loss_decay_gamma 0 selects the paper default for the block size.
 dflash:
-  mode: dflash
   target_model_id: Qwen/Qwen3-4B
   target_torch_dtype: bfloat16
   block_size: 0
   loss_decay_gamma: 0.0
-  mask_token_id: null        # auto-detected from tokenizer
-  eps: 0.001
-  supervise_padding: true
 
 # Placeholder loss_fn — DFlashSFTRecipe uses DFlashDecayLoss internally.
 loss_fn:
