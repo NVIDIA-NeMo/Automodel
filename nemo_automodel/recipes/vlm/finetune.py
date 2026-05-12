@@ -282,7 +282,11 @@ def _chunk_vlm_media(
         # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
         # All images are padded to the same max_patches, so split by image count directly.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
+        # Ceil division so trailing samples are not dropped when batch_size is not
+        # divisible by n_microbatches.  Mirrors torch.tensor.chunk(n) semantics used
+        # by the PP schedule on input_ids/labels — keeps image chunks aligned with
+        # text chunks even on uneven splits.
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -297,7 +301,7 @@ def _chunk_vlm_media(
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
 
-        samples_per_mb = batch_size // n_microbatches
+        samples_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             s_start = mb_idx * samples_per_mb
             s_end = min(s_start + samples_per_mb, batch_size)
@@ -315,7 +319,7 @@ def _chunk_vlm_media(
         patch_counts = image_grid.prod(dim=1)
         cumsum = torch.cumsum(patch_counts, dim=0)
 
-        images_per_mb = batch_size // n_microbatches
+        images_per_mb = -(-batch_size // n_microbatches)
         for mb_idx in range(n_microbatches):
             img_start = mb_idx * images_per_mb
             img_end = min(img_start + images_per_mb, n_images)
@@ -326,13 +330,20 @@ def _chunk_vlm_media(
             patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
             pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
     else:
-        pixel_values_chunks.append(pixel_values)
-        image_grid_chunks.append(image_grid)
-        for _ in range(n_microbatches - 1):
-            pixel_values_chunks.append(pixel_values[:0])
-            image_grid_chunks.append(image_grid[:0])
-        logging.warning(
-            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
+        # No layout matched. Previously this branch logged a warning and gave all
+        # images to mb0 with empty tensors for mb1..N, but trailing microbatches
+        # whose text still contains media tokens would then scatter into empty
+        # pixel_values — silent corruption. Fail loudly so the calling collate is
+        # forced to provide n_images_per_sample (or align n_images with batch_size)
+        # instead of training on broken data.
+        raise ValueError(
+            "VLM PP chunking cannot align pixel_values with the batch: "
+            f"pixel_values.shape={tuple(pixel_values.shape)}, "
+            f"image_grid.shape={tuple(image_grid.shape)}, "
+            f"n_images={n_images}, batch_size={batch_size}, "
+            f"n_images_per_sample={'set' if n_images_per_sample is not None else 'None'}. "
+            "Either ensure pixel_values has shape [batch_size, ...] (one media tensor per "
+            "sample) or pass n_images_per_sample so the chunker can map images to samples."
         )
 
     return pixel_values_chunks, image_grid_chunks
@@ -348,6 +359,7 @@ def build_dataloader(
     local_batch_size,
     cfg_model=None,
     cfg_ps=None,
+    get_rope_index=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -362,6 +374,11 @@ def build_dataloader(
         cfg_model: Model configuration (used to detect attention backend).
         cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
             When provided, takes precedence over ``dataset.packing``.
+        get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
+            VLM neat packing computes mRoPE 3D position IDs per sample so packed
+            mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
+            position semantics across pack boundaries instead of falling back to
+            plain 1D positions.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -479,6 +496,7 @@ def build_dataloader(
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
                     processor=processor,
                     balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
+                    get_rope_index=get_rope_index,
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
@@ -832,6 +850,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        # Extract mRoPE position-id builder from the model so VLM neat packing can
+        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
+        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -842,6 +865,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             cfg_model=self.cfg.model,
             cfg_ps=self.cfg.get("packed_sequence", None),
+            get_rope_index=get_rope_index,
         )
 
         # Build validation dataloader if the config provides it
@@ -855,6 +879,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                get_rope_index=get_rope_index,
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
@@ -1005,6 +1030,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 image_sizes = batch.pop("image_sizes", None)
                 image_position_ids = batch.pop("image_position_ids", None)
                 n_images_per_sample = batch.pop("n_images_per_sample", None)
+                pixel_values_videos = batch.pop("pixel_values_videos", None)
+                video_grid_thw = batch.pop("video_grid_thw", None)
+                n_videos_per_sample = batch.pop("n_videos_per_sample", None)
 
                 image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
                 if image_grid is None and image_sizes is not None:
@@ -1029,6 +1057,30 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
                     stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
                     stage0_model._vlm_chunk_idx = 0
+                elif pixel_values is not None:
+                    batch["pixel_values"] = pixel_values
+
+                if self.pp.info.has_first_stage and pixel_values_videos is not None and video_grid_thw is not None:
+                    stage0_model = self.model_parts[0]
+                    n_microbatches = self.pp._info.schedule._n_microbatches
+                    batch_size = input_ids.shape[0]
+
+                    pixel_values_videos_chunks, video_grid_thw_chunks = _chunk_vlm_media(
+                        pixel_values_videos,
+                        video_grid_thw,
+                        batch_size,
+                        n_microbatches,
+                        n_images_per_sample=n_videos_per_sample,
+                    )
+
+                    stage0_model._vlm_pixel_values_videos_chunks = pixel_values_videos_chunks
+                    stage0_model._vlm_video_grid_thw_chunks = video_grid_thw_chunks
+                    stage0_model._vlm_chunk_idx = 0
+                else:
+                    if pixel_values_videos is not None:
+                        batch["pixel_values_videos"] = pixel_values_videos
+                    if video_grid_thw is not None:
+                        batch["video_grid_thw"] = video_grid_thw
 
                 if self.pp.info.has_first_stage:
                     self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
@@ -1040,6 +1092,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     stage0_model = self.model_parts[0]
                     stage0_model._vlm_pixel_values_chunks = None
                     stage0_model._vlm_image_grid_hws_chunks = None
+                    stage0_model._vlm_chunk_idx = None
+                if self.pp.info.has_first_stage and pixel_values_videos is not None and video_grid_thw is not None:
+                    stage0_model = self.model_parts[0]
+                    stage0_model._vlm_pixel_values_videos_chunks = None
+                    stage0_model._vlm_video_grid_thw_chunks = None
                     stage0_model._vlm_chunk_idx = None
 
             if self.pp.info.has_last_stage:

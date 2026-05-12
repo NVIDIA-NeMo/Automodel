@@ -12,68 +12,82 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-node (4 nodes) fine-tune of Gemma4 31B with TP=4, PP=4 and DP=2.
-# Topology: 4 nodes x 8 GPUs = 32 GPUs total (TP4 x PP4 x DP2).
-# Gemma4 31B has 46 decoder layers; PP=4 splits them across 4 stages.
-#
-# Per-node launch (set MASTER_ADDR to the rendezvous host and NODE_RANK
-# per node, e.g. via SLURM/MPI):
-#
-#   torchrun --nnodes=4 --nproc-per-node=8 \
-#            --master-addr=$MASTER_ADDR --master-port=29500 \
-#            --node-rank=$NODE_RANK \
-#            examples/vlm_finetune/finetune.py \
-#            -c examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml
+# LoRA fine-tuning recipe for Qwen/Qwen3.6-27B on MedPix-VQA.
+# LoRA memory note: a one-step smoke run used ~16.3 GiB/GPU on 8xH100.
+# With FSDP2 DP sharding, 4xH100 should fit comfortably at the same microbatch.
+# automodel examples/vlm_finetune/qwen3_5/qwen3_6_27b_lora.yaml --nproc-per-node 4
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8
-  local_batch_size: 4
-  ckpt_every_steps: 500
-  val_every_steps: 500
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 100
   num_epochs: 2
+  max_steps: 100
 
 dist_env:
   backend: nccl
-  timeout_minutes: 60
+  timeout_minutes: 10
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 42
+  seed: 1234
   ranked: true
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: google/gemma-4-31B-it
-  torch_dtype: torch.bfloat16
-  use_liger_kernel: true
-  use_sdpa_patching: false
-  attn_implementation: eager
-  text_config:
-    use_cache: false
+  pretrained_model_name_or_path: Qwen/Qwen3.6-27B
+  attn_implementation: sdpa
+  torch_dtype: bfloat16
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-27B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: False
+  exclude_modules:
+    - "*vision_tower*"
+    - "*vision*"
+    - "*visual*"
+    - "*image_encoder*"
+    - "*lm_head*"
+    - "*audio*"
+  dim: 8
+  alpha: 32
+  use_triton: True
 
 checkpoint:
-  enabled: true
-  checkpoint_dir: vlm_checkpoints/gemma4_31b_it_tp4_pp4/
-  model_save_format: torch_save
+  enabled: false
+  checkpoint_dir: /tmp/checkpoints/qwen3_6_27b_lora/
+  model_save_format: safetensors
   save_consolidated: false
 
 distributed:
-  strategy: fsdp2
-  dp_size: none
-  tp_size: 4
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
   cp_size: 1
-  pp_size: 4
+  pp_size: 1
+  dp_replicate_size: 1
   ep_size: 1
-
   sequence_parallel: false
   activation_checkpointing: true
 
   pipeline:
-    pp_schedule: 1f1b
+    pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
+    layers_per_stage: 2
     scale_grads_in_schedule: false
+    round_virtual_stages_to_pp_multiple: up
+    dtype: bf16
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -81,42 +95,33 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
-  split: train[:1000]
+  split: train
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
-  pin_memory: true
-  drop_last: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation[:500]
+  split: validation
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1e-5
-  weight_decay: 0.01
   betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0.01
 
-lr_scheduler:
-  lr_decay_style: cosine
-
-freeze_config:
-  freeze_embeddings: true
-  freeze_vision_tower: true
-  freeze_audio_tower: true
-  freeze_language_model: false
-
-ci:
-  recipe_owner: athitten
-  time: "00:30:00"
-  nodes: 4
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_name>
