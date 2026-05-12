@@ -291,7 +291,7 @@ class TestDeepseekV4ModelSmoke:
             for seq in [1, 4, 16, 32]:
                 input_ids = torch.randint(0, cfg.vocab_size, (1, seq))
                 with torch.no_grad():
-                    logits = model(input_ids)
+                    logits = model(input_ids).logits
                 assert logits.shape == (1, seq, cfg.vocab_size)
 
 
