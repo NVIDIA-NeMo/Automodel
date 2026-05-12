@@ -2622,6 +2622,80 @@ class TestChunkVlmMedia:
         assert pv_chunks[0].shape[0] == 4
         assert pv_chunks[1].shape[0] == 9 + 6 + 16
 
+    def test_uneven_batch_size_general_branch_covers_all_samples(self):
+        """batch_size not divisible by n_microbatches must not drop trailing samples.
+
+        torch.tensor.chunk(n) used by schedule.step on input_ids returns ceil-sized
+        chunks. _chunk_vlm_media must mirror that or the last sample's images are
+        silently lost while its text still flows through the schedule.
+        """
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 7 samples across 3 microbatches: ceil(7/3)=3, expect splits [3, 3, 1].
+        batch_size, n_microbatches = 7, 3
+        image_grid = torch.tensor([[1, 2, 2]] * batch_size)  # 4 patches/image
+        pixel_values = torch.randn(int(image_grid.prod(dim=1).sum().item()), 64)
+        n_images_per_sample = torch.tensor([1] * batch_size)
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+            n_images_per_sample=n_images_per_sample,
+        )
+
+        assert len(ig_chunks) == n_microbatches
+        assert [c.shape[0] for c in ig_chunks] == [3, 3, 1]
+        assert sum(c.shape[0] for c in ig_chunks) == batch_size  # no sample dropped
+        assert sum(c.shape[0] for c in pv_chunks) == pixel_values.shape[0]
+
+    def test_uneven_batch_size_legacy_branch_covers_all_images(self):
+        """Legacy 1-image-per-sample branch must also use ceil division."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 5 images across 3 microbatches: ceil(5/3)=2, expect splits [2, 2, 1].
+        batch_size, n_microbatches = 5, 3
+        image_grid = torch.tensor([[1, 2, 2]] * batch_size)
+        pixel_values = torch.randn(int(image_grid.prod(dim=1).sum().item()), 64)
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+        )
+
+        assert len(ig_chunks) == n_microbatches
+        assert [c.shape[0] for c in ig_chunks] == [2, 2, 1]
+        assert sum(c.shape[0] for c in ig_chunks) == batch_size
+
+    def test_uneven_batch_size_gemma4_multi_image_branch_covers_all_samples(self):
+        """Gemma4 multi-image branch (3D pixel_values + counts) must also use ceil."""
+        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
+
+        # 7 samples across 3 microbatches: ceil(7/3)=3, expect sample splits [3, 3, 1].
+        # Image counts per split are [2 + 1 + 0, 3 + 1 + 2, 1] = [3, 6, 1].
+        batch_size, n_microbatches = 7, 3
+        max_patches = 4
+        n_images_per_sample = torch.tensor([2, 1, 0, 3, 1, 2, 1])
+        n_images = int(n_images_per_sample.sum().item())
+        image_grid = torch.tensor([[1, 2, 2]] * n_images)
+        pixel_values = torch.randn(n_images, max_patches, 64)  # 3D, one row per image.
+
+        pv_chunks, ig_chunks = _chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+            n_images_per_sample=n_images_per_sample,
+        )
+
+        assert len(ig_chunks) == n_microbatches
+        assert [c.shape[0] for c in ig_chunks] == [3, 6, 1]
+        assert [c.shape[0] for c in pv_chunks] == [3, 6, 1]
+        assert sum(c.shape[0] for c in pv_chunks) == n_images
+
 
 # -----------------------------------------------------------------------------
 # get_rope_index forwarding tests for build_dataloader
