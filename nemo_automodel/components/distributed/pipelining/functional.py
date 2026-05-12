@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
     get_text_module,
+    model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
 
@@ -509,9 +510,18 @@ def split_model_into_stages(
         """Build a pipeline stage from specified module names."""
         # Deep copy the model
         stage_model = copy.deepcopy(model)
-        patch_hf_model_for_pp(
-            stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
-        )
+        # Two model implementation paths:
+        #   - HF / dedicated-patch path (LLMs, Gemma4 VLM, Mistral3 VLM): the
+        #     PP-aware forward lives in ``patch_hf_model_for_pp``.
+        #   - Custom-impl path that handles PP itself (Qwen3-VL-MoE, KimiVL,
+        #     Kimi-K2.5-VL, Qwen3.5-MoE): the model class declares
+        #     ``_pp_keep_self_forward = True`` so its own ``forward`` (which
+        #     pulls per-microbatch pixel_values from ``_vlm_pixel_values_chunks``)
+        #     stays intact.
+        if not model_keeps_self_forward(stage_model):
+            patch_hf_model_for_pp(
+                stage_model, patch_inner_model=patch_inner_model, patch_causal_lm_model=patch_causal_lm_model
+            )
         # Create a set of modules to keep
         modules_to_keep = set(module_names)
         modules_sorted = sorted(modules_to_keep, key=lambda x: x.split(".")[-1])

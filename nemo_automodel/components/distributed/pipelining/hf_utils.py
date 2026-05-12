@@ -586,15 +586,32 @@ def _is_gemma4_vlm(model: torch.nn.Module) -> bool:
     return getattr(text_config, "model_type", None) == "gemma4"
 
 
+def model_keeps_self_forward(model: torch.nn.Module) -> bool:
+    """Return True when *model* opts out of pipeline-aware forward patching.
+
+    Used by the pipeline split call site to skip ``patch_hf_model_for_pp``
+    entirely for models whose own ``forward`` is already PP-aware (typically
+    because it pulls pixel_values out of ``self._vlm_pixel_values_chunks``
+    set by the training loop). Currently set on Qwen3-VL-MoE, Qwen3.5-MoE,
+    KimiVL, and Kimi-K2.5-VL.
+    """
+    return bool(getattr(type(model), "_pp_keep_self_forward", False))
+
+
 def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
+
+    The caller is responsible for skipping this function when the model
+    opts out via ``model_keeps_self_forward(model)``. This function itself
+    only branches on the patch *flavor*:
 
     - Gemma4 VLM (``config.model_type == 'gemma4'`` with a nested text
       backbone at ``model.model.language_model``): patch the text backbone
       and VLM outer with Gemma4-specific VLM-aware forwards.
-    - Other models with ``model.model`` (e.g., LlamaForCausalLM and most
-      other VLMs): patch inner and outer with the generic CausalLM
-      forwards.
+    - Mistral3 VLM: patch the text backbone with the generic inner forward
+      and the outer with the Mistral3-specific VLM forward.
+    - Other models with ``model.model`` (e.g., LlamaForCausalLM and other
+      LLMs): patch inner and outer with the generic CausalLM forwards.
     - Else: patch the module itself with the generic inner forward.
     """
     inner_model = getattr(model, "model", None)
@@ -633,6 +650,27 @@ def init_hf_model_buffers(model: torch.nn.Module, device: torch.device) -> None:
             rotary_owner.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
 
+# VLM model_types whose vision routing is handled inside ``patch_hf_model_for_pp``
+# (a dedicated ``pipeline_forward_*_vlm`` function reads ``_vlm_pixel_values_chunks``).
+_PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD: tuple[str, ...] = ("gemma4", "mistral3")
+
+
+def _is_vlm(model: torch.nn.Module) -> bool:
+    """Best-effort check for whether ``model`` is a vision-language model.
+
+    Looks at the standard VLM markers used elsewhere in the codebase: a nested
+    ``text_config``, a ``vision_tower`` attribute on the outer model, or a
+    ``visual`` attribute on the inner model (Qwen-VL convention).
+    """
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "text_config", None) is not None:
+        return True
+    if hasattr(model, "vision_tower"):
+        return True
+    inner = getattr(model, "model", None)
+    return inner is not None and (hasattr(inner, "vision_tower") or hasattr(inner, "visual"))
+
+
 def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
     """Validate if a model is compatible with torch.distributed.pipelining."""
     model_name = getattr(getattr(model, "config", object()), "pretrained_model_name_or_path", "Unknown")
@@ -665,6 +703,32 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
                 )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")
+
+        # VLM PP routing: vision_tower only runs on stage 0, and pixel_values
+        # are passed through the training loop's _vlm_pixel_values_chunks
+        # mechanism. The model class must either (a) be on the dedicated PP
+        # forward list (Gemma4 / Mistral3) or (b) declare
+        # _pp_keep_self_forward = True so its own forward is preserved.
+        # Otherwise patch_hf_model_for_pp replaces forward with the generic
+        # CausalLM path, which silently drops pixel_values and trains the
+        # language model on placeholder text embeddings.
+        if _is_vlm(model):
+            mt_outer = getattr(config, "model_type", None)
+            mt_inner = getattr(getattr(config, "text_config", None), "model_type", None)
+            has_dedicated = (
+                mt_outer in _PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD
+                or mt_inner in _PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD
+            )
+            keeps_own = bool(getattr(type(model), "_pp_keep_self_forward", False))
+            if not has_dedicated and not keeps_own:
+                issues.append(
+                    f"VLM model_type='{mt_outer}' is not on the pipeline-aware list "
+                    f"({', '.join(_PP_VLM_MODEL_TYPES_WITH_DEDICATED_FORWARD)}) and the model class "
+                    f"{type(model).__name__} does not declare ``_pp_keep_self_forward = True``. "
+                    "Without one of these, patch_hf_model_for_pp will replace the model's forward "
+                    "with the generic CausalLM forward, and pixel_values stored in "
+                    "``_vlm_pixel_values_chunks`` will never reach the vision tower."
+                )
 
     if issues:
         error_msg = f"Model '{model_name}' is not compatible with pipeline parallelism:\n\n"
