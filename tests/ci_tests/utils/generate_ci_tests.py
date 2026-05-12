@@ -268,6 +268,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         job["variables"]["MODEL_FAMILY"] = model_name
         pipeline[f'{config_name}'] = job
         if vllm_job:
+            vllm_job["variables"]["MODEL_FAMILY"] = model_name
             pipeline[f"{config_name}_vllm_deploy"] = vllm_job
 
     return pipeline
