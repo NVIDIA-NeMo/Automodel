@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+from nemo_automodel.components.distributed.pipelining.vlm_utils import chunk_vlm_media, stage_vlm_media_for_pp
 
-__all__ = ["AutoPipeline"]
+__all__ = ["AutoPipeline", "chunk_vlm_media", "stage_vlm_media_for_pp"]

@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.pipelining.vlm_utils import chunk_vlm_media
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
@@ -1451,6 +1452,17 @@ class TestForwardBackwardStepPP:
             "image_grid_hws": image_grid_hws,
         }
         loss_buffer = []
+        captured_chunks = {}
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            captured_chunks["chunk_idx"] = model._vlm_chunk_idx
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step = MagicMock(side_effect=step_side_effect)
 
         pp_recipe._forward_backward_step(
             idx=0,
@@ -1463,6 +1475,11 @@ class TestForwardBackwardStepPP:
 
         # Verify chunking happened correctly
         model = pp_recipe.model_parts[0]
+        assert captured_chunks["chunk_idx"] == 0
+        assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:13])
+        assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[13:])
+        assert torch.equal(captured_chunks["image_grid"][0], image_grid_hws[:2])
+        assert torch.equal(captured_chunks["image_grid"][1], image_grid_hws[2:])
         assert model._vlm_pixel_values_chunks is None  # Cleared after step
         assert model._vlm_image_grid_hws_chunks is None
         assert model._vlm_chunk_idx is None
@@ -1516,6 +1533,54 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp.info.schedule.step.assert_called_once()
 
         # Verify loss was computed
+        assert len(loss_buffer) == 1
+
+    def test_pp_vlm_chunking_qwen35_ep4_pp2_local_batch_images(self, pp_recipe, monkeypatch):
+        """Qwen3.5 35B EP4/PP2-style local batch keeps proper image chunks during schedule.step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        )
+
+        image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
+        patch_counts = image_grid_thw.prod(dim=1)
+        pixel_values = torch.arange(int(patch_counts.sum()) * 4, dtype=torch.float32).reshape(-1, 4)
+        batch = {
+            "labels": torch.randint(0, 100, (2, 10)),
+            "input_ids": torch.randint(0, 100, (2, 10)),
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "n_images_per_sample": torch.tensor([1, 1]),
+        }
+        loss_buffer = []
+        captured_chunks = {}
+
+        def step_side_effect(*args, **kwargs):
+            model = pp_recipe.model_parts[0]
+            captured_chunks["pixel_values"] = [chunk.clone() for chunk in model._vlm_pixel_values_chunks]
+            captured_chunks["image_grid"] = [chunk.clone() for chunk in model._vlm_image_grid_hws_chunks]
+            for _ in range(2):
+                kwargs["losses"].append(torch.tensor(0.5))
+
+        pp_recipe.pp.info.schedule.step = MagicMock(side_effect=step_side_effect)
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=loss_buffer,
+            num_label_tokens=20,
+            num_batches=1,
+            is_train=True,
+        )
+
+        split_at = int(patch_counts[0].item())
+        assert torch.equal(captured_chunks["pixel_values"][0], pixel_values[:split_at])
+        assert torch.equal(captured_chunks["pixel_values"][1], pixel_values[split_at:])
+        assert torch.equal(captured_chunks["image_grid"][0], image_grid_thw[:1])
+        assert torch.equal(captured_chunks["image_grid"][1], image_grid_thw[1:])
+        assert pp_recipe.model_parts[0]._vlm_pixel_values_chunks is None
         assert len(loss_buffer) == 1
 
     def test_pp_vlm_chunking_mismatched_images_raises(self, pp_recipe, monkeypatch):
@@ -2360,34 +2425,30 @@ def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _chunk_vlm_media tests
+# chunk_vlm_media tests
 # ---------------------------------------------------------------------------
 
 
 class TestChunkVlmMedia:
-    """Tests for _chunk_vlm_media PP microbatch splitting."""
+    """Tests for PP VLM media microbatch splitting."""
 
     def test_4d_pixel_values_simple_chunk(self):
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         pixel_values = torch.randn(4, 3, 56, 56)
         image_grid = torch.tensor([[1, 2, 2]] * 4)
-        pv_chunks, ig_chunks = _chunk_vlm_media(pixel_values, image_grid, batch_size=4, n_microbatches=2)
+        pv_chunks, ig_chunks = chunk_vlm_media(pixel_values, image_grid, batch_size=4, n_microbatches=2)
         assert len(pv_chunks) == 2
         assert pv_chunks[0].shape[0] == 2
         assert pv_chunks[1].shape[0] == 2
 
     def test_n_images_per_sample_packed(self):
         """Packed sequences: each batch item has variable number of images."""
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         # 2 batch items: first has 3 images, second has 1 image
         # image_grid: 4 images total, each 2x2 patches = 4 patches each
         image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]])
         pixel_values = torch.randn(16, 64)  # 4 images * 4 patches = 16 patches
         n_images_per_sample = torch.tensor([3, 1])
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
+        pv_chunks, ig_chunks = chunk_vlm_media(
             pixel_values, image_grid, batch_size=2, n_microbatches=2,
             n_images_per_sample=n_images_per_sample,
         )
@@ -2398,14 +2459,12 @@ class TestChunkVlmMedia:
         assert pv_chunks[1].shape[0] == 4   # 1 image * 4 patches
 
     def test_legacy_one_image_per_sample(self):
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         # 4 samples, 1 image each with different patch counts
         image_grid = torch.tensor([[1, 2, 2], [1, 3, 3], [1, 2, 2], [1, 3, 3]])
         patch_counts = image_grid.prod(dim=1)  # [4, 9, 4, 9] = 26 total
         pixel_values = torch.randn(int(patch_counts.sum()), 64)
 
-        pv_chunks, ig_chunks = _chunk_vlm_media(
+        pv_chunks, ig_chunks = chunk_vlm_media(
             pixel_values, image_grid, batch_size=4, n_microbatches=2,
         )
         assert len(pv_chunks) == 2
@@ -2414,17 +2473,36 @@ class TestChunkVlmMedia:
         assert pv_chunks[0].shape[0] == 4 + 9  # first 2 images
         assert pv_chunks[1].shape[0] == 4 + 9  # last 2 images
 
+    def test_qwen35_ep4_pp2_style_n_images_per_sample(self):
+        """EP does not affect chunking; PP2 should split media by batch sample ownership."""
+        image_grid = torch.tensor([[1, 2, 2], [1, 1, 3], [1, 3, 3], [1, 2, 4]])
+        patch_counts = image_grid.prod(dim=1)
+        pixel_values = torch.randn(int(patch_counts.sum()), 64)
+        n_images_per_sample = torch.tensor([1, 0, 2, 1])
+
+        pv_chunks, ig_chunks = chunk_vlm_media(
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
+            n_images_per_sample=n_images_per_sample,
+        )
+
+        assert len(pv_chunks) == 2
+        assert torch.equal(ig_chunks[0], image_grid[:1])
+        assert torch.equal(ig_chunks[1], image_grid[1:])
+        assert pv_chunks[0].shape[0] == int(patch_counts[:1].sum())
+        assert pv_chunks[1].shape[0] == int(patch_counts[1:].sum())
+
     def test_fallback_mismatched_images_raises(self):
         """n_images != batch_size with no n_images_per_sample now raises rather
         than silently emptying mb1..N (which previously caused trailing microbatches
         to scatter media tokens into empty pixel_values)."""
-        from nemo_automodel.recipes.vlm.finetune import _chunk_vlm_media
-
         image_grid = torch.tensor([[1, 2, 2], [1, 2, 2], [1, 2, 2]])
         pixel_values = torch.randn(12, 64)  # 3 images but batch_size=2
 
         with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
-            _chunk_vlm_media(
+            chunk_vlm_media(
                 pixel_values, image_grid, batch_size=2, n_microbatches=2,
             )
 

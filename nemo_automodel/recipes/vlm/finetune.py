@@ -56,7 +56,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.pipelining import AutoPipeline, stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -251,98 +251,6 @@ def build_loss_fn(cfg_loss):
         The instantiated loss function.
     """
     return cfg_loss.instantiate()
-
-
-def _chunk_vlm_media(
-    pixel_values: torch.Tensor,
-    image_grid: torch.Tensor,
-    batch_size: int,
-    n_microbatches: int,
-    n_images_per_sample: torch.Tensor | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Split VLM pixel_values and image_grid into PP microbatch chunks.
-
-    Handles four layouts:
-    1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
-    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
-    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
-       ``n_images_per_sample`` (general case, works for packed sequences too).
-    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
-    """
-    n_images = image_grid.shape[0]
-    pixel_values_chunks: list[torch.Tensor] = []
-    image_grid_chunks: list[torch.Tensor] = []
-
-    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
-        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
-        # Both are indexed by image along dim 0, one entry per sample.
-        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
-        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
-        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
-        # All images are padded to the same max_patches, so split by image count directly.
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
-            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[img_start:img_end])
-            image_grid_chunks.append(image_grid[img_start:img_end])
-    elif n_images_per_sample is not None:
-        # General case: use per-sample image counts to associate images with
-        # batch items.  Works for packed sequences (multiple images per item).
-        patch_counts = image_grid.prod(dim=1)
-        cumsum_patches = torch.cumsum(patch_counts, dim=0)
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-
-        samples_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-
-            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
-            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
-            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    elif n_images == batch_size:
-        # Legacy: exactly 1 image per sample.
-        patch_counts = image_grid.prod(dim=1)
-        cumsum = torch.cumsum(patch_counts, dim=0)
-
-        images_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            img_start = mb_idx * images_per_mb
-            img_end = min(img_start + images_per_mb, n_images)
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    else:
-        # No layout matched. Previously this branch logged a warning and gave all
-        # images to mb0 with empty tensors for mb1..N, but trailing microbatches
-        # whose text still contains media tokens would then scatter into empty
-        # pixel_values — silent corruption. Fail loudly so the calling collate is
-        # forced to provide n_images_per_sample (or align n_images with batch_size)
-        # instead of training on broken data.
-        raise ValueError(
-            "VLM PP chunking cannot align pixel_values with the batch: "
-            f"pixel_values.shape={tuple(pixel_values.shape)}, "
-            f"image_grid.shape={tuple(image_grid.shape)}, "
-            f"n_images={n_images}, batch_size={batch_size}, "
-            f"n_images_per_sample={'set' if n_images_per_sample is not None else 'None'}. "
-            "Either ensure pixel_values has shape [batch_size, ...] (one media tensor per "
-            "sample) or pass n_images_per_sample so the chunker can map images to samples."
-        )
-
-    return pixel_values_chunks, image_grid_chunks
 
 
 def build_dataloader(
@@ -1017,51 +925,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 input_ids = batch.pop("input_ids")
                 self.pp.update_seq_len(input_ids.shape[1])
 
-                # VLM: Custom chunking for pixel_values and image_grid
-                # These tensors have non-standard structure that can't be naively chunked by dim 0
-                # TODO: @HuiyingLi properly handle pixel_values split
-                pixel_values = batch.pop("pixel_values", None)
-                image_grid_hws = batch.pop("image_grid_hws", None)
-                image_grid_thw = batch.pop("image_grid_thw", None)
-                image_sizes = batch.pop("image_sizes", None)
-                image_position_ids = batch.pop("image_position_ids", None)
-                n_images_per_sample = batch.pop("n_images_per_sample", None)
-
-                image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
-                if image_grid is None and image_sizes is not None:
-                    image_grid = image_sizes
-                if image_grid is None and image_position_ids is not None:
-                    image_grid = image_position_ids
-
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    n_microbatches = self.pp._info.schedule._n_microbatches
-                    batch_size = input_ids.shape[0]
-
-                    pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
-                        pixel_values,
-                        image_grid,
-                        batch_size,
-                        n_microbatches,
-                        n_images_per_sample=n_images_per_sample,
-                    )
-
-                    # Store pre-chunked tensors on model for forward to use
-                    stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-                    stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
-                    stage0_model._vlm_chunk_idx = 0
-
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
-                else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
-
-                # Clear stored VLM chunks after PP step
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    stage0_model._vlm_pixel_values_chunks = None
-                    stage0_model._vlm_image_grid_hws_chunks = None
-                    stage0_model._vlm_chunk_idx = None
+                with stage_vlm_media_for_pp(self.pp, self.model_parts, batch, input_ids):
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
