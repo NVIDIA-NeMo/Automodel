@@ -1,0 +1,126 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DFlash draft-model SFT recipe.
+#
+# Trains z-lab/Qwen3-4B-DFlash-b16 (draft) conditioned on Qwen/Qwen3-4B (target).
+# The target model is frozen; only the draft Transformer layers are updated.
+#
+# Usage (8-GPU):
+#   python -m torch.distributed.run --nproc-per-node=8 \
+#       examples/dllm_sft/finetune.py \
+#       -c examples/dllm_sft/dflash_sft.yaml
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: null
+  num_epochs: 6
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+seed: 42
+
+wandb:
+  project: dflash-sft
+  name: dflash-qwen3-4b-run
+
+# Draft model — loaded via AutoModel (custom DFlashDraftModel class).
+# Receives FSDP2 sharding; only these weights are updated.
+model:
+  _target_: transformers.AutoModel.from_pretrained
+  pretrained_model_name_or_path: z-lab/Qwen3-4B-DFlash-b16
+  trust_remote_code: true
+  torch_dtype: bfloat16
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/dflash-qwen3-4b
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: null
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy: null
+
+# Required by DiffusionLMSFTRecipe parent — mode must be 'dflash'.
+dllm:
+  mode: dflash
+  mask_token_id: null
+  eps: 0.001
+  supervise_padding: true
+
+# DFlash-specific configuration.
+# target_model_id: frozen causal LM whose hidden states condition the draft.
+# block_size 0 reads from the draft model config (16 for *-b16 drafts).
+# loss_decay_gamma 0 selects the paper default for the block size.
+dflash:
+  target_model_id: Qwen/Qwen3-4B
+  target_torch_dtype: bfloat16
+  block_size: 0
+  loss_decay_gamma: 0.0
+  num_blocks_per_sample: 1
+
+# Placeholder loss_fn — DFlashStrategy uses DFlashDecayLoss internally.
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 6.0e-4
+  weight_decay: 0.0
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  init_lr: 0.0
+  min_lr: 0.0
+  warmup_ratio: 0.04        # matches DFlash paper Appendix A.1
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
+  seq_length: 3072
+  truncation: true
+  unshifted: true
+  tokenizer:
+    # Tokenizer comes from the target model (shared with draft)
+    pretrained_model_name_or_path: Qwen/Qwen3-4B
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  group_by_length: true
