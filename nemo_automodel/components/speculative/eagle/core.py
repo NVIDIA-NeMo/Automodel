@@ -114,20 +114,17 @@ class Eagle3TrainerModule(nn.Module):
         # attention layer appends to on every step. Re-created per batch.
         cache_hidden: list[list[torch.Tensor]] = [[], []]
 
-        # SpecForge weights step i with ``0.8 ** i`` -- earlier TTT steps
-        # are easier (less compounding error) so they dominate the loss,
-        # while later steps still contribute a smaller signal. The sum is
-        # NOT renormalized; matching SpecForge keeps the gradient magnitude
-        # comparable across implementations at the same learning rate.
-        # Reference: SpecForge ``scripts/train_eagle3.py::run_backward_and_update``.
-        #
-        # LR tuning note: the effective per-batch gradient magnitude is
-        # proportional to ``Σ_{i=0..ttt_steps-1} 0.8^i`` (~2.95 at the
-        # default ``ttt_steps=4``). If you change this schedule -- either
-        # the decay constant, the number of TTT steps, or by reintroducing
-        # an average over steps -- scale the optimizer LR by the inverse
-        # ratio of the new vs. old weight sum to keep updates comparable.
-        # ``clip_grad_norm`` is the safety net, not the LR scheduler.
+        # Weighted average across TTT steps: step ``i`` is weighted by
+        # ``0.8 ** i`` and the sum is divided by the total weight. This
+        # keeps the EAGLE-3 / SpecForge decay schedule (earlier steps
+        # dominate, later steps still contribute a smaller signal) while
+        # making the loss magnitude *invariant* to the choice of
+        # ``ttt_steps`` and the decay constant -- a proper weighted mean
+        # always lands in the same ``~ln(draft_vocab_size)`` range at
+        # init, and the optimizer LR does not need to be rescaled when
+        # the TTT schedule changes. SpecForge omits this normalization;
+        # we keep it deliberately so config knobs stay decoupled from LR.
+        weight_sum = sum(0.8**i for i in range(self.ttt_steps))
         for step_idx in range(self.ttt_steps):
             cur_hidden_states = self.draft_model(
                 input_ids=cur_input_ids,
@@ -154,5 +151,6 @@ class Eagle3TrainerModule(nn.Module):
                 cur_position_mask = _shift_left_with_zero(cur_position_mask)
                 cur_target_probs = _shift_left_with_zero(cur_target_probs)
 
+        avg_loss = running_loss / weight_sum
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=running_loss, accuracy=accuracy, valid_tokens=running_valid)
+        return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)

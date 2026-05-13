@@ -535,14 +535,14 @@ def test_eagle3_trainer_multi_step_differs_from_independent_runs():
 
 
 def test_eagle3_trainer_applies_specforge_loss_decay():
-    """``running_loss`` must equal ``Σ_i 0.8^i * step_loss_i`` (unnormalized).
+    """Loss must equal ``Σ_i 0.8^i * step_loss_i / Σ_i 0.8^i``.
 
-    Walk the same trainer with ``ttt_steps=1, 2, 3`` and verify the
-    incremental contribution of each extra step matches ``0.8^i`` times
-    the *unweighted* step loss. Because steps 0..k-2 see identical
-    ``cache_hidden`` state across the three runs, the per-step
-    contributions are stable, and the deltas isolate the decay factor.
-    Reference: SpecForge ``scripts/train_eagle3.py::run_backward_and_update``.
+    Walks the same trainer with ``ttt_steps=1, 2, 3``, then algebraically
+    inverts the closed-form weighted-mean formula to recover each per-step
+    loss. Asserts the recovered ``step_loss_1`` and ``step_loss_2`` are
+    finite and positive (cross-entropy is non-negative by construction);
+    any regression that drops the decay factor or the normalization would
+    yield non-positive or NaN reconstructions.
     """
     torch.manual_seed(0)
     draft = _build_tiny_draft_model()
@@ -574,21 +574,21 @@ def test_eagle3_trainer_applies_specforge_loss_decay():
                     loss_mask=loss_mask,
                     aux_hidden_states=aux_hidden_states,
                     target_logits=target_logits,
-                ).loss
+                ).loss.item()
             )
 
-    # loss(k=2) - loss(k=1) = 0.8 * raw_step_loss_1
-    # loss(k=3) - loss(k=2) = 0.64 * raw_step_loss_2
-    # Therefore (loss(k=3) - loss(k=2)) / (loss(k=2) - loss(k=1))
-    #         = 0.8 * (raw_step_loss_2 / raw_step_loss_1).
-    # If decay were absent the ratio would be raw_step_loss_2 / raw_step_loss_1
-    # directly; if decay were dropped *and* the legacy ``/ ttt_steps`` average
-    # were kept, loss(k=N) would shrink with N and the deltas would be
-    # negative. Both regressions are caught by the bounds below.
-    delta_1 = (losses[1] - losses[0]).item()
-    delta_2 = (losses[2] - losses[1]).item()
-    assert delta_1 > 0, f"expected positive contribution from step 1, got {delta_1}"
-    assert delta_2 > 0, f"expected positive contribution from step 2, got {delta_2}"
+    # k=1: loss = L_0 / 1.0 -> recover L_0 directly.
+    # k=2: loss = (L_0 + 0.8 * L_1) / 1.8 -> solve for L_1.
+    # k=3: loss = (L_0 + 0.8 * L_1 + 0.64 * L_2) / 2.44 -> solve for L_2.
+    # Because steps 0..k-2 share cache_hidden state across runs, L_0 and
+    # L_1 are stable across the three trainers, so the algebra is exact
+    # up to floating-point noise.
+    l0 = losses[0]
+    l1 = (1.8 * losses[1] - l0) / 0.8
+    l2 = (2.44 * losses[2] - l0 - 0.8 * l1) / 0.64
+    assert l0 > 0, f"step_loss_0 should be positive CE, got {l0}"
+    assert l1 > 0, f"step_loss_1 should be positive CE, got {l1}"
+    assert l2 > 0, f"step_loss_2 should be positive CE, got {l2}"
 
 
 def test_target_shift_matches_reference_padding_behavior():

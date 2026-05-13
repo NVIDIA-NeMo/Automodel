@@ -25,12 +25,9 @@ recipe_args:
   max_grad_norm: 1.0
 
 optimizer:
-  # LR is calibrated against the SpecForge-style weighted loss
-  # ``Σ_{i=0..ttt_steps-1} 0.8^i * step_loss_i`` (unnormalized).
-  # If you change ``ttt_steps`` or the decay constant in
-  # ``components/speculative/eagle/core.py``, rescale this LR by the
-  # inverse ratio of the new vs. old weight sum to keep update magnitude
-  # comparable. See the equivalent note in the PerfectBlend config.
+  # TTT loss is a weighted mean (``Σ 0.8^i * L_i / Σ 0.8^i``), so LR is
+  # invariant to ``ttt_steps`` and to the decay constant in
+  # ``components/speculative/eagle/core.py``.
   lr: 1.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.0
