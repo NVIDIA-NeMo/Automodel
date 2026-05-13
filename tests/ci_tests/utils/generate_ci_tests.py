@@ -60,7 +60,7 @@ def slurm_time_multiplier(time: str, multiplier: int):
 # Scopes that auto-discover all configs via rglob (no recipe list needed).
 # All other scope/folder combinations read from {scope}_recipes.yml.
 AUTO_DISCOVER_SCOPES = {
-    "release": ["llm_finetune", "vlm_finetune"],
+    "release": ["llm_finetune", "vlm_finetune", "diffusion_finetune"],
     "performance": ["llm_benchmark", "vlm_benchmark"],
 }
 
@@ -265,8 +265,10 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str):
         job, vllm_job = generate_job(config, config_override, scope, test_folder, automodel_dir)
         if job is None:
             continue  # skipped via ci.known_issue_id (no allow_failure)
+        job["variables"]["MODEL_FAMILY"] = model_name
         pipeline[f'{config_name}'] = job
         if vllm_job:
+            vllm_job["variables"]["MODEL_FAMILY"] = model_name
             pipeline[f"{config_name}_vllm_deploy"] = vllm_job
 
     return pipeline

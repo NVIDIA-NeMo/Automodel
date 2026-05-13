@@ -434,6 +434,10 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
 class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForConditionalGeneration, MoEFSDPSyncMixin):
     """Qwen3-VL conditional generation model using the Qwen3-MoE backend components."""
 
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -526,21 +530,26 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
     ):
         # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
         pixel_values = kwargs.get("pixel_values", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            # Check if we have media tokens in input_ids
-            # 151655 = <|image_pad|>, 151656 = <|video_pad|>
-            has_media_tokens = input_ids is not None and ((input_ids == 151655).any() or (input_ids == 151656).any())
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        if input_ids is not None:
+            has_image_tokens = (input_ids == 151655).any()
+            has_video_tokens = (input_ids == 151656).any()
+        else:
+            has_image_tokens = False
+            has_video_tokens = False
 
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        consumed_vlm_chunk = False
+
+        if pixel_values is None and has_image_tokens:
+            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            if image_chunks is not None and chunk_idx < len(image_chunks):
+                pixel_values = image_chunks[chunk_idx]
+                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
+                    image_grid_hws = image_grid_chunks[chunk_idx]
                     # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
                     if image_grid_hws is not None and image_grid_hws.numel() > 0:
                         if image_grid_hws.shape[-1] == 2:
@@ -550,9 +559,23 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                             image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
                         else:
                             image_grid_thw = image_grid_hws
-                    kwargs["pixel_values"] = pixel_values
-                    kwargs["image_grid_thw"] = image_grid_thw
-                    self._vlm_chunk_idx = chunk_idx + 1
+                kwargs["pixel_values"] = pixel_values
+                kwargs["image_grid_thw"] = image_grid_thw
+                consumed_vlm_chunk = True
+
+        if pixel_values_videos is None and has_video_tokens:
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if video_chunks is not None and chunk_idx < len(video_chunks):
+                pixel_values_videos = video_chunks[chunk_idx]
+                video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
+                    video_grid_thw = video_grid_chunks[chunk_idx]
+                kwargs["pixel_values_videos"] = pixel_values_videos
+                kwargs["video_grid_thw"] = video_grid_thw
+                consumed_vlm_chunk = True
+
+        if consumed_vlm_chunk:
+            self._vlm_chunk_idx = chunk_idx + 1
 
         # With pipeline parallelism, attention_mask (from batch kwargs) can have a
         # different sequence length than inputs_embeds (hidden states from prev stage).
