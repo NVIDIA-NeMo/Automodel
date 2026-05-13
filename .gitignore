@@ -6,6 +6,10 @@ output
 output_2048
 result
 *.pt
+
+# tooling artifacts
+.codex
+.humanize/
 tests/data/asr
 .DS_Store
 bert.pt.json
