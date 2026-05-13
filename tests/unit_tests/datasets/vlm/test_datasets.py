@@ -1304,3 +1304,146 @@ class TestRobustDatasetWrapperFakeImageInjection:
         # Original conversation should be unchanged
         assert len(original_conv[0]["content"]) == 1
         assert original_conv[0]["content"][0]["type"] == "text"
+
+
+# ---------------------------------------------------------------------------
+# WenetSpeech_Wu ASR dataset builder (Qwen3-Omni)
+# ---------------------------------------------------------------------------
+import io as _io
+import sys as _sys
+
+import numpy as _np
+import soundfile as _sf
+
+
+def _make_wav_bytes(sampling_rate=16000, duration_seconds=0.5, frequency_hz=440.0):
+    """Generate a short mono WAV blob for synthetic tests."""
+    t = _np.linspace(0, duration_seconds, int(sampling_rate * duration_seconds), endpoint=False)
+    waveform = 0.1 * _np.sin(2 * _np.pi * frequency_hz * t).astype(_np.float32)
+    buf = _io.BytesIO()
+    _sf.write(buf, waveform, sampling_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+class _SyntheticHFRows(list):
+    """Minimal stand-in for a HuggingFace Dataset over our two-column fixture.
+
+    Supports ``column_names``, ``cast_column`` (no-op since we already shape the
+    cells like ``Audio(decode=False)`` would), and iteration.
+    """
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.column_names = sorted({k for row in rows for k in row.keys()})
+
+    def cast_column(self, column_name, _feature):
+        return self
+
+
+def test_make_wenetspeech_wu_asr_dataset_bytes_branch(monkeypatch):
+    """The bytes branch decodes via soundfile and emits the Qwen3-Omni schema."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "text": "你好"},
+            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(
+        path_or_dataset="ignored",
+        split="train",
+        sampling_rate=16000,
+    )
+
+    assert len(rows) == 2
+    for row, src in zip(rows, fake_rows):
+        assert list(row.keys()) == ["conversation"]
+        conv = row["conversation"]
+        assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+
+        # user turn carries the decoded audio
+        user_content = conv[1]["content"]
+        assert isinstance(user_content, list) and len(user_content) == 1
+        audio_item = user_content[0]
+        assert audio_item["type"] == "audio"
+        waveform = audio_item["audio"]
+        assert isinstance(waveform, _np.ndarray)
+        assert waveform.dtype == _np.float32
+        assert waveform.ndim == 1
+
+        # assistant turn carries the transcript
+        assistant_content = conv[2]["content"]
+        assert assistant_content == [{"type": "text", "text": src["text"]}]
+
+
+def test_make_wenetspeech_wu_asr_dataset_path_branch(monkeypatch, tmp_path):
+    """The path branch decodes via soundfile when no in-memory bytes are present."""
+    wav_path = tmp_path / "sample.wav"
+    _sf.write(str(wav_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": None, "path": str(wav_path)}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    assert len(rows) == 1
+    waveform = rows[0]["conversation"][1]["content"][0]["audio"]
+    assert waveform.dtype == _np.float32
+    assert waveform.ndim == 1
+
+
+def test_make_wenetspeech_wu_asr_dataset_raises_when_audio_cell_empty(monkeypatch):
+    """Both ``bytes`` and ``path`` missing must raise a clear ValueError."""
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": None, "path": None}, "text": "x"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    with pytest.raises(ValueError, match="neither 'bytes' nor 'path'"):
+        ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+
+
+def test_make_wenetspeech_wu_asr_dataset_drops_empty_text(monkeypatch):
+    """Default behaviour skips samples whose transcript is empty/whitespace."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "text": "  "},
+            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    assert len(rows) == 1
+    assert rows[0]["conversation"][2]["content"][0]["text"] == "侬好"
+
+
+def test_make_wenetspeech_wu_asr_dataset_module_does_not_import_torchcodec():
+    """The dataset module must not transitively pull in torchcodec."""
+    assert "torchcodec" not in _sys.modules
+    # The module under test (already imported at the top of this file as ``ds``)
+    # must not import torchcodec at module load time either.
+    # ``ds.__dict__`` should not contain a top-level ``torchcodec`` binding.
+    assert "torchcodec" not in ds.__dict__
+
+
+def test_make_wenetspeech_wu_asr_dataset_resamples_when_sr_differs(monkeypatch):
+    """When source SR != target SR, the waveform is resampled and stays float32 mono."""
+    wav = _make_wav_bytes(sampling_rate=8000, duration_seconds=0.25)
+    fake_rows = _SyntheticHFRows(
+        [{"audio": {"bytes": wav, "path": None}, "text": "你好"}]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(
+        path_or_dataset="ignored",
+        sampling_rate=16000,
+    )
+    waveform = rows[0]["conversation"][1]["content"][0]["audio"]
+    assert waveform.dtype == _np.float32
+    assert waveform.ndim == 1
+    # 0.25s at 16 kHz target ≈ 4000 samples (allow ±a few for resample_poly polyphase rounding).
+    assert abs(waveform.shape[0] - 4000) <= 8

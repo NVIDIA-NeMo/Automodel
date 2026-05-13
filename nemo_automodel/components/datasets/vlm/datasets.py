@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import logging
 import math
@@ -21,8 +22,10 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
+import soundfile as sf
 import torch.utils.data
-from datasets import load_dataset
+from datasets import Audio, load_dataset
 from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.utils import (
@@ -204,6 +207,128 @@ def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="t
 
     ret = [format(example) for example in dataset]
     return ret
+
+
+def _decode_audio_cell_to_mono_float32(audio_cell, target_sampling_rate):
+    """Decode a HuggingFace ``Audio(decode=False)`` cell to a 1-D float32 waveform.
+
+    Avoids ``torchcodec`` by using ``soundfile`` for both byte and path branches,
+    matching the pattern in ``result/decode_vllm.py``.
+
+    Args:
+        audio_cell: Dict with ``bytes`` and/or ``path`` keys, as returned by
+            HuggingFace ``datasets`` when the column has ``Audio(decode=False)``.
+        target_sampling_rate: Desired output sampling rate (Hz). If the source
+            differs, the waveform is resampled via ``scipy.signal.resample_poly``.
+
+    Returns:
+        Tuple of ``(waveform_float32_mono, target_sampling_rate)``.
+
+    Raises:
+        ValueError: If both ``bytes`` and ``path`` are missing.
+    """
+    if not isinstance(audio_cell, dict):
+        raise ValueError(f"audio cell must be a dict, got {type(audio_cell).__name__}: {audio_cell!r}")
+
+    raw_bytes = audio_cell.get("bytes")
+    raw_path = audio_cell.get("path")
+
+    if raw_bytes is not None:
+        waveform, source_sampling_rate = sf.read(io.BytesIO(raw_bytes))
+    elif isinstance(raw_path, str) and raw_path:
+        waveform, source_sampling_rate = sf.read(raw_path)
+    else:
+        raise ValueError(f"audio cell has neither 'bytes' nor 'path': {audio_cell!r}")
+
+    if waveform.ndim > 1:
+        waveform = waveform.mean(axis=1)
+    waveform = waveform.astype(np.float32, copy=False)
+
+    if source_sampling_rate != target_sampling_rate:
+        # Local import to avoid a hard scipy dependency at module load.
+        from scipy.signal import resample_poly
+
+        waveform = resample_poly(waveform, target_sampling_rate, source_sampling_rate).astype(np.float32, copy=False)
+
+    return waveform, target_sampling_rate
+
+
+def make_wenetspeech_wu_asr_dataset(
+    path_or_dataset,
+    split="train",
+    sampling_rate=16000,
+    system_prompt="Transcribe the Wu Chinese speech to text.",
+    audio_column="audio",
+    text_column="text",
+    drop_empty_text=True,
+    **load_kwargs,
+):
+    """Load and preprocess ``yuekai/WenetSpeech_Wu_1k`` for Qwen3-Omni ASR fine-tuning.
+
+    Decodes audio via ``soundfile`` (no ``torchcodec`` dependency) by casting the
+    audio column to ``Audio(decode=False)`` and then handling the ``bytes`` /
+    ``path`` branches explicitly. The resulting samples follow the Qwen3-Omni
+    chat-template schema expected by :func:`qwen3_omni_asr_collate_fn`:
+
+    ``{"conversation": [system, user(audio np.ndarray), assistant(transcript)]}``.
+
+    Args:
+        path_or_dataset: HuggingFace dataset id or local path. May reference the
+            gated ``yuekai/WenetSpeech_Wu_1k`` (requires ``huggingface-cli login``)
+            or a local mirror.
+        split: Dataset split to load.
+        sampling_rate: Target sampling rate in Hz. Audio is resampled if the
+            source rate differs.
+        system_prompt: Instruction placed in the ``system`` turn of every
+            conversation.
+        audio_column: Name of the audio column in the source dataset.
+        text_column: Name of the transcript column in the source dataset.
+        drop_empty_text: If True, samples whose transcript is empty or whitespace
+            are skipped. If False, an empty transcript raises ``ValueError``.
+        **load_kwargs: Forwarded to ``datasets.load_dataset``.
+
+    Returns:
+        List of dicts with a ``conversation`` key suitable for
+        :func:`qwen3_omni_asr_collate_fn`.
+
+    Raises:
+        ValueError: When an audio cell has neither ``bytes`` nor ``path``, or
+            when ``drop_empty_text=False`` and a transcript is empty.
+    """
+    dataset = load_dataset(path_or_dataset, split=split, **load_kwargs)
+
+    if audio_column not in dataset.column_names:
+        raise ValueError(
+            f"audio_column={audio_column!r} not found in dataset columns: {dataset.column_names}"
+        )
+    if text_column not in dataset.column_names:
+        raise ValueError(
+            f"text_column={text_column!r} not found in dataset columns: {dataset.column_names}"
+        )
+
+    dataset = dataset.cast_column(audio_column, Audio(decode=False))
+
+    formatted = []
+    for example in dataset:
+        transcript = example.get(text_column)
+        if transcript is None or (isinstance(transcript, str) and not transcript.strip()):
+            if drop_empty_text:
+                continue
+            raise ValueError(f"empty transcript in {text_column!r}; refusing to emit zero-label sample")
+
+        waveform, _ = _decode_audio_cell_to_mono_float32(example[audio_column], sampling_rate)
+
+        formatted.append(
+            {
+                "conversation": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": [{"type": "audio", "audio": waveform}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": transcript}]},
+                ],
+            }
+        )
+
+    return formatted
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
