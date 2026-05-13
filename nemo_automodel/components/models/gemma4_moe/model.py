@@ -19,7 +19,8 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -33,7 +34,7 @@ def _make_missing(name: str):
 
 
 try:
-    from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
     from transformers.models.gemma4 import modeling_gemma4 as _g4
     from transformers.models.gemma4.configuration_gemma4 import (
         Gemma4Config,
@@ -72,14 +73,36 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     HFGemma4ForConditionalGeneration = _make_missing("Gemma4ForConditionalGeneration")
     HFGemma4Model = _make_missing("Gemma4Model")
     BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
+    ModelOutput = _make_missing("ModelOutput")
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.gemma4_moe.mtp import build_gemma4_mtp, build_mtp_config_from_kwargs
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import Gemma4MoEStateDictAdapter
+
+if _GEMMA4_HF_AVAILABLE:
+
+    @dataclass
+    class Gemma4WithMTPCausalLMOutput(ModelOutput):
+        """Gemma4 forward output augmented with MTP fields.
+
+        ``mtp_per_depth_h`` and ``mtp_loss_scaling_factor`` must be declared
+        dataclass fields (rather than attributes set after construction) so
+        they survive output-restructuring layers like FSDP2's mixed-precision
+        output cast, which rebuild ``ModelOutput`` instances from declared
+        fields only (see PR #2161 commit 0b2889ab).
+        """
+
+        logits: Optional[torch.Tensor] = None
+        hidden_states: Optional[tuple[torch.Tensor, ...]] = None
+        mtp_per_depth_h: Optional[list[torch.Tensor]] = None
+        mtp_loss_scaling_factor: Optional[float] = None
+else:
+    Gemma4WithMTPCausalLMOutput = _make_missing("Gemma4WithMTPCausalLMOutput")
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +500,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         text_config: dict | None = None,
+        *,
+        mtp_num_layers: int = 0,
+        mtp_layer_pattern: str = "*",
+        mtp_loss_scaling_factor: float = 0.1,
         **kwargs,
     ):
         if not _GEMMA4_HF_AVAILABLE:
@@ -505,8 +532,22 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         text_config = config.text_config if hasattr(config, "text_config") else config
         enable_moe = getattr(text_config, "enable_moe_block", False)
 
+        # --- Optional MTP head (works for both dense and MoE Gemma4 variants) ---
+        # MTP is opt-in via constructor kwargs (HF Gemma4 configs have no MTP fields).
+        # The block is created here so checkpoint reload sees consistent state.
+        self.mtp_config = build_mtp_config_from_kwargs(
+            mtp_num_layers=mtp_num_layers,
+            mtp_layer_pattern=mtp_layer_pattern,
+            mtp_loss_scaling_factor=mtp_loss_scaling_factor,
+        )
+        if self.mtp_config.enabled:
+            mtp_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
+            self.mtp = build_gemma4_mtp(text_config, self.mtp_config, dtype=mtp_dtype)
+        else:
+            self.mtp = None
+
         if not enable_moe:
-            # Dense Gemma4 — keep vanilla HF model, nothing else to do.
+            # Dense Gemma4 — keep vanilla HF model.
             return
 
         # --- MoE path: replace the text model ---
@@ -554,8 +595,44 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             cache_position = torch.arange(seq_len, device=input_ids.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        mtp_active = self.mtp is not None and self.training
         if not getattr(text_config, "enable_moe_block", False):
-            # Dense path — delegate to HF forward
+            # Dense path — delegate to HF forward.  When MTP is active we
+            # additionally request hidden states so we can read the post-final-norm
+            # last hidden state to feed into the MTP head.
+            if mtp_active:
+                kwargs.pop("output_hidden_states", None)
+                hf_out = super().forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    cache_position=cache_position,
+                    pixel_values=pixel_values,
+                    image_position_ids=image_position_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    output_hidden_states=True,
+                    **kwargs,
+                )
+                if hf_out.hidden_states is None:
+                    raise RuntimeError(
+                        "Gemma4 dense forward did not return hidden states; MTP requires output_hidden_states=True."
+                    )
+                hidden_states = hf_out.hidden_states[-1]
+                mtp_per_depth_h = self.mtp(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    embed_fn=self.model.language_model.embed_tokens,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                )
+                return Gemma4WithMTPCausalLMOutput(
+                    logits=hf_out.logits,
+                    hidden_states=hf_out.hidden_states,
+                    mtp_per_depth_h=mtp_per_depth_h,
+                    mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+                )
+
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -613,6 +690,21 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             logits = torch.tanh(logits)
             logits = logits * final_logit_softcapping
 
+        if mtp_active:
+            mtp_per_depth_h = self.mtp(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                embed_fn=self.model.language_model.embed_tokens,
+                position_ids=position_ids,
+                attention_mask=None,
+            )
+            return Gemma4WithMTPCausalLMOutput(
+                logits=logits,
+                hidden_states=None,
+                mtp_per_depth_h=mtp_per_depth_h,
+                mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+            )
+
         return logits
 
     @torch.no_grad()
@@ -622,6 +714,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        # MTP head: random init the auxiliary layers so they can be trained
+        # on top of a pretrained backbone (Gemma4 ships without MTP weights).
+        if getattr(self, "mtp", None) is not None:
+            mtp_buffer_device = buffer_device or (
+                torch.device(f"cuda:{torch.cuda.current_device()}")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            for sublayer in self.mtp.layers:
+                sublayer.init_weights(buffer_device=mtp_buffer_device)
+
         if not getattr(text_config, "enable_moe_block", False):
             self.to(dtype)
             return

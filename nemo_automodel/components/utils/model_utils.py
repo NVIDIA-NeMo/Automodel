@@ -259,10 +259,16 @@ def apply_parameter_freezing(model, freeze_config):
         - freeze_vision_tower: bool (default True)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - freeze_base_for_mtp: bool (default False) — when True, freezes every
+          parameter that does NOT live under the ``mtp.`` namespace. Use this
+          for the MTP "warmup" phase where only the auxiliary multi-token
+          prediction head trains while the backbone (text, vision, audio,
+          lm_head) stays frozen.
     """
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
+    freeze_base_for_mtp = freeze_config.get("freeze_base_for_mtp", False)
 
     # Freeze vision tower
     if freeze_vision_tower:
@@ -275,6 +281,16 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # MTP warmup: train only the auxiliary MTP head, freeze everything else.
+    # Includes the LM head — the head is shared between the main next-token
+    # prediction and MTP depths; warmup keeps it fixed so MTP fusion learns
+    # to project into the existing logit basis. Switch this off (and
+    # optionally re-enable lm_head training) for the joint training phase.
+    if freeze_base_for_mtp:
+        for name, param in model.named_parameters():
+            if ".mtp." not in name and not name.startswith("mtp."):
+                param.requires_grad_(False)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache

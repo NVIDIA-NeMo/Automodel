@@ -33,6 +33,16 @@ Additionally, the Gemma4 router is mapped to the NeMo Gemma4Gate:
 The per_expert_scale is absorbed into down_projs during from_hf.  When
 saving back to HF, per_expert_scale is emitted as ones (scale already baked
 into the weights).
+
+Multi-Token Prediction (MTP) keys
+---------------------------------
+When the MTP head is enabled (``mtp_num_layers > 0`` on the model
+constructor), the model exposes additional weights under ``mtp.layers.{i}.*``
+that have no HF counterpart (Gemma4 has no native MTP). These keys flow
+through the pass-through branch in both ``from_hf`` and ``to_hf`` unchanged,
+so a NeMo MTP-augmented checkpoint round-trips with the MTP keys preserved
+verbatim. To exclude MTP weights from an HF-format export pass an
+``exclude_key_regex`` like ``r"^.*mtp\\.layers\\..*$"`` to ``to_hf``.
 """
 
 import re
@@ -205,7 +215,7 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
                 hf_state_dict[f"{layer_prefix}.router.per_expert_scale"] = torch.ones(n_experts, dtype=self.dtype)
                 continue
 
-            # --- Pass-through ---
+            # --- Pass-through (also applies to MTP keys) ---
             hf_state_dict[fqn] = tensor
 
         if exclude_key_regex:

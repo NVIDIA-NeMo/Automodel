@@ -689,6 +689,73 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
+def calculate_mtp_loss(
+    loss_fn,
+    *,
+    mtp_per_depth_h: list[torch.Tensor],
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: Optional[int] = None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Compute the DeepSeek-V3 style Multi-Token Prediction auxiliary loss. Similar to the one in the LLM recipe.
+
+    Each depth's (aka MTP module's) CE is dispatched through :func:`calculate_loss` with the same
+    loss class as the main path so MTP inherits FusedLinearCrossEntropy /
+    MaskedCrossEntropy memory and numerical characteristics. Labels are rolled
+    cumulatively left by 1 per depth in lockstep with the model's input rolling
+    inside :class:`MTPModule`; the trailing ``k+1`` positions at depth ``k`` are
+    masked with ``ignore_index`` to avoid leaking past-end-of-sequence noise.
+
+    Args:
+        loss_fn: Configured per-token loss class (same instance the main path uses).
+        mtp_per_depth_h: Per-depth hidden states from the model's MTP head,
+            one ``[B, S, H]`` tensor per depth.
+        labels: Original (unshifted) labels.
+        model: The wrapped model; used to fetch the shared LM head when the loss
+            class needs materialized logits (non-FusedLinearCE path).
+        scaling_factor: Coefficient applied to the summed per-depth CE.
+        num_label_tokens: Total non-ignore label tokens (forwarded to the base
+            loss for sum-reduction normalization).
+        ignore_index: Label value masked out of the CE loss for the trailing
+            ``k+1`` rolled positions at depth ``k``.
+
+    Returns:
+        Scalar MTP loss with autograd graph.
+    """
+    from nemo_automodel.components.models.common.mtp import roll_tensor
+
+    D = len(mtp_per_depth_h)
+    cur_labels = labels
+    total = mtp_per_depth_h[0].new_zeros(())
+    for k, h_k in enumerate(mtp_per_depth_h):
+        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
+        masked = cur_labels.clone()
+        n_invalid = min(k + 1, masked.shape[-1])
+        masked[..., -n_invalid:] = ignore_index
+
+        if isinstance(loss_fn, FusedLinearCrossEntropy):
+            depth_loss = calculate_loss(
+                loss_fn,
+                hidden_states=h_k,
+                labels=masked,
+                model=model,
+                num_label_tokens=num_label_tokens,
+            )
+        else:
+            depth_loss = calculate_loss(
+                loss_fn,
+                logits=model.get_output_embeddings()(h_k),
+                labels=masked,
+                model=model,
+                num_label_tokens=num_label_tokens,
+            )
+        total = total + depth_loss
+
+    return total * (scaling_factor / D)
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -822,6 +889,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+
+        # PP + MTP is not supported yet (depths share the LM head and require
+        # cross-stage hidden-state plumbing). Match the upstream LLM recipe's
+        # MTP for nemotron, deepseek-v3, etc.
+        if self.pp_enabled and any(getattr(mp, "mtp", None) is not None for mp in self.model_parts):
+            raise NotImplementedError(
+                "Multi-Token Prediction (MTP) is not supported with pipeline parallelism in the VLM recipe. "
+                "Set distributed.pipeline.pp_size=1 or disable MTP (mtp_num_layers=0)."
+            )
 
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
@@ -1054,6 +1130,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
                 )
+                # Optional MTP auxiliary loss (e.g. Gemma4 + mtp_num_layers > 0).
+                # Models opt in by returning ``mtp_per_depth_h`` (list of hidden
+                # states) and ``mtp_loss_scaling_factor`` from forward.
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                if mtp_per_depth_h is not None:
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=getattr(out, "mtp_loss_scaling_factor", 0.1),
+                        num_label_tokens=num_label_tokens,
+                    )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
