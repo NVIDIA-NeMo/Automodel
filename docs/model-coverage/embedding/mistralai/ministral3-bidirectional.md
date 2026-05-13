@@ -65,7 +65,7 @@ cd Automodel
 
 ```bash
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
-```
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml
 
 See the [Installation Guide](../../../guides/installation.md).
 
