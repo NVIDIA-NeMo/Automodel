@@ -17,9 +17,9 @@
 """A self-contained port of Megatron-Core's indexed dataset loader.
 
 Supports the original mmap and file-pointer readers for local *.bin / *.idx
-pairs. The file pair is expected to live on a local filesystem.
+pairs, plus optional streaming readers for object storage (S3 and MSC).
 
-All three calls below are equivalent:
+All three calls below are equivalent for local data:
 
     from nemo_automodel.datasets.llm.indexed_dataset import IndexedDataset
 
@@ -31,6 +31,11 @@ All three calls below are equivalent:
 
     ds = IndexedDataset("/path/to/shard_00_text_document.idx")
     print(len(ds), ds[0][:20])
+
+For object-storage data, pass an :class:`ObjectStorageConfig`:
+
+    cfg = ObjectStorageConfig(path_to_idx_cache="/tmp/idx_cache")
+    ds = IndexedDataset("s3://bucket/path/shard_00_text_document", object_storage_config=cfg)
 """
 
 from __future__ import annotations
@@ -41,16 +46,115 @@ import os
 import shutil
 import struct
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from itertools import accumulate
 from types import TracebackType
-from typing import Any, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
 
+from nemo_automodel.shared.import_utils import safe_import
+
 logger = logging.getLogger(__name__)
+
+# Optional dependencies for object-storage support. Install via
+# ``pip install nemo_automodel[s3]`` (boto3) or ``[msc]`` (multi-storage-client).
+HAS_BOTO3, boto3 = safe_import("boto3")
+HAS_MSC, multi_storage_client = safe_import("multi_storage_client")
+
+_S3_PREFIX = "s3://"
+_MSC_PREFIX = "msc://"
+
+
+@dataclass
+class ObjectStorageConfig:
+    """Configuration for reading ``.bin``/``.idx`` files from object storage.
+
+    Attributes:
+        path_to_idx_cache: Local directory where the ``.idx`` file is cached on
+            first use. Re-used across ranks via a per-host directory layout.
+        bin_chunk_nbytes: Size in bytes of each chunked range read against the
+            ``.bin`` object. Defaults to 256 MiB. Larger values reduce request
+            count but increase per-rank memory footprint.
+    """
+
+    path_to_idx_cache: str
+    bin_chunk_nbytes: int = 256 * 1024 * 1024
+
+
+def _is_object_storage_path(path: str) -> bool:
+    """Return ``True`` if ``path`` is an ``s3://`` or ``msc://`` URI."""
+    return path.startswith(_S3_PREFIX) or path.startswith(_MSC_PREFIX)
+
+
+def _parse_s3_path(path: str) -> Tuple[str, str]:
+    """Split an ``s3://bucket/key`` URI into ``(bucket, key)``."""
+    if not path.startswith(_S3_PREFIX):
+        raise ValueError(f"Not an S3 path: {path}")
+    parts = path[len(_S3_PREFIX) :].split("/")
+    bucket = parts[0]
+    key = "/".join(parts[1:]) if len(parts) > 1 else ""
+    return bucket, key
+
+
+def _get_index_cache_path(idx_path: str, object_storage_config: ObjectStorageConfig) -> str:
+    """Return the local cache path for ``idx_path`` under ``path_to_idx_cache``."""
+    if idx_path.startswith(_S3_PREFIX):
+        stripped = idx_path[len(_S3_PREFIX) :]
+    elif idx_path.startswith(_MSC_PREFIX):
+        stripped = idx_path[len(_MSC_PREFIX) :]
+    else:
+        raise ValueError(f"Not an object storage path: {idx_path}")
+    return os.path.join(object_storage_config.path_to_idx_cache, stripped)
+
+
+def _cache_index_file(remote_path: str, local_path: str) -> None:
+    """Download ``.idx`` from object storage to ``local_path``.
+
+    Rank 0 performs the download and other ranks wait on a ``torch.distributed``
+    barrier. If the local file already exists this is a no-op.
+
+    Raises:
+        ImportError: If the relevant client library (``boto3`` for ``s3://`` or
+            ``multi_storage_client`` for ``msc://``) is not installed.
+        ValueError: If ``remote_path`` is neither an ``s3://`` nor an
+            ``msc://`` URI.
+    """
+    torch_dist_enabled = torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if torch_dist_enabled else 0
+
+    if remote_path.startswith(_S3_PREFIX):
+        if not HAS_BOTO3:
+            raise ImportError("boto3 is required to read s3:// datasets. Install via `pip install nemo_automodel[s3]`.")
+        if not os.path.exists(local_path):
+            if not torch_dist_enabled or rank == 0:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                bucket, key = _parse_s3_path(remote_path)
+                client = boto3.client("s3")
+                logger.info("Downloading %s -> %s", remote_path, local_path)
+                client.download_file(bucket, key, local_path)
+                client.close()
+    elif remote_path.startswith(_MSC_PREFIX):
+        if not HAS_MSC:
+            raise ImportError(
+                "multi_storage_client is required to read msc:// datasets. "
+                "Install via `pip install nemo_automodel[msc]`."
+            )
+        if not os.path.exists(local_path):
+            if not torch_dist_enabled or rank == 0:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                multi_storage_client.download_file(remote_path, local_path)
+    else:
+        raise ValueError(f"Unsupported object storage path: {remote_path}")
+
+    if torch_dist_enabled:
+        torch.distributed.barrier()
+    if not os.path.exists(local_path):
+        raise RuntimeError(f"Index cache file not found after download: {local_path}")
+
 
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
 
@@ -422,33 +526,157 @@ class _FileBinReader(_BinReader):
         return out
 
 
+class _S3BinReader(_BinReader):
+    """Stream ``.bin`` data from S3 via chunked ranged ``GetObject`` calls.
+
+    A single in-memory chunk (sized by
+    :attr:`ObjectStorageConfig.bin_chunk_nbytes`) is cached so consecutive
+    reads within the same chunk avoid network round-trips. Random-access
+    reads outside the current chunk trigger a new ranged ``GetObject``.
+    """
+
+    def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
+        if not HAS_BOTO3:
+            raise ImportError("boto3 is required to read s3:// datasets. Install via `pip install nemo_automodel[s3]`.")
+        if object_storage_config.bin_chunk_nbytes <= 0:
+            raise ValueError(f"bin_chunk_nbytes must be positive, got {object_storage_config.bin_chunk_nbytes}")
+        self._client = boto3.client("s3")
+        self._s3_bucket, self._s3_key = _parse_s3_path(bin_path)
+        self._cache_nbytes = object_storage_config.bin_chunk_nbytes
+        self._cache_bytes_start: int = 0
+        self._cache_bytes_end: int = 0
+        self._cache: Optional[bytes] = None
+
+    def _extract_from_cache(self, offset: int, size: int) -> bytes:
+        if self._cache is None:
+            raise RuntimeError("Cache is empty; cannot extract before first read")
+        start = offset - self._cache_bytes_start
+        end = start + size
+        if start < 0 or end > len(self._cache):
+            raise IndexError(
+                f"Cache window [{self._cache_bytes_start}, {self._cache_bytes_end}) "
+                f"does not contain requested range [{offset}, {offset + size})"
+            )
+        return self._cache[start:end]
+
+    def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read ``count`` elements of ``dtype`` starting at byte ``offset``."""
+        size = count * DType.size(dtype)
+        if self._cache is not None and offset >= self._cache_bytes_start and offset + size <= self._cache_bytes_end:
+            return numpy.frombuffer(self._extract_from_cache(offset, size), dtype=dtype)
+
+        bytes_start = (offset // self._cache_nbytes) * self._cache_nbytes
+        bytes_end = max(bytes_start + self._cache_nbytes, offset + size)
+        self._cache = self._client.get_object(
+            Bucket=self._s3_bucket,
+            Key=self._s3_key,
+            Range=f"bytes={bytes_start}-{bytes_end - 1}",
+        )["Body"].read()
+        self._cache_bytes_start = bytes_start
+        self._cache_bytes_end = bytes_end
+        return numpy.frombuffer(self._extract_from_cache(offset, size), dtype=dtype)
+
+    def __del__(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
+class _MultiStorageClientBinReader(_BinReader):
+    """Read ``.bin`` data via NVIDIA's :mod:`multi_storage_client`."""
+
+    def __init__(self, bin_path: str, object_storage_config: ObjectStorageConfig) -> None:
+        if not HAS_MSC:
+            raise ImportError(
+                "multi_storage_client is required to read msc:// datasets. "
+                "Install via `pip install nemo_automodel[msc]`."
+            )
+        self._client, self._bin_path = multi_storage_client.resolve_storage_client(bin_path)
+
+    def read(self, dtype: Type[numpy.number], count: int, offset: int) -> numpy.ndarray:
+        """Read ``count`` elements of ``dtype`` starting at byte ``offset``."""
+        size = count * DType.size(dtype)
+        buffer = self._client.read(
+            path=self._bin_path,
+            byte_range=multi_storage_client.types.Range(offset=offset, size=size),
+        )
+        return numpy.frombuffer(buffer, dtype=dtype)
+
+
+OBJECT_STORAGE_BIN_READERS: Dict[str, Type[_BinReader]] = {
+    "s3": _S3BinReader,
+    "msc": _MultiStorageClientBinReader,
+}
+
+
 class IndexedDataset(torch.utils.data.Dataset):
     """A fast, on-disk dataset backed by Megatron-style index + binary files."""
 
-    def __init__(self, path_prefix: str, multimodal: bool = False, mmap: bool = True) -> None:
+    def __init__(
+        self,
+        path_prefix: str,
+        multimodal: bool = False,
+        mmap: bool = True,
+        object_storage_config: Optional[ObjectStorageConfig] = None,
+    ) -> None:
         """Initialize the IndexedDataset
 
         Args:
-        path_prefix (str): The index (.idx) and data (.bin) prefix
-
-        multimodal (bool): Whether the dataset is multimodal. Defaults to False.
-
-        mmap (bool): Whether to mmap the .bin files. Defaults to True.
+            path_prefix (str): The index (.idx) and data (.bin) prefix. May be an S3 URI
+                (``s3://bucket/key``) when ``object_storage_config`` is provided.
+            multimodal (bool): Whether the dataset is multimodal. Defaults to False.
+            mmap (bool): Whether to mmap the .bin files. Defaults to True. Must be False
+                for object-storage paths.
+            object_storage_config (Optional[ObjectStorageConfig]): When provided and
+                ``path_prefix`` is an S3/MSC URI, the .idx file is downloaded to
+                ``object_storage_config.path_to_idx_cache`` and the .bin file is streamed
+                via chunked GETs.
         """
         super().__init__()
         normalized_prefix = _normalize_prefix(path_prefix)
-        self.initialize(normalized_prefix, multimodal, mmap)
+        if _is_object_storage_path(normalized_prefix) and object_storage_config is not None:
+            if mmap:
+                raise ValueError(
+                    "mmap must be False for object-storage prefixes; "
+                    "set mmap=False (or set `mmap_bin_files: false` in the recipe)."
+                )
+            idx_path = get_idx_path(normalized_prefix)
+            cache_idx_path = _get_index_cache_path(idx_path, object_storage_config)
+            _cache_index_file(idx_path, cache_idx_path)
+        self.initialize(normalized_prefix, multimodal, mmap, object_storage_config)
 
-    def initialize(self, path_prefix: str, multimodal: bool, mmap: bool) -> None:
-        idx_path, bin_path = get_idx_path(path_prefix), get_bin_path(path_prefix)
-        assert os.path.exists(idx_path) and os.path.exists(bin_path), f"Missing .idx or .bin at prefix {path_prefix}"
+    def initialize(
+        self,
+        path_prefix: str,
+        multimodal: bool,
+        mmap: bool,
+        object_storage_config: Optional[ObjectStorageConfig] = None,
+    ) -> None:
+        idx_path = get_idx_path(path_prefix)
+        bin_path = get_bin_path(path_prefix)
+
+        if _is_object_storage_path(path_prefix) and object_storage_config is not None:
+            # .idx is already cached locally; determine local path for _IndexReader
+            local_idx_path = _get_index_cache_path(idx_path, object_storage_config)
+            if not os.path.exists(local_idx_path):
+                raise RuntimeError(f"Cached .idx not found: {local_idx_path}")
+            access = "s3" if path_prefix.startswith(_S3_PREFIX) else "msc"
+            bin_reader: _BinReader = OBJECT_STORAGE_BIN_READERS[access](bin_path, object_storage_config)
+            index_reader = _IndexReader(local_idx_path, multimodal)
+        else:
+            assert os.path.exists(idx_path) and os.path.exists(bin_path), (
+                f"Missing .idx or .bin at prefix {path_prefix}"
+            )
+            bin_reader = _MMapBinReader(bin_path) if mmap else _FileBinReader(bin_path)
+            index_reader = _IndexReader(idx_path, multimodal)
 
         self.path_prefix = path_prefix
         self.multimodal = multimodal
         self.mmap = mmap
-
-        self.bin_reader = _MMapBinReader(bin_path) if mmap else _FileBinReader(bin_path)
-        self.index = _IndexReader(idx_path, multimodal)
+        self.object_storage_config = object_storage_config
+        self.bin_reader = bin_reader
+        self.index = index_reader
 
     def __len__(self) -> int:
         return len(self.index)
@@ -503,6 +731,8 @@ class IndexedDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def exists(path_prefix: str) -> bool:
+        if _is_object_storage_path(path_prefix):
+            return True  # existence check deferred to download time
         return os.path.exists(get_idx_path(path_prefix)) and os.path.exists(get_bin_path(path_prefix))
 
 
