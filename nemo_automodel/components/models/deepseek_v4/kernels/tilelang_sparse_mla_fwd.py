@@ -203,8 +203,8 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    valid_mask = (topk_idxs != -1).to(torch.int32).contiguous()
-    topk_idxs = topk_idxs.clamp(min=0).to(torch.int32).contiguous()
+    valid_mask = ((topk_idxs >= 0) & (topk_idxs < seq_len_kv)).to(torch.int32).contiguous()
+    topk_idxs = topk_idxs.clamp(min=0, max=max(seq_len_kv - 1, 0)).to(torch.int32).contiguous()
 
     kernel = sparse_mqa_fwd(
         heads,

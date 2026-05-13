@@ -44,7 +44,7 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
     ) -> torch.Tensor:
         """Run the vendored sparse attention forward kernel."""
         output, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output.clone(), lse)
+        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output, lse)
         ctx.sm_scale = sm_scale
         return output
 
@@ -91,22 +91,20 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         sm_scale: float | None = None,
     ) -> torch.Tensor:
         """Run the vendored sparse attention forward kernel over head chunks."""
-        outputs = []
-        lses = []
+        output = q.new_empty(q.shape)
+        lse = torch.empty(q.shape[:3], dtype=torch.float32, device=q.device)
         for start in range(0, q.shape[2], max_heads_per_kernel):
             end = min(start + max_heads_per_kernel, q.shape[2])
-            output, lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
+            chunk_output, chunk_lse = sparse_mla_fwd.sparse_mqa_fwd_interface(
                 q[:, :, start:end, :].contiguous(),
                 kv,
                 attn_sink[start:end].contiguous(),
                 topk_idxs,
                 sm_scale=sm_scale,
             )
-            outputs.append(output)
-            lses.append(lse)
-        output = torch.cat(outputs, dim=2)
-        lse = torch.cat(lses, dim=2)
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output.clone(), lse)
+            output[:, :, start:end, :].copy_(chunk_output)
+            lse[:, :, start:end].copy_(chunk_lse)
+        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output, lse)
         ctx.max_heads_per_kernel = max_heads_per_kernel
         ctx.sm_scale = sm_scale
         return output
@@ -116,13 +114,13 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         """Run chunked backward and accumulate shared KV gradients in fp32."""
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        grad_q_chunks = []
+        grad_q_full = torch.empty_like(q)
         grad_kv = torch.zeros_like(kv, dtype=torch.float32)
-        grad_attn_sink_chunks = []
+        grad_attn_sink_full = torch.empty_like(attn_sink)
         max_heads = ctx.max_heads_per_kernel
         for start in range(0, q.shape[2], max_heads):
             end = min(start + max_heads, q.shape[2])
-            grad_q, grad_kv_chunk, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
+            grad_q_chunk, grad_kv_chunk, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
                 q[:, :, start:end, :].contiguous(),
                 kv,
                 attn_sink[start:end].contiguous(),
@@ -133,13 +131,13 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
                 sm_scale=ctx.sm_scale,
                 return_dkv_accum_dtype=True,
             )
-            grad_q_chunks.append(grad_q)
+            grad_q_full[:, :, start:end, :].copy_(grad_q_chunk)
             grad_kv += grad_kv_chunk
-            grad_attn_sink_chunks.append(grad_attn_sink)
+            grad_attn_sink_full[start:end].copy_(grad_attn_sink)
         return (
-            torch.cat(grad_q_chunks, dim=2),
+            grad_q_full,
             grad_kv.to(kv.dtype),
-            torch.cat(grad_attn_sink_chunks, dim=0),
+            grad_attn_sink_full,
             None,
             None,
             None,

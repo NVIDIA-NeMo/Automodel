@@ -140,7 +140,7 @@ def clean_logits_(
             for n_i in T.Pipelined(T.ceildiv(seq_len_kv, block_K)):
                 for k_i in T.serial(block_K // threads):
                     idx = n_i * block_K + k_i * threads + tx
-                    if idx < cu_k_s or idx >= cu_k_e:
+                    if idx < seq_len_kv and (idx < cu_k_s or idx >= cu_k_e):
                         Logits[bx, idx] = -T.infinity(dtype)
 
     return clean_logits_kernel
@@ -172,11 +172,44 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
     """
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
+    block_Q = max(128 // heads, 1)
+    padded_seq_len = (seq_len + block_Q - 1) // block_Q * block_Q
+    if padded_seq_len != seq_len:
+        q_pad = torch.zeros(
+            (padded_seq_len - seq_len, heads, index_dim),
+            device=q.device,
+            dtype=q.dtype,
+        )
+        weights_pad = torch.zeros(
+            (padded_seq_len - seq_len, heads),
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        cu_pad = torch.full(
+            (padded_seq_len - seq_len,),
+            seq_len_kv,
+            device=cu_seqlen_ks.device,
+            dtype=cu_seqlen_ks.dtype,
+        )
+        q = torch.cat([q, q_pad], dim=0).contiguous()
+        weights = torch.cat([weights, weights_pad], dim=0).contiguous()
+        cu_seqlen_ks = torch.cat([cu_seqlen_ks, cu_pad], dim=0).contiguous()
+        cu_seqlen_ke = torch.cat([cu_seqlen_ke, cu_pad], dim=0).contiguous()
+
+    block_N = 256
+    padded_seq_len_kv = (seq_len_kv + block_N - 1) // block_N * block_N
+    if padded_seq_len_kv != seq_len_kv:
+        kv_pad = torch.zeros(
+            (padded_seq_len_kv - seq_len_kv, index_dim),
+            device=kv.device,
+            dtype=kv.dtype,
+        )
+        kv = torch.cat([kv, kv_pad], dim=0).contiguous()
 
     clean_logits_kernel = clean_logits_()
-    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim)
+    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_Q=block_Q)
 
-    logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
+    logits = torch.empty([padded_seq_len, padded_seq_len_kv], device=q.device, dtype=torch.float32)
     tl_indexer_fwd_kernel(
         q.view(seq_len * heads, index_dim),
         kv,
@@ -187,7 +220,7 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
     )
     if clean_logits:
         clean_logits_kernel(logits, cu_seqlen_ks, cu_seqlen_ke)
-    return logits
+    return logits[:seq_len, :seq_len_kv]
 
 
 def batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):

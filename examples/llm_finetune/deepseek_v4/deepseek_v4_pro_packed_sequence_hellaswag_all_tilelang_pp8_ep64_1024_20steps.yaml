@@ -26,6 +26,7 @@ step_scheduler:
   ckpt_every_steps: 500
   save_checkpoint_every_epoch: false
   val_every_steps: 500
+  gc_every_steps: 10
   num_epochs: 10
   max_steps: 20
 
@@ -72,7 +73,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: torch
+    dispatcher: deepep
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

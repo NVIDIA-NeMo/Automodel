@@ -24,6 +24,7 @@ step_scheduler:
   local_batch_size: 8
   ckpt_every_steps: 500
   val_every_steps: 500
+  gc_every_steps: 10
   num_epochs: 1
   max_steps: 100
 
@@ -70,7 +71,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: torch
+    dispatcher: deepep
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
