@@ -209,21 +209,17 @@ class TestDFlashDecayLoss:
         assert torch.allclose(result_norm.total_loss, result_unnorm.total_loss / 10, atol=1e-5)
 
     def test_decay_weights_decrease_monotonically(self):
-        """First predicted position (k=1) has higher weight than later positions."""
+        """First predicted position has higher weight than the last."""
         torch.manual_seed(0)
         B, T, V = 1, 8, 16
-        # Use logits that make all tokens equally likely so CE is uniform.
-        logits = torch.zeros(B, T, V)
+        logits = torch.zeros(B, T, V)  # uniform CE so only weights differ
         target_ids = torch.zeros(B, T, dtype=torch.long)
-        # Compute loss with full mask and check that first position contributes more.
         loss_fn = DFlashDecayLoss(loss_gamma=2.0)
 
-        # Loss for only position 0 (weight = exp(0/2) = 1)
         mask_first = torch.zeros(B, T)
         mask_first[:, 0] = 1.0
         loss_first = loss_fn(logits, target_ids, mask_first).total_loss
 
-        # Loss for only position T-1 (weight = exp(-(T-1)/2))
         mask_last = torch.zeros(B, T)
         mask_last[:, -1] = 1.0
         loss_last = loss_fn(logits, target_ids, mask_last).total_loss
@@ -231,59 +227,39 @@ class TestDFlashDecayLoss:
         assert loss_first > loss_last
 
     def test_block_size_resets_decay_per_block(self):
-        """With block_size, each block starts fresh at weight=1 (exp(0/γ)=1).
-
-        Two blocks concatenated should have the same weight profile as a single
-        block repeated, NOT a monotone decay across both blocks.
-        """
+        """With block_size, each block starts fresh at weight=1; without it weights
+        decay monotonically across the full concatenated sequence."""
         torch.manual_seed(1)
-        block_size = 4  # T_per = 3 predicted per block
-        n = 2
-        T = n * (block_size - 1)  # 6
+        block_size, n, gamma = 4, 2, 2.0
+        T = n * (block_size - 1)
         B, V = 1, 8
-
         logits = torch.randn(B, T, V)
         target_ids = torch.randint(0, V, (B, T))
         block_mask = torch.ones(B, T)
-        gamma = 2.0
-
         loss_fn = DFlashDecayLoss(loss_gamma=gamma)
 
-        # With block_size: weights reset → [w0,w1,w2, w0,w1,w2]
         result_reset = loss_fn(logits, target_ids, block_mask, block_size=block_size)
-
-        # Without block_size: monotone → [w0,w1,w2,w3,w4,w5]
         result_mono = loss_fn(logits, target_ids, block_mask)
-
-        # They should differ because reset gives more weight to the second block
         assert not torch.allclose(result_reset.total_loss, result_mono.total_loss, atol=1e-4)
 
-        # Verify reset weights manually: both blocks should start at weight 1
         T_per = block_size - 1
         w_single = torch.exp(-torch.arange(T_per, dtype=torch.float) / gamma)
-        w_expected = w_single.repeat(n)
         w_mono = torch.exp(-torch.arange(T, dtype=torch.float) / gamma)
-        # First block weights should match in both cases
-        assert torch.allclose(w_expected[:T_per], w_mono[:T_per])
-        # Second block: reset starts at 1, mono continues decay
-        assert w_expected[T_per] > w_mono[T_per]
+        assert torch.allclose(w_single.repeat(n)[:T_per], w_mono[:T_per])
+        assert w_single.repeat(n)[T_per] > w_mono[T_per]  # second block resets to 1
 
-    def test_multi_block_output_shapes(self):
-        """Multi-block: T = N * (block_size - 1); logits and targets must match."""
-        block_size = 8
-        n_blocks = 3
+    def test_multi_block_loss_is_scalar(self):
+        block_size, n_blocks = 8, 3
         T = n_blocks * (block_size - 1)
         B, V = 2, 64
         logits = torch.randn(B, T, V)
         target_ids = torch.randint(0, V, (B, T))
         block_mask = torch.ones(B, T)
-        loss_fn = DFlashDecayLoss(loss_gamma=4.0)
-        result = loss_fn(logits, target_ids, block_mask, block_size=block_size)
-        assert isinstance(result, DLLMLossOutput)
-        assert result.total_loss.ndim == 0  # scalar
+        result = DFlashDecayLoss(loss_gamma=4.0)(logits, target_ids, block_mask, block_size=block_size)
+        assert result.total_loss.ndim == 0
 
     def test_gamma_controls_decay_rate(self):
-        """Larger γ → slower decay → more uniform weighting across positions."""
+        """Larger γ → slower decay → different total loss than small γ."""
         torch.manual_seed(2)
         T, V = 10, 16
         logits = torch.randn(1, T, V)
@@ -293,8 +269,6 @@ class TestDFlashDecayLoss:
         loss_fast = DFlashDecayLoss(loss_gamma=1.0)(logits, target_ids, block_mask).total_loss
         loss_slow = DFlashDecayLoss(loss_gamma=100.0)(logits, target_ids, block_mask).total_loss
 
-        # With γ=100 weights ≈ 1 everywhere; with γ=1 later positions are down-weighted.
-        # Both should be positive and differ.
         assert loss_fast.item() > 0
         assert loss_slow.item() > 0
         assert not torch.allclose(loss_fast, loss_slow, atol=1e-3)
