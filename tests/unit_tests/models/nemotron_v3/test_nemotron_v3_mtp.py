@@ -26,9 +26,9 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.mtp import (
     MTPConfig,
-    parse_mtp_layer_pattern,
     roll_tensor,
 )
+from nemo_automodel.components.models.nemotron_v3.mtp import parse_mtp_layer_pattern
 
 
 class MockNemotronV3Config:
@@ -349,6 +349,82 @@ class TestMTPRepeatedLayer:
         # Only mtp.layers.{0,1} should exist for P=2 with 1 physical depth.
         mtp_indices = {int(k.split(".")[2]) for k in sd if k.startswith("mtp.layers.")}
         assert mtp_indices == {0, 1}
+
+
+class TestMTPLossDispatch:
+    """``calculate_mtp_loss`` has two branches in ``train_ft.py``: one for
+    ``FusedLinearCrossEntropy`` (passes ``hidden_states`` straight to the
+    fused kernel) and one for standard loss classes (materializes logits via
+    ``lm_head`` first). All other MTP tests + the verification YAMLs exercise
+    the standard branch; this class covers the fused branch on CPU by
+    monkey-patching ``cut_cross_entropy.linear_cross_entropy`` to a stub.
+    """
+
+    def test_fused_linear_ce_branch_dispatches(self, backend, monkeypatch):
+        """When the loss is ``FusedLinearCrossEntropy``, ``calculate_mtp_loss``
+        must route per-depth hidden states + lm_head weight into the fused
+        kernel, NOT materialize logits via ``lm_head(h_k)``. We verify this
+        by stubbing ``linear_cross_entropy`` and asserting it is called once
+        per MTP depth with the expected kwargs."""
+        from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+        from nemo_automodel.recipes.llm.train_ft import calculate_mtp_loss
+
+        if not linear_ce_mod.HAVE_CUT_CROSS_ENTROPY:
+            pytest.skip("cut_cross_entropy not installed")
+
+        calls: list[dict] = []
+
+        def fake_linear_cross_entropy(hidden_states, lm_weight, **kwargs):
+            calls.append(
+                {
+                    "hidden_shape": tuple(hidden_states.shape),
+                    "weight_shape": tuple(lm_weight.shape),
+                    "labels_shape": tuple(kwargs["targets"].shape),
+                    "ignore_index": kwargs.get("ignore_index"),
+                    "reduction": kwargs.get("reduction"),
+                }
+            )
+            return torch.tensor(1.0)
+
+        monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", fake_linear_cross_entropy)
+
+        model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
+        model.train()
+        # Two synthetic per-depth hidden states matching what model.mtp would
+        # produce; shapes are [B, S, H].
+        bsz, seq_len = 2, 8
+        h = torch.randn(bsz, seq_len, config.hidden_size, dtype=torch.bfloat16)
+        mtp_per_depth_h = [h.clone() for _ in range(model.mtp_config.num_layers)]
+        labels = torch.randint(0, config.vocab_size, (bsz, seq_len))
+
+        loss_fn = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")
+        out = calculate_mtp_loss(
+            loss_fn,
+            mtp_per_depth_h=mtp_per_depth_h,
+            labels=labels,
+            model=model,
+            scaling_factor=0.1,
+            num_label_tokens=bsz * seq_len,
+        )
+
+        # One fused-kernel invocation per MTP depth (D=1 here).
+        assert len(calls) == len(mtp_per_depth_h), (
+            f"expected {len(mtp_per_depth_h)} fused-kernel calls, got {len(calls)}"
+        )
+        # Each call must receive the lm_head weight of shape [vocab, hidden] and
+        # the rolled labels of shape [B, S].
+        for call in calls:
+            assert call["weight_shape"] == (config.vocab_size, config.hidden_size)
+            assert call["labels_shape"] == (bsz, seq_len)
+            assert call["ignore_index"] == -100
+        # Loss is finite scalar. The fused branch normalizes stub_loss by
+        # num_label_tokens internally (linear_ce.py:169-171), then
+        # calculate_mtp_loss scales by scaling_factor/D over the per-depth sum:
+        #   per-depth = stub_loss / num_label_tokens = 1.0 / 16 = 0.0625
+        #   total     = (0.1 / 1) * 0.0625 = 0.00625
+        expected = 0.1 / len(mtp_per_depth_h) * (1.0 / (bsz * seq_len)) * len(mtp_per_depth_h)
+        assert torch.isfinite(out).item()
+        assert abs(out.item() - expected) < 1e-6, f"expected {expected}, got {out.item()}"
 
 
 class TestMTPStateDictAdapter:

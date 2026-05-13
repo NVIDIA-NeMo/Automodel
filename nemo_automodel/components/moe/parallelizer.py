@@ -82,10 +82,10 @@ def _iter_moe_blocks(model: nn.Module, _model: nn.Module):
     and must receive the same EP / FSDP treatment so their state-dict
     round-trips cleanly.
     """
-    yield from (block for _, block in _model.layers.named_children())
+    yield from _model.layers.children()
     mtp_module = getattr(model, "mtp", None)
     if mtp_module is not None and hasattr(mtp_module, "layers"):
-        yield from (block for _, block in mtp_module.layers.named_children())
+        yield from mtp_module.layers.children()
 
 
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):

@@ -22,41 +22,6 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-# Hybrid layer symbols matching HF Nemotron-H's ``hybrid_override_pattern``
-# and ``mtp_hybrid_override_pattern``.
-_SYMBOL_TO_BLOCK = {
-    "M": "mamba",
-    "*": "attention",
-    "-": "mlp",
-    "E": "moe",
-}
-
-
-def parse_mtp_layer_pattern(pattern: str) -> list[str]:
-    """Parse an MTP layer pattern (e.g. ``"*E"``) into a list of block types.
-
-    Args:
-        pattern: Pattern string using symbols ``M`` (mamba), ``*`` (attention),
-            ``-`` (mlp), ``E`` (moe).
-
-    Returns:
-        List of block type names (``"mamba"``, ``"attention"``, ``"mlp"``, ``"moe"``).
-
-    Raises:
-        ValueError: If the pattern is empty or contains unknown symbols.
-    """
-    if not pattern:
-        raise ValueError("MTP layer pattern is empty")
-    blocks: list[str] = []
-    for ch in pattern:
-        if ch not in _SYMBOL_TO_BLOCK:
-            raise ValueError(
-                f"Unknown MTP layer symbol {ch!r} in pattern {pattern!r}; "
-                f"valid symbols are {sorted(_SYMBOL_TO_BLOCK.keys())}"
-            )
-        blocks.append(_SYMBOL_TO_BLOCK[ch])
-    return blocks
-
 
 def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tensor:
     """Roll a tensor along ``dim`` by ``shifts`` and zero the wrapped slice.
@@ -142,6 +107,10 @@ class MTPModule(nn.Module):
 
     Args:
         mtp_config: :class:`MTPConfig` describing depth and pattern.
+        block_types_per_sublayer: List of block-type strings (one per inner
+            sublayer position), length must equal ``mtp_config.pattern_length``.
+            Caller is responsible for parsing the model-specific symbol
+            convention; this module does not interpret symbols.
         sublayer_factory: Callable
             ``factory(global_idx, depth, sublayer_idx, block_type, has_fusion, has_final_norm) -> nn.Module``
             constructing one sublayer. The returned module must be callable
@@ -154,27 +123,32 @@ class MTPModule(nn.Module):
     def __init__(
         self,
         mtp_config: MTPConfig,
+        block_types_per_sublayer: list[str],
         sublayer_factory: Callable[..., nn.Module],
     ) -> None:
         super().__init__()
         if not mtp_config.enabled:
             raise ValueError("MTPModule constructed with disabled MTPConfig")
+        if len(block_types_per_sublayer) != mtp_config.pattern_length:
+            raise ValueError(
+                f"len(block_types_per_sublayer)={len(block_types_per_sublayer)} "
+                f"!= mtp_config.pattern_length={mtp_config.pattern_length}"
+            )
         self.mtp_config = mtp_config
-        block_types = parse_mtp_layer_pattern(mtp_config.layer_pattern)
-        P = mtp_config.pattern_length
+        num_sublayers_per_depth = mtp_config.pattern_length
         num_physical_depths = mtp_config.num_physical_depths
         layers: list[nn.Module] = []
-        for d in range(num_physical_depths):
-            for s in range(P):
-                global_idx = d * P + s
+        for depth in range(num_physical_depths):
+            for sublayer_idx in range(num_sublayers_per_depth):
+                global_idx = depth * num_sublayers_per_depth + sublayer_idx
                 layers.append(
                     sublayer_factory(
                         global_idx=global_idx,
-                        depth=d,
-                        sublayer_idx=s,
-                        block_type=block_types[s],
-                        has_fusion=(s == 0),
-                        has_final_norm=(s == P - 1),
+                        depth=depth,
+                        sublayer_idx=sublayer_idx,
+                        block_type=block_types_per_sublayer[sublayer_idx],
+                        has_fusion=(sublayer_idx == 0),
+                        has_final_norm=(sublayer_idx == num_sublayers_per_depth - 1),
                     )
                 )
         self.layers = nn.ModuleList(layers)
@@ -218,25 +192,25 @@ class MTPModule(nn.Module):
             List of length ``num_depths`` containing the hidden state
             produced at each depth.
         """
-        D = self.num_depths
-        P = self.pattern_length
+        num_iterations = self.num_depths
+        num_sublayers_per_depth = self.pattern_length
         use_repeated = self.mtp_config.use_repeated_layer
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         cur_position_ids = position_ids
-        for d in range(D):
+        for depth in range(num_iterations):
             cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
             if cur_position_ids is not None:
                 cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
 
             decoder_input = embed_fn(cur_input_ids)
-            phys_d = 0 if use_repeated else d
-            for s in range(P):
-                sublayer = self.layers[phys_d * P + s]
+            physical_depth = 0 if use_repeated else depth
+            for sublayer_idx in range(num_sublayers_per_depth):
+                sublayer = self.layers[physical_depth * num_sublayers_per_depth + sublayer_idx]
                 kwargs = dict(block_kwargs)
                 if cur_position_ids is not None:
                     kwargs["position_ids"] = cur_position_ids
-                if s == 0:
+                if sublayer_idx == 0:
                     kwargs["embed_input"] = decoder_input
                 hidden_states = sublayer(hidden_states, **kwargs)
             per_depth_h.append(hidden_states)

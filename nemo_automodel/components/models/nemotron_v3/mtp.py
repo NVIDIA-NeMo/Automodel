@@ -39,6 +39,43 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 
+# Hybrid layer symbols matching HF Nemotron-H's ``hybrid_override_pattern``
+# and ``mtp_hybrid_override_pattern``. Specific to this model family; lives
+# here rather than in common scaffolding because no other model family uses
+# this exact symbol convention.
+_PATTERN_SYMBOL_TO_BLOCK_TYPE = {
+    "M": "mamba",
+    "*": "attention",
+    "-": "mlp",
+    "E": "moe",
+}
+
+
+def parse_mtp_layer_pattern(pattern: str) -> list[str]:
+    """Parse a NemotronH MTP layer pattern (e.g. ``"*E"``) into block types.
+
+    Args:
+        pattern: Pattern string using symbols ``M`` (mamba), ``*`` (attention),
+            ``-`` (mlp), ``E`` (moe).
+
+    Returns:
+        List of block-type names (``"mamba"``, ``"attention"``, ``"mlp"``, ``"moe"``).
+
+    Raises:
+        ValueError: If the pattern is empty or contains unknown symbols.
+    """
+    if not pattern:
+        raise ValueError("MTP layer pattern is empty")
+    blocks: list[str] = []
+    for ch in pattern:
+        if ch not in _PATTERN_SYMBOL_TO_BLOCK_TYPE:
+            raise ValueError(
+                f"Unknown MTP layer symbol {ch!r} in pattern {pattern!r}; "
+                f"valid symbols are {sorted(_PATTERN_SYMBOL_TO_BLOCK_TYPE.keys())}"
+            )
+        blocks.append(_PATTERN_SYMBOL_TO_BLOCK_TYPE[ch])
+    return blocks
+
 
 class NemotronV3MTPSublayer(NemotronV3Block):
     """One MTP sublayer for NemotronV3.
@@ -152,6 +189,7 @@ def build_nemotron_v3_mtp(
         ``mtp_config.enabled`` is ``False``.
     """
     base_layer_idx = config.num_hidden_layers
+    block_types_per_sublayer = parse_mtp_layer_pattern(mtp_config.layer_pattern)
 
     def factory(*, global_idx, depth, sublayer_idx, block_type, has_fusion, has_final_norm):
         return NemotronV3MTPSublayer(
@@ -165,7 +203,11 @@ def build_nemotron_v3_mtp(
             dtype=dtype,
         )
 
-    return MTPModule(mtp_config=mtp_config, sublayer_factory=factory)
+    return MTPModule(
+        mtp_config=mtp_config,
+        block_types_per_sublayer=block_types_per_sublayer,
+        sublayer_factory=factory,
+    )
 
 
 def build_mtp_config_from_hf(
