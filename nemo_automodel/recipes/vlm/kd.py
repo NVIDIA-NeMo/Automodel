@@ -142,6 +142,44 @@ def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=
     del student_tokenizer, teacher_tokenizer
 
 
+def _get_model_input_embedding_dim(model: torch.nn.Module) -> int | None:
+    """Return the model input embedding width when it can be inferred."""
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if callable(get_input_embeddings):
+        embeddings = get_input_embeddings()
+        if embeddings is not None:
+            embedding_dim = getattr(embeddings, "embedding_dim", None)
+            if embedding_dim is not None:
+                return int(embedding_dim)
+            weight = getattr(embeddings, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.ndim >= 2:
+                return int(weight.shape[-1])
+
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None)
+    for cfg in (text_config, config):
+        hidden_size = getattr(cfg, "hidden_size", None)
+        if hidden_size is not None:
+            return int(hidden_size)
+    return None
+
+
+def _validate_cp_pre_embed_teacher_compatibility(inputs_embeds: torch.Tensor, teacher_model: torch.nn.Module) -> None:
+    """Reject CP pre-embed when the teacher cannot consume the student's embedding width."""
+    teacher_hidden_size = _get_model_input_embedding_dim(teacher_model)
+    if teacher_hidden_size is None:
+        return
+
+    student_hidden_size = int(inputs_embeds.shape[-1])
+    if student_hidden_size != teacher_hidden_size:
+        raise ValueError(
+            "VLM KD with context parallelism pre-embeds multimodal inputs with the student model before CP "
+            "sharding, so teacher and student input embedding hidden sizes must match. "
+            f"Got student inputs_embeds hidden size {student_hidden_size} and teacher input embedding hidden "
+            f"size {teacher_hidden_size}."
+        )
+
+
 class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     """Fine-tune a student VLM via knowledge distillation from a teacher VLM."""
 
@@ -209,6 +247,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
             with torch.no_grad():
                 prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            if "inputs_embeds" in prepared:
+                _validate_cp_pre_embed_teacher_compatibility(prepared["inputs_embeds"], self.teacher_model)
             for k in VLM_INPUT_KEYS:
                 batch.pop(k, None)
             batch.update(prepared)
