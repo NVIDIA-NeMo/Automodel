@@ -71,9 +71,20 @@ class TestRenameHfKey:
         assert _rename_hf_key("layers.0.attn.wkv.weight") == "model.layers.0.self_attn.wkv.weight"
 
     def test_attn_attn_sink(self):
-        # ``attn_sink`` (HF) maps to ``self_attn.sinks`` to match the
-        # ``module.sinks`` attribute consumed by ``eager_attention_with_sink``.
-        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks"
+        # ``attn_sink`` (HF) maps to a callable parameter holder so FSDP2 can
+        # shard it as its own fp32 unit while ``module.sinks`` still exposes
+        # the tensor to attention.
+        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks_param.weight"
+
+    def test_attn_compressor_ape(self):
+        assert _rename_hf_key("layers.2.attn.compressor.ape") == (
+            "model.layers.2.self_attn.compressor.ape_param.weight"
+        )
+
+    def test_attn_indexer_compressor_ape(self):
+        assert _rename_hf_key("layers.2.attn.indexer.compressor.ape") == (
+            "model.layers.2.self_attn.compressor.indexer.ape_param.weight"
+        )
 
     def test_gate_weight(self):
         assert _rename_hf_key("layers.1.ffn.gate.weight") == "model.layers.1.mlp.gate.weight"
@@ -192,6 +203,18 @@ class TestDeepSeekV4StateDictAdapterToHF:
         )
         assert adapter._internal_key_to_hf("model.layers.1.mlp.gate.weight") == "layers.1.ffn.gate.weight"
         assert adapter._internal_key_to_hf("model.layers.1.mlp.gate.tid2eid") == "layers.1.ffn.gate.tid2eid"
+
+    def test_internal_key_to_hf_fp32_holders(self):
+        adapter = _make_adapter()
+        assert adapter._internal_key_to_hf("model.layers.0.self_attn.sinks_param.weight") == "layers.0.attn.attn_sink"
+        assert (
+            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.ape_param.weight")
+            == "layers.2.attn.compressor.ape"
+        )
+        assert (
+            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.indexer.ape_param.weight")
+            == "layers.2.attn.indexer.compressor.ape"
+        )
 
     def test_non_quantized_gate_bias(self):
         adapter = _make_adapter()

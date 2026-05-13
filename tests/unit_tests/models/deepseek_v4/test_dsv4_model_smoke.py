@@ -118,7 +118,7 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
-    def test_dsv4_fsdp_wraps_fp32_islands_without_common_util_policy(self, monkeypatch):
+    def test_dsv4_fsdp_wraps_fp32_islands_without_ignored_trainable_tensors(self, monkeypatch):
         cfg = _tiny_config(
             num_hidden_layers=1,
             num_hash_layers=0,
@@ -171,10 +171,13 @@ class TestDeepseekV4ModelSmoke:
         expected_fp32_modules = {
             "attn_hc",
             "ffn_hc",
+            "self_attn.sinks_param",
             "self_attn.compressor.wkv",
             "self_attn.compressor.wgate",
+            "self_attn.compressor.ape_param",
             "self_attn.compressor.indexer.wkv",
             "self_attn.compressor.indexer.wgate",
+            "self_attn.compressor.indexer.ape_param",
         }
         assert expected_fp32_modules.issubset(calls_by_name)
         for name in expected_fp32_modules:
@@ -182,11 +185,8 @@ class TestDeepseekV4ModelSmoke:
             assert calls_by_name[name]["mp_policy"].reduce_dtype == torch.float32
 
         parent_ignored = calls_by_name["<block>"]["ignored_params"]
-        block_params = dict(block.named_parameters())
-        assert block_params["self_attn.sinks"] in parent_ignored
-        assert block_params["self_attn.compressor.ape"] in parent_ignored
-        assert block_params["self_attn.compressor.indexer.ape"] in parent_ignored
         assert ignored_expert_params.issubset(parent_ignored)
+        assert len(parent_ignored) == len(ignored_expert_params)
 
     def test_reference_fp32_parameters_constructed_before_cast(self):
         cfg = _tiny_config(
@@ -311,7 +311,7 @@ class TestDeepseekV4ModelSmoke:
 
         model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
 
-    def test_hash_gate_tid2eid_matches_reference_int32_dtype(self):
+    def test_hash_gate_tid2eid_uses_deepep_runtime_int64_dtype(self):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
         model = DeepseekV4ForCausalLM(
             cfg,
@@ -327,9 +327,9 @@ class TestDeepseekV4ModelSmoke:
         )
 
         gate = model.model.layers["0"].mlp.gate
-        assert gate.tid2eid.dtype == torch.int32
+        assert gate.tid2eid.dtype == torch.int64
         cast_model_to_dtype(model, torch.bfloat16)
-        assert gate.tid2eid.dtype == torch.int32
+        assert gate.tid2eid.dtype == torch.int64
 
         gate.set_input_ids(torch.tensor([[1, 2, 3]]))
         _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))

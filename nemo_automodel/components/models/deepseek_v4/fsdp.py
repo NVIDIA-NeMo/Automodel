@@ -29,16 +29,13 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "ffn_hc",
     "hc_head",
     "lm_head",
+    "self_attn.sinks_param",
     "self_attn.compressor.wkv",
     "self_attn.compressor.wgate",
+    "self_attn.compressor.ape_param",
     "self_attn.compressor.indexer.wkv",
     "self_attn.compressor.indexer.wgate",
-)
-
-_DSV4_DIRECT_FP32_PARAM_SUFFIXES = (
-    "self_attn.sinks",
-    "self_attn.compressor.ape",
-    "self_attn.compressor.indexer.ape",
+    "self_attn.compressor.indexer.ape_param",
 )
 
 
@@ -108,7 +105,7 @@ def _fsdp_kwargs_for_module(module: nn.Module, fsdp_kwargs: dict) -> dict:
     return filtered_kwargs
 
 
-def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp32_policy: bool, **fsdp_kwargs):
+def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp32_policy: bool = False, **fsdp_kwargs):
     if module is None or _has_fsdp_state(module):
         return module
 
@@ -132,26 +129,6 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
             continue
         seen.add(id(submodule))
         yield submodule
-
-
-def _nested_fsdp_param_ids(module: nn.Module) -> set[int]:
-    ids: set[int] = set()
-    for child in module.modules():
-        if child is module:
-            continue
-        if _has_fsdp_state(child):
-            ids.update(id(param) for param in child.parameters())
-    return ids
-
-
-def _direct_dsv4_fp32_params(module: nn.Module, skipped_param_ids: set[int]) -> set[nn.Parameter]:
-    ignored_params: set[nn.Parameter] = set()
-    for name, param in module.named_parameters():
-        if id(param) in skipped_param_ids or param.dtype != torch.float32:
-            continue
-        if any(_matches_suffix(name, suffix) for suffix in _DSV4_DIRECT_FP32_PARAM_SUFFIXES):
-            ignored_params.add(param)
-    return ignored_params
 
 
 def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
@@ -181,7 +158,6 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
             **fsdp_kwargs,
         )
 
-    wrapped_param_ids: set[int] = set()
     for fp32_module in _iter_dsv4_fp32_modules(module):
         _fully_shard_once(
             fp32_module,
@@ -191,14 +167,8 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
             fp32_policy=True,
             **fsdp_kwargs,
         )
-        wrapped_param_ids.update(id(param) for param in fp32_module.parameters())
 
     ignored_params = set(fsdp_kwargs.get("ignored_params") or ())
-    skipped_param_ids = {id(param) for param in ignored_params}
-    skipped_param_ids.update(_nested_fsdp_param_ids(module))
-    skipped_param_ids.update(wrapped_param_ids)
-    ignored_params.update(_direct_dsv4_fp32_params(module, skipped_param_ids))
-
     parent_kwargs = dict(fsdp_kwargs)
     if ignored_params:
         parent_kwargs["ignored_params"] = ignored_params

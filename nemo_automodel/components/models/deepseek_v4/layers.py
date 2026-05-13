@@ -505,6 +505,17 @@ def _build_indexer_topk_compressed_mask(
     )  # [B, S, P]
 
 
+class DeepseekV4FP32Parameter(nn.Module):
+    """Callable holder for fp32 tensors that need their own FSDP unit."""
+
+    def __init__(self, value: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(value.to(torch.float32))
+
+    def forward(self) -> torch.Tensor:
+        return self.weight
+
+
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -526,10 +537,14 @@ class DeepseekV4Indexer(nn.Module):
         proj_dim = 2 * self.head_dim  # overlap mode
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
-        self.ape = nn.Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
+        self.ape_param = DeepseekV4FP32Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
+
+    @property
+    def ape(self) -> torch.Tensor:
+        return self.ape_param()
 
     def forward(
         self,
@@ -599,9 +614,13 @@ class DeepseekV4Compressor(nn.Module):
         proj_dim = coff * head_dim
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
-        self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
+        self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
+
+    @property
+    def ape(self) -> torch.Tensor:
+        return self.ape_param()
 
     def forward(
         self,
@@ -829,11 +848,15 @@ class DeepseekV4Attention(nn.Module):
             config.o_groups,
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
         self.compressor = (
             DeepseekV4Compressor(config, self.compress_ratio, self.head_dim) if self.compress_ratio else None
         )
+
+    @property
+    def sinks(self) -> torch.Tensor:
+        return self.sinks_param()
 
     def forward(
         self,
@@ -953,11 +976,11 @@ class DeepseekV4Attention(nn.Module):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()
-        nn.init.zeros_(self.sinks)
+        nn.init.zeros_(self.sinks_param.weight)
         if self.compressor is not None:
             for mod in self.compressor.modules():
                 if isinstance(mod, nn.Linear):
                     nn.init.trunc_normal_(mod.weight, mean=0.0, std=init_std)
-            nn.init.zeros_(self.compressor.ape)
+            nn.init.zeros_(self.compressor.ape_param.weight)
             if self.compressor.indexer is not None:
-                nn.init.zeros_(self.compressor.indexer.ape)
+                nn.init.zeros_(self.compressor.indexer.ape_param.weight)

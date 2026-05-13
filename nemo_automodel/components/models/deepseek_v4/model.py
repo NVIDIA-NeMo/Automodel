@@ -184,7 +184,7 @@ class DeepseekV4HashGate(nn.Module):
     pre-assign expert indices.  The routing weight is still computed from the
     gate weight but the *selection* is deterministic per token id.
 
-    tid2eid shape: [vocab_size, n_activated_experts]  (int32, non-trainable)
+    tid2eid shape: [vocab_size, n_activated_experts]  (int64 runtime, non-trainable)
 
     Signature matches ``components.moe.layers.Gate`` — ``forward(x, token_mask,
     cp_mesh)`` returning ``(weights, indices, aux_loss)`` — so the generic MoE
@@ -206,11 +206,11 @@ class DeepseekV4HashGate(nn.Module):
         # Token-id -> expert-id lookup table.  Registered as a persistent
         # buffer (not a Parameter) because FSDP's param-sharding path rejects
         # int tensors via .requires_grad_(), and the table is non-trainable
-        # anyway.  Dtype matches the V4 Flash inference implementation and
-        # checkpoint on-disk layout (I32).
+        # anyway.  DeepEP expects runtime expert indices to be int64; the
+        # checkpoint adapter may load the on-disk I32 table into this buffer.
         self.register_buffer(
             "tid2eid",
-            torch.zeros(config.vocab_size, self.topk, dtype=torch.int32),
+            torch.zeros(config.vocab_size, self.topk, dtype=torch.int64),
             persistent=True,
         )
         # Kept for API compat with the generic Gate (e.g. optimizer sync paths
@@ -254,7 +254,7 @@ class DeepseekV4HashGate(nn.Module):
             scores = scores.softmax(dim=-1)
 
         if input_ids is not None:
-            indices = self.tid2eid[input_ids.flatten().to(torch.int64)].long()
+            indices = self.tid2eid[input_ids.flatten().to(torch.int64)]
         else:
             # Fallback to score-based topk — keeps the module usable in tests or
             # PP stages where input_ids is not threaded through.
@@ -584,7 +584,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(logits.float()) if self.lm_head else logits
+        if self.lm_head:
+            hidden_dtype = logits.dtype
+            logits = self.lm_head(logits.float()).to(hidden_dtype)
         if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
             logits = logits.unsqueeze(0)
         return logits
