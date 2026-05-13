@@ -1493,10 +1493,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 if mtp_per_depth_h is not None:
-                    # ``mtp_per_depth_h`` is only ever populated by models whose
-                    # output dataclass also declares ``mtp_loss_scaling_factor``
-                    # (e.g. ``NemotronHCausalLMOutputWithPast``), so direct
-                    # attribute access is safe here.
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
