@@ -161,9 +161,9 @@ def test_encoder_build_ministral3_registry_path(tmp_path, monkeypatch):
     assert any("save1" in p for p in model.model.saved)
 
 
-@pytest.mark.parametrize("top_level_model_type", ["ministral3", "ministral3_bidirec", "mistral3"])
+@pytest.mark.parametrize("top_level_model_type", ["ministral3", "ministral3_bidirec"])
 def test_encoder_build_ministral_supported_model_types(tmp_path, monkeypatch, top_level_model_type):
-    """Hub / local configs use ministral3, saved bidirectional uses ministral3_bidirec; VLM uses mistral3."""
+    """Hub / local text configs use ministral3; saved bidirectional checkpoints use ministral3_bidirec."""
     class FakeBidirectionalModel(FakeLM):
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
