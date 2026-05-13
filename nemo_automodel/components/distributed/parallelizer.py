@@ -154,9 +154,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_fsdp2_prefetch: bool = True,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
+        fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
+        if fully_shard_fn is None:
+            fully_shard_fn = fully_shard
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
@@ -298,12 +301,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
+            fully_shard_fn=fully_shard_fn,
         )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
         # will be used in backward immediately
-        model = fully_shard(
+        model = fully_shard_fn(
             model,
             mesh=dp_mesh,
             mp_policy=mp_policy,
@@ -478,21 +482,13 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
         from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
-        original_fully_shard = globals().get("fully_shard")
-        assert original_fully_shard is not None, "fully_shard not found in module globals"
-
-        globals()["fully_shard"] = fully_shard_deepseek_v4
-        try:
-            result = super().parallelize(
-                model,
-                device_mesh,
-                dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
-                **kwargs,
-            )
-        finally:
-            globals()["fully_shard"] = original_fully_shard
-
-        return result
+        return super().parallelize(
+            model,
+            device_mesh,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            fully_shard_fn=fully_shard_deepseek_v4,
+            **kwargs,
+        )
 
 
 class WanParallelizationStrategy(ParallelizationStrategy):
@@ -760,6 +756,7 @@ def apply_fsdp2_sharding_recursively(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    fully_shard_fn=None,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -786,6 +783,9 @@ def apply_fsdp2_sharding_recursively(
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
+    if fully_shard_fn is None:
+        fully_shard_fn = fully_shard
+
     pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
@@ -812,6 +812,7 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                fully_shard_fn=fully_shard_fn,
             )
 
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
@@ -821,7 +822,7 @@ def apply_fsdp2_sharding_recursively(
                 reshard_after_forward = False
             else:
                 reshard_after_forward = enum_id < len(flat_layer_items) - 1
-            fully_shard(
+            fully_shard_fn(
                 child_module,
                 mesh=mesh,
                 mp_policy=mp_policy,
@@ -858,6 +859,7 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                fully_shard_fn=fully_shard_fn,
             )
 
 
