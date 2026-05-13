@@ -325,6 +325,61 @@ def test_draft_attention_step1_attends_to_step0_kv():
     )
 
 
+def test_draft_attention_rope_shifts_position_by_step_idx():
+    """At TTT step ``k`` RoPE must be applied with ``position_ids + k``.
+
+    Without the shift, step ``k``'s newly-projected K/V would encode the
+    same absolute position as step 0, defeating the EAGLE-3 "this token
+    is k positions into the future" semantics. SpecForge implements this
+    as ``lck = len(cache_hidden[0]); position_ids + lck``; we mirror it
+    with ``step_idx = len(cache_k); position_ids + step_idx``.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    batch_size, seq_len = 2, 6
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    projected = draft.project_hidden_states(aux_hidden_states)
+
+    # Wrap rotary_emb to capture which position_ids it was called with.
+    attn = draft.decoder.self_attn
+    original_rotary = attn.rotary_emb
+    captured: list[torch.Tensor] = []
+
+    class _Recording(torch.nn.Module):
+        def forward(self, x, position_ids):
+            captured.append(position_ids.clone())
+            return original_rotary(x, position_ids)
+
+    attn.rotary_emb = _Recording()
+
+    try:
+        cache_hidden: list[list[torch.Tensor]] = [[], []]
+        for _ in range(3):
+            with torch.no_grad():
+                draft(
+                    input_ids=input_ids,
+                    projected_hidden_states=projected,
+                    attention_mask=attention_mask,
+                    cache_hidden=cache_hidden,
+                )
+    finally:
+        attn.rotary_emb = original_rotary
+
+    # Three TTT steps -> three rotary_emb calls with positions:
+    #   step 0: arange       = [0..T-1]
+    #   step 1: arange + 1   = [1..T]
+    #   step 2: arange + 2   = [2..T+1]
+    assert len(captured) == 3
+    base = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    for step_idx, pos in enumerate(captured):
+        expected = base + step_idx
+        torch.testing.assert_close(pos, expected, msg=f"step {step_idx} position mismatch: got {pos[0].tolist()}")
+
+
 def test_draft_attention_einsum_matches_loop_reference():
     """The polished ``einsum`` TTT attention must match a SpecForge-style loop reference.
 
