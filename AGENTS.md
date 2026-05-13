@@ -209,12 +209,26 @@ file gives step-by-step instructions an AI agent can follow.
 
 | # | Skill                    | Directory                  | Description                                      |
 |---|--------------------------|----------------------------|--------------------------------------------------|
-| 1 | model-onboarding         | `model-onboarding`         | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family     |
-| 2 | developer-guide          | `developer-guide`          | Environment setup and day-to-day dev workflow     |
-| 3 | recipe-development       | `recipe-development`       | Create and modify training/eval recipes           |
-| 4 | distributed-training     | `distributed-training`     | FSDP2, HSDP, pipeline parallelism, context parallelism |
-| 5 | parity-testing           | `parity-testing`           | Verify numerical correctness against reference implementations |
-| 6 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
+| 1 | model-onboarding         | `model-onboarding`         | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family |
+| 2 | recipe-development       | `recipe-development`       | Create and modify training/eval recipes           |
+| 3 | distributed-training     | `distributed-training`     | FSDP2, HSDP, pipeline parallelism, context parallelism |
+| 4 | parity-testing           | `parity-testing`           | Verify numerical correctness against reference implementations |
+| 5 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
+| 6 | linting-and-formatting   | `linting-and-formatting`   | ruff rules, type hints, docstrings, copyright headers, code review checklist |
+| 7 | build-and-dependency     | `build-and-dependency`     | Container setup, uv package management, environment variables, CLI usage |
+| 8 | cicd                     | `cicd`                     | Commit/PR workflow, CI trigger mechanism, failure investigation |
+| 9 | testing                  | `testing`                  | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
 
-When starting a task, identify which skill applies and read that file for
-domain-specific guidance before writing any code.
+**Always read the relevant `SKILL.md` before starting any task it covers —
+skills are mandatory context, not optional background reading.**
+
+**Workflow — mandatory order for every task:**
+1. **Pull information first.** Read the commit, PR, error log, file, or
+   whatever artifact the task is about. Do not reason about it yet.
+2. **Select and invoke the skill.** Based on what you just read, identify
+   the relevant skill and invoke it before forming any answer or plan.
+3. **Answer or implement.** Only after the skill is loaded, use its context
+   to reason, diagnose, or write code.
+
+Never skip or reorder these steps. Do not wait for the user to name the right
+skill keyword — infer it from the artifact you read.

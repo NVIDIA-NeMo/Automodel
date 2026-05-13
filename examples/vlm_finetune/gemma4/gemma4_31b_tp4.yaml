@@ -40,7 +40,9 @@ model:
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
-  attn_implementation: sdpa
+  # SDPA backward NaNs in bf16 on Gemma4 31B's attention shapes when local_batch_size >= 2
+  # using eager attention to be robust for all bs
+  attn_implementation: eager
   # 31B does not use kv_shared layers (only used in 2B, 4B), hence use_cache: false.
   text_config:
     use_cache: false
@@ -104,3 +106,7 @@ freeze_config:
 #   project: <your-project>
 #   entity: <your-entity>
 #   name: <your-run-name>
+
+ci:
+  recipe_owner: athitten
+  time: "00:30:00"

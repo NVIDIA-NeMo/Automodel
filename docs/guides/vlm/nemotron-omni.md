@@ -313,7 +313,7 @@ to spot-check structured output.
 ```python
 import torch
 import json
-from transformers import AutoConfig, AutoModel, AutoProcessor
+from transformers import AutoModel, AutoProcessor
 from datasets import load_dataset
 from nemo_automodel.components.datasets.vlm.utils import json2token
 
@@ -323,19 +323,18 @@ CKPT = "<checkpoint_dir>/LOWEST_VAL/model/consolidated"
 processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
 tokenizer = processor.tokenizer
 
-# Resolve the trust_remote_code model class via from_config, then load weights.
-# Using AutoModel.from_pretrained directly can mis-route on v3 dumps.
-config = AutoConfig.from_pretrained(CKPT, trust_remote_code=True)
-model_class = type(AutoModel.from_config(config, trust_remote_code=True))
-if not hasattr(model_class, "all_tied_weights_keys"):
-    model_class.all_tied_weights_keys = {}
-model = model_class.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16)
+# `device_map` streams weights directly to GPU; skipping the AutoModel.from_config
+# CPU-instantiation step saves ~5 min on the 30B v3 dump.
+model = AutoModel.from_pretrained(
+    CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16,
+    device_map={"": torch.cuda.current_device()},
+)
 
 # Reset RADIO's `summary_idxs` (non-persistent buffer; can be a meta tensor after load)
 if hasattr(model, "vision_model") and hasattr(model.vision_model, "radio_model"):
     model.vision_model.radio_model.summary_idxs = None
 
-model = model.cuda().eval()
+model.eval()
 
 # Load dataset
 dataset = load_dataset("naver-clova-ix/cord-v2")
