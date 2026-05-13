@@ -1,5 +1,5 @@
 # Minimal smoke-test config — 2 steps, no checkpointing, no wandb.
-recipe: DFlashSFTRecipe
+recipe: DiffusionLMSFTRecipe
 
 step_scheduler:
   global_batch_size: 1
@@ -50,6 +50,7 @@ dflash:
   target_torch_dtype: bfloat16
   block_size: 0
   loss_decay_gamma: 0.0
+  num_blocks_per_sample: 4
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
