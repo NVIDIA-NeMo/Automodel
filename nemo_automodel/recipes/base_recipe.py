@@ -182,6 +182,21 @@ def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str,
     return "\n".join(error_msg)
 
 
+def _format_checkpoint_load_error(
+    checkpoint_dir: str, ckpt_dir: str, restore_from: str | None, original_error: Exception
+) -> str:
+    """Format a helpful message when a checkpoint exists but cannot be loaded."""
+    return "\n".join(
+        [
+            "Failed to load an auto-detected checkpoint from the current checkpoint.checkpoint_dir.",
+            f"Checkpoint: {ckpt_dir}",
+            "To start a fresh run, use a different checkpoint.checkpoint_dir or remove the existing checkpoint.",
+            "To resume, make sure the current command matches the saved run.",
+            f"Original error: {type(original_error).__name__}: {original_error}",
+        ]
+    )
+
+
 def _is_rank_0() -> bool:
     """True if distributed is not initialized or this process is rank 0.
     TODO(@akoumpa): deprecate in favor of deviemesh api
@@ -561,10 +576,21 @@ class BaseRecipe:
         if is_rank_0:
             print(f"Loading checkpoint from {ckpt_dir}", flush=True)
 
-        model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
-
-        self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
-        self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        try:
+            model, optimizer, scheduler = self._load_checkpoint_tracked_state(ckpt_dir)
+            self.checkpointer.load_model(model, os.path.join(ckpt_dir, "model"))
+            self.checkpointer.load_optimizer(optimizer, model, ckpt_dir, scheduler)
+        except Exception as e:
+            if restore_from:
+                raise
+            raise RuntimeError(
+                _format_checkpoint_load_error(
+                    checkpoint_dir=self.checkpointer.config.checkpoint_dir,
+                    ckpt_dir=ckpt_dir,
+                    restore_from=restore_from,
+                    original_error=e,
+                )
+            ) from e
 
     def _log_experiment_details(self):
         """Log metadata and config on main rank using YAML markers."""
