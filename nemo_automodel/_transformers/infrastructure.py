@@ -184,6 +184,7 @@ def _instantiate_pipeline(
     config: Optional[PipelineConfig],
     mesh: MeshContext,
     device: Optional[torch.device] = None,
+    strategy_config: Optional[Union[FSDP2Config, MegatronFSDPConfig, DDPConfig]] = None,
 ) -> Optional[AutoPipeline]:
     """Instantiate AutoPipeline from config.
 
@@ -191,6 +192,8 @@ def _instantiate_pipeline(
         config: Pipeline config. If None or pp_size <= 1, returns None.
         mesh: MeshContext holding device_mesh, moe_mesh, and axis names.
         device: Target device for pipeline computation.
+        strategy_config: Strategy config fallback when ``mesh`` was rebuilt from
+            raw device meshes and no longer carries the recipe-level config.
 
     Returns:
         AutoPipeline instance, or None if pipeline parallelism is not enabled.
@@ -203,7 +206,7 @@ def _instantiate_pipeline(
 
     # Route the existing FSDP2Config.defer_fsdp_grad_sync into the pipeline so
     # the same knob controls grad-sync behavior under PP.
-    strategy_config = getattr(mesh, "strategy_config", None)
+    strategy_config = getattr(mesh, "strategy_config", None) or strategy_config
     if strategy_config is not None and hasattr(strategy_config, "defer_fsdp_grad_sync"):
         config_dict.setdefault("defer_fsdp_grad_sync", strategy_config.defer_fsdp_grad_sync)
 
@@ -299,7 +302,7 @@ def instantiate_infrastructure(
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 
     model_wrapper = _instantiate_distributed(distributed_config, mesh)
-    autopipeline = _instantiate_pipeline(pipeline_config, mesh, device)
+    autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
     if ep_size > 1:

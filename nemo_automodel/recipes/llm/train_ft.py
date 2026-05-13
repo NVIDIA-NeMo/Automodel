@@ -154,6 +154,11 @@ def _uses_thd_collater(cfg_dataloader):
     )
 
 
+def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
+    """Return whether the recipe should attach PP causal-mask precomputation."""
+    return getattr(model_config, "model_type", None) != "deepseek_v4"
+
+
 def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.step_scheduler.local_batch_size // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
@@ -654,7 +659,12 @@ def build_dataloader(
                     "Pipeline parallel mask precomputation will be skipped."
                 )
             else:
-                if "collate_fn" in dl_kwargs:
+                if not _should_precompute_pp_causal_masks(hf_model_config):
+                    logger.info(
+                        "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
+                        getattr(hf_model_config, "model_type", None),
+                    )
+                elif "collate_fn" in dl_kwargs:
                     # Case 1: PP enabled + collate_fn exists -> chain them
                     # base_collate_fn -> add_causal_masks_to_batch
                     base_collate_fn = dl_kwargs["collate_fn"]
@@ -1507,6 +1517,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
+    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
+        pp_group = self.device_mesh["pp"].get_group()
+        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
+        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
+        return tensor
+
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
@@ -1641,12 +1658,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
-            # Send loss to first rank if pp group rank is 0
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
+            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
@@ -1708,13 +1720,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             val_loss = val_loss.to(self.dist_env.device)
             # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
             pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(val_loss, dst=0)
-                torch.distributed.send(pp_num_tokens, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(val_loss, src=src_rank)
-                torch.distributed.recv(pp_num_tokens, src=src_rank)
+            val_loss = self._broadcast_from_last_pp_stage(val_loss)
+            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
+            if self.dist_env.is_main:
                 total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss

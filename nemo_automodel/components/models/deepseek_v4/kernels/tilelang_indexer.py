@@ -32,8 +32,8 @@ from .tilelang_indexer_fwd import _make_causal_cu_seqlens, batched_indexer_fwd
 
 
 def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
-    valid_mask = topk_indices != -1
-    safe_indices = topk_indices.clamp(min=0).to(torch.int64)
+    valid_mask = (topk_indices >= 0) & (topk_indices < logits.shape[dim])
+    safe_indices = topk_indices.clamp(min=0, max=max(logits.shape[dim] - 1, 0)).to(torch.int64)
     scores = torch.gather(logits, dim=dim, index=safe_indices)
     scores = torch.where(valid_mask, scores, float("-inf"))
     return scores

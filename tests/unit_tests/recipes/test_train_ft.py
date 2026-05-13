@@ -258,7 +258,7 @@ def test_peft_without_pipeline_parallelism(caplog):
                                     cfg_peft=cfg_peft,
                                     seed=42,
                                 )
-                                optimizer = build_optimizer(model, cfg_opt, None, None)
+                                _ = build_optimizer(model, cfg_opt, None, None)
 
                             # Verify that apply_lora was called
                             assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -1192,7 +1192,7 @@ def test_build_model_with_quantized_model_config():
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, None)
+                    _ = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated with quantization config
     assert model is not None
@@ -1216,7 +1216,7 @@ def test_build_model_without_quant_config():
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, None)
+                    _ = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated without quantization config
     assert model is not None
@@ -1252,7 +1252,7 @@ def test_build_optimizer_disables_foreach_with_tp():
                         seed=42,
                         device_mesh=mock_mesh,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, mock_mesh)
+                    _ = build_optimizer(model, cfg_opt, None, mock_mesh)
 
     # Verify foreach was disabled
     assert cfg_opt.foreach is False
@@ -1460,6 +1460,52 @@ def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
     captured = getattr(mod.dl_factory_capture, "captured")
     assert "collate_fn" in captured
     assert callable(captured["collate_fn"])
+
+
+def test_build_dataloader_pp_deepseek_v4_skips_mask_collate(caplog):
+    """DeepSeek V4 computes causal masks internally, so PP mask precomputation is skipped."""
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
+    cfg_ps = ConfigNode({})
+
+    mock_config = MagicMock(model_type="deepseek_v4")
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
+        caplog.at_level(logging.INFO),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" not in captured
+    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+    add_masks.assert_not_called()
 
 
 def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():

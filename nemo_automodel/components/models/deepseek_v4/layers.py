@@ -78,6 +78,11 @@ def _dsv4_kernel_backend(backend: BackendConfig) -> str:
     return "tilelang" if backend.attn == "tilelang" else "torch"
 
 
+def _rms_norm_last_dim(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMS-normalize the last dim without materializing an ``x.square()`` tensor."""
+    return F.rms_norm(x, (x.shape[-1],), eps=eps)
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek V4 attention + compressor + indexer + rotary embedding, ported
 # verbatim from HuggingFace transformers PR 45616 (Arthur Zucker, "Add
@@ -140,10 +145,13 @@ def _apply_partial_rope_interleaved(
     while c.ndim < a.ndim:
         c = c.unsqueeze(1)
         s = s.unsqueeze(1)
-    new_a = a * c - b * s
-    new_b = a * s + b * c
-    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2).to(input_dtype)
-    return torch.cat([nope, new_rope], dim=-1)
+    out = torch.empty_like(x)
+    if nope.shape[-1] > 0:
+        out[..., :-rd] = nope
+    out_pairs = out[..., -rd:].unflatten(-1, (-1, 2))
+    out_pairs[..., 0] = a * c - b * s
+    out_pairs[..., 1] = a * s + b * c
+    return out
 
 
 def apply_rotary_pos_emb(
@@ -538,8 +546,8 @@ def _build_indexer_topk_compressed_mask(
     min_val = torch.finfo(attention_mask.dtype).min
     indexer_topk = indexer_topk.to(device=attention_mask.device)
     batch, seq_len = indexer_topk.shape[:2]
-    valid = indexer_topk != -1  # [B, S, K]
-    safe_idx = indexer_topk.clamp(min=0)
+    valid = (indexer_topk >= 0) & (indexer_topk < n_pooled)  # [B, S, K]
+    safe_idx = indexer_topk.clamp(min=0, max=max(n_pooled - 1, 0))
     indicator_counts = torch.zeros(
         (batch, seq_len, n_pooled),
         dtype=torch.int32,
@@ -800,9 +808,8 @@ class DeepseekV4HyperConnection(nn.Module):
 
     def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
-        mix = torch.nn.functional.linear(flat, self.fn.float()) * rsqrt  # [B, S, (2+H)*H]
+        mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.fn.float())  # [B, S, (2+H)*H]
         pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
         hc = self.hc_mult
 
@@ -859,8 +866,7 @@ class DeepseekV4HyperHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = torch.nn.functional.linear(flat, self.hc_fn.float()) * rsqrt
+        mixes = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.hc_fn.float())
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
@@ -958,7 +964,7 @@ class DeepseekV4Attention(nn.Module):
 
         # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
         # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+        q = _rms_norm_last_dim(q, self.config.rms_norm_eps)
 
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)

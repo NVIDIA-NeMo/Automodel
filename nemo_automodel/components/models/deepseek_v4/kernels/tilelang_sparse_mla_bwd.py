@@ -310,8 +310,8 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
-    valid_mask = (topk_idxs != -1).to(torch.int32).contiguous()
-    topk_idxs = topk_idxs.clamp(min=0).to(torch.int32).contiguous()
+    valid_mask = ((topk_idxs >= 0) & (topk_idxs < S_kv)).to(torch.int32).contiguous()
+    topk_idxs = topk_idxs.clamp(min=0, max=max(S_kv - 1, 0)).to(torch.int32).contiguous()
 
     preprocess_kernel = preprocess(B, S, H, D)
     delta = preprocess_kernel(o, do)

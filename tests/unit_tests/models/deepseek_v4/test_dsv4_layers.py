@@ -29,6 +29,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4RotaryEmbedding,
     _apply_partial_rope_interleaved,
     _build_indexer_topk_compressed_mask,
+    _rms_norm_last_dim,
     _yarn_correction_dim,
     _yarn_correction_range,
     _yarn_linear_ramp,
@@ -67,6 +68,117 @@ class TestDeepseekV4AttentionMask:
         expected_compressed_mask = torch.tensor([[[[0.0, min_val, 0.0, min_val, min_val]]]])
         compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled=5).unsqueeze(1)
         torch.testing.assert_close(compressed_mask, expected_compressed_mask)
+
+    def test_indexer_topk_mask_drops_high_invalid_entries(self):
+        """Positive out-of-range pool IDs must not become scatter/gather indices."""
+        attention_mask = torch.zeros(1, 1, 1, 1)
+        indexer_topk = torch.tensor([[[2, 99, 0, -1]]])
+
+        min_val = torch.finfo(attention_mask.dtype).min
+        expected_compressed_mask = torch.tensor([[[[0.0, min_val, 0.0, min_val, min_val]]]])
+        compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled=5).unsqueeze(1)
+        torch.testing.assert_close(compressed_mask, expected_compressed_mask)
+
+    def test_sparse_topk_builder_drops_high_invalid_entries(self):
+        compressed_topk = torch.tensor([[[0, 99], [1, -1], [99, 0], [-1, -1]]])
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=4,
+            key_len=6,
+            window_size=2,
+            device=torch.device("cpu"),
+            compress_ratio=4,
+            compressed_topk=compressed_topk,
+            n_pooled=2,
+        )
+
+        assert (topk >= 6).sum().item() == 0
+        assert topk[0, 0, -2].item() == 4
+        assert topk[0, 0, -1].item() == -1
+
+    def test_packed_topk_uses_padded_lengths_for_tail_padding(self):
+        seq_len = 8
+        real_seq_lens = torch.tensor([[3, 2]], dtype=torch.long)
+        padded_seq_lens = torch.tensor([[3, 5]], dtype=torch.long)
+
+        real_mask = build_packed_causal_padding_mask(
+            real_seq_lens,
+            seq_len=seq_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            sliding_window=4,
+        )
+        real_topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=seq_len,
+            key_len=seq_len,
+            window_size=4,
+            device=torch.device("cpu"),
+            attention_mask=real_mask,
+        )
+
+        padded_mask = build_packed_causal_padding_mask(
+            padded_seq_lens,
+            seq_len=seq_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            sliding_window=4,
+        )
+        padded_topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=seq_len,
+            key_len=seq_len,
+            window_size=4,
+            device=torch.device("cpu"),
+            attention_mask=padded_mask,
+        )
+
+        assert (real_topk[0, 5:] >= 0).sum(dim=-1).eq(0).all()
+        assert (padded_topk[0, 5:] >= 0).sum(dim=-1).gt(0).all()
+
+
+class TestRMSNormLastDim:
+    def _reference(self, x, eps):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+
+    def test_matches_reference_forward_backward(self):
+        eps = 1e-6
+        x = torch.randn(2, 3, 5, 7)
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(lambda x_: self._reference(x_, eps), (x,), grad)
+        actual, (actual_grad,) = _run_forward_backward(lambda x_: _rms_norm_last_dim(x_, eps), (x,), grad)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for bf16 RMSNorm parity")
+    def test_cuda_bfloat16_matches_reference_forward_backward(self):
+        eps = 1e-6
+        x = torch.randn(2, 4, 16, 64, device="cuda", dtype=torch.bfloat16)
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(lambda x_: self._reference(x_, eps), (x,), grad)
+        actual, (actual_grad,) = _run_forward_backward(lambda x_: _rms_norm_last_dim(x_, eps), (x,), grad)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-2, atol=2e-2)
+
+    def test_bias_free_linear_matches_post_scale_forward_backward(self):
+        eps = 1e-6
+        x = torch.randn(2, 5, 7)
+        weight = torch.randn(3, 7)
+        grad = torch.randn(2, 5, 3)
+
+        def reference(x_, weight_):
+            scale = torch.rsqrt(x_.square().mean(-1, keepdim=True) + eps)
+            return torch.nn.functional.linear(x_, weight_) * scale
+
+        expected, expected_grads = _run_forward_backward(reference, (x, weight), grad)
+        actual, actual_grads = _run_forward_backward(
+            lambda x_, weight_: torch.nn.functional.linear(_rms_norm_last_dim(x_, eps), weight_),
+            (x, weight),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
 
 
 class TestDeepseekV4GroupedLinear:
@@ -300,6 +412,28 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
+        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
+    )
+    def test_sinkhorn_tilelang_backend_accepts_non_contiguous_grad(self):
+        torch.manual_seed(123)
+        x = torch.randn(2, 128, 4, 4, device="cuda")
+        grad = torch.randn_like(x).transpose(-1, -2)
+        assert not grad.is_contiguous()
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
     def test_sparse_attention_torch_matches_dense_topk_reference(self):
         torch.manual_seed(123)
         bsz, seq, heads, dim = 2, 7, 3, 8
@@ -317,6 +451,36 @@ class TestDeepseekV4OptimizedKernels:
             compress_ratio=4,
             n_pooled=n_pooled,
         )
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dense_attention_topk_torch(q_, kv_, sinks_, topk, dim**-0.5),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_sparse_attention_torch_ignores_high_invalid_topk(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim = 1, 3, 2, 8
+        q = torch.randn(bsz, seq, heads, dim)
+        kv = torch.randn(bsz, 4, dim)
+        sinks = torch.randn(heads)
+        grad = torch.randn_like(q)
+        topk = torch.tensor([[[0, 99, -1], [1, 2, 99], [3, -1, 99]]])
+
         expected, expected_grads = _run_forward_backward(
             lambda q_, kv_, sinks_: dense_attention_topk_torch(q_, kv_, sinks_, topk, dim**-0.5),
             (q, kv, sinks),
@@ -570,6 +734,40 @@ class TestDeepseekV4OptimizedKernels:
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad)
 
+    def test_indexer_topk_scores_torch_ignores_high_invalid_topk(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled = 1, 3, 2, 8, 4
+        q = torch.randn(bsz, seq, heads, dim)
+        pooled_kv = torch.randn(bsz, pooled, dim)
+        weights = torch.randn(bsz, seq, heads)
+        topk_indices = torch.tensor([[[0, 99, -1], [1, 2, 99], [3, -1, 99]]])
+        grad = torch.randn(bsz, seq, topk_indices.shape[-1])
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: extract_indexer_topk_scores_torch(
+                indexer_scores_torch(q_, pooled_kv_, weights_, dim**-0.5),
+                topk_indices,
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
     @pytest.mark.skipif(
         not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
         reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
@@ -652,6 +850,21 @@ class TestDeepseekV4OptimizedKernels:
 class TestApplyPartialRopeInterleaved:
     """Released DSV4-Flash uses INTERLEAVED RoPE pairs ``(2k, 2k+1)``."""
 
+    def _reference_apply(self, x, cos, sin, rd):
+        half = rd // 2
+        nope, rope = x[..., :-rd], x[..., -rd:]
+        rope_pairs = rope.unflatten(-1, (-1, 2))
+        a, b = rope_pairs[..., 0], rope_pairs[..., 1]
+        c = cos[..., :half]
+        s = sin[..., :half]
+        while c.ndim < a.ndim:
+            c = c.unsqueeze(1)
+            s = s.unsqueeze(1)
+        new_a = a * c - b * s
+        new_b = a * s + b * c
+        new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2)
+        return torch.cat([nope, new_rope], dim=-1)
+
     def _make_cos_sin(self, batch, seq, rd):
         """Build the Llama-style ``cat([f, f], -1)`` cos/sin tensors that
         ``_apply_partial_rope_interleaved`` consumes (it uses only the
@@ -689,6 +902,27 @@ class TestApplyPartialRopeInterleaved:
         sin = torch.zeros(bsz, seq, rd)
         y = _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim=rd)
         torch.testing.assert_close(y, x)
+
+    def test_matches_reference_forward_backward(self):
+        bsz, heads, seq, rd, nope = 2, 3, 4, 8, 5
+        x = torch.randn(bsz, heads, seq, nope + rd, requires_grad=True)
+        cos, sin = self._make_cos_sin(bsz, seq, rd)
+        cos = cos.clone().requires_grad_()
+        sin = sin.clone().requires_grad_()
+
+        x_ref = x.detach().clone().requires_grad_()
+        cos_ref = cos.detach().clone().requires_grad_()
+        sin_ref = sin.detach().clone().requires_grad_()
+        expected = self._reference_apply(x_ref, cos_ref, sin_ref, rd)
+        actual = _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim=rd)
+
+        torch.testing.assert_close(actual, expected)
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        expected.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        torch.testing.assert_close(cos.grad, cos_ref.grad)
+        torch.testing.assert_close(sin.grad, sin_ref.grad)
 
 
 class TestYaRNHelpers:

@@ -50,6 +50,16 @@ _HAS_TILE_KERNELS_SINKHORN, _tile_kernels_sinkhorn = safe_import_from(
     "sinkhorn_normalize",
     msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use backend.attn='tilelang'.",
 )
+_HAS_TILE_KERNELS_SINKHORN_FWD, _tile_kernels_sinkhorn_fwd = safe_import_from(
+    "tile_kernels.mhc.sinkhorn_kernel",
+    "_mhc_sinkhorn_fwd",
+    msg="TileKernels low-level sinkhorn forward kernel is unavailable.",
+)
+_HAS_TILE_KERNELS_SINKHORN_BWD, _tile_kernels_sinkhorn_bwd = safe_import_from(
+    "tile_kernels.mhc.sinkhorn_kernel",
+    "_mhc_sinkhorn_bwd",
+    msg="TileKernels low-level sinkhorn backward kernel is unavailable.",
+)
 _HAS_MILES_SPARSE_ATTN, _miles_sparse_attn_tilelang = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
     "sparse_attn_tilelang",
@@ -81,7 +91,7 @@ _HAS_MILES_INDEXER_AUTOGRAD, _miles_v4_lighting_indexer = safe_import_from(
 def is_dsv4_kernel_available(name: Literal["sinkhorn", "sparse_attn", "indexer"]) -> bool:
     """Return whether the optional TileLang kernel package for ``name`` is importable."""
     if name == "sinkhorn":
-        return _HAS_TILE_KERNELS_SINKHORN
+        return _HAS_TILE_KERNELS_SINKHORN and _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD
     if name == "sparse_attn":
         return _HAS_MILES_SPARSE_ATTN
     if name == "indexer":
@@ -127,6 +137,51 @@ def sinkhorn_normalize_torch(x: torch.Tensor, repeat: int, eps: float) -> torch.
     return x
 
 
+class _Dsv4TileKernelsSinkhorn(torch.autograd.Function):
+    """TileKernels Sinkhorn wrapper that accepts non-contiguous backward gradients.
+
+    The upstream high-level wrapper launches the backward kernel with
+    ``grad_output`` as-is. DSV4 consumes HC combinations through transposed
+    matmul sites, so autograd can provide a transposed gradient layout. The
+    low-level TileKernels backward kernel requires contiguous row-major inputs.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        repeat: int,
+        eps: float,
+    ) -> torch.Tensor:
+        flat_x = x.contiguous().view(-1, *x.shape[-2:])
+        hidden_size = flat_x.shape[1]
+        flat_output = torch.empty_like(flat_x)
+        fwd_kernel = _tile_kernels_sinkhorn_fwd(hidden_size, 1, repeat, eps)
+        bwd_kernel = _tile_kernels_sinkhorn_bwd(hidden_size, 32, repeat, eps)
+        fwd_kernel(flat_x, flat_output)
+        ctx.save_for_backward(flat_x)
+        ctx.bwd_kernel = bwd_kernel
+        ctx.input_shape = x.shape
+        return flat_output.view_as(x)
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None]:
+        (flat_x,) = ctx.saved_tensors
+        flat_grad_output = grad_output.contiguous().view_as(flat_x)
+        flat_grad_input = torch.empty_like(flat_x)
+        ctx.bwd_kernel(flat_grad_output, flat_x, flat_grad_input)
+        return flat_grad_input.view(ctx.input_shape), None, None
+
+
+def _tile_kernels_sinkhorn_contiguous_grad(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
+    if _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD:
+        return _Dsv4TileKernelsSinkhorn.apply(x, repeat, eps)
+    return _tile_kernels_sinkhorn(x.contiguous(), repeat=repeat, eps=eps)
+
+
 def dsv4_sinkhorn_normalize(
     x: torch.Tensor,
     *,
@@ -137,11 +192,11 @@ def dsv4_sinkhorn_normalize(
     """Normalize HyperConnection combination logits with torch or TileKernels."""
     if _should_use_tilelang(
         backend,
-        available=_HAS_TILE_KERNELS_SINKHORN,
+        available=is_dsv4_kernel_available("sinkhorn"),
         kernel_name="sinkhorn",
         tensors=(x,),
     ):
-        return _tile_kernels_sinkhorn(x.contiguous(), repeat=repeat, eps=eps)
+        return _tile_kernels_sinkhorn_contiguous_grad(x, repeat=repeat, eps=eps)
     return sinkhorn_normalize_torch(x, repeat=repeat, eps=eps)
 
 
@@ -182,12 +237,14 @@ def build_dsv4_sparse_topk_indices(
             compressed = compressed.expand(batch_size, -1, -1)
         topk = torch.cat([topk, compressed], dim=-1)
 
+    topk = torch.where((topk >= 0) & (topk < key_len), topk, torch.full_like(topk, -1))
+
     if attention_mask is not None:
         if attention_mask.dim() != 4:
             raise ValueError(f"Expected 4D additive attention mask, got rank {attention_mask.dim()}")
         safe_topk = topk.clamp(min=0, max=key_len - 1)
         mask_values = torch.gather(attention_mask[:, 0, :, :key_len], dim=-1, index=safe_topk)
-        topk = torch.where(mask_values < 0, torch.full_like(topk, -1), topk)
+        topk = torch.where((topk < 0) | (mask_values < 0), torch.full_like(topk, -1), topk)
 
     return topk
 
@@ -212,7 +269,7 @@ def sparse_attention_torch(
     kv_float = kv.float()
     batch, _, heads, _ = q.shape
     key_len = kv.shape[1]
-    valid = topk_idxs != -1
+    valid = (topk_idxs >= 0) & (topk_idxs < key_len)
     safe_idxs = topk_idxs.clamp(min=0, max=max(key_len - 1, 0))
     batch_idx = torch.arange(batch, device=q.device).view(batch, 1, 1)
     kv_gathered = kv_float[batch_idx, safe_idxs]
@@ -239,10 +296,11 @@ def dense_attention_topk_torch(
     key_len = kv.shape[1]
     topk_len = topk_idxs.shape[-1]
     attn_mask = torch.zeros(batch, seq_len, key_len, dtype=torch.bool, device=q.device)
-    valid = topk_idxs != -1
+    valid = (topk_idxs >= 0) & (topk_idxs < key_len)
+    safe_topk = topk_idxs.clamp(min=0, max=max(key_len - 1, 0))
     batch_idx = torch.arange(batch, device=q.device).view(batch, 1, 1).expand(batch, seq_len, topk_len)
     seq_idx = torch.arange(seq_len, device=q.device).view(1, seq_len, 1).expand(batch, seq_len, topk_len)
-    attn_mask[batch_idx[valid], seq_idx[valid], topk_idxs[valid].long()] = True
+    attn_mask[batch_idx[valid], seq_idx[valid], safe_topk[valid].long()] = True
 
     scores = torch.einsum("bshd,bkd->bshk", q.float(), kv.float()) * sm_scale
     scores = scores.masked_fill(~attn_mask.unsqueeze(2), float("-inf"))
@@ -275,6 +333,11 @@ def dsv4_sparse_attention(
         kv = kv.contiguous()
         sinks = sinks.float().contiguous()
         topk_idxs = topk_idxs.to(torch.int32).contiguous()
+        original_heads = q.shape[2]
+        if original_heads < 16:
+            head_pad = 16 - original_heads
+            q = torch.cat([q, q.new_zeros(*q.shape[:2], head_pad, q.shape[3])], dim=2).contiguous()
+            sinks = torch.cat([sinks, sinks.new_zeros(head_pad)], dim=0).contiguous()
 
         # Miles runs this kernel under tensor parallelism, so the kernel sees a
         # small local head count. AutoModel's DSV4 recipe currently uses TP=1,
@@ -285,8 +348,10 @@ def dsv4_sparse_attention(
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            return _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
-        return _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
+            output = _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
+        else:
+            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
+        return output[:, :, :original_heads, :]
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
 
@@ -304,8 +369,8 @@ def indexer_scores_torch(
 
 def extract_indexer_topk_scores_torch(logits: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
     """Extract top-k score values, masking ``-1`` entries with ``-inf``."""
-    valid = topk_indices != -1
-    safe_indices = topk_indices.clamp(min=0).to(torch.int64)
+    valid = (topk_indices >= 0) & (topk_indices < logits.shape[-1])
+    safe_indices = topk_indices.clamp(min=0, max=max(logits.shape[-1] - 1, 0)).to(torch.int64)
     scores = torch.gather(logits, dim=-1, index=safe_indices)
     return torch.where(valid, scores, torch.full((), float("-inf"), dtype=scores.dtype, device=scores.device))
 

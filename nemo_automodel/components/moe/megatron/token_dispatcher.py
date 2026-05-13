@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
@@ -37,7 +38,7 @@ from .moe_utils import (
     unpermute,
 )
 
-SHARING_DEEPEP_MANAGER = True
+SHARING_DEEPEP_MANAGER = os.environ.get("NEMO_MOE_SHARE_TOKEN_DISPATCHER", "1") != "0"
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -48,6 +49,10 @@ SHARING_DEEPEP_MANAGER = True
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
+
+
+def _use_async_deepep_dispatch() -> bool:
+    return os.environ.get("NEMO_MOE_DEEPEP_ASYNC_DISPATCH") == "1"
 
 
 class _DispatchManager(ABC):
@@ -713,7 +718,12 @@ class MoEFlexTokenDispatcher:
         hidden_states, _ = self.dispatch_preprocess(
             hidden_states=hidden_states, num_local_tokens=num_local_tokens, probs=probs
         )
-        hidden_states, _ = self.dispatch_all_to_all(hidden_states, async_finish=False, allocate_on_comm_stream=False)
+        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and _use_async_deepep_dispatch()
+        hidden_states, _ = self.dispatch_all_to_all(
+            hidden_states,
+            async_finish=async_dispatch,
+            allocate_on_comm_stream=async_dispatch,
+        )
         global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(hidden_states)
 
         return global_input_tokens, tokens_per_expert, permuted_probs
@@ -739,7 +749,12 @@ class MoEFlexTokenDispatcher:
             token_probs=token_probs,
             token_indices=token_indices,
         )
-        hidden_states, _ = self.dispatch_all_to_all(hidden_states, async_finish=False, allocate_on_comm_stream=False)
+        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and _use_async_deepep_dispatch()
+        hidden_states, _ = self.dispatch_all_to_all(
+            hidden_states,
+            async_finish=async_dispatch,
+            allocate_on_comm_stream=async_dispatch,
+        )
         global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(hidden_states)
 
         return global_input_tokens, tokens_per_expert, permuted_probs

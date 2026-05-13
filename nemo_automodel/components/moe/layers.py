@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import warnings
 from functools import partial
 from typing import Optional
@@ -704,6 +705,15 @@ class MoE(nn.Module):
             if self.fc2_latent_proj is not None:
                 y = self.fc2_latent_proj(y)
             return y.view(shape)
+
+        if os.environ.get("NEMO_MOE_DISABLE_SHARED_EXPERT_OVERLAP") == "1":
+            z = self.shared_experts(x)
+            if self.shared_expert_gate is not None:
+                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+            y = self.experts(x_latent, token_mask, weights, indices)
+            if self.fc2_latent_proj is not None:
+                y = self.fc2_latent_proj(y)
+            return (y + z).view(shape)
 
         # Execute shared experts in a separate stream to overlap compute with the
         # communication for grouped experts.

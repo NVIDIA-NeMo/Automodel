@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -37,6 +38,8 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_swiglu_impl,
 )
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
+
+_DEEPEP_DEBUG_PRINTED = False
 
 # ── EP variable-length collective helpers ──
 
@@ -382,7 +385,8 @@ class GroupedExperts(nn.Module):
 
         # Gradient anchor
         if ep_size > 1:
-            y = y + (x * 0.0)
+            # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
+            y.add_(x.sum(dtype=torch.float32) * 0.0)
 
         # Variable-length reduce: all_reduce + narrow to original per-rank token boundaries
         if ep_size > 1:
@@ -659,6 +663,7 @@ class GroupedExpertsDeepEP(nn.Module):
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
+        ep_group = ep_mesh.get_group()
 
         config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
@@ -681,8 +686,17 @@ class GroupedExpertsDeepEP(nn.Module):
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
-            ep_group=ep_mesh.get_group(),
+            ep_group=ep_group,
         )
+        if self.dispatcher_backend == "deepep":
+            self._init_deepep_buffer(ep_group)
+
+    def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
+        """Initialize DeepEP communication buffers before activation checkpointing."""
+        from nemo_automodel.components.moe.megatron.fused_a2a import get_buffer
+
+        dtype_size = max(torch.empty((), dtype=self.config.dtype).element_size(), 2)
+        get_buffer(ep_group, self.config.expert_dim * dtype_size)
 
     def forward(
         self,
@@ -714,6 +728,36 @@ class GroupedExpertsDeepEP(nn.Module):
         )
 
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
+        global _DEEPEP_DEBUG_PRINTED
+        if os.environ.get("DSV4_DEEPEP_DEBUG") == "1" and (
+            os.environ.get("DSV4_DEEPEP_DEBUG_ONCE", "1") != "1" or not _DEEPEP_DEBUG_PRINTED
+        ):
+            _DEEPEP_DEBUG_PRINTED = True
+            rank = dist.get_rank() if dist.is_initialized() else -1
+            debug_rank_values = os.environ.get("DSV4_DEEPEP_DEBUG_RANKS", "0,8,16,24,32,40,48,56").replace(":", ",")
+            debug_ranks = {int(x) for x in debug_rank_values.split(",") if x}
+            if rank in debug_ranks:
+                valid = indices >= 0
+                duplicate_rows = (
+                    (indices.sort(dim=-1).values[:, 1:] == indices.sort(dim=-1).values[:, :-1]).any(dim=-1).sum()
+                    if indices.numel() > 0
+                    else torch.tensor(0, device=indices.device)
+                )
+                group_ranks = dist.get_process_group_ranks(self.token_dispatcher.group)
+                print(
+                    "[DSV4_DEEPEP_DEBUG] "
+                    f"rank={rank} ep_rank={self.ep_rank} ep_size={self.ep_size} "
+                    f"group0={group_ranks[0]} group_last={group_ranks[-1]} "
+                    f"x_shape={tuple(x.shape)} x_dtype={x.dtype} x_contig={x.is_contiguous()} "
+                    f"weights_shape={tuple(weights.shape)} weights_dtype={weights.dtype} "
+                    f"weights_contig={weights.is_contiguous()} weights_min={float(weights.float().min().item())} "
+                    f"weights_max={float(weights.float().max().item())} weights_nan={bool(torch.isnan(weights.float()).any().item())} "
+                    f"indices_shape={tuple(indices.shape)} indices_dtype={indices.dtype} indices_contig={indices.is_contiguous()} "
+                    f"indices_min={int(indices.min().item())} indices_max={int(indices.max().item())} "
+                    f"valid={int(valid.sum().item())} masked={int((~valid).sum().item())} "
+                    f"duplicate_rows={int(duplicate_rows.item())} token_mask_true={int(token_mask.sum().item())}",
+                    flush=True,
+                )
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = self.token_dispatcher.token_permutation2(
             hidden_states=x,
             num_local_tokens=x.size(0),
