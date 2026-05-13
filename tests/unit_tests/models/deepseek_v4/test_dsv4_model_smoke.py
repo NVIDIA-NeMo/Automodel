@@ -331,6 +331,10 @@ class TestDeepseekV4ModelSmoke:
         cast_model_to_dtype(model, torch.bfloat16)
         assert gate.tid2eid.dtype == torch.int32
 
+        gate.set_input_ids(torch.tensor([[1, 2, 3]]))
+        _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))
+        assert indices.dtype == torch.long
+
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
         """Both HC expand sites mix residual streams as ``comb.T @ x``."""
 

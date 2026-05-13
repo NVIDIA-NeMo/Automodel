@@ -254,7 +254,7 @@ class DeepseekV4HashGate(nn.Module):
             scores = scores.softmax(dim=-1)
 
         if input_ids is not None:
-            indices = self.tid2eid[input_ids.flatten().to(torch.int64)]
+            indices = self.tid2eid[input_ids.flatten().to(torch.int64)].long()
         else:
             # Fallback to score-based topk — keeps the module usable in tests or
             # PP stages where input_ids is not threaded through.
