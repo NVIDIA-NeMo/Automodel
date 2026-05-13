@@ -14,7 +14,7 @@
 
 """Loss functions for diffusion LLM (dLLM) training.
 
-Both loss classes return :class:`DLLMLossOutput` so the recipe can handle them
+All loss classes return :class:`DLLMLossOutput` so the recipe can handle them
 uniformly without branching on model type.
 """
 
@@ -109,5 +109,82 @@ class MDLMCrossEntropyLoss(nn.Module):
         # Normalize by total supervised tokens
         if num_diffusion_tokens is not None:
             loss = loss / max(num_diffusion_tokens, 1)
+
+        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
+
+
+class DFlashDecayLoss(nn.Module):
+    """Position-decay cross-entropy loss for DFlash draft model training.
+
+    Implements Eq. 4 of the DFlash paper:
+
+    .. math::
+        w_k = \\exp\\!\\left(-\\frac{k-1}{\\gamma}\\right), \\quad k = 1, \\dots, T
+
+    where *k* indexes the predicted positions within a block (k=0 is the clean
+    anchor and is not predicted; k=1 is the first masked position).
+
+    Loss is normalised by the sum of effective weights
+    ``(w_k * block_mask)``.  Pass *num_tokens* (a global all-reduced count) for
+    normalisation consistent across DP replicas and gradient-accumulation steps.
+
+    Paper default γ values (Appendix A.1):
+
+    - block size 16 → γ = 7
+    - block size 10 → γ = 5
+    - block size  8 → γ = 4
+
+    Args:
+        loss_gamma: Decay parameter γ.
+    """
+
+    def __init__(self, loss_gamma: float = 7.0):
+        super().__init__()
+        self.loss_gamma = float(loss_gamma)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_tokens: Optional[int] = None,
+        block_size: Optional[int] = None,
+    ) -> DLLMLossOutput:
+        """Compute the DFlash decay-weighted loss.
+
+        Args:
+            logits: Draft model logits for the predicted block positions,
+                shape ``[B, T, V]`` where ``T = N * (block_size - 1)``.
+            target_ids: Ground-truth token IDs, shape ``[B, T]``.
+            block_mask: Float/bool valid-position mask, shape ``[B, T]``.
+                Zero entries (padding) are excluded from the loss.
+            num_tokens: Optional global token count for loss normalisation.
+            block_size: When provided, the decay weights reset at each block
+                boundary so that every block's first predicted position has
+                weight 1.  Required for multi-block training (N > 1).
+
+        Returns:
+            :class:`DLLMLossOutput`.
+        """
+        token_nll = _compute_per_token_nll(logits, target_ids)  # [B, T]
+        B, T = token_nll.shape
+
+        if block_size is not None:
+            # Multi-block: replicate per-block decay so weights reset at each boundary.
+            T_per = block_size - 1
+            n_blocks = T // T_per if T_per > 0 else 1
+            w_single = torch.exp(
+                -torch.arange(T_per, device=logits.device, dtype=token_nll.dtype) / self.loss_gamma
+            )
+            w = w_single.repeat(n_blocks)
+        else:
+            # Single-block or legacy: monotone decay over the full T.
+            w = torch.exp(-torch.arange(T, device=logits.device, dtype=token_nll.dtype) / self.loss_gamma)
+
+        weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
+
+        loss = (token_nll * weights).sum()
+        if num_tokens is not None:
+            loss = loss / max(float(num_tokens), 1.0)
 
         return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())

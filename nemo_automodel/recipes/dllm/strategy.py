@@ -194,6 +194,8 @@ class DFlashStrategy(DLLMStrategy):
     - ``target_torch_dtype`` (default ``"bfloat16"``) — target dtype.
     - ``block_size`` (default 0) — draft block size; 0 reads from draft config.
     - ``loss_decay_gamma`` (default 0.0) — γ for Eq. 4; 0 uses paper defaults.
+    - ``num_blocks_per_sample`` (default 1) — N anchor blocks per sequence per
+      step, enabling the multi-block sparse-attention pass from §4.2.
     """
 
     def __init__(self):
@@ -201,6 +203,7 @@ class DFlashStrategy(DLLMStrategy):
         self.target_embed = None
         self.target_head = None
         self.block_size: int = 0
+        self.num_blocks_per_sample: int = 1
         self.layer_ids: list = []
         self.dflash_loss_fn = None
 
@@ -230,7 +233,7 @@ class DFlashStrategy(DLLMStrategy):
         """Load and freeze the target LM; resolve block_size, layer_ids, decay loss."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from nemo_automodel.components.loss.dflash_loss import DFlashDecayLoss
+        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
 
         dflash_cfg = recipe.cfg.get("dflash", None) or {}
 
@@ -318,10 +321,14 @@ class DFlashStrategy(DLLMStrategy):
         )
         self.dflash_loss_fn = DFlashDecayLoss(loss_gamma=loss_gamma)
 
+        # --- Multi-block ---
+        self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
+
         logger.info(
-            "DFlash setup: target=%s, block_size=%d, layer_ids=%s, loss_gamma=%.1f",
+            "DFlash setup: target=%s, block_size=%d, num_blocks=%d, layer_ids=%s, loss_gamma=%.1f",
             target_model_id,
             self.block_size,
+            self.num_blocks_per_sample,
             self.layer_ids,
             loss_gamma,
         )
@@ -360,6 +367,87 @@ class DFlashStrategy(DLLMStrategy):
             [out.hidden_states[lid + offset] for lid in self.layer_ids], dim=-1
         )[:, :start, :]
 
+    def _sample_anchor_blocks(
+        self,
+        recipe,
+        input_ids: torch.Tensor,
+        attn: torch.Tensor,
+        num_blocks: int,
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample N non-overlapping anchor blocks and return concatenated tensors.
+
+        Uses the stars-and-bars transformation so all valid N-tuples are
+        equally likely: transform indices t_i ∈ [0, avail) to
+        starts_i = t_i + i * block_size + 1.
+
+        Returns:
+            starts: sorted list of N anchor positions (ints).
+            block_output_ids: [B, N*block_size] — anchor+mask tokens.
+            block_targets: [B, N*(block_size-1)] — ground-truth tokens.
+            block_mask: [B, N*(block_size-1)] — float valid-position mask.
+        """
+        B = input_ids.size(0)
+        device = input_ids.device
+        valid_len = int(attn.sum(dim=1).min().item())
+
+        # Clamp to however many blocks fit without overlap.
+        max_n = max(1, (valid_len - 1) // self.block_size)
+        n = min(num_blocks, max_n)
+
+        # avail = number of "slack" positions for the starts transformation.
+        avail = valid_len - n * self.block_size
+        if n == 1 or avail < 1:
+            start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn)
+            return [start], boi, bt, bm
+
+        perm = torch.randperm(avail, device=device)[:n].sort().values  # [n], values in [0, avail)
+        starts = (perm + torch.arange(n, device=device) * self.block_size + 1).tolist()
+        starts = [int(s) for s in starts]
+
+        boi_list, bt_list, bm_list = [], [], []
+        for start in starts:
+            boi = input_ids.new_full((B, self.block_size), recipe.mask_token_id)
+            boi[:, 0] = input_ids[:, start]
+            boi_list.append(boi)
+            bt_list.append(input_ids[:, start + 1 : start + self.block_size])
+            bm_list.append(attn[:, start + 1 : start + self.block_size].float())
+
+        return (
+            starts,
+            torch.cat(boi_list, dim=1),
+            torch.cat(bt_list, dim=1),
+            torch.cat(bm_list, dim=1),
+        )
+
+    @staticmethod
+    def _build_block_attention_mask(
+        starts: list[int],
+        block_size: int,
+        ctx_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build the sparse block-diagonal additive attention mask (§4.2).
+
+        Shape: ``[1, 1, N*block_size, ctx_len + N*block_size]``
+
+        Block *b* rows attend only to:
+        - context columns 0..starts[b]-1 (own causal prefix), and
+        - noise columns ctx_len + b*block_size .. ctx_len+(b+1)*block_size-1
+          (own block; bidirectional).
+
+        All other entries are ``-inf``.
+        """
+        n = len(starts)
+        total = ctx_len + n * block_size
+        mask = torch.full((1, 1, n * block_size, total), float("-inf"), dtype=dtype, device=device)
+        for b, start in enumerate(starts):
+            r0, r1 = b * block_size, (b + 1) * block_size
+            mask[:, :, r0:r1, :start] = 0.0  # context prefix
+            c0 = ctx_len + b * block_size
+            mask[:, :, r0:r1, c0 : c0 + block_size] = 0.0  # own block
+        return mask
+
     def pre_step(self, recipe, batches) -> tuple[int, int]:
         """Sample anchor blocks and run frozen target forwards for all microbatches."""
         device = recipe.dist_env.device
@@ -367,12 +455,20 @@ class DFlashStrategy(DLLMStrategy):
         for batch in batches:
             input_ids = batch["input_ids"].to(device)
             attn = batch.get("attention_mask", torch.ones_like(input_ids)).to(device)
-            start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(
-                recipe, input_ids, attn
-            )
-            target_hidden = self._run_target_forward(input_ids, attn, start)
+            if self.num_blocks_per_sample > 1:
+                starts, block_output_ids, block_targets, block_mask = self._sample_anchor_blocks(
+                    recipe, input_ids, attn, self.num_blocks_per_sample
+                )
+                ctx_len = starts[-1]
+                target_hidden = self._run_target_forward(input_ids, attn, ctx_len)
+                batch["_dflash_starts"] = starts
+            else:
+                start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(
+                    recipe, input_ids, attn
+                )
+                target_hidden = self._run_target_forward(input_ids, attn, start)
+                batch["_dflash_start"] = start
             # Offload to CPU so draft backward has the full VRAM budget.
-            batch["_dflash_start"] = start
             batch["_dflash_target_hidden"] = target_hidden.cpu()
             batch["_dflash_block_output_ids"] = block_output_ids
             batch["_dflash_block_targets"] = block_targets
@@ -402,12 +498,12 @@ class DFlashStrategy(DLLMStrategy):
             for k, v in batch.items()
         }
 
-        if "_dflash_start" in batch:
-            start = batch.pop("_dflash_start")
-            target_hidden = batch.pop("_dflash_target_hidden").to(device)
-            block_output_ids = batch.pop("_dflash_block_output_ids")
-            block_targets = batch.pop("_dflash_block_targets")
-            block_mask = batch.pop("_dflash_block_mask")
+        # Retrieve pre-computed DFlash tensors (set by pre_step).
+        multi_block = "_dflash_starts" in batch
+        if multi_block:
+            starts = batch.pop("_dflash_starts")
+        elif "_dflash_start" in batch:
+            starts = [batch.pop("_dflash_start")]
         else:
             # Fallback: compute on the fly (e.g. when called outside pre_step).
             input_ids = batch["input_ids"]
@@ -416,12 +512,36 @@ class DFlashStrategy(DLLMStrategy):
                 recipe, input_ids, attn
             )
             target_hidden = self._run_target_forward(input_ids, attn, start)
+            starts = [start]
+            batch["_dflash_target_hidden"] = target_hidden
+            batch["_dflash_block_output_ids"] = block_output_ids
+            batch["_dflash_block_targets"] = block_targets
+            batch["_dflash_block_mask"] = block_mask
+            multi_block = False
+
+        target_hidden = batch.pop("_dflash_target_hidden").to(device)
+        block_output_ids = batch.pop("_dflash_block_output_ids")
+        block_targets = batch.pop("_dflash_block_targets")
+        block_mask = batch.pop("_dflash_block_mask")
 
         B = block_output_ids.size(0)
-        noise_embedding = self.target_embed(block_output_ids)
-        position_ids = (
-            torch.arange(start + self.block_size, device=device).unsqueeze(0).expand(B, -1)
+        n = len(starts)
+        ctx_len = starts[-1]  # context = positions 0..ctx_len-1
+        noise_embedding = self.target_embed(block_output_ids)  # [B, n*block_size, dim]
+
+        # Position IDs: actual sequence positions for RoPE correctness.
+        ctx_pos = torch.arange(ctx_len, device=device)
+        block_pos = torch.cat(
+            [torch.arange(s, s + self.block_size, device=device) for s in starts]
         )
+        position_ids = torch.cat([ctx_pos, block_pos]).unsqueeze(0).expand(B, -1)
+
+        # Sparse block-diagonal attention mask (only needed for n > 1).
+        attn_mask: Optional[torch.Tensor] = None
+        if n > 1:
+            attn_mask = DFlashStrategy._build_block_attention_mask(
+                starts, self.block_size, ctx_len, noise_embedding.dtype, device
+            )
 
         draft = recipe.model_parts[0]
         sync_ctx = (
@@ -447,23 +567,41 @@ class DFlashStrategy(DLLMStrategy):
         train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
-            draft_hidden = draft(
+            draft_kwargs = dict(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids,
                 use_cache=False,
                 is_causal=False,
             )
+            if attn_mask is not None:
+                draft_kwargs["attention_mask"] = attn_mask
+
+            draft_hidden = draft(**draft_kwargs)
             if not torch.is_tensor(draft_hidden):
                 draft_hidden = getattr(draft_hidden, "last_hidden_state", draft_hidden[0])
 
-            logits = self.target_head(draft_hidden[:, -self.block_size + 1 :, :])
+            # Extract predicted positions (skip anchor token per block).
+            # draft_hidden: [B, n*block_size, dim] — noise positions only.
+            pred = torch.cat(
+                [
+                    draft_hidden[
+                        :,
+                        b * self.block_size + 1 : (b + 1) * self.block_size,
+                        :,
+                    ]
+                    for b in range(n)
+                ],
+                dim=1,
+            )
+            logits = self.target_head(pred)
 
             loss_result = self.dflash_loss_fn(
                 logits=logits,
                 target_ids=block_targets,
                 block_mask=block_mask,
                 num_tokens=num_diffusion_tokens,
+                block_size=self.block_size if n > 1 else None,
             )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())

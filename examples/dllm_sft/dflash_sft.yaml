@@ -86,6 +86,7 @@ dflash:
   target_torch_dtype: bfloat16
   block_size: 0
   loss_decay_gamma: 0.0
+  num_blocks_per_sample: 1
 
 # Placeholder loss_fn — DFlashStrategy uses DFlashDecayLoss internally.
 loss_fn:
