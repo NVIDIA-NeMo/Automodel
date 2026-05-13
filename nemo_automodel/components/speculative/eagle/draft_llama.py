@@ -46,27 +46,43 @@ def _build_causal_mask(
 class Eagle3LlamaAttention(nn.Module):
     """EAGLE-3 draft attention over ``[input_emb, hidden]`` 2H features.
 
-    Supports two paths:
+    The attention has two operating modes.
 
-    - ``cache_hidden is None`` -- single forward, regular causal attention
-      (used for evaluation and for tests).
-    - ``cache_hidden = [[K_0, K_1, ...], [V_0, V_1, ...]]`` -- TTT
-      recurrence (test-time-training). At each call:
+    Single-step (``cache_hidden=None``)
+        Standard scaled-dot-product causal attention; used for evaluation
+        and for any caller that doesn't need the EAGLE-3 multi-step
+        recurrence.
 
-      * the rotary position is shifted by ``lck = len(cache_hidden[0])``
-        so the RoPE encodes "this is ``lck`` tokens into the future";
-      * the freshly-computed K and V (already GQA-expanded) are appended
-        to ``cache_hidden``;
-      * the output is the SpecForge ``llama3_eagle.py`` recurrence:
-        full ``Q @ K_0`` (with the standard causal mask added) plus, for
-        every cached later step ``i >= 1``, a *diagonal* contribution
-        ``(Q_t * K_i_t).sum(-1)`` -- each Q position only attends to the
-        *same* position in each previous draft step, never to another
-        position. This is the core EAGLE-3 multi-step training trick.
+    TTT recurrence (``cache_hidden=[K_list, V_list]``)
+        At step ``k`` (0-indexed), with ``K_list`` and ``V_list`` already
+        holding entries from steps ``0..k-1``:
 
-    ``cache_hidden`` is mutated in place; the caller is responsible for
-    re-initializing it (typically ``[[], []]``) at the start of each
-    training batch.
+        1. ``step_idx = len(K_list)`` (equal to ``k``) gives the rotary
+           phase shift, so the draft's ``K_k`` encodes "this is ``k``
+           tokens into the future". The shifted ``cos`` / ``sin`` are
+           computed from ``position_ids + step_idx``.
+        2. The freshly projected K, V (after GQA expansion) are appended
+           to the cache lists in place.
+        3. The attention output is the EAGLE-3 mixed pattern:
+
+           ``attn_weights = [ Q @ K_0^T / sqrt(d) + mask ]  ||  diag_1  ||  ...  ||  diag_k``
+
+           where ``diag_i[t] = (Q_t * K_i_t).sum(-1) / sqrt(d)``. The
+           softmax is taken over the full extended column axis of length
+           ``T + k``. Output is
+
+           ``out = attn_probs[..., :T] @ V_0  +  sum_{i=1..k} attn_probs[..., T+i-1, None] * V_i``.
+
+           In English: Q at position ``t`` attends to all K_0 positions
+           (the regular ``T x T`` causal block), and additionally to the
+           *same* position ``t`` in each previous draft step ``i >= 1``.
+           Implementation-wise we replace SpecForge ``llama3_eagle.py``'s
+           two ``O(k^2)`` ``cat``/``add`` Python loops with single
+           vectorized ``einsum`` calls.
+
+    ``cache_hidden`` is mutated in place; callers are responsible for
+    re-initializing it to ``[[], []]`` at the start of each training
+    batch.
     """
 
     def __init__(self, config: LlamaConfig):
@@ -129,43 +145,48 @@ class Eagle3LlamaAttention(nn.Module):
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
             return self.o_proj(attn_output)
 
-        # TTT recurrence path. ``cache_hidden`` is ``[K_list, V_list]``.
-        lck = len(cache_hidden[0])
-        cos, sin = self.rotary_emb(combined_states, position_ids + lck)
+        # ---- TTT recurrence path. ``cache_hidden = [K_list, V_list]`` ----
+        # ``step_idx`` is the cache length BEFORE this step's append; it
+        # equals the 0-indexed TTT step number and doubles as the rotary
+        # phase shift. After the append below the cache holds
+        # ``step_idx + 1`` entries (indices ``0..step_idx``).
+        cache_k, cache_v = cache_hidden
+        step_idx = len(cache_k)
+
+        cos, sin = self.rotary_emb(combined_states, position_ids + step_idx)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         k, v = self._repeat_kv(k, v)
+        cache_k.append(k)
+        cache_v.append(v)
 
-        cache_hidden[0].append(k)
-        cache_hidden[1].append(v)
-        cache_k = cache_hidden[0]
-        cache_v = cache_hidden[1]
-        new_lck = len(cache_k)
-
-        # Standard T x T attention against the step-0 keys.
-        k0 = cache_k[0]
-        v0 = cache_v[0]
+        # Block 1: full T x T causal attention against the step-0 keys.
+        k0, v0 = cache_k[0], cache_v[0]
         attn_weights = torch.matmul(q, k0.transpose(-2, -1)) * self.scaling
-        attn_weights = attn_weights + attention_mask
+        attn_weights = attn_weights + attention_mask  # [B, 1, T, T] additive mask
 
-        # Diagonal extensions: one column per cached later step ``i``,
-        # holding ``(Q_t * K_i_t).sum(-1) / sqrt(d)`` for every Q position
-        # ``t``. Each new column is unmasked because the diagonal is
-        # intrinsically causal across draft steps.
-        for i in range(1, new_lck):
-            ki = cache_k[i]
-            attn_weightsi = (q * ki).sum(-1) * self.scaling
-            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
+        # Block 2: diagonal extensions for cached later steps ``i = 1..step_idx``.
+        # Each contributes one column ``(Q_t * K_i_t).sum(-1) / sqrt(d)``,
+        # i.e. Q at position ``t`` attends only to position ``t`` of
+        # ``K_i``. Replaces SpecForge's ``O(k^2)`` cat-in-loop with a
+        # single ``einsum`` + single ``cat``.
+        if step_idx >= 1:
+            later_k = torch.stack(cache_k[1:], dim=0)  # [step_idx, B, H, T, D]
+            diag = torch.einsum("bhtd,sbhtd->bhts", q, later_k) * self.scaling
+            attn_weights = torch.cat((attn_weights, diag), dim=-1)
 
+        # Block 3: softmax over the extended ``T + step_idx`` key axis.
         attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
 
-        # Output: ``attn_probs[..., :T] @ V_0`` covers the regular block;
-        # for each cached step ``i >= 1``, the single column at
-        # ``attn_probs[..., T + i - 1]`` scales the same-position ``V_i``.
+        # Block 4: output =
+        #   ``attn_probs[..., :T] @ V_0``  (regular T x T block)
+        # + ``sum_{i=1..step_idx} attn_probs[..., T+i-1, None] * V_i``
+        # Same fusion as Block 2 -- one ``einsum`` instead of an O(k^2)
+        # accumulator loop.
         attn_output = torch.matmul(attn_probs[..., :seq_len], v0)
-        for i in range(1, new_lck):
-            vi = cache_v[i]
-            probs_i = attn_probs[..., seq_len + i - 1]  # [B, H, T]
-            attn_output = attn_output + probs_i[..., None] * vi
+        if step_idx >= 1:
+            later_v = torch.stack(cache_v[1:], dim=0)  # [step_idx, B, H, T, D]
+            diag_probs = attn_probs[..., seq_len:]  # [B, H, T, step_idx]
+            attn_output = attn_output + torch.einsum("bhts,sbhtd->bhtd", diag_probs, later_v)
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)

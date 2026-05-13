@@ -325,6 +325,92 @@ def test_draft_attention_step1_attends_to_step0_kv():
     )
 
 
+def test_draft_attention_einsum_matches_loop_reference():
+    """The polished ``einsum`` TTT attention must match a SpecForge-style loop reference.
+
+    Implementing the diagonal extensions twice -- once with the
+    ``cat``-in-loop pattern from the SpecForge reference, once with the
+    fused ``einsum`` in production -- and asserting they produce
+    near-identical outputs guards against any algebraic regression a
+    future refactor might introduce.
+    """
+    from nemo_automodel.components.models.llama.rope_utils import (
+        apply_rotary_pos_emb as _rope,
+    )
+    from nemo_automodel.components.speculative.eagle.draft_llama import _build_causal_mask
+
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    batch_size, seq_len = 2, 6
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    projected = draft.project_hidden_states(aux_hidden_states)
+
+    # Production einsum path: 3 TTT steps, chain the hidden state forward
+    # (this is what ``Eagle3TrainerModule`` does in real training).
+    cache_einsum: list[list[torch.Tensor]] = [[], []]
+    with torch.no_grad():
+        h_e = projected
+        for _ in range(3):
+            h_e = draft(
+                input_ids=input_ids,
+                projected_hidden_states=h_e,
+                attention_mask=attention_mask,
+                cache_hidden=cache_einsum,
+            )
+        out_einsum = h_e
+
+    # SpecForge-style cat-in-loop reference, driven through the same
+    # decoder layer (so RMSNorm / MLP / residuals match exactly).
+    attn = draft.decoder.self_attn
+    scaling = attn.scaling
+    layer = draft.decoder
+
+    def _ref_attention(combined, mask, pos_ids, cache):
+        bsz, q_len, _ = combined.shape
+        q, k, v = attn._project_qkv(combined)
+        step_idx = len(cache[0])
+        cos, sin = attn.rotary_emb(combined, pos_ids + step_idx)
+        q, k = _rope(q, k, cos, sin)
+        k, v = attn._repeat_kv(k, v)
+        cache[0].append(k)
+        cache[1].append(v)
+        k0, v0 = cache[0][0], cache[1][0]
+        attn_w = torch.matmul(q, k0.transpose(-2, -1)) * scaling + mask
+        for i in range(1, step_idx + 1):
+            col = (q * cache[0][i]).sum(-1) * scaling
+            attn_w = torch.cat((attn_w, col[..., None]), dim=-1)
+        probs = torch.softmax(attn_w.float(), dim=-1).to(q.dtype)
+        out = torch.matmul(probs[..., :q_len], v0)
+        for i in range(1, step_idx + 1):
+            out = out + probs[..., q_len + i - 1, None] * cache[1][i]
+        out = out.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        return attn.o_proj(out)
+
+    causal_mask = _build_causal_mask(attention_mask, dtype=projected.dtype)
+    position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    cache_ref: list[list[torch.Tensor]] = [[], []]
+    with torch.no_grad():
+        hidden = projected
+        for _ in range(3):
+            input_embeds = draft.embed_input_ids(input_ids)
+            residual = hidden
+            norm_input = layer.input_emb_layernorm(input_embeds)
+            norm_hidden = layer.hidden_layernorm(hidden)
+            combined = torch.cat((norm_input, norm_hidden), dim=-1)
+            hidden = residual + _ref_attention(combined, causal_mask, position_ids, cache_ref)
+            residual = hidden
+            hidden = layer.post_attention_layernorm(hidden)
+            hidden = residual + layer.mlp(hidden)
+        out_ref = hidden
+
+    diff = (out_einsum - out_ref).abs().max().item()
+    assert diff < 1e-5, f"einsum TTT path diverges from loop reference (max_diff={diff})."
+
+
 def test_eagle3_trainer_multi_step_differs_from_independent_runs():
     """Multi-step TTT loss must differ from ``ttt_steps`` independent single-step losses.
 
