@@ -29,7 +29,6 @@ import inspect
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -79,7 +78,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScale
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.forward_backward import forward_backward_step
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -1334,101 +1333,36 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
-        train_ctx, batch = make_cp_batch_and_ctx(
-            self.device_mesh,
-            batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
-            )
-            and _uses_thd_collater(self.cfg.dataloader),
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+        forward_backward_step(
+            idx=idx,
+            batch=batch,
+            device=self.dist_env.device,
+            device_mesh=self.device_mesh,
+            model_parts=getattr(self, "model_parts", []),
+            distributed_config=getattr(self, "distributed_config", None),
+            loss_fn=getattr(self, "loss_fn", None),
+            calculate_loss_fn=calculate_loss,
+            loss_buffer=loss_buffer,
+            num_label_tokens=num_label_tokens,
+            num_batches=num_batches,
+            is_train=is_train,
+            pp_enabled=self.pp_enabled,
+            pp=self.pp,
+            dp_group_size=1 if self.pp_enabled else self._get_dp_group_size(include_cp=True),
+            make_cp_batch_and_ctx_fn=make_cp_batch_and_ctx,
+            get_sync_ctx_fn=get_sync_ctx,
+            filter_forward_kwargs_fn=filter_forward_kwargs,
+            make_cp_batch_kwargs={
+                "use_te": _uses_te_dot_product_attention(
+                    self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+                )
+                and _uses_thd_collater(self.cfg.dataloader),
+                "padding_token_id": self.tokenizer.pad_token_id if self.tokenizer else 0,
+                "num_chunks": _get_num_thd_chunks(self.pp_enabled, self.cfg),
+            },
+            fp8_context_factory=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else None,
+            pp_eval_enabled=True,
         )
-        labels = batch.pop("labels")
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
-
-        if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
-
-                input_ids = batch.pop("input_ids")
-
-                # Update PP stage shapes for the current batch's seq_len.
-                # This is a no-op when the length hasn't changed.
-                self.pp.update_seq_len(input_ids.shape[1])
-
-                # Filter out None values and empty dicts from batch to avoid PP chunking errors
-                batch_filtered = {
-                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
-                }
-
-                if is_train:
-                    # Use step for training (forward + backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
-                else:
-                    # Use eval for validation (forward only, no backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
-
-            if self.pp.info.has_last_stage:
-                local_loss = torch.sum(torch.stack(losses))
-            else:
-                local_loss = torch.tensor(0.0, device=self.dist_env.device)
-
-            loss_buffer.append(local_loss.clone().detach())
-        else:
-            model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with train_ctx(), sync_ctx, fp8_ctx:
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
-
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    num_label_tokens=num_label_tokens,
-                )
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
