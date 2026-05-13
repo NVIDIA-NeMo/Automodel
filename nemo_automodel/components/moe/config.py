@@ -39,6 +39,8 @@ class MoEParallelizerConfig:
 
 @dataclass(kw_only=True)
 class MoEConfig:
+    """Configuration for routed and shared MoE expert modules."""
+
     n_routed_experts: int
     n_shared_experts: int
     n_activated_experts: int
