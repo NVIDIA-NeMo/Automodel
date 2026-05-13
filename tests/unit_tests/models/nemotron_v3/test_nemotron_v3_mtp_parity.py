@@ -64,6 +64,13 @@ def _build_model(backend, *, mtp_layers, mtp_pattern, dtype=torch.float32, **cfg
         **cfg_overrides,
     )
     model = NemotronHForCausalLM(config, backend=backend)
+    # GroupedExperts parameters are allocated via ``torch.empty`` and rely on
+    # the production ``initialize_weights`` path (not invoked in unit tests) to
+    # fill them. Force finite values so state-dict round-trip equality is not
+    # tripped by NaN bytes leaking from uninitialized memory.
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(mean=0.0, std=0.02)
     return model.to(dtype=dtype), config
 
 
@@ -222,6 +229,7 @@ class TestMTPForwardDeterminism:
     ``equal_nan=True``.
     """
 
+    @pytest.mark.run_only_on("GPU")
     def test_forward_is_deterministic(self, backend):
         torch.manual_seed(7)
         model, config = _build_model(backend, mtp_layers=1, mtp_pattern="*E")
@@ -240,6 +248,7 @@ class TestMTPForwardDeterminism:
         for h1, h2 in zip(out1.mtp_per_depth_h, out2.mtp_per_depth_h):
             torch.testing.assert_close(h1, h2, rtol=0.0, atol=0.0, equal_nan=True)
 
+    @pytest.mark.run_only_on("GPU")
     def test_eval_mode_skips_mtp_branch(self, backend):
         """In eval mode, MTP must not run (out.mtp_per_depth_h is None) and
         the main logits should be unaffected by the MTP module's existence."""

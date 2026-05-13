@@ -196,6 +196,7 @@ def _make_model(backend, *, mtp_layers=0, mtp_pattern="", **cfg_overrides):
 
 
 class TestMTPDisabled:
+    @pytest.mark.run_only_on("GPU")
     def test_no_mtp_when_config_omits_fields(self, backend):
         """When num_nextn_predict_layers is 0, self.mtp must be None and
         forward must not emit per-depth hidden states."""
@@ -233,6 +234,7 @@ class TestMTPEnabled:
         assert hasattr(last, "final_layernorm")
         assert not hasattr(first, "final_layernorm")
 
+    @pytest.mark.run_only_on("GPU")
     def test_forward_train_emits_mtp_per_depth_h(self, backend):
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
         model.train()
@@ -251,6 +253,7 @@ class TestMTPEnabled:
         assert out.loss is not None
         assert out.loss.requires_grad
 
+    @pytest.mark.run_only_on("GPU")
     def test_forward_eval_skips_mtp_branch(self, backend):
         """At eval (or without labels) MTP must not run."""
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
@@ -260,6 +263,7 @@ class TestMTPEnabled:
         assert out.mtp_per_depth_h is None
         assert out.mtp_loss_scaling_factor is None
 
+    @pytest.mark.run_only_on("GPU")
     def test_mtp_backward_populates_mtp_grads(self, backend):
         model, config = _make_model(backend, mtp_layers=1, mtp_pattern="*E")
         model.train()
@@ -317,6 +321,7 @@ class TestMTPRepeatedLayer:
         assert model.mtp.layers[0].has_fusion is True
         assert model.mtp.layers[1].has_final_norm is True
 
+    @pytest.mark.run_only_on("GPU")
     def test_forward_emits_one_h_per_iteration(self, backend):
         model, config = self._build_repeated(backend, iterations=2, pattern="*E")
         model.train()
@@ -327,6 +332,7 @@ class TestMTPRepeatedLayer:
         assert len(out.mtp_per_depth_h) == 2
         assert all(h.requires_grad for h in out.mtp_per_depth_h)
 
+    @pytest.mark.run_only_on("GPU")
     def test_backward_accumulates_on_shared_params(self, backend):
         """Calling the same physical sublayer twice must accumulate gradient
         from both iterations onto the shared parameters."""
