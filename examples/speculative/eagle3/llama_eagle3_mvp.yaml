@@ -6,6 +6,21 @@ dist_env:
 
 recipe_args:
   target_model_name_or_path: meta-llama/Llama-3.2-1B
+  # ``train_data_path`` accepts either a HF dataset id or a local
+  # ``.jsonl`` / directory of ``.jsonl`` files. Each row must follow the
+  # OpenAI chat schema -- the ``ChatDataset`` ingestion path keys on a
+  # ``messages`` list of ``{role, content}`` entries:
+  #
+  #   {"messages": [
+  #     {"role": "system",    "content": "You are a helpful assistant."},
+  #     {"role": "user",      "content": "What is the capital of France?"},
+  #     {"role": "assistant", "content": "Paris."}
+  #   ]}
+  #
+  # If a dataset ships the conversations under a different key (e.g.
+  # PerfectBlend uses ``conversations``), rename the column locally
+  # before pointing the recipe at it. See the inline one-liner in
+  # ``llama_eagle3_perfectblend.yaml``.
   train_data_path: /path/to/train.jsonl
   val_data_path: null
   train_split: null
