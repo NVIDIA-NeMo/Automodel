@@ -321,7 +321,7 @@ class TestMoeMeshDerivation:
         mesh._get_root_mesh = Mock(return_value=mesh)
         mesh._flatten_mapping = {}
         ctx = MeshContext.from_meshes(mesh)
-        assert ctx.moe_mesh is None 
+        assert ctx.moe_mesh is None
 
     def test_moe_mesh_none_when_no_device_mesh(self):
         """moe_mesh stays None when device_mesh is None."""

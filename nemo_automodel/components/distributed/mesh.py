@@ -220,7 +220,8 @@ class MeshContext:
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
         )
-    
+
+
 def _derive_moe_mesh(device_mesh: "DeviceMesh") -> "Optional[DeviceMesh]":
     """Derive the MoE EP mesh from device_mesh when EP dims are present."""
     if device_mesh is None:

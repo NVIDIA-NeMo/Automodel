@@ -1533,7 +1533,7 @@ class TestMoeMeshRemovedFromAPI:
     def test_from_pretrained_has_no_moe_mesh(self, cls):
         sig = inspect.signature(cls.from_pretrained)
         assert "moe_mesh" not in sig.parameters, (f"{cls.__name__}.from_pretrained still accepts moe_mesh")
-    
+
     @pytest.mark.parametrize("cls", [NeMoAutoModelForCausalLM,
         NeMoAutoModelForSequenceClassification,
         NeMoAutoModelForImageTextToText,])
@@ -1541,5 +1541,3 @@ class TestMoeMeshRemovedFromAPI:
     def test_from_config_has_no_moe_mesh(self, cls):
         sig = inspect.signature(cls.from_config)
         assert "moe_mesh" not in sig.parameters, (f"{cls.__name__}.from_config still accepts moe_mesh")
-
-
