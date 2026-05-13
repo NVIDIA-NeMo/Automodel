@@ -96,9 +96,7 @@ class DLLMStrategy(ABC):
         num_noise = 0
         num_supervised = 0
         for batch in batches:
-            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(
-                batch["input_ids"], batch["loss_mask"]
-            )
+            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(batch["input_ids"], batch["loss_mask"])
             batch["_noisy_input_ids"] = noisy_input_ids
             batch["_noise_mask"] = noise_mask
             batch["_p_mask"] = p_mask
@@ -239,9 +237,7 @@ class DFlashStrategy(DLLMStrategy):
 
         # Resolve mask_token_id when the tokenizer (e.g. Qwen3) has none.
         if recipe.mask_token_id is None:
-            tok_id = dflash_cfg.get("target_model_id") or recipe.cfg.get(
-                "model.pretrained_model_name_or_path"
-            )
+            tok_id = dflash_cfg.get("target_model_id") or recipe.cfg.get("model.pretrained_model_name_or_path")
             if tok_id:
                 tok = AutoTokenizer.from_pretrained(tok_id, trust_remote_code=True)
                 if tok.mask_token_id is None:
@@ -258,9 +254,7 @@ class DFlashStrategy(DLLMStrategy):
         target_dtype = getattr(torch, target_dtype_str, torch.bfloat16)
 
         logger.info("DFlash: loading frozen target model %s (%s)", target_model_id, target_dtype_str)
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            target_model_id, torch_dtype=target_dtype
-        )
+        self.target_model = AutoModelForCausalLM.from_pretrained(target_model_id, torch_dtype=target_dtype)
         self.target_model.eval()
         self.target_model.requires_grad_(False)
         self.target_model = self.target_model.to(recipe.dist_env.device)
@@ -268,9 +262,7 @@ class DFlashStrategy(DLLMStrategy):
         self.target_embed = self.target_model.get_input_embeddings()
         self.target_head = self.target_model.get_output_embeddings()
         if self.target_embed is None:
-            self.target_embed = getattr(
-                getattr(self.target_model, "model", None), "embed_tokens", None
-            )
+            self.target_embed = getattr(getattr(self.target_model, "model", None), "embed_tokens", None)
         if self.target_head is None:
             self.target_head = getattr(self.target_model, "lm_head", None)
         if self.target_embed is None or self.target_head is None:
@@ -281,13 +273,9 @@ class DFlashStrategy(DLLMStrategy):
         block_size = int(dflash_cfg.get("block_size", 0))
         if block_size <= 0:
             draft_cfg = getattr(draft, "config", None)
-            block_size = getattr(draft, "block_size", None) or getattr(
-                draft_cfg, "block_size", None
-            )
+            block_size = getattr(draft, "block_size", None) or getattr(draft_cfg, "block_size", None)
         if not block_size:
-            raise ValueError(
-                "Cannot infer block_size from draft config. Set dflash.block_size in the YAML."
-            )
+            raise ValueError("Cannot infer block_size from draft config. Set dflash.block_size in the YAML.")
         self.block_size = int(block_size)
         if self.block_size < 2:
             raise ValueError("dflash.block_size must be at least 2.")
@@ -304,8 +292,7 @@ class DFlashStrategy(DLLMStrategy):
             mid = self.target_model.config.num_hidden_layers // 2
             layer_ids = [mid]
             logger.warning(
-                "DFlash: cannot determine target_layer_ids from draft config; "
-                "falling back to single mid-layer %d.",
+                "DFlash: cannot determine target_layer_ids from draft config; falling back to single mid-layer %d.",
                 mid,
             )
         self.layer_ids = list(layer_ids)
@@ -315,9 +302,7 @@ class DFlashStrategy(DLLMStrategy):
         loss_gamma = (
             gamma_cfg
             if gamma_cfg > 0.0
-            else {16: 7.0, 10: 5.0, 8: 4.0}.get(
-                self.block_size, max(2.0, self.block_size / 2.0)
-            )
+            else {16: 7.0, 10: 5.0, 8: 4.0}.get(self.block_size, max(2.0, self.block_size / 2.0))
         )
         self.dflash_loss_fn = DFlashDecayLoss(loss_gamma=loss_gamma)
 
@@ -353,9 +338,7 @@ class DFlashStrategy(DLLMStrategy):
         return start, block_output_ids, block_targets, block_mask
 
     @torch.no_grad()
-    def _run_target_forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, start: int
-    ) -> torch.Tensor:
+    def _run_target_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, start: int) -> torch.Tensor:
         out = self.target_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -363,9 +346,7 @@ class DFlashStrategy(DLLMStrategy):
             use_cache=False,
         )
         offset = 1  # skip embedding layer (index 0)
-        return torch.cat(
-            [out.hidden_states[lid + offset] for lid in self.layer_ids], dim=-1
-        )[:, :start, :]
+        return torch.cat([out.hidden_states[lid + offset] for lid in self.layer_ids], dim=-1)[:, :start, :]
 
     def _sample_anchor_blocks(
         self,
@@ -463,9 +444,7 @@ class DFlashStrategy(DLLMStrategy):
                 target_hidden = self._run_target_forward(input_ids, attn, ctx_len)
                 batch["_dflash_starts"] = starts
             else:
-                start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(
-                    recipe, input_ids, attn
-                )
+                start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(recipe, input_ids, attn)
                 target_hidden = self._run_target_forward(input_ids, attn, start)
                 batch["_dflash_start"] = start
             # Offload to CPU so draft backward has the full VRAM budget.
@@ -493,10 +472,7 @@ class DFlashStrategy(DLLMStrategy):
     ) -> None:
         """DFlash microbatch: draft forward + decay loss + (optional) backward."""
         device = recipe.dist_env.device
-        batch = {
-            k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+        batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         # Retrieve pre-computed DFlash tensors (set by pre_step).
         multi_block = "_dflash_starts" in batch
@@ -508,9 +484,7 @@ class DFlashStrategy(DLLMStrategy):
             # Fallback: compute on the fly (e.g. when called outside pre_step).
             input_ids = batch["input_ids"]
             attn = batch.get("attention_mask", torch.ones_like(input_ids))
-            start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(
-                recipe, input_ids, attn
-            )
+            start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(recipe, input_ids, attn)
             target_hidden = self._run_target_forward(input_ids, attn, start)
             starts = [start]
             batch["_dflash_target_hidden"] = target_hidden
@@ -531,9 +505,7 @@ class DFlashStrategy(DLLMStrategy):
 
         # Position IDs: actual sequence positions for RoPE correctness.
         ctx_pos = torch.arange(ctx_len, device=device)
-        block_pos = torch.cat(
-            [torch.arange(s, s + self.block_size, device=device) for s in starts]
-        )
+        block_pos = torch.cat([torch.arange(s, s + self.block_size, device=device) for s in starts])
         position_ids = torch.cat([ctx_pos, block_pos]).unsqueeze(0).expand(B, -1)
 
         # Sparse block-diagonal attention mask (only needed for n > 1).
@@ -548,22 +520,16 @@ class DFlashStrategy(DLLMStrategy):
             get_sync_ctx(
                 draft,
                 idx == num_batches - 1,
-                defer_fsdp_grad_sync=getattr(
-                    recipe.distributed_config, "defer_fsdp_grad_sync", True
-                ),
+                defer_fsdp_grad_sync=getattr(recipe.distributed_config, "defer_fsdp_grad_sync", True),
             )
             if is_train
             else nullcontext()
         )
         autocast_dtype = getattr(recipe.distributed_config, "autocast_dtype", None)
         autocast_ctx = (
-            torch.autocast(device_type="cuda", dtype=autocast_dtype)
-            if autocast_dtype is not None
-            else nullcontext()
+            torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
-        fp8_ctx = (
-            recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
-        )
+        fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
@@ -625,7 +591,5 @@ def get_dllm_strategy(mode: str) -> DLLMStrategy:
     """
     cls = DLLM_STRATEGIES.get(mode)
     if cls is None:
-        raise ValueError(
-            f"Unknown dllm.mode: {mode!r}. Available: {sorted(DLLM_STRATEGIES)}"
-        )
+        raise ValueError(f"Unknown dllm.mode: {mode!r}. Available: {sorted(DLLM_STRATEGIES)}")
     return cls()
