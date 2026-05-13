@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
+# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml
 # Or with torchrun for multi-GPU:
 # torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml
 
