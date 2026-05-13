@@ -277,6 +277,8 @@ def merge_lora(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line options for LoRA adapter merging."""
+
     parser = argparse.ArgumentParser(description="Merge a LoRA / QLoRA adapter into a HuggingFace base model.")
     parser.add_argument(
         "--base-model",
@@ -337,6 +339,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
+    """Run LoRA adapter merging from the command line."""
+
     args = parse_args()
     merge_lora(
         base_model=args.base_model,

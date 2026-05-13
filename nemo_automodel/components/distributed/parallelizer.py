@@ -102,7 +102,7 @@ try:
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
     HAVE_MEGATRON_FSDP = True
-except:
+except ImportError:
     pass
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
@@ -1127,6 +1127,7 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
 
 
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):
+    """Validate that a Nemotron-NAS model can be tensor-parallel sharded."""
     num_attention_heads = model.config.num_attention_heads
     assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
 
