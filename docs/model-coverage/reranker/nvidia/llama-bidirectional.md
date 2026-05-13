@@ -81,7 +81,7 @@ cd /opt/Automodel
 **3. Run the recipe**:
 
 ```bash
-automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
+torchrun --nproc-per-node=8 examples/retrieval/cross_encoder/finetune.py --config examples/retrieval/cross_encoder/llama3_2_1b.yaml
 ```
 :::
 
