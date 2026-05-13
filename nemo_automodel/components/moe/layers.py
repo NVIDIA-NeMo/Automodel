@@ -60,6 +60,7 @@ class MLP(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         activation: str = "swiglu",
         bias: bool = False,
+        swiglu_limit: float = 0.0,
     ):
         """
         Initializes the MLP layer.
@@ -71,6 +72,9 @@ class MLP(nn.Module):
             dtype (torch.dtype): Data type for weights.
             activation (str): Activation function - "swiglu" (default) or "relu2".
             bias (bool): Whether to use bias in linear layers.
+            swiglu_limit (float): When > 0 and activation is gated, run SwiGLU
+                in fp32 with one-sided gate clamp ``max=limit`` and symmetric
+                up clamp ``±limit``. Matches DSV4 reference ``Expert.forward``.
         """
         super().__init__()
         if activation not in ("swiglu", "relu2"):
@@ -78,6 +82,7 @@ class MLP(nn.Module):
 
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        self.swiglu_limit = float(swiglu_limit)
 
         self.up_proj = initialize_linear_module(
             linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
@@ -103,10 +108,16 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        if self.is_gated:
-            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-        else:
+        if not self.is_gated:
             return self.down_proj(F.relu(self.up_proj(x)).pow(2))
+        if self.swiglu_limit > 0.0:
+            # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
+            # gate clamp and symmetric up clamp; cast back before down_proj.
+            dtype = x.dtype
+            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
+            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            return self.down_proj((F.silu(gate) * up).to(dtype))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -344,7 +355,7 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
             # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
-            scores = torch.sqrt(F.softplus(scores.float())).to(scores.dtype)
+            scores = torch.sqrt(F.softplus(scores.float()))
             original_scores = scores
 
             if self.e_score_correction_bias is not None:
@@ -522,6 +533,16 @@ class Gate(nn.Module):
             torch.Tensor: Auxiliary loss for load balancing.
                 Shape is [].
         """
+        # Pin aux-loss arithmetic to fp32. The activation-checkpoint recompute pass
+        # does not replay FSDP2 MixedPrecisionPolicy cast_forward_inputs, so `x` and
+        # anything derived from `x.dtype` (including original_scores in some MoE
+        # configs) can differ between forward and recompute. Doing the cast inside
+        # the AC region — rather than at the Gate level — guarantees the saved
+        # tensors of this region (expert_scores [n_experts] and the aux-loss scalar)
+        # are fp32 on both passes regardless of upstream behavior.
+        original_scores = original_scores.float()
+        expert_load = expert_load.float()
+
         context_length = token_mask.sum()
         expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
 
@@ -616,6 +637,7 @@ class MoE(nn.Module):
                 dtype=config.dtype,
                 activation=config.shared_expert_activation,
                 bias=config.expert_bias,
+                swiglu_limit=config.swiglu_limit,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)

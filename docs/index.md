@@ -213,6 +213,7 @@ Installation <guides/installation.md>
 Configuration <guides/configuration.md>
 🤗 HF Compatibility <guides/huggingface-api-compatibility.md>
 Repo Structure <repository-structure.md>
+Release Notes <release-notes.md>
 ::::
 
 ::::{toctree}
@@ -282,7 +283,7 @@ Diffusion Dataset <guides/diffusion/dataset.md>
 Overview <launcher/overview.md>
 Local Workstation <launcher/local-workstation.md>
 SLURM Cluster <launcher/slurm.md>
-NeMo-Run <launcher/nemo-run.md>
+NeMo Run <launcher/nemo-run.md>
 SkyPilot <launcher/skypilot.md>
 SkyPilot k8s <launcher/skypilot-kubernetes.md>
 ::::
@@ -296,4 +297,5 @@ Pipeline Parallelism <guides/pipelining.md>
 guides/fp8-training.md
 guides/mlflow-logging.md
 API Reference <apidocs/index.rst>
+Breaking Changes <breaking-changes.md>
 ::::

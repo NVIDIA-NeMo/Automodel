@@ -53,6 +53,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
+from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -75,7 +76,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -253,89 +254,16 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
-def _chunk_vlm_media(
-    pixel_values: torch.Tensor,
-    image_grid: torch.Tensor,
-    batch_size: int,
-    n_microbatches: int,
-    n_images_per_sample: torch.Tensor | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Split VLM pixel_values and image_grid into PP microbatch chunks.
-
-    Handles four layouts:
-    1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
-    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
-    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
-       ``n_images_per_sample`` (general case, works for packed sequences too).
-    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
-    """
-    n_images = image_grid.shape[0]
-    pixel_values_chunks: list[torch.Tensor] = []
-    image_grid_chunks: list[torch.Tensor] = []
-
-    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
-        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
-        # Both are indexed by image along dim 0, one entry per sample.
-        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
-        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
-        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
-        # All images are padded to the same max_patches, so split by image count directly.
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
-            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[img_start:img_end])
-            image_grid_chunks.append(image_grid[img_start:img_end])
-    elif n_images_per_sample is not None:
-        # General case: use per-sample image counts to associate images with
-        # batch items.  Works for packed sequences (multiple images per item).
-        patch_counts = image_grid.prod(dim=1)
-        cumsum_patches = torch.cumsum(patch_counts, dim=0)
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-
-        samples_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-
-            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
-            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
-            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    elif n_images == batch_size:
-        # Legacy: exactly 1 image per sample.
-        patch_counts = image_grid.prod(dim=1)
-        cumsum = torch.cumsum(patch_counts, dim=0)
-
-        images_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            img_start = mb_idx * images_per_mb
-            img_end = min(img_start + images_per_mb, n_images)
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    else:
-        pixel_values_chunks.append(pixel_values)
-        image_grid_chunks.append(image_grid)
-        for _ in range(n_microbatches - 1):
-            pixel_values_chunks.append(pixel_values[:0])
-            image_grid_chunks.append(image_grid[:0])
-        logging.warning(
-            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
-        )
-
-    return pixel_values_chunks, image_grid_chunks
+def _move_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device) if v is not None else None for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device) for v in value)
+    return value
 
 
 def build_dataloader(
@@ -348,6 +276,8 @@ def build_dataloader(
     local_batch_size,
     cfg_model=None,
     cfg_ps=None,
+    get_rope_index=None,
+    pp_n_microbatches=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -362,6 +292,13 @@ def build_dataloader(
         cfg_model: Model configuration (used to detect attention backend).
         cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
             When provided, takes precedence over ``dataset.packing``.
+        get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
+            VLM neat packing computes mRoPE 3D position IDs per sample so packed
+            mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
+            position semantics across pack boundaries instead of falling back to
+            plain 1D positions.
+        pp_n_microbatches: When set, wrap collate so VLM media tensors are
+            pre-chunked for this many PP microbatches before entering the train loop.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -453,7 +390,16 @@ def build_dataloader(
 
             ds_raw = ds
             truncate = cfg_ds.get("truncate", max_length is not None)
-            ds = PreTokenizedDatasetWrapper(ds_raw, processor, max_length=max_length, truncate=truncate)
+
+            post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
+
+            ds = PreTokenizedDatasetWrapper(
+                ds_raw,
+                processor,
+                max_length=max_length,
+                truncate=truncate,
+                post_tokenize_hook=post_tokenize_hook,
+            )
 
             if packing_cfg:
                 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -470,6 +416,7 @@ def build_dataloader(
                     packing_ratio=packing_cfg.get("packing_ratio", 1.0),
                     processor=processor,
                     balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
+                    get_rope_index=get_rope_index,
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
@@ -514,6 +461,9 @@ def build_dataloader(
 
         if hasattr(ds, "robust_collate"):
             collate_fn = ds.robust_collate(collate_fn)
+
+        if pp_n_microbatches is not None:
+            collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
 
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
@@ -823,6 +773,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        # Extract mRoPE position-id builder from the model so VLM neat packing can
+        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
+        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+        pp_n_microbatches = None
+        if self.pp_enabled:
+            pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
+
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
             self.cfg.dataloader,
@@ -833,6 +791,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
             cfg_model=self.cfg.model,
             cfg_ps=self.cfg.get("packed_sequence", None),
+            get_rope_index=get_rope_index,
+            pp_n_microbatches=pp_n_microbatches,
         )
 
         # Build validation dataloader if the config provides it
@@ -846,6 +806,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 device_mesh=self.device_mesh,
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                get_rope_index=get_rope_index,
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
@@ -942,14 +903,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
+        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+
+        # Routed through __call__ so FSDP2 forward pre-hook fires and
+        # unshards the vision tower's weights before the embed/scatter.
+        _model = self.model_parts[0]
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+            and not self.pp_enabled
+        )
+        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+            with torch.no_grad():
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            for k in VLM_INPUT_KEYS:
+                batch.pop(k, None)
+            batch.update(prepared)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
@@ -970,51 +941,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 input_ids = batch.pop("input_ids")
                 self.pp.update_seq_len(input_ids.shape[1])
 
-                # VLM: Custom chunking for pixel_values and image_grid
-                # These tensors have non-standard structure that can't be naively chunked by dim 0
-                # TODO: @HuiyingLi properly handle pixel_values split
-                pixel_values = batch.pop("pixel_values", None)
-                image_grid_hws = batch.pop("image_grid_hws", None)
-                image_grid_thw = batch.pop("image_grid_thw", None)
-                image_sizes = batch.pop("image_sizes", None)
-                image_position_ids = batch.pop("image_position_ids", None)
-                n_images_per_sample = batch.pop("n_images_per_sample", None)
-
-                image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
-                if image_grid is None and image_sizes is not None:
-                    image_grid = image_sizes
-                if image_grid is None and image_position_ids is not None:
-                    image_grid = image_position_ids
-
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    n_microbatches = self.pp._info.schedule._n_microbatches
-                    batch_size = input_ids.shape[0]
-
-                    pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
-                        pixel_values,
-                        image_grid,
-                        batch_size,
-                        n_microbatches,
-                        n_images_per_sample=n_images_per_sample,
-                    )
-
-                    # Store pre-chunked tensors on model for forward to use
-                    stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-                    stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
-                    stage0_model._vlm_chunk_idx = 0
-
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
-                else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
-
-                # Clear stored VLM chunks after PP step
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    stage0_model._vlm_pixel_values_chunks = None
-                    stage0_model._vlm_image_grid_hws_chunks = None
-                    stage0_model._vlm_chunk_idx = None
+                with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1033,7 +964,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            with sync_ctx, train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1218,19 +1149,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+
+                _model = self.model_parts[0]
+                _cp_active = (
+                    self.device_mesh is not None
+                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+                    and self.device_mesh["cp"].size() > 1
+                    and not self.pp_enabled
+                )
+                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                    with torch.no_grad():
+                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                    for k in VLM_INPUT_KEYS:
+                        batch.pop(k, None)
+                    batch.update(prepared)
+
+                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
                 labels = batch.pop("labels")
-                num_label_tokens = (labels != -100).sum().item()
-
-                if (
-                    self.device_mesh
-                    and "position_ids" not in batch
-                    and (self.device_mesh["cp"].size() > 1 or self.device_mesh["tp"].size() > 1)
-                ):
-                    batch["position_ids"] = (
-                        torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(self.model_parts[0].device)
-                    )
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch, labels)
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
