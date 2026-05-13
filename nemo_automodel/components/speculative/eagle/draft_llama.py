@@ -46,39 +46,32 @@ def _build_causal_mask(
 class Eagle3LlamaAttention(nn.Module):
     """EAGLE-3 draft attention over ``[input_emb, hidden]`` 2H features.
 
-    The attention has two operating modes.
+    Driven through a shared ``cache_hidden = [K_list, V_list]`` pair. At
+    step ``k`` (0-indexed), with ``K_list`` and ``V_list`` already holding
+    entries from steps ``0..k-1``:
 
-    Single-step (``cache_hidden=None``)
-        Standard scaled-dot-product causal attention; used for evaluation
-        and for any caller that doesn't need the EAGLE-3 multi-step
-        recurrence.
+    1. ``step_idx = len(K_list)`` (equal to ``k``) gives the rotary phase
+       shift, so the draft's ``K_k`` encodes "this is ``k`` tokens into
+       the future". The shifted ``cos`` / ``sin`` are computed from
+       ``position_ids + step_idx``.
+    2. The freshly projected K, V (after GQA expansion) are appended to
+       the cache lists in place.
+    3. The attention output is the EAGLE-3 mixed pattern:
 
-    TTT recurrence (``cache_hidden=[K_list, V_list]``)
-        At step ``k`` (0-indexed), with ``K_list`` and ``V_list`` already
-        holding entries from steps ``0..k-1``:
+       ``attn_weights = [ Q @ K_0^T / sqrt(d) + mask ]  ||  diag_1  ||  ...  ||  diag_k``
 
-        1. ``step_idx = len(K_list)`` (equal to ``k``) gives the rotary
-           phase shift, so the draft's ``K_k`` encodes "this is ``k``
-           tokens into the future". The shifted ``cos`` / ``sin`` are
-           computed from ``position_ids + step_idx``.
-        2. The freshly projected K, V (after GQA expansion) are appended
-           to the cache lists in place.
-        3. The attention output is the EAGLE-3 mixed pattern:
+       where ``diag_i[t] = (Q_t * K_i_t).sum(-1) / sqrt(d)``. The softmax
+       is taken over the full extended column axis of length ``T + k``.
+       Output is
 
-           ``attn_weights = [ Q @ K_0^T / sqrt(d) + mask ]  ||  diag_1  ||  ...  ||  diag_k``
+       ``out = attn_probs[..., :T] @ V_0  +  sum_{i=1..k} attn_probs[..., T+i-1, None] * V_i``.
 
-           where ``diag_i[t] = (Q_t * K_i_t).sum(-1) / sqrt(d)``. The
-           softmax is taken over the full extended column axis of length
-           ``T + k``. Output is
-
-           ``out = attn_probs[..., :T] @ V_0  +  sum_{i=1..k} attn_probs[..., T+i-1, None] * V_i``.
-
-           In English: Q at position ``t`` attends to all K_0 positions
-           (the regular ``T x T`` causal block), and additionally to the
-           *same* position ``t`` in each previous draft step ``i >= 1``.
-           Implementation-wise we replace SpecForge ``llama3_eagle.py``'s
-           two ``O(k^2)`` ``cat``/``add`` Python loops with single
-           vectorized ``einsum`` calls.
+       In English: Q at position ``t`` attends to all K_0 positions (the
+       regular ``T x T`` causal block), and additionally to the *same*
+       position ``t`` in each previous draft step ``i >= 1``.
+       Implementation-wise we replace SpecForge ``llama3_eagle.py``'s
+       two ``O(k^2)`` ``cat`` / ``add`` Python loops with single
+       vectorized ``einsum`` calls.
 
     ``cache_hidden`` is mutated in place; callers are responsible for
     re-initializing it to ``[[], []]`` at the start of each training
@@ -127,29 +120,18 @@ class Eagle3LlamaAttention(nn.Module):
         combined_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
+        cache_hidden: list[list[torch.Tensor]],
     ) -> torch.Tensor:
         batch_size, seq_len, _ = combined_states.shape
         q, k, v = self._project_qkv(combined_states)
 
-        if cache_hidden is None:
-            # Single-step path: regular causal attention over [B, H, T, T].
-            cos, sin = self.rotary_emb(combined_states, position_ids)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            k, v = self._repeat_kv(k, v)
-
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
-            attn_weights = attn_weights + attention_mask
-            attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
-            attn_output = torch.matmul(attn_probs, v)
-            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-            return self.o_proj(attn_output)
-
-        # ---- TTT recurrence path. ``cache_hidden = [K_list, V_list]`` ----
         # ``step_idx`` is the cache length BEFORE this step's append; it
         # equals the 0-indexed TTT step number and doubles as the rotary
         # phase shift. After the append below the cache holds
-        # ``step_idx + 1`` entries (indices ``0..step_idx``).
+        # ``step_idx + 1`` entries (indices ``0..step_idx``). On the first
+        # call ``cache_hidden = [[], []]`` so ``step_idx = 0`` and the
+        # diagonal-extension blocks below collapse to a plain causal
+        # attention, equivalent to the non-cached path.
         cache_k, cache_v = cache_hidden
         step_idx = len(cache_k)
 
@@ -231,7 +213,7 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
+        cache_hidden: list[list[torch.Tensor]],
     ) -> torch.Tensor:
         residual = hidden_states
         norm_input_embeds = self.input_emb_layernorm(input_embeds)
@@ -308,14 +290,18 @@ class LlamaEagle3DraftModel(PreTrainedModel):
     ) -> torch.Tensor:
         """Run one full-sequence draft update step.
 
-        ``cache_hidden`` activates the EAGLE-3 TTT recurrence in the
-        attention layer. Pass ``[[], []]`` on the first step of a TTT
-        unroll and the same list object on each subsequent step; the
-        attention layer appends the per-step K and V to it.
+        ``cache_hidden`` is the EAGLE-3 TTT cache. Pass ``[[], []]`` on
+        the first step of a TTT unroll and the same list object on each
+        subsequent step; the attention layer appends the per-step K and V
+        to it. If ``None`` is passed (e.g. from a one-shot evaluation
+        call) a fresh ``[[], []]`` is allocated locally -- step 0 of TTT
+        is mathematically equivalent to a plain causal forward.
         """
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
             position_ids = position_ids.expand(input_ids.shape[0], -1)
+        if cache_hidden is None:
+            cache_hidden = [[], []]
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
