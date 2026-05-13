@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM strategies (MDLMStrategy) and get_dllm_strategy."""
+"""Tests for dLLM strategies (MDLMStrategy, DFlashStrategy) and get_dllm_strategy."""
+
+import types
 
 import pytest
 import torch
@@ -22,6 +24,7 @@ from nemo_automodel.components.loss.dllm_loss import (
 )
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
+    DFlashStrategy,
     DLLMStrategy,
     MDLMStrategy,
     get_dllm_strategy,
@@ -35,6 +38,9 @@ from nemo_automodel.recipes.dllm.strategy import (
 class TestDLLMStrategyRegistry:
     def test_mdlm_in_strategies(self):
         assert "mdlm" in DLLM_STRATEGIES
+
+    def test_dflash_in_strategies(self):
+        assert "dflash" in DLLM_STRATEGIES
 
     def test_get_mdlm_strategy(self):
         s = get_dllm_strategy("mdlm")
@@ -249,3 +255,203 @@ class TestNormalizationModeOverride:
 
         s = NoiseModeStrategy()
         assert s.normalization_mode == "noise"
+
+
+# ---------------------------------------------------------------------------
+# DFlashStrategy — unit tests (CPU, no model loading)
+# ---------------------------------------------------------------------------
+
+MASK_ID = 999
+BLOCK_SIZE = 16
+
+
+def _make_recipe(mask_token_id=MASK_ID):
+    """Minimal recipe stub with the fields DFlashStrategy methods need."""
+    return types.SimpleNamespace(mask_token_id=mask_token_id)
+
+
+def _make_strategy(block_size=BLOCK_SIZE):
+    s = DFlashStrategy()
+    s.block_size = block_size
+    return s
+
+
+class TestDFlashStrategyRegistry:
+    def test_get_dflash_strategy(self):
+        s = get_dllm_strategy("dflash")
+        assert isinstance(s, DFlashStrategy)
+
+    def test_dflash_loss_log_key(self):
+        s = DFlashStrategy()
+        assert s.loss_log_key == "Loss/Train_DFlash"
+
+    def test_dflash_defaults(self):
+        s = DFlashStrategy()
+        assert s.num_blocks_per_sample == 1
+        assert s.block_size == 0
+
+
+class TestDFlashSampleAnchorBlocks:
+    """Tests for _sample_anchor_blocks (CPU, no GPU required)."""
+
+    def _make_inputs(self, seq_len, batch_size=2):
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        attn = torch.ones(batch_size, seq_len, dtype=torch.long)
+        return input_ids, attn
+
+    def test_single_block_shapes(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(64)
+        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=1)
+        assert len(starts) == 1
+        assert boi.shape == (2, 8)
+        assert bt.shape == (2, 7)
+        assert bm.shape == (2, 7)
+
+    def test_multi_block_shapes(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        n = 4
+        input_ids, attn = self._make_inputs(128)
+        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=n)
+        assert len(starts) == n
+        assert boi.shape == (2, n * 8)
+        assert bt.shape == (2, n * 7)
+        assert bm.shape == (2, n * 7)
+
+    def test_starts_are_sorted(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        for _ in range(10):
+            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            assert starts == sorted(starts)
+
+    def test_blocks_are_non_overlapping(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        for _ in range(10):
+            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            for i in range(len(starts) - 1):
+                assert starts[i + 1] >= starts[i] + s.block_size, \
+                    f"blocks overlap: starts={starts}"
+
+    def test_blocks_fit_in_sequence(self):
+        seq_len = 64
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        for _ in range(10):
+            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            for start in starts:
+                assert start >= 1
+                assert start + s.block_size <= seq_len
+
+    def test_fallback_when_sequence_too_short(self):
+        """If sequence can't fit N blocks, gracefully returns fewer."""
+        s = _make_strategy(block_size=16)
+        recipe = _make_recipe()
+        # seq_len=20 → only 1 block of size 16 fits (start ∈ [1,4])
+        input_ids, attn = self._make_inputs(20)
+        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+        assert len(starts) == 1
+        assert boi.shape[1] == 16
+
+    def test_anchor_token_is_clean(self):
+        """First token of each block in block_output_ids should be the real token."""
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        for i, start in enumerate(starts):
+            assert (boi[:, i * s.block_size] == input_ids[:, start]).all()
+
+    def test_non_anchor_tokens_are_mask(self):
+        """All positions after the anchor in each block should be MASK_ID."""
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        starts, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        n = len(starts)
+        for b in range(n):
+            noise_slice = boi[:, b * s.block_size + 1 : (b + 1) * s.block_size]
+            assert (noise_slice == MASK_ID).all()
+
+
+class TestDFlashBuildBlockAttentionMask:
+    """Tests for _build_block_attention_mask (CPU, static method)."""
+
+    def test_output_shape(self):
+        starts = [10, 30, 55]
+        block_size, ctx_len = 8, 55
+        mask = DFlashStrategy._build_block_attention_mask(
+            starts, block_size, ctx_len, torch.float32, torch.device("cpu")
+        )
+        n = len(starts)
+        assert mask.shape == (1, 1, n * block_size, ctx_len + n * block_size)
+
+    def test_context_prefix_attended(self):
+        """Block b should attend to context positions 0..starts[b]-1."""
+        starts = [5, 20]
+        block_size, ctx_len = 4, 20
+        mask = DFlashStrategy._build_block_attention_mask(
+            starts, block_size, ctx_len, torch.float32, torch.device("cpu")
+        )
+        # Block 0 rows: attend to cols 0..4 (starts[0]=5 → cols 0..4)
+        assert (mask[0, 0, :block_size, :starts[0]] == 0.0).all()
+        # Block 1 rows: attend to cols 0..19 (starts[1]=20)
+        assert (mask[0, 0, block_size:, :starts[1]] == 0.0).all()
+
+    def test_own_block_attended(self):
+        """Each block's rows should attend to its own noise columns."""
+        starts = [5, 20]
+        block_size, ctx_len = 4, 20
+        mask = DFlashStrategy._build_block_attention_mask(
+            starts, block_size, ctx_len, torch.float32, torch.device("cpu")
+        )
+        # Block 0 noise cols: ctx_len + 0*block_size .. ctx_len + block_size - 1
+        c0 = ctx_len
+        assert (mask[0, 0, :block_size, c0 : c0 + block_size] == 0.0).all()
+        # Block 1 noise cols
+        c1 = ctx_len + block_size
+        assert (mask[0, 0, block_size:, c1 : c1 + block_size] == 0.0).all()
+
+    def test_cross_block_masked(self):
+        """Block b must NOT attend to another block's noise columns."""
+        starts = [5, 20]
+        block_size, ctx_len = 4, 20
+        mask = DFlashStrategy._build_block_attention_mask(
+            starts, block_size, ctx_len, torch.float32, torch.device("cpu")
+        )
+        # Block 0 rows should NOT attend to block 1's noise cols
+        c1 = ctx_len + block_size
+        assert (mask[0, 0, :block_size, c1 : c1 + block_size] == float("-inf")).all()
+        # Block 1 rows should NOT attend to block 0's noise cols
+        c0 = ctx_len
+        assert (mask[0, 0, block_size:, c0 : c0 + block_size] == float("-inf")).all()
+
+    def test_future_context_masked(self):
+        """Block b must NOT attend to context positions >= starts[b]."""
+        starts = [5, 20]
+        block_size, ctx_len = 4, 20
+        mask = DFlashStrategy._build_block_attention_mask(
+            starts, block_size, ctx_len, torch.float32, torch.device("cpu")
+        )
+        # Block 0: positions starts[0]..ctx_len-1 should be -inf
+        if starts[0] < ctx_len:
+            assert (mask[0, 0, :block_size, starts[0]:ctx_len] == float("-inf")).all()
+
+    def test_single_block_full_context_attended(self):
+        """Single block attends to its full context (0..ctx_len-1) and own noise."""
+        start = 15
+        block_size, ctx_len = 8, 15
+        mask = DFlashStrategy._build_block_attention_mask(
+            [start], block_size, ctx_len, torch.float32, torch.device("cpu")
+        )
+        # Full context attended
+        assert (mask[0, 0, :, :ctx_len] == 0.0).all()
+        # Own noise attended
+        assert (mask[0, 0, :, ctx_len:] == 0.0).all()
