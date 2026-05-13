@@ -1374,13 +1374,14 @@ class _MockPPInfo:
         self.schedule = MagicMock()
         self.schedule._n_microbatches = n_microbatches
 
-        def step_side_effect(*args, **kwargs):
+        def schedule_side_effect(*args, **kwargs):
             if self._add_losses and kwargs.get("losses") is not None:
                 # Add mock losses for each microbatch
                 for _ in range(n_microbatches):
                     kwargs["losses"].append(torch.tensor(0.5))
 
-        self.schedule.step = MagicMock(side_effect=step_side_effect)
+        self.schedule.step = MagicMock(side_effect=schedule_side_effect)
+        self.schedule.eval = MagicMock(side_effect=schedule_side_effect)
 
 
 class _MockAutoPipeline:
@@ -1431,8 +1432,8 @@ class TestForwardBackwardStepPP:
         """Create a recipe configured for PP testing."""
         return _create_pp_recipe()
 
-    def test_pp_skips_validation_forward(self, pp_recipe, monkeypatch):
-        """Test that PP mode skips forward pass during validation."""
+    def test_pp_uses_eval_for_validation(self, pp_recipe, monkeypatch):
+        """Test that PP mode uses schedule.eval() during validation."""
         pp_recipe.pp = _MockAutoPipeline()
 
         monkeypatch.setattr(
@@ -1446,7 +1447,6 @@ class TestForwardBackwardStepPP:
         }
         loss_buffer = []
 
-        # Should return early without error
         pp_recipe._forward_backward_step(
             idx=0,
             batch=batch,
@@ -1456,8 +1456,10 @@ class TestForwardBackwardStepPP:
             is_train=False,  # Validation mode
         )
 
-        # Loss buffer should be empty (no forward pass)
-        assert len(loss_buffer) == 0
+        pp_recipe.pp.info.schedule.eval.assert_called_once()
+        pp_recipe.pp.info.schedule.step.assert_not_called()
+        assert len(loss_buffer) == 1
+        assert torch.isclose(loss_buffer[0], torch.tensor(1.0))
 
     def test_pp_vlm_chunking_equal_images_and_batch(self, pp_recipe, monkeypatch):
         """Test VLM pixel_values chunking when n_images == batch_size."""
@@ -1953,6 +1955,43 @@ class TestForwardBackwardStepPP:
         args, kwargs = step_calls[0]
         assert len(args) == 0  # No positional args
         assert "target" in kwargs
+
+
+@pytest.mark.cuda(False)
+def test_vlm_run_validation_epoch_pp_sends_loss_from_last_stage(monkeypatch):
+    """VLM PP validation should reuse _forward_backward_step and report from the last stage."""
+    recipe = _create_pp_recipe()
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), rank=1, is_main=False)
+    recipe.device_mesh = SimpleNamespace(mesh=torch.tensor([[0, 1]]), mesh_dim_names=("dp", "pp"))
+    recipe.step_scheduler = SimpleNamespace(step=7, epoch=2)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+
+    calls = []
+
+    def fake_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+        calls.append((idx, num_label_tokens, num_batches, is_train))
+        loss_buffer.append(torch.tensor(6.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
+
+    send_calls = []
+
+    def fake_send(tensor, dst):
+        send_calls.append((tensor.clone(), dst))
+
+    monkeypatch.setattr("torch.distributed.send", fake_send)
+
+    val_dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
+    result = recipe._run_validation_epoch(val_dataloader)
+
+    assert calls == [(0, None, 1, False)]
+    assert result.metrics["val_loss"] == pytest.approx(2.0)
+    assert result.metrics["num_label_tokens"] == 3
+    assert len(send_calls) == 2
+    assert send_calls[0][0].item() == pytest.approx(2.0)
+    assert send_calls[1][0].item() == 3
 
 
 # -----------------------------------------------------------------------------
@@ -2582,6 +2621,56 @@ def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is False
+
+
+def test_vlm_setup_wraps_validation_dataloader_for_pp(monkeypatch):
+    """PP VLM validation dataloader gets the same media microbatch prep as training."""
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+    cfg.validation_dataset = ConfigNode({"path_or_dataset": "val"})
+    cfg.distributed.pipeline = ConfigNode({"pp_microbatch_size": 2})
+    cfg.step_scheduler.local_batch_size = 4
+
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+
+    class FakeAutoPipeline:
+        pp_batch_size = 4
+        pp_microbatch_size = 2
+
+        def __init__(self):
+            self.parts = [DummyModel()]
+
+    fake_pipeline = FakeAutoPipeline()
+    pipeline_config = SimpleNamespace()
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.AutoPipeline", FakeAutoPipeline)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", lambda model: True)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: fake_pipeline)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.setup_distributed",
+        lambda cfg, world_size: SimpleNamespace(
+            strategy_config=None,
+            pipeline_config=pipeline_config,
+            moe_config=None,
+            activation_checkpointing=False,
+            pp_enabled=True,
+            pp_size=2,
+            device_mesh=None,
+            moe_mesh=None,
+            cp_size=1,
+        ),
+    )
+
+    dataloader_calls = []
+
+    def fake_build_dataloader(*args, **kwargs):
+        dataloader_calls.append(kwargs)
+        return ("dl", "proc")
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", fake_build_dataloader)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert [call["pp_n_microbatches"] for call in dataloader_calls] == [2, 2]
 
 
 # ---------------------------------------------------------------------------

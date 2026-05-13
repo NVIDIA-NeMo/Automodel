@@ -795,6 +795,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 seed=self.cfg.get("seed", 42),
                 local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 get_rope_index=get_rope_index,
+                pp_n_microbatches=pp_n_microbatches,
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
@@ -852,12 +853,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                     val_loss = {}
                     if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                        if self.pp_enabled:
-                            logger.warning("Validation is not supported for pipeline parallelism")
-                        else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
+                        val_log_data = self._run_validation_epoch(self.val_dataloader)
+                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_log_data)
                         for mp in self.model_parts:
                             mp.train()
 
@@ -932,12 +930,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
             prepare_batch_before_cp=self._prepare_vlm_batch_for_cp,
             pp_batch_context_factory=lambda pp_batch: stage_vlm_media_for_pp(self.pp, self.model_parts, pp_batch),
             filter_pp_batch=False,
-            pp_eval_enabled=False,
+            pp_eval_enabled=True,
             hidden_states_error_message=(
                 "FusedLinearCrossEntropy requires the model to output hidden states. "
                 "Set `model.text_config.output_hidden_states=True` in the config."
             ),
         )
+
+    def _get_pp_last_stage_rank_for_reporting(self):
+        if self.device_mesh is not None and "pp" in self.device_mesh.mesh_dim_names:
+            dim_names = list(self.device_mesh.mesh_dim_names)
+            mesh = self.device_mesh.mesh
+            idx = []
+            for name in dim_names:
+                if name == "pp":
+                    idx.append(-1)
+                else:
+                    idx.append(0)
+            return mesh[tuple(idx)].item()
+        return self.device_mesh.mesh.reshape(-1)[-1].item()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1049,18 +1060,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             reporting_loss = reporting_loss.float().to(self.dist_env.device)
             # Send loss to first rank from the last PP stage of rank0's mesh coords.
             # This avoids picking a global-rank sender from a different EP/PP group.
-            if self.device_mesh is not None and "pp" in self.device_mesh.mesh_dim_names:
-                dim_names = list(self.device_mesh.mesh_dim_names)
-                mesh = self.device_mesh.mesh
-                idx = []
-                for name in dim_names:
-                    if name == "pp":
-                        idx.append(-1)
-                    else:
-                        idx.append(0)
-                src_rank = mesh[tuple(idx)].item()
-            else:
-                src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
+            src_rank = self._get_pp_last_stage_rank_for_reporting()
             if self.dist_env.rank == src_rank:
                 torch.distributed.send(reporting_loss, dst=0)
             elif self.dist_env.is_main:
@@ -1091,60 +1091,42 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for mp in self.model_parts:
                 mp.eval()
 
-            total_loss = 0.0
-            total_tokens = 0
+            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {
-                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-                    for k, v in batch.items()
-                }
+                loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
-
-                _model = self.model_parts[0]
-                _cp_active = (
-                    self.device_mesh is not None
-                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-                    and self.device_mesh["cp"].size() > 1
-                    and not self.pp_enabled
+                self._forward_backward_step(
+                    0,
+                    batch,
+                    loss_buffer=loss_buffer,
+                    num_label_tokens=None,
+                    num_batches=1,
+                    is_train=False,
                 )
-                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                    with torch.no_grad():
-                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                    for k in VLM_INPUT_KEYS:
-                        batch.pop(k, None)
-                    batch.update(prepared)
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
-                labels = batch.pop("labels")
-                with train_ctx():
-                    batch = filter_forward_kwargs(self.model_parts[0], batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
-                    else:
-                        out = self.model_parts[0](**batch)
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=self.model_parts[0],
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
-                        num_label_tokens=num_label_tokens,
-                    )
-                    total_num_label_tokens += num_label_tokens
-
-                total_loss += local_loss.item() * num_label_tokens
-                total_tokens += num_label_tokens
+                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_num_label_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized
-        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
-        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
+        total_loss = self._dp_allreduce(total_loss, include_cp=True)
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
-        val_loss = total_loss / max(total_tokens, 1e-8)
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+            src_rank = self._get_pp_last_stage_rank_for_reporting()
+            if self.dist_env.rank == src_rank:
+                torch.distributed.send(val_loss, dst=0)
+                torch.distributed.send(pp_num_tokens, dst=0)
+            elif self.dist_env.is_main:
+                torch.distributed.recv(val_loss, src=src_rank)
+                torch.distributed.recv(pp_num_tokens, src=src_rank)
+                total_num_label_tokens = pp_num_tokens.item()
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
         return MetricsSample(
             step=self.step_scheduler.step,
