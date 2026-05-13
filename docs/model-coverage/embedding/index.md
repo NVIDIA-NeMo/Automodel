@@ -27,6 +27,7 @@ Any Hugging Face model that can be loaded with `AutoModel` can be used as an emb
 |---|---|
 | {download}`llama3_2_1b.yaml <../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml>` | Bi-encoder — Llama 3.2 1B embedding model |
 | {download}`llama_embed_nemotron_8b.yaml <../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml>` | Bi-encoder — Llama-Embed-Nemotron-8B reproduction recipe |
+[ [download}`ministral3_3b_instruct.yaml <../../../examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml>` | Bi-encoder — Ministral3-3B recipe |
 
 ## Supported Workflows
 
