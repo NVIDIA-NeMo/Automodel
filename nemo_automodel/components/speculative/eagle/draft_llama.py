@@ -44,7 +44,30 @@ def _build_causal_mask(
 
 
 class Eagle3LlamaAttention(nn.Module):
-    """Attention layer that consumes concatenated ``[input_emb, hidden]`` features."""
+    """EAGLE-3 draft attention over ``[input_emb, hidden]`` 2H features.
+
+    Supports two paths:
+
+    - ``cache_hidden is None`` -- single forward, regular causal attention
+      (used for evaluation and for tests).
+    - ``cache_hidden = [[K_0, K_1, ...], [V_0, V_1, ...]]`` -- TTT
+      recurrence (test-time-training). At each call:
+
+      * the rotary position is shifted by ``lck = len(cache_hidden[0])``
+        so the RoPE encodes "this is ``lck`` tokens into the future";
+      * the freshly-computed K and V (already GQA-expanded) are appended
+        to ``cache_hidden``;
+      * the output is the SpecForge ``llama3_eagle.py`` recurrence:
+        full ``Q @ K_0`` (with the standard causal mask added) plus, for
+        every cached later step ``i >= 1``, a *diagonal* contribution
+        ``(Q_t * K_i_t).sum(-1)`` -- each Q position only attends to the
+        *same* position in each previous draft step, never to another
+        position. This is the core EAGLE-3 multi-step training trick.
+
+    ``cache_hidden`` is mutated in place; the caller is responsible for
+    re-initializing it (typically ``[[], []]``) at the start of each
+    training batch.
+    """
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -62,12 +85,7 @@ class Eagle3LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
-    def forward(
-        self,
-        combined_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = combined_states.shape
         q = self.q_proj(combined_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = (
@@ -80,18 +98,75 @@ class Eagle3LlamaAttention(nn.Module):
             .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
             .transpose(1, 2)
         )
+        return q, k, v
 
-        cos, sin = self.rotary_emb(combined_states, position_ids)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
+    def _repeat_kv(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.num_key_value_groups > 1:
             k = k.repeat_interleave(self.num_key_value_groups, dim=1)
             v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+        return k, v
 
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+    def forward(
+        self,
+        combined_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = combined_states.shape
+        q, k, v = self._project_qkv(combined_states)
+
+        if cache_hidden is None:
+            # Single-step path: regular causal attention over [B, H, T, T].
+            cos, sin = self.rotary_emb(combined_states, position_ids)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            k, v = self._repeat_kv(k, v)
+
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+            attn_weights = attn_weights + attention_mask
+            attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
+            attn_output = torch.matmul(attn_probs, v)
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+            return self.o_proj(attn_output)
+
+        # TTT recurrence path. ``cache_hidden`` is ``[K_list, V_list]``.
+        lck = len(cache_hidden[0])
+        cos, sin = self.rotary_emb(combined_states, position_ids + lck)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        k, v = self._repeat_kv(k, v)
+
+        cache_hidden[0].append(k)
+        cache_hidden[1].append(v)
+        cache_k = cache_hidden[0]
+        cache_v = cache_hidden[1]
+        new_lck = len(cache_k)
+
+        # Standard T x T attention against the step-0 keys.
+        k0 = cache_k[0]
+        v0 = cache_v[0]
+        attn_weights = torch.matmul(q, k0.transpose(-2, -1)) * self.scaling
         attn_weights = attn_weights + attention_mask
+
+        # Diagonal extensions: one column per cached later step ``i``,
+        # holding ``(Q_t * K_i_t).sum(-1) / sqrt(d)`` for every Q position
+        # ``t``. Each new column is unmasked because the diagonal is
+        # intrinsically causal across draft steps.
+        for i in range(1, new_lck):
+            ki = cache_k[i]
+            attn_weightsi = (q * ki).sum(-1) * self.scaling
+            attn_weights = torch.cat((attn_weights, attn_weightsi[..., None]), dim=-1)
+
         attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
-        attn_output = torch.matmul(attn_probs, v)
+
+        # Output: ``attn_probs[..., :T] @ V_0`` covers the regular block;
+        # for each cached step ``i >= 1``, the single column at
+        # ``attn_probs[..., T + i - 1]`` scales the same-position ``V_i``.
+        attn_output = torch.matmul(attn_probs[..., :seq_len], v0)
+        for i in range(1, new_lck):
+            vi = cache_v[i]
+            probs_i = attn_probs[..., seq_len + i - 1]  # [B, H, T]
+            attn_output = attn_output + probs_i[..., None] * vi
+
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 
@@ -135,12 +210,18 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         norm_input_embeds = self.input_emb_layernorm(input_embeds)
         norm_hidden_states = self.hidden_layernorm(hidden_states)
         combined_states = torch.cat((norm_input_embeds, norm_hidden_states), dim=-1)
-        hidden_states = residual + self.self_attn(combined_states, attention_mask, position_ids)
+        hidden_states = residual + self.self_attn(
+            combined_states,
+            attention_mask,
+            position_ids,
+            cache_hidden=cache_hidden,
+        )
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -202,8 +283,15 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         projected_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
+        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
     ) -> torch.Tensor:
-        """Run one full-sequence draft update step."""
+        """Run one full-sequence draft update step.
+
+        ``cache_hidden`` activates the EAGLE-3 TTT recurrence in the
+        attention layer. Pass ``[[], []]`` on the first step of a TTT
+        unroll and the same list object on each subsequent step; the
+        attention layer appends the per-step K and V to it.
+        """
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
             position_ids = position_ids.expand(input_ids.shape[0], -1)
@@ -215,4 +303,5 @@ class LlamaEagle3DraftModel(PreTrainedModel):
             hidden_states=projected_hidden_states,
             attention_mask=causal_mask,
             position_ids=position_ids,
+            cache_hidden=cache_hidden,
         )

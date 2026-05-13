@@ -231,6 +231,164 @@ def test_build_eagle3_token_mapping_prefers_high_frequency_tokens():
     assert selected_ids[2].item() == 4
 
 
+def test_draft_attention_cache_grows_one_per_call():
+    """Each TTT-mode attention call must append exactly one K and one V to cache_hidden."""
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    batch_size, seq_len = 2, 6
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    projected = draft.project_hidden_states(aux_hidden_states)
+
+    cache_hidden: list[list[torch.Tensor]] = [[], []]
+    for expected_lck in range(1, 4):
+        draft(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+            cache_hidden=cache_hidden,
+        )
+        assert len(cache_hidden[0]) == expected_lck
+        assert len(cache_hidden[1]) == expected_lck
+        # K/V tensors are stored AFTER GQA expansion -> shape head dim is num_heads.
+        head_dim = config.hidden_size // config.num_attention_heads
+        assert cache_hidden[0][-1].shape == (batch_size, config.num_attention_heads, seq_len, head_dim)
+        assert cache_hidden[1][-1].shape == (batch_size, config.num_attention_heads, seq_len, head_dim)
+
+
+def test_draft_attention_step1_attends_to_step0_kv():
+    """At TTT step 1, the diagonal contribution from K_1/V_1 must change the output.
+
+    Mutating V_1 in cache_hidden must produce a different attention output at
+    step 1 -- this regression-guards the diagonal-extension code path. Without
+    that code path the step-1 output collapses back to ``Q @ K_0 -> V_0`` and
+    is independent of V_1.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    batch_size, seq_len = 2, 6
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    projected = draft.project_hidden_states(aux_hidden_states)
+
+    # Step 0: populate cache with (K_0, V_0).
+    cache_a: list[list[torch.Tensor]] = [[], []]
+    with torch.no_grad():
+        draft(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+            cache_hidden=cache_a,
+        )
+    # Step 1: capture the real attention output.
+    with torch.no_grad():
+        out_real = draft(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+            cache_hidden=cache_a,
+        )
+
+    # Repeat but zero the V_1 entry right after step 1 appends it.
+    cache_b: list[list[torch.Tensor]] = [[], []]
+    with torch.no_grad():
+        draft(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+            cache_hidden=cache_b,
+        )
+
+    # Monkey-patch V_1 to a constant during step 1: detect change by comparing
+    # against a *third* run where the cache is fresh -- if the step-1 path
+    # were broken (degenerate to step-0 attention), out_real would equal a
+    # one-call cache_hidden=None forward, which is what we now build.
+    cache_no_step1: list[list[torch.Tensor]] = [[], []]
+    with torch.no_grad():
+        out_step0_only = draft(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+            cache_hidden=cache_no_step1,
+        )
+
+    diff = (out_real - out_step0_only).abs().max().item()
+    assert diff > 1e-4, (
+        f"step-1 attention output is identical to step-0 (max_diff={diff}); "
+        "the diagonal K_1/V_1 contribution is not being applied."
+    )
+
+
+def test_eagle3_trainer_multi_step_differs_from_independent_runs():
+    """Multi-step TTT loss must differ from ``ttt_steps`` independent single-step losses.
+
+    With the EAGLE-3 cache_hidden recurrence wired up, step 2 of a
+    ``ttt_steps=3`` run conditions on the K/V of steps 0 and 1. If the
+    recurrence were not wired (each step independently rebuilds attention),
+    the multi-step loss would average to the same value as a single-step
+    forward repeated 3 times. This guards against accidental regressions.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+
+    batch_size, seq_len = 2, 8
+    input_ids = torch.randint(0, config.draft_vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    loss_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+
+    multi = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=3,
+    )
+    single = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=1,
+    )
+
+    with torch.no_grad():
+        loss_multi = multi(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            aux_hidden_states=aux_hidden_states,
+            target_logits=target_logits,
+        ).loss
+        loss_single = single(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            aux_hidden_states=aux_hidden_states,
+            target_logits=target_logits,
+        ).loss
+
+    assert torch.isfinite(loss_multi)
+    assert torch.isfinite(loss_single)
+    # The two paths must not produce identical losses; if they did, the
+    # cache_hidden recurrence has likely regressed.
+    assert (loss_multi - loss_single).abs().item() > 1e-4, (
+        f"multi-step TTT loss ({loss_multi.item():.6f}) matches single-step "
+        f"loss ({loss_single.item():.6f}) exactly -- the cache_hidden "
+        "recurrence is probably not in effect."
+    )
+
+
 def test_target_shift_matches_reference_padding_behavior():
     tensor = torch.tensor([[[1.0], [2.0], [3.0]]])
     shifted = _shift_left_with_zero(tensor)

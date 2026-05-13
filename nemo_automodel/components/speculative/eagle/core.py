@@ -78,7 +78,20 @@ class Eagle3TrainerModule(nn.Module):
         aux_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
     ) -> Eagle3StepMetrics:
-        """Run the EAGLE-3 unrolled draft loss for one batch."""
+        """Run the EAGLE-3 unrolled draft loss for one batch.
+
+        The attention layer is driven through a shared ``cache_hidden``
+        list so each TTT step can attend to the K/V branches produced by
+        every previous step at the same position. This matches the
+        SpecForge ``llama3_eagle.py`` recurrence; without it, multi-step
+        TTT would degenerate into ``ttt_steps`` independent single-step
+        passes and the draft would never learn the multi-step
+        distribution it sees at deployment time.
+
+        ``attention_mask`` is held constant across TTT steps -- only
+        ``input_ids`` / ``loss_mask`` / ``position_mask`` /
+        ``target_probs`` roll forward by one position per step.
+        """
         hidden_states = self.draft_model.project_hidden_states(aux_hidden_states)
         target_probs, position_mask = _compute_target_distribution(
             target_logits=target_logits,
@@ -92,17 +105,21 @@ class Eagle3TrainerModule(nn.Module):
         running_valid = hidden_states.new_zeros(())
 
         cur_input_ids = input_ids
-        cur_attention_mask = attention_mask
         cur_loss_mask = loss_mask
         cur_position_mask = position_mask
         cur_target_probs = target_probs
         cur_hidden_states = hidden_states
 
+        # EAGLE-3 TTT KV cache: a pair of lists [K_list, V_list] that the
+        # attention layer appends to on every step. Re-created per batch.
+        cache_hidden: list[list[torch.Tensor]] = [[], []]
+
         for step_idx in range(self.ttt_steps):
             cur_hidden_states = self.draft_model(
                 input_ids=cur_input_ids,
                 projected_hidden_states=cur_hidden_states,
-                attention_mask=cur_attention_mask,
+                attention_mask=attention_mask,
+                cache_hidden=cache_hidden,
             )
             logits = self.draft_model.compute_logits(cur_hidden_states)
             step_loss = masked_soft_cross_entropy(
@@ -119,7 +136,6 @@ class Eagle3TrainerModule(nn.Module):
 
             if step_idx + 1 < self.ttt_steps:
                 cur_input_ids = _shift_left_with_zero(cur_input_ids)
-                cur_attention_mask = _shift_left_with_zero(cur_attention_mask)
                 cur_loss_mask = _shift_left_with_zero(cur_loss_mask)
                 cur_position_mask = _shift_left_with_zero(cur_position_mask)
                 cur_target_probs = _shift_left_with_zero(cur_target_probs)
