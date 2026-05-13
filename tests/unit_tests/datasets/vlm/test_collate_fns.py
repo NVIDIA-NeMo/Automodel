@@ -1417,8 +1417,8 @@ def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only
 
     Regression: previously image_counts was derived from all_grid_thws only, so
     text-only samples were skipped and the resulting tensor was shorter than
-    batch_size. Downstream PP _chunk_vlm_media indexes cumsum_images by
-    sample index and would IndexError out of bounds.
+    batch_size. VLM PP media prep indexes cumsum_images by sample index and
+    would IndexError out of bounds.
     """
     MEDIA_TOKEN_ID = 163605
 
@@ -1471,6 +1471,37 @@ def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only
     )
     # text-only sample → 0; image sample → 1
     assert batch["n_images_per_sample"].tolist() == [0, 1]
+
+
+def test_wrap_vlm_collate_for_pp_prepares_media_chunks():
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, wrap_vlm_collate_for_pp
+
+    image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
+    patch_counts = image_grid_thw.prod(dim=1)
+    pixel_values = torch.arange(int(patch_counts.sum()) * 4, dtype=torch.float32).reshape(-1, 4)
+
+    def collate_fn(_examples):
+        return {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "pixel_values": pixel_values.clone(),
+            "image_grid_thw": image_grid_thw.clone(),
+            "n_images_per_sample": torch.tensor([1, 1]),
+        }
+
+    batch = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=2)([{}, {}])
+
+    assert VLM_PP_MEDIA_KEY in batch
+    assert "pixel_values" not in batch
+    assert "image_grid_thw" not in batch
+    assert "n_images_per_sample" not in batch
+
+    media = batch[VLM_PP_MEDIA_KEY]
+    split_at = int(patch_counts[0].item())
+    assert torch.equal(media["pixel_values"][0], pixel_values[:split_at])
+    assert torch.equal(media["pixel_values"][1], pixel_values[split_at:])
+    assert torch.equal(media["image_grid_hws"][0], image_grid_thw[:1])
+    assert torch.equal(media["image_grid_hws"][1], image_grid_thw[1:])
 
 
 def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_truncation_orphan(

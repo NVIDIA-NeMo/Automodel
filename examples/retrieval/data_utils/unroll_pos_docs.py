@@ -87,6 +87,8 @@ def unroll_training_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def main():
+    """Run positive-document unrolling from the command line."""
+
     parser = argparse.ArgumentParser(
         description="Unroll training data with multiple positive docs into single-pos-doc records"
     )

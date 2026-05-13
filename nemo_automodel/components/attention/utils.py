@@ -32,6 +32,7 @@ def initialize_attn_module_and_func(
     num_gqa_groups: int | None = None,
     **kwargs: Any,
 ) -> tuple[nn.Module | None, Callable[..., torch.Tensor]]:
+    """Initialize an attention backend module and callable."""
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
 
