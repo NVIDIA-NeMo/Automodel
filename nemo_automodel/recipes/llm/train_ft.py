@@ -1362,7 +1362,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             },
             model_context_factory=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else None,
             filter_pp_batch=True,
-            pp_eval_enabled=True,
             hidden_states_error_message=(
                 "FusedLinearCrossEntropy requires the model to output hidden states. "
                 "Set `model.output_hidden_states=True` in the config."

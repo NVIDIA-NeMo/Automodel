@@ -930,7 +930,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             prepare_batch_before_cp=self._prepare_vlm_batch_for_cp,
             pp_batch_context_factory=lambda pp_batch: stage_vlm_media_for_pp(self.pp, self.model_parts, pp_batch),
             filter_pp_batch=False,
-            pp_eval_enabled=True,
             hidden_states_error_message=(
                 "FusedLinearCrossEntropy requires the model to output hidden states. "
                 "Set `model.text_config.output_hidden_states=True` in the config."

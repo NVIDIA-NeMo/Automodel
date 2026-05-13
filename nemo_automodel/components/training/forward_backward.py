@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, MutableMapping
 from contextlib import nullcontext
 from typing import Any
@@ -63,8 +62,6 @@ def forward_backward_step(
     model_context_factory: Callable[[], Any] | None = None,
     pp_batch_context_factory: Callable[[MutableMapping[str, Any]], Any] | None = None,
     filter_pp_batch: bool = True,
-    pp_eval_enabled: bool = True,
-    pp_validation_skip_message: str = "Skipping forward pass for validation because pipeline parallelism is enabled",
     hidden_states_error_message: str = (
         "FusedLinearCrossEntropy requires the model to output hidden states. "
         "Set `model.output_hidden_states=True` in the config."
@@ -87,9 +84,6 @@ def forward_backward_step(
     if pp_enabled:
         if pp is None:
             raise ValueError("pp must be provided when pp_enabled=True")
-        if not is_train and not pp_eval_enabled:
-            logging.info(pp_validation_skip_message)
-            return
 
         with train_ctx(), model_ctx:
             losses = [] if pp.info.has_last_stage else None
