@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, MutableMapping
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -227,40 +226,9 @@ def wrap_vlm_collate_for_pp(
     return wrapper
 
 
-@contextmanager
-def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: MutableMapping[str, Any]):
-    """Attach dataloader-prepared VLM media chunks to PP stage 0 for one schedule call."""
-    pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
-    stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
-    staged = False
-
-    if stage0_model is not None:
-        if "pixel_values" in pp_media:
-            stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
-            stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
-            staged = True
-        if "pixel_values_videos" in pp_media:
-            stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
-            stage0_model._vlm_video_grid_thw_chunks = pp_media.get("video_grid_thw")
-            staged = True
-        if staged:
-            stage0_model._vlm_chunk_idx = 0
-
-    try:
-        yield
-    finally:
-        if staged and stage0_model is not None:
-            stage0_model._vlm_pixel_values_chunks = None
-            stage0_model._vlm_image_grid_hws_chunks = None
-            stage0_model._vlm_pixel_values_videos_chunks = None
-            stage0_model._vlm_video_grid_thw_chunks = None
-            stage0_model._vlm_chunk_idx = None
-
-
 __all__ = [
     "VLM_PP_MEDIA_KEY",
     "chunk_vlm_media",
     "prepare_vlm_media_for_pp",
-    "stage_vlm_media_for_pp",
     "wrap_vlm_collate_for_pp",
 ]

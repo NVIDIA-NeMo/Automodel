@@ -28,6 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -52,7 +53,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
+from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -66,7 +67,6 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.forward_backward import forward_backward_step
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -252,6 +252,47 @@ def build_loss_fn(cfg_loss):
         The instantiated loss function.
     """
     return cfg_loss.instantiate()
+
+
+def _move_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device) if v is not None else None for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device) for v in value)
+    return value
+
+
+@contextmanager
+def stage_prepared_vlm_media_for_pp(pp, model_parts, pp_media):
+    """Attach dataloader-prepared VLM media chunks to stage 0 for one PP call."""
+    stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
+    staged = False
+
+    if stage0_model is not None:
+        if "pixel_values" in pp_media:
+            stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
+            stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
+            staged = True
+        if "pixel_values_videos" in pp_media:
+            stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
+            stage0_model._vlm_video_grid_thw_chunks = pp_media.get("video_grid_thw")
+            staged = True
+        if staged:
+            stage0_model._vlm_chunk_idx = 0
+
+    try:
+        yield
+    finally:
+        if staged and stage0_model is not None:
+            stage0_model._vlm_pixel_values_chunks = None
+            stage0_model._vlm_image_grid_hws_chunks = None
+            stage0_model._vlm_pixel_values_videos_chunks = None
+            stage0_model._vlm_video_grid_thw_chunks = None
+            stage0_model._vlm_chunk_idx = None
 
 
 def build_dataloader(
@@ -881,25 +922,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.checkpointer.close()
 
     # ------------------ helpers ------------------
-    def _prepare_vlm_batch_for_cp(self, batch):
-        # Routed through __call__ so FSDP2 forward pre-hook fires and
-        # unshards the vision tower's weights before the embed/scatter.
-        model = self.model_parts[0]
-        cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
-        )
-        if cp_active and hasattr(model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = model(_pre_embed_only=True, **mm_kwargs)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
-        return batch
-
     def _forward_backward_step(
         self,
         idx,
@@ -910,29 +932,92 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        forward_backward_step(
-            idx=idx,
-            batch=batch,
-            device=self.dist_env.device,
-            device_mesh=self.device_mesh,
-            model_parts=self.model_parts,
-            distributed_config=self.distributed_config,
-            loss_fn=self.loss_fn,
-            calculate_loss_fn=calculate_loss,
-            loss_buffer=loss_buffer,
-            num_label_tokens=num_label_tokens,
-            num_batches=num_batches,
-            is_train=is_train,
-            pp_enabled=self.pp_enabled,
-            pp=getattr(self, "pp", None),
-            dp_group_size=1 if self.pp_enabled else self._get_dp_group_size(include_cp=True),
-            make_cp_batch_and_ctx_fn=make_cp_batch_and_ctx,
-            get_sync_ctx_fn=get_sync_ctx,
-            filter_forward_kwargs_fn=filter_forward_kwargs,
-            pre_cp_transform=self._prepare_vlm_batch_for_cp,
-            pp_batch_context_factory=lambda batch: stage_vlm_media_for_pp(self.pp, self.model_parts, batch),
-            pp_eval_enabled=False,
+        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+
+        # Routed through __call__ so FSDP2 forward pre-hook fires and
+        # unshards the vision tower's weights before the embed/scatter.
+        _model = self.model_parts[0]
+        _cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+            and not self.pp_enabled
         )
+        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
+            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+            with torch.no_grad():
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            for k in VLM_INPUT_KEYS:
+                batch.pop(k, None)
+            batch.update(prepared)
+
+        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        labels = batch.pop("labels")
+
+        if self.pp_enabled:
+            if not is_train:
+                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
+                return
+
+            with train_ctx():
+                losses = [] if self.pp.info.has_last_stage else None
+                if self.pp.info.has_last_stage:
+                    masked_labels = labels.clone()
+                    targets = masked_labels
+                else:
+                    targets = None
+
+                input_ids = batch.pop("input_ids")
+                self.pp.update_seq_len(input_ids.shape[1])
+                pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
+
+                with stage_prepared_vlm_media_for_pp(self.pp, self.model_parts, pp_media):
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
+
+            if self.pp.info.has_last_stage:
+                local_loss = torch.sum(torch.stack(losses))
+            else:
+                local_loss = torch.tensor(0.0, device=self.dist_env.device)
+
+            loss_buffer.append(local_loss.clone().detach())
+        else:
+            model = self.model_parts[0]
+            sync_ctx = (
+                get_sync_ctx(
+                    model,
+                    idx == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+                )
+                if is_train
+                else nullcontext()
+            )
+            with sync_ctx, train_ctx():
+                batch = filter_forward_kwargs(model, batch)
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                    # use num_logits_to_keep to avoid full logits matrix in memory
+                    out = model(logits_to_keep=1, **batch)
+                    if "hidden_states" not in out:
+                        raise ValueError(
+                            "FusedLinearCrossEntropy requires the model to output hidden states. "
+                            "Set `model.text_config.output_hidden_states=True` in the config."
+                        )
+                else:
+                    out = model(**batch)
+
+                local_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=getattr(out, "logits", out),
+                    labels=labels,
+                    model=model,
+                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                    num_label_tokens=num_label_tokens,
+                )
+                loss_buffer.append(local_loss.clone().detach())
+                if is_train:
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
