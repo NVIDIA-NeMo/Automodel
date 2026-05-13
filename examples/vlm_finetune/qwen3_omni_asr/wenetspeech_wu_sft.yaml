@@ -78,13 +78,14 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-# LoRA adapters land only on the thinker language model's self-attention
-# projections. Vision tower, audio tower, lm_head, and audio_projector are
-# explicitly excluded by construction so the adapter set cannot drift.
+# LoRA adapters land only on the language model's self-attention projections.
+# The NEMO custom Qwen3-Omni model exposes the LM layers under `model.layers.*`
+# (the audio tower lives at `audio_tower.layers.*` and the vision tower at
+# `visual.*`), so this pattern keeps adapters off audio/vision/lm_head modules.
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules:
-    - thinker.model.layers.*.self_attn.*_proj
+    - model.layers.*.self_attn.*_proj
   dim: 16
   alpha: 32
   dropout: 0.0

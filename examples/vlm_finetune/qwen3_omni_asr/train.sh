@@ -30,6 +30,14 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CONFIG:-${SCRIPT_DIR}/wenetspeech_wu_sft.yaml}"
 
+# Single-node 8-GPU contract: the YAML's ep_size=8 fsdp2 schedule assumes 8 GPUs.
+# Running with a different worker count would silently change the parallelization
+# plan, so reject the call up front.
+if [[ "${NPROC_PER_NODE}" != "8" ]]; then
+    echo "NPROC_PER_NODE must be exactly 8 (single-node 8-GPU contract); got '${NPROC_PER_NODE}'." >&2
+    exit 1
+fi
+
 if [[ ! -x "${PY}" ]]; then
     echo "PY interpreter not found or not executable: ${PY}" >&2
     exit 1

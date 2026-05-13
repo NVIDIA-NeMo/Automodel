@@ -3318,3 +3318,58 @@ def test_qwen3_omni_asr_function_body_does_not_import_qwen_omni_utils(collate_mo
     body_src = "\n".join(ast.unparse(node) for node in body)
     assert "qwen_omni_utils" not in body_src
     assert "process_mm_info" not in body_src
+
+
+def test_qwen3_omni_asr_validate_helper_coerces_float64_to_float32(collate_mod):
+    """A 1-D float64 waveform must be coerced to float32 (no raise)."""
+    waveform = _np.zeros(400, dtype=_np.float64)
+    coerced = collate_mod._validate_and_coerce_audio_payload(waveform, sample_index=0)
+    assert isinstance(coerced, _np.ndarray)
+    assert coerced.dtype == _np.float32
+    assert coerced.ndim == 1
+    assert coerced.shape == (400,)
+
+
+def test_qwen3_omni_asr_validate_helper_rejects_2d_audio(collate_mod):
+    """A non-1-D audio payload must raise ValueError naming sample index and shape/dtype."""
+    waveform_2d = _np.zeros((2, 400), dtype=_np.float32)
+    with pytest.raises(ValueError, match=r"sample\[3\] audio payload must be 1-D"):
+        collate_mod._validate_and_coerce_audio_payload(waveform_2d, sample_index=3)
+
+
+def test_qwen3_omni_asr_collate_coerces_float64_inputs(collate_mod, monkeypatch):
+    """End-to-end: the collate must accept a float64 waveform and forward it as float32."""
+
+    labels_stub = torch.tensor([[10, 11, 12, 13, 14, 15]], dtype=torch.long)
+    monkeypatch.setattr(
+        collate_mod,
+        "build_labels_from_template",
+        lambda input_ids, conversations, processor_arg: labels_stub,
+        raising=True,
+    )
+
+    processor = DummyQwen3OmniAsrProcessor()
+    conv = [
+        {"role": "system", "content": "Transcribe."},
+        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros(400, dtype=_np.float64)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
+    ]
+    collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)
+
+    # The collate must have coerced the float64 waveform to float32 BEFORE passing to the processor.
+    forwarded_audio = processor.call_kwargs[0]["audio"]
+    assert forwarded_audio is not None and len(forwarded_audio) == 1
+    assert forwarded_audio[0].dtype == _np.float32
+    assert forwarded_audio[0].ndim == 1
+
+
+def test_qwen3_omni_asr_collate_rejects_2d_audio(collate_mod):
+    """End-to-end: a 2-D waveform inside the conversation must raise during collation."""
+    processor = DummyQwen3OmniAsrProcessor()
+    conv = [
+        {"role": "system", "content": "Transcribe."},
+        {"role": "user", "content": [{"type": "audio", "audio": _np.zeros((2, 400), dtype=_np.float32)}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "你好"}]},
+    ]
+    with pytest.raises(ValueError, match=r"sample\[0\].*1-D"):
+        collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)

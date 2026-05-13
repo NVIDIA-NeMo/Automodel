@@ -718,6 +718,56 @@ def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) ->
     return audios
 
 
+def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> "np.ndarray":  # type: ignore[name-defined]
+    """Coerce an audio payload to a 1-D ``float32`` ``np.ndarray`` or raise.
+
+    The single rule:
+      - Convert any numeric ``np.ndarray`` / ``torch.Tensor`` to ``np.float32``.
+      - The result must be exactly 1-D after conversion (mono waveform).
+      - Anything else raises ``ValueError`` naming the sample index, observed
+        shape, and observed dtype so the caller can pinpoint the bad sample.
+
+    Args:
+        payload: Audio object pulled from a conversation content item.
+        sample_index: Index of the offending sample within the batch (for error
+            messages).
+
+    Returns:
+        A 1-D ``np.float32`` ``np.ndarray``.
+
+    Raises:
+        ValueError: When the payload is not a numeric array or is not 1-D.
+    """
+    import numpy as _np
+
+    if hasattr(payload, "detach") and hasattr(payload, "cpu") and hasattr(payload, "numpy"):
+        # torch.Tensor or similar; move to CPU before NumPy view.
+        payload = payload.detach().cpu().numpy()
+
+    if not isinstance(payload, _np.ndarray):
+        raise ValueError(
+            f"sample[{sample_index}] audio payload must be an np.ndarray or torch.Tensor; "
+            f"got type={type(payload).__name__}"
+        )
+
+    if not _np.issubdtype(payload.dtype, _np.number):
+        raise ValueError(
+            f"sample[{sample_index}] audio payload must have a numeric dtype; "
+            f"got shape={payload.shape} dtype={payload.dtype}"
+        )
+
+    if payload.dtype != _np.float32:
+        payload = payload.astype(_np.float32, copy=False)
+
+    if payload.ndim != 1:
+        raise ValueError(
+            f"sample[{sample_index}] audio payload must be 1-D (mono waveform); "
+            f"got shape={payload.shape} dtype={payload.dtype}"
+        )
+
+    return payload
+
+
 def _conversation_ends_with_assistant_text(conversation: Sequence[Dict[str, Any]]) -> bool:
     """Return True iff the last turn is an ``assistant`` turn with non-empty text content."""
     if not conversation:
@@ -788,8 +838,10 @@ def qwen3_omni_asr_collate_fn(
     ]
 
     all_audios: List[Any] = []
-    for conv in conversations:
-        all_audios.extend(_extract_audios_from_conversation(conv))
+    for idx, conv in enumerate(conversations):
+        sample_audios = _extract_audios_from_conversation(conv)
+        for payload in sample_audios:
+            all_audios.append(_validate_and_coerce_audio_payload(payload, sample_index=idx))
 
     processor_kwargs = {
         "text": texts,
