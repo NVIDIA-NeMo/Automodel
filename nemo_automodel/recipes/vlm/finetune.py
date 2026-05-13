@@ -28,7 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -53,7 +53,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, wrap_vlm_collate_for_pp
+from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -264,35 +264,6 @@ def _move_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, tuple):
         return tuple(_move_to_device(v, device) for v in value)
     return value
-
-
-@contextmanager
-def stage_prepared_vlm_media_for_pp(pp, model_parts, pp_media):
-    """Attach dataloader-prepared VLM media chunks to stage 0 for one PP call."""
-    stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
-    staged = False
-
-    if stage0_model is not None:
-        if "pixel_values" in pp_media:
-            stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
-            stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
-            staged = True
-        if "pixel_values_videos" in pp_media:
-            stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
-            stage0_model._vlm_video_grid_thw_chunks = pp_media.get("video_grid_thw")
-            staged = True
-        if staged:
-            stage0_model._vlm_chunk_idx = 0
-
-    try:
-        yield
-    finally:
-        if staged and stage0_model is not None:
-            stage0_model._vlm_pixel_values_chunks = None
-            stage0_model._vlm_image_grid_hws_chunks = None
-            stage0_model._vlm_pixel_values_videos_chunks = None
-            stage0_model._vlm_video_grid_thw_chunks = None
-            stage0_model._vlm_chunk_idx = None
 
 
 def build_dataloader(
@@ -969,9 +940,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
                 input_ids = batch.pop("input_ids")
                 self.pp.update_seq_len(input_ids.shape[1])
-                pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
 
-                with stage_prepared_vlm_media_for_pp(self.pp, self.model_parts, pp_media):
+                with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
                     if self.pp.info.has_first_stage:
                         self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
                     else:
