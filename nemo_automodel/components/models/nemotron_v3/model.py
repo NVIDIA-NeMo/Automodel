@@ -274,6 +274,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         backend: BackendConfig | None = None,
         *,
         mtp_loss_scaling_factor: float = 0.1,
+        num_nextn_predict_layers: int | None = None,
+        mtp_use_repeated_layer: bool = False,
         **kwargs,
     ):
         """Initialize NemotronV3ForCausalLM.
@@ -284,8 +286,15 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             mtp_loss_scaling_factor: Auxiliary-loss weight for the MTP head
                 (default ``0.1``). Programmatic override only — not exposed
                 as a YAML knob to keep recipe configs auto-detected.
-                ``num_nextn_predict_layers`` and
-                ``mtp_hybrid_override_pattern`` come from the HF config.
+            num_nextn_predict_layers: Optional override for the HF config's
+                ``num_nextn_predict_layers`` field (i.e. the MTP forward
+                iteration count). When ``None``, the value from ``config`` is
+                used. Set explicitly when the trained model used weight-tied
+                MTP (``mtp_use_repeated_layer=True``) and the HF export only
+                retains the physical depth count.
+            mtp_use_repeated_layer: When ``True``, build a single physical
+                MTP depth and reuse it across all iterations. Mirrors
+                Megatron's ``--mtp-use-repeated-layer``. Defaults to ``False``.
             **kwargs: Additional arguments. Recognized keys:
                 ``moe_config``, ``moe_overrides``.
         """
@@ -315,7 +324,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         )
 
         # self.mtp is None when num_nextn_predict_layers is absent or 0.
-        self.mtp_config = build_mtp_config_from_hf(config, loss_scaling_factor=mtp_loss_scaling_factor)
+        self.mtp_config = build_mtp_config_from_hf(
+            config,
+            loss_scaling_factor=mtp_loss_scaling_factor,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+            use_repeated_layer=mtp_use_repeated_layer,
+        )
         if self.mtp_config.enabled:
             self.mtp = build_nemotron_v3_mtp(
                 config,

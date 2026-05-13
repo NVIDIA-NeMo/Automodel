@@ -91,25 +91,35 @@ class MTPConfig:
     """Runtime configuration for the MTP block.
 
     Attributes:
-        num_layers: Number of MTP depths (D). ``0`` disables MTP.
+        num_layers: Number of MTP forward iterations (D). ``0`` disables MTP.
+            Equivalent to Megatron's ``--mtp-num-layers``.
         layer_pattern: Per-depth inner-block pattern, e.g. ``"*E"`` for one
             attention + one MoE sublayer per depth.
         loss_scaling_factor: Coefficient applied to the summed per-depth CE
             loss (default ``0.1``). The effective per-depth weight is
             ``loss_scaling_factor / num_layers``.
+        use_repeated_layer: When ``True``, build a single physical depth's
+            worth of sublayers and reuse it for all ``num_layers`` forward
+            iterations (weight-tied across depths). Equivalent to Megatron's
+            ``--mtp-use-repeated-layer``.
     """
 
     num_layers: int = 0
     layer_pattern: str = ""
     loss_scaling_factor: float = 0.1
+    use_repeated_layer: bool = False
 
     @property
     def pattern_length(self) -> int:
         return len(self.layer_pattern)
 
     @property
+    def num_physical_depths(self) -> int:
+        return 1 if self.use_repeated_layer else self.num_layers
+
+    @property
     def total_sublayers(self) -> int:
-        return self.num_layers * self.pattern_length
+        return self.num_physical_depths * self.pattern_length
 
     @property
     def enabled(self) -> bool:
@@ -152,9 +162,9 @@ class MTPModule(nn.Module):
         self.mtp_config = mtp_config
         block_types = parse_mtp_layer_pattern(mtp_config.layer_pattern)
         P = mtp_config.pattern_length
-        D = mtp_config.num_layers
+        num_physical_depths = mtp_config.num_physical_depths
         layers: list[nn.Module] = []
-        for d in range(D):
+        for d in range(num_physical_depths):
             for s in range(P):
                 global_idx = d * P + s
                 layers.append(
@@ -210,6 +220,7 @@ class MTPModule(nn.Module):
         """
         D = self.num_depths
         P = self.pattern_length
+        use_repeated = self.mtp_config.use_repeated_layer
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         cur_position_ids = position_ids
@@ -219,8 +230,9 @@ class MTPModule(nn.Module):
                 cur_position_ids = roll_tensor(cur_position_ids, shifts=-1, dim=-1)
 
             decoder_input = embed_fn(cur_input_ids)
+            phys_d = 0 if use_repeated else d
             for s in range(P):
-                sublayer = self.layers[d * P + s]
+                sublayer = self.layers[phys_d * P + s]
                 kwargs = dict(block_kwargs)
                 if cur_position_ids is not None:
                     kwargs["position_ids"] = cur_position_ids

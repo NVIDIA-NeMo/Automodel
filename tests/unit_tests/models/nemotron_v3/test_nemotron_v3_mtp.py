@@ -152,6 +152,19 @@ class TestMTPConfig:
         assert c.pattern_length == 2
         assert c.total_sublayers == 4
 
+    def test_use_repeated_layer_defaults_false(self):
+        """Regression: default behavior is unchanged when the new flag is unset."""
+        c = MTPConfig(num_layers=2, layer_pattern="*E")
+        assert c.use_repeated_layer is False
+        assert c.num_physical_depths == c.num_layers
+        assert c.total_sublayers == c.num_layers * c.pattern_length
+
+    def test_use_repeated_layer_collapses_physical_depths(self):
+        """When set, physical depth count is 1 regardless of num_layers."""
+        c = MTPConfig(num_layers=5, layer_pattern="*E", use_repeated_layer=True)
+        assert c.num_physical_depths == 1
+        assert c.total_sublayers == 1 * c.pattern_length
+
 
 # ---------------------------------------------------------------------------
 # End-to-end forward / backward
@@ -266,6 +279,76 @@ class TestMTPEnabled:
 # ---------------------------------------------------------------------------
 # State-dict adapter MTP key handling
 # ---------------------------------------------------------------------------
+
+
+class TestMTPRepeatedLayer:
+    """Weight-tied repeated MTP iterations (Megatron --mtp-use-repeated-layer parity).
+
+    Build with ``num_nextn_predict_layers > 1`` overridden via the kwarg and
+    ``mtp_use_repeated_layer=True``. Only one physical depth's worth of
+    sublayers should exist in the state_dict, while the forward emits one
+    hidden state per iteration.
+    """
+
+    def _build_repeated(self, backend, *, iterations, pattern):
+        """Construct a model whose HF config exposes a single physical MTP depth
+        but whose runtime iterates ``iterations`` times through the shared head."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        # HF config records 1 physical depth (this is what the checkpoint exposes);
+        # the kwargs override drives the runtime iteration count and weight tying.
+        config = MockNemotronV3Config(
+            num_nextn_predict_layers=1,
+            mtp_hybrid_override_pattern=pattern,
+        )
+        model = NemotronHForCausalLM(
+            config,
+            backend=backend,
+            num_nextn_predict_layers=iterations,
+            mtp_use_repeated_layer=True,
+        )
+        return model.to(torch.bfloat16), config
+
+    def test_physical_sublayers_match_one_depth(self, backend):
+        model, _ = self._build_repeated(backend, iterations=2, pattern="*E")
+        # P=2; one physical depth backs all iterations.
+        assert len(model.mtp.layers) == 2
+        # Fusion on the first sublayer, final_layernorm on the last.
+        assert model.mtp.layers[0].has_fusion is True
+        assert model.mtp.layers[1].has_final_norm is True
+
+    def test_forward_emits_one_h_per_iteration(self, backend):
+        model, config = self._build_repeated(backend, iterations=2, pattern="*E")
+        model.train()
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        out = model(input_ids, labels=input_ids.clone())
+        assert out.mtp_per_depth_h is not None
+        # 2 iterations -> 2 hidden states returned, despite only 1 physical depth.
+        assert len(out.mtp_per_depth_h) == 2
+        assert all(h.requires_grad for h in out.mtp_per_depth_h)
+
+    def test_backward_accumulates_on_shared_params(self, backend):
+        """Calling the same physical sublayer twice must accumulate gradient
+        from both iterations onto the shared parameters."""
+        model, config = self._build_repeated(backend, iterations=2, pattern="*E")
+        model.train()
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        out = model(input_ids, labels=input_ids.clone())
+        # Each iteration's hidden state must influence the shared params.
+        sum(h.sum() for h in out.mtp_per_depth_h).backward()
+        # The single physical fusion-bearing sublayer must have a grad.
+        assert model.mtp.layers[0].enorm.weight.grad is not None
+        assert model.mtp.layers[0].eh_proj.weight.grad is not None
+        assert model.mtp.layers[1].final_layernorm.weight.grad is not None
+
+    def test_state_dict_layout_matches_one_depth(self, backend):
+        """State dict must contain only the one physical depth's keys, so the
+        HF checkpoint (which carries D=1 worth of mtp.* weights) loads cleanly."""
+        model, _ = self._build_repeated(backend, iterations=3, pattern="*E")
+        sd = model.state_dict()
+        # Only mtp.layers.{0,1} should exist for P=2 with 1 physical depth.
+        mtp_indices = {int(k.split(".")[2]) for k in sd if k.startswith("mtp.layers.")}
+        assert mtp_indices == {0, 1}
 
 
 class TestMTPStateDictAdapter:

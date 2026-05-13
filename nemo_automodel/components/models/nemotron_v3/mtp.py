@@ -172,6 +172,8 @@ def build_mtp_config_from_hf(
     config,
     *,
     loss_scaling_factor: float = 0.1,
+    num_nextn_predict_layers: int | None = None,
+    use_repeated_layer: bool = False,
 ) -> MTPConfig:
     """Construct an :class:`MTPConfig` from an HF NemotronH config.
 
@@ -185,14 +187,26 @@ def build_mtp_config_from_hf(
         loss_scaling_factor: Auxiliary-loss weight applied to the summed
             per-depth CE (default ``0.1``). Not stored on the HF config;
             override programmatically when constructing the model.
+        num_nextn_predict_layers: Optional override for the HF config's
+            ``num_nextn_predict_layers`` field. When ``None``, uses the value
+            from ``config``. Set explicitly when the trained model used
+            weight-tied MTP iterations (``use_repeated_layer=True``) and the
+            HF export only retains the physical depth count.
+        use_repeated_layer: When ``True``, build only one physical MTP depth
+            and reuse it across all iterations. Mirrors Megatron's
+            ``--mtp-use-repeated-layer``. Defaults to ``False``.
 
     Returns:
         :class:`MTPConfig`.
     """
-    num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    if num_nextn_predict_layers is None:
+        num_layers = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
+    else:
+        num_layers = int(num_nextn_predict_layers)
     pattern = getattr(config, "mtp_hybrid_override_pattern", "") or ""
     return MTPConfig(
         num_layers=num_layers,
         layer_pattern=pattern,
         loss_scaling_factor=loss_scaling_factor,
+        use_repeated_layer=use_repeated_layer,
     )
