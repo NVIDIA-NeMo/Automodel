@@ -1,6 +1,6 @@
 """Minimal GPU smoke test for DFlashSFTRecipe core logic.
 
-Tests the three novel pieces without the full distributed recipe stack:
+Tests the four novel pieces without the full distributed recipe stack:
   1. Target forward + hidden-state extraction
   2. Anchor-block masking
   3. Draft forward conditioned on target hidden states
@@ -13,9 +13,9 @@ Run:
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
+from nemo_automodel.components.loss.dflash_loss import DFlashDecayLoss
 
 # --- Inlined helpers (avoid importing the full recipe which needs torchao) ---
 
@@ -42,18 +42,6 @@ def _get_target_embeddings(model):
     return embed, head
 
 
-class DFlashDecayLoss(torch.nn.Module):
-    def __init__(self, loss_gamma=7.0):
-        super().__init__()
-        self.loss_gamma = float(loss_gamma)
-
-    def forward(self, logits, target_ids, block_mask):
-        B, T, V = logits.shape
-        nll = F.cross_entropy(logits.reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(B, T)
-        w = torch.exp(-torch.arange(T, device=logits.device, dtype=nll.dtype) / self.loss_gamma)
-        weights = w.unsqueeze(0) * block_mask.to(nll.dtype)
-        loss = (nll * weights).sum() / weights.sum().clamp_min(1e-8)
-        return loss
 
 DRAFT_ID = "z-lab/Qwen3-4B-DFlash-b16"
 TARGET_ID = "Qwen/Qwen3-4B"
@@ -146,8 +134,10 @@ def main():
 
     # paper default gamma for block_size 16
     gamma = {16: 7.0, 10: 5.0, 8: 4.0}.get(block_size, block_size / 2.0)
+    num_tokens = int(block_mask.sum().item())
     loss_fn = DFlashDecayLoss(loss_gamma=gamma)
-    loss = loss_fn(logits=logits, target_ids=block_targets, block_mask=block_mask)
+    loss_result = loss_fn(logits=logits, target_ids=block_targets, block_mask=block_mask, num_tokens=num_tokens)
+    loss = loss_result.total_loss
     print(f"  loss = {loss.item():.4f}  (gamma={gamma})")
 
     loss.backward()
