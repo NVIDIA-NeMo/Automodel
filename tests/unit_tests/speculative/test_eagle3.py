@@ -424,9 +424,13 @@ def test_eagle3_trainer_multi_step_differs_from_independent_runs():
     draft = _build_tiny_draft_model()
     config = draft.config
 
+    # Cover the entire target vocab so every shifted TTT step still has
+    # supervised positions; otherwise step 1/2 ``position_mask`` can be
+    # all-zero (each step shifts left and zero-fills the tail) and their
+    # losses collapse to 0, which would make the multi-step weighted sum
+    # numerically identical to the single-step loss.
     selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
-    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
-    selected_token_mask[selected_token_ids] = True
+    selected_token_mask = torch.ones(config.vocab_size, dtype=torch.bool)
 
     batch_size, seq_len = 2, 8
     input_ids = torch.randint(0, config.draft_vocab_size, (batch_size, seq_len))
@@ -473,6 +477,63 @@ def test_eagle3_trainer_multi_step_differs_from_independent_runs():
         f"loss ({loss_single.item():.6f}) exactly -- the cache_hidden "
         "recurrence is probably not in effect."
     )
+
+
+def test_eagle3_trainer_applies_specforge_loss_decay():
+    """``running_loss`` must equal ``Σ_i 0.8^i * step_loss_i`` (unnormalized).
+
+    Walk the same trainer with ``ttt_steps=1, 2, 3`` and verify the
+    incremental contribution of each extra step matches ``0.8^i`` times
+    the *unweighted* step loss. Because steps 0..k-2 see identical
+    ``cache_hidden`` state across the three runs, the per-step
+    contributions are stable, and the deltas isolate the decay factor.
+    Reference: SpecForge ``scripts/train_eagle3.py::run_backward_and_update``.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.ones(config.vocab_size, dtype=torch.bool)
+
+    batch_size, seq_len = 2, 8
+    input_ids = torch.randint(0, config.draft_vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    loss_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+
+    losses: list[torch.Tensor] = []
+    for k in (1, 2, 3):
+        trainer = Eagle3TrainerModule(
+            draft,
+            selected_token_ids=selected_token_ids,
+            selected_token_mask=selected_token_mask,
+            ttt_steps=k,
+        )
+        with torch.no_grad():
+            losses.append(
+                trainer(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
+                    aux_hidden_states=aux_hidden_states,
+                    target_logits=target_logits,
+                ).loss
+            )
+
+    # loss(k=2) - loss(k=1) = 0.8 * raw_step_loss_1
+    # loss(k=3) - loss(k=2) = 0.64 * raw_step_loss_2
+    # Therefore (loss(k=3) - loss(k=2)) / (loss(k=2) - loss(k=1))
+    #         = 0.8 * (raw_step_loss_2 / raw_step_loss_1).
+    # If decay were absent the ratio would be raw_step_loss_2 / raw_step_loss_1
+    # directly; if decay were dropped *and* the legacy ``/ ttt_steps`` average
+    # were kept, loss(k=N) would shrink with N and the deltas would be
+    # negative. Both regressions are caught by the bounds below.
+    delta_1 = (losses[1] - losses[0]).item()
+    delta_2 = (losses[2] - losses[1]).item()
+    assert delta_1 > 0, f"expected positive contribution from step 1, got {delta_1}"
+    assert delta_2 > 0, f"expected positive contribution from step 2, got {delta_2}"
 
 
 def test_target_shift_matches_reference_padding_behavior():

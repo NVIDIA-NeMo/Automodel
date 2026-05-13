@@ -114,6 +114,12 @@ class Eagle3TrainerModule(nn.Module):
         # attention layer appends to on every step. Re-created per batch.
         cache_hidden: list[list[torch.Tensor]] = [[], []]
 
+        # SpecForge weights step i with ``0.8 ** i`` -- earlier TTT steps
+        # are easier (less compounding error) so they dominate the loss,
+        # while later steps still contribute a smaller signal. The sum is
+        # NOT renormalized; matching SpecForge keeps the gradient magnitude
+        # comparable across implementations at the same learning rate.
+        # Reference: SpecForge ``scripts/train_eagle3.py::run_backward_and_update``.
         for step_idx in range(self.ttt_steps):
             cur_hidden_states = self.draft_model(
                 input_ids=cur_input_ids,
@@ -127,7 +133,7 @@ class Eagle3TrainerModule(nn.Module):
                 target_probs=cur_target_probs,
                 position_mask=cur_position_mask,
             )
-            running_loss = running_loss + step_loss
+            running_loss = running_loss + step_loss * (0.8**step_idx)
 
             valid_mask = cur_position_mask.squeeze(-1).bool()
             correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
@@ -140,6 +146,5 @@ class Eagle3TrainerModule(nn.Module):
                 cur_position_mask = _shift_left_with_zero(cur_position_mask)
                 cur_target_probs = _shift_left_with_zero(cur_target_probs)
 
-        avg_loss = running_loss / float(self.ttt_steps)
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)
+        return Eagle3StepMetrics(loss=running_loss, accuracy=accuracy, valid_tokens=running_valid)
