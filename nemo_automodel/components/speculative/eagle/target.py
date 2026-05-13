@@ -54,8 +54,21 @@ class HFEagle3TargetModel:
         self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids is not None else self._default_aux_layer_ids()
 
     def _default_aux_layer_ids(self) -> list[int]:
+        # Three reference points: an early layer, a middle one, and a late
+        # one. ``max(1, ...)`` keeps the indices in-bounds for shallow
+        # toy models, but the raw recipe collides on small ``num_layers``
+        # (e.g. 5 layers -> ``[1, 1, 1]``); deduplicate preserving order
+        # so ``generate_batch`` cannot end up registering multiple hooks
+        # on the same module and tripping the post-forward length check.
         num_layers = self.model.config.num_hidden_layers
-        return [1, max(1, num_layers // 2 - 1), max(1, num_layers - 4)]
+        candidates = [1, max(1, num_layers // 2 - 1), max(1, num_layers - 4)]
+        seen: set[int] = set()
+        unique: list[int] = []
+        for lid in candidates:
+            if lid not in seen:
+                unique.append(lid)
+                seen.add(lid)
+        return unique
 
     def _get_transformer_layers(self) -> Iterable[nn.Module]:
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
