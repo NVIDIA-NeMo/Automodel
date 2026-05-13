@@ -73,6 +73,14 @@ def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn
     return model
 
 
+def _configure_generic_backbone_causality(model: PreTrainedModel, is_causal: bool) -> None:
+    """Persist and apply causality settings for generic HuggingFace encoder backbones."""
+    model.config.is_causal = is_causal
+    for module in model.modules():
+        if hasattr(module, "is_causal"):
+            module.is_causal = is_causal
+
+
 def _load_from_extracted_state(
     backbone_class: type[PreTrainedModel],
     config,
@@ -212,6 +220,7 @@ def build_encoder_backbone(
     extract_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
+    is_causal: Optional[bool] = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -240,6 +249,7 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
+        is_causal: Optional attention causality setting for generic embedding backbones.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -256,13 +266,20 @@ def build_encoder_backbone(
         logger.info(f"Loading {model_name_or_path} with HuggingFace Auto classes to extract {extract_submodel}")
         model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
         extracted_model = _extract_submodel(model, extract_submodel)
-        return _build_backbone_from_extracted_submodel(
+        backbone = _build_backbone_from_extracted_submodel(
             extracted_model,
             task=task,
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
         )
+        if (
+            task == "embedding"
+            and is_causal is not None
+            and not ModelRegistry.has_retrieval_model(backbone.__class__.__name__)
+        ):
+            _configure_generic_backbone_causality(backbone, is_causal)
+        return backbone
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
     if BidirectionalModelClass is not None:
@@ -284,7 +301,10 @@ def build_encoder_backbone(
         return AutoModelForSequenceClassification.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
-    return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    if is_causal is not None:
+        _configure_generic_backbone_causality(model, is_causal)
+    return model
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
@@ -392,6 +412,7 @@ class BiEncoderModel(nn.Module):
             effective_task,
             trust_remote_code=trust_remote_code,
             pooling=pooling,
+            is_causal=is_causal,
             **hf_kwargs,
         )
 
