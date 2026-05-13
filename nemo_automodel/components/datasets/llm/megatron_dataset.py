@@ -76,12 +76,16 @@ class MegatronPretraining:
                 Note that if limit_val_batches <= 1, we generate the entire validaton dataset, so
                 weights should not be provided for the validation split.
 
-                Example JSON file format:
+                Example JSON file format (dict-of-splits):
                     {
                         "train": ["30", "path/to/dataset1", "70", "path/to/dataset2"],
                         "valid": ["path/to/val_dataset"],
                         "test": ["path/to/test_dataset"]
                     }
+                Alternatively the JSON file may contain a single flattened list
+                (Megatron-LM canonical form), paired with the ``split`` argument
+                to derive per-split ratios:
+                    ["30", "path/to/dataset1", "70", "path/to/dataset2"]
             seq_length (int): Sequence length.
             tokenizer (Optional[PreTrainedTokenizerBase]): An instance of a PreTrainedTokenizerBase object.
             micro_batch_size (int): Batch size per GPU.
@@ -356,30 +360,45 @@ def get_list_of_files(path: str):
     return sorted(list(unique_paths))
 
 
-def try_load_blend_from_json(path: Union[str, Path]) -> Optional[Dict[str, List]]:
+def try_load_blend_from_json(
+    path: Union[str, Path],
+) -> Optional[Union[Dict[str, List], List]]:
     """
     Load a data blend configuration from a JSON file.
 
+    Two top-level JSON shapes are accepted:
+
+    1. **Dict-of-splits** (Automodel native form): keys are split names
+       ('train', 'valid', 'test'); values are path lists. Common aliases
+       'valid' / 'val' / 'dev' are normalized to 'validation'.
+    2. **Flat list** (Megatron-LM canonical form): a single zipped list of
+       alternating weights and dataset prefixes. The caller uses the
+       ``split=`` parameter to allocate this blend across train / validation
+       / test splits.
+
     Args:
         path: Path to a JSON file containing the blend configuration.
-              The JSON should contain a dictionary with split names as keys (e.g., 'train', 'valid', 'test'),
-              where each value is a list of dataset paths or a flattened list of weights and paths.
-              Common aliases like 'valid', 'val', 'dev' are automatically normalized to 'validation'.
 
     Returns:
-        Dictionary containing the blend configuration if the path is a JSON file, None otherwise.
+        Dictionary or list containing the blend configuration if ``path`` is
+        a JSON file. ``None`` if ``path`` is not a ``.json`` file (caller
+        should fall back to interpreting ``path`` as a glob or a literal
+        prefix).
 
     Raises:
         FileNotFoundError: If the JSON file does not exist.
         PermissionError: If the JSON file cannot be read.
-        ValueError: If the JSON is invalid or not a dictionary.
+        ValueError: If the JSON is invalid or is neither a list nor a dict.
 
-    Example JSON format:
+    Example dict-of-splits JSON:
         {
             "train": ["30", "path/to/dataset1", "70", "path/to/dataset2"],
             "valid": ["path/to/val_dataset"],
             "test": ["path/to/test_dataset"]
         }
+
+    Example flat-list JSON (Megatron-LM convention, paired with ``split=``):
+        ["30", "path/to/dataset1", "70", "path/to/dataset2"]
     """
     path = Path(path)
 
@@ -399,8 +418,13 @@ def try_load_blend_from_json(path: Union[str, Path]) -> Optional[Dict[str, List]
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in blend file {path}: {e}")
 
+    if isinstance(blend_config, list):
+        # Flat Megatron-LM blend form: ["w1", "prefix1", "w2", "prefix2", ...].
+        # The caller routes this through `get_blend_from_list` together with
+        # `split=` to derive per-split ratios.
+        return blend_config
     if not isinstance(blend_config, dict):
-        raise ValueError(f"Blend JSON file must contain a dictionary, got {type(blend_config)}")
+        raise ValueError(f"Blend JSON file must contain a list or dictionary, got {type(blend_config)}")
 
     # Normalize split names (e.g., "valid" -> "validation", "val" -> "validation")
     split_aliases = {
