@@ -16,6 +16,8 @@
 # torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py \
 #   --config examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_neat_packing.yaml
 
+recipe: FinetuneRecipeForVLM
+
 step_scheduler:
   global_batch_size: 16
   local_batch_size: 1
@@ -23,8 +25,6 @@ step_scheduler:
   val_every_steps: 100
   max_steps: 100
   num_epochs: 2
-
-recipe: FinetuneRecipeForVLM
 
 dist_env:
   backend: nccl
