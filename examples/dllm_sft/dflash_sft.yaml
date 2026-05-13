@@ -19,10 +19,10 @@
 #
 # Usage (8-GPU):
 #   python -m torch.distributed.run --nproc-per-node=8 \
-#       nemo_automodel/recipes/dllm/train_dflash.py \
+#       examples/dllm_sft/finetune.py \
 #       -c examples/dllm_sft/dflash_sft.yaml
 
-recipe: DFlashSFTRecipe
+recipe: DiffusionLMSFTRecipe
 
 step_scheduler:
   global_batch_size: 16
@@ -87,7 +87,7 @@ dflash:
   block_size: 0
   loss_decay_gamma: 0.0
 
-# Placeholder loss_fn — DFlashSFTRecipe uses DFlashDecayLoss internally.
+# Placeholder loss_fn — DFlashStrategy uses DFlashDecayLoss internally.
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 

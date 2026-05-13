@@ -463,6 +463,7 @@ class DFlashStrategy(DLLMStrategy):
                 logits=logits,
                 target_ids=block_targets,
                 block_mask=block_mask,
+                num_tokens=num_diffusion_tokens,
             )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
