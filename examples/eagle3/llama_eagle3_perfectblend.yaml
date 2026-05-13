@@ -1,0 +1,61 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+recipe_args:
+  target_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+  # ``frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`` is
+  # distributed with a ``conversations`` column, but ChatDataset expects
+  # ``messages``. Before pointing the recipe at the dataset, rename the
+  # column locally (one-liner shown below) and pass the rewritten
+  # directory or HF dataset ID here.
+  #
+  #   python -c "import pandas as pd; from pathlib import Path; \
+  #              src = Path('<download_dir>'); dst = Path('<output_dir>'); \
+  #              dst.mkdir(parents=True, exist_ok=True); \
+  #              [pd.read_parquet(f).rename(columns={'conversations': 'messages'}) \
+  #               .to_parquet(dst / f.name, index=False) for f in sorted(src.glob('train-*.parquet'))]"
+  train_data_path: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
+  val_data_path: null
+
+  # Full PerfectBlend is ~1.42M rows -> ~14h/epoch on 8 GPUs and roughly
+  # 3x what an EAGLE-3 draft needs to converge. Slice down to 200k
+  # samples for a ~2h/epoch run; remove this line (or set to null) to
+  # train on the full corpus.
+  train_split: "train[:200000]"
+  val_split: null
+
+  output_dir: ./outputs/eagle3_llama_perfectblend
+
+  seq_length: 2048
+
+  # 8 GPUs * micro_batch=1 * grad_accum=4 -> effective batch 32.
+  micro_batch_size: 1
+  grad_accumulation_steps: 4
+  num_workers: 4
+
+  # 200k samples * 1 epoch / 8 ranks / grad_accum=4 ~= 6.25k optim steps.
+  # If you switch to the full 1.42M, this still works -- it just runs
+  # ~7x longer per epoch.
+  num_epochs: 1
+
+  ttt_steps: 4
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 20
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 2.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  # 5% of ~6.25k optim steps ~= 310 warmup steps -- enough for AdamW
+  # second moments to settle.
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
