@@ -52,6 +52,14 @@ recipe_args:
   max_grad_norm: 1.0
 
 optimizer:
+  # LR is calibrated against the SpecForge-style weighted loss
+  # ``Σ_{i=0..ttt_steps-1} 0.8^i * step_loss_i`` (unnormalized) with
+  # ``ttt_steps=4`` -- effective weight sum ~= 2.95. If you change
+  # ``ttt_steps`` or the decay constant in
+  # ``components/speculative/eagle/core.py``, rescale this LR by the
+  # inverse ratio of the new vs. old weight sum to keep the per-batch
+  # update magnitude comparable. ``max_grad_norm: 1.0`` clips outliers
+  # but does not normalize away the scale change.
   lr: 2.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.0

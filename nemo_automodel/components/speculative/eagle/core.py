@@ -120,6 +120,14 @@ class Eagle3TrainerModule(nn.Module):
         # NOT renormalized; matching SpecForge keeps the gradient magnitude
         # comparable across implementations at the same learning rate.
         # Reference: SpecForge ``scripts/train_eagle3.py::run_backward_and_update``.
+        #
+        # LR tuning note: the effective per-batch gradient magnitude is
+        # proportional to ``Σ_{i=0..ttt_steps-1} 0.8^i`` (~2.95 at the
+        # default ``ttt_steps=4``). If you change this schedule -- either
+        # the decay constant, the number of TTT steps, or by reintroducing
+        # an average over steps -- scale the optimizer LR by the inverse
+        # ratio of the new vs. old weight sum to keep updates comparable.
+        # ``clip_grad_norm`` is the safety net, not the LR scheduler.
         for step_idx in range(self.ttt_steps):
             cur_hidden_states = self.draft_model(
                 input_ids=cur_input_ids,
