@@ -73,17 +73,24 @@ class ExpertParallel(ParallelStyle):
         )
 
 
-def _iter_moe_blocks(model: nn.Module, _model: nn.Module):
+def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
     """Yield decoder blocks that may contain MoE sublayers.
 
-    Covers the main backbone (``_model.layers``) plus an optional MTP
-    auxiliary head (``model.mtp.layers``) when present. MTP sublayers are
-    not registered under ``_model.layers`` but carry the same MoE structure
-    and must receive the same EP / FSDP treatment so their state-dict
-    round-trips cleanly.
+    Covers the main backbone (``backbone.layers``) plus an optional MTP
+    auxiliary head (``model_wrapper.mtp.layers``) when present. MTP sublayers
+    are not registered under ``backbone.layers`` but carry the same MoE
+    structure and must receive the same EP / FSDP treatment so their
+    state-dict round-trips cleanly.
+
+    Args:
+        model_wrapper: Outer model (e.g. ``NemotronHForCausalLM``) — the
+            attribute that may carry the MTP head.
+        backbone: Inner backbone (``model_wrapper.model``, possibly text-only
+            after VLM unwrapping) whose ``.layers`` holds the main decoder
+            stack.
     """
-    yield from _model.layers.children()
-    mtp_module = getattr(model, "mtp", None)
+    yield from backbone.layers.children()
+    mtp_module = getattr(model_wrapper, "mtp", None)
     if mtp_module is not None and hasattr(mtp_module, "layers"):
         yield from mtp_module.layers.children()
 
