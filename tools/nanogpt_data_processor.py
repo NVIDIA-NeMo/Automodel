@@ -191,6 +191,8 @@ def make_parser():
 
 
 class BinaryDataWriter:
+    """Write tokenized samples and BOS offsets to binary dataset files."""
+
     def __init__(self, filename, bos_token_id, vocab_size):
         """
         Initialize the binary data writer.

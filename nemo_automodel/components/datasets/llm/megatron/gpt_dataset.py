@@ -38,6 +38,8 @@ _PAD_TOKEN_ID = -100
 
 
 class Split(Enum):
+    """Dataset split identifiers used by Megatron GPT datasets."""
+
     train = 0
     valid = 1
     test = 2
