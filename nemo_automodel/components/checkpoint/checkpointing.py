@@ -202,10 +202,19 @@ class CheckpointingConfig:
         """
         Convert a raw string such as "safetensors" into the right Enum.
         """
+
+        if self.save_consolidated and is_cloud_path(self.checkpoint_dir):
+            raise ValueError(
+                f"Safetensors format (save_consolidated=True) is not compatible with "
+                f"remote cloud storage paths ('{self.checkpoint_dir}'). "
+                f"To use cloud storage with MSC, set save_consolidated=False to use "
+                f"DCP format instead."
+            )
+
         formats = [v.value for v in SerializationFormat]
-        assert self.model_save_format in formats, (
-            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
-        )
+        if self.model_save_format not in formats:
+            raise ValueError(f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}")
+
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
         if self.save_consolidated or False:
             if not self.v4_compatible:
