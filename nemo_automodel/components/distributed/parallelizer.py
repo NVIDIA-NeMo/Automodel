@@ -476,27 +476,12 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
     """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
 
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
-        original_fn = globals().get("apply_fsdp2_sharding_recursively")
-        assert original_fn is not None, "apply_fsdp2_sharding_recursively not found in module globals"
+        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
-        def _fsdp_by_dtype(module, mesh, mp_policy, offload_policy=None, *args, **kwargs):
-            if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-                items = module.items() if isinstance(module, nn.ModuleDict) else enumerate(module)
-                for _, child in items:
-                    if isinstance(child, (nn.ModuleList, nn.ModuleDict)):
-                        _fsdp_by_dtype(child, mesh, mp_policy, offload_policy)
-                    else:
-                        parallelizer_utils.fully_shard_by_dtype(
-                            child,
-                            mesh,
-                            mp_policy,
-                            offload_policy,
-                        )
-            else:
-                for _, sub in module.named_children():
-                    _fsdp_by_dtype(sub, mesh, mp_policy, offload_policy)
+        original_fully_shard = globals().get("fully_shard")
+        assert original_fully_shard is not None, "fully_shard not found in module globals"
 
-        globals()["apply_fsdp2_sharding_recursively"] = _fsdp_by_dtype
+        globals()["fully_shard"] = fully_shard_deepseek_v4
         try:
             result = super().parallelize(
                 model,
@@ -505,7 +490,7 @@ class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
                 **kwargs,
             )
         finally:
-            globals()["apply_fsdp2_sharding_recursively"] = original_fn
+            globals()["fully_shard"] = original_fully_shard
 
         return result
 

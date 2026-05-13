@@ -283,6 +283,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.moe.experts",
         "nemo_automodel.components.distributed.pipelining",
         "nemo_automodel.components.distributed.pipelining.hf_utils",
+        "nemo_automodel.components.distributed.mesh_utils",
     ]:
         if mod in sys.modules:
             sys.modules.pop(mod)
@@ -304,6 +305,10 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining", pipelining_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.hf_utils", hf_utils_stub)
+
+    mesh_utils_stub = types.ModuleType("nemo_automodel.components.distributed.mesh_utils")
+    mesh_utils_stub.get_submesh = lambda mesh, axis_names: mesh[axis_names]
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.mesh_utils", mesh_utils_stub)
 
     # Stub dtype_from_str utility
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
@@ -878,6 +883,35 @@ def test_apply_fsdp_without_lm_head_precision_uses_default_policy(monkeypatch):
 
     # Should only have one MixedPrecisionPolicy call (the default one)
     assert mp_policy_mock.call_count == 1
+
+
+def test_apply_fsdp_uses_dsv4_wrapper_only_for_deepseek_v4(monkeypatch):
+    """DeepSeek-V4 gets its model-specific dtype wrapper without changing generic MoE FSDP."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    dsv4_fsdp_stub = types.ModuleType("nemo_automodel.components.models.deepseek_v4.fsdp")
+    dsv4_fully_shard_mock = MagicMock()
+    dsv4_fsdp_stub.fully_shard_deepseek_v4 = dsv4_fully_shard_mock
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.models.deepseek_v4.fsdp", dsv4_fsdp_stub)
+
+    block = DummyBlock(mlp=DummyMoE())
+    model = DummyModel([block])
+    model.config = types.SimpleNamespace(model_type="deepseek_v4")
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        lm_head_precision=None,
+    )
+
+    assert _find_call_by_first_arg(dsv4_fully_shard_mock, block) is not None
+    assert _find_call_by_first_arg(fully_shard_mock, block) is None
 
 
 def test_parallelize_model_passes_lm_head_precision_to_apply_fsdp(monkeypatch):

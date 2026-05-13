@@ -53,7 +53,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
@@ -143,7 +143,7 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         # --- Attention site: collapse → norm → attn → expand ---
-        pre, post, comb = self.attn_hc.compute_weights(x)
+        pre, post, comb = self.attn_hc(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         attn_out, _ = self.self_attn(
             hidden_states=self.input_layernorm(collapsed),
@@ -157,7 +157,7 @@ class DeepseekV4Block(nn.Module):
         x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
         # --- MLP site: same pattern ---
-        pre, post, comb = self.ffn_hc.compute_weights(x)
+        pre, post, comb = self.ffn_hc(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
@@ -609,6 +609,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
+        # After FSDP2 wrapping, parameter dtypes must already be correct from
+        # construction-time metadata. A blanket ``model.to(bf16)`` would
+        # downcast fp32 DTensors before checkpoint load can fill them.
+        if _has_dtensor_params(self):
+            return
         cast_model_to_dtype(self, dtype)
 
 

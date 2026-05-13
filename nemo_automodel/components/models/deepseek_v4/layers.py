@@ -524,9 +524,9 @@ class DeepseekV4Indexer(nn.Module):
         self.index_topk = config.index_topk
         self.softmax_scale = self.head_dim**-0.5
         proj_dim = 2 * self.head_dim  # overlap mode
-        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.ape = nn.Parameter(torch.zeros(self.compress_ratio, proj_dim))
+        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.ape = nn.Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
@@ -597,9 +597,9 @@ class DeepseekV4Compressor(nn.Module):
         self.overlap = compress_ratio == 4
         coff = 2 if self.overlap else 1
         proj_dim = coff * head_dim
-        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim))
+        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
 
@@ -709,9 +709,9 @@ class DeepseekV4HyperConnection(nn.Module):
         self.hc_eps = hc_eps
         self.norm_eps = rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
-        self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size))
-        self.base = nn.Parameter(torch.empty(mix))
-        self.scale = nn.Parameter(torch.empty(3))
+        self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size, dtype=torch.float32))
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
@@ -749,6 +749,9 @@ class DeepseekV4HyperConnection(nn.Module):
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
         return pre, post, comb
 
+    def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.compute_weights(hidden_streams)
+
 
 class DeepseekV4HyperHead(nn.Module):
     """Final HC-stream collapse before the shared RMSNorm + ``lm_head``.
@@ -764,9 +767,9 @@ class DeepseekV4HyperHead(nn.Module):
         self.hc_mult = hc_mult
         self.norm_eps = rms_norm_eps
         self.eps = hc_eps
-        self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * hidden_size))
-        self.hc_base = nn.Parameter(torch.empty(self.hc_mult))
-        self.hc_scale = nn.Parameter(torch.empty(1))
+        self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * hidden_size, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.flatten(2).float()
@@ -826,7 +829,7 @@ class DeepseekV4Attention(nn.Module):
             config.o_groups,
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks = nn.Parameter(torch.zeros(self.num_heads))
+        self.sinks = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
         self.compressor = (
             DeepseekV4Compressor(config, self.compress_ratio, self.head_dim) if self.compress_ratio else None

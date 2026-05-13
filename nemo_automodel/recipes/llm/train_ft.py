@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -334,6 +335,15 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
     for part in getattr(model, "parts", [model]):
         trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        has_dtensor_params = any(isinstance(param, DTensor) for param in trainable_params)
+        has_tensor_params = any(not isinstance(param, DTensor) for param in trainable_params)
+        if has_dtensor_params and has_tensor_params and getattr(cfg_opt, "foreach", None) is not False:
+            # Adam's foreach kernels cannot take regular Tensor and DTensor
+            # values in the same multi-tensor op. This can happen when FSDP
+            # intentionally ignores a few replicated parameters while most
+            # parameters are sharded.
+            cfg_opt.foreach = False
+            logging.info("Disabling optimizer foreach because trainable params include both Tensor and DTensor")
         # TODO(@akoumparouli): no branching for building the optimizer, refactor.
         if has_dion_optimizer:
             tmp_optimizer = build_dion_optimizer(
