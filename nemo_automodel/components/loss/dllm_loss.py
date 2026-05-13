@@ -167,17 +167,18 @@ class DFlashDecayLoss(nn.Module):
             :class:`DLLMLossOutput`.
         """
         token_nll = _compute_per_token_nll(logits, target_ids)  # [B, T]
-        B, T = token_nll.shape
+        del logits
+        _, T = token_nll.shape
 
         if block_size is not None:
             # Multi-block: replicate per-block decay so weights reset at each boundary.
             T_per = block_size - 1
             n_blocks = T // T_per if T_per > 0 else 1
-            w_single = torch.exp(-torch.arange(T_per, device=logits.device, dtype=token_nll.dtype) / self.loss_gamma)
+            w_single = torch.exp(-torch.arange(T_per, device=token_nll.device, dtype=token_nll.dtype) / self.loss_gamma)
             w = w_single.repeat(n_blocks)
         else:
             # Single-block or legacy: monotone decay over the full T.
-            w = torch.exp(-torch.arange(T, device=logits.device, dtype=token_nll.dtype) / self.loss_gamma)
+            w = torch.exp(-torch.arange(T, device=token_nll.device, dtype=token_nll.dtype) / self.loss_gamma)
 
         weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
 
