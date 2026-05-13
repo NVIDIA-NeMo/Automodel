@@ -15,10 +15,10 @@
 import torch
 from transformers import LlamaConfig
 
+from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_token_mapping
+from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule, _compute_target_distribution
-from nemo_automodel.components.speculative.eagle.data import build_eagle3_token_mapping
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
-from nemo_automodel.components.speculative.eagle.loss import masked_soft_cross_entropy
 from nemo_automodel.components.speculative.eagle.target import _shift_left_with_zero
 
 

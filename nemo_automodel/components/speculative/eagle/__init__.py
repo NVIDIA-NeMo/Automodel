@@ -12,22 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EAGLE-3 training components."""
+"""EAGLE-3 training components.
+
+Only the EAGLE-3-native model and trainer classes live here. Generic
+helpers were moved to the project's canonical locations:
+
+- ``masked_soft_cross_entropy`` -> ``nemo_automodel.components.loss.soft_ce``
+- ``build_eagle3_dataloader`` / ``build_eagle3_token_mapping``
+  -> ``nemo_automodel.components.datasets.llm.eagle3``
+
+Import them directly from those modules.
+"""
 
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
-from nemo_automodel.components.speculative.eagle.data import (
-    build_eagle3_dataloader,
-    build_eagle3_token_mapping,
-)
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
-from nemo_automodel.components.speculative.eagle.loss import masked_soft_cross_entropy
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
 
 __all__ = [
-    "build_eagle3_dataloader",
-    "build_eagle3_token_mapping",
     "Eagle3TrainerModule",
     "HFEagle3TargetModel",
     "LlamaEagle3DraftModel",
-    "masked_soft_cross_entropy",
 ]

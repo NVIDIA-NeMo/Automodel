@@ -31,12 +31,14 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.datasets.llm.eagle3 import (
+    build_eagle3_dataloader,
+    build_eagle3_token_mapping,
+)
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
     LlamaEagle3DraftModel,
-    build_eagle3_dataloader,
-    build_eagle3_token_mapping,
 )
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
