@@ -105,19 +105,17 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         psld = dllm_cfg.get("pad_seq_len_divisible", None)
         self.dllm_pad_seq_len_divisible = int(psld) if psld is not None else None
 
-        # Resolve mask_token_id
+        # Resolve mask_token_id — may stay None if the strategy's setup_extra() will set it.
         self.mask_token_id = dllm_cfg.get("mask_token_id", None)
         if self.mask_token_id is None:
-            # Try to get from tokenizer
             if (
                 self.tokenizer is not None
                 and hasattr(self.tokenizer, "mask_token_id")
                 and self.tokenizer.mask_token_id is not None
             ):
                 self.mask_token_id = self.tokenizer.mask_token_id
-            else:
-                raise ValueError("dllm.mask_token_id must be set in config, or the tokenizer must have a mask_token_id")
-        self.mask_token_id = int(self.mask_token_id)
+        if self.mask_token_id is not None:
+            self.mask_token_id = int(self.mask_token_id)
 
         # --- Build dLLM loss function via strategy ---
         self.dllm_loss_fn = self.dllm_strategy.create_loss_fn(dllm_cfg)
@@ -134,6 +132,15 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Buffers for dLLM-specific metrics
         self._dllm_loss_buffer = []
+
+        # --- Strategy post-setup hook (e.g. loads frozen target for DFlash) ---
+        self.dllm_strategy.setup_extra(self)
+        if self.mask_token_id is None:
+            raise ValueError(
+                "dllm.mask_token_id must be set in config, resolved by the tokenizer, "
+                "or set by strategy.setup_extra()."
+            )
+        self.mask_token_id = int(self.mask_token_id)
 
     def _wrap_dataloader_collate(self):
         """Replace dataloader collate functions with the dLLM single-pass collater.
@@ -285,22 +292,14 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         Follows the parent pattern but uses loss_mask from the collate wrapper
         instead of labels != -100 for token counting.
         """
-        # Pre-corrupt all microbatches so we can count noise tokens globally
-        # before any forward pass.
-        num_noise_tokens = 0  # diffusion loss denominator (corrupted positions)
-        num_supervised_tokens = 0  # total supervised tokens (all loss_mask==1 positions)
-
-        for batch in batches:
-            noisy_input_ids, noise_mask, p_mask = self._apply_corruption(batch["input_ids"], batch["loss_mask"])
-            batch["_noisy_input_ids"] = noisy_input_ids
-            batch["_noise_mask"] = noise_mask
-            batch["_p_mask"] = p_mask
-            batch["_clean_input_ids"] = batch["input_ids"].clone()
-            num_noise_tokens += noise_mask.sum().item()
-            num_supervised_tokens += batch["loss_mask"].sum().item()
-
-        num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens, dtype=torch.long)).item()
-        num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens, dtype=torch.long)).item()
+        # Pre-process all microbatches (corruption for MDLM, target forwards for DFlash).
+        num_noise_tokens_raw, num_supervised_tokens_raw = self.dllm_strategy.pre_step(self, batches)
+        num_noise_tokens = self._dp_allreduce(
+            torch.tensor(num_noise_tokens_raw, dtype=torch.long)
+        ).item()
+        num_supervised_tokens = self._dp_allreduce(
+            torch.tensor(num_supervised_tokens_raw, dtype=torch.long)
+        ).item()
 
         # Select denominator based on strategy (MDLM -> supervised, future models may use noise)
         if self.dllm_strategy.normalization_mode == "noise":
@@ -321,7 +320,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
+            self.dllm_strategy.forward_backward(
+                self,
                 i,
                 batch,
                 loss_buffer=loss_buffer,
@@ -406,7 +406,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             metrics={
                 "loss": total_loss,
                 "Loss/Train_Total": total_loss,
-                "Loss/Train_DLLM": dllm_loss,
+                self.dllm_strategy.loss_log_key: dllm_loss,
                 "grad_norm": grad_norm,
                 "Train/grad_norm": grad_norm,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
@@ -438,22 +438,19 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             use_noise = self.dllm_strategy.normalization_mode == "noise"
 
             for batch in val_dataloader:
-                # Pre-corrupt this val batch (same as training path)
-                input_ids = batch["input_ids"]
-                loss_mask = batch["loss_mask"]
-                noisy_input_ids, noise_mask, p_mask = self._apply_corruption(input_ids, loss_mask)
-                batch["_noisy_input_ids"] = noisy_input_ids
-                batch["_noise_mask"] = noise_mask
-                batch["_p_mask"] = p_mask
-                batch["_clean_input_ids"] = input_ids.clone()
-
-                # Count tokens for this batch (all-reduce across DP for this batch)
-                num_noise = self._dp_allreduce(torch.tensor(noise_mask.sum().item(), dtype=torch.long)).item()
-                num_supervised = self._dp_allreduce(torch.tensor(loss_mask.sum().item(), dtype=torch.long)).item()
+                # Pre-process this val batch via the strategy (mirrors training pre_step).
+                num_noise_raw, num_supervised_raw = self.dllm_strategy.pre_step(self, [batch])
+                num_noise = self._dp_allreduce(
+                    torch.tensor(num_noise_raw, dtype=torch.long)
+                ).item()
+                num_supervised = self._dp_allreduce(
+                    torch.tensor(num_supervised_raw, dtype=torch.long)
+                ).item()
                 num_norm = num_noise if use_noise else num_supervised
 
                 loss_buffer = []
-                self._forward_backward_step(
+                self.dllm_strategy.forward_backward(
+                    self,
                     0,
                     batch,
                     loss_buffer=loss_buffer,
@@ -511,7 +508,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["Loss/Train_Total"],
-                log_data.metrics["Loss/Train_DLLM"],
+                log_data.metrics[self.dllm_strategy.loss_log_key],
                 log_data.metrics["Train/grad_norm"],
                 log_data.metrics["Train/lr"],
                 log_data.metrics["Train/mem"],

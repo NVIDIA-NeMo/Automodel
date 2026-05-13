@@ -16,7 +16,6 @@ import importlib
 
 _LAZY_ATTRS = {
     "DiffusionLMSFTRecipe": (".train_ft", "DiffusionLMSFTRecipe"),
-    "DFlashSFTRecipe": (".train_dflash", "DFlashSFTRecipe"),
 }
 
 __all__ = list(_LAZY_ATTRS)
