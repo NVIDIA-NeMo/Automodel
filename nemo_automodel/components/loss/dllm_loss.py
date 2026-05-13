@@ -173,9 +173,7 @@ class DFlashDecayLoss(nn.Module):
             # Multi-block: replicate per-block decay so weights reset at each boundary.
             T_per = block_size - 1
             n_blocks = T // T_per if T_per > 0 else 1
-            w_single = torch.exp(
-                -torch.arange(T_per, device=logits.device, dtype=token_nll.dtype) / self.loss_gamma
-            )
+            w_single = torch.exp(-torch.arange(T_per, device=logits.device, dtype=token_nll.dtype) / self.loss_gamma)
             w = w_single.repeat(n_blocks)
         else:
             # Single-block or legacy: monotone decay over the full T.
