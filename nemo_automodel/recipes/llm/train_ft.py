@@ -525,7 +525,11 @@ def build_dataloader(
 
         # Apply packing if configured
         if packed_sequence_size > 0:
-            logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
+            if not getattr(ds, "is_pre_packed", False):
+                logger.info(f"Packing dataset with size: {packed_sequence_size}")
+            else:
+                logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
+
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
 
