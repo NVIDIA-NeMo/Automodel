@@ -147,7 +147,7 @@ class DeepseekV4MTPBlock(nn.Module):
         position_embeddings = self._rotary_emb(embed_input, position_ids)
         position_embeddings_compress = self._rotary_emb_compress(embed_input, position_ids)
 
-        pre, post, comb = self.attn_hc.compute_weights(hidden_states)
+        pre, post, comb = self.attn_hc(hidden_states)
         collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
         attn_out, _ = self.self_attn(
             hidden_states=self.input_layernorm(collapsed),
@@ -162,7 +162,7 @@ class DeepseekV4MTPBlock(nn.Module):
             comb.transpose(-1, -2).to(dtype), hidden_states
         )
 
-        pre, post, comb = self.ffn_hc.compute_weights(hidden_states)
+        pre, post, comb = self.ffn_hc(hidden_states)
         collapsed = (pre.unsqueeze(-1) * hidden_states).sum(dim=2).to(hidden_states.dtype)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         hidden_states = post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(
