@@ -131,7 +131,7 @@ dflash:
 
 ## Fine-Tune the Model
 
-### LLaDA2
+### Fine-Tune LLaDA2
 
 ```bash
 torchrun --nproc-per-node=8 \
