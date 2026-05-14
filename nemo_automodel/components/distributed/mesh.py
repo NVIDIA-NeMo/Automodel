@@ -223,15 +223,16 @@ class MeshContext:
 
 
 def _derive_moe_mesh(device_mesh: "DeviceMesh") -> "Optional[DeviceMesh]":
-    """Derive the MoE EP mesh from device_mesh when EP dims are present."""
+    """Derive the MoE EP mesh from device_mesh when EP dims are present and EP size > 1."""
     if device_mesh is None:
         return None
     root = device_mesh._get_root_mesh() if hasattr(device_mesh, "_get_root_mesh") else device_mesh
     fm = getattr(root, "_flatten_mapping", {})
     if MeshAxisName.EP in fm:
-        return fm[MeshAxisName.EP]
+        mesh = fm[MeshAxisName.EP]
+        return mesh if mesh.size() > 1 else None
     if MeshAxisName.EP in getattr(device_mesh, "mesh_dim_names", ()):
-        return device_mesh
+        return device_mesh if device_mesh[MeshAxisName.EP].size() > 1 else None
     return None
 
 
