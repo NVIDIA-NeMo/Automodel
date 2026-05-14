@@ -139,7 +139,7 @@ torchrun --nproc-per-node=8 \
     -c examples/dllm_sft/llada2_sft.yaml
 ```
 
-### DFlash
+### Fine-Tune with DFlash
 
 ```bash
 torchrun --nproc-per-node=8 \
