@@ -1,0 +1,84 @@
+seed: 42
+
+wandb:
+  project: flux2-finetuning
+  mode: online
+  name: flux2_finetune_run
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  mode: "finetune"
+  cache_dir: null
+  attention_backend: "flash"
+
+optim:
+  learning_rate: 1e-5
+  optimizer:
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 500
+  min_lr: 0.0
+
+# Adjust dp_size to the total number of GPUs
+fsdp:
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false
+  cpu_offload: false
+
+flow_matching:
+  adapter_type: "flux2"
+  adapter_kwargs:
+    guidance_scale: 3.5
+    use_guidance_embeds: true
+  # DreamBooth default: weighting_scheme="none" = uniform u, no loss weighting.
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  # shift=3.0 matches FlowMatchEulerDiscreteScheduler shift for FLUX.2-dev.
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.0
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  cfg_dropout_prob: 0.0
+  i2v_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 1000
+  local_batch_size: 1
+  global_batch_size: 4
+  ckpt_every_steps: 500
+  log_every: 10
+  # max_steps: null  # Set to limit training to a specific number of steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 2
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
+  restore_from: null

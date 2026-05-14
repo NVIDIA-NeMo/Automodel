@@ -1,0 +1,112 @@
+seed: 42
+
+wandb:
+  project: flux2-finetuning
+  mode: online
+  name: flux2_lora_run
+
+dist_env:
+  backend: "nccl"
+  init_method: "env://"
+
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.2-dev"
+  # Required when peft block is present — selects pre-inject hook and is
+  # passed to auto_diffusion_pipeline for model-specific setup.
+  model_type: "flux2"
+  mode: "finetune"
+  cache_dir: null
+  attention_backend: "flash"
+
+# ── LoRA / PEFT configuration ─────────────────────────────────────────────────
+# Defaults aligned with diffusers/examples/dreambooth/train_dreambooth_lora_flux2.py
+# Target modules cover both double-stream (transformer_blocks) and
+# single-stream (single_transformer_blocks) attention projections.
+# Run `for n, m in model.named_modules(): print(n)` to verify exact names.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 4
+  alpha: 4
+  dropout: 0.0
+  target_modules:
+    - "*.to_q"
+    - "*.to_k"
+    - "*.to_v"
+    - "*.to_out.0"
+    - "*.to_qkv_mlp_proj"
+    - "*.single_transformer_blocks.*.attn.to_out"
+
+optim:
+  learning_rate: 1e-4
+  optimizer:
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 500
+  min_lr: 0.0
+
+# FSDP2 with param_dtype=None when LoRA enabled:
+#   base weights (bf16): sharded, no grad comms
+#   LoRA weights (fp32): sharded, grad allreduced by FSDP2
+fsdp:
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  activation_checkpointing: false
+  cpu_offload: false
+
+flow_matching:
+  adapter_type: "flux2"
+  adapter_kwargs:
+    guidance_scale: 3.5
+    use_guidance_embeds: true
+  # DreamBooth default: weighting_scheme="none" = uniform u, no loss weighting.
+  # Alternative: timestep_sampling: "logit_normal" (SD3 paper recommendation for fine-tuning).
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  # shift=3.0 matches FlowMatchEulerDiscreteScheduler shift for FLUX.2-dev.
+  # Dynamic shifting applies at inference per resolution; training uses the base shift.
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.0
+  sigma_min: 0.0
+  sigma_max: 1.0
+  num_train_timesteps: 1000
+  # DreamBooth does not apply CFG dropout during training.
+  # Set > 0 only if you want unconditional guidance support.
+  cfg_dropout_prob: 0.0
+  i2v_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 100
+  summary_log_interval: 10
+
+step_scheduler:
+  num_epochs: 1000
+  local_batch_size: 1
+  global_batch_size: 4
+  ckpt_every_steps: 500
+  log_every: 10
+  # max_steps: null  # Set to limit training to a specific number of steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader
+    cache_dir: PATH_TO_YOUR_DATA
+    train_text_encoder: false
+    num_workers: 0
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  # LoRA saves adapter_model.safetensors + adapter_config.json
+  # (ignores model_save_format — PEFT format always used for LoRA)
+  model_save_format: torch_save
+  save_consolidated: false
+  restore_from: null
