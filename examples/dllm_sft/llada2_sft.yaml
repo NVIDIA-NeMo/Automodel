@@ -47,7 +47,7 @@ wandb:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: inclusionAI/LLaDA2.1-8B-Instruct
+  pretrained_model_name_or_path: inclusionAI/LLaDA2.1-mini
   torch_dtype: bfloat16
   trust_remote_code: true
 
@@ -74,11 +74,11 @@ distributed:
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-# LLaDA2 mask token ID (shared across all LLaDA2/LLaDA variants).
+# LLaDA2.1 mask token ID (<|mask|> in the Qwen-based tokenizer).
 # Set eps > 0 to ensure at least some corruption every step.
 dllm:
   mode: mdlm
-  mask_token_id: 126336
+  mask_token_id: 156895
   eps: 0.001
   supervise_padding: true
 
@@ -106,7 +106,7 @@ dataset:
   truncation: true
   unshifted: true
   tokenizer:
-    pretrained_model_name_or_path: inclusionAI/LLaDA2.1-8B-Instruct
+    pretrained_model_name_or_path: inclusionAI/LLaDA2.1-mini
     trust_remote_code: true
 
 dataloader:
