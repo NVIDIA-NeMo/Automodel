@@ -617,6 +617,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
                 # experts == "te"
@@ -625,6 +627,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
         else:
             # Default to torch experts

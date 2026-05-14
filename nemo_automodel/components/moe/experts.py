@@ -623,6 +623,8 @@ class GroupedExpertsDeepEP(nn.Module):
         backend: Optional["BackendConfig"] = None,
         dispatcher_backend: str = "deepep",
         dispatcher_num_sms: int = 20,
+        dispatcher_share_token_dispatcher: bool = True,
+        dispatcher_async_dispatch: bool = False,
     ):
         """
         Initializes the GroupedExperts module.
@@ -633,6 +635,8 @@ class GroupedExpertsDeepEP(nn.Module):
                 uses torch._grouped_mm; otherwise uses grouped_gemm.ops.gmm.
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
+            dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
+            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
         super().__init__()
 
@@ -642,6 +646,8 @@ class GroupedExpertsDeepEP(nn.Module):
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
+        self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
+        self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -673,6 +679,8 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
+            moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
+            moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
         )
 
         self.n_routed_experts = self.config.n_routed_experts
@@ -863,6 +871,8 @@ class GroupedExpertsTE(nn.Module):
         backend: Optional["BackendConfig"] = None,
         dispatcher_backend: str = "deepep",
         dispatcher_num_sms: int = 20,
+        dispatcher_share_token_dispatcher: bool = True,
+        dispatcher_async_dispatch: bool = False,
     ):
         """
         Initialize the GroupedExpertsTEGroupedLinear module.
@@ -872,6 +882,8 @@ class GroupedExpertsTE(nn.Module):
             backend: Backend configuration (reserved for future use).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
+            dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
+            dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
         from transformer_engine.pytorch import GroupedLinear
 
@@ -889,6 +901,8 @@ class GroupedExpertsTE(nn.Module):
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
+        self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
+        self.dispatcher_async_dispatch = dispatcher_async_dispatch
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1197,6 +1211,8 @@ class GroupedExpertsTE(nn.Module):
             moe_flex_dispatcher_backend=self.dispatcher_backend,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
+            moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
+            moe_deepep_async_dispatch=self.dispatcher_async_dispatch,
         )
 
         local_expert_indices_offset = self.ep_rank * self.num_local_experts

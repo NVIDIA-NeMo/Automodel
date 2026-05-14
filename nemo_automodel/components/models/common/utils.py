@@ -153,6 +153,10 @@ class BackendConfig:
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+        dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
+            manager instance across MoE layers.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
+            and allocate dispatched tensors on the communication stream.
         enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
@@ -180,6 +184,8 @@ class BackendConfig:
         else "torch"
     )
     dispatcher_num_sms: int = 20
+    dispatcher_share_token_dispatcher: bool = True
+    dispatcher_async_dispatch: bool = False
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
