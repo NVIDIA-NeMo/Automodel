@@ -546,7 +546,7 @@ class NemotronV3Block(nn.Module):
     Supports hybrid layer types: Mamba, Attention, MLP, MoE
     """
 
-    def __init__(self, config, layer_idx: int, moe_config=None, backend=None):
+    def __init__(self, config, layer_idx: int, moe_config=None, backend=None, block_type: str | None = None):
         """Initialize NemotronV3Block.
 
         Args:
@@ -554,6 +554,12 @@ class NemotronV3Block(nn.Module):
             layer_idx: Index of this layer in the model
             moe_config: MoE configuration (required for MoE layers)
             backend: Backend configuration (optional)
+            block_type: Optional override for the block type. When ``None``
+                (default) the type is read from
+                ``config.layers_block_type[layer_idx]``. Used by callers that
+                build extra blocks outside the main backbone's per-layer
+                pattern (e.g. MTP sublayers at indices past
+                ``num_hidden_layers``).
         """
         super().__init__()
         self.config = config
@@ -569,7 +575,7 @@ class NemotronV3Block(nn.Module):
 
         # Determine layer type from config
         # 'M' → mamba, '*' → attention, '-' → mlp, other → moe
-        self.block_type = config.layers_block_type[layer_idx]
+        self.block_type = block_type if block_type is not None else config.layers_block_type[layer_idx]
 
         # Create mixer based on block type
         if self.block_type == "mamba":

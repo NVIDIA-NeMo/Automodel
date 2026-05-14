@@ -21,6 +21,7 @@ on:
       - 'examples/**/*.yaml'
       - 'tests/ci_tests/utils/validate_nightly_recipes.py'
       - 'tests/ci_tests/utils/generate_ci_tests.py'
+      - 'tools/lint_example_yamls.py'
 
 jobs:
   validate-nightly-recipes:
@@ -42,7 +43,10 @@ jobs:
       - name: Install validator deps
         run: |
           uv venv .venv-validator
-          uv pip install --python .venv-validator/bin/python --quiet ruamel.yaml
+          uv pip install --python .venv-validator/bin/python --quiet pyyaml ruamel.yaml
+
+      - name: Lint example YAMLs
+        run: .venv-validator/bin/python tools/lint_example_yamls.py --automodel-dir .
 
       - name: Validate nightly recipe references
         run: .venv-validator/bin/python tests/ci_tests/utils/validate_nightly_recipes.py --automodel-dir .

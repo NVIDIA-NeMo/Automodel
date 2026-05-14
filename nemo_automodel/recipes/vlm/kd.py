@@ -56,7 +56,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.components.training.utils import count_tail_padding
+from nemo_automodel.components.training.utils import ScopedModuleOffloading, count_tail_padding
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, filter_forward_kwargs
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
 
@@ -142,6 +142,44 @@ def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=
     del student_tokenizer, teacher_tokenizer
 
 
+def _get_model_input_embedding_dim(model: torch.nn.Module) -> int | None:
+    """Return the model input embedding width when it can be inferred."""
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if callable(get_input_embeddings):
+        embeddings = get_input_embeddings()
+        if embeddings is not None:
+            embedding_dim = getattr(embeddings, "embedding_dim", None)
+            if embedding_dim is not None:
+                return int(embedding_dim)
+            weight = getattr(embeddings, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.ndim >= 2:
+                return int(weight.shape[-1])
+
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None)
+    for cfg in (text_config, config):
+        hidden_size = getattr(cfg, "hidden_size", None)
+        if hidden_size is not None:
+            return int(hidden_size)
+    return None
+
+
+def _validate_cp_pre_embed_teacher_compatibility(inputs_embeds: torch.Tensor, teacher_model: torch.nn.Module) -> None:
+    """Reject CP pre-embed when the teacher cannot consume the student's embedding width."""
+    teacher_hidden_size = _get_model_input_embedding_dim(teacher_model)
+    if teacher_hidden_size is None:
+        return
+
+    student_hidden_size = int(inputs_embeds.shape[-1])
+    if student_hidden_size != teacher_hidden_size:
+        raise ValueError(
+            "VLM KD with context parallelism pre-embeds multimodal inputs with the student model before CP "
+            "sharding, so teacher and student input embedding hidden sizes must match. "
+            f"Got student inputs_embeds hidden size {student_hidden_size} and teacher input embedding hidden "
+            f"size {teacher_hidden_size}."
+        )
+
+
 class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     """Fine-tune a student VLM via knowledge distillation from a teacher VLM."""
 
@@ -154,6 +192,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if self.pp_enabled:
             raise NotImplementedError("Pipeline parallelism is not supported for VLM knowledge distillation yet.")
 
+        self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
+        teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
+
         self.teacher_model = _build_teacher_model(
             cfg_teacher=self.cfg.get("teacher_model", None),
             cfg_freeze=self.cfg.get("teacher_freeze_config", None),
@@ -161,7 +202,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
-            device=self.dist_env.device,
+            device=teacher_device,
         )
 
         logger.info("Teacher Model: " + str(self.teacher_model))
@@ -206,6 +247,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
             with torch.no_grad():
                 prepared = _model(_pre_embed_only=True, **mm_kwargs)
+            if "inputs_embeds" in prepared:
+                _validate_cp_pre_embed_teacher_compatibility(prepared["inputs_embeds"], self.teacher_model)
             for k in VLM_INPUT_KEYS:
                 batch.pop(k, None)
             batch.update(prepared)
@@ -225,10 +268,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         with sync_ctx, train_ctx():
             # Teacher forward (no grad) — free intermediates immediately.
-            with torch.no_grad():
+            with (
+                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                torch.no_grad(),
+            ):
                 teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
                 teacher_out = self.teacher_model(**teacher_batch)
-                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
+                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
                 del teacher_out, teacher_batch
 
             # Student forward.

@@ -15,6 +15,7 @@
 from typing import Optional
 
 import torch
+import torch.distributed.nn.functional as dist_nn_func
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -74,17 +75,18 @@ def _kl_forward_tp(
 
     # --- Stable global log-softmax for student: log Q ---
     student_max, _ = torch.max(s_logits, dim=-1, keepdim=True)
+    student_max = student_max.detach()
     torch.distributed.all_reduce(student_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
     output_student = s_logits - student_max
     denom_student = torch.sum(torch.exp(output_student), dim=-1, keepdim=True)
-    torch.distributed.all_reduce(denom_student, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    denom_student = dist_nn_func.all_reduce(denom_student, op=torch.distributed.ReduceOp.SUM, group=tp_group)
     student_log_prob = output_student - torch.log(denom_student.clamp(min=1e-12))
 
     # --- Per-token sum(P * log Q): local accumulate then global reduce ---
     # Mask -inf student logits so that 0 * -inf does not produce NaN.
     inf_mask = torch.isinf(s_logits)
     ce_local = torch.masked_fill(teacher_prob * student_log_prob, inf_mask, 0.0).sum(dim=-1)
-    torch.distributed.all_reduce(ce_local, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    ce_local = dist_nn_func.all_reduce(ce_local, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
     return ce_local  # shape: [valid_tokens]
 
