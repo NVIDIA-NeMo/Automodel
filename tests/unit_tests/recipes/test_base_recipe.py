@@ -326,6 +326,25 @@ def test_load_checkpoint_auto_detect_restores_latest(tmp_path):
     assert torch.allclose(recipe_inst.model.weight, weight_after_step)
 
 
+def test_load_checkpoint_autodetect_failure_has_helpful_message(tmp_path, monkeypatch):
+    """Auto-resume failures should point users at checkpoint_dir reuse instead of surfacing only low-level errors."""
+    (tmp_path / "epoch_0_step_100").mkdir()
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    def fail_tracked_state(_ckpt_dir):
+        raise IndexError("tuple index out of range")
+
+    monkeypatch.setattr(recipe_inst, "_load_checkpoint_tracked_state", fail_tracked_state)
+
+    with pytest.raises(RuntimeError) as exc:
+        recipe_inst.load_checkpoint(restore_from=None)
+
+    msg = str(exc.value)
+    assert "Failed to load an auto-detected checkpoint" in msg
+    assert "use a different checkpoint.checkpoint_dir or remove the existing checkpoint" in msg
+    assert "To resume, make sure the current command matches the saved run." in msg
+
+
 def test_load_checkpoint_with_latest_keyword(tmp_path):
     """
     Test that restore_from='LATEST' loads the latest checkpoint.

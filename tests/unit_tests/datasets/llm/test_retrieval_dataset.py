@@ -387,6 +387,102 @@ def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch
     assert "C" in corpus_dict
 
 
+def test_parse_data_entry():
+    assert rd._parse_data_entry("/tmp/data.json") == (None, "/tmp/data.json")
+    assert rd._parse_data_entry([3, "/tmp/data.json"]) == (3, "/tmp/data.json")
+    assert rd._parse_data_entry((3, "/tmp/data.json")) == (3, "/tmp/data.json")
+
+    with pytest.raises(ValueError, match="num_samples must be non-negative"):
+        rd._parse_data_entry([-1, "/tmp/data.json"])
+    with pytest.raises(ValueError, match="num_samples must be an integer"):
+        rd._parse_data_entry(["3", "/tmp/data.json"])
+    with pytest.raises(ValueError, match="path must be a string"):
+        rd._parse_data_entry([3, 4])
+
+
+def test_load_datasets_samples_single_top_level_entry_once(tmp_path, monkeypatch):
+    corpus_dir = tmp_path / "corpus_sample_single"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "S"}))
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}, {"id": "n2", "text": "N2"}]
+        ),
+    )
+
+    train_file = _make_train_file(tmp_path, corpus_dir, data_len=5, corpus_id="S")
+
+    dataset_a, _ = rd.load_datasets([2, str(train_file)], seed=7)
+    dataset_b, _ = rd.load_datasets([2, str(train_file)], seed=7)
+    dataset_c, _ = rd.load_datasets([2, str(train_file)], seed=8)
+
+    assert len(dataset_a) == 2
+    assert dataset_a["question_id"] == dataset_b["question_id"]
+    assert dataset_a["question_id"] != dataset_c["question_id"]
+
+
+def test_make_retrieval_dataset_mixed_sampled_and_full_entries(tmp_path, monkeypatch):
+    corpus_dir = tmp_path / "corpus_mixed"
+    corpus_dir.mkdir()
+    (corpus_dir / "merlin_metadata.json").write_text(json.dumps({"class": "TextQADataset", "corpus_id": "M"}))
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [{"id": "p", "text": "P"}, {"id": "n1", "text": "N1"}, {"id": "n2", "text": "N2"}]
+        ),
+    )
+
+    sampled_file = tmp_path / "sampled.json"
+    sampled_file.write_text(
+        json.dumps(
+            {
+                "corpus": [{"path": str(corpus_dir)}],
+                "data": [
+                    {
+                        "question_id": f"s{i}",
+                        "question": f"S{i}",
+                        "corpus_id": "M",
+                        "pos_doc": [{"id": "p"}],
+                        "neg_doc": [{"id": "n1"}],
+                    }
+                    for i in range(5)
+                ],
+            }
+        )
+    )
+    full_file = tmp_path / "full.json"
+    full_file.write_text(
+        json.dumps(
+            {
+                "corpus": [{"path": str(corpus_dir)}],
+                "data": [
+                    {
+                        "question_id": f"f{i}",
+                        "question": f"F{i}",
+                        "corpus_id": "M",
+                        "pos_doc": [{"id": "p"}],
+                        "neg_doc": [{"id": "n2"}],
+                    }
+                    for i in range(3)
+                ],
+            }
+        )
+    )
+
+    ds = rd.make_retrieval_dataset(
+        data_dir_list=[[2, str(sampled_file)], str(full_file)],
+        data_type="train",
+        n_passages=2,
+        seed=123,
+    )
+
+    assert len(ds) == 5
+    assert len(ds[0]["doc_text"]) == 2
+
+
 def test_transform_func_positive_else_and_text_empty_branch():
     # Covers line 198 (positives not list) and 228 (text empty and no image)
     corpus = DummyCorpus({"p": {"text": "", "image": "", "nr_ocr": ""}, "n": {"text": "n", "image": "", "nr_ocr": ""}})
