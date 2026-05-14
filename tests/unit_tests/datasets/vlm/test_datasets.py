@@ -1325,19 +1325,25 @@ def _make_wav_bytes(sampling_rate=16000, duration_seconds=0.5, frequency_hz=440.
     return buf.getvalue()
 
 
-class _SyntheticHFRows(list):
-    """Minimal stand-in for a HuggingFace Dataset over our two-column fixture.
+def _SyntheticHFRows(rows):
+    """Build a real HF ``Dataset`` from a list of ``{audio: {bytes,path}, text}`` rows.
 
-    Supports ``column_names``, ``cast_column`` (no-op since we already shape the
-    cells like ``Audio(decode=False)`` would), and iteration.
+    The audio column is stored as a plain ``struct<bytes, path>`` (no ``Audio``
+    feature), because HF's ``Audio.encode_example`` requires ``torchcodec`` even
+    for ``decode=False`` and that is absent from this env. The builder's
+    downstream ``cast_column(audio, Audio(decode=False))`` is monkey-patched
+    away below; the storage layout already matches what the builder's lazy
+    ``with_transform`` callback consumes, so the cast is functionally a no-op.
     """
+    from datasets import Dataset as _Dataset
 
-    def __init__(self, rows):
-        super().__init__(rows)
-        self.column_names = sorted({k for row in rows for k in row.keys()})
-
-    def cast_column(self, column_name, _feature):
-        return self
+    columns = sorted({k for row in rows for k in row.keys()}) if rows else ["audio", "text"]
+    data = {col: [r.get(col) for r in rows] for col in columns}
+    dataset = _Dataset.from_dict(data)
+    # Replace cast_column on the produced instance so the builder's call
+    # ``cast_column(audio, Audio(decode=False))`` does not pull torchcodec.
+    dataset.cast_column = lambda column_name, _feature: dataset  # type: ignore[assignment]
+    return dataset
 
 
 def test_make_wenetspeech_wu_asr_dataset_bytes_branch(monkeypatch):
@@ -1397,12 +1403,17 @@ def test_make_wenetspeech_wu_asr_dataset_path_branch(monkeypatch, tmp_path):
 
 
 def test_make_wenetspeech_wu_asr_dataset_raises_when_audio_cell_empty(monkeypatch):
-    """Both ``bytes`` and ``path`` missing must raise a clear ValueError."""
+    """Both ``bytes`` and ``path`` missing must raise a clear ValueError.
+
+    With the lazy ``with_transform`` builder this fires at access time, not at
+    construction time — so the assertion is anchored on ``rows[0]``.
+    """
     fake_rows = _SyntheticHFRows([{"audio": {"bytes": None, "path": None}, "text": "x"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
+    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
     with pytest.raises(ValueError, match="neither 'bytes' nor 'path'"):
-        ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+        _ = rows[0]
 
 
 def test_make_wenetspeech_wu_asr_dataset_drops_empty_text(monkeypatch):
@@ -1522,3 +1533,41 @@ def test_make_wenetspeech_wu_asr_dataset_blank_prompts_drop(monkeypatch):
     assert [t["role"] for t in conv] == ["user", "assistant"]
     assert len(conv[0]["content"]) == 1
     assert conv[0]["content"][0]["type"] == "audio"
+
+
+def test_make_wenetspeech_wu_asr_dataset_is_lazy_no_decode_at_construction(monkeypatch):
+    """Builder must NOT call the audio decoder at construction time.
+
+    The decode helper is recorded on each call; constructing the dataset must
+    not trigger any decode. Only ``rows[0]`` (the lazy transform access) should.
+    """
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "text": "你好"},
+            {"audio": {"bytes": wav, "path": None}, "text": "侬好"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    decode_calls = []
+    original_decode = ds._decode_audio_cell_to_mono_float32
+
+    def _spy(audio_cell, target_sampling_rate):
+        decode_calls.append(target_sampling_rate)
+        return original_decode(audio_cell, target_sampling_rate)
+
+    monkeypatch.setattr(ds, "_decode_audio_cell_to_mono_float32", _spy)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    # Construction must not have decoded any audio.
+    assert decode_calls == [], f"decode ran at construction time: {len(decode_calls)} calls"
+    # Length is O(1) (Arrow row count); does not iterate.
+    assert len(rows) == 2
+    assert decode_calls == []
+    # First __getitem__ triggers exactly one decode.
+    _ = rows[0]
+    assert len(decode_calls) == 1
+    # Second __getitem__ triggers one more (no caching at this layer).
+    _ = rows[1]
+    assert len(decode_calls) == 2

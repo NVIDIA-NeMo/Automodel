@@ -253,6 +253,30 @@ def _decode_audio_cell_to_mono_float32(audio_cell, target_sampling_rate):
     return waveform, target_sampling_rate
 
 
+def _build_asr_conversation(
+    waveform,
+    transcript,
+    *,
+    system_prompt,
+    user_prompt,
+    has_system,
+    has_user_text,
+):
+    """Assemble the Qwen3-Omni ASR chat-template conversation for one sample."""
+    conversation = []
+    if has_system:
+        conversation.append({"role": "system", "content": system_prompt})
+
+    user_content = []
+    if has_user_text:
+        user_content.append({"type": "text", "text": user_prompt})
+    user_content.append({"type": "audio", "audio": waveform})
+    conversation.append({"role": "user", "content": user_content})
+
+    conversation.append({"role": "assistant", "content": [{"type": "text", "text": transcript}]})
+    return conversation
+
+
 def make_wenetspeech_wu_asr_dataset(
     path_or_dataset,
     split="train",
@@ -264,46 +288,59 @@ def make_wenetspeech_wu_asr_dataset(
     drop_empty_text=True,
     **load_kwargs,
 ):
-    """Load and preprocess ``yuekai/WenetSpeech_Wu_1k`` for Qwen3-Omni ASR fine-tuning.
+    """Load and lazy-preprocess ``yuekai/WenetSpeech_Wu_1k`` for Qwen3-Omni ASR fine-tuning.
 
-    Decodes audio via ``soundfile`` (no ``torchcodec`` dependency) by casting the
-    audio column to ``Audio(decode=False)`` and then handling the ``bytes`` /
-    ``path`` branches explicitly. The resulting samples follow the Qwen3-Omni
-    chat-template schema expected by :func:`qwen3_omni_asr_collate_fn`:
+    Returns a HuggingFace ``Dataset`` whose ``__getitem__`` produces a single
+    ``{"conversation": [...]}`` dict suitable for
+    :func:`qwen3_omni_asr_collate_fn`. **No audio is decoded at construction
+    time** — both the soundfile decode (mono mix + ``float32`` cast + optional
+    ``scipy.signal.resample_poly``) and the conversation assembly run inside a
+    HuggingFace ``with_transform`` callback, so the only fixed startup cost is
+    the Arrow-level metadata read of the parquet shards (and the on-demand
+    download of those shards if they are not already in the HF cache).
+    Empty-transcript filtering happens via ``dataset.filter`` against the text
+    column only — also Arrow-level — so audio bytes are never materialized at
+    startup.
 
-    - If both ``system_prompt`` and ``user_prompt`` are provided, the conversation
-      is ``system -> user(text + audio) -> assistant(transcript)``.
-    - If only ``system_prompt`` is set, the conversation is the legacy
-      ``system -> user(audio) -> assistant(transcript)`` shape.
-    - If only ``user_prompt`` is set (``system_prompt=None``), the conversation is
-      ``user(text + audio) -> assistant(transcript)`` with NO system turn.
-    - If both are ``None`` / empty, the conversation is the minimal
-      ``user(audio) -> assistant(transcript)`` shape.
+    The conversation shape follows the prompt-presence matrix:
+
+    - both ``system_prompt`` and ``user_prompt`` set →
+      ``system → user(text+audio) → assistant``
+    - only ``system_prompt`` set → ``system → user(audio) → assistant``  (legacy default)
+    - only ``user_prompt`` set (``system_prompt=None``) →
+      ``user(text+audio) → assistant``  (no system turn)
+    - neither set → ``user(audio) → assistant``
+
+    Whitespace-only prompts are treated as absent.
 
     Args:
-        path_or_dataset: HuggingFace dataset id or local path. May reference the
-            gated ``yuekai/WenetSpeech_Wu_1k`` (requires ``huggingface-cli login``)
+        path_or_dataset: HuggingFace dataset id or local path. May reference
+            the gated ``yuekai/WenetSpeech_Wu_1k`` (requires ``hf auth login``)
             or a local mirror.
         split: Dataset split to load.
-        sampling_rate: Target sampling rate in Hz. Audio is resampled if the
-            source rate differs.
-        system_prompt: Instruction placed in a ``system`` turn. Pass ``None`` or
-            an empty string to skip the system turn entirely.
+        sampling_rate: Target sampling rate in Hz. Audio is resampled inside
+            the lazy transform if the source rate differs.
+        system_prompt: Instruction placed in a ``system`` turn. Pass ``None``
+            or an empty/whitespace string to skip the system turn entirely.
         user_prompt: Instruction prepended to the audio inside the user turn.
             Pass ``None`` to emit a user turn with only the audio item.
         audio_column: Name of the audio column in the source dataset.
         text_column: Name of the transcript column in the source dataset.
-        drop_empty_text: If True, samples whose transcript is empty or whitespace
-            are skipped. If False, an empty transcript raises ``ValueError``.
+        drop_empty_text: If True, samples whose transcript is empty or
+            whitespace are dropped via ``dataset.filter`` (Arrow-level, no
+            audio decode). If False, an empty transcript triggers a
+            ``ValueError`` inside the transform at access time.
         **load_kwargs: Forwarded to ``datasets.load_dataset``.
 
     Returns:
-        List of dicts with a ``conversation`` key suitable for
-        :func:`qwen3_omni_asr_collate_fn`.
+        A HuggingFace ``Dataset`` whose elements are
+        ``{"conversation": <chat-template list>}`` and whose audio is decoded
+        on demand via dataloader workers.
 
     Raises:
-        ValueError: When an audio cell has neither ``bytes`` nor ``path``, or
-            when ``drop_empty_text=False`` and a transcript is empty.
+        ValueError: When ``audio_column`` or ``text_column`` is missing, when
+            an audio cell has neither ``bytes`` nor ``path``, or when
+            ``drop_empty_text=False`` and a transcript is empty.
     """
     dataset = load_dataset(path_or_dataset, split=split, **load_kwargs)
 
@@ -318,34 +355,42 @@ def make_wenetspeech_wu_asr_dataset(
 
     dataset = dataset.cast_column(audio_column, Audio(decode=False))
 
-    has_system = bool(system_prompt) and (not isinstance(system_prompt, str) or system_prompt.strip())
-    has_user_text = bool(user_prompt) and (not isinstance(user_prompt, str) or user_prompt.strip())
+    if drop_empty_text:
+        # Arrow-level filter on the text column only; no audio decode runs.
+        dataset = dataset.filter(
+            lambda batch: [bool(t) and bool(t.strip()) for t in batch[text_column]],
+            batched=True,
+        )
 
-    formatted = []
-    for example in dataset:
-        transcript = example.get(text_column)
-        if transcript is None or (isinstance(transcript, str) and not transcript.strip()):
-            if drop_empty_text:
-                continue
-            raise ValueError(f"empty transcript in {text_column!r}; refusing to emit zero-label sample")
+    has_system = isinstance(system_prompt, str) and bool(system_prompt.strip())
+    has_user_text = isinstance(user_prompt, str) and bool(user_prompt.strip())
 
-        waveform, _ = _decode_audio_cell_to_mono_float32(example[audio_column], sampling_rate)
+    def _format(batch):
+        # ``with_transform`` always passes a column-batched dict
+        # ({col: [v1, v2, ...]}) regardless of whether the caller did
+        # ``ds[i]`` or ``ds[i:j]``; HF unwraps the single-row case afterwards.
+        audio_cells = batch[audio_column]
+        transcripts = batch[text_column]
+        conversations = []
+        for audio_cell, transcript in zip(audio_cells, transcripts):
+            if not isinstance(transcript, str) or not transcript.strip():
+                raise ValueError(
+                    f"empty transcript in {text_column!r}; refusing to emit zero-label sample"
+                )
+            waveform, _ = _decode_audio_cell_to_mono_float32(audio_cell, sampling_rate)
+            conversations.append(
+                _build_asr_conversation(
+                    waveform,
+                    transcript,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    has_system=has_system,
+                    has_user_text=has_user_text,
+                )
+            )
+        return {"conversation": conversations}
 
-        conversation = []
-        if has_system:
-            conversation.append({"role": "system", "content": system_prompt})
-
-        user_content = []
-        if has_user_text:
-            user_content.append({"type": "text", "text": user_prompt})
-        user_content.append({"type": "audio", "audio": waveform})
-        conversation.append({"role": "user", "content": user_content})
-
-        conversation.append({"role": "assistant", "content": [{"type": "text", "text": transcript}]})
-
-        formatted.append({"conversation": conversation})
-
-    return formatted
+    return dataset.with_transform(_format)
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
