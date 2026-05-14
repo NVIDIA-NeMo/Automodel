@@ -25,11 +25,11 @@ from nemo_automodel.components.models.common.utils import set_is_first_microbatc
 
 # Regex pattern to match expert parameters in GroupedExpertsTE.
 # Matches FQNs like:
-# - model.layers.X.mlp.experts.gate_up_linear.weight0
+# - model.layers.X.mlp.experts.gate_up_linear.weight
 # - model.layers.X.mlp.experts.gate_up_linear.bias0
-# - model.layers.X.mlp.experts.down_linear.weight0
+# - model.layers.X.mlp.experts.down_linear.weight
 # - model.layers.X.mlp.experts.down_linear.bias0
-_TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
+_TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias\d+)$")
 
 
 @torch.no_grad()

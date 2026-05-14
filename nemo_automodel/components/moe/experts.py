@@ -858,6 +858,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
+            single_grouped_parameter=True,
         )
         # down_linear: [moe_inter_dim] -> [dim]
         self.down_linear = GroupedLinear(
@@ -867,6 +868,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",
+            single_grouped_parameter=True,
         )
 
         self.expert_activation = get_expert_activation_for_deepep(config)
@@ -883,14 +885,18 @@ class GroupedExpertsTE(nn.Module):
         self.moe_mesh = None
         self.ep_rank = 0
 
+    def _get_grouped_weight_param(self, linear: "GroupedLinear") -> Optional[torch.Tensor]:
+        weight = getattr(linear, "weight", None)
+        if weight is None:
+            return None
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        return weight
+
     def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
-        weights = []
-        for i in range(linear.num_gemms):
-            w = getattr(linear, f"weight{i}")
-            if isinstance(w, DTensor):
-                w = w.to_local()
-            weights.append(w)
-        stacked = torch.stack(weights, dim=0)  # [num_experts, out, in]
+        grouped_weight = self._get_grouped_weight_param(linear)
+        assert grouped_weight is not None, "GroupedLinear must expose a grouped weight parameter"
+        stacked = grouped_weight
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, in, out]
         return stacked
@@ -909,11 +915,9 @@ class GroupedExpertsTE(nn.Module):
     def _set_stacked_weight(self, linear: "GroupedLinear", stacked: torch.Tensor, transpose: bool = False):
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, out, in]
-        for i in range(linear.num_gemms):
-            weight_param = getattr(linear, f"weight{i}")
-            if isinstance(weight_param, DTensor):
-                weight_param = weight_param.to_local()
-            weight_param.data.copy_(stacked[i])
+        grouped_weight = self._get_grouped_weight_param(linear)
+        assert grouped_weight is not None, "GroupedLinear must expose a grouped weight parameter"
+        grouped_weight.data.copy_(stacked)
 
     def _set_stacked_bias(self, linear: "GroupedLinear", stacked: torch.Tensor):
         if not linear.use_bias or stacked is None:
@@ -1008,7 +1012,7 @@ class GroupedExpertsTE(nn.Module):
         """
         Return state dict with stacked tensors in DeepEP format.
 
-        Converts TE GroupedLinear's weight{i} parameters to stacked format:
+        Converts TE GroupedLinear's grouped weight parameter to stacked format:
         - gate_and_up_projs: [num_local_experts, dim, moe_inter_dim * 2]
         - down_projs: [num_local_experts, moe_inter_dim, dim]
 
@@ -1054,7 +1058,7 @@ class GroupedExpertsTE(nn.Module):
         """
         Load state dict with stacked tensors in DeepEP format.
 
-        Converts stacked format to TE GroupedLinear's weight{i} parameters:
+        Converts stacked format to TE GroupedLinear's grouped weight parameter:
         - gate_and_up_projs: [num_local_experts, dim, moe_inter_dim * 2]
         - down_projs: [num_local_experts, moe_inter_dim, dim]
         """
@@ -1133,6 +1137,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",
+            single_grouped_parameter=True,
         )
 
         # down_linear: [moe_inter_dim] -> [dim]
@@ -1143,6 +1148,7 @@ class GroupedExpertsTE(nn.Module):
             bias=self.expert_bias,
             params_dtype=self.config.dtype,
             device="meta",
+            single_grouped_parameter=True,
         )
 
         token_dispatcher_config = TokenDispatcherConfig(
@@ -1232,9 +1238,13 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
+            grouped_weight = self._get_grouped_weight_param(self.gate_up_linear)
+            assert grouped_weight is not None, "GroupedLinear must expose a grouped weight parameter"
+            output1 = torch.matmul(x[0] * 0, to_local(grouped_weight[0]).T)
             output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+            grouped_weight = self._get_grouped_weight_param(self.down_linear)
+            assert grouped_weight is not None, "GroupedLinear must expose a grouped weight parameter"
+            output2 = torch.matmul(output1_, to_local(grouped_weight[0]).T)
 
         if fp8_active and actual_m_splits is not None:
             output2 = self.fp8_unpadding(output2, actual_m_splits)
