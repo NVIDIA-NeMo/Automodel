@@ -157,6 +157,10 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
             and allocate dispatched tensors on the communication stream.
+        disable_shared_expert_overlap: When True, run shared experts sequentially on the
+            current CUDA stream instead of overlapping them on a side stream with the
+            grouped-expert dispatch. Useful as an escape hatch when the side-stream
+            overlap interacts poorly with the dispatcher backend.
         enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
@@ -186,6 +190,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    disable_shared_expert_overlap: bool = False
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):

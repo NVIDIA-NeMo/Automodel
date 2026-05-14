@@ -240,6 +240,16 @@ class TestBackendConfigHybridEP:
         config = BackendConfig(dispatcher="deepep", dispatcher_async_dispatch=True)
         assert config.dispatcher_async_dispatch is True
 
+    def test_disable_shared_expert_overlap_default(self):
+        """Test that disable_shared_expert_overlap defaults to False."""
+        config = BackendConfig()
+        assert config.disable_shared_expert_overlap is False
+
+    def test_disable_shared_expert_overlap_custom(self):
+        """Test that disable_shared_expert_overlap accepts an explicit value."""
+        config = BackendConfig(disable_shared_expert_overlap=True)
+        assert config.disable_shared_expert_overlap is True
+
     def test_te_experts_falls_back_with_hybridep(self):
         """Test that te experts with hybridep dispatcher is valid (no fallback)."""
         config = BackendConfig(experts="te", dispatcher="hybridep")
