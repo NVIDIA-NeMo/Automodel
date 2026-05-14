@@ -151,7 +151,7 @@ torchrun --nproc-per-node=8 \
 
 The generation script ([`generate.py`](../../../examples/dllm_generate/generate.py)) supports chat, raw, and infilling modes for LLaDA checkpoints.
 
-### LLaDA Generation
+### Generate with LLaDA
 
 ```bash
 python examples/dllm_generate/generate.py \
