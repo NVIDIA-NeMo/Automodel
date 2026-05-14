@@ -419,7 +419,7 @@ def _load_hf_sources(hf_uris: List[str]):
     return Dataset.from_list(hf_data), corpus_dict
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0):
     """
     Transform function to convert from raw format to training format.
 
@@ -428,6 +428,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         num_neg_docs: Number of negative documents to use
         corpus_dict: Dictionary mapping corpus_id to corpus objects
         use_dataset_instruction: Whether to use instruction from dataset's metadata
+        epoch: Current epoch for cycling through positive documents
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -447,10 +448,10 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
-        # Get one positive doc (take first one)
+        # Get one positive doc (cycle through positives based on epoch)
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
-            cur_pos_neg_doc.append(positives[0])
+            cur_pos_neg_doc.append(positives[epoch % len(positives)])
         else:
             cur_pos_neg_doc.append(positives)
 
@@ -526,42 +527,58 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     return result
 
 
-def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def _cross_encoder_transform_func(
+    examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0
+):
     """
     Transform function to convert from raw format to cross-encoder training format.
     """
     from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
-    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
+    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction, epoch=epoch)
     return flatten_bi_encoder_to_cross_encoder(data)
 
 
-def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Create transform function with specified number of negative documents."""
+class RetrievalTransform:
+    """Stateful transform for retrieval datasets with epoch-based positive cycling.
 
-    def transform(examples):
+    This class encapsulates the transform state (epoch, corpus_dict, etc.) and
+    provides a clean interface for updating the epoch without recreating the transform.
+    """
+
+    def __init__(
+        self,
+        num_neg_docs: int,
+        corpus_dict: dict,
+        use_dataset_instruction: bool = False,
+        model_type: str = "bi_encoder",
+    ):
+        self.num_neg_docs = num_neg_docs
+        self.corpus_dict = corpus_dict
+        self.use_dataset_instruction = use_dataset_instruction
+        self.model_type = model_type
+        self.epoch = 0
+
+    def __call__(self, examples):
+        if self.model_type == "cross_encoder":
+            return _cross_encoder_transform_func(
+                examples,
+                num_neg_docs=self.num_neg_docs,
+                corpus_dict=self.corpus_dict,
+                use_dataset_instruction=self.use_dataset_instruction,
+                epoch=self.epoch,
+            )
         return _transform_func(
             examples,
-            num_neg_docs=num_neg_docs,
-            corpus_dict=corpus_dict,
-            use_dataset_instruction=use_dataset_instruction,
+            num_neg_docs=self.num_neg_docs,
+            corpus_dict=self.corpus_dict,
+            use_dataset_instruction=self.use_dataset_instruction,
+            epoch=self.epoch,
         )
 
-    return transform
-
-
-def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Create cross-encoder transform function with specified number of negative documents."""
-
-    def transform(examples):
-        return _cross_encoder_transform_func(
-            examples,
-            num_neg_docs=num_neg_docs,
-            corpus_dict=corpus_dict,
-            use_dataset_instruction=use_dataset_instruction,
-        )
-
-    return transform
+    def set_epoch(self, epoch: int):
+        """Update the epoch for positive document cycling."""
+        self.epoch = epoch
 
 
 def make_retrieval_dataset(
@@ -649,11 +666,6 @@ def make_retrieval_dataset(
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
-    if model_type == "cross_encoder":
-        transform_factory = _create_cross_encoder_transform_func
-    else:
-        transform_factory = _create_transform_func
-
     if data_type == "train":
         if max_train_samples is not None:
             if do_shuffle:
@@ -663,12 +675,15 @@ def make_retrieval_dataset(
             )
 
         negative_size = n_passages - 1
-        dataset.set_transform(transform_factory(negative_size, corpus_dict, use_dataset_instruction))
+        transform = RetrievalTransform(negative_size, corpus_dict, use_dataset_instruction, model_type)
+        dataset.set_transform(transform)
+        dataset.set_epoch = transform.set_epoch
 
     elif data_type == "eval":
         if eval_negative_size is None:
             eval_negative_size = n_passages - 1
-        dataset.set_transform(transform_factory(eval_negative_size, corpus_dict, use_dataset_instruction))
+        transform = RetrievalTransform(eval_negative_size, corpus_dict, use_dataset_instruction, model_type)
+        dataset.set_transform(transform)
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")
