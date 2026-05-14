@@ -1,6 +1,6 @@
 # EXAONE
 
-[EXAONE](https://www.lgresearch.ai/exaone) is a bilingual (Korean-English) language model series from LG AI Research, with strong performance on Korean-language benchmarks.
+EXAONE is a bilingual (Korean-English) language model series from LG AI Research, with strong performance on Korean-language benchmarks.
 
 :::{card}
 | | |
