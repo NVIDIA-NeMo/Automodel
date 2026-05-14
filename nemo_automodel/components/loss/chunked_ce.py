@@ -41,6 +41,8 @@ def compute_cross_entropy(
 
 
 class ChunkedCrossEntropy(nn.Module):
+    """Cross-entropy loss computed over sequence chunks."""
+
     def __init__(self, chunk_len: int = 32, compile: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """
         Chunked cross-entropy loss.

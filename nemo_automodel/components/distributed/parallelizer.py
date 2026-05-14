@@ -102,7 +102,7 @@ try:
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
     HAVE_MEGATRON_FSDP = True
-except:
+except ImportError:
     pass
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
@@ -154,9 +154,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_fsdp2_prefetch: bool = True,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
+        fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
         tp_mesh = device_mesh[tp_mesh_name]
+        if fully_shard_fn is None:
+            fully_shard_fn = fully_shard
 
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
         # if dp_replicate_size > 1, use HSDP, else use FSDP
@@ -298,12 +301,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
+            fully_shard_fn=fully_shard_fn,
         )
 
         # Apply FSDP to the root model
         # Do not reshard after forward for root model because its parameters
         # will be used in backward immediately
-        model = fully_shard(
+        model = fully_shard_fn(
             model,
             mesh=dp_mesh,
             mp_policy=mp_policy,
@@ -472,6 +476,21 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         return result
 
 
+class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
+    """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
+
+    def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
+        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+
+        return super().parallelize(
+            model,
+            device_mesh,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            fully_shard_fn=fully_shard_deepseek_v4,
+            **kwargs,
+        )
+
+
 class WanParallelizationStrategy(ParallelizationStrategy):
     """Parallelization strategy for Wan-style transformer modules used in Diffusers.
 
@@ -617,6 +636,7 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
+    "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
@@ -736,6 +756,7 @@ def apply_fsdp2_sharding_recursively(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    fully_shard_fn=None,
 ) -> None:
     """
     Recursively apply FSDP2 sharding to modules, with optimizations for ModuleList.
@@ -762,6 +783,9 @@ def apply_fsdp2_sharding_recursively(
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
     """
+    if fully_shard_fn is None:
+        fully_shard_fn = fully_shard
+
     pp_enabled = "pp" in mesh.mesh_dim_names and mesh["pp"].size() > 1
 
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
@@ -788,6 +812,7 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                fully_shard_fn=fully_shard_fn,
             )
 
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
@@ -797,7 +822,7 @@ def apply_fsdp2_sharding_recursively(
                 reshard_after_forward = False
             else:
                 reshard_after_forward = enum_id < len(flat_layer_items) - 1
-            fully_shard(
+            fully_shard_fn(
                 child_module,
                 mesh=mesh,
                 mp_policy=mp_policy,
@@ -834,6 +859,7 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                fully_shard_fn=fully_shard_fn,
             )
 
 
@@ -1101,6 +1127,7 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
 
 
 def validate_tp_mesh_for_nemotron_nas(model, tp_size):
+    """Validate that a Nemotron-NAS model can be tensor-parallel sharded."""
     num_attention_heads = model.config.num_attention_heads
     assert num_attention_heads % tp_size == 0, "num_attention_heads in config does not match the TP size"
 

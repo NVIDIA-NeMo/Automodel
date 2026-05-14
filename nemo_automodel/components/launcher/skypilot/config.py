@@ -22,6 +22,8 @@ SUPPORTED_CLOUDS = ("aws", "gcp", "azure", "lambda", "kubernetes")
 
 @dataclass
 class SkyPilotConfig:
+    """Configuration for launching AutoModel jobs with SkyPilot."""
+
     # Required: cloud provider
     cloud: str = field(metadata=dict(help=f"Cloud provider. One of: {SUPPORTED_CLOUDS}"))
 
