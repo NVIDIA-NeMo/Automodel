@@ -390,6 +390,19 @@ class TestDFlashSampleAnchorBlocks:
             noise_slice = boi[:, b * s.block_size + 1 : (b + 1) * s.block_size]
             assert (noise_slice == MASK_ID).all()
 
+    def test_loss_mask_zeros_block_mask(self):
+        """block_mask must be zero wherever loss_mask is zero."""
+        torch.manual_seed(7)
+        B, L, bs = 2, 64, 8
+        s = _make_strategy(block_size=bs)
+        recipe = _make_recipe()
+        input_ids = torch.randint(0, 100, (B, L))
+        attn = torch.ones(B, L, dtype=torch.long)
+        # Zero the entire loss_mask — every predicted position should be masked out.
+        loss_mask = torch.zeros(B, L, dtype=torch.long)
+        _, _, _, bm = s._sample_anchor_block(recipe, input_ids, attn, loss_mask=loss_mask)
+        assert bm.sum().item() == 0
+
 
 class TestDFlashBuildBlockAttentionMask:
     """Tests for _build_block_attention_mask (CPU, static method)."""

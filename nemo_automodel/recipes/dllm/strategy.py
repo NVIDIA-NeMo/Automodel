@@ -323,7 +323,11 @@ class DFlashStrategy(DLLMStrategy):
     # ------------------------------------------------------------------
 
     def _sample_anchor_block(
-        self, recipe, input_ids: torch.Tensor, attention_mask: torch.Tensor
+        self,
+        recipe,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = input_ids.size(0)
         device = input_ids.device
@@ -334,7 +338,8 @@ class DFlashStrategy(DLLMStrategy):
         block_output_ids = input_ids.new_full((B, self.block_size), recipe.mask_token_id)
         block_output_ids[:, 0] = input_ids[:, start]
         block_targets = input_ids[:, start + 1 : start + self.block_size]
-        block_mask = attention_mask[:, start + 1 : start + self.block_size].float()
+        effective_mask = attention_mask if loss_mask is None else attention_mask * loss_mask
+        block_mask = effective_mask[:, start + 1 : start + self.block_size].float()
         return start, block_output_ids, block_targets, block_mask
 
     @torch.no_grad()
@@ -354,6 +359,7 @@ class DFlashStrategy(DLLMStrategy):
         input_ids: torch.Tensor,
         attn: torch.Tensor,
         num_blocks: int,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample N non-overlapping anchor blocks and return concatenated tensors.
 
@@ -378,20 +384,21 @@ class DFlashStrategy(DLLMStrategy):
         # avail = number of "slack" positions for the starts transformation.
         avail = valid_len - n * self.block_size
         if n == 1 or avail < 1:
-            start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn)
+            start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn, loss_mask)
             return [start], boi, bt, bm
 
         perm = torch.randperm(avail, device=device)[:n].sort().values  # [n], values in [0, avail)
         starts = (perm + torch.arange(n, device=device) * self.block_size + 1).tolist()
         starts = [int(s) for s in starts]
 
+        effective = attn if loss_mask is None else attn * loss_mask
         boi_list, bt_list, bm_list = [], [], []
         for start in starts:
             boi = input_ids.new_full((B, self.block_size), recipe.mask_token_id)
             boi[:, 0] = input_ids[:, start]
             boi_list.append(boi)
             bt_list.append(input_ids[:, start + 1 : start + self.block_size])
-            bm_list.append(attn[:, start + 1 : start + self.block_size].float())
+            bm_list.append(effective[:, start + 1 : start + self.block_size].float())
 
         return (
             starts,
@@ -436,15 +443,20 @@ class DFlashStrategy(DLLMStrategy):
         for batch in batches:
             input_ids = batch["input_ids"].to(device)
             attn = batch.get("attention_mask", torch.ones_like(input_ids)).to(device)
+            loss_mask = batch.get("loss_mask")
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(device)
             if self.num_blocks_per_sample > 1:
                 starts, block_output_ids, block_targets, block_mask = self._sample_anchor_blocks(
-                    recipe, input_ids, attn, self.num_blocks_per_sample
+                    recipe, input_ids, attn, self.num_blocks_per_sample, loss_mask
                 )
                 ctx_len = starts[-1]
                 target_hidden = self._run_target_forward(input_ids, attn, ctx_len)
                 batch["_dflash_starts"] = starts
             else:
-                start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(recipe, input_ids, attn)
+                start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(
+                    recipe, input_ids, attn, loss_mask
+                )
                 target_hidden = self._run_target_forward(input_ids, attn, start)
                 batch["_dflash_start"] = start
             # Offload to CPU so draft backward has the full VRAM budget.
