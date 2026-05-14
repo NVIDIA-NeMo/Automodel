@@ -54,6 +54,8 @@ DEFAULT_PROMPTS = [
 
 
 def main():
+    """Extract NeMo AutoModel activations for comparison."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Training YAML config")
     parser.add_argument("--output-file", required=True, help="Path to save activations (.pt)")

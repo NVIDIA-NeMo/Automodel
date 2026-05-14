@@ -848,7 +848,74 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     return loss_fn(**loss_fn_kwargs)
 
 
+def calculate_mtp_loss(
+    loss_fn,
+    *,
+    mtp_per_depth_h: list[torch.Tensor],
+    labels: torch.Tensor,
+    model: nn.Module,
+    scaling_factor: float = 0.1,
+    num_label_tokens: Optional[int] = None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
+
+    Each depth's CE is dispatched through :func:`calculate_loss` with the
+    same loss class as the main path, so MTP inherits FusedLinearCrossEntropy
+    / MaskedCrossEntropy memory and numerical characteristics.
+
+    Args:
+        loss_fn: Configured per-token loss class (same instance the main
+            path uses).
+        mtp_per_depth_h: Per-depth hidden states from the model's MTP head,
+            one ``[B, S, H]`` tensor per depth.
+        labels: Original (unshifted) labels.
+        model: The wrapped model; used to fetch the shared LM head when the
+            loss class needs materialized logits (non-FusedLinearCE path).
+        scaling_factor: Coefficient applied to the summed per-depth CE.
+        num_label_tokens: Total non-ignore label tokens (forwarded to the
+            base loss for sum-reduction normalization).
+        ignore_index: Label value masked out of the CE loss for the trailing
+            ``k+1`` rolled positions at depth ``k``.
+
+    Returns:
+        Scalar MTP loss with autograd graph.
+    """
+    from nemo_automodel.components.models.common.mtp import roll_tensor
+
+    D = len(mtp_per_depth_h)
+    cur_labels = labels
+    total = mtp_per_depth_h[0].new_zeros(())
+    for k, h_k in enumerate(mtp_per_depth_h):
+        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
+        masked = cur_labels.clone()
+        n_invalid = min(k + 1, masked.shape[-1])
+        masked[..., -n_invalid:] = ignore_index
+
+        if isinstance(loss_fn, FusedLinearCrossEntropy):
+            depth_loss = calculate_loss(
+                loss_fn,
+                hidden_states=h_k,
+                labels=masked,
+                model=model,
+                num_label_tokens=num_label_tokens,
+            )
+        else:
+            depth_loss = calculate_loss(
+                loss_fn,
+                logits=model.get_output_embeddings()(h_k),
+                labels=masked,
+                model=model,
+                num_label_tokens=num_label_tokens,
+            )
+        total = total + depth_loss
+
+    return total * (scaling_factor / D)
+
+
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
+    """Build validation dataloaders from validation dataset config entries."""
+
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
         if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
@@ -1421,6 +1488,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                if mtp_per_depth_h is not None:
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=out.mtp_loss_scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                    )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
