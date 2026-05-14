@@ -90,7 +90,7 @@ dataset:
 | Field | Description |
 |-------|-------------|
 | `dllm.mode` | Training strategy (`mdlm` or `dflash`) |
-| `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA/LLaDA2) |
+| `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1) |
 | `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples |
 | `dataset.unshifted` | Must be `true` for dLLM — disables the autoregressive input/target shift |
 
