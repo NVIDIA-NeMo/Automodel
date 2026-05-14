@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import warnings
 from contextlib import nullcontext
 from functools import partial
@@ -668,9 +667,7 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
-        # Env-var escape hatch resolved once at construction time so the hot
-        # forward path doesn't pay a per-step ``os.environ.get`` cost.
-        self._disable_shared_expert_overlap = os.environ.get("NEMO_MOE_DISABLE_SHARED_EXPERT_OVERLAP") == "1"
+        self._disable_shared_expert_overlap = backend.disable_shared_expert_overlap
 
     def forward(
         self,
