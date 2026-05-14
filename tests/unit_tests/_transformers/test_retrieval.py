@@ -19,7 +19,7 @@ import json
 import pytest
 import torch
 import torch.nn as nn
-from transformers import AutoModel, Mistral3Config
+from transformers import AutoModel, Mistral3Config, Qwen2Config, Qwen2Model
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
@@ -66,6 +66,20 @@ def _save_tiny_vlm(tmp_path, text_model_type: str):
     return model_dir, language_state_dict
 
 
+def _tiny_qwen2_config() -> Qwen2Config:
+    """Build a tiny unsupported decoder-only config for generic backbone tests."""
+    return Qwen2Config(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+    )
+
+
 def _assert_state_dict_equal(expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]) -> None:
     assert set(expected) == set(actual)
     for key, tensor in expected.items():
@@ -98,6 +112,42 @@ def test_extract_submodel_unsupported_embedding_from_local_vlm(tmp_path):
     backbone.save_pretrained(save_dir)
     saved_config = json.loads((save_dir / "config.json").read_text())
     assert saved_config["model_type"] == "mistral"
+
+
+def test_generic_embedding_backbone_persists_noncausal_config_and_is_bidirectional(tmp_path):
+    """Generic HF embedding backbones persist non-causal config and run bidirectionally."""
+    from nemo_automodel._transformers import retrieval
+
+    torch.manual_seed(1234)
+    model_dir = tmp_path / "qwen2"
+    Qwen2Model(_tiny_qwen2_config()).eval().save_pretrained(model_dir)
+
+    encoder = retrieval.BiEncoderModel.build(
+        model_name_or_path=str(model_dir),
+        pooling="avg",
+        l2_normalize=False,
+        is_causal=False,
+        attn_implementation="eager",
+    )
+
+    assert "qwen2" not in retrieval.SUPPORTED_BACKBONES
+    assert encoder.model.config.is_causal is False
+    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in encoder.model.layers)
+
+    input_ids = torch.tensor([[1, 2, 3, 0]])
+    modified_input_ids = torch.tensor([[1, 2, 5, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+    encoder.model.eval()
+    with torch.no_grad():
+        base_outputs = encoder.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        modified_outputs = encoder.model(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
+
+    assert not torch.allclose(base_outputs[:, 0], modified_outputs[:, 0], atol=1e-7, rtol=1e-7)
+
+    save_dir = tmp_path / "saved_qwen2_encoder"
+    encoder.save_pretrained(str(save_dir))
+    saved_config = json.loads((save_dir / "config.json").read_text())
+    assert saved_config["is_causal"] is False
 
 
 def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
