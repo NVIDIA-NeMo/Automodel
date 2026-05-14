@@ -320,8 +320,6 @@ omit = [
     "nemo_automodel/components/datasets/llm/delta_lake_dataset.py",
     # Weird file suddenly appearing in coverage
     "_remote_module_non_scriptable",
-    # deleted file; may still appear in coverage data from cache
-    "nemo_automodel/_transformers/retrieval.py",
 ]
 
 [tool.ruff]
@@ -346,6 +344,7 @@ select = [
     "E741", # ambiguous variable name
     "F821", # undefined name
     "E266", # too many leading '#' for block comment
+    "E722", # do not use bare except
     "I",    # isort
     "D101", # docstring
     "D103",
@@ -355,8 +354,6 @@ select = [
 
 ignore = [
     "E501", # Line too long - handled by formatter
-    "D101",
-    "D103",
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -370,6 +367,40 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
+# Baseline existing public APIs that still need docstrings. New files and files
+# not listed here fail D101/D103 normally.
+"nemo_automodel/components/models/baichuan/configuration.py" = ["D101"]
+"nemo_automodel/components/models/baichuan/model.py" = ["D101"]
+"nemo_automodel/components/models/deepseek_v3/layers.py" = ["D101"]
+"nemo_automodel/components/models/deepseek_v3/model.py" = ["D101"]
+"nemo_automodel/components/models/deepseek_v3/rope_utils.py" = ["D103"]
+"nemo_automodel/components/models/deepseek_v3/state_dict_adapter.py" = ["D101", "D103"]
+"nemo_automodel/components/models/deepseek_v32/config.py" = ["D101"]
+"nemo_automodel/components/models/deepseek_v4/model.py" = ["D101"]
+"nemo_automodel/components/models/gemma4_moe/model.py" = ["D101"]
+"nemo_automodel/components/models/glm4_moe/model.py" = ["D101"]
+"nemo_automodel/components/models/glm4_moe_lite/model.py" = ["D101"]
+"nemo_automodel/components/models/glm_moe_dsa/model.py" = ["D101"]
+"nemo_automodel/components/models/gpt_oss/layers.py" = ["D101"]
+"nemo_automodel/components/models/gpt_oss/model.py" = ["D101"]
+"nemo_automodel/components/models/gpt_oss/rope_utils.py" = ["D101", "D103"]
+"nemo_automodel/components/models/gpt_oss/state_dict_adapter.py" = ["D101"]
+"nemo_automodel/components/models/hy_v3/model.py" = ["D101"]
+"nemo_automodel/components/models/kimivl/model.py" = ["D101"]
+"nemo_automodel/components/models/llama_bidirectional/export_onnx.py" = ["D103"]
+"nemo_automodel/components/models/llava_onevision/rice_vit.py" = ["D101", "D103"]
+"nemo_automodel/components/models/llava_onevision/state_dict_adapter.py" = ["D101"]
+"nemo_automodel/components/models/minimax_m2/model.py" = ["D101"]
+"nemo_automodel/components/models/minimax_m2/state_dict_adapter.py" = ["D103"]
+"nemo_automodel/components/models/mistral3/model.py" = ["D101", "D103"]
+"nemo_automodel/components/models/mistral4/configuration.py" = ["D101"]
+"nemo_automodel/components/models/mistral4/model.py" = ["D101"]
+"nemo_automodel/components/models/qwen3_moe/model.py" = ["D101"]
+"nemo_automodel/components/models/qwen3_next/layers.py" = ["D101"]
+"nemo_automodel/components/models/qwen3_next/model.py" = ["D101"]
+"nemo_automodel/components/models/qwen3_vl_moe/model.py" = ["D101"]
+"nemo_automodel/recipes/retrieval/train_bi_encoder.py" = ["D103"]
+"nemo_automodel/recipes/retrieval/train_cross_encoder.py" = ["D101", "D103"]
 
 
 [tool.ruff.lint.isort]

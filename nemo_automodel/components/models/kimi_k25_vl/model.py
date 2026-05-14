@@ -418,9 +418,10 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 def tpool_patch_merger(
-    x: torch.Tensor, grid_thws: torch.Tensor, merge_kernel_size: List[int] = [2, 2]
+    x: torch.Tensor, grid_thws: torch.Tensor, merge_kernel_size: List[int] | None = None
 ) -> List[torch.Tensor]:
     """Merge patches with temporal pooling."""
+    merge_kernel_size = [2, 2] if merge_kernel_size is None else merge_kernel_size
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0
@@ -884,6 +885,10 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
     main_input_name = "pixel_values"
     _no_split_modules = ["MoonViT3dEncoderLayer"]
     supports_gradient_checkpointing = True
+
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
 
     @classmethod
     def from_config(cls, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):

@@ -1410,6 +1410,179 @@ def test_kimi_k25_vl_collate_fn_truncation_drops_image_data(collate_mod, monkeyp
     assert (batch["input_ids"] == MEDIA_TOKEN_ID).sum().item() == 0
 
 
+def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_text_only_mix(
+    collate_mod, monkeypatch
+):
+    """Mixed batch (text-only + image): n_images_per_sample length must equal batch_size.
+
+    Regression: previously image_counts was derived from all_grid_thws only, so
+    text-only samples were skipped and the resulting tensor was shorter than
+    batch_size. VLM PP media prep indexes cumsum_images by sample index and
+    would IndexError out of bounds.
+    """
+    MEDIA_TOKEN_ID = 163605
+
+    class MixedProcessor:
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, *, text, return_tensors, medias=None, **kwargs):
+            if medias:
+                input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4]])
+                attention_mask = torch.ones_like(input_ids)
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "grid_thws": torch.tensor([[1, 4, 4]]),
+                    "pixel_values": torch.randn(1, 3, 14, 14),
+                }
+            input_ids = torch.tensor([[10, 11, 12, 13, 14]])
+            attention_mask = torch.ones_like(input_ids)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    processor = MixedProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    text_only = [
+        {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+    ]
+    with_image = [
+        {"role": "user", "content": [{"type": "image", "image": "x.jpg"}, {"type": "text", "text": "What?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Cat."}]},
+    ]
+    examples = [{"conversation": text_only}, {"conversation": with_image}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor)
+
+    assert "n_images_per_sample" in batch
+    assert batch["n_images_per_sample"].shape == (2,), (
+        f"n_images_per_sample length must equal batch_size=2, "
+        f"got shape {batch['n_images_per_sample'].shape}"
+    )
+    # text-only sample → 0; image sample → 1
+    assert batch["n_images_per_sample"].tolist() == [0, 1]
+
+
+def test_wrap_vlm_collate_for_pp_prepares_media_chunks():
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, wrap_vlm_collate_for_pp
+
+    image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
+    patch_counts = image_grid_thw.prod(dim=1)
+    pixel_values = torch.arange(int(patch_counts.sum()) * 4, dtype=torch.float32).reshape(-1, 4)
+
+    def collate_fn(_examples):
+        return {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "labels": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "pixel_values": pixel_values.clone(),
+            "image_grid_thw": image_grid_thw.clone(),
+            "n_images_per_sample": torch.tensor([1, 1]),
+        }
+
+    batch = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=2)([{}, {}])
+
+    assert VLM_PP_MEDIA_KEY in batch
+    assert "pixel_values" not in batch
+    assert "image_grid_thw" not in batch
+    assert "n_images_per_sample" not in batch
+
+    media = batch[VLM_PP_MEDIA_KEY]
+    split_at = int(patch_counts[0].item())
+    assert torch.equal(media["pixel_values"][0], pixel_values[:split_at])
+    assert torch.equal(media["pixel_values"][1], pixel_values[split_at:])
+    assert torch.equal(media["image_grid_hws"][0], image_grid_thw[:1])
+    assert torch.equal(media["image_grid_hws"][1], image_grid_thw[1:])
+
+
+def test_kimi_k25_vl_collate_fn_n_images_per_sample_matches_batch_size_truncation_orphan(
+    collate_mod, monkeypatch
+):
+    """Mixed batch (truncated image + intact image): n_images_per_sample length must equal batch_size.
+
+    Regression: a sample whose image region got orphaned by truncation was
+    correctly excluded from all_grid_thws but still kept in all_expanded.
+    Without the fix, n_images_per_sample length would be smaller than the
+    final batch and downstream PP indexing would crash.
+    """
+    MEDIA_TOKEN_ID = 163605
+
+    class MaybeOrphanProcessor:
+        """Returns the same large grid for both calls; the second call's tokens
+        will be truncated past the image region by max_length below."""
+
+        def __init__(self):
+            self.tokenizer = DummyTokenizer(pad_token_id=0)
+            self.media_placeholder_token_id = MEDIA_TOKEN_ID
+            self._call_idx = 0
+
+        def apply_chat_template(self, conversation, **kwargs):
+            return "chat:processed"
+
+        def __call__(self, *, text, return_tensors, medias=None, **kwargs):
+            self._call_idx += 1
+            if self._call_idx == 1:
+                # Small grid that fits within max_length after expansion
+                input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4]])
+                attention_mask = torch.ones_like(input_ids)
+                grid_thws = torch.tensor([[1, 4, 4]])  # 4 image tokens
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "grid_thws": grid_thws,
+                    "pixel_values": torch.randn(1, 3, 14, 14),
+                }
+            # Second sample: 5 text + 16 image tokens = 21 post-expansion;
+            # max_length=15 truncates into the image region → orphan path.
+            input_ids = torch.tensor([[1, 2, MEDIA_TOKEN_ID, 3, 4, 5]])
+            attention_mask = torch.ones_like(input_ids)
+            grid_thws = torch.tensor([[1, 8, 8]])  # 16 image tokens after expansion
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "grid_thws": grid_thws,
+                "pixel_values": torch.randn(1, 3, 64, 64),
+            }
+
+    processor = MaybeOrphanProcessor()
+
+    def fake_build_labels(input_ids, conversations, processor_arg):
+        batch_size, seq_len = input_ids.shape
+        return torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1)
+
+    monkeypatch.setattr(collate_mod, "build_labels_from_template", fake_build_labels, raising=True)
+
+    conv_intact = [
+        {"role": "user", "content": [{"type": "image", "image": "a.jpg"}, {"type": "text", "text": "?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "."}]},
+    ]
+    conv_orphan = [
+        {"role": "user", "content": [{"type": "image", "image": "b.jpg"}, {"type": "text", "text": "?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "."}]},
+    ]
+    examples = [{"conversation": conv_intact}, {"conversation": conv_orphan}]
+
+    batch = collate_mod.kimi_k25_vl_collate_fn(examples, processor, max_length=15)
+
+    assert batch["input_ids"].shape[0] == 2
+    assert "n_images_per_sample" in batch
+    assert batch["n_images_per_sample"].shape == (2,), (
+        f"n_images_per_sample length must equal batch_size=2, "
+        f"got shape {batch['n_images_per_sample'].shape}"
+    )
+    # First sample's image survives → 1; second sample is orphaned → 0
+    assert batch["n_images_per_sample"].tolist() == [1, 0]
+
+
 def test_kimi_k25_vl_collate_fn_multiple_examples(collate_mod, monkeypatch):
     """Test kimi_k25_vl_collate_fn handles multiple examples with padding."""
     # Processor that produces variable length sequences

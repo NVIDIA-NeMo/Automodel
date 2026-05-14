@@ -28,7 +28,6 @@ from nemo_automodel.components.models.common.mtp.mtp import (
     MTPConfig,
     MTPModule,
     get_mtp_loss_scaling_factor,
-    parse_mtp_layer_pattern,
     roll_tensor,
 )
 
@@ -36,6 +35,5 @@ __all__ = [
     "MTPConfig",
     "MTPModule",
     "get_mtp_loss_scaling_factor",
-    "parse_mtp_layer_pattern",
     "roll_tensor",
 ]

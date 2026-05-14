@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
@@ -24,6 +24,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     create_pipeline_forward_causal_lm,
     create_pipeline_forward_inner,
     init_hf_model_buffers,
+    model_keeps_self_forward,
     patch_hf_model_for_pp,
     validate_hf_model_for_pipeline_support,
 )
@@ -36,15 +37,11 @@ class TestCreatePipelineForwardInner:
         forward_fn = create_pipeline_forward_inner("AutoModel")
         assert callable(forward_fn)
 
-    @patch('torch.arange')
+    @patch("torch.arange")
     def test_forward_with_embeddings(self, mock_arange):
         # Create mock model with embeddings
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=True
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=True)
         mock_model.gradient_checkpointing = False
 
         # Mock embed_tokens
@@ -88,11 +85,7 @@ class TestCreatePipelineForwardInner:
     def test_forward_without_embeddings(self):
         # Create mock model without embeddings
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=False)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.layers = None
@@ -111,11 +104,7 @@ class TestCreatePipelineForwardInner:
     def test_forward_with_float_input_ids(self):
         # Test when input_ids is actually hidden states (float type)
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=False)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.layers = None
@@ -141,16 +130,11 @@ class TestCreatePipelineForwardCausalLM:
     def test_forward_with_inner_model(self):
         # Create mock causal LM model
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
 
         # Mock inner model
         mock_inner = Mock()
-        mock_inner.return_value = BaseModelOutputWithPast(
-            last_hidden_state=torch.randn(1, 10, 768)
-        )
+        mock_inner.return_value = BaseModelOutputWithPast(last_hidden_state=torch.randn(1, 10, 768))
         mock_model.model = mock_inner
 
         # Mock lm_head
@@ -173,10 +157,7 @@ class TestCreatePipelineForwardCausalLM:
     def test_forward_without_inner_model(self):
         # Create mock without inner model (pipeline stage)
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
         mock_model.model = None
         mock_model.lm_head = None
 
@@ -191,10 +172,7 @@ class TestCreatePipelineForwardCausalLM:
 
     def test_forward_with_logits_to_keep(self):
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
         mock_model.model = None
 
         # Mock lm_head
@@ -214,10 +192,7 @@ class TestCreatePipelineForwardCausalLM:
     def test_forward_with_non_basemodel_output(self):
         """Test handling when inner model returns non-BaseModelOutputWithPast."""
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
 
         # Mock inner model that returns tensor directly
         mock_inner = Mock()
@@ -245,10 +220,7 @@ class TestCreatePipelineForwardCausalLM:
     def test_forward_with_float_input_ids_causal_lm(self):
         """Test handling float input_ids in causal LM without inner model."""
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
         mock_model.model = None
         mock_model.lm_head = None
 
@@ -264,10 +236,7 @@ class TestCreatePipelineForwardCausalLM:
     def test_forward_invalid_input_causal_lm(self):
         """Test error when invalid input provided to causal LM stage."""
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False)
         mock_model.model = None
         mock_model.lm_head = None
 
@@ -286,6 +255,7 @@ class TestPatchHfModelForPp:
 
     def test_patch_model_with_inner_model(self):
         """Test patching model that has inner .model attribute."""
+
         # Create model with inner model
         class OuterModel(nn.Module):
             def __init__(self):
@@ -314,6 +284,7 @@ class TestPatchHfModelForPp:
 
     def test_patch_model_selective_patching(self):
         """Test selective patching with flags."""
+
         class OuterModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -332,6 +303,7 @@ class TestPatchHfModelForPp:
 
     def test_patch_model_with_none_inner(self):
         """Test patching when model.model is None."""
+
         class OuterModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -348,6 +320,7 @@ class TestPatchHfModelForPp:
 
     def test_patch_gemma4_vlm_uses_gemma4_forward(self):
         """Gemma4 VLM (config.model_type == 'gemma4') gets the Gemma4-specific forwards."""
+
         class _Inner(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -374,6 +347,7 @@ class TestPatchHfModelForPp:
 
     def test_patch_non_gemma4_vlm_falls_back_to_generic(self):
         """VLMs that happen to expose model.language_model but are NOT Gemma4 use the generic path."""
+
         class _Inner(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -401,6 +375,7 @@ class TestPatchHfModelForPp:
 
     def test_patch_gemma4_vlm_via_text_config_model_type(self):
         """Gemma4 detection also works when model_type is only in config.text_config."""
+
         class _Inner(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -418,12 +393,33 @@ class TestPatchHfModelForPp:
         assert model.model.language_model.forward.__func__.__name__ == "pipeline_forward_gemma4_text"
         assert model.forward.__func__.__name__ == "pipeline_forward_gemma4_vlm"
 
+    def test_model_keeps_self_forward_helper(self):
+        """``model_keeps_self_forward`` reflects the class-level opt-out flag.
+
+        Regression for the silent-vision bug where chunk-aware VLMs (Qwen3-VL-MoE,
+        KimiVL, Kimi-K2.5-VL, Qwen3.5-MoE) had their pixel_values-fetching forward
+        replaced by the generic CausalLM forward, causing vision_tower to never
+        run. The fix splits responsibility: the model class declares the flag,
+        and the pipeline build call site uses ``model_keeps_self_forward`` to
+        decide whether to invoke ``patch_hf_model_for_pp`` at all.
+        """
+
+        class _OptedIn(nn.Module):
+            _pp_keep_self_forward = True
+
+        class _Default(nn.Module):
+            pass
+
+        assert model_keeps_self_forward(_OptedIn()) is True
+        assert model_keeps_self_forward(_Default()) is False
+
 
 class TestInitHfModelBuffers:
     """Test init_hf_model_buffers function."""
 
     def test_init_buffers_with_rotary_emb(self):
         """Test buffer initialization for model with rotary embeddings."""
+
         class MockRotaryEmb(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -450,7 +446,7 @@ class TestInitHfModelBuffers:
         init_hf_model_buffers(model, device)
 
         # Verify buffer was registered (mock implementation sets attribute)
-        assert hasattr(model.model.rotary_emb, 'inv_freq')
+        assert hasattr(model.model.rotary_emb, "inv_freq")
 
     def test_init_buffers_without_rotary_emb(self):
         """Test buffer initialization for model without rotary embeddings."""
@@ -462,6 +458,7 @@ class TestInitHfModelBuffers:
 
     def test_init_buffers_with_direct_rotary_emb(self):
         """Test buffer initialization when rotary_emb is directly on model."""
+
         class MockRotaryEmb(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -487,7 +484,7 @@ class TestInitHfModelBuffers:
         init_hf_model_buffers(model, device)
 
         # Verify buffer was registered (mock implementation sets attribute)
-        assert hasattr(model.rotary_emb, 'inv_freq')
+        assert hasattr(model.rotary_emb, "inv_freq")
 
 
 class TestValidateHfModelForPipelineSupport:
@@ -495,6 +492,7 @@ class TestValidateHfModelForPipelineSupport:
 
     def test_validate_valid_model(self):
         """Test validation of compatible model."""
+
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
             tie_word_embeddings = False
@@ -512,6 +510,7 @@ class TestValidateHfModelForPipelineSupport:
 
     def test_validate_model_with_tied_embeddings(self):
         """Validation fails only when lm_head and embed_tokens actually share storage."""
+
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
             tie_word_embeddings = True  # Needed to enable the tied-weights check
@@ -538,6 +537,7 @@ class TestValidateHfModelForPipelineSupport:
 
     def test_validate_encoder_decoder_model(self):
         """Test validation fails for encoder-decoder model."""
+
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
             tie_word_embeddings = False
@@ -555,10 +555,11 @@ class TestValidateHfModelForPipelineSupport:
 
     def test_validate_multiple_issues(self):
         """Test validation with multiple issues."""
+
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
             tie_word_embeddings = True  # Issue 1 (only fires when weights are actually tied)
-            is_encoder_decoder = True   # Issue 2
+            is_encoder_decoder = True  # Issue 2
 
         class _Inner(nn.Module):
             def __init__(self, shared_embed):
@@ -594,6 +595,7 @@ class TestValidateHfModelForPipelineSupport:
 
     def test_validate_model_with_empty_config(self):
         """Test validation of model with empty config."""
+
         class MockModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -602,6 +604,78 @@ class TestValidateHfModelForPipelineSupport:
         model = MockModel()
 
         # Should not raise any error (getattr with default False)
+        validate_hf_model_for_pipeline_support(model)
+
+    def test_validate_unsupported_vlm_pp_combination_raises(self):
+        """VLMs without dedicated PP forward AND without _pp_keep_self_forward must fail validation."""
+
+        class _TextCfg:
+            tie_word_embeddings = False
+
+        class MockConfig:
+            pretrained_model_name_or_path = "test/some_vlm"
+            tie_word_embeddings = False
+            is_encoder_decoder = False
+            model_type = "some_unknown_vlm"
+            text_config = _TextCfg()
+
+        class MockVLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = MockConfig()
+                self.vision_tower = nn.Linear(4, 4)
+
+        model = MockVLM()
+
+        with pytest.raises(ValueError, match="not on the pipeline-aware list"):
+            validate_hf_model_for_pipeline_support(model)
+
+    def test_validate_chunk_aware_vlm_passes(self):
+        """VLMs that opt into _pp_keep_self_forward must pass validation."""
+
+        class _TextCfg:
+            tie_word_embeddings = False
+
+        class MockConfig:
+            pretrained_model_name_or_path = "test/qwen3_vl_moe"
+            tie_word_embeddings = False
+            is_encoder_decoder = False
+            model_type = "qwen3_vl_moe"
+            text_config = _TextCfg()
+
+        class MockVLM(nn.Module):
+            _pp_keep_self_forward = True
+
+            def __init__(self):
+                super().__init__()
+                self.config = MockConfig()
+                self.vision_tower = nn.Linear(4, 4)
+
+        model = MockVLM()
+        # Should not raise.
+        validate_hf_model_for_pipeline_support(model)
+
+    def test_validate_dedicated_vlm_passes(self):
+        """VLMs on the dedicated-forward list (gemma4 / mistral3) must pass validation."""
+
+        class _TextCfg:
+            tie_word_embeddings = False
+            model_type = "gemma4"
+
+        class MockConfig:
+            pretrained_model_name_or_path = "test/gemma4"
+            tie_word_embeddings = False
+            is_encoder_decoder = False
+            model_type = "gemma4_vlm"
+            text_config = _TextCfg()
+
+        class MockVLM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = MockConfig()
+                self.vision_tower = nn.Linear(4, 4)
+
+        model = MockVLM()
         validate_hf_model_for_pipeline_support(model)
 
     def test_no_gradient_checkpointing_warning(self):
@@ -619,7 +693,7 @@ class TestValidateHfModelForPipelineSupport:
 
         inputs_embeds = torch.randn(1, 10, 768)
 
-        with patch('nemo_automodel.components.distributed.pipelining.hf_utils.logger') as mock_logger:
+        with patch("nemo_automodel.components.distributed.pipelining.hf_utils.logger") as mock_logger:
             output = forward_fn(mock_model, inputs_embeds=inputs_embeds)
             # No warning should be called in the new style
             assert not mock_logger.warning_once.called
@@ -630,11 +704,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_missing_input_error(self):
         """Test error when neither input_ids nor inputs_embeds provided with embed_tokens."""
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=False)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = Mock()
         mock_model.layers = None
@@ -650,11 +720,7 @@ class TestValidateHfModelForPipelineSupport:
     def test_invalid_inputs_embeds_error(self):
         """Test error when inputs_embeds not provided for stage without embed_tokens."""
         mock_model = Mock()
-        mock_model.config = Mock(
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=False
-        )
+        mock_model.config = Mock(output_attentions=False, output_hidden_states=False, use_cache=False)
         mock_model.gradient_checkpointing = False
         mock_model.embed_tokens = None
         mock_model.layers = None
@@ -715,9 +781,10 @@ class TestValidateHfModelForPipelineSupport:
         mock_model.layers = nn.ModuleList([layer])
 
         # Mock the masking functions and create causal_mask_mapping
-        with patch('transformers.masking_utils.create_causal_mask') as mock_create_causal, \
-             patch('transformers.masking_utils.create_sliding_window_causal_mask') as mock_create_sliding:
-
+        with (
+            patch("transformers.masking_utils.create_causal_mask") as mock_create_causal,
+            patch("transformers.masking_utils.create_sliding_window_causal_mask") as mock_create_sliding,
+        ):
             mock_create_causal.return_value = torch.ones(1, 1, 10, 10)
             mock_create_sliding.return_value = torch.ones(1, 1, 10, 10) * 2
 
@@ -760,7 +827,7 @@ class TestValidateHfModelForPipelineSupport:
         assert isinstance(output, BaseModelOutputWithPast)
         assert output.attentions is None
 
-    @patch('nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module')
+    @patch("nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module")
     def test_rotary_emb_via_get_text_module(self, mock_get_text_module):
         """Test that rotary_emb is accessed via get_text_module for multimodal model support."""
         mock_model = Mock()
@@ -795,7 +862,7 @@ class TestValidateHfModelForPipelineSupport:
         # Verify rotary_emb was called
         mock_rotary.assert_called_once()
 
-    @patch('nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module')
+    @patch("nemo_automodel.components.distributed.pipelining.hf_utils.get_text_module")
     def test_rotary_emb_none_via_get_text_module(self, mock_get_text_module):
         """Test that None rotary_emb from get_text_module is handled correctly."""
         mock_model = Mock()
@@ -841,6 +908,7 @@ class TestGetTextModule:
 
     def test_returns_language_model_when_present(self):
         """Test that language_model attribute is returned when present."""
+
         class VLMModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -853,6 +921,7 @@ class TestGetTextModule:
 
     def test_returns_text_model_when_present(self):
         """Test that text_model attribute is returned when present."""
+
         class VLMModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -865,6 +934,7 @@ class TestGetTextModule:
 
     def test_returns_text_decoder_when_present(self):
         """Test that text_decoder attribute is returned when present."""
+
         class VLMModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -876,6 +946,7 @@ class TestGetTextModule:
 
     def test_returns_model_when_no_text_attr(self):
         """Test that model itself is returned when no text module attribute exists."""
+
         class SimpleModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -892,6 +963,7 @@ class TestGetTextModule:
 
     def test_priority_order_language_model_first(self):
         """Test that language_model has priority over text_model."""
+
         class VLMModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -904,6 +976,7 @@ class TestGetTextModule:
 
     def test_skips_none_attribute(self):
         """Test that None attributes are skipped."""
+
         class VLMModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -952,21 +1025,25 @@ class TestIsMistral3Vlm:
 
     def test_model_type_mistral3_returns_true(self):
         from nemo_automodel.components.distributed.pipelining.hf_utils import _is_mistral3_vlm
+
         m = Mock()
         m.config = Mock(model_type="mistral3")
         assert _is_mistral3_vlm(m) is True
 
     def test_model_type_other_returns_false(self):
         from nemo_automodel.components.distributed.pipelining.hf_utils import _is_mistral3_vlm
+
         m = Mock()
         m.config = Mock(model_type="llama")
         assert _is_mistral3_vlm(m) is False
 
     def test_no_config_returns_false(self):
         from nemo_automodel.components.distributed.pipelining.hf_utils import _is_mistral3_vlm
+
         # Use a real object without `config` to avoid Mock auto-attributing.
         class _Bare:
             pass
+
         assert _is_mistral3_vlm(_Bare()) is False
 
 
@@ -1039,9 +1116,7 @@ class TestPipelineForwardMistral3Vlm:
                 self.model.get_image_features = Mock()
                 self.model.get_placeholder_mask = Mock()
                 # Lang model forward — return a plain tensor (last_hidden_state path).
-                self.model.language_model.forward = Mock(
-                    return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16)
-                )
+                self.model.language_model.forward = Mock(return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16))
                 # No lm_head on stage 0 (only the last stage has it).
 
         m = _Stage0()
@@ -1053,7 +1128,7 @@ class TestPipelineForwardMistral3Vlm:
         forward retrieves the current microbatch's chunk and advances the
         chunk index — fixing the original PP-VLM bug."""
         m = self._make_first_stage_model(image_token_id=10)
-        # Pre-stage chunks like the recipe does via _chunk_vlm_media.
+        # Pre-stage chunks like the VLM dataloader PP media prep does for schedule.step.
         chunk0 = torch.zeros(1, 3, 8, 8, dtype=torch.bfloat16)
         chunk1 = torch.ones(1, 3, 8, 8, dtype=torch.bfloat16)
         m._vlm_pixel_values_chunks = [chunk0, chunk1]
@@ -1089,9 +1164,7 @@ class TestPipelineForwardMistral3Vlm:
         from types import SimpleNamespace as _SN
 
         m = self._make_first_stage_model(vision_feature_layer_default=-1)
-        m.model.get_image_features.return_value = _SN(
-            pooler_output=(torch.zeros(1, 4, dtype=torch.bfloat16),)
-        )
+        m.model.get_image_features.return_value = _SN(pooler_output=(torch.zeros(1, 4, dtype=torch.bfloat16),))
         m.model.get_placeholder_mask.return_value = torch.zeros(1, 5, 4, dtype=torch.bool)
         # Avoid chunk-retrieval branch by passing pixel_values directly.
         m(
@@ -1111,9 +1184,7 @@ class TestPipelineForwardMistral3Vlm:
         m._vlm_image_grid_hws_chunks = None
         m._vlm_chunk_idx = 0
         # input_ids contains NO image tokens (token 10 absent).
-        m.model.language_model.forward = Mock(
-            return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16)
-        )
+        m.model.language_model.forward = Mock(return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16))
         m(input_ids=torch.tensor([[1, 2, 3, 4, 5]]), pixel_values=None)
         m.model.get_image_features.assert_not_called()
         assert m._vlm_chunk_idx == 0  # unchanged
@@ -1134,9 +1205,7 @@ class TestPipelineForwardMistral3Vlm:
                 self.model.language_model = nn.Module()
                 # Non-first stage: embed_tokens is None (pruned in the PP split).
                 self.model.language_model.embed_tokens = None
-                self.model.language_model.forward = Mock(
-                    return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16)
-                )
+                self.model.language_model.forward = Mock(return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16))
                 self.model.vision_tower = None  # also pruned
                 # No lm_head — middle stage.
 

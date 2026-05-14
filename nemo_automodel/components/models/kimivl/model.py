@@ -317,8 +317,11 @@ class MoonVisionPatchEmbed(nn.Module):
         return self.pos_emb(x, grid_hws)
 
 
-def patch_merger(x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: List[int] = [2, 2]) -> List[torch.Tensor]:
+def patch_merger(
+    x: torch.Tensor, grid_hws: torch.Tensor, merge_kernel_size: List[int] | None = None
+) -> List[torch.Tensor]:
     """Merge patches."""
+    merge_kernel_size = [2, 2] if merge_kernel_size is None else merge_kernel_size
     d_model = x.size(-1)
     outputs = []
     pre_sum = 0
@@ -627,6 +630,10 @@ class KimiVLModel(nn.Module):
 
 class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiVL model with backend-aware DeepseekV3 language model."""
+
+    # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
+    # patch_hf_model_for_pp must not replace it under PP.
+    _pp_keep_self_forward: bool = True
 
     @classmethod
     def from_config(cls, config, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs):

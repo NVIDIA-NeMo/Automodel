@@ -46,8 +46,9 @@ HC (Hyper-Connections):
   See ``_hc_split_sinkhorn`` for the pure-torch port of the reference mixer
   (ported from miles PR 1045's ``kernel/sinkhorn.py``).
 
-Sliding-window / compress-ratio attention is NOT yet implemented.
-All layers use full causal attention regardless of compress_ratios.
+Compress-ratio attention (Compressor + Indexer) is wired into
+DeepseekV4Attention.forward for layers with compress_ratio > 0.
+All layers share the same sliding-window causal mask on the local KV path.
 """
 
 from __future__ import annotations
@@ -473,7 +474,7 @@ def eager_attention_with_sink(
     sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
-    probs = F.softmax(combined, dim=-1, dtype=combined.dtype)[..., :-1]
+    probs = F.softmax(combined, dim=-1, dtype=torch.float32)[..., :-1]
     probs = F.dropout(probs, p=dropout, training=module.training).to(value_states.dtype)
     return torch.matmul(probs, value_states).transpose(1, 2).contiguous(), probs
 
