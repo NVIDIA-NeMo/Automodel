@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-based draft model for EAGLE-3 training."""
+"""Minimal Llama-based draft model for EAGLE-3 training.
+
+Module naming is aligned to ``sglang/srt/models/llama_eagle3.py`` so that a
+checkpoint produced by this trainer can be loaded directly by SGLang's
+``LlamaForCausalLMEagle3.load_weights`` without any key remapping. The state
+dict layout is:
+
+    model.embed_tokens.weight
+    model.fc.weight
+    model.layers.0.input_layernorm.weight
+    model.layers.0.hidden_norm.weight
+    model.layers.0.post_attention_layernorm.weight
+    model.layers.0.self_attn.{q,k,v,o}_proj.weight
+    model.layers.0.mlp.{gate,up,down}_proj.weight
+    model.norm.weight
+    lm_head.weight
+
+SGLang merges ``q_proj/k_proj/v_proj`` into a single ``qkv_proj`` and
+``gate_proj/up_proj`` into ``gate_up_proj`` via its ``stacked_params_mapping``
+at load time, so the un-fused storage above is the canonical on-disk format.
+"""
 
 from __future__ import annotations
 
@@ -191,16 +211,24 @@ class Eagle3LlamaMLP(nn.Module):
 
 
 class Eagle3LlamaDecoderLayer(nn.Module):
-    """Single decoder layer used by the minimal EAGLE-3 draft model."""
+    """Single decoder layer used by the minimal EAGLE-3 draft model.
 
-    def __init__(self, config: LlamaConfig):
+    Attribute names mirror SGLang's ``LlamaDecoderLayer`` in
+    ``sglang/srt/models/llama_eagle3.py``: ``input_layernorm`` is applied
+    to the per-step token embeddings (``embeds`` in SGLang),
+    ``hidden_norm`` is applied to the carried hidden state.
+    ``is_input_layer`` is the layer-0 flag that gates the ``[embeds,
+    hidden]`` concatenation (always true for our single-layer draft).
+    """
+
+    def __init__(self, config: LlamaConfig, layer_id: int = 0):
         super().__init__()
-        self.input_emb_layernorm = initialize_rms_norm_module(
+        self.layer_id = layer_id
+        self.is_input_layer = layer_id == 0
+        self.input_layernorm = initialize_rms_norm_module(
             "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
         )
-        self.hidden_layernorm = initialize_rms_norm_module(
-            "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
-        )
+        self.hidden_norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
         self.post_attention_layernorm = initialize_rms_norm_module(
             "torch", config.hidden_size, eps=config.rms_norm_eps, device=None
         )
@@ -216,8 +244,8 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         cache_hidden: list[list[torch.Tensor]],
     ) -> torch.Tensor:
         residual = hidden_states
-        norm_input_embeds = self.input_emb_layernorm(input_embeds)
-        norm_hidden_states = self.hidden_layernorm(hidden_states)
+        norm_input_embeds = self.input_layernorm(input_embeds)
+        norm_hidden_states = self.hidden_norm(hidden_states)
         combined_states = torch.cat((norm_input_embeds, norm_hidden_states), dim=-1)
         hidden_states = residual + self.self_attn(
             combined_states,
@@ -232,8 +260,39 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Eagle3LlamaModel(nn.Module):
+    """Inner backbone matching SGLang's ``LlamaModel`` in ``llama_eagle3.py``.
+
+    Owns ``embed_tokens``, the ``fc`` projection from concatenated target
+    aux hidden states to draft hidden size, the (single-element) draft
+    ``layers`` ModuleList, and the final ``norm``. The ``LlamaEagle3DraftModel``
+    wrapper around this module adds the top-level ``lm_head`` and the
+    training-facing public API.
+    """
+
+    def __init__(self, config: LlamaConfig):
+        super().__init__()
+        self.config = config
+        target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        # SGLang uses ``num_aux_hidden_states`` (default 3) to size ``fc``'s
+        # input dim. We mirror that convention so the weight shape is
+        # identical and the key ``model.fc.weight`` round-trips cleanly.
+        num_aux_hidden_states = getattr(config, "num_aux_hidden_states", 3)
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        self.fc = nn.Linear(target_hidden_size * num_aux_hidden_states, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList([Eagle3LlamaDecoderLayer(config, layer_id=0)])
+        self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
+
+
 class LlamaEagle3DraftModel(PreTrainedModel):
     """Minimal Llama-only EAGLE-3 draft model.
+
+    State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
+    checkpoint can be loaded by SGLang's inference engine without any
+    remapping (SGLang's ``load_weights`` fuses ``q/k/v_proj`` into
+    ``qkv_proj`` and ``gate/up_proj`` into ``gate_up_proj`` via its
+    standard ``stacked_params_mapping``).
 
     This intentionally starts narrow:
     - Llama config only
@@ -243,7 +302,7 @@ class LlamaEagle3DraftModel(PreTrainedModel):
     """
 
     config_class = LlamaConfig
-    base_model_prefix = "draft_model"
+    base_model_prefix = "model"
 
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
@@ -251,10 +310,7 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.hidden_proj = nn.Linear(self.target_hidden_size * 3, config.hidden_size, bias=False)
-        self.decoder = Eagle3LlamaDecoderLayer(config)
-        self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps, device=None)
+        self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
         self.post_init()
@@ -262,23 +318,23 @@ class LlamaEagle3DraftModel(PreTrainedModel):
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
         """Initialize draft embeddings from the target model embeddings."""
         with torch.no_grad():
-            self.embed_tokens.weight.copy_(target_embedding.weight)
+            self.model.embed_tokens.weight.copy_(target_embedding.weight)
 
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""
-        self.embed_tokens.weight.requires_grad_(False)
+        self.model.embed_tokens.weight.requires_grad_(False)
 
     def project_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project concatenated target aux states from ``3 * H_target`` to draft hidden size."""
-        return self.hidden_proj(aux_hidden_states)
+        """Project concatenated target aux states from ``num_aux * H_target`` to draft hidden size."""
+        return self.model.fc(aux_hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed input ids with the draft embedding table."""
-        return self.embed_tokens(input_ids)
+        return self.model.embed_tokens(input_ids)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute draft logits on the configured draft vocabulary."""
-        return self.lm_head(self.norm(hidden_states))
+        return self.lm_head(self.model.norm(hidden_states))
 
     def forward(
         self,
@@ -305,7 +361,7 @@ class LlamaEagle3DraftModel(PreTrainedModel):
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
-        return self.decoder(
+        return self.model.layers[0](
             input_embeds=draft_input_embeds,
             hidden_states=projected_hidden_states,
             attention_mask=causal_mask,

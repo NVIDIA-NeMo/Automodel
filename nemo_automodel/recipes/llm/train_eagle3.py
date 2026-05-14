@@ -140,7 +140,7 @@ class TrainEagle3Recipe(BaseRecipe):
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
-        # to bf16 while ``nn.Linear`` defaults to fp32, and ``hidden_proj`` errors
+        # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
         self.draft_model = LlamaEagle3DraftModel(LlamaConfig.from_dict(draft_config)).to(
             device=self.device, dtype=self.compute_dtype

@@ -345,7 +345,7 @@ def test_draft_attention_rope_shifts_position_by_step_idx():
     projected = draft.project_hidden_states(aux_hidden_states)
 
     # Wrap rotary_emb to capture which position_ids it was called with.
-    attn = draft.decoder.self_attn
+    attn = draft.model.layers[0].self_attn
     original_rotary = attn.rotary_emb
     captured: list[torch.Tensor] = []
 
@@ -420,9 +420,9 @@ def test_draft_attention_einsum_matches_loop_reference():
 
     # SpecForge-style cat-in-loop reference, driven through the same
     # decoder layer (so RMSNorm / MLP / residuals match exactly).
-    attn = draft.decoder.self_attn
+    attn = draft.model.layers[0].self_attn
     scaling = attn.scaling
-    layer = draft.decoder
+    layer = draft.model.layers[0]
 
     def _ref_attention(combined, mask, pos_ids, cache):
         bsz, q_len, _ = combined.shape
@@ -453,8 +453,8 @@ def test_draft_attention_einsum_matches_loop_reference():
         for _ in range(3):
             input_embeds = draft.embed_input_ids(input_ids)
             residual = hidden
-            norm_input = layer.input_emb_layernorm(input_embeds)
-            norm_hidden = layer.hidden_layernorm(hidden)
+            norm_input = layer.input_layernorm(input_embeds)
+            norm_hidden = layer.hidden_norm(hidden)
             combined = torch.cat((norm_input, norm_hidden), dim=-1)
             hidden = residual + _ref_attention(combined, causal_mask, position_ids, cache_ref)
             residual = hidden
