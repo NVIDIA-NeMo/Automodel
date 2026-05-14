@@ -940,36 +940,20 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
 
 
 def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch):
-    """Test that _run_validation_epoch sends val_loss from last stage to main rank for PP."""
+    """Test that _run_validation_epoch broadcasts val_loss from last stage to main rank for PP."""
     from contextlib import nullcontext
 
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    # Track distributed send/recv calls
-    send_calls = []
-    recv_calls = []
-
-    def mock_send(tensor, dst):
-        send_calls.append((tensor.item(), dst))
-
-    def mock_recv(tensor, src):
-        recv_calls.append((tensor, src))
-        # Simulate receiving a value
-        tensor.fill_(0.5)
-
-    monkeypatch.setattr("torch.distributed.send", mock_send)
-    monkeypatch.setattr("torch.distributed.recv", mock_recv)
 
     # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
     object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
     object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
 
-    # Mock device_mesh.mesh to return rank 0 as last stage
-    mock_mesh = MagicMock()
-    mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
-    object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+    # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe broadcasts
+    # within the PP group instead of doing send/recv to global rank 0).
+    monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
 
     # Set dist_env.rank to 0 (last stage and main rank are the same in this test)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
@@ -1012,33 +996,27 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
 
 def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch):
-    """Test that main rank receives val_loss from last stage when they differ."""
+    """Test that main rank receives val_loss from last stage via the PP broadcast helper."""
     from contextlib import nullcontext
 
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=False)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    recv_calls = []
-
-    def mock_send(tensor, dst):
-        pass
-
-    def mock_recv(tensor, src):
-        recv_calls.append(src)
-        tensor.fill_(0.5)
-
-    monkeypatch.setattr("torch.distributed.send", mock_send)
-    monkeypatch.setattr("torch.distributed.recv", mock_recv)
 
     # Set up recipe attributes - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
     object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
     object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
 
-    # Mock device_mesh.mesh to return rank 3 as last stage
-    mock_mesh = MagicMock()
-    mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 3)
-    object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+    # Track calls to the PP last-stage broadcast helper and simulate the last
+    # stage's value of 0.5 propagating into the non-last-stage tensor.
+    broadcast_calls = []
+
+    def mock_broadcast(tensor):
+        broadcast_calls.append(tensor)
+        tensor.fill_(0.5)
+        return tensor
+
+    monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", mock_broadcast)
 
     # Main rank (0) is different from last stage (3)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
@@ -1069,8 +1047,9 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
 
     result = recipe._run_validation_epoch(val_dataloader)
 
-    # Main rank should have received from src_rank=3
-    assert 3 in recv_calls, "Main rank should receive val_loss from last stage (rank 3)"
+    # Main rank should have invoked the PP broadcast helper to pull val_loss
+    # and pp_num_tokens from the last PP stage (two calls total).
+    assert len(broadcast_calls) >= 1, "Main rank should broadcast val_loss from the last PP stage"
     assert isinstance(result.metrics["val_loss"], float)
 
 
@@ -1773,9 +1752,9 @@ class TestRunTrainOptimStepSetsMoEScale:
         if pp_enabled:
             pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
             object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
-            mock_mesh = MagicMock()
-            mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
-            object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+            # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
+            # broadcasts inside the PP group instead of using send/recv).
+            monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
         object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
 
         monkeypatch.setattr(
@@ -1809,10 +1788,6 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         # 3 valid labels out of 4
         batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
-
-        # Mock PP loss reporting path
-        monkeypatch.setattr("torch.distributed.send", lambda *a, **k: None)
-        monkeypatch.setattr("torch.distributed.recv", lambda *a, **k: None)
 
         recipe._run_train_optim_step(batches)
 
