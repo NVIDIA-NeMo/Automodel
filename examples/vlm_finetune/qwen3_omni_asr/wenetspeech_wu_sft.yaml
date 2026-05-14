@@ -12,26 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Wu Chinese ASR fine-tuning of Qwen3-Omni-30B-A3B-Instruct on yuekai/WenetSpeech_Wu_1k.
+# Full-FT Wu Chinese ASR of Qwen3-Omni-30B-A3B-Instruct on yuekai/WenetSpeech_Wu_1k.
 #
-# Audio decoding goes through `make_wenetspeech_wu_asr_dataset` which uses
-# `datasets.Audio(decode=False)` + soundfile, so this recipe runs in environments
-# without `torchcodec` or `qwen_omni_utils` (e.g. the bundled DTensorPolicyWorkerV2
-# Python at /opt/ray_venvs/...).
+# Schedule:
+#   * No system turn; the user turn carries an explicit Shanghainese / Wu
+#     transcription instruction followed by the audio.
+#   * No PEFT; the language model and the audio tower are both fully trainable.
+#     Vision tower is frozen (the recipe never feeds images).
+#   * WandB enabled by default; override project/entity/save_dir via env vars
+#     WANDB_PROJECT / WANDB_ENTITY / WANDB_DIR.
+#   * Checkpoints land under result/checkpoints/... every 100 steps (consolidated
+#     HF safetensors; result/ is gitignored).
 #
 # To run on a single 8-GPU node:
 #   export WENETSPEECH_WU_PATH=/path/to/wenetspeech_wu_1k  # local mirror or HF id
 #   examples/vlm_finetune/qwen3_omni_asr/train.sh
 #
 # The env var WENETSPEECH_WU_PATH has no default; OmegaConf will raise a clear
-# missing-variable error if it is unset.
+# missing-variable error if it is unset. Full FT of a 30B-A3B MoE plus the
+# audio tower is memory-tight on 8x H100 80GB; if you OOM, drop
+# step_scheduler.global_batch_size, enable activation checkpointing in the
+# moe parallelizer config, or freeze the audio_tower.
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 200
+  ckpt_every_steps: 100
   num_epochs: 1
   max_steps: 500
 
@@ -60,7 +68,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /tmp/checkpoints/qwen3_omni_asr_wenetspeech_wu
+  checkpoint_dir: result/checkpoints/qwen3_omni_asr_wenetspeech_wu
   model_save_format: safetensors
   save_consolidated: true
 
@@ -72,32 +80,29 @@ distributed:
   ep_size: 8
   sequence_parallel: false
 
+# Full fine-tune: audio tower + language model trainable; only the vision tower
+# stays frozen (we never feed images). No PEFT adapters.
 freeze_config:
   freeze_embeddings: false
   freeze_vision_tower: true
-  freeze_audio_tower: true
+  freeze_audio_tower: false
   freeze_language_model: false
-
-# LoRA adapters land only on the language model's self-attention projections.
-# The NEMO custom Qwen3-Omni model exposes the LM layers under `model.layers.*`
-# (the audio tower lives at `audio_tower.layers.*` and the vision tower at
-# `visual.*`), so this pattern keeps adapters off audio/vision/lm_head modules.
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules:
-    - model.layers.*.self_attn.*_proj
-  dim: 16
-  alpha: 32
-  dropout: 0.0
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
+# Conversation shape (per sample):
+#   user(  text=user_prompt + audio=<waveform>  )
+#   assistant(  text=<transcript>  )
+# No system turn (system_prompt: null).
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_wenetspeech_wu_asr_dataset
   path_or_dataset: ${oc.env:WENETSPEECH_WU_PATH}
   split: train
   sampling_rate: 16000
+  system_prompt: null
+  user_prompt: >-
+    请将这段上海话（吴语）语音逐字转写成纯文本。原则：忠实于发音。如果听到的是明显的吴语方言词（如阿拉、侬、伊拉、辰光、搿、勿、覅、辣海、老酒、物事、哪能、伐、唻），就用对应的吴语方言字；如果听到的是普通话发音，就用普通话用字，不要硬替换。不要做普通话↔吴语之间的翻译。只输出转写文本，不要加任何引导语、解释或标点。
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -112,12 +117,10 @@ optimizer:
   lr: 2.0e-5
   weight_decay: 0.0
 
-# Uncomment and configure for W&B logging
-# wandb:
-#   project: <your_wandb_project>
-#   entity: <your_wandb_entity>
-#   name: qwen3_omni_asr_wenetspeech_wu
-#   save_dir: <your_wandb_save_dir>
+wandb:
+  project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-wenetspeech-wu}
+  name: ${oc.env:WANDB_NAME,qwen3_omni_asr_wenetspeech_wu_fullft}
+  dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:
   recipe_owner: yuekaiz

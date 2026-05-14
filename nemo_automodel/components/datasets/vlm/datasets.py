@@ -258,6 +258,7 @@ def make_wenetspeech_wu_asr_dataset(
     split="train",
     sampling_rate=16000,
     system_prompt="Transcribe the Wu Chinese speech to text.",
+    user_prompt=None,
     audio_column="audio",
     text_column="text",
     drop_empty_text=True,
@@ -270,7 +271,14 @@ def make_wenetspeech_wu_asr_dataset(
     ``path`` branches explicitly. The resulting samples follow the Qwen3-Omni
     chat-template schema expected by :func:`qwen3_omni_asr_collate_fn`:
 
-    ``{"conversation": [system, user(audio np.ndarray), assistant(transcript)]}``.
+    - If both ``system_prompt`` and ``user_prompt`` are provided, the conversation
+      is ``system -> user(text + audio) -> assistant(transcript)``.
+    - If only ``system_prompt`` is set, the conversation is the legacy
+      ``system -> user(audio) -> assistant(transcript)`` shape.
+    - If only ``user_prompt`` is set (``system_prompt=None``), the conversation is
+      ``user(text + audio) -> assistant(transcript)`` with NO system turn.
+    - If both are ``None`` / empty, the conversation is the minimal
+      ``user(audio) -> assistant(transcript)`` shape.
 
     Args:
         path_or_dataset: HuggingFace dataset id or local path. May reference the
@@ -279,8 +287,10 @@ def make_wenetspeech_wu_asr_dataset(
         split: Dataset split to load.
         sampling_rate: Target sampling rate in Hz. Audio is resampled if the
             source rate differs.
-        system_prompt: Instruction placed in the ``system`` turn of every
-            conversation.
+        system_prompt: Instruction placed in a ``system`` turn. Pass ``None`` or
+            an empty string to skip the system turn entirely.
+        user_prompt: Instruction prepended to the audio inside the user turn.
+            Pass ``None`` to emit a user turn with only the audio item.
         audio_column: Name of the audio column in the source dataset.
         text_column: Name of the transcript column in the source dataset.
         drop_empty_text: If True, samples whose transcript is empty or whitespace
@@ -308,6 +318,9 @@ def make_wenetspeech_wu_asr_dataset(
 
     dataset = dataset.cast_column(audio_column, Audio(decode=False))
 
+    has_system = bool(system_prompt) and (not isinstance(system_prompt, str) or system_prompt.strip())
+    has_user_text = bool(user_prompt) and (not isinstance(user_prompt, str) or user_prompt.strip())
+
     formatted = []
     for example in dataset:
         transcript = example.get(text_column)
@@ -318,15 +331,19 @@ def make_wenetspeech_wu_asr_dataset(
 
         waveform, _ = _decode_audio_cell_to_mono_float32(example[audio_column], sampling_rate)
 
-        formatted.append(
-            {
-                "conversation": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": [{"type": "audio", "audio": waveform}]},
-                    {"role": "assistant", "content": [{"type": "text", "text": transcript}]},
-                ],
-            }
-        )
+        conversation = []
+        if has_system:
+            conversation.append({"role": "system", "content": system_prompt})
+
+        user_content = []
+        if has_user_text:
+            user_content.append({"type": "text", "text": user_prompt})
+        user_content.append({"type": "audio", "audio": waveform})
+        conversation.append({"role": "user", "content": user_content})
+
+        conversation.append({"role": "assistant", "content": [{"type": "text", "text": transcript}]})
+
+        formatted.append({"conversation": conversation})
 
     return formatted
 

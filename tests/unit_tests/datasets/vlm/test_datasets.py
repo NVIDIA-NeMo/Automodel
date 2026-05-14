@@ -1447,3 +1447,78 @@ def test_make_wenetspeech_wu_asr_dataset_resamples_when_sr_differs(monkeypatch):
     assert waveform.ndim == 1
     # 0.25s at 16 kHz target ≈ 4000 samples (allow ±a few for resample_poly polyphase rounding).
     assert abs(waveform.shape[0] - 4000) <= 8
+
+
+def test_make_wenetspeech_wu_asr_dataset_user_prompt_appears_before_audio(monkeypatch):
+    """When ``user_prompt`` is set, it becomes the first text item in the user turn."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(
+        path_or_dataset="ignored",
+        user_prompt="please transcribe",
+    )
+    assert len(rows) == 1
+    conv = rows[0]["conversation"]
+    # Default system_prompt is still present.
+    assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+    user_content = conv[1]["content"]
+    # First user item is the text prompt, second is the audio ndarray.
+    assert user_content[0] == {"type": "text", "text": "please transcribe"}
+    assert user_content[1]["type"] == "audio"
+    assert isinstance(user_content[1]["audio"], _np.ndarray)
+
+
+def test_make_wenetspeech_wu_asr_dataset_system_none_drops_system_turn(monkeypatch):
+    """``system_prompt=None`` (or empty) must drop the system turn entirely."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt=None,
+        user_prompt="please transcribe",
+    )
+    assert len(rows) == 1
+    conv = rows[0]["conversation"]
+    # No system turn.
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    user_content = conv[0]["content"]
+    assert user_content[0]["type"] == "text"
+    assert user_content[1]["type"] == "audio"
+
+
+def test_make_wenetspeech_wu_asr_dataset_both_prompts_none(monkeypatch):
+    """When both prompts are None the user turn carries only the audio item."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt=None,
+        user_prompt=None,
+    )
+    conv = rows[0]["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    assert len(conv[0]["content"]) == 1
+    assert conv[0]["content"][0]["type"] == "audio"
+
+
+def test_make_wenetspeech_wu_asr_dataset_blank_prompts_drop(monkeypatch):
+    """Whitespace-only prompts are treated as absent."""
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_wenetspeech_wu_asr_dataset(
+        path_or_dataset="ignored",
+        system_prompt="   ",
+        user_prompt="\t\n",
+    )
+    conv = rows[0]["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    assert len(conv[0]["content"]) == 1
+    assert conv[0]["content"][0]["type"] == "audio"
