@@ -667,6 +667,10 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
+        # Env-var escape hatch resolved once at construction time so the hot
+        # forward path doesn't pay a per-step ``os.environ.get`` cost.
+        self._disable_shared_expert_overlap = os.environ.get("NEMO_MOE_DISABLE_SHARED_EXPERT_OVERLAP") == "1"
+
     def forward(
         self,
         x: torch.Tensor,
@@ -710,7 +714,7 @@ class MoE(nn.Module):
                 y = self.fc2_latent_proj(y)
             return y.view(shape)
 
-        if os.environ.get("NEMO_MOE_DISABLE_SHARED_EXPERT_OVERLAP") == "1":
+        if self._disable_shared_expert_overlap:
             z = self.shared_experts(x)
             if self.shared_expert_gate is not None:
                 z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z

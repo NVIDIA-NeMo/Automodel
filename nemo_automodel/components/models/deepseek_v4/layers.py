@@ -134,7 +134,6 @@ def _apply_partial_rope_interleaved(
     """
     rd = rope_head_dim
     half = rd // 2
-    input_dtype = x.dtype
     nope, rope = x[..., :-rd], x[..., -rd:]
     # Pair-reshape last dim: [..., rd] -> [..., rd/2, 2]
     rope_pairs = rope.float().unflatten(-1, (-1, 2))
