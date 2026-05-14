@@ -360,6 +360,7 @@ def scale_grads_and_clip_grad_norm(
 
 
 def move_to_device(model, device):
+    """Move a model and its buffers to a device and release stale CUDA cache."""
     # FSDP modules do not move buffers to the device automatically
     for v in model.buffers():
         v.data = v.data.to(device)
@@ -369,6 +370,8 @@ def move_to_device(model, device):
 
 
 class ScopedModuleOffloading:
+    """Context manager that temporarily moves a module between CPU and CUDA."""
+
     def __init__(self, model, enabled=False):
         self.model = model
         self.enabled = enabled

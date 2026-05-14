@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_dion_optimizer(cfg_opt: Any) -> bool:
+    """Return whether an optimizer config targets a Dion-family optimizer."""
     target = getattr(cfg_opt, "_target_", None)
     name = getattr(target, "__name__", "")
     module = getattr(target, "__module__", "")

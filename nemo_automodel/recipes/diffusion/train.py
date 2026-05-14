@@ -327,6 +327,7 @@ def build_lr_scheduler(
 
 
 def is_main_process():
+    """Return whether the current process should perform rank-zero work."""
     return (not dist.is_initialized()) or dist.get_rank() == 0
 
 

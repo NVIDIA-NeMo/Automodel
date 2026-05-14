@@ -48,6 +48,8 @@ def init_all_rng(seed: int, ranked: bool = False):
 
 @dataclass
 class RNGState:
+    """Snapshot of Python, NumPy, Torch, and CUDA RNG states."""
+
     random_rng_state: tuple
     np_rng_state: tuple
     torch_rng_state: torch.Tensor
