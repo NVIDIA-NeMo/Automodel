@@ -74,24 +74,30 @@ constraints = [
     { name = "wheel", specifier = ">=0.46.2" },
 ]
 overrides = [
+    { name = "cuda-bindings", marker = "sys_platform == 'never'" },
+    { name = "cuda-pathfinder", marker = "sys_platform == 'never'" },
     { name = "flash-attn", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cublas-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cuda-cupti-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cuda-nvrtc-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cufft-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cufile-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-curand-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cusolver-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cusparse-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-cusparselt-cu12", marker = "sys_platform == 'never'" },
-    { name = "nvidia-nccl-cu12", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cublas", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cudnn-cu13", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cufft", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cufile", marker = "sys_platform == 'never'" },
+    { name = "nvidia-curand", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cusolver", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cusparse", marker = "sys_platform == 'never'" },
+    { name = "nvidia-cusparselt-cu13", marker = "sys_platform == 'never'" },
+    { name = "nvidia-nccl-cu13", marker = "sys_platform == 'never'" },
+    { name = "nvidia-nvjitlink", marker = "sys_platform == 'never'" },
+    { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'never'" },
+    { name = "nvidia-nvtx", marker = "sys_platform == 'never'" },
     { name = "torch", marker = "sys_platform == 'never'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchao", marker = "sys_platform == 'never'" },
     { name = "torchcodec", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformer-engine", marker = "sys_platform == 'never'" },
+    { name = "transformer-engine-cu13", marker = "sys_platform == 'never'" },
     { name = "transformer-engine-torch", marker = "sys_platform == 'never'" },
     { name = "triton", marker = "sys_platform == 'never'" },
 ]
@@ -3500,14 +3506,14 @@ requires-dist = [
     { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchao" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
     { name = "torchvision", marker = "sys_platform == 'darwin' and extra == 'diffusion'", index = "https://pypi.org/simple" },
     { name = "torchvision", marker = "sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "<=2.11.0" },
+    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = ">=2.14.1" },
     { name = "transformers", specifier = "==5.5.0" },
     { name = "wandb", specifier = ">=0.26.1" },
 ]
@@ -3520,7 +3526,7 @@ build = [
     { name = "setuptools" },
     { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "<=2.10.0", index = "https://pypi.org/simple" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform == 'linux'", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu130" },
 ]
 dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
@@ -6653,10 +6659,10 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.11.0"
+version = "2.14.1"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/33/44571ec584c88e1715f4c2afefc0ddd45064c7065ac1c6ffc8e832bc3ba3/transformer_engine-2.11.0-py3-none-any.whl", hash = "sha256:7ee1eae8fa6b0cb471c6066aa3555304fda8537174e5019929dc0c8655071df3", size = 723110, upload-time = "2026-01-02T09:58:23.245Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/e3/d54ab51ad6d9be35582fc8cd0bcf851f4c7d0f75d465ae7d706fba4fc40e/transformer_engine-2.14.1-py3-none-any.whl", hash = "sha256:ad0e5e3c11b90bc98f7dd843c7af06d8a321361ac0df8c6c35326c9b437bdfec", size = 820028, upload-time = "2026-04-29T17:11:33.922Z" },
 ]
 
 [[package]]

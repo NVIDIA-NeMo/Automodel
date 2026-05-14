@@ -118,7 +118,7 @@ cuda = [
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
-    "transformer-engine[pytorch]<=2.11.0",
+    "transformer-engine[pytorch]>=2.14.1",
 ]
 cuda_source = [
     "bitsandbytes",
@@ -228,7 +228,7 @@ constraint-dependencies = [
     "pygments>=2.20.0",
 ]
 override-dependencies = [
-    "nvidia-cudnn-cu12==9.19.0.56; sys_platform == 'linux'"
+    "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
 ]
 prerelease = "allow"
 
@@ -239,12 +239,12 @@ liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 

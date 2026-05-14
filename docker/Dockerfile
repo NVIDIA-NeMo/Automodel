@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
 ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.04-py3
 ARG BASE_IMAGE=cuda
 
@@ -62,8 +62,8 @@ RUN if [ -f /usr/local/bin/torchrun ]; then \
 FROM update_base_container AS automodel_dep
 
 # Install TE
-ARG INSTALL_TE=False
-ARG TE_COMMIT=release_v2.11
+ARG INSTALL_TE=True
+ARG TE_COMMIT=release_v2.14
 RUN if [ "$INSTALL_TE" = "True" ]; then \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
