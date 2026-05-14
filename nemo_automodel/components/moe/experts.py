@@ -666,6 +666,13 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.expert_activation = get_expert_activation_for_deepep(config)
 
+        # Resolve DSV4 DeepEP debug env-vars once at construction so the hot
+        # forward path doesn't pay a per-step ``os.environ.get`` cost.
+        self._debug_enabled = os.environ.get("DSV4_DEEPEP_DEBUG") == "1"
+        self._debug_once = os.environ.get("DSV4_DEEPEP_DEBUG_ONCE", "1") == "1"
+        debug_rank_values = os.environ.get("DSV4_DEEPEP_DEBUG_RANKS", "0,8,16,24,32,40,48,56").replace(":", ",")
+        self._debug_ranks = {int(x) for x in debug_rank_values.split(",") if x}
+
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()
@@ -737,14 +744,10 @@ class GroupedExpertsDeepEP(nn.Module):
 
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
         global _DEEPEP_DEBUG_PRINTED
-        if os.environ.get("DSV4_DEEPEP_DEBUG") == "1" and (
-            os.environ.get("DSV4_DEEPEP_DEBUG_ONCE", "1") != "1" or not _DEEPEP_DEBUG_PRINTED
-        ):
+        if self._debug_enabled and (not self._debug_once or not _DEEPEP_DEBUG_PRINTED):
             _DEEPEP_DEBUG_PRINTED = True
             rank = dist.get_rank() if dist.is_initialized() else -1
-            debug_rank_values = os.environ.get("DSV4_DEEPEP_DEBUG_RANKS", "0,8,16,24,32,40,48,56").replace(":", ",")
-            debug_ranks = {int(x) for x in debug_rank_values.split(",") if x}
-            if rank in debug_ranks:
+            if rank in self._debug_ranks:
                 valid = indices >= 0
                 duplicate_rows = (
                     (indices.sort(dim=-1).values[:, 1:] == indices.sort(dim=-1).values[:, :-1]).any(dim=-1).sum()
