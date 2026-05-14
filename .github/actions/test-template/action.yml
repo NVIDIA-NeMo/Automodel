@@ -46,7 +46,6 @@ inputs:
   runner:
     description: "Runner to use for test"
     required: true
-
 runs:
   using: "composite"
   steps:

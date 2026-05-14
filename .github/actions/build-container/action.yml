@@ -54,6 +54,7 @@ runs:
       uses: actions/checkout@v6
       with:
         ref: ${{ steps.sha.outputs.main }}
+        fetch-depth: 0
 
     - name: Install GH CLI
       shell: bash
