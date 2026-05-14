@@ -31,6 +31,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import mlflow
 import torch
 import torch.nn as nn
 import wandb
@@ -61,6 +62,10 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.mlflow_utils import (
+    configure_mlflow,
+    to_float_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -685,6 +690,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            if configure_mlflow(self.cfg) is not None:
+                logging.info("MLflow experiment tracking enabled")
+
         # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
@@ -1226,6 +1235,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
 
@@ -1251,10 +1263,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
+        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

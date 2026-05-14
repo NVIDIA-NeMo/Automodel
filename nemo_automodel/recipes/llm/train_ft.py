@@ -32,6 +32,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import mlflow
 import torch
 import torch.nn as nn
 import wandb
@@ -71,7 +72,10 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
+from nemo_automodel.components.loggers.mlflow_utils import (
+    configure_mlflow,
+    to_float_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -1006,11 +1010,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-        self.mlflow_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            self.mlflow_logger = build_mlflow(self.cfg)
-            self.mlflow_logger.log_params(self.cfg.to_dict())
-            logging.info("MLflow experiment tracking enabled")
+            if configure_mlflow(self.cfg) is not None:
+                logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "comet"):
@@ -1749,8 +1751,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
 
-        if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         if self.comet_logger is not None:
             self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
@@ -1793,8 +1795,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if self.mlflow_logger is not None:
-                self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
@@ -1805,6 +1807,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
+            if mlflow.active_run() is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
                 )
 
         # JSONL training log (always log for detailed local records)
