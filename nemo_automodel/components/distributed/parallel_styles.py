@@ -79,6 +79,8 @@ class TPLinear(nn.Linear):
 
 
 class ColwiseParallelLora(ColwiseParallel):
+    """Column-wise tensor parallel style for LoRA-aware modules."""
+
     def _partition_linear_fn(self, name, module, device_mesh):
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
@@ -125,6 +127,8 @@ class ColwiseParallelLora(ColwiseParallel):
 
 
 class RowwiseParallelLora(RowwiseParallel):
+    """Row-wise tensor parallel style for LoRA-aware modules."""
+
     def _partition_linear_fn(self, name, module, device_mesh):
         # Rowwise shard weight to Shard(1), bias to Replicate(), weight be Shard(1)
         # means Rowwise as nn.Linear is input * weight^T + bias, where
@@ -160,6 +164,8 @@ class RowwiseParallelLora(RowwiseParallel):
 
 
 class SequenceParallelLora(SequenceParallel):
+    """Sequence parallel style that replicates LoRA module parameters."""
+
     def _replicate_module_fn(self, name: str, module: nn.Module, device_mesh: DeviceMesh):
         for p_name, param in module.named_parameters():
             # simple replication with fixed ones_ init from LayerNorm/RMSNorm, which allow
@@ -172,6 +178,7 @@ class SequenceParallelLora(SequenceParallel):
 
 
 def translate_to_lora(plan):
+    """Mutate a tensor-parallel plan to the matching LoRA-aware style."""
     CLS_MAP = {
         ColwiseParallel: ColwiseParallelLora,
         RowwiseParallel: RowwiseParallelLora,

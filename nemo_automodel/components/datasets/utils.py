@@ -77,6 +77,7 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
 
 
 def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
+    """Return the last non-padding index before a trailing padding run."""
     # lst = [optional-value .., non-value, ..., non-value, value, ...]
     # return the index of the last non-value token
     i = len(lst) - 1
@@ -94,6 +95,7 @@ def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
 
 
 def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
+    """Return the default pad token id for a batch field name."""
     PAD_TOKEN_IDS = {
         "labels": -100,
         "attention_mask": 0,
@@ -107,6 +109,7 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = N
 
 
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
+    """Build an attention mask from labels with trailing ignored positions."""
     # if the last token is not an ignore token, then the attention mask is all 1s
     if len(ids) == 0:
         return []

@@ -212,8 +212,8 @@ def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext
     Returns:
         A :class:`MeshContext` with device meshes attached.
     """
+    from nemo_automodel.components.distributed import mesh_utils
     from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-    from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
     if world_size is None:
         world_size = get_world_size_safe()
@@ -221,7 +221,7 @@ def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext
     cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
     parsed = parse_distributed_section(cfg_dict)
 
-    device_mesh, moe_mesh = create_device_mesh(
+    device_mesh, moe_mesh = mesh_utils.create_device_mesh(
         parsed["strategy_config"],
         dp_size=parsed["dp_size"],
         dp_replicate_size=parsed["dp_replicate_size"],

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+
 from nemo_automodel.components.training.step_scheduler import (
     StepScheduler,
     _calculate_max_steps,
@@ -305,7 +306,7 @@ def test_ckpt_every_steps_is_none(dataloader, is_iterable):
 
 def test_iterable_dataloader():
     dataloader = IterableDataLoader(num_batches=10)
-    scheduler = StepScheduler(
+    StepScheduler(
         global_batch_size=1,
         local_batch_size=1,
         dp_size=1,
@@ -350,7 +351,7 @@ def test_is_gc_step_every_n_steps():
 
 def test_gc_every_steps_must_be_positive():
     dataloader = SizedDataLoader(num_batches=1)
-    with pytest.raises(AssertionError, match="gc_every_steps must be greater than 0 if not None"):
+    with pytest.raises(ValueError, match="gc_every_steps must be greater than 0 if not None"):
         StepScheduler(
             global_batch_size=1,
             local_batch_size=1,
