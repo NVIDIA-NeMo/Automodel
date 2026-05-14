@@ -18,6 +18,11 @@
 
 recipe: TrainBiEncoderRecipe
 
+ci:
+  time: "02:00:00"
+  nodes: 1
+  embed_eval: true
+
 seed: 42
 
 temperature: 0.02
@@ -143,4 +148,4 @@ distributed:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
