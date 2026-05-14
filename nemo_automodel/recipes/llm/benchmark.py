@@ -287,13 +287,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
+                        loss_buffer.append(
+                            self._forward_backward_step(
+                                batch,
+                                num_label_tokens=None,
+                                is_train=True,
+                                is_last_microbatch=ga_step_idx == ga_steps - 1,
+                            )
                         )
 
                     torch.cuda.nvtx.range_pop()

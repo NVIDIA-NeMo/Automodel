@@ -54,14 +54,12 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -76,7 +74,7 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -580,53 +578,6 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-            }
-        )
-    else:
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
-
-
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -900,36 +851,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
     def _forward_backward_step(
         self,
-        idx,
         batch,
         *,
-        loss_buffer,
         num_label_tokens,
-        num_batches,
         is_train: bool = True,
+        is_last_microbatch: bool = True,
     ):
-        forward_backward_step(
-            idx=idx,
+        return forward_backward_step(
             batch=batch,
             device=self.dist_env.device,
             device_mesh=self.device_mesh,
             model_parts=self.model_parts,
             distributed_config=self.distributed_config,
             loss_fn=self.loss_fn,
-            calculate_loss_fn=calculate_loss,
-            loss_buffer=loss_buffer,
             num_label_tokens=num_label_tokens,
-            num_batches=num_batches,
             is_train=is_train,
-            pp_enabled=self.pp_enabled,
-            pp=getattr(self, "pp", None),
-            dp_group_size=1 if self.pp_enabled else self._get_dp_group_size(include_cp=True),
-            make_cp_batch_and_ctx_fn=make_cp_batch_and_ctx,
-            get_sync_ctx_fn=get_sync_ctx,
-            filter_forward_kwargs_fn=filter_forward_kwargs,
+            pp=getattr(self, "pp", None) if self.pp_enabled else None,
+            is_last_microbatch=is_last_microbatch,
             prepare_batch_before_cp=self._prepare_vlm_batch_for_cp,
             pp_batch_context_factory=lambda pp_batch: stage_vlm_media_for_pp(self.pp, self.model_parts, pp_batch),
-            filter_pp_batch=False,
             hidden_states_error_message=(
                 "FusedLinearCrossEntropy requires the model to output hidden states. "
                 "Set `model.text_config.output_hidden_states=True` in the config."
@@ -997,8 +937,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+            loss_buffer.append(
+                self._forward_backward_step(
+                    batch,
+                    num_label_tokens=num_label_tokens,
+                    is_last_microbatch=i == num_batches - 1,
+                )
             )
 
         grad_norm = scale_grads_and_clip_grad_norm(
@@ -1093,17 +1037,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
-                self._forward_backward_step(
-                    0,
-                    batch,
-                    loss_buffer=loss_buffer,
-                    num_label_tokens=None,
-                    num_batches=1,
-                    is_train=False,
-                )
-                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                loss = self._forward_backward_step(batch, num_label_tokens=None, is_train=False)
+                total_loss += loss.item()
                 total_num_label_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized

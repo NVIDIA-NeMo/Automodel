@@ -302,10 +302,9 @@ class TestBenchmarkingRecipeRunBenchmark:
         """Test that run_benchmark sets all models to training mode."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
 
-        # Mock _forward_backward_step to append loss to loss_buffer
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5))
+        # Mock _forward_backward_step to return loss
+        def mock_forward_backward_step(batch, **kwargs):
+            return torch.tensor(0.5)
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
@@ -344,10 +343,9 @@ class TestBenchmarkingRecipeRunBenchmark:
         """Test that gradient accumulation steps are calculated correctly."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
 
-        # Mock _forward_backward_step to append loss to loss_buffer
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5))
+        # Mock _forward_backward_step to return loss
+        def mock_forward_backward_step(batch, **kwargs):
+            return torch.tensor(0.5)
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
@@ -389,10 +387,9 @@ class TestBenchmarkingRecipeRunBenchmark:
         """Test that gradients are zeroed at the start of each iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
 
-        # Mock _forward_backward_step to append loss to loss_buffer
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5))
+        # Mock _forward_backward_step to return loss
+        def mock_forward_backward_step(batch, **kwargs):
+            return torch.tensor(0.5)
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
@@ -431,10 +428,9 @@ class TestBenchmarkingRecipeRunBenchmark:
         """Test that optimizer step is called once per iteration."""
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
 
-        # Mock _forward_backward_step to append loss to loss_buffer
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5))
+        # Mock _forward_backward_step to return loss
+        def mock_forward_backward_step(batch, **kwargs):
+            return torch.tensor(0.5)
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         # Mock timers to return a dict with the expected structure
@@ -473,9 +469,8 @@ class TestBenchmarkingRecipeRunBenchmark:
         mock_recipe._get_dp_group_size = MagicMock(return_value=8)
         mock_recipe._maybe_collect_garbage = MagicMock()
 
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5))
+        def mock_forward_backward_step(batch, **kwargs):
+            return torch.tensor(0.5)
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
         mock_recipe.timers._get_global_min_max_time = MagicMock(
@@ -807,10 +802,10 @@ class TestBenchmarkingRecipeLossCalculation:
         # Track loss_buffer contents
         captured_loss_buffers = []
 
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5 + ga_step_idx * 0.1))
-                captured_loss_buffers.append(list(loss_buffer))
+        def mock_forward_backward_step(batch, **kwargs):
+            loss = torch.tensor(0.5 + len(captured_loss_buffers) * 0.1)
+            captured_loss_buffers.append(loss)
+            return loss
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
 
@@ -846,8 +841,8 @@ class TestBenchmarkingRecipeLossCalculation:
         with patch("torch.distributed.barrier"):
             mock_recipe.run_benchmark()
 
-        # Verify loss_buffer was populated correctly (8 GA steps)
-        assert len(captured_loss_buffers[-1]) == 8
+        # Verify losses were produced for all 8 GA steps
+        assert len(captured_loss_buffers) == 8
 
     def test_dp_allreduce_called_for_loss(self, mock_recipe):
         """Test that DP allreduce is called for loss synchronization."""
@@ -862,9 +857,8 @@ class TestBenchmarkingRecipeLossCalculation:
         mock_recipe.__dict__["_dp_allreduce"] = MagicMock(side_effect=track_allreduce)
 
         # Mock forward_backward_step
-        def mock_forward_backward_step(ga_step_idx, batch, loss_buffer=None, **kwargs):
-            if loss_buffer is not None:
-                loss_buffer.append(torch.tensor(0.5))
+        def mock_forward_backward_step(batch, **kwargs):
+            return torch.tensor(0.5)
 
         mock_recipe._forward_backward_step = MagicMock(side_effect=mock_forward_backward_step)
 

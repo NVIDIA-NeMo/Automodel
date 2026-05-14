@@ -59,20 +59,18 @@ from nemo_automodel.components.datasets.llm.megatron.sampler import create_megat
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -95,7 +93,6 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
-    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
@@ -803,53 +800,6 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-            }
-        )
-    else:
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
-
-
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
@@ -1325,33 +1275,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # ------------------ helpers ------------------
     def _forward_backward_step(
         self,
-        idx,
         batch,
         *,
-        loss_buffer,
         num_label_tokens,
-        num_batches,
         is_train: bool = True,
+        is_last_microbatch: bool = True,
     ):
-        forward_backward_step(
-            idx=idx,
+        return forward_backward_step(
             batch=batch,
             device=self.dist_env.device,
             device_mesh=self.device_mesh,
             model_parts=getattr(self, "model_parts", []),
             distributed_config=getattr(self, "distributed_config", None),
             loss_fn=getattr(self, "loss_fn", None),
-            calculate_loss_fn=calculate_loss,
-            loss_buffer=loss_buffer,
             num_label_tokens=num_label_tokens,
-            num_batches=num_batches,
             is_train=is_train,
-            pp_enabled=self.pp_enabled,
-            pp=self.pp,
-            dp_group_size=1 if self.pp_enabled else self._get_dp_group_size(include_cp=True),
-            make_cp_batch_and_ctx_fn=make_cp_batch_and_ctx,
-            get_sync_ctx_fn=get_sync_ctx,
-            filter_forward_kwargs_fn=filter_forward_kwargs,
+            pp=self.pp if self.pp_enabled else None,
+            is_last_microbatch=is_last_microbatch,
             make_cp_batch_kwargs={
                 "use_te": _uses_te_dot_product_attention(
                     self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
@@ -1361,7 +1301,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 "num_chunks": _get_num_thd_chunks(self.pp_enabled, self.cfg),
             },
             model_context_factory=self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else None,
-            filter_pp_batch=True,
             hidden_states_error_message=(
                 "FusedLinearCrossEntropy requires the model to output hidden states. "
                 "Set `model.output_hidden_states=True` in the config."
@@ -1417,8 +1356,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+            loss_buffer.append(
+                self._forward_backward_step(
+                    batch,
+                    num_label_tokens=num_label_tokens,
+                    is_last_microbatch=i == num_batches - 1,
+                )
             )
 
             if i == 0:
@@ -1544,18 +1487,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = 0
 
             for batch in val_dataloader:
-                loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
-                self._forward_backward_step(
-                    0,
-                    batch,
-                    loss_buffer=loss_buffer,
-                    num_label_tokens=None,  # we will normalize outside.
-                    num_batches=1,
-                    is_train=False,
-                )
+                loss = self._forward_backward_step(batch, num_label_tokens=None, is_train=False)
 
-                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_loss += loss.item()
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)

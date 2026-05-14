@@ -808,7 +808,7 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        "nemo_automodel.components.training.forward_backward.make_cp_batch_and_ctx",
         lambda device_mesh, batch, **kwargs: (nullcontext, batch),
     )
 
@@ -818,15 +818,7 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
         "labels": torch.tensor([[1, 2, 3]]),
     }
 
-    loss_buffer = []
-    recipe._forward_backward_step(
-        idx=0,
-        batch=batch,
-        loss_buffer=loss_buffer,
-        num_label_tokens=None,
-        num_batches=1,
-        is_train=False,  # Validation mode
-    )
+    recipe._forward_backward_step(batch=batch, num_label_tokens=None, is_train=False)
 
     # Should use eval, not step
     assert len(pp_info.schedule.eval_calls) == 1, "schedule.eval() should be called once for validation"
@@ -842,7 +834,7 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        "nemo_automodel.components.training.forward_backward.make_cp_batch_and_ctx",
         lambda device_mesh, batch, **kwargs: (nullcontext, batch),
     )
 
@@ -852,15 +844,7 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
         "labels": torch.tensor([[1, 2, 3]]),
     }
 
-    loss_buffer = []
-    recipe._forward_backward_step(
-        idx=0,
-        batch=batch,
-        loss_buffer=loss_buffer,
-        num_label_tokens=None,
-        num_batches=1,
-        is_train=True,  # Training mode
-    )
+    recipe._forward_backward_step(batch=batch, num_label_tokens=None, is_train=True)
 
     # Should use step, not eval
     assert len(pp_info.schedule.step_calls) == 1, "schedule.step() should be called once for training"
@@ -876,7 +860,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monke
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        "nemo_automodel.components.training.forward_backward.make_cp_batch_and_ctx",
         lambda device_mesh, batch, **kwargs: (nullcontext, batch),
     )
 
@@ -886,15 +870,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monke
         "labels": torch.tensor([[1, 2, 3]]),
     }
 
-    loss_buffer = []
-    recipe._forward_backward_step(
-        idx=0,
-        batch=batch,
-        loss_buffer=loss_buffer,
-        num_label_tokens=None,
-        num_batches=1,
-        is_train=False,  # Validation mode
-    )
+    recipe._forward_backward_step(batch=batch, num_label_tokens=None, is_train=False)
 
     # Should use eval without input_ids as first positional arg
     assert len(pp_info.schedule.eval_calls) == 1
@@ -912,7 +888,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
 
     # Mock make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        "nemo_automodel.components.training.forward_backward.make_cp_batch_and_ctx",
         lambda device_mesh, batch, **kwargs: (nullcontext, batch),
     )
 
@@ -922,15 +898,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
         "labels": torch.tensor([[1, 2, 3]]),
     }
 
-    loss_buffer = []
-    recipe._forward_backward_step(
-        idx=0,
-        batch=batch,
-        loss_buffer=loss_buffer,
-        num_label_tokens=None,
-        num_batches=1,
-        is_train=True,  # Training mode
-    )
+    recipe._forward_backward_step(batch=batch, num_label_tokens=None, is_train=True)
 
     # Should use step without input_ids as first positional arg
     assert len(pp_info.schedule.step_calls) == 1
@@ -974,9 +942,9 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
     # Set dist_env.rank to 0 (last stage and main rank are the same in this test)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
 
-    # Mock the forward_backward_step to populate loss_buffer
-    def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
-        loss_buffer.append(torch.tensor(0.5))
+    # Mock the forward_backward_step to return loss
+    def mock_forward_backward_step(batch, *, num_label_tokens, is_train, is_last_microbatch=True):
+        return torch.tensor(0.5)
 
     monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
 
@@ -990,7 +958,7 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     # Mock make_cp_batch_and_ctx
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        "nemo_automodel.components.training.forward_backward.make_cp_batch_and_ctx",
         lambda device_mesh, batch, **kwargs: (nullcontext, batch),
     )
 
@@ -1043,8 +1011,8 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     # Main rank (0) is different from last stage (3)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
 
-    def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
-        loss_buffer.append(torch.tensor(0.0))  # Non-last stage has 0 loss
+    def mock_forward_backward_step(batch, *, num_label_tokens, is_train, is_last_microbatch=True):
+        return torch.tensor(0.0)  # Non-last stage has 0 loss
 
     monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
 
@@ -1056,7 +1024,7 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
+        "nemo_automodel.components.training.forward_backward.make_cp_batch_and_ctx",
         lambda device_mesh, batch, **kwargs: (nullcontext, batch),
     )
 
@@ -1740,8 +1708,8 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr(recipe, "_get_dp_group_size", lambda include_cp=False: dp_group_size)
         monkeypatch.setattr(recipe, "_get_cp_group_size", lambda: 1)
 
-        def mock_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True):
-            loss_buffer.append(torch.tensor(0.5))
+        def mock_forward_backward_step(batch, *, num_label_tokens, is_train=True, is_last_microbatch=True):
+            return torch.tensor(0.5)
 
         monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
         monkeypatch.setattr(
