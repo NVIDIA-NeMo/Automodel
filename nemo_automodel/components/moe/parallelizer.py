@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        return True
+
+    inner_model = getattr(model, "model", None)
+    inner_config = getattr(inner_model, "config", None)
+    return getattr(inner_config, "model_type", None) == "deepseek_v4"
+
+
 def _get_cp_stream() -> torch.cuda.Stream:
     global _CP_STREAM
     if _CP_STREAM is None:
@@ -238,8 +248,14 @@ def apply_fsdp(
             cast_forward_inputs=True,
         )
 
+    fully_shard_impl = fully_shard
+    if _is_deepseek_v4_model(model):
+        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+
+        fully_shard_impl = fully_shard_deepseek_v4
+
     fully_shard_default = functools.partial(
-        fully_shard,
+        fully_shard_impl,
         mesh=fsdp_mesh,
         reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,

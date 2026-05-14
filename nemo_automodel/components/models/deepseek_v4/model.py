@@ -54,7 +54,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
@@ -161,7 +161,7 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         # --- Attention site: collapse → norm → attn → expand ---
-        pre, post, comb = self.attn_hc.compute_weights(x)
+        pre, post, comb = self.attn_hc(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         attn_out, _ = self.self_attn(
             hidden_states=self.input_layernorm(collapsed),
@@ -175,7 +175,7 @@ class DeepseekV4Block(nn.Module):
         x = post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
         # --- MLP site: same pattern ---
-        pre, post, comb = self.ffn_hc.compute_weights(x)
+        pre, post, comb = self.ffn_hc(x)
         collapsed = (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
@@ -202,7 +202,7 @@ class DeepseekV4HashGate(nn.Module):
     pre-assign expert indices.  The routing weight is still computed from the
     gate weight but the *selection* is deterministic per token id.
 
-    tid2eid shape: [vocab_size, n_activated_experts]  (int32, non-trainable)
+    tid2eid shape: [vocab_size, n_activated_experts]  (int64 runtime, non-trainable)
 
     Signature matches ``components.moe.layers.Gate`` — ``forward(x, token_mask,
     cp_mesh)`` returning ``(weights, indices, aux_loss)`` — so the generic MoE
@@ -224,7 +224,8 @@ class DeepseekV4HashGate(nn.Module):
         # Token-id -> expert-id lookup table.  Registered as a persistent
         # buffer (not a Parameter) because FSDP's param-sharding path rejects
         # int tensors via .requires_grad_(), and the table is non-trainable
-        # anyway.  Dtype matches the V4 Flash checkpoint on-disk layout (I64).
+        # anyway.  DeepEP expects runtime expert indices to be int64; the
+        # checkpoint adapter may load the on-disk I32 table into this buffer.
         self.register_buffer(
             "tid2eid",
             torch.zeros(config.vocab_size, self.topk, dtype=torch.int64),
@@ -511,7 +512,15 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         "hc_head.hc_fn",
         "hc_head.hc_base",
         "hc_head.hc_scale",
+        "self_attn.sinks",
+        "self_attn.compressor.wkv",
+        "self_attn.compressor.wgate",
+        "self_attn.compressor.ape",
+        "self_attn.compressor.indexer.wkv",
+        "self_attn.compressor.indexer.wgate",
+        "self_attn.compressor.indexer.ape",
         "e_score_correction_bias",
+        "lm_head",
     ]
 
     @classmethod
@@ -557,7 +566,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             config.hidden_size,
             config.vocab_size,
             bias=False,
-            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            dtype=torch.float32,
         )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
@@ -718,7 +727,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         else:
             hidden_states = model_out
             mtp_hc_hidden = None
-        logits = self.lm_head(hidden_states) if self.lm_head else hidden_states
+        if self.lm_head:
+            hidden_dtype = hidden_states.dtype
+            logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
+        else:
+            logits = hidden_states
         if thd_mode:
             logits = logits.unsqueeze(0)
 
@@ -797,6 +810,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if self.mtp is not None:
             for sublayer in self.mtp.layers:
                 sublayer.init_weights(buffer_device=buffer_device)
+        # After FSDP2 wrapping, parameter dtypes must already be correct from
+        # construction-time metadata. A blanket ``model.to(bf16)`` would
+        # downcast fp32 DTensors before checkpoint load can fill them.
+        if _has_dtensor_params(self):
+            return
         cast_model_to_dtype(self, dtype)
 
 

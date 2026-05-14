@@ -25,8 +25,12 @@ Or as a standalone script:
 
 import pytest
 import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
+from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
@@ -114,6 +118,223 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_dsv4_fsdp_wraps_fp32_islands_without_ignored_trainable_tensors(self, monkeypatch):
+        cfg = _tiny_config(
+            num_hidden_layers=1,
+            num_hash_layers=0,
+            compress_ratios=[4],
+            torch_dtype="bfloat16",
+        )
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            enable_hf_state_dict_adapter=False,
+            dispatcher="torch",
+            experts="torch_mm",
+        )
+        old_default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            model = DeepseekV4ForCausalLM(cfg, backend=backend)
+        finally:
+            torch.set_default_dtype(old_default_dtype)
+
+        block = model.model.layers["0"]
+        module_names = {id(module): name for name, module in block.named_modules()}
+        module_names[id(block)] = "<block>"
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module_names.get(id(module), "<unknown>"), kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+        )
+        ignored_expert_params = set(block.mlp.experts.parameters())
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=object(),
+            mp_policy=input_policy,
+            offload_policy=object(),
+            ignored_params=ignored_expert_params,
+        )
+
+        calls_by_name = {name: kwargs for name, kwargs in calls}
+        expected_fp32_modules = {
+            "attn_hc",
+            "ffn_hc",
+            "self_attn.sinks_param",
+            "self_attn.compressor.wkv",
+            "self_attn.compressor.wgate",
+            "self_attn.compressor.ape_param",
+            "self_attn.compressor.indexer.wkv",
+            "self_attn.compressor.indexer.wgate",
+            "self_attn.compressor.indexer.ape_param",
+        }
+        assert expected_fp32_modules.issubset(calls_by_name)
+        for name in expected_fp32_modules:
+            assert calls_by_name[name]["mp_policy"].param_dtype == torch.float32
+            assert calls_by_name[name]["mp_policy"].reduce_dtype == torch.float32
+
+        parent_ignored = calls_by_name["<block>"]["ignored_params"]
+        assert ignored_expert_params.issubset(parent_ignored)
+        assert len(parent_ignored) == len(ignored_expert_params)
+
+    def test_reference_fp32_parameters_constructed_before_cast(self):
+        cfg = _tiny_config(
+            num_hidden_layers=2,
+            num_hash_layers=0,
+            compress_ratios=[4, 0],
+            torch_dtype="bfloat16",
+        )
+        old_default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            model = DeepseekV4ForCausalLM(
+                cfg,
+                backend=BackendConfig(
+                    attn="sdpa",
+                    linear="torch",
+                    rms_norm="torch",
+                    rope_fusion=False,
+                    enable_hf_state_dict_adapter=False,
+                    dispatcher="torch",
+                    experts="torch_mm",
+                ),
+            )
+        finally:
+            torch.set_default_dtype(old_default_dtype)
+
+        expected_fp32 = (
+            "attn_hc.fn",
+            "attn_hc.base",
+            "attn_hc.scale",
+            "ffn_hc.fn",
+            "ffn_hc.base",
+            "ffn_hc.scale",
+            "hc_head.hc_fn",
+            "hc_head.hc_base",
+            "hc_head.hc_scale",
+            "self_attn.sinks",
+            "self_attn.compressor.wkv",
+            "self_attn.compressor.wgate",
+            "self_attn.compressor.ape",
+            "self_attn.compressor.indexer.wkv",
+            "self_attn.compressor.indexer.wgate",
+            "self_attn.compressor.indexer.ape",
+            "lm_head",
+        )
+        matched = []
+        for name, param in model.named_parameters():
+            if any(keyword in name for keyword in expected_fp32):
+                matched.append(name)
+                assert param.dtype == torch.float32, name
+
+        assert matched
+        assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+        assert model.model.layers["0"].self_attn.wq_a.weight.dtype == torch.bfloat16
+
+    def test_reference_fp32_parameters_survive_bf16_cast(self):
+        cfg = _tiny_config(num_hidden_layers=3, num_hash_layers=0, compress_ratios=[0, 4, 0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        expected_fp32 = (
+            "attn_hc.fn",
+            "attn_hc.base",
+            "attn_hc.scale",
+            "ffn_hc.fn",
+            "ffn_hc.base",
+            "ffn_hc.scale",
+            "hc_head.hc_fn",
+            "hc_head.hc_base",
+            "hc_head.hc_scale",
+            "self_attn.sinks",
+            "self_attn.compressor.wkv",
+            "self_attn.compressor.wgate",
+            "self_attn.compressor.ape",
+            "self_attn.compressor.indexer.wkv",
+            "self_attn.compressor.indexer.wgate",
+            "self_attn.compressor.indexer.ape",
+            "lm_head",
+        )
+        matched = []
+        for name, param in model.named_parameters():
+            if any(keyword in name for keyword in expected_fp32):
+                matched.append(name)
+                assert param.dtype == torch.float32, name
+
+        assert matched
+        assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+
+    def test_initialize_weights_does_not_blanket_cast_dtensor_params(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+
+        monkeypatch.setattr(dsv4_model_module, "_has_dtensor_params", lambda _: True)
+
+        def fail_cast(*args, **kwargs):
+            raise AssertionError("cast_model_to_dtype must not run after FSDP2/DTensor wrapping")
+
+        monkeypatch.setattr(dsv4_model_module, "cast_model_to_dtype", fail_cast)
+
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
+
+    def test_hash_gate_tid2eid_uses_deepep_runtime_int64_dtype(self):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+
+        gate = model.model.layers["0"].mlp.gate
+        assert gate.tid2eid.dtype == torch.int64
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert gate.tid2eid.dtype == torch.int64
+
+        gate.set_input_ids(torch.tensor([[1, 2, 3]]))
+        _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))
+        assert indices.dtype == torch.long
+
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
         """Both HC expand sites mix residual streams as ``comb.T @ x``."""
 
@@ -127,6 +348,9 @@ class TestDeepseekV4ModelSmoke:
                 pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
                 post = torch.zeros_like(pre)
                 return pre, post, self.comb.expand(bsz, seq, -1, -1)
+
+            def forward(self, hidden_streams):
+                return self.compute_weights(hidden_streams)
 
         class _ZeroAttention(torch.nn.Module):
             def forward(self, hidden_states, **kwargs):

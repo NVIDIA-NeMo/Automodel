@@ -213,6 +213,7 @@ def _yaml_error_line(exc: yaml.YAMLError) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the example YAML linter."""
     parser = argparse.ArgumentParser(description="Lint YAML files under examples/.")
     parser.add_argument(
         "paths",
