@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
@@ -38,8 +37,6 @@ from .moe_utils import (
     unpermute,
 )
 
-SHARING_DEEPEP_MANAGER = os.environ.get("NEMO_MOE_SHARE_TOKEN_DISPATCHER", "1") != "0"
-
 """ We use the following notation throughout this file:
      H: hidden size
      B: micro batch size
@@ -49,10 +46,6 @@ SHARING_DEEPEP_MANAGER = os.environ.get("NEMO_MOE_SHARE_TOKEN_DISPATCHER", "1") 
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
-
-
-def _use_async_deepep_dispatch() -> bool:
-    return os.environ.get("NEMO_MOE_DEEPEP_ASYNC_DISPATCH") == "1"
 
 
 class _DispatchManager(ABC):
@@ -501,6 +494,12 @@ class TokenDispatcherConfig:
     moe_hybridep_num_sms: int = 24
     """Number of SMs to use for HybridEP dispatch and combine APIs."""
 
+    moe_share_token_dispatcher: bool = True
+    """Share one communication manager instance across MoE layers for the configured backend."""
+
+    moe_deepep_async_dispatch: bool = False
+    """Use asynchronous DeepEP/UCCL-EP dispatch and allocate dispatched tensors on the communication stream."""
+
 
 class MoEFlexTokenDispatcher:
     """
@@ -558,7 +557,7 @@ class MoEFlexTokenDispatcher:
                 _dispatch_fn=dispatch_fn,
                 _combine_fn=combine_fn,
             )
-            if SHARING_DEEPEP_MANAGER:
+            if self.config.moe_share_token_dispatcher:
                 if MoEFlexTokenDispatcher.shared_uccl_manager is None:
                     MoEFlexTokenDispatcher.shared_uccl_manager = _DeepepManager(**manager_kwargs)
                 self._comm_manager = MoEFlexTokenDispatcher.shared_uccl_manager
@@ -567,7 +566,7 @@ class MoEFlexTokenDispatcher:
         elif backend == "deepep":
             if set_deepep_num_sms is not None:
                 set_deepep_num_sms(self.config.moe_deepep_num_sms)
-            if SHARING_DEEPEP_MANAGER:
+            if self.config.moe_share_token_dispatcher:
                 if MoEFlexTokenDispatcher.shared_deepep_manager is None:
                     MoEFlexTokenDispatcher.shared_deepep_manager = _DeepepManager(
                         group=ep_group,
@@ -592,7 +591,7 @@ class MoEFlexTokenDispatcher:
                     moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                 )
         elif backend == "hybridep":
-            if SHARING_DEEPEP_MANAGER:
+            if self.config.moe_share_token_dispatcher:
                 if MoEFlexTokenDispatcher.shared_hybridep_manager is None:
                     MoEFlexTokenDispatcher.shared_hybridep_manager = _HybridEPManager(
                         group=ep_group,
@@ -718,7 +717,7 @@ class MoEFlexTokenDispatcher:
         hidden_states, _ = self.dispatch_preprocess(
             hidden_states=hidden_states, num_local_tokens=num_local_tokens, probs=probs
         )
-        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and _use_async_deepep_dispatch()
+        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
         hidden_states, _ = self.dispatch_all_to_all(
             hidden_states,
             async_finish=async_dispatch,
@@ -749,7 +748,7 @@ class MoEFlexTokenDispatcher:
             token_probs=token_probs,
             token_indices=token_indices,
         )
-        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and _use_async_deepep_dispatch()
+        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
         hidden_states, _ = self.dispatch_all_to_all(
             hidden_states,
             async_finish=async_dispatch,
