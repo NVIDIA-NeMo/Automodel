@@ -186,6 +186,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     model,
                     sequence_parallel,
                     tp_shard_plan,
+                    tp_size=tp_mesh.size(),
                 ).items()
             }
 
@@ -1400,6 +1401,7 @@ def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    tp_size: int = 1,
 ) -> Dict[str, ParallelStyle]:
     """
     Select the tensor-parallel plan for the given model.
@@ -1407,7 +1409,17 @@ def _get_parallel_plan(
     Priority order:
     1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
     2) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, fall back to HF plan.
-    3) Otherwise, use the default base plan.
+    3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
+    4) Otherwise, fall back to the default base plan.
+
+    When ``tp_size > 1`` and the model has no registered plan in
+    ``PARALLELIZE_FUNCTIONS`` and no HF-native ``_tp_plan`` (i.e. path 4 would
+    apply), this raises ``ValueError`` instead of returning the default base
+    plan. The default plan produces placements that do not populate the
+    ``shard_order`` metadata newer versions of PyTorch DTensor assert on, so
+    using it at ``tp_size > 1`` would crash inside
+    ``torch.distributed.tensor._redistribute`` with an opaque assertion. Path
+    4 is only safe at ``tp_size == 1``, where no actual sharding happens.
     """
     model_parallel_plan = None
     model_cls = type(model)
@@ -1478,6 +1490,20 @@ def _get_parallel_plan(
             model_parallel_plan = hf_plan
             logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
         else:
+            if tp_size > 1:
+                raise ValueError(
+                    f"No tensor-parallel plan is registered for '{model_cls.__name__}' and the "
+                    f"model does not expose a HuggingFace `_tp_plan`. The default base plan "
+                    f"cannot be used at tp_size={tp_size}: it produces DTensor placements "
+                    "without `shard_order` metadata, which trips an internal assert in "
+                    "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
+                    "Register a working plan in one of the following ways:\n"
+                    f"  1. Add an entry for '{model_cls.__name__}' to "
+                    "`nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS`.\n"
+                    "  2. Define a `_tp_plan` on the model class (HF-native per-model TP plan).\n"
+                    "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
+                    "Alternatively, run with tp_size=1."
+                )
             base_model_tp_plan = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),

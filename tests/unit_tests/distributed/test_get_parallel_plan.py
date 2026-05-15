@@ -229,6 +229,71 @@ def test_not_registered_and_hf_fail_base_plan(monkeypatch):
     assert "model.norm" in result_sp
 
 
+def test_default_plan_fallthrough_raises_at_tp_size_gt_1(monkeypatch):
+    """tp_size > 1 with no registered plan and no HF `_tp_plan` should raise a clear ValueError.
+
+    The default base plan produces DTensor placements without ``shard_order`` metadata,
+    which trips an internal assert in ``torch.distributed.tensor._redistribute`` on the
+    first weight redistribute. We refuse early so unknown HF custom-code architectures
+    (loaded with ``trust_remote_code=True``) get an actionable error instead of an
+    opaque PyTorch assertion. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
+    """
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+
+    def _raise_hf(_model):
+        raise RuntimeError("hf fail")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    for sp in (False, True):
+        with pytest.raises(ValueError) as excinfo:
+            _get_parallel_plan(_DummyModel(), sequence_parallel=sp, tp_size=2)
+
+        msg = str(excinfo.value)
+        # The error must name the offending class and the three supported registration paths.
+        assert _DummyModel.__name__ in msg
+        assert "PARALLELIZE_FUNCTIONS" in msg
+        assert "_tp_plan" in msg
+        assert "tp_shard_plan" in msg
+
+
+def test_default_plan_fallthrough_tp_size_1_still_returns_base_plan(monkeypatch):
+    """tp_size == 1 keeps the existing behavior: the default base plan is returned.
+
+    At tp_size == 1 no sharding actually happens, so the missing ``shard_order``
+    metadata never matters. This preserves backwards compatibility for callers that
+    do not pass ``tp_size`` (default is 1).
+    """
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+
+    def _raise_hf(_model):
+        raise RuntimeError("hf fail")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    # Explicit tp_size=1 — should still return the base plan.
+    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_size=1)
+    assert "model.embed_tokens" in result and "lm_head" in result
+
+
+def test_hf_native_plan_unaffected_at_tp_size_gt_1(monkeypatch):
+    """Models that expose an HF-native ``_tp_plan`` must not trip the new guard.
+
+    The fail-fast check only fires when path 4 (default base plan) would be taken.
+    If ``get_hf_tp_shard_plan`` returns a non-empty plan, that plan must be used
+    regardless of ``tp_size``.
+    """
+    hf_plan = {"model.embed_tokens": "embed", "lm_head": "head"}
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda _m: hf_plan, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_size=4)
+    assert result is hf_plan
+
+
 def test_custom_plan_imports_non_dict_raises(monkeypatch):
     """If import resolves but returns non-dict object, raise ValueError."""
 
