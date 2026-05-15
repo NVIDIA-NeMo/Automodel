@@ -242,10 +242,6 @@ def build_model_and_optimizer(
     transformer_engine_fp8_safe_only: bool = False,
     fuse_qkv_projections: bool = False,
     compact_fused_qkv_projections: bool = False,
-    torchao_float8_linear: bool = False,
-    torchao_float8_fsdp_all_gather: bool = True,
-    torchao_float8_recipe_name: Optional[str] = None,
-    torchao_float8_force_recompute_weight_in_bwd: bool = False,
     pipeline_spec: Optional[Dict[str, Any]] = None,
     peft_cfg=None,
     model_type=None,
@@ -267,10 +263,6 @@ def build_model_and_optimizer(
         transformer_engine_fp8_safe_only: Whether to skip TE conversion for known FP8-incompatible modules.
         fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer before FSDP.
         compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
-        torchao_float8_linear: Whether to replace transformer torch.nn.Linear modules with torchao Float8Linear.
-        torchao_float8_fsdp_all_gather: Whether torchao Float8Linear should use FP8 FSDP2 all-gather.
-        torchao_float8_recipe_name: Optional torchao Float8Linear recipe name.
-        torchao_float8_force_recompute_weight_in_bwd: Whether to recompute FP8 weight in backward.
         pipeline_spec: Pipeline specification for pretraining (from_config).
             Required when finetune_mode is False. Should contain:
             - transformer_cls: str (e.g., "WanTransformer3DModel", "FluxTransformer2DModel")
@@ -383,10 +375,6 @@ def build_model_and_optimizer(
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
-            torchao_float8_linear=torchao_float8_linear,
-            torchao_float8_fsdp_all_gather=torchao_float8_fsdp_all_gather,
-            torchao_float8_recipe_name=torchao_float8_recipe_name,
-            torchao_float8_force_recompute_weight_in_bwd=torchao_float8_force_recompute_weight_in_bwd,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -410,10 +398,6 @@ def build_model_and_optimizer(
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
-            torchao_float8_linear=torchao_float8_linear,
-            torchao_float8_fsdp_all_gather=torchao_float8_fsdp_all_gather,
-            torchao_float8_recipe_name=torchao_float8_recipe_name,
-            torchao_float8_force_recompute_weight_in_bwd=torchao_float8_force_recompute_weight_in_bwd,
         )
     fsdp2_manager = created_managers["transformer"]
     transformer_module = pipe.transformer
@@ -619,31 +603,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         self.fuse_qkv_projections = bool(self.cfg.get("model.fuse_qkv_projections", False))
         self.compact_fused_qkv_projections = bool(self.cfg.get("model.compact_fused_qkv_projections", False))
-        self.torchao_float8_linear = bool(self.cfg.get("model.torchao_float8_linear", False))
-        self.torchao_float8_fsdp_all_gather = bool(self.cfg.get("model.torchao_float8_fsdp_all_gather", True))
-        self.torchao_float8_recipe_name = self.cfg.get("model.torchao_float8_recipe_name", "tensorwise")
-        self.torchao_float8_force_recompute_weight_in_bwd = bool(
-            self.cfg.get("model.torchao_float8_force_recompute_weight_in_bwd", False)
-        )
-        self.torchao_float8_precompute_scale_for_fsdp = bool(
-            self.cfg.get("model.torchao_float8_precompute_scale_for_fsdp", False)
-        )
         if self.transformer_engine_fp8:
             self.transformer_engine_linear = True
-        if self.transformer_engine_linear and self.torchao_float8_linear:
-            raise ValueError("Use only one of model.transformer_engine_linear or model.torchao_float8_linear")
-        if self.transformer_engine_fp8 and self.torchao_float8_linear:
-            raise ValueError("Use only one of model.transformer_engine_fp8 or model.torchao_float8_linear")
         if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
             raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
-        if self.torchao_float8_precompute_scale_for_fsdp and not self.torchao_float8_linear:
-            raise ValueError(
-                "model.torchao_float8_precompute_scale_for_fsdp=true requires model.torchao_float8_linear=true"
-            )
-        if self.torchao_float8_precompute_scale_for_fsdp and not self.torchao_float8_fsdp_all_gather:
-            raise ValueError(
-                "model.torchao_float8_precompute_scale_for_fsdp=true requires model.torchao_float8_fsdp_all_gather=true"
-            )
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
         self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
         self.bf16 = torch.bfloat16
@@ -674,17 +637,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
             self._te_fp8_group = dist.group.WORLD if dist.is_initialized() else None
 
-        self._torchao_precompute_float8_dynamic_scale_for_fsdp = None
-        if self.torchao_float8_precompute_scale_for_fsdp:
-            available, precompute_float8_dynamic_scale_for_fsdp = safe_import_from(
-                "torchao.float8",
-                "precompute_float8_dynamic_scale_for_fsdp",
-                msg="model.torchao_float8_precompute_scale_for_fsdp=true requires torchao.float8",
-            )
-            if not available:
-                raise ImportError("model.torchao_float8_precompute_scale_for_fsdp=true requires torchao.float8")
-            self._torchao_precompute_float8_dynamic_scale_for_fsdp = precompute_float8_dynamic_scale_for_fsdp
-
         logging.info("[INFO] Diffusion Trainer with Flow Matching")
         logging.info(
             f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}"
@@ -701,15 +653,6 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info("[INFO] Fuse QKV projections: %s", self.fuse_qkv_projections)
         logging.info("[INFO] Compact fused QKV projections: %s", self.compact_fused_qkv_projections)
-        logging.info(
-            "[INFO] torchao Float8Linear: %s (recipe=%s, fsdp_float8_all_gather=%s, "
-            "force_recompute_weight_in_bwd=%s, precompute_scale_for_fsdp=%s)",
-            self.torchao_float8_linear,
-            self.torchao_float8_recipe_name,
-            self.torchao_float8_fsdp_all_gather,
-            self.torchao_float8_force_recompute_weight_in_bwd,
-            self.torchao_float8_precompute_scale_for_fsdp,
-        )
         logging.info(
             "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
             self.check_loss,
@@ -804,10 +747,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             transformer_engine_fp8_safe_only=self.transformer_engine_fp8,
             fuse_qkv_projections=self.fuse_qkv_projections,
             compact_fused_qkv_projections=self.compact_fused_qkv_projections,
-            torchao_float8_linear=self.torchao_float8_linear,
-            torchao_float8_fsdp_all_gather=self.torchao_float8_fsdp_all_gather,
-            torchao_float8_recipe_name=self.torchao_float8_recipe_name,
-            torchao_float8_force_recompute_weight_in_bwd=self.torchao_float8_force_recompute_weight_in_bwd,
             attention_backend=self.attention_backend,
             pipeline_spec=pipeline_spec,
             peft_cfg=self.peft_cfg,
@@ -960,12 +899,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             recipe=self._te_fp8_recipe,
             amax_reduction_group=self._te_fp8_group,
         )
-
-    def _precompute_torchao_float8_scales(self) -> None:
-        """Precompute torchao FP8 FSDP scales after optimizer updates when enabled."""
-        if self._torchao_precompute_float8_dynamic_scale_for_fsdp is None:
-            return
-        self._torchao_precompute_float8_dynamic_scale_for_fsdp(self.model)
 
     def _get_torch_profiler_config(self) -> Dict[str, Any]:
         """Return the optional torch profiler config."""
@@ -1130,7 +1063,6 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler[0].step(1)
-                self._precompute_torchao_float8_scales()
 
                 perf_window_steps += 1
                 perf_window_local_samples += _count_local_batch_group_samples(batch_group)

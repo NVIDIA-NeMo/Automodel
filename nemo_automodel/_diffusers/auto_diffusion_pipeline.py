@@ -42,7 +42,7 @@ Usage:
 
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -57,7 +57,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     WanParallelizationStrategy,
 )
-from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
 # diffusers is an optional dependency
@@ -331,64 +331,6 @@ def _fuse_transformer_qkv_projections(module: nn.Module, module_name: str, *, co
     return fused
 
 
-def _replace_linear_with_torchao_float8(
-    module: nn.Module,
-    module_name: str,
-    *,
-    enable_fsdp_float8_all_gather: bool = True,
-    recipe_name: Optional[str] = None,
-    force_recompute_fp8_weight_in_bwd: bool = False,
-) -> int:
-    """Replace torch Linear modules with torchao Float8Linear modules for training."""
-    has_torchao_float8, torchao_float8 = safe_import(
-        "torchao.float8",
-        msg="model.torchao_float8_linear=true requires torchao.float8 to be importable",
-    )
-    if not has_torchao_float8:
-        raise ImportError("model.torchao_float8_linear=true requires torchao.float8 to be importable")
-
-    if recipe_name and recipe_name != "tensorwise":
-        config = torchao_float8.Float8LinearConfig.from_recipe_name(recipe_name)
-        if recipe_name.startswith("rowwise"):
-            torch._inductor.config.emulate_precision_casts = True
-    else:
-        config = torchao_float8.Float8LinearConfig()
-
-    config = replace(
-        config,
-        enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
-        force_recompute_fp8_weight_in_bwd=force_recompute_fp8_weight_in_bwd,
-    )
-
-    def module_filter_fn(child: nn.Module, child_name: str) -> bool:
-        if not isinstance(child, nn.Linear):
-            return False
-        if not _is_fp8_training_safe_linear(child_name, child):
-            logger.info(
-                "[torchao-fp8] Keeping %s.%s as torch.nn.Linear for FP8 shape compatibility; weight shape=%s",
-                module_name,
-                child_name,
-                tuple(child.weight.shape),
-            )
-            return False
-        return True
-
-    converted = sum(1 for child_name, child in module.named_modules() if module_filter_fn(child, child_name))
-    torchao_float8.convert_to_float8_training(module, config=config, module_filter_fn=module_filter_fn)
-    active_float8 = sum(1 for child in module.modules() if child.__class__.__name__ == "Float8Linear")
-    logger.info(
-        "[torchao-fp8] Replaced %d Linear modules with Float8Linear in %s; active Float8Linear modules=%d; "
-        "recipe=%s fsdp_float8_all_gather=%s force_recompute_weight_in_bwd=%s",
-        converted,
-        module_name,
-        active_float8,
-        recipe_name or "tensorwise",
-        enable_fsdp_float8_all_gather,
-        force_recompute_fp8_weight_in_bwd,
-    )
-    return active_float8
-
-
 def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
     """
     Factory function to create the appropriate parallel manager based on config.
@@ -564,10 +506,6 @@ class NeMoAutoDiffusionPipeline:
         transformer_engine_fp8_safe_only: bool = False,
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
-        torchao_float8_linear: bool = False,
-        torchao_float8_fsdp_all_gather: bool = True,
-        torchao_float8_recipe_name: Optional[str] = None,
-        torchao_float8_force_recompute_weight_in_bwd: bool = False,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -595,10 +533,6 @@ class NeMoAutoDiffusionPipeline:
             transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
             fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
-            torchao_float8_linear: Whether to replace torch.nn.Linear modules in the transformer with torchao Float8Linear.
-            torchao_float8_fsdp_all_gather: Whether torchao Float8Linear should use FP8 FSDP2 all-gather.
-            torchao_float8_recipe_name: Optional torchao Float8Linear recipe name.
-            torchao_float8_force_recompute_weight_in_bwd: Whether to recompute FP8 weight in backward.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -632,8 +566,6 @@ class NeMoAutoDiffusionPipeline:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
 
-        if transformer_engine_linear and torchao_float8_linear:
-            raise ValueError("Use only one of model.transformer_engine_linear or model.torchao_float8_linear")
         if compact_fused_qkv_projections and not fuse_qkv_projections:
             raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
 
@@ -649,17 +581,6 @@ class NeMoAutoDiffusionPipeline:
                         module,
                         name,
                         fp8_safe_only=transformer_engine_fp8_safe_only,
-                    )
-
-        if torchao_float8_linear:
-            for name, module in _iter_pipeline_modules(pipe):
-                if name == "transformer" and (not components_to_load or name in components_to_load):
-                    _replace_linear_with_torchao_float8(
-                        module,
-                        name,
-                        enable_fsdp_float8_all_gather=torchao_float8_fsdp_all_gather,
-                        recipe_name=torchao_float8_recipe_name,
-                        force_recompute_fp8_weight_in_bwd=torchao_float8_force_recompute_weight_in_bwd,
                     )
 
         if peft_cfg is not None:
@@ -758,10 +679,6 @@ class NeMoAutoDiffusionPipeline:
         transformer_engine_fp8_safe_only: bool = False,
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
-        torchao_float8_linear: bool = False,
-        torchao_float8_fsdp_all_gather: bool = True,
-        torchao_float8_recipe_name: Optional[str] = None,
-        torchao_float8_force_recompute_weight_in_bwd: bool = False,
         **kwargs,
     ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelManager]]:
         """
@@ -787,10 +704,6 @@ class NeMoAutoDiffusionPipeline:
             transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
             fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
-            torchao_float8_linear: Whether to replace torch.nn.Linear modules in the transformer with torchao Float8Linear.
-            torchao_float8_fsdp_all_gather: Whether torchao Float8Linear should use FP8 FSDP2 all-gather.
-            torchao_float8_recipe_name: Optional torchao Float8Linear recipe name.
-            torchao_float8_force_recompute_weight_in_bwd: Whether to recompute FP8 weight in backward.
             **kwargs: Additional arguments
 
         Returns:
@@ -848,8 +761,6 @@ class NeMoAutoDiffusionPipeline:
                 transformer = transformer.to(dev)
             pipe = cls(transformer=transformer)
 
-        if transformer_engine_linear and torchao_float8_linear:
-            raise ValueError("Use only one of model.transformer_engine_linear or model.torchao_float8_linear")
         if compact_fused_qkv_projections and not fuse_qkv_projections:
             raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
 
@@ -857,17 +768,6 @@ class NeMoAutoDiffusionPipeline:
             for name, module in _iter_pipeline_modules(pipe):
                 if name == "transformer" and (not components_to_load or name in components_to_load):
                     _fuse_transformer_qkv_projections(module, name, compact=compact_fused_qkv_projections)
-
-        if torchao_float8_linear:
-            for name, module in _iter_pipeline_modules(pipe):
-                if name == "transformer" and (not components_to_load or name in components_to_load):
-                    _replace_linear_with_torchao_float8(
-                        module,
-                        name,
-                        enable_fsdp_float8_all_gather=torchao_float8_fsdp_all_gather,
-                        recipe_name=torchao_float8_recipe_name,
-                        force_recompute_fp8_weight_in_bwd=torchao_float8_force_recompute_weight_in_bwd,
-                    )
 
         # Make parameters trainable (always true for from_config / pretraining)
         for name, module in _iter_pipeline_modules(pipe):
