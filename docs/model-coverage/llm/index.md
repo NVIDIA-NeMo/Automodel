@@ -39,10 +39,10 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | NVIDIA | [Nemotron-H](nvidia/nemotron-h.md) | `NemotronHForCausalLM` |
 | NVIDIA | [Nemotron-Flash](nvidia/nemotron-flash.md) | `NemotronFlashForCausalLM` |
 | NVIDIA | [Nemotron-Super](nvidia/nemotron-super.md) | `DeciLMForCausalLM` |
-| THUDM / Zhipu AI | [ChatGLM](thudm/chatglm.md) | `ChatGLMModel` |
-| THUDM / Zhipu AI | [GLM-4](thudm/glm4.md) | `GlmForCausalLM`, `Glm4ForCausalLM` |
-| THUDM / ZAI | [GLM-4 MoE](thudm/glm4-moe.md) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
-| THUDM / ZAI | [GLM-5 / GLM-5.1](thudm/glm5-moe-dsa.md) | `GlmMoeDsaForCausalLM` |
+| ZAI / Zhipu AI | [ChatGLM](thudm/chatglm.md) | `ChatGLMModel` |
+| ZAI / Zhipu AI | [GLM-4](thudm/glm4.md) | `GlmForCausalLM`, `Glm4ForCausalLM` |
+| ZAI / Zhipu AI | [GLM-4 MoE](thudm/glm4-moe.md) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
+| ZAI / Zhipu AI | [GLM-5 / GLM-5.1](thudm/glm5-moe-dsa.md) | `GlmMoeDsaForCausalLM` |
 | IBM | [Granite](ibm/granite.md) | `GraniteForCausalLM` |
 | IBM | [Granite MoE](ibm/granite-moe.md) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
 | IBM | [Bamba](ibm/bamba.md) | `BambaForCausalLM` |
