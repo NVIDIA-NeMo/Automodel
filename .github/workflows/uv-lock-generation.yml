@@ -21,6 +21,7 @@ on:
 
 jobs:
   check_uv_lock_and_update:
+    if: github.repository == 'NVIDIA-NeMo/Automodel' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
