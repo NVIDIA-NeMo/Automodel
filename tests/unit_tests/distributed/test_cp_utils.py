@@ -124,10 +124,12 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     monkeypatch.setattr(_cu, "get_train_context", _fake_get_train_ctx)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
-    labels = torch.tensor([[10, 20, 30]])
-    loss_mask = torch.tensor([[1, 1, 1]])
+    # seq_len=4 is divisible by cp_size*2=4 so the cp-divisor padding path is
+    # not exercised here (covered by test_cp_utils_inputs_embeds.py).
+    labels = torch.tensor([[10, 20, 30, 40]])
+    loss_mask = torch.tensor([[1, 1, 1, 1]])
     batch = {
-        "input_ids": torch.tensor([[10, 20, 30]]),
+        "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": labels,
     }
 
@@ -158,10 +160,11 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
     monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    padding_mask = torch.tensor([[True, False, True]])
+    # seq_len=4 is divisible by cp_size*2=4 (no padding triggered).
+    padding_mask = torch.tensor([[True, False, True, True]])
     batch = {
-        "input_ids": torch.tensor([[10, 20, 30]]),
-        "labels": torch.tensor([[10, 20, 30]]),
+        "input_ids": torch.tensor([[10, 20, 30, 40]]),
+        "labels": torch.tensor([[10, 20, 30, 40]]),
         "padding_mask": padding_mask,
     }
 
@@ -187,7 +190,7 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
     monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    seq_len = 6
+    seq_len = 8  # divisible by cp_size*2 to skip the cp-divisor padding path
     # mRoPE position_ids: [3, B, S] — temporal, height, width
     position_ids_3d = torch.arange(3 * 1 * seq_len).view(3, 1, seq_len)
     batch = {

@@ -9,6 +9,22 @@ coverage:
         base: auto
         if_ci_failed: error
         if_not_found: success
+        paths:
+          - "!nemo_automodel/_transformers/retrieval.py"
+          - "!nemo_automodel/recipes/retrieval/**"
+          - "!nemo_automodel/components/datasets/llm/retrieval_*.py"
+          - "!nemo_automodel/components/models/common/inbatch_neg_utils.py"
+      retrieval:
+        target: 60%
+        threshold: 30%
+        base: auto
+        if_ci_failed: error
+        if_not_found: success
+        paths:
+          - "nemo_automodel/_transformers/retrieval.py"
+          - "nemo_automodel/recipes/retrieval/**"
+          - "nemo_automodel/components/datasets/llm/retrieval_*.py"
+          - "nemo_automodel/components/models/common/inbatch_neg_utils.py"
 
 fixes:
   - "/opt/Automodel/::"

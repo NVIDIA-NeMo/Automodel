@@ -418,7 +418,14 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_labels.view(-1),
             )
 
-        if is_thd:
+        # Restore the batch dim for THD only when the inner forward returned
+        # 2D logits.  When the caller feeds the model via ``inputs_embeds``
+        # (shape ``[1, T, H]``), ``NemotronHModel.forward`` squeezes to
+        # ``[T, H]`` for the layer stack and unsqueezes back to ``[1, T, H]``
+        # before returning (see the ``squeezed_for_thd`` branch); the lm_head
+        # then yields ``[1, T, V]`` already and a second unsqueeze here would
+        # produce a spurious ``[1, 1, T, V]``.
+        if is_thd and logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
         return CausalLMOutputWithPast(

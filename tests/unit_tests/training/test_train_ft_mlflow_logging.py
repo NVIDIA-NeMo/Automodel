@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
 from unittest.mock import Mock
@@ -26,6 +27,8 @@ def _install_fake_wandb():
     Provide a minimal 'wandb' package so train_ft can be imported without the real dependency.
     """
     wandb = types.ModuleType("wandb")
+    # accelerate calls importlib.util.find_spec("wandb"), which raises if __spec__ is None
+    wandb.__spec__ = importlib.util.spec_from_loader("wandb", loader=None)
     wandb.run = None
 
     class Settings:

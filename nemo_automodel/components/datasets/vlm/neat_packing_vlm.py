@@ -47,7 +47,14 @@ from nemo_automodel.components.datasets.vlm.samplers import (
 
 logger = logging.getLogger(__name__)
 
-MEDIA_KEYS = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts")
+MEDIA_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "image_position_ids",
+    "pixel_values_videos",
+    "video_grid_thw",
+    "second_per_grid_ts",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +309,10 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
     out["labels"] = sample["labels"][1:]
     out["attention_mask"] = sample["attention_mask"][:-1]
 
+    if (mm_ttids := sample.get("mm_token_type_ids")) is not None:
+        mm_ttids = torch.as_tensor(mm_ttids)
+        out["mm_token_type_ids"] = mm_ttids[0, :-1] if mm_ttids.ndim == 2 else mm_ttids[:-1]
+
     if has_mrope and "position_ids" in sample and sample["position_ids"] is not None:
         out["position_ids"] = sample["position_ids"][:, :-1]
 
@@ -321,11 +332,13 @@ def _build_packed_vlm_sample(
     all_input_ids: list[int] = []
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
+    all_mm_token_type_ids: list[int] = []
     all_position_ids_1d: list[int] = []
     mrope_position_ids_list: list[torch.Tensor] = []
 
     pixel_values_list: list[torch.Tensor] = []
     image_grid_thw_list: list[torch.Tensor] = []
+    image_position_ids_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
     video_grid_thw_list: list[torch.Tensor] = []
     second_per_grid_ts_list: list[torch.Tensor] = []
@@ -345,6 +358,12 @@ def _build_packed_vlm_sample(
         all_labels.extend(labs)
         all_attention_mask.extend([seq_idx] * seq_len)
 
+        mm_ttids = sample.get("mm_token_type_ids")
+        if mm_ttids is not None:
+            all_mm_token_type_ids.extend(mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else mm_ttids)
+        else:
+            all_mm_token_type_ids.extend([0] * seq_len)
+
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
         else:
@@ -355,6 +374,8 @@ def _build_packed_vlm_sample(
         if "image_grid_thw" in sample and sample["image_grid_thw"] is not None:
             n_images += sample["image_grid_thw"].shape[0]
             image_grid_thw_list.append(sample["image_grid_thw"])
+        if "image_position_ids" in sample and sample["image_position_ids"] is not None:
+            image_position_ids_list.append(sample["image_position_ids"])
         if "pixel_values_videos" in sample and sample["pixel_values_videos"] is not None:
             pixel_values_videos_list.append(sample["pixel_values_videos"])
         if "video_grid_thw" in sample and sample["video_grid_thw"] is not None:
@@ -368,6 +389,7 @@ def _build_packed_vlm_sample(
         "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
         "labels": torch.tensor(all_labels, dtype=torch.long),
         "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
+        "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
         "n_images": n_images,
         "n_videos": n_videos,
     }
@@ -379,6 +401,7 @@ def _build_packed_vlm_sample(
 
     packed["pixel_values"] = torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
+    packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
     packed["video_grid_thw"] = torch.cat(video_grid_thw_list, dim=0) if video_grid_thw_list else None
     packed["second_per_grid_ts"] = torch.cat(second_per_grid_ts_list, dim=0) if second_per_grid_ts_list else None

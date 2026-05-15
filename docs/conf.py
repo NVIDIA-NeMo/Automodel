@@ -20,11 +20,16 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
+import datetime
 import os
 import sys
 
 # flake8: noqa
 # pylint: skip-file
+
+# Embed a build timestamp so every docs build produces unique content,
+# ensuring Akamai ECCU revalidate detects changed ETags on S3.
+build_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 project = "NeMo-AutoModel"
 copyright = "2026, NVIDIA Corporation"
@@ -105,7 +110,8 @@ html_theme_options = {
         "version_match": release,
     },
     "extra_head": {
-        """
+        f"""
+    <meta name="build-timestamp" content="{build_timestamp}">
     <script src="https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js" ></script>
     """
     },

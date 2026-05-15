@@ -922,12 +922,21 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     ``pixel_values_videos``, ``video_grid_thw``).
     """
 
-    def __init__(self, dataset, processor, max_length=None, max_retries=10, truncate=False):
+    def __init__(
+        self,
+        dataset,
+        processor,
+        max_length=None,
+        max_retries=10,
+        truncate=False,
+        post_tokenize_hook=None,
+    ):
         self.dataset = dataset
         self.processor = processor
         self.max_length = max_length
         self.truncate = truncate
         self.max_retries = max_retries
+        self.post_tokenize_hook = post_tokenize_hook
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
 
@@ -998,6 +1007,8 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     processor_kwargs["video_metadata"] = [video_metadata]
 
                 result = self.processor(**processor_kwargs)
+                if self.post_tokenize_hook is not None:
+                    result = self.post_tokenize_hook(result, self.processor)
 
                 input_ids = result["input_ids"][0]  # (seq_len,)
                 seq_len = input_ids.shape[0]
