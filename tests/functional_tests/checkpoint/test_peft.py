@@ -274,6 +274,7 @@ def test_hf_peft_checkpoint(force_hf, use_triton):
         "moe_rank_scaling": False,
         "target_modules": [],
         "use_dora": False,
+        "use_memory_efficient_lora": True,
         "use_triton": False,
     }
 
