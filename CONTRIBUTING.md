@@ -111,12 +111,39 @@ pip install grouped_gemm
 
 We use [uv](https://docs.astral.sh/uv/) for managing dependencies.
 
-New required dependencies can be added by `uv add $DEPENDENCY`.
+New required dependencies can be added by `uv add $DEPENDENCY`. If
+`pyproject.toml` changes, update both lock files using the same flow as
+[Generate Uv lock](./.github/workflows/uv-lock-generation.yml). This updates
+the default `uv.lock`, then updates the PyTorch-container lock file with the
+override dependencies from `docker/common/uv-pytorch.toml`. The PyTorch helper
+rewrites `pyproject.toml` for locking, so the commands below save and restore
+your intended `pyproject.toml` contents:
 
-Adding a new dependency will update UV's lock-file. Please check this into your branch:
+The workflow can update lock files automatically for same-repository PRs, but
+it is skipped for PRs opened from forks. If you open a PR from a fork, run this
+lock update flow locally and include the generated lock files in your branch.
 
 ```bash
-git add uv.lock pyproject.toml
+set -e
+
+uv lock --check || uv lock
+
+tmp_pyproject="$(mktemp)"
+cp pyproject.toml "$tmp_pyproject"
+mv uv.lock uv_main.lock
+bash docker/common/update_pyproject_pytorch.sh "$PWD"
+uv lock --check || uv lock
+mv uv.lock docker/common/uv-pytorch.lock
+mv uv_main.lock uv.lock
+cp "$tmp_pyproject" pyproject.toml
+rm "$tmp_pyproject"
+```
+
+Only commit your intended `pyproject.toml` changes plus the generated lock
+files:
+
+```bash
+git add pyproject.toml uv.lock docker/common/uv-pytorch.lock
 git commit -s -m "build: Adding dependencies"
 git push
 ```
