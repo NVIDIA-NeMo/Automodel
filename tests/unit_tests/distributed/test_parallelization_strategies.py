@@ -31,6 +31,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     _DEFAULT_STRATEGY,
     PARALLELIZATION_STRATEGIES,
     DefaultParallelizationStrategy,
+    HunyuanParallelizationStrategy,
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
     WanParallelizationStrategy,
@@ -702,6 +703,61 @@ class TestWanParallelizationStrategy:
 
         env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
         assert result is wan_model
+
+
+class TestHunyuanParallelizationStrategy:
+    """Tests for HunyuanParallelizationStrategy."""
+
+    @pytest.fixture
+    def hunyuan_strategy(self):
+        return HunyuanParallelizationStrategy()
+
+    @pytest.fixture
+    def hunyuan_model(self):
+        model = nn.Module()
+        model.transformer_blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+        return model
+
+    def test_passes_prefetch_options_to_recursive_fsdp(self, hunyuan_strategy, hunyuan_model, monkeypatch):
+        mesh = MagicMock()
+        dp_mesh = MagicMock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.get_fsdp_dp_mesh",
+            lambda *_args, **_kwargs: dp_mesh,
+        )
+        checkpoint_wrapper_mock = MagicMock(side_effect=lambda module, **_kwargs: module)
+        apply_fsdp_mock = MagicMock()
+        fully_shard_mock = MagicMock(side_effect=lambda model, **_kwargs: model)
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            checkpoint_wrapper_mock,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively",
+            apply_fsdp_mock,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.fully_shard",
+            fully_shard_mock,
+            raising=False,
+        )
+
+        result = hunyuan_strategy.parallelize(
+            model=hunyuan_model,
+            device_mesh=mesh,
+            enable_fsdp2_prefetch=False,
+            fsdp2_backward_prefetch_depth=5,
+            fsdp2_forward_prefetch_depth=4,
+        )
+
+        from unittest.mock import ANY
+
+        assert result is hunyuan_model
+        assert checkpoint_wrapper_mock.call_count == 2
+        apply_fsdp_mock.assert_called_once_with(hunyuan_model, dp_mesh, ANY, None, False, 5, 4)
+        fully_shard_mock.assert_called_once()
 
 
 class TestFsdp2StrategyParallelizeIntegration:

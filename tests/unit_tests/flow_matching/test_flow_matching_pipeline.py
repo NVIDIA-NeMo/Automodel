@@ -1005,6 +1005,41 @@ class TestPipelineEdgeCases:
         with pytest.raises(ValueError, match="Loss exploded"):
             pipeline.step(big_model, batch, torch.device("cpu"), torch.float32, global_step=0)
 
+    def test_check_loss_false_skips_loss_explosion_guard(self, simple_adapter):
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            flow_shift=1.0,
+            use_loss_weighting=False,
+            log_interval=1000,
+            summary_log_interval=1000,
+        )
+
+        class HugeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(1, 1)
+
+            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
+                return (torch.full_like(hidden_states, 100.0),)
+
+        batch = {
+            "video_latents": torch.zeros(2, 16, 4, 8, 8),
+            "text_embeddings": torch.randn(2, 77, 4096),
+        }
+
+        _, average_weighted_loss, _, metrics = pipeline.step(
+            HugeModel(),
+            batch,
+            torch.device("cpu"),
+            torch.float32,
+            global_step=0,
+            collect_metrics=False,
+            check_loss=False,
+        )
+
+        assert average_weighted_loss > 100
+        assert metrics == {}
+
     def test_nan_loss_raises(self, simple_adapter):
         pipeline = FlowMatchingPipeline(
             model_adapter=simple_adapter,
