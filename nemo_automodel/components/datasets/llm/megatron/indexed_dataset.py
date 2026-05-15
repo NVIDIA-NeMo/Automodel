@@ -573,7 +573,7 @@ class _S3BinReader(_BinReader):
             Range=f"bytes={bytes_start}-{bytes_end - 1}",
         )["Body"].read()
         self._cache_bytes_start = bytes_start
-        self._cache_bytes_end = bytes_end
+        self._cache_bytes_end = bytes_start + len(self._cache)
         return numpy.frombuffer(self._extract_from_cache(offset, size), dtype=dtype)
 
     def __del__(self) -> None:
