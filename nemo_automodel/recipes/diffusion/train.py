@@ -20,7 +20,6 @@ import os
 import time
 from contextlib import nullcontext
 from math import ceil
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
@@ -900,83 +899,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             amax_reduction_group=self._te_fp8_group,
         )
 
-    def _get_torch_profiler_config(self) -> Dict[str, Any]:
-        """Return the optional torch profiler config."""
-        profiling_cfg = self.cfg.get("profiling", {}) or {}
-        if hasattr(profiling_cfg, "to_dict"):
-            profiling_cfg = profiling_cfg.to_dict()
-        torch_profiler_cfg = profiling_cfg.get("torch_profiler", profiling_cfg) or {}
-        if hasattr(torch_profiler_cfg, "to_dict"):
-            torch_profiler_cfg = torch_profiler_cfg.to_dict()
-        return dict(torch_profiler_cfg)
-
-    def _should_profile_current_rank(self, profiler_cfg: Dict[str, Any]) -> bool:
-        """Return whether torch profiling should run on this rank."""
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        ranks = profiler_cfg.get("ranks", [0])
-        if ranks in ("all", "*"):
-            return True
-        if isinstance(ranks, int):
-            return rank == ranks
-        return rank in {int(profile_rank) for profile_rank in ranks}
-
-    def _build_torch_profiler(self) -> Optional[Any]:
-        """Build an opt-in torch profiler for bounded performance experiments."""
-        profiler_cfg = self._get_torch_profiler_config()
-        if not profiler_cfg.get("enabled", False):
-            return None
-        if not self._should_profile_current_rank(profiler_cfg):
-            return None
-
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        output_dir = Path(str(profiler_cfg.get("output_dir", "profile_default"))).expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-        wait_steps = int(profiler_cfg.get("wait_steps", 1))
-        warmup_steps = int(profiler_cfg.get("warmup_steps", 1))
-        active_steps = int(profiler_cfg.get("active_steps", 3))
-        repeat = int(profiler_cfg.get("repeat", 1))
-        row_limit = int(profiler_cfg.get("row_limit", 40))
-        sort_by = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
-
-        def trace_handler(profiler: torch.profiler.profile) -> None:
-            step = int(self.step_scheduler.step)
-            trace_path = output_dir / f"rank{rank}_step{step}.pt.trace.json"
-            summary_path = output_dir / f"rank{rank}_step{step}_key_averages.txt"
-            profiler.export_chrome_trace(str(trace_path))
-            summary = profiler.key_averages().table(sort_by=sort_by, row_limit=row_limit)
-            summary_path.write_text(summary + "\n", encoding="utf-8")
-            logging.info("[PROFILE] Wrote torch profiler trace to %s", trace_path)
-            logging.info("[PROFILE] Wrote torch profiler summary to %s", summary_path)
-
-        logging.info(
-            "[PROFILE] Torch profiler enabled on rank %s: output_dir=%s wait=%s warmup=%s active=%s repeat=%s",
-            rank,
-            output_dir,
-            wait_steps,
-            warmup_steps,
-            active_steps,
-            repeat,
-        )
-        return torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(
-                wait=wait_steps,
-                warmup=warmup_steps,
-                active=active_steps,
-                repeat=repeat,
-            ),
-            on_trace_ready=trace_handler,
-            record_shapes=bool(profiler_cfg.get("record_shapes", True)),
-            profile_memory=bool(profiler_cfg.get("profile_memory", True)),
-            with_stack=bool(profiler_cfg.get("with_stack", False)),
-            with_flops=bool(profiler_cfg.get("with_flops", False)),
-        )
-
     def run_train_validation_loop(self):
         logging.info("[INFO] Starting T2V training with Flow Matching")
         logging.info(f"[INFO] Global Batch size: {self.global_batch_size}; Local Batch size: {self.local_batch_size}")
@@ -990,9 +912,6 @@ class TrainDiffusionRecipe(BaseRecipe):
         perf_window_local_samples = 0
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        profiler = self._build_torch_profiler()
-        if profiler is not None:
-            profiler.start()
 
         for epoch in self.step_scheduler.epochs:
             if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
@@ -1131,9 +1050,6 @@ class TrainDiffusionRecipe(BaseRecipe):
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
 
-                if profiler is not None:
-                    profiler.step()
-
             if num_steps == 0:
                 logging.info(f"[INFO] Epoch {epoch + 1} skipped (already completed in previous run)")
                 continue
@@ -1147,9 +1063,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
             if wandb.run is not None:
                 wandb.finish()
-
-        if profiler is not None:
-            profiler.stop()
 
         logging.info("[INFO] Training complete!")
 

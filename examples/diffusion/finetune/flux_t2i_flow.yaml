@@ -35,20 +35,6 @@ fsdp:
   fsdp2_backward_prefetch_depth: 3
   fsdp2_forward_prefetch_depth: 2
 
-profiling:
-  enabled: false
-  output_dir: profile_default
-  wait_steps: 1
-  warmup_steps: 1
-  active_steps: 3
-  repeat: 1
-  ranks: [0]
-  record_shapes: true
-  profile_memory: true
-  with_stack: false
-  with_flops: false
-  row_limit: 40
-
 flow_matching:
   adapter_type: "flux"
   adapter_kwargs:
