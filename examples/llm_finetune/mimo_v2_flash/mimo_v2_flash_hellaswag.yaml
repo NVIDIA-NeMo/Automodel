@@ -1,0 +1,135 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 16 H100 nodes (128 GPUs):
+#   torchrun --nproc-per-node 8 -m nemo_automodel.cli.app examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 8
+  ckpt_every_steps: 25
+  val_every_steps: 500
+  num_epochs: 1
+  max_steps: 100
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 32
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.mimo_v2_flash.config.MiMoV2FlashConfig.from_pretrained
+    pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2-Flash
+    name_or_path: XiaomiMiMo/MiMo-V2-Flash
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    dispatcher: deepep
+    experts: torch_mm
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/mimo_v2_flash
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+  allow_partial_optimizer_load: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2-Flash
+    trust_remote_code: true
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2-Flash
+    trust_remote_code: true
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.1
+
+wandb:
+  project: automodel-mimo-v2-flash
+  name: mimo_v2_flash_hellaswag_16n
+  mode: online

@@ -39,6 +39,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
+from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +266,18 @@ def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
     return hidden_size, vocab_size
 
 
+def _get_pipeline_activation_dtype(model_config, stage: PipelineStage) -> torch.dtype:
+    config_dtype = getattr(model_config, "torch_dtype", None)
+    if isinstance(config_dtype, torch.dtype):
+        return config_dtype
+    if isinstance(config_dtype, str):
+        return dtype_from_str(config_dtype, default=torch.bfloat16)
+    try:
+        return next(param.dtype for param in stage.submod.parameters() if param.is_floating_point())
+    except StopIteration:
+        return torch.bfloat16
+
+
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
     model_config,
@@ -299,11 +312,7 @@ def _precompute_stage_shapes(
     hc_mult = int(getattr(model_config, "hc_mult", 1) or 1) if is_v4 else 1
 
     for stage in stages:
-        # Infer the computation dtype from the stage's parameters
-        try:
-            model_dtype = next(stage.submod.parameters()).dtype
-        except StopIteration:
-            model_dtype = torch.bfloat16
+        model_dtype = _get_pipeline_activation_dtype(model_config, stage)
 
         inner_submod = getattr(stage.submod, "model", stage.submod)
         stage_has_norm = getattr(inner_submod, "norm", None) is not None
@@ -485,6 +494,7 @@ def split_model_into_stages(
     is_v4_keep = getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
     has_rotary_emb_compress = is_v4_keep and hasattr(text_model, "rotary_emb_compress")
     has_hc_head = is_v4_keep and hasattr(text_model, "hc_head")
+    has_swa_rotary_emb = hasattr(text_model, "swa_rotary_emb")
 
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
@@ -505,6 +515,9 @@ def split_model_into_stages(
         if has_rotary_emb_compress:
             for stage_modules in module_names_per_stage:
                 stage_modules.append(f"{layers_prefix}rotary_emb_compress")
+        if has_swa_rotary_emb:
+            for stage_modules in module_names_per_stage:
+                stage_modules.append(f"{layers_prefix}swa_rotary_emb")
         if has_hc_head:
             module_names_per_stage[-1].append(f"{layers_prefix}hc_head")
 
