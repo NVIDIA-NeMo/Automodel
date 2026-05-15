@@ -32,10 +32,16 @@ dist_env:
 
 # Model
 # Option 1 – shorthand builder
+# `torch_dtype` controls the *storage* dtype of the sharded parameter (and
+# therefore of the AdamW EMA buffers). `float32` keeps the optimizer state in
+# fp32 -- the Megatron-style master-weights pattern -- while bf16
+# forward/backward compute is still applied via the FSDP2 `mp_policy` below.
+# See docs/guides/mixed-precision.md for the trade-offs and when bf16 storage
+# is acceptable.
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
-  torch_dtype: bf16
+  torch_dtype: float32
   trust_remote_code: True
 
 checkpoint:
@@ -92,6 +98,17 @@ distributed:
 
   sequence_parallel: false
   activation_checkpointing: true
+
+  # FSDP2 mixed-precision policy. The defaults applied by FSDP2Config are the
+  # values shown here (Megatron-style: bf16 compute, fp32 gradient reduction);
+  # the block is included explicitly so the canonical pattern is discoverable
+  # from a recipe. See docs/guides/mixed-precision.md for the trade-offs.
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
 
   pipeline:
     pp_schedule: interleaved1f1b
