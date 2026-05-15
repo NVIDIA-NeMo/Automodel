@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``Gemma4WithDrafter`` against real HF transformers 5.8.
+"""Unit tests for ``Gemma4WithDrafter``
 
 These tests exercise the composite end-to-end against the real HuggingFace
 ``Gemma4ForConditionalGeneration`` and ``Gemma4AssistantForCausalLM`` on a tiny
@@ -286,13 +286,24 @@ class TestCompositeGradientFlow:
         out = comp(input_ids=ids)
         out.drafter_logits[0].float().sum().backward()
 
-        # pre_projection / post_projection are the drafter's signature layers
-        # for joint training (they consume base's embed+h_final and project
-        # back to backbone-hidden).
+        # pre_projection is the drafter's signature input-side layer for joint
+        # training: it consumes ``cat(base.embed, base.h_final)`` and projects
+        # to drafter hidden, so any gradient from the drafter logits MUST land
+        # here. (``post_projection`` is the recurrent output layer used only
+        # for multi-step drafter chains; we run ``drafter_num_steps=1`` so it
+        # is not on the loss path and intentionally receives no gradient.)
         assert comp.drafter.pre_projection.weight.grad is not None
         assert torch.any(comp.drafter.pre_projection.weight.grad != 0)
-        assert comp.drafter.post_projection.weight.grad is not None
-        assert torch.any(comp.drafter.post_projection.weight.grad != 0)
+
+        # Also confirm at least one drafter decoder body weight (q_proj) is
+        # being trained -- catches the failure mode where pre_projection sees
+        # gradient but the body is detached for some reason.
+        seen_body = False
+        for name, p in comp.drafter.named_parameters():
+            if ".q_proj." in name and p.grad is not None and torch.any(p.grad != 0):
+                seen_body = True
+                break
+        assert seen_body, "Drafter loss did not reach any drafter decoder q_proj weight"
 
     def test_drafter_loss_reaches_base_kv_store_layers(self, composite):
         """The drafter loss must propagate through ``shared_kv_states`` back

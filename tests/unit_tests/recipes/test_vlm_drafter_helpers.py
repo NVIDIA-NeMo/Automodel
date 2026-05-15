@@ -28,9 +28,11 @@ from nemo_automodel.recipes.vlm.finetune import (
 
 
 class TestShiftLabelsLeft:
-    """Drafter step k predicts position ``t + 1 + k`` of the input sequence,
-    so the corresponding labels are the original labels shifted left by
-    ``k + 1`` positions, with the trailing ``k + 1`` columns masked to -100."""
+    """The VLM collate pipeline pre-shifts labels by 1 so that ``labels[t] ==
+    input_ids[t + 1]``. Drafter step ``k`` predicts position ``t + 1 + k`` of
+    the original sequence, which maps to ``labels[t + k]`` in the pre-shifted
+    convention -- so ``_shift_labels_left`` is called with ``k`` (not ``k + 1``).
+    For ``k = 0`` the shift is a no-op."""
 
     def test_k_zero_is_identity(self):
         labels = torch.tensor([[1, 2, 3, 4, 5]])
@@ -41,6 +43,37 @@ class TestShiftLabelsLeft:
         labels = torch.tensor([[1, 2, 3, 4, 5]])
         out = _shift_labels_left(labels, -1)
         torch.testing.assert_close(out, labels)
+
+    def test_post_collate_semantic_alignment(self):
+        """Anchor the semantic contract: given input_ids and the VLM-collate
+        pre-shifted labels (``labels[t] == input_ids[t + 1]``), the drafter
+        step-k target after ``_shift_labels_left(labels, k)`` is
+        ``input_ids[t + 1 + k]`` (i.e. the token (k+1) positions ahead of
+        ``input_ids[t]``).
+
+        This pins the convention that the off-by-one bug violated -- if a
+        future change reintroduces a ``k + 1`` shift, this test fails."""
+        input_ids = torch.tensor([[10, 20, 30, 40, 50, 60, 70, 80]])
+        # Simulate the collate's ``labels = labels[:, 1:]`` shift.
+        labels = input_ids[:, 1:]
+
+        # k = 0: drafter target should equal input_ids[t + 1] for every t.
+        target_k0 = _shift_labels_left(labels, 0)
+        for t in range(labels.shape[-1] - 1):
+            assert target_k0[0, t].item() == input_ids[0, t + 1].item(), (
+                f"k=0 step at t={t}: expected input_ids[t+1]={input_ids[0, t + 1]}, got {target_k0[0, t]}"
+            )
+        # Last position drops out (no next token); it stays at the pre-collate value.
+        assert target_k0[0, -1].item() == labels[0, -1].item()
+
+        # k = 1: drafter target should equal input_ids[t + 2] for every t in range.
+        target_k1 = _shift_labels_left(labels, 1)
+        for t in range(labels.shape[-1] - 2):
+            assert target_k1[0, t].item() == input_ids[0, t + 2].item(), (
+                f"k=1 step at t={t}: expected input_ids[t+2]={input_ids[0, t + 2]}, got {target_k1[0, t]}"
+            )
+        # Trailing entries are -100 (no valid target k+1 positions ahead).
+        assert target_k1[0, -1].item() == -100
 
     def test_shift_one(self):
         labels = torch.tensor([[1, 2, 3, 4, 5]])

@@ -51,11 +51,14 @@ model:
   # Joint training knobs.
   drafter_loss_weight: 0.1
   drafter_num_steps: 1
-  # Base 4B uses kv-shared layers, hence text_config.use_cache: true to keep
-  # the K/V state cache enabled in HF's forward (same as gemma4_4b.yaml).
+  # Base 4B needs ``text_config.use_cache: true`` so the DynamicCache is
+  # allocated inside HF's forward (same as gemma4_4b.yaml). Without it, the
+  # sliding-window attention mask path silently degrades (the SDPA mask-skip
+  # optimization collapses sliding layers into plain causal attention),
+  # which inflates the initial training loss. This is orthogonal to KV-
+  # sharing -- that goes through ``shared_kv_states``, not ``past_key_values``.
   text_config:
     use_cache: true
-    output_hidden_states: true
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false

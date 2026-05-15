@@ -57,12 +57,6 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
         def from_config(cls, config: Gemma4AssistantConfig, **kwargs):
             return cls(config, **kwargs)
 
-        @classmethod
-        def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-            if not _GEMMA4_ASSISTANT_HF_AVAILABLE:
-                raise UnavailableError("transformers.models.gemma4_assistant is not available.")
-            return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
     ModelClass = Gemma4DrafterForCausalLM
 else:
 

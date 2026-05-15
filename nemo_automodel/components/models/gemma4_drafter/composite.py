@@ -107,12 +107,18 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         *,
         drafter_loss_weight: float = 1.0,
         drafter_num_steps: int = 1,
+        freeze_base_for_drafter: bool = False,
+        share_embedding_with_base: bool = False,
+        base_activation_checkpointing: bool = False,
     ):
         super().__init__()
         self.base = base
         self.drafter = drafter
         self.drafter_loss_weight = float(drafter_loss_weight)
         self.drafter_num_steps = int(drafter_num_steps)
+        self.freeze_base_for_drafter = bool(freeze_base_for_drafter)
+        self.share_embedding_with_base = bool(share_embedding_with_base)
+        self.base_activation_checkpointing = bool(base_activation_checkpointing)
 
         if self.drafter_num_steps != 1:
             raise NotImplementedError(
@@ -130,6 +136,44 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
                 f"drafter.config.backbone_hidden_size ({drafter_config.backbone_hidden_size}) "
                 f"must match base text_config.hidden_size ({base_text_config.hidden_size})"
             )
+
+        if self.share_embedding_with_base:
+            # One-shot init alignment: copy the base's input-embedding weight into
+            # the drafter's ``embed_tokens``. The drafter's ``lm_head`` is tied to
+            # its own ``embed_tokens`` (per HF ``_tied_weights_keys``), so the
+            # ``lm_head`` row weights start aligned with the base's embedding too.
+            # The two embeddings then evolve as independent parameters during
+            # training (each accumulates its own gradient). True shared-storage
+            # tying is intentionally avoided -- it conflicts with FSDP2's
+            # per-module ownership model.
+            base_embed = base.get_input_embeddings()
+            drafter_embed = drafter.get_input_embeddings()
+            if base_embed.weight.shape != drafter_embed.weight.shape:
+                raise ValueError(
+                    f"share_embedding_with_base=True but base embed_tokens shape "
+                    f"{tuple(base_embed.weight.shape)} != drafter embed_tokens shape "
+                    f"{tuple(drafter_embed.weight.shape)}. The two models must share a vocabulary."
+                )
+            with torch.no_grad():
+                drafter_embed.weight.copy_(base_embed.weight)
+            logger.info(
+                "Gemma4WithDrafter: copied base embed_tokens into drafter at init (share_embedding_with_base=True)."
+            )
+
+        if self.freeze_base_for_drafter:
+            for p in self.base.parameters():
+                p.requires_grad_(False)
+            logger.info("Gemma4WithDrafter: froze all base parameters (freeze_base_for_drafter=True).")
+
+        if self.base_activation_checkpointing:
+            enable_fn = getattr(self.base, "gradient_checkpointing_enable", None)
+            if enable_fn is None:
+                raise RuntimeError(
+                    "base_activation_checkpointing=True but the base model does not expose "
+                    "`gradient_checkpointing_enable`. Pass a HF-style model."
+                )
+            enable_fn()
+            logger.info("Gemma4WithDrafter: enabled gradient checkpointing on the base.")
 
     @staticmethod
     def _get_base_text_config(base: nn.Module):
@@ -150,6 +194,9 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         pretrained_model_name_or_path: Optional[str] = None,
         drafter_loss_weight: float = 1.0,
         drafter_num_steps: int = 1,
+        freeze_base_for_drafter: bool = False,
+        share_embedding_with_base: bool = False,
+        base_activation_checkpointing: bool = False,
         torch_dtype: Any = None,
         attn_implementation: Optional[str] = None,
         use_liger_kernel: Optional[bool] = None,
@@ -176,8 +223,20 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             drafter_loss_weight: ``lambda`` multiplier on the drafter loss.
             drafter_num_steps: Number of recurrent drafter steps. Currently
                 must be 1.
-            torch_dtype: dtype to use for both sub-models (the drafter is
-                bf16-only; passing other dtypes will surface a warning).
+            freeze_base_for_drafter: If True, freeze all base parameters so
+                only the drafter is trained (drafter-only sub-case). Default
+                False (joint training).
+            share_embedding_with_base: If True, copy the base's input
+                embedding into the drafter's ``embed_tokens`` once at init.
+                The drafter's ``lm_head`` is tied to its own ``embed_tokens``
+                so the row weights start aligned with the base too. The two
+                embeddings then evolve as independent parameters during
+                training.
+            base_activation_checkpointing: If True, enable HF gradient
+                checkpointing on the base to reduce activation memory.
+                Important for the 4B + drafter + long-context setting.
+            torch_dtype: dtype to use for both sub-models. Must be
+                ``torch.bfloat16`` -- the drafter is bf16-only.
             attn_implementation: Forwarded to both sub-loads.
             use_liger_kernel: Forwarded to both sub-loads.
             use_sdpa_patching: Forwarded to both sub-loads.
@@ -218,6 +277,17 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             raise NotImplementedError(
                 "PEFT (LoRA/QLoRA) for joint base + drafter fine-tuning is not "
                 "supported yet. Run full SFT or open an issue."
+            )
+        if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ()):
+            if device_mesh["cp"].size() > 1:
+                raise ValueError(
+                    "Context parallelism is not supported with Gemma4WithDrafter "
+                    "(the drafter's shared_kv_states path is not CP-safe). "
+                    "Set `cp_size: 1` in the distributed config."
+                )
+        if torch_dtype is not None and torch_dtype != torch.bfloat16:
+            raise ValueError(
+                f"Gemma4WithDrafter requires torch_dtype=torch.bfloat16 (the drafter is bf16-only). Got {torch_dtype}."
             )
 
         # Imported here to avoid a circular import at module load time.
@@ -282,6 +352,9 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             drafter,
             drafter_loss_weight=drafter_loss_weight,
             drafter_num_steps=drafter_num_steps,
+            freeze_base_for_drafter=freeze_base_for_drafter,
+            share_embedding_with_base=share_embedding_with_base,
+            base_activation_checkpointing=base_activation_checkpointing,
         )
 
     # ------------------------------------------------------------------
@@ -308,13 +381,21 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         # pop it just in case to keep the composite forward stable.
         kwargs.pop("logits_to_keep", None)
 
+        # Note: do NOT force ``use_cache=False`` here. For Gemma 4 the
+        # presence of a ``DynamicCache`` changes how sliding-window attention
+        # masks are constructed (``masking_utils._preprocess_mask_arguments``
+        # pulls ``is_sliding`` / ``get_mask_sizes`` from the cache). Without
+        # the cache the SDPA mask-skip optimization can collapse sliding
+        # layers into plain causal attention, which silently inflates the
+        # initial training loss. The YAML sets ``text_config.use_cache: true``
+        # so the cache gets allocated per forward and discarded; small
+        # overhead, correct math.
         base_out = self.base(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_hidden_states=True,
             return_shared_kv_states=True,
-            use_cache=False,
             **kwargs,
         )
 
