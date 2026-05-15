@@ -5,7 +5,7 @@
 Common workflows used for setting up Automodel environment:
 
 1. [Developing with Automodel container](#1-developing-with-automodel-container)
-2. [Developing with UV sync/pip install]($2-developing-with-uv-syncpip-install)
+2. [Developing with UV sync/pip install](#2-developing-with-uv-syncpip-install)
 3. [Developing with custom docker build](#3-developing-with-custom-docker-build)
 
 ### 1. Developing with Automodel container
