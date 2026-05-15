@@ -119,9 +119,10 @@ override dependencies from `docker/common/uv-pytorch.toml`. The PyTorch helper
 rewrites `pyproject.toml` for locking, so the commands below save and restore
 your intended `pyproject.toml` contents:
 
-The workflow can update lock files automatically for same-repository PRs, but
-it is skipped for PRs opened from forks. If you open a PR from a fork, run this
-lock update flow locally and include the generated lock files in your branch.
+The workflow can update lock files automatically for same-repository PRs. For
+PRs opened from forks, the workflow runs in check-only mode because it cannot
+push fixes back to the fork. If the fork check fails, run this lock update flow
+locally and include the generated lock files in your branch.
 
 ```bash
 set -e
