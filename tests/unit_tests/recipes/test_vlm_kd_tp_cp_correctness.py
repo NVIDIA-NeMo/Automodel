@@ -99,6 +99,7 @@ def _make_recipe(*, student: nn.Module, teacher: nn.Module, kd_loss_fn: KDLoss, 
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=False)
     recipe._ce_loss_buffer = []
     recipe._kd_loss_buffer = []
+    recipe._offload_teacher_model = False
     recipe._get_dp_group_size = lambda include_cp=False: 1
     return recipe
 

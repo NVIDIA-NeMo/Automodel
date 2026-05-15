@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 
 class MegatronPretraining:
+    """Build Megatron pretraining datasets and dataloaders."""
+
     def __init__(
         self,
         paths: Path | List | Dict[str, List],
