@@ -17,11 +17,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.device_mesh import DeviceMesh
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from nemo_automodel.components.models.common import (
@@ -35,7 +32,6 @@ from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import Mi
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.moe.state_dict_utils import is_dtensor
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -101,26 +97,6 @@ def _fallback_additive_mask(
         pad_add = (1.0 - attention_mask.to(dtype=dtype, device=device)).unsqueeze(1).unsqueeze(2) * min_value
         additive = additive + pad_add
     return additive
-
-
-def _dtensor_to_full_tensor(value: torch.Tensor) -> torch.Tensor:
-    if not is_dtensor(value):
-        return value
-
-    result = value.to_local().contiguous()
-    for mesh_dim, placement in enumerate(value.placements):
-        placement_name = placement.__class__.__name__
-        if placement_name == "Replicate":
-            continue
-        group = value.device_mesh.get_group(mesh_dim)
-        if placement_name == "Shard":
-            gathered = dist_nn_f.all_gather(result, group=group)
-            result = torch.cat(gathered, dim=placement.dim).contiguous()
-        elif placement_name == "Partial":
-            result = dist_nn_f.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
-        else:
-            raise NotImplementedError(f"Unsupported DTensor placement for MiMo gate: {placement}")
-    return result
 
 
 def _ensure_additive_mask(
@@ -349,7 +325,7 @@ class MiMoV2FlashBlock(nn.Module):
         is_moe_layer = getattr(config, "n_routed_experts", None) is not None and bool(config.moe_layer_freq[layer_idx])
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         if is_moe_layer:
-            self.mlp = MiMoV2MoE(moe_config, backend)
+            self.mlp = MoE(moe_config, backend)
             self.mlp.gate.weight = nn.Parameter(
                 self.mlp.gate.weight.to(torch.float32),
                 requires_grad=self.mlp.gate.weight.requires_grad,
@@ -402,142 +378,6 @@ class MiMoV2FlashBlock(nn.Module):
         self.mlp.init_weights(buffer_device)
 
 
-class MiMoV2MoE(MoE):
-    """MiMo MoE wrapper that preserves fp32 routing weights.
-
-    The HF reference computes sigmoid router probabilities and the weighted
-    expert accumulation in fp32, only casting the final MoE result back to the
-    hidden-state dtype.  Automodel's generic Gate normally returns weights in
-    the activation dtype, so MiMo keeps the routing probabilities in fp32 before
-    passing them to the selected expert backend.
-    """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        padding_mask: torch.Tensor | None = None,
-        cp_mesh: DeviceMesh | None = None,
-    ) -> torch.Tensor:
-        if cp_mesh is None:
-            cp_mesh = self.cp_mesh
-
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        if padding_mask is not None:
-            token_mask = (~padding_mask).flatten()
-        else:
-            token_mask = torch.ones(x.size(0), dtype=torch.bool, device=x.device)
-
-        weights, indices = self._gate_forward_hf(x)
-        if self.backend.dispatcher == "torch" and hasattr(self.experts, "gate_and_up_projs"):
-            y = self._forward_hf_loop(x, token_mask, weights, indices)
-            return y.view(shape)
-
-        y = self.experts(x, token_mask, weights, indices)
-        return y.view(shape)
-
-    def _gate_forward_hf(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        gate_weight = _dtensor_to_full_tensor(self.gate.weight)
-        scores = F.linear(x.float(), gate_weight.float(), bias=None).sigmoid()
-        if self.gate.score_func != "sigmoid":
-            raise NotImplementedError(f"Unsupported MiMo gate score function: {self.gate.score_func}")
-
-        scores_for_choice = scores
-        if self.gate.e_score_correction_bias is not None:
-            correction_bias = _dtensor_to_full_tensor(self.gate.e_score_correction_bias)
-            scores_for_choice = scores_for_choice + correction_bias.float().unsqueeze(0)
-
-        if self.gate.n_groups > 1:
-            scores_for_choice = scores_for_choice.view(x.size(0), self.gate.n_groups, -1)
-            group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
-            group_idx = torch.topk(group_scores, k=self.gate.topk_groups, dim=-1, sorted=False)[1]
-            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
-            score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
-            scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(~score_mask.bool(), float("-inf"))
-
-        indices = torch.topk(scores_for_choice, k=self.gate.topk, dim=-1, sorted=False)[1]
-        weights = scores.gather(1, indices)
-        if self.gate.norm_topk_prob and self.gate.topk > 1:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        weights = weights * self.gate.route_scale
-        return weights, indices
-
-    def _forward_hf_loop(
-        self,
-        x: torch.Tensor,
-        token_mask: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        gate_and_up_projs = self.experts.gate_and_up_projs
-        down_projs = self.experts.down_projs
-        if is_dtensor(gate_and_up_projs):
-            ep_mesh = gate_and_up_projs.device_mesh
-            ep_size = ep_mesh.size()
-            ep_rank = ep_mesh.get_local_rank()
-            gate_and_up_projs = gate_and_up_projs.to_local()
-            down_projs = down_projs.to_local()
-        else:
-            ep_mesh = None
-            ep_size = 1
-            ep_rank = 0
-
-        gate_and_up_projs = gate_and_up_projs.to(x.dtype)
-        down_projs = down_projs.to(x.dtype)
-        local_num_tokens = x.size(0)
-
-        if ep_size > 1:
-            ep_group = ep_mesh.get_group()
-            local_len = torch.tensor([local_num_tokens], device=x.device, dtype=torch.int64)
-            gathered_len_t = [torch.zeros_like(local_len) for _ in range(ep_size)]
-            dist.all_gather(gathered_len_t, local_len, group=ep_group)
-            gathered_lens = [int(t.item()) for t in gathered_len_t]
-            max_len = max(gathered_lens)
-
-            def _all_gather_dim0_var(local_tensor: torch.Tensor) -> torch.Tensor:
-                if max_len > local_tensor.size(0):
-                    pad_shape = (max_len - local_tensor.size(0),) + tuple(local_tensor.shape[1:])
-                    pad = torch.zeros(pad_shape, dtype=local_tensor.dtype, device=local_tensor.device)
-                    local_tensor = torch.cat([local_tensor, pad], dim=0)
-                gathered = [torch.empty_like(local_tensor) for _ in range(ep_size)]
-                dist.all_gather(gathered, local_tensor, group=ep_group)
-                gathered = [g[:n] for g, n in zip(gathered, gathered_lens)]
-                return torch.cat(gathered, dim=0)
-
-            x = _all_gather_dim0_var(x)
-            weights = _all_gather_dim0_var(weights.float())
-            indices = _all_gather_dim0_var(indices)
-            token_mask = _all_gather_dim0_var(token_mask)
-
-        y = torch.zeros_like(x, dtype=torch.float32)
-        n_local_experts = self.n_routed_experts // ep_size
-        experts_start_idx = ep_rank * n_local_experts
-        experts_end_idx = experts_start_idx + n_local_experts
-
-        for expert_idx in range(experts_start_idx, experts_end_idx):
-            selected = (indices == expert_idx) & token_mask.unsqueeze(-1)
-            token_indices, weight_indices = torch.where(selected)
-            if token_indices.numel() == 0:
-                continue
-
-            local_expert_idx = expert_idx - experts_start_idx
-            expert_input = x[token_indices]
-            gate_and_up = gate_and_up_projs[local_expert_idx]
-            gate_weight, up_weight = torch.chunk(gate_and_up, 2, dim=-1)
-            gate = expert_input @ gate_weight
-            up = expert_input @ up_weight
-            expert_output = (F.silu(gate) * up) @ down_projs[local_expert_idx]
-            expert_weights = weights[token_indices, weight_indices]
-            y.index_add_(0, token_indices, expert_output * expert_weights.unsqueeze(-1))
-
-        if ep_size > 1:
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
-            start = sum(gathered_lens[:ep_rank])
-            y = y.narrow(0, start, local_num_tokens).contiguous()
-
-        return y.to(x.dtype)
-
-
 class MiMoV2FlashModel(nn.Module):
     """Backbone model for Xiaomi MiMo-V2-Flash."""
 
@@ -566,7 +406,7 @@ class MiMoV2FlashModel(nn.Module):
             n_limited_groups=config.topk_group,
             train_gate=True,
             gate_bias_update_factor=0.0,
-            score_func=config.scoring_func,
+            score_func="sigmoid_with_bias" if config.scoring_func == "sigmoid" else config.scoring_func,
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0.0,
             norm_topk_prob=config.norm_topk_prob,
@@ -575,6 +415,7 @@ class MiMoV2FlashModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=False,
             force_e_score_correction_bias=True,
+            gate_output_dtype=torch.float32,
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
         )
         if moe_overrides:

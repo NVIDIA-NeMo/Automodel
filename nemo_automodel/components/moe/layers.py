@@ -218,7 +218,8 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax', 'sigmoid', 'softmax_with_bias', or 'sqrtsoftplus').
+        score_func (str): Scoring function ('softmax', 'sigmoid', 'sigmoid_with_bias',
+            'softmax_with_bias', or 'sqrtsoftplus').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -250,6 +251,7 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        self.output_dtype = config.gate_output_dtype
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -363,6 +365,26 @@ class Gate(nn.Module):
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
+        elif self.score_func == "sigmoid_with_bias":
+            scores = scores.sigmoid()
+            original_scores = scores
+            scores_for_choice = scores
+
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores_for_choice + self.e_score_correction_bias
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+                group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
+                group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
+                scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
+                    ~score_mask.bool(), float("-inf")
+                )
+
+            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
+            weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
             original_scores = scores
@@ -393,9 +415,10 @@ class Gate(nn.Module):
 
         weights = weights * self.route_scale
 
-        if self.gate_precision is not None:
-            weights = weights.to(dtype=original_dtype)
-            original_scores = original_scores.to(dtype=original_dtype)
+        output_dtype = self.output_dtype or original_dtype
+        weights = weights.to(dtype=output_dtype)
+        if self.output_dtype is not None or self.gate_precision is not None:
+            original_scores = original_scores.to(dtype=output_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
@@ -420,7 +443,7 @@ class Gate(nn.Module):
         if self._track_load_balance and aux_loss is not None:
             self._last_aux_loss = aux_loss.detach()
 
-        return weights.type_as(x), indices, aux_loss
+        return weights, indices, aux_loss
 
     def update_bias(self) -> None:
         """

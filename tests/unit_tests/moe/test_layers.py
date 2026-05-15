@@ -654,6 +654,68 @@ class TestGate:
         assert weights.shape == (num_tokens, moe_config.n_activated_experts)
         assert indices.shape == (num_tokens, moe_config.n_activated_experts)
 
+    def test_gate_forward_sigmoid_with_bias_groups_matches_reference(self, moe_config, device):
+        """MiMo routing uses bias for selection, but final weights come from unbiased sigmoid scores."""
+        moe_config.score_func = "sigmoid_with_bias"
+        moe_config.n_routed_experts = 16
+        moe_config.n_expert_groups = 4
+        moe_config.n_limited_groups = 2
+        moe_config.n_activated_experts = 4
+        moe_config.norm_topk_prob = True
+        moe_config.route_scale = 1.0
+        moe_config.gate_bias_update_factor = 0
+        moe_config.aux_loss_coeff = 0
+        moe_config.force_e_score_correction_bias = True
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config, gate_precision=torch.float32).to(device)
+
+        torch.manual_seed(1234)
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+            gate.e_score_correction_bias.copy_(torch.linspace(-0.75, 0.75, moe_config.n_routed_experts, device=device))
+
+        num_tokens = 8
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.float32, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, indices, _ = gate(x, token_mask, cp_mesh=None)
+
+        with torch.no_grad():
+            scores = F.linear(x, gate.weight).sigmoid()
+            scores_for_choice = scores + gate.e_score_correction_bias
+            scores_for_choice = scores_for_choice.view(num_tokens, moe_config.n_expert_groups, -1)
+            group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+            group_idx = torch.topk(group_scores, k=moe_config.n_limited_groups, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(num_tokens, -1)
+            scores_for_choice = scores_for_choice.reshape(num_tokens, -1).masked_fill(~score_mask.bool(), float("-inf"))
+            expected_indices = torch.topk(scores_for_choice, k=moe_config.n_activated_experts, dim=-1, sorted=False)[1]
+            expected_weights = scores.gather(1, expected_indices)
+            expected_weights = expected_weights / (expected_weights.sum(dim=-1, keepdim=True) + 1e-20)
+
+        torch.testing.assert_close(indices, expected_indices)
+        torch.testing.assert_close(weights.detach(), expected_weights, rtol=1e-5, atol=1e-5)
+
+    def test_gate_output_dtype_override(self, moe_config, device):
+        """Models can keep routing weights fp32 even when activations are bf16."""
+        moe_config.score_func = "sigmoid_with_bias"
+        moe_config.gate_bias_update_factor = 0
+        moe_config.aux_loss_coeff = 0
+        moe_config.force_e_score_correction_bias = True
+        moe_config.gate_output_dtype = torch.float32
+        gate = Gate(moe_config, gate_precision=torch.float32).to(device)
+
+        with torch.no_grad():
+            gate.weight.normal_(0, 0.02)
+
+        num_tokens = 16
+        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        weights, _, _ = gate(x, token_mask, cp_mesh=None)
+
+        assert weights.dtype == torch.float32
+
     def test_gate_forward_sqrtsoftplus_basic(self, moe_config, device):
         """``score_func='sqrtsoftplus'`` should compute weights as sqrt(softplus(logits))."""
         moe_config.score_func = "sqrtsoftplus"
@@ -829,9 +891,7 @@ class TestGate:
         assert aux_loss.requires_grad
 
     @pytest.mark.parametrize("gate_precision", [None, torch.float32])
-    def test_gate_aux_loss_under_activation_checkpointing(
-        self, moe_config, device, gate_precision
-    ):
+    def test_gate_aux_loss_under_activation_checkpointing(self, moe_config, device, gate_precision):
         """Aux-loss path must be activation-checkpoint safe: saved tensors that AC
         observes during forward must match dtype on backward recompute. Regression
         test for the case where Gate cast `original_scores` back to bf16 right
@@ -861,9 +921,7 @@ class TestGate:
             weights, _, aux_loss = gate(x_, token_mask, cp_mesh=None)
             # Inject the aux_loss gradient the same way the real model does, so
             # MoEAuxLossAutoScaler's saved tensor is exercised on backward.
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=x_.device
-            )
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0, device=x_.device)
             return weights.sum()
 
         # Wrap in bf16 autocast so any op that promotes to fp32 (e.g. softmax) on
@@ -946,8 +1004,7 @@ class TestGate:
 
         loss = gate._compute_aux_loss(original_scores_bf16, expert_load_int, token_mask, cp_mesh=None)
         assert loss.dtype == torch.float32, (
-            f"_compute_aux_loss must return fp32 to satisfy the AC saved/recomputed "
-            f"dtype contract; got {loss.dtype}."
+            f"_compute_aux_loss must return fp32 to satisfy the AC saved/recomputed dtype contract; got {loss.dtype}."
         )
 
     def test_gate_update_bias(self, moe_config, device):

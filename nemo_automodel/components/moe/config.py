@@ -72,6 +72,7 @@ class MoEConfig:
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
     moe_latent_size: int | None = None
+    gate_output_dtype: str | torch.dtype | None = None
 
     @property
     def expert_dim(self) -> int:
@@ -81,6 +82,8 @@ class MoEConfig:
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_from_str(self.dtype, default=torch.bfloat16)
+        if isinstance(self.gate_output_dtype, str):
+            self.gate_output_dtype = dtype_from_str(self.gate_output_dtype, default=None)
 
 
 @dataclass
