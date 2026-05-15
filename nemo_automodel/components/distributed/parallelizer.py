@@ -742,24 +742,47 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
 
     _patch_dtensor_spec_hash_for_symint()
 
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        module_list = model.model.layers
-    elif hasattr(model, "layers"):
-        module_list = model.layers
-    else:
-        logger.warning("_apply_per_layer_compile: cannot find transformer layers, skipping")
-        return
-
-    # PP converts model.model.layers from nn.ModuleList to nn.ModuleDict (str keys).
-    # enumerate(nn.ModuleDict) yields string keys, not modules -- use .items() instead.
-    items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
-
     compiled_count = 0
-    for _, layer in items:
-        # Unwrap any layer-level checkpoint wrapper (PP path) to reach the actual decoder layer.
-        actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
-        actual_layer.compile()
-        compiled_count += 1
+    compiled_modules: set[int] = set()
+
+    def _compile_module_list(module_list: nn.ModuleList | nn.ModuleDict) -> None:
+        nonlocal compiled_count
+        # PP converts model.model.layers from nn.ModuleList to nn.ModuleDict (str keys).
+        # enumerate(nn.ModuleDict) yields string keys, not modules -- use .items() instead.
+        items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
+        for _, layer in items:
+            # Unwrap any layer-level checkpoint wrapper (PP path) to reach the actual decoder layer.
+            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            module_id = id(actual_layer)
+            if module_id in compiled_modules:
+                continue
+            actual_layer.compile()
+            compiled_modules.add(module_id)
+            compiled_count += 1
+
+    module_lists = []
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        module_lists.append(model.model.layers)
+    if hasattr(model, "layers"):
+        module_lists.append(model.layers)
+    for attr_name in ("transformer_blocks", "single_transformer_blocks"):
+        module_list = getattr(model, attr_name, None)
+        if isinstance(module_list, (nn.ModuleList, nn.ModuleDict)):
+            module_lists.append(module_list)
+
+    if module_lists:
+        for module_list in module_lists:
+            _compile_module_list(module_list)
+    else:
+        logger.warning("_apply_per_layer_compile: using heuristic layer extraction")
+        for layer in _extract_model_layers(model):
+            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            module_id = id(actual_layer)
+            if module_id in compiled_modules:
+                continue
+            actual_layer.compile()
+            compiled_modules.add(module_id)
+            compiled_count += 1
 
     logger.info("Per-layer torch.compile applied to %d decoder layers", compiled_count)
 
