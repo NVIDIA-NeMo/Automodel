@@ -16,7 +16,7 @@
 # Benchmarking config for Mistral Small 4 (~119B) LoRA
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/mistral4_lora.yaml --nproc-per-node 8
+#   automodel examples/vlm_benchmark/mistral/mistral4_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
