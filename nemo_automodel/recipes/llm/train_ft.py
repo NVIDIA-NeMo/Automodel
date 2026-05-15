@@ -735,15 +735,22 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if cfg is None:
         return None
 
-    # Calculate total steps for the training run
+    # Calculate total steps for the training run.
+    # `step_scheduler.epoch_len` is already in optimizer-step units
+    # (microbatches // grad_acc_steps) and is None for IterableDataset, in which
+    # case `max_steps` governs the total step count.
     total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+    if step_scheduler.epoch_len is not None:
+        total_steps = total_epochs * step_scheduler.epoch_len
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+    else:
+        if step_scheduler.max_steps is None:
+            raise ValueError(
+                "build_lr_scheduler: dataloader has no __len__ (iterable dataset) and "
+                "step_scheduler.max_steps is not set. Set step_scheduler.max_steps in your config."
+            )
+        total_steps = step_scheduler.max_steps
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
