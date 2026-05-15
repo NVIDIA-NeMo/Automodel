@@ -643,7 +643,7 @@ class TestWanParallelizationStrategy:
         # FSDP applied with the correct dp_mesh
         from unittest.mock import ANY
 
-        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
         env["fully_shard"].assert_called()
         assert result is wan_model
 
@@ -700,7 +700,7 @@ class TestWanParallelizationStrategy:
         # Ensure FSDP used the dp_mesh we provided via custom names
         from unittest.mock import ANY
 
-        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None)
+        env["apply_fsdp"].assert_called_once_with(wan_model, dp_mesh, ANY, None, True, 2, 1)
         assert result is wan_model
 
 
