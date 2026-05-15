@@ -277,21 +277,24 @@ def _build_asr_conversation(
     return conversation
 
 
-def make_wenetspeech_wu_asr_dataset(
+def make_hf_audio_asr_dataset(
     path_or_dataset,
     split="train",
+    name=None,
     sampling_rate=16000,
-    system_prompt="Transcribe the Wu Chinese speech to text.",
+    system_prompt=None,
     user_prompt=None,
     audio_column="audio",
     text_column="text",
     drop_empty_text=True,
     **load_kwargs,
 ):
-    """Load and lazy-preprocess ``yuekai/WenetSpeech_Wu_1k`` for Qwen3-Omni ASR fine-tuning.
+    """Lazy HuggingFace audio→text dataset builder for Qwen3-Omni ASR fine-tuning.
 
-    Returns a HuggingFace ``Dataset`` whose ``__getitem__`` produces a single
-    ``{"conversation": [...]}`` dict suitable for
+    Loads any HuggingFace ASR dataset that exposes an audio column (``Audio``
+    feature with ``bytes`` and/or ``path`` populated after
+    ``cast_column(decode=False)``) and a transcript column, and yields the
+    Qwen3-Omni chat-template conversation expected by
     :func:`qwen3_omni_asr_collate_fn`. **No audio is decoded at construction
     time** — both the soundfile decode (mono mix + ``float32`` cast + optional
     ``scipy.signal.resample_poly``) and the conversation assembly run inside a
@@ -302,35 +305,45 @@ def make_wenetspeech_wu_asr_dataset(
     column only — also Arrow-level — so audio bytes are never materialized at
     startup.
 
+    Defaults are tuned for the common case (``audio`` / ``text`` columns,
+    16 kHz, no system turn). Datasets that diverge can override per-field via
+    YAML; see :file:`docs/guides/audio/qwen3-omni-asr.md` for an override table.
+
     The conversation shape follows the prompt-presence matrix:
 
     - both ``system_prompt`` and ``user_prompt`` set →
       ``system → user(text+audio) → assistant``
-    - only ``system_prompt`` set → ``system → user(audio) → assistant``  (legacy default)
-    - only ``user_prompt`` set (``system_prompt=None``) →
-      ``user(text+audio) → assistant``  (no system turn)
-    - neither set → ``user(audio) → assistant``
+    - only ``system_prompt`` set → ``system → user(audio) → assistant``
+    - only ``user_prompt`` set → ``user(text+audio) → assistant``  (no system turn)
+    - neither set (the default) → ``user(audio) → assistant``
 
     Whitespace-only prompts are treated as absent.
 
     Args:
-        path_or_dataset: HuggingFace dataset id or local path. May reference
-            the gated ``yuekai/WenetSpeech_Wu_1k`` (requires ``hf auth login``)
-            or a local mirror.
-        split: Dataset split to load.
+        path_or_dataset: HuggingFace dataset id or local path.
+        split: Dataset split to load (e.g. ``"train"``, ``"train[:5000]"``).
+        name: Optional dataset configuration / subset. Forwarded to
+            ``datasets.load_dataset(path, name=name, ...)``. Required by some
+            datasets (e.g. ``edinburghcstr/ami`` needs ``"ihm"`` or ``"sdm"``;
+            CommonVoice needs the language code).
         sampling_rate: Target sampling rate in Hz. Audio is resampled inside
             the lazy transform if the source rate differs.
-        system_prompt: Instruction placed in a ``system`` turn. Pass ``None``
-            or an empty/whitespace string to skip the system turn entirely.
+        system_prompt: Instruction placed in a ``system`` turn. Default
+            ``None`` skips the system turn entirely; pass a string to emit one.
         user_prompt: Instruction prepended to the audio inside the user turn.
             Pass ``None`` to emit a user turn with only the audio item.
-        audio_column: Name of the audio column in the source dataset.
-        text_column: Name of the transcript column in the source dataset.
+        audio_column: Name of the audio column in the source dataset (default
+            ``"audio"`` — works for AMI / LibriSpeech / GigaSpeech /
+            WenetSpeech / CommonVoice).
+        text_column: Name of the transcript column (default ``"text"`` —
+            works for AMI / LibriSpeech / GigaSpeech / WenetSpeech; override
+            to ``"sentence"`` for CommonVoice).
         drop_empty_text: If True, samples whose transcript is empty or
             whitespace are dropped via ``dataset.filter`` (Arrow-level, no
             audio decode). If False, an empty transcript triggers a
             ``ValueError`` inside the transform at access time.
-        **load_kwargs: Forwarded to ``datasets.load_dataset``.
+        **load_kwargs: Forwarded to ``datasets.load_dataset`` (e.g.
+            ``trust_remote_code=True``).
 
     Returns:
         A HuggingFace ``Dataset`` whose elements are
@@ -342,7 +355,7 @@ def make_wenetspeech_wu_asr_dataset(
             an audio cell has neither ``bytes`` nor ``path``, or when
             ``drop_empty_text=False`` and a transcript is empty.
     """
-    dataset = load_dataset(path_or_dataset, split=split, **load_kwargs)
+    dataset = load_dataset(path_or_dataset, name=name, split=split, **load_kwargs)
 
     if audio_column not in dataset.column_names:
         raise ValueError(

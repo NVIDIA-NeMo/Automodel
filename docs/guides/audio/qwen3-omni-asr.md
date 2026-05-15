@@ -44,9 +44,9 @@ hf auth whoami                 # confirms which account is logged in
 The recipe's dataset builder will then load the dataset via the standard
 `datasets.load_dataset` path.
 
-### Built-in builder: `make_wenetspeech_wu_asr_dataset`
+### Built-in builder: `make_hf_audio_asr_dataset`
 
-`nemo_automodel.components.datasets.vlm.datasets.make_wenetspeech_wu_asr_dataset`
+`nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`
 returns a HuggingFace `Dataset` whose `__getitem__` lazily produces a single
 `{"conversation": [...]}` dict suitable for `qwen3_omni_asr_collate_fn`. The
 key design points:
@@ -59,17 +59,24 @@ key design points:
   constant-time metadata read; audio decode + chat-template assembly only run
   inside dataloader workers when a batch is fetched. Startup time for the
   builder is independent of split size.
-* **Configurable prompt shape**: the conversation contains a `system` turn, a
-  `user` turn (text instruction + audio), and an `assistant` turn (the
-  transcript). Either `system_prompt` or `user_prompt` (or both) may be
-  `None`/empty to drop the corresponding turn.
+* **Configurable prompt shape**: by default the conversation is the minimal
+  `user(audio) → assistant(transcript)` shape (both `system_prompt` and
+  `user_prompt` default to `None`). Setting either or both expands the
+  conversation: `system_prompt="..."` adds a `system` turn, `user_prompt="..."`
+  prepends a text item before the audio inside the user turn. Whitespace-only
+  prompts are treated as absent.
+* **Dataset-agnostic**: the builder accepts any HuggingFace audio dataset that
+  exposes an audio column (cast to `Audio(decode=False)`) and a transcript
+  column. Defaults (`audio_column="audio"`, `text_column="text"`,
+  `name=None`) cover AMI, LibriSpeech, GigaSpeech, and WenetSpeech out of the
+  box; per-dataset overrides go in the recipe YAML.
 
 ```python
 from nemo_automodel.components.datasets.vlm.datasets import (
-    make_wenetspeech_wu_asr_dataset,
+    make_hf_audio_asr_dataset,
 )
 
-dataset = make_wenetspeech_wu_asr_dataset(
+dataset = make_hf_audio_asr_dataset(
     path_or_dataset="yuekai/WenetSpeech_Wu_1k",
     split="train[:5000]",
     sampling_rate=16000,
@@ -109,6 +116,50 @@ intentionally **not** registered in the global `COLLATE_FNS` map so the
 existing `Qwen3OmniMoeProcessor → qwen3_omni_collate_fn` mapping keeps
 serving non-ASR VLM users that *do* have `qwen_omni_utils` installed.
 
+### Using a different HF audio dataset
+
+The Wu YAML is one of two example configs:
+`examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml` is a sibling that points at
+the public AMI meeting corpus and shows the minimal YAML diff required to
+swap datasets. To target your own dataset, set `dataset.path_or_dataset` and
+override the defaults below only when the dataset diverges:
+
+| Dataset                                 | `path_or_dataset`                    | `name`            | `text_column` |
+|-----------------------------------------|--------------------------------------|-------------------|---------------|
+| `yuekai/WenetSpeech_Wu_1k` (gated)      | `${oc.env:WENETSPEECH_WU_PATH}`      | —                 | `text` (default) |
+| `edinburghcstr/ami`                     | `edinburghcstr/ami`                  | `ihm` or `sdm`    | `text` (default) |
+| `openslr/librispeech_asr`               | `openslr/librispeech_asr`            | optional config   | `text` (default) |
+| `speechcolab/gigaspeech`                | `speechcolab/gigaspeech`             | optional config   | `text` (default) |
+| `mozilla-foundation/common_voice_*`     | `mozilla-foundation/common_voice_18_0` | language code (e.g. `zh-CN`) | **`sentence`** |
+
+YAML override snippet for AMI / SDM far-field training:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
+  path_or_dataset: edinburghcstr/ami
+  name: sdm           # near-field is `ihm`
+  split: train
+  sampling_rate: 16000
+  system_prompt: null
+  user_prompt: "Transcribe the English audio into text."
+```
+
+YAML override snippet for CommonVoice (note `text_column: sentence`):
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
+  path_or_dataset: mozilla-foundation/common_voice_18_0
+  name: zh-CN
+  text_column: sentence
+  split: train
+  sampling_rate: 16000
+```
+
+Audio columns are universally named `audio` across these datasets, so the
+default `audio_column="audio"` rarely needs an override.
+
 ---
 
 ## 2. Train
@@ -128,14 +179,16 @@ node. The defaults:
 | `optimizer`        | `AdamW(lr=2.0e-5, betas=[0.9, 0.95], weight_decay=0.0)`  |
 | `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=true` |
 | `wandb`            | enabled by default; project / name / dir via env vars     |
-| `dataset`          | `make_wenetspeech_wu_asr_dataset` with `WENETSPEECH_WU_PATH` env var |
+| `dataset`          | `make_hf_audio_asr_dataset` with `WENETSPEECH_WU_PATH` env var |
 
 `peft:` is intentionally omitted — both the language model and the audio
 tower are trainable, vision tower stays frozen. With `ep_size=8` the MoE
 experts are sharded across all 8 GPUs.
 
-To use a different audio dataset, change `dataset.path_or_dataset`,
-`text_column`, and `user_prompt`; everything else generalises.
+`examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml` is a sibling config that
+mirrors the Wu recipe with `path_or_dataset: edinburghcstr/ami` + `name: ihm`
+and an English transcription `user_prompt`; see the "Using a different HF
+audio dataset" subsection above for column overrides on other datasets.
 
 ### Launch
 
@@ -145,8 +198,17 @@ It validates `NPROC_PER_NODE=8` and `WENETSPEECH_WU_PATH` up front, then
 
 ```bash
 export WENETSPEECH_WU_PATH=yuekai/WenetSpeech_Wu_1k   # gated HF id or local mirror
-# Optional WandB overrides; offline-friendly by default:
-export WANDB_MODE=${WANDB_MODE:-offline}
+# AMI / other public datasets just need a stub value for this precondition:
+#   export WENETSPEECH_WU_PATH=unused
+# and a `--config-file examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml`
+# override to point at the AMI YAML.
+
+# WandB: as long as WANDB_API_KEY is set in the environment (either via
+# `wandb login`, or by exporting WANDB_API_KEY=<key> from your shell rc),
+# the run streams online and shows up in the configured project. To dry-run
+# without uploading, set:
+#   export WANDB_MODE=offline
+# and `wandb sync result/wandb/<run-dir>` later.
 export WANDB_PROJECT=${WANDB_PROJECT:-qwen3-omni-asr-wenetspeech-wu}
 
 examples/vlm_finetune/qwen3_omni_asr/train.sh \
@@ -369,9 +431,10 @@ dialects.
 
 | Path                                                                       | Role                                                          |
 |----------------------------------------------------------------------------|---------------------------------------------------------------|
-| `nemo_automodel/components/datasets/vlm/datasets.py`                       | `make_wenetspeech_wu_asr_dataset` (lazy `with_transform` builder) |
+| `nemo_automodel/components/datasets/vlm/datasets.py`                       | `make_hf_audio_asr_dataset` (lazy `with_transform` builder) |
 | `nemo_automodel/components/datasets/vlm/collate_fns.py`                    | `qwen3_omni_asr_collate_fn` (no `qwen_omni_utils`)              |
-| `examples/vlm_finetune/qwen3_omni_asr/wenetspeech_wu_sft.yaml`             | Full-FT recipe                                                |
+| `examples/vlm_finetune/qwen3_omni_asr/wenetspeech_wu_sft.yaml`             | Full-FT Wu Chinese ASR recipe (gated dataset)                 |
+| `examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml`                        | Full-FT English ASR recipe on AMI (public; sibling demo)      |
 | `examples/vlm_finetune/qwen3_omni_asr/train.sh`                            | Launcher (validates `NPROC_PER_NODE=8` + `WENETSPEECH_WU_PATH`) |
 | `tools/wrap_thinker_ckpt_as_omni.py`                                       | Convert thinker checkpoint → HF Omni export                   |
 | `tools/merge_lora_streaming.py`                                            | Stream-merge a LoRA adapter into the base model (peft-free)   |

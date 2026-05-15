@@ -12,27 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-FT Wu Chinese ASR of Qwen3-Omni-30B-A3B-Instruct on yuekai/WenetSpeech_Wu_1k.
+# Full-FT English ASR of Qwen3-Omni-30B-A3B-Instruct on edinburghcstr/ami.
 #
-# Schedule:
-#   * No system turn; the user turn carries an explicit Shanghainese / Wu
-#     transcription instruction followed by the audio.
-#   * No PEFT; the language model and the audio tower are both fully trainable.
-#     Vision tower is frozen (the recipe never feeds images).
-#   * WandB enabled by default; override project/entity/save_dir via env vars
-#     WANDB_PROJECT / WANDB_ENTITY / WANDB_DIR.
-#   * Checkpoints land under result/checkpoints/... every 100 steps (consolidated
-#     HF safetensors; result/ is gitignored).
+# Companion to wenetspeech_wu_sft.yaml that demonstrates swapping the dataset
+# only via the `dataset:` block. Everything else (model, distributed, freeze,
+# optimizer, wandb) matches the Wu recipe.
 #
-# To run on a single 8-GPU node:
-#   export WENETSPEECH_WU_PATH=/path/to/wenetspeech_wu_1k  # local mirror or HF id
-#   examples/vlm_finetune/qwen3_omni_asr/train.sh
+# AMI has two mutually exclusive configurations (passed via the builder's
+# explicit ``name=`` parameter); ``ihm`` (Individual Headset Microphone) is the
+# standard near-field setup. Override to ``sdm`` for far-field training.
 #
-# The env var WENETSPEECH_WU_PATH has no default; OmegaConf will raise a clear
-# missing-variable error if it is unset. Full FT of a 30B-A3B MoE plus the
-# audio tower is memory-tight on 8x H100 80GB; if you OOM, drop
-# step_scheduler.global_batch_size, enable activation checkpointing in the
-# moe parallelizer config, or freeze the audio_tower.
+# AMI is a public dataset, so no env-var indirection is needed for the path.
+# train.sh still requires *some* value for WENETSPEECH_WU_PATH (legacy
+# precondition check); set a stub:
+#   export WENETSPEECH_WU_PATH=unused
+#   examples/vlm_finetune/qwen3_omni_asr/train.sh --config-file examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml
 
 recipe: FinetuneRecipeForVLM
 
@@ -68,7 +62,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: result/checkpoints/qwen3_omni_asr_wenetspeech_wu
+  checkpoint_dir: result/checkpoints/qwen3_omni_asr_ami
   model_save_format: safetensors
   save_consolidated: true
 
@@ -97,12 +91,12 @@ loss_fn:
 # No system turn (system_prompt: null).
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
-  path_or_dataset: ${oc.env:WENETSPEECH_WU_PATH}
+  path_or_dataset: edinburghcstr/ami
+  name: ihm
   split: train
   sampling_rate: 16000
   system_prompt: null
-  user_prompt: >-
-    请将这段上海话（吴语）语音逐字转写成纯文本。原则：忠实于发音。如果听到的是明显的吴语方言词（如阿拉、侬、伊拉、辰光、搿、勿、覅、辣海、老酒、物事、哪能、伐、唻），就用对应的吴语方言字；如果听到的是普通话发音，就用普通话用字，不要硬替换。不要做普通话↔吴语之间的翻译。只输出转写文本，不要加任何引导语、解释或标点。
+  user_prompt: "Transcribe the English audio into text."
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -118,8 +112,8 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
-  project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-wenetspeech-wu}
-  name: ${oc.env:WANDB_NAME,qwen3_omni_asr_wenetspeech_wu_fullft}
+  project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-ami}
+  name: ${oc.env:WANDB_NAME,qwen3_omni_asr_ami_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:

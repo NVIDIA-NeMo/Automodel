@@ -1307,7 +1307,7 @@ class TestRobustDatasetWrapperFakeImageInjection:
 
 
 # ---------------------------------------------------------------------------
-# WenetSpeech_Wu ASR dataset builder (Qwen3-Omni)
+# HF audio ASR dataset builder (Qwen3-Omni)
 # ---------------------------------------------------------------------------
 import io as _io
 import sys as _sys
@@ -1346,7 +1346,7 @@ def _SyntheticHFRows(rows):
     return dataset
 
 
-def test_make_wenetspeech_wu_asr_dataset_bytes_branch(monkeypatch):
+def test_make_hf_audio_asr_dataset_bytes_branch(monkeypatch):
     """The bytes branch decodes via soundfile and emits the Qwen3-Omni schema."""
     wav = _make_wav_bytes()
     fake_rows = _SyntheticHFRows(
@@ -1357,7 +1357,7 @@ def test_make_wenetspeech_wu_asr_dataset_bytes_branch(monkeypatch):
     )
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(
+    rows = ds.make_hf_audio_asr_dataset(
         path_or_dataset="ignored",
         split="train",
         sampling_rate=16000,
@@ -1367,10 +1367,11 @@ def test_make_wenetspeech_wu_asr_dataset_bytes_branch(monkeypatch):
     for row, src in zip(rows, fake_rows):
         assert list(row.keys()) == ["conversation"]
         conv = row["conversation"]
-        assert [t["role"] for t in conv] == ["system", "user", "assistant"]
+        # Default system_prompt is None → no system turn.
+        assert [t["role"] for t in conv] == ["user", "assistant"]
 
         # user turn carries the decoded audio
-        user_content = conv[1]["content"]
+        user_content = conv[0]["content"]
         assert isinstance(user_content, list) and len(user_content) == 1
         audio_item = user_content[0]
         assert audio_item["type"] == "audio"
@@ -1380,11 +1381,11 @@ def test_make_wenetspeech_wu_asr_dataset_bytes_branch(monkeypatch):
         assert waveform.ndim == 1
 
         # assistant turn carries the transcript
-        assistant_content = conv[2]["content"]
+        assistant_content = conv[1]["content"]
         assert assistant_content == [{"type": "text", "text": src["text"]}]
 
 
-def test_make_wenetspeech_wu_asr_dataset_path_branch(monkeypatch, tmp_path):
+def test_make_hf_audio_asr_dataset_path_branch(monkeypatch, tmp_path):
     """The path branch decodes via soundfile when no in-memory bytes are present."""
     wav_path = tmp_path / "sample.wav"
     _sf.write(str(wav_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
@@ -1395,14 +1396,15 @@ def test_make_wenetspeech_wu_asr_dataset_path_branch(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
     assert len(rows) == 1
-    waveform = rows[0]["conversation"][1]["content"][0]["audio"]
+    # Default system_prompt is None → user turn at index 0.
+    waveform = rows[0]["conversation"][0]["content"][0]["audio"]
     assert waveform.dtype == _np.float32
     assert waveform.ndim == 1
 
 
-def test_make_wenetspeech_wu_asr_dataset_raises_when_audio_cell_empty(monkeypatch):
+def test_make_hf_audio_asr_dataset_raises_when_audio_cell_empty(monkeypatch):
     """Both ``bytes`` and ``path`` missing must raise a clear ValueError.
 
     With the lazy ``with_transform`` builder this fires at access time, not at
@@ -1411,12 +1413,12 @@ def test_make_wenetspeech_wu_asr_dataset_raises_when_audio_cell_empty(monkeypatc
     fake_rows = _SyntheticHFRows([{"audio": {"bytes": None, "path": None}, "text": "x"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
     with pytest.raises(ValueError, match="neither 'bytes' nor 'path'"):
         _ = rows[0]
 
 
-def test_make_wenetspeech_wu_asr_dataset_drops_empty_text(monkeypatch):
+def test_make_hf_audio_asr_dataset_drops_empty_text(monkeypatch):
     """Default behaviour skips samples whose transcript is empty/whitespace."""
     wav = _make_wav_bytes()
     fake_rows = _SyntheticHFRows(
@@ -1427,12 +1429,13 @@ def test_make_wenetspeech_wu_asr_dataset_drops_empty_text(monkeypatch):
     )
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
     assert len(rows) == 1
-    assert rows[0]["conversation"][2]["content"][0]["text"] == "侬好"
+    # Default system_prompt is None → assistant turn at index 1.
+    assert rows[0]["conversation"][1]["content"][0]["text"] == "侬好"
 
 
-def test_make_wenetspeech_wu_asr_dataset_module_does_not_import_torchcodec():
+def test_make_hf_audio_asr_dataset_module_does_not_import_torchcodec():
     """The dataset module must not transitively pull in torchcodec."""
     assert "torchcodec" not in _sys.modules
     # The module under test (already imported at the top of this file as ``ds``)
@@ -1441,7 +1444,7 @@ def test_make_wenetspeech_wu_asr_dataset_module_does_not_import_torchcodec():
     assert "torchcodec" not in ds.__dict__
 
 
-def test_make_wenetspeech_wu_asr_dataset_resamples_when_sr_differs(monkeypatch):
+def test_make_hf_audio_asr_dataset_resamples_when_sr_differs(monkeypatch):
     """When source SR != target SR, the waveform is resampled and stays float32 mono."""
     wav = _make_wav_bytes(sampling_rate=8000, duration_seconds=0.25)
     fake_rows = _SyntheticHFRows(
@@ -1449,30 +1452,32 @@ def test_make_wenetspeech_wu_asr_dataset_resamples_when_sr_differs(monkeypatch):
     )
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(
+    rows = ds.make_hf_audio_asr_dataset(
         path_or_dataset="ignored",
         sampling_rate=16000,
     )
-    waveform = rows[0]["conversation"][1]["content"][0]["audio"]
+    # Default system_prompt is None → user turn at index 0.
+    waveform = rows[0]["conversation"][0]["content"][0]["audio"]
     assert waveform.dtype == _np.float32
     assert waveform.ndim == 1
     # 0.25s at 16 kHz target ≈ 4000 samples (allow ±a few for resample_poly polyphase rounding).
     assert abs(waveform.shape[0] - 4000) <= 8
 
 
-def test_make_wenetspeech_wu_asr_dataset_user_prompt_appears_before_audio(monkeypatch):
+def test_make_hf_audio_asr_dataset_user_prompt_appears_before_audio(monkeypatch):
     """When ``user_prompt`` is set, it becomes the first text item in the user turn."""
     wav = _make_wav_bytes()
     fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(
+    rows = ds.make_hf_audio_asr_dataset(
         path_or_dataset="ignored",
+        system_prompt="Transcribe.",
         user_prompt="please transcribe",
     )
     assert len(rows) == 1
     conv = rows[0]["conversation"]
-    # Default system_prompt is still present.
+    # Explicit system_prompt is set → full three-turn shape.
     assert [t["role"] for t in conv] == ["system", "user", "assistant"]
     user_content = conv[1]["content"]
     # First user item is the text prompt, second is the audio ndarray.
@@ -1481,13 +1486,13 @@ def test_make_wenetspeech_wu_asr_dataset_user_prompt_appears_before_audio(monkey
     assert isinstance(user_content[1]["audio"], _np.ndarray)
 
 
-def test_make_wenetspeech_wu_asr_dataset_system_none_drops_system_turn(monkeypatch):
+def test_make_hf_audio_asr_dataset_system_none_drops_system_turn(monkeypatch):
     """``system_prompt=None`` (or empty) must drop the system turn entirely."""
     wav = _make_wav_bytes()
     fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(
+    rows = ds.make_hf_audio_asr_dataset(
         path_or_dataset="ignored",
         system_prompt=None,
         user_prompt="please transcribe",
@@ -1501,13 +1506,13 @@ def test_make_wenetspeech_wu_asr_dataset_system_none_drops_system_turn(monkeypat
     assert user_content[1]["type"] == "audio"
 
 
-def test_make_wenetspeech_wu_asr_dataset_both_prompts_none(monkeypatch):
+def test_make_hf_audio_asr_dataset_both_prompts_none(monkeypatch):
     """When both prompts are None the user turn carries only the audio item."""
     wav = _make_wav_bytes()
     fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(
+    rows = ds.make_hf_audio_asr_dataset(
         path_or_dataset="ignored",
         system_prompt=None,
         user_prompt=None,
@@ -1518,13 +1523,13 @@ def test_make_wenetspeech_wu_asr_dataset_both_prompts_none(monkeypatch):
     assert conv[0]["content"][0]["type"] == "audio"
 
 
-def test_make_wenetspeech_wu_asr_dataset_blank_prompts_drop(monkeypatch):
+def test_make_hf_audio_asr_dataset_blank_prompts_drop(monkeypatch):
     """Whitespace-only prompts are treated as absent."""
     wav = _make_wav_bytes()
     fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(
+    rows = ds.make_hf_audio_asr_dataset(
         path_or_dataset="ignored",
         system_prompt="   ",
         user_prompt="\t\n",
@@ -1535,7 +1540,7 @@ def test_make_wenetspeech_wu_asr_dataset_blank_prompts_drop(monkeypatch):
     assert conv[0]["content"][0]["type"] == "audio"
 
 
-def test_make_wenetspeech_wu_asr_dataset_is_lazy_no_decode_at_construction(monkeypatch):
+def test_make_hf_audio_asr_dataset_is_lazy_no_decode_at_construction(monkeypatch):
     """Builder must NOT call the audio decoder at construction time.
 
     The decode helper is recorded on each call; constructing the dataset must
@@ -1559,7 +1564,7 @@ def test_make_wenetspeech_wu_asr_dataset_is_lazy_no_decode_at_construction(monke
 
     monkeypatch.setattr(ds, "_decode_audio_cell_to_mono_float32", _spy)
 
-    rows = ds.make_wenetspeech_wu_asr_dataset(path_or_dataset="ignored")
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
     # Construction must not have decoded any audio.
     assert decode_calls == [], f"decode ran at construction time: {len(decode_calls)} calls"
     # Length is O(1) (Arrow row count); does not iterate.
@@ -1571,3 +1576,48 @@ def test_make_wenetspeech_wu_asr_dataset_is_lazy_no_decode_at_construction(monke
     # Second __getitem__ triggers one more (no caching at this layer).
     _ = rows[1]
     assert len(decode_calls) == 2
+
+
+def test_make_hf_audio_asr_dataset_default_system_prompt_is_none(monkeypatch):
+    """Without overriding ``system_prompt``, the builder emits no system turn.
+
+    Pins down the post-rename default: the builder is dataset-agnostic, so its
+    default prompt shape is the most neutral one (``user → assistant``).
+    """
+    wav = _make_wav_bytes()
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    conv = rows[0]["conversation"]
+    assert [t["role"] for t in conv] == ["user", "assistant"]
+    # User turn carries only the audio (no text item).
+    assert conv[0]["content"][0]["type"] == "audio"
+
+
+def test_make_hf_audio_asr_dataset_passes_name_to_load_dataset(monkeypatch):
+    """``name`` is forwarded to ``datasets.load_dataset`` as the subset/config.
+
+    AMI requires ``name='ihm'`` or ``name='sdm'``; CommonVoice requires the
+    language code. The builder must expose this as a first-class parameter so
+    YAML files don't have to round-trip through ``**load_kwargs``.
+    """
+    wav = _make_wav_bytes()
+    captured_kwargs = {}
+
+    def _spy_load_dataset(path, *args, **kwargs):
+        captured_kwargs["path"] = path
+        captured_kwargs.update(kwargs)
+        # Return a real fake dataset so the rest of the builder can run.
+        return _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "x"}])
+
+    monkeypatch.setattr(ds, "load_dataset", _spy_load_dataset)
+
+    ds.make_hf_audio_asr_dataset(
+        path_or_dataset="edinburghcstr/ami",
+        name="ihm",
+        split="train[:1]",
+    )
+    assert captured_kwargs["path"] == "edinburghcstr/ami"
+    assert captured_kwargs["name"] == "ihm"
+    assert captured_kwargs["split"] == "train[:1]"

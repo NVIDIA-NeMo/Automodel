@@ -797,7 +797,7 @@ def qwen3_omni_asr_collate_fn(
     that lack ``qwen_omni_utils`` and ``torchcodec``. It assumes audio waveforms
     are already attached to the conversation as 1-D ``np.ndarray`` items of the
     form ``{"type": "audio", "audio": waveform}`` (see
-    :func:`nemo_automodel.components.datasets.vlm.datasets.make_wenetspeech_wu_asr_dataset`)
+    :func:`nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`)
     and passes them directly to the processor's ``audio=`` kwarg, which routes to
     the bundled ``WhisperFeatureExtractor``.
 
