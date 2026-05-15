@@ -16,7 +16,7 @@
 # Benchmarking config for Nemotron-3-Super-120B-A12B LoRA
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/nemotron_super_v3_lora.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction

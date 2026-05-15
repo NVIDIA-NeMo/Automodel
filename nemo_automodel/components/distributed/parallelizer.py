@@ -576,7 +576,15 @@ class WanParallelizationStrategy(ParallelizationStrategy):
             )
 
         # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        apply_fsdp2_sharding_recursively(
+            model,
+            dp_mesh,
+            mp_policy,
+            offload_policy,
+            kwargs.get("enable_fsdp2_prefetch", True),
+            kwargs.get("fsdp2_backward_prefetch_depth", 2),
+            kwargs.get("fsdp2_forward_prefetch_depth", 1),
+        )
 
         return fully_shard(
             model,
@@ -622,7 +630,15 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
                 )
 
         # Apply FSDP sharding recursively and to root
-        apply_fsdp2_sharding_recursively(model, dp_mesh, mp_policy, offload_policy)
+        apply_fsdp2_sharding_recursively(
+            model,
+            dp_mesh,
+            mp_policy,
+            offload_policy,
+            kwargs.get("enable_fsdp2_prefetch", True),
+            kwargs.get("fsdp2_backward_prefetch_depth", 2),
+            kwargs.get("fsdp2_forward_prefetch_depth", 1),
+        )
 
         return fully_shard(
             model,
