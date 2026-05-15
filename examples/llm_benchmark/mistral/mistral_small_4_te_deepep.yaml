@@ -15,7 +15,7 @@
 # Benchmarking config for Mistral Small 4 (119B) Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/mistral_small_4_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/mistral/mistral_small_4_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
