@@ -1412,14 +1412,18 @@ def _get_parallel_plan(
     3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
     4) Otherwise, fall back to the default base plan.
 
-    When ``tp_size > 1`` and the model has no registered plan in
-    ``PARALLELIZE_FUNCTIONS`` and no HF-native ``_tp_plan`` (i.e. path 4 would
-    apply), this raises ``ValueError`` instead of returning the default base
-    plan. The default plan produces placements that do not populate the
-    ``shard_order`` metadata newer versions of PyTorch DTensor assert on, so
-    using it at ``tp_size > 1`` would crash inside
-    ``torch.distributed.tensor._redistribute`` with an opaque assertion. Path
-    4 is only safe at ``tp_size == 1``, where no actual sharding happens.
+    When ``tp_size > 1`` and the model falls through to path 4 *and* the
+    model class was loaded from a custom-code source (HF's
+    ``trust_remote_code=True`` path, where the dynamic class lives under
+    ``transformers_modules.*``), this raises ``ValueError`` instead of
+    returning the default base plan. On recent PyTorch the default plan's
+    placements do not populate ``shard_order`` and trip an internal assert in
+    ``torch.distributed.tensor._redistribute`` on the first weight
+    redistribute, which surfaces to the user as an opaque PyTorch internal
+    error. Custom-code architectures are the only known-broken case (see
+    https://github.com/NVIDIA-NeMo/Automodel/issues/2243); known HF
+    architectures that happen to fall through (e.g. Mixtral) are left on the
+    default plan with a warning, since they have been working in practice.
     """
     model_parallel_plan = None
     model_cls = type(model)
@@ -1490,12 +1494,18 @@ def _get_parallel_plan(
             model_parallel_plan = hf_plan
             logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
         else:
-            if tp_size > 1:
+            # HF places dynamic classes loaded via ``trust_remote_code=True`` under the
+            # ``transformers_modules.*`` namespace. Those are the only archs known to
+            # actually crash inside ``_redistribute`` with the default base plan, so we
+            # only fail-fast for them. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
+            is_remote_code = (model_cls.__module__ or "").startswith("transformers_modules.")
+            if tp_size > 1 and is_remote_code:
                 raise ValueError(
-                    f"No tensor-parallel plan is registered for '{model_cls.__name__}' and the "
-                    f"model does not expose a HuggingFace `_tp_plan`. The default base plan "
-                    f"cannot be used at tp_size={tp_size}: it produces DTensor placements "
-                    "without `shard_order` metadata, which trips an internal assert in "
+                    f"No tensor-parallel plan is registered for the custom-code architecture "
+                    f"'{model_cls.__name__}' (loaded via trust_remote_code=True) and the model "
+                    f"does not expose a HuggingFace `_tp_plan`. The default base plan cannot be "
+                    f"used at tp_size={tp_size}: it produces DTensor placements without "
+                    "`shard_order` metadata, which trips an internal assert in "
                     "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
                     "Register a working plan in one of the following ways:\n"
                     f"  1. Add an entry for '{model_cls.__name__}' to "
@@ -1503,6 +1513,16 @@ def _get_parallel_plan(
                     "  2. Define a `_tp_plan` on the model class (HF-native per-model TP plan).\n"
                     "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
                     "Alternatively, run with tp_size=1."
+                )
+            if tp_size > 1:
+                logger.warning(
+                    "No tensor-parallel plan is registered for '%s' and the model does not "
+                    "expose a HuggingFace `_tp_plan`. Falling back to the default base plan at "
+                    "tp_size=%d. If you hit an internal assert in "
+                    "`torch.distributed.tensor._redistribute` on `shard_order is not None`, "
+                    "register a plan via `PARALLELIZE_FUNCTIONS`, `_tp_plan`, or `tp_shard_plan`.",
+                    model_cls.__name__,
+                    tp_size,
                 )
             base_model_tp_plan = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
