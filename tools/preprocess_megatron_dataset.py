@@ -113,9 +113,21 @@ class Encoder(object):
         data = json.loads(json_line)
         output = {}
         for key in self.args.json_keys:
-            text = data[key]
+            text = data.get(key)
+            if isinstance(text, list):
+                raw_sentences = [s for s in text if isinstance(s, str) and s]
+            elif isinstance(text, str) and text:
+                raw_sentences = [text]
+            else:
+                output[key] = []
+                continue
+
             max_len = 1000000
-            tokens_list = [Encoder.splitter.tokenize(text[i : i + max_len]) for i in range(0, len(text), max_len)]
+            tokens_list = [
+                Encoder.splitter.tokenize(text[i : i + max_len])
+                for text in raw_sentences
+                for i in range(0, len(text), max_len)
+            ]
             output[key] = [tokens for partial in tokens_list for tokens in partial]
         return json.dumps(output), len(json_line)
 
@@ -123,16 +135,38 @@ class Encoder(object):
         data = json.loads(json_line)
         ids = {}
         lens = {}
+        skipped_fragments = 0
         for key in self.args.json_keys:
-            text = data[key]
+            text = data.get(key)
+            # Two layers of defense against malformed JSONL rows:
+            # 1) Type filter for the obvious cases (null / non-string). Validators
+            #    that only check key presence (e.g. Lingua's validate_json.py) let
+            #    through entries like {"text": null}, which crash the HF
+            #    tokenizer with `TextEncodeInput must be Union[...]`.
+            # 2) try/except around the actual tokenizer call, because some
+            #    strings (long, null-byte-bearing, malformed surrogate, ...) pass
+            #    the type check but are still rejected by the tokenizers crate.
             if isinstance(text, list):
-                sentences = text
-            else:
+                sentences = [s for s in text if isinstance(s, str) and s]
+                invalid_items = len(text) - len(sentences)
+                skipped_fragments += invalid_items
+                if not sentences and invalid_items == 0:
+                    skipped_fragments += 1
+            elif isinstance(text, str) and text:
                 sentences = [text]
+            else:
+                skipped_fragments += 1
+                ids[key] = []
+                lens[key] = []
+                continue
             doc_ids = []
             sentence_lens = []
             for sentence in sentences:
-                sentence_ids = Encoder.tokenizer(sentence).input_ids
+                try:
+                    sentence_ids = Encoder.tokenizer(sentence).input_ids
+                except (TypeError, ValueError):
+                    skipped_fragments += 1
+                    continue
                 if len(sentence_ids) > 0:
                     doc_ids.extend(sentence_ids)
                     sentence_lens.append(len(sentence_ids))
@@ -141,7 +175,7 @@ class Encoder(object):
                 sentence_lens[-1] += 1
             ids[key] = doc_ids
             lens[key] = sentence_lens
-        return ids, lens, len(json_line)
+        return ids, lens, len(json_line), skipped_fragments
 
 
 class Partition(object):
@@ -211,15 +245,27 @@ class Partition(object):
         startup_end = time.time()
         proc_start = time.time()
         total_bytes_processed = 0
+        skipped_fragments = 0
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+        for i, (doc, sentence_lens, bytes_processed, skipped) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
+            skipped_fragments += skipped
             for key in doc.keys():
+                if len(doc[key]) == 0:
+                    continue
                 builders[key].add_document(doc[key], sentence_lens[key])
             self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
 
+        if skipped_fragments:
+            print(
+                f"Warning: skipped {skipped_fragments} malformed or empty text fragment(s) in {input_file_name}",
+                file=sys.stderr,
+            )
+        pool.close()
+        pool.join()
         fin.close()
-        builders[key].finalize(output_idx_files[key])
+        for key in builders:
+            builders[key].finalize(output_idx_files[key])
 
     def process_parquet_file(self, file_name):
         input_file_name, output_prefix = file_name
@@ -255,16 +301,26 @@ class Partition(object):
         startup_end = time.time()
         proc_start = time.time()
         total_bytes_processed = 0
+        skipped_fragments = 0
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+        for i, (doc, sentence_lens, bytes_processed, skipped) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
+            skipped_fragments += skipped
             for key in doc.keys():
+                if len(doc[key]) == 0:
+                    continue
                 builders[key].add_document(doc[key], sentence_lens[key])
             self.print_processing_stats(i, proc_start, total_bytes_processed, source=input_file_name)
 
+        if skipped_fragments:
+            print(
+                f"Warning: skipped {skipped_fragments} malformed or empty text fragment(s) in {input_file_name}",
+                file=sys.stderr,
+            )
         pool.close()
         pool.join()
-        builders[key].finalize(output_idx_files[key])
+        for key in builders:
+            builders[key].finalize(output_idx_files[key])
 
 
 def get_args():
@@ -420,6 +476,12 @@ def main():
                 processes.append(p)
             for p in processes:
                 p.join()
+            failed = [p.exitcode for p in processes if p.exitcode != 0]
+            if failed:
+                sys.exit(
+                    f"preprocess_megatron_dataset: {len(failed)}/{len(processes)} sentence-split worker "
+                    "process(es) failed"
+                )
 
         # Encode each file independently
         processes = []
@@ -432,6 +494,12 @@ def main():
             processes.append(p)
         for p in processes:
             p.join()
+        # Propagate child failures so the calling shell sees a non-zero exit.
+        # Without this, an unhandled exception inside a worker silently leaves
+        # an unfinalized .bin (no .idx) on disk while the script exits 0.
+        failed = [p.exitcode for p in processes if p.exitcode != 0]
+        if failed:
+            sys.exit(f"preprocess_megatron_dataset: {len(failed)}/{len(processes)} worker process(es) failed")
     else:
         # Parquet processing
         processes = []
@@ -443,6 +511,9 @@ def main():
             processes.append(p)
         for p in processes:
             p.join()
+        failed = [p.exitcode for p in processes if p.exitcode != 0]
+        if failed:
+            sys.exit(f"preprocess_megatron_dataset: {len(failed)}/{len(processes)} worker process(es) failed")
     return
 
 
