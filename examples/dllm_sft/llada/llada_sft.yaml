@@ -28,9 +28,10 @@ dist_env:
 
 seed: 42
 
-wandb:
-  project: dllm-baseline
-  name: am-llada-tulu3_run
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: dllm-baseline
+#   name: am-llada-tulu3_run
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
@@ -96,3 +97,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   group_by_length: true
+
+ci:
+  time: "00:45:00"
+  recipe_owner: zezhou
