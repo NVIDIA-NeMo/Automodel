@@ -430,7 +430,6 @@ ignore_imports = [
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.llama.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.gemma4_moe.model",
     "nemo_automodel.components.distributed.optimized_tp_plans -> nemo_automodel.components.models.mistral3_vlm.model",
-    "nemo_automodel.components.training.signal_handler -> nemo_automodel.components.loggers.mlflow_utils",
 ]
 
 # ty: type checking (https://github.com/astral-sh/ty)

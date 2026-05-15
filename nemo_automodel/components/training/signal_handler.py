@@ -20,10 +20,6 @@ from typing import Any, Optional
 import torch
 import torch.distributed
 
-from nemo_automodel.components.loggers.mlflow_utils import (
-    end_active_run_as_killed as mlflow_end_run_as_killed,
-)
-
 
 def get_device(local_rank: Optional[int] = None) -> torch.device:
     """
@@ -145,7 +141,6 @@ class DistributedSignalHandler:
         def handler(signum: int, frame: Optional[Any]) -> None:
             logging.info("Received signal {}, initiating graceful stop".format(signum))
             self._signal_received = True
-            mlflow_end_run_as_killed()
 
         signal.signal(self.sig, handler)
         logging.info("Signal handler installed for {}".format(self.sig))

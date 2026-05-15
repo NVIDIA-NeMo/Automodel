@@ -64,6 +64,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
     configure_mlflow,
+    end_mlflow_active_run_as_killed,
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -900,6 +901,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.metric_logger_valid.close()
 
         self.checkpointer.close()
+
+        # Mark the MLflow run KILLED if training exited via SIGTERM.
+        if self.step_scheduler.sigterm_flag:
+            end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
     def _forward_backward_step(

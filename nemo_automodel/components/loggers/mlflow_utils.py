@@ -193,7 +193,7 @@ def to_float_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def end_active_run_as_killed() -> None:
+def end_mlflow_active_run_as_killed() -> None:
     """End the active MLflow run with status=KILLED.
 
     Called from the SIGTERM handler so interrupted runs show as KILLED

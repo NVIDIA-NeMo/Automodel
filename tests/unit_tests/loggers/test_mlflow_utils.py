@@ -22,7 +22,7 @@ import torch.distributed as dist
 from nemo_automodel.components.loggers.mlflow_utils import (
     _install_mlflow_failure_hook,
     configure_mlflow,
-    end_active_run_as_killed,
+    end_mlflow_active_run_as_killed,
     flatten_params_for_mlflow,
     to_float_metrics,
 )
@@ -256,7 +256,7 @@ class TestConfigureMlflow:
         assert run2.info.run_id == run1.info.run_id
 
 
-class TestEndActiveRunAsKilled:
+class TestEndMlflowActiveRunAsKilled:
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path):
         mlflow.set_tracking_uri(f"file://{tmp_path}/mlruns")
@@ -270,7 +270,7 @@ class TestEndActiveRunAsKilled:
         run = mlflow.start_run()
         run_id = run.info.run_id
 
-        end_active_run_as_killed()
+        end_mlflow_active_run_as_killed()
 
         # mlflow's run should now be ended (no active run) and stored with KILLED status
         assert mlflow.active_run() is None
@@ -278,7 +278,7 @@ class TestEndActiveRunAsKilled:
 
     def test_no_op_when_no_active_run(self):
         assert mlflow.active_run() is None  # precondition
-        end_active_run_as_killed()  # should not raise
+        end_mlflow_active_run_as_killed()  # should not raise
         assert mlflow.active_run() is None
 
     def test_suppresses_errors_from_end_run(self, monkeypatch):
@@ -290,7 +290,7 @@ class TestEndActiveRunAsKilled:
             raise RuntimeError("simulated reentrancy failure")
 
         monkeypatch.setattr(mlflow, "end_run", _raises)
-        end_active_run_as_killed()  # must not raise
+        end_mlflow_active_run_as_killed()  # must not raise
 
 
 class TestInstallMlflowFailureHook:
