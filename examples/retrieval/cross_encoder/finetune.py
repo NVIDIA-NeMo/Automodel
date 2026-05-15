@@ -19,6 +19,8 @@ from nemo_automodel.recipes.retrieval import TrainCrossEncoderRecipe
 
 
 def main(default_config_path="examples/retrieval/cross_encoder/llama3_2_1b.yaml"):
+    """Run cross-encoder retrieval fine-tuning with the configured recipe."""
+
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainCrossEncoderRecipe(cfg)
     recipe.setup()

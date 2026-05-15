@@ -34,6 +34,8 @@ import sys
 
 
 def parse_args():
+    """Parse command-line options for ChatDataset validation."""
+
     parser = argparse.ArgumentParser(description="Validate ChatDataset samples for training correctness.")
     parser.add_argument("--dataset", type=str, required=True, help="HF dataset ID or local path")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-30B-A3B", help="Model/tokenizer name")
@@ -142,6 +144,8 @@ def validate(dataset, eos_token_id, num_samples):
 
 
 def main():
+    """Run ChatDataset validation from the command line."""
+
     args = parse_args()
 
     from transformers import AutoTokenizer
