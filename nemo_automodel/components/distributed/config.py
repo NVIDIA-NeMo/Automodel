@@ -63,15 +63,16 @@ class FSDP2Config:
             (non-packed) training only. Disable if using packed-sequence training
             (position_ids that reset to 0 mid-sequence). Default ``False``.
         mp_policy (Optional[MixedPrecisionPolicy]): MixedPrecisionPolicy for FSDP2.
-            If ``None`` (default), uses the Megatron-style master-weights pattern:
-            bf16 forward/backward compute with fp32 gradient reduction. Override
-            from YAML using the ``_target_`` pattern::
+            If ``None`` (default), uses bf16 forward/backward compute with fp32
+            gradient reduction. Pair this with ``model.torch_dtype: float32`` for
+            the Megatron-style fp32 master-weights pattern. Override from YAML
+            using the ``_target_`` pattern::
 
                 mp_policy:
                   _target_: torch.distributed.fsdp.MixedPrecisionPolicy
                   param_dtype: bfloat16
                   reduce_dtype: float32
-                  output_dtype: float32
+                  output_dtype: bfloat16
 
             See ``docs/guides/mixed-precision.md`` for the full set of recommended
             patterns and the bf16-storage trap (issue #1679).
@@ -119,9 +120,9 @@ class FSDP2Config:
 
     def __post_init__(self):
         if self.mp_policy is None:
-            # Megatron-style "master weights" default: bf16 compute, fp32 gradient
-            # reduction. Pair with ``model.torch_dtype: float32`` for a fp32
-            # optimizer state. See ``docs/guides/mixed-precision.md``.
+            # FSDP2 default: bf16 compute and fp32 gradient reduction. Pair with
+            # ``model.torch_dtype: float32`` for fp32 optimizer state. See
+            # ``docs/guides/mixed-precision.md``.
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,

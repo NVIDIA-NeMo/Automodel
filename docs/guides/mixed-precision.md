@@ -8,8 +8,8 @@ sharded parameter. Together these decide what numeric precision the optimizer
 state ends up in -- which is the part that determines whether long pre-training
 runs converge cleanly.
 
-This page describes the two precision patterns we recommend, and the trap that
-sits between them.
+This page describes the precision patterns we recommend, and the trap that sits
+between them.
 
 ## Storage dtype vs compute dtype
 
@@ -31,11 +31,11 @@ and smaller, the AdamW state can become quantized/stale, producing periodic
 [issue #1679](https://github.com/NVIDIA-NeMo/Automodel/issues/1679) for the
 full reproduction.
 
-## Pattern A (recommended for pre-training): fp32 master weights + bf16 compute
+## Pattern A (recommended for PyTorch AdamW pre-training): fp32 master weights + bf16 compute
 
 ```yaml
 model:
-  torch_dtype: float32              # sharded parameter + Adam state in fp32
+  torch_dtype: float32              # sharded parameter + AdamW state in fp32
 
 distributed:
   _target_: nemo_automodel.components.distributed.config.FSDP2Config
@@ -56,9 +56,17 @@ applies when no `mp_policy:` is set are exactly the values above -- you only
 need to set `model.torch_dtype: float32` to opt into the master-weights side
 of the pattern.
 
+The main trade-off is checkpoint dtype, not necessarily runtime memory. With
+`torch.optim.AdamW`, the resident fp32 sharded parameter is the master weight, so
+there is no separate fp32 master-weight copy. Keep periodic training checkpoints
+in fp32 if you need exact resume. After training, export a separate model-only
+bf16 checkpoint for inference or release.
+
 If you set the model dtype to bf16 storage, but need the precision of fp32
-optimizer state, you can also use the Transformer Engine fused optimizer instead -- it
-keeps `master_weights`, `exp_avg`, and `exp_avg_sq` in fp32 explicitly:
+optimizer state, you can also use the Transformer Engine fused optimizer instead.
+This keeps `master_weights`, `exp_avg`, and `exp_avg_sq` in fp32 explicitly, but
+it is an optimizer-level precision option rather than a guaranteed memory
+reduction:
 
 ```yaml
 optimizer:
