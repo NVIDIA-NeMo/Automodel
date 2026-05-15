@@ -35,10 +35,12 @@ from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _
 from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
+)
+from nemo_automodel.components.checkpoint.checkpointing import (
     is_cloud_path,
     _ensure_msc_available,
     _ensure_dirs,
-    save_config
+    save_config,
 )
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
