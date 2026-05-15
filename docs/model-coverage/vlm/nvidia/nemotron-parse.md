@@ -1,6 +1,6 @@
 # Nemotron-Parse
 
-[Nemotron-Parse-v1.1](https://huggingface.co/nvidia/Nemotron-Parse-v1.1) is NVIDIA's document parsing VLM, specializing in extracting structured information from complex documents including tables, forms, and mixed-content PDFs.
+[Nemotron-Parse-v1.1](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1) is NVIDIA's document parsing VLM, specializing in extracting structured information from complex documents including tables, forms, and mixed-content PDFs.
 
 :::{card}
 | | |
@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Nemotron-Parse v1.1 | [`nvidia/Nemotron-Parse-v1.1`](https://huggingface.co/nvidia/Nemotron-Parse-v1.1) |
+| Nemotron-Parse v1.1 | [`nvidia/NVIDIA-Nemotron-Parse-v1.1`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1) |
 
 ## Example Recipes
 
@@ -88,4 +88,4 @@ See also the [tutorial notebook](https://github.com/NVIDIA-NeMo/Automodel/blob/m
 
 ## Hugging Face Model Cards
 
-- [nvidia/Nemotron-Parse-v1.1](https://huggingface.co/nvidia/Nemotron-Parse-v1.1)
+- [nvidia/NVIDIA-Nemotron-Parse-v1.1](https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.1)
