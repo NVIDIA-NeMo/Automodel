@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
+
 import pytest
 
 from tests.utils.test_utils import run_test_script
-import shutil
 
 TEST_FOLDER = "hf_transformer_vlm"
 HF_TRANSFORMER_VLM_FSDP2_TP2_FILENAME = "L2_HF_Transformer_VLM_FSDP2_TP2.sh"
@@ -24,6 +25,7 @@ HF_TRANSFORMER_VLM_FUSED_CE_SFT_FILENAME = "L2_HF_Transformer_VLM_Fused_CE_SFT.s
 HF_TRANSFORMER_VLM_PEFT_FILENAME = "L2_HF_Transformer_VLM_PEFT.sh"
 HF_TRANSFORMER_VLM_SFT_FILENAME = "L2_HF_Transformer_VLM_SFT.sh"
 HF_TRANSFORMER_VLM_SFT_MegatronFSDP_FILENAME = "L2_HF_Transformer_VLM_SFT_MegatronFSDP.sh"
+HF_TRANSFORMER_VLM_GEMMA4_JOINT_DRAFTER_FILENAME = "L2_HF_Transformer_VLM_Gemma4_Joint_Drafter.sh"
 
 
 class TestHFTransformerVLM:
@@ -59,3 +61,14 @@ class TestHFTransformerVLM:
     @pytest.mark.pleasefixme
     def test_hf_transformer_vlm_sft_megatron_fsdp(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_MegatronFSDP_FILENAME)
+
+    # Gated on `transformers>=5.8.0.dev` (gemma4_assistant) AND on the mini
+    # base + drafter checkpoints under `$TEST_DATA_DIR`.  Once both are
+    # available in CI, drop `pleasefixme` and the test will block PRs on
+    # joint base + drafter regressions.
+    @pytest.mark.pleasefixme
+    def test_hf_transformer_vlm_gemma4_joint_drafter(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_GEMMA4_JOINT_DRAFTER_FILENAME)
+        finally:
+            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)

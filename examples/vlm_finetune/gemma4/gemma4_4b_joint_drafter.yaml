@@ -1,0 +1,124 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Joint fine-tuning of Gemma 4 4B (E4B) base + the released drafter
+# (google/gemma-4-E4B-it-assistant) on MedPix VQA.
+#
+# Both sub-models are trainable.  Loss = L_base + drafter_loss_weight * L_drafter.
+# After training the composite saves two HF-format directories
+# (`base/` and `drafter/`) so vLLM can serve the pair with speculative decoding.
+#
+# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py \
+#     -c examples/vlm_finetune/gemma4/gemma4_4b_joint_drafter.yaml
+#
+# Requires: transformers>=5.8.0.dev
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.components.models.gemma4_drafter.composite.Gemma4WithDrafter.from_pretrained
+  # Base model path (also used by the recipe to load the processor / tokenizer
+  # and to set the checkpoint cache key).
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
+  drafter_path: google/gemma-4-E4B-it-assistant
+  # Joint training knobs.
+  drafter_loss_weight: 0.1
+  drafter_num_steps: 1
+  # Base 4B uses kv-shared layers, hence text_config.use_cache: true to keep
+  # the K/V state cache enabled in HF's forward (same as gemma4_4b.yaml).
+  text_config:
+    use_cache: true
+    output_hidden_states: true
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: true
+  use_sdpa_patching: false
+  attn_implementation: eager
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: vlm_checkpoints/gemma4_4b_joint_drafter/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train[:1000]
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:500]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  # Embeddings must stay trainable: the drafter consumes the base's token
+  # embeddings via its pre_projection input, so freezing them would block
+  # gradient flow from the drafter loss to the base.
+  freeze_embeddings: false
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: <your-run-name>
+
+ci:
+  recipe_owner: athitten

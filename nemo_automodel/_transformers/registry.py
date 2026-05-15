@@ -64,6 +64,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
         ),
         (
+            "Gemma4AssistantForCausalLM",
+            ("nemo_automodel.components.models.gemma4_drafter.model", "Gemma4DrafterForCausalLM"),
+        ),
+        (
             "GptOssForCausalLM",
             ("nemo_automodel.components.models.gpt_oss.model", "GptOssForCausalLM"),
         ),
