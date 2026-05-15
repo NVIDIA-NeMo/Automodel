@@ -80,7 +80,6 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: false
   dequantize_base_checkpoint: true
-  allow_partial_optimizer_load: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

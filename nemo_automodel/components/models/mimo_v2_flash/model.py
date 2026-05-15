@@ -114,11 +114,10 @@ def _dtensor_to_full_tensor(value: torch.Tensor) -> torch.Tensor:
             continue
         group = value.device_mesh.get_group(mesh_dim)
         if placement_name == "Shard":
-            gathered = [torch.empty_like(result) for _ in range(value.device_mesh.size(mesh_dim))]
-            dist.all_gather(gathered, result, group=group)
+            gathered = dist_nn_f.all_gather(result, group=group)
             result = torch.cat(gathered, dim=placement.dim).contiguous()
         elif placement_name == "Partial":
-            dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+            result = dist_nn_f.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
         else:
             raise NotImplementedError(f"Unsupported DTensor placement for MiMo gate: {placement}")
     return result
