@@ -117,7 +117,7 @@ class FSDP2Config:
         if self.mp_policy is None:
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
                 output_dtype=torch.bfloat16,
                 cast_forward_inputs=True,
             )
