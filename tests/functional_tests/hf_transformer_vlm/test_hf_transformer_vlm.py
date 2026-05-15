@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
+
 import pytest
 
 from tests.utils.test_utils import run_test_script
-import shutil
 
 TEST_FOLDER = "hf_transformer_vlm"
 HF_TRANSFORMER_VLM_FSDP2_TP2_FILENAME = "L2_HF_Transformer_VLM_FSDP2_TP2.sh"

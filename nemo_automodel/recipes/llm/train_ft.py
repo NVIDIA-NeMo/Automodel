@@ -169,7 +169,6 @@ def build_model(
     cfg_compile=None,
     cfg_quantization=None,
     device_mesh=None,
-    moe_mesh=None,
     distributed_config=None,
     pipeline_config=None,
     cfg_qat=None,
@@ -189,7 +188,6 @@ def build_model(
         cfg_compile: Configuration for torch.compile.
         cfg_quantization: Configuration for BitsAndBytes quantization.
         device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
         distributed_config: Strategy-specific distributed config (FSDP2Config, etc.).
         pipeline_config: Pipeline parallelism config.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
@@ -205,7 +203,6 @@ def build_model(
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
             "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
             "pipeline_config": pipeline_config,
             "sdpa_method": sdpa_method,
@@ -268,7 +265,7 @@ def build_model(
             # exactly as from_pretrained/from_config do internally.
             model = cfg_model.instantiate()
 
-            mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+            mesh = MeshContext.from_meshes(device_mesh)
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
@@ -1091,7 +1088,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
-            moe_mesh=self.moe_mesh,
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -1108,7 +1104,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
             cfg_qat=self.cfg.get("qat", None),

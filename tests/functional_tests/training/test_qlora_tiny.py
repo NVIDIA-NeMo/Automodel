@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import sys
 
+import datasets
 import pytest
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.quantization.qlora import verify_qlora_quantization
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
-
-import datasets
 
 datasets.disable_caching()
 

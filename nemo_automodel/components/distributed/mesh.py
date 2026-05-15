@@ -119,6 +119,8 @@ class MeshContext:
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.moe_mesh is None and self.device_mesh is not None:
+            self.moe_mesh = _derive_moe_mesh(self.device_mesh)
         _validate_mesh_dim_names(self)
         _validate_distributed_setup(self)
 
@@ -218,6 +220,20 @@ class MeshContext:
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
         )
+
+
+def _derive_moe_mesh(device_mesh: "DeviceMesh") -> "Optional[DeviceMesh]":
+    """Derive the MoE EP mesh from device_mesh when EP dims are present and EP size > 1."""
+    if device_mesh is None:
+        return None
+    root = device_mesh._get_root_mesh() if hasattr(device_mesh, "_get_root_mesh") else device_mesh
+    fm = getattr(root, "_flatten_mapping", {})
+    if MeshAxisName.EP in fm:
+        mesh = fm[MeshAxisName.EP]
+        return mesh if mesh.size() > 1 else None
+    if MeshAxisName.EP in getattr(device_mesh, "mesh_dim_names", ()):
+        return device_mesh if device_mesh[MeshAxisName.EP].size() > 1 else None
+    return None
 
 
 # misc utils

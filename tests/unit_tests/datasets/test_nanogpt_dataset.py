@@ -11,23 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
-from torch.utils.data import get_worker_info
 
 from nemo_automodel.components.datasets.llm.nanogpt_dataset import (
-    NanogptDataset,
     MAGIC,
     VERSION,
-    load_bin_shard,
-    _get_start_end_pos_single_file,
+    NanogptDataset,
     _get_next_bos_position,
-    _get_worker_id_and_total_workers
+    _get_start_end_pos_single_file,
+    _get_worker_id_and_total_workers,
+    load_bin_shard,
 )
 
 

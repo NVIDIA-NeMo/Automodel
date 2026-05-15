@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 import types
 from contextlib import contextmanager
@@ -23,6 +24,8 @@ import torch
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
     NeMoAutoModelForCausalLM,
+    NeMoAutoModelForImageTextToText,
+    NeMoAutoModelForSequenceClassification,
     _BaseNeMoAutoModelClass,
     _consume_config_overrides,
     _get_next_fallback_attn,
@@ -1512,3 +1515,29 @@ class TestPatchRemoteCodeCompat:
         # Existing values should be preserved
         assert model.all_tied_weights_keys == ["existing.key"]
         assert model.config.use_cache is True
+
+
+# =============================================================================
+# Tests for moe_mesh removal from public API
+# =============================================================================
+
+
+class TestMoeMeshRemovedFromAPI:
+    """moe_mesh must not appear in any NemoAutoModel user-facing init signatures"""
+
+    @pytest.mark.parametrize("cls", [NeMoAutoModelForCausalLM,
+        NeMoAutoModelForSequenceClassification,
+        NeMoAutoModelForImageTextToText,
+    ])
+
+    def test_from_pretrained_has_no_moe_mesh(self, cls):
+        sig = inspect.signature(cls.from_pretrained)
+        assert "moe_mesh" not in sig.parameters, (f"{cls.__name__}.from_pretrained still accepts moe_mesh")
+
+    @pytest.mark.parametrize("cls", [NeMoAutoModelForCausalLM,
+        NeMoAutoModelForSequenceClassification,
+        NeMoAutoModelForImageTextToText,])
+
+    def test_from_config_has_no_moe_mesh(self, cls):
+        sig = inspect.signature(cls.from_config)
+        assert "moe_mesh" not in sig.parameters, (f"{cls.__name__}.from_config still accepts moe_mesh")

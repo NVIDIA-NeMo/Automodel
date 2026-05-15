@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 from typing import List, Tuple
 
-import pytest
 import torch
 import torch.nn as nn
 
 from nemo_automodel.components.distributed.parallelizer_utils import (
-    iter_maximal_uniform_dtype_subtrees,
-    _group_params_by_dtype,
-    _get_module_from_path,
     _fully_shard,
+    _get_module_from_path,
+    _group_params_by_dtype,
     fully_shard_by_dtype,
+    iter_maximal_uniform_dtype_subtrees,
 )
 
 

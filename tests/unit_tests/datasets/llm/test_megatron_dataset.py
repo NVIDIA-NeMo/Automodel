@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _get_right_trailing_pad_mask
-from nemo_automodel.components.datasets.llm.megatron_dataset import try_load_blend_from_json, get_list_of_files
+from nemo_automodel.components.datasets.llm.megatron_dataset import get_list_of_files, try_load_blend_from_json
 
 
 class TestGetRightTrailingPadMask:

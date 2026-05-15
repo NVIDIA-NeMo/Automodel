@@ -21,10 +21,10 @@ import pytest
 import torch.nn as nn
 
 from nemo_automodel.components.distributed.parallelizer import (
-    fsdp2_strategy_parallelize,
-    get_parallelization_strategy,
     DefaultParallelizationStrategy,
     NemotronHParallelizationStrategy,
+    fsdp2_strategy_parallelize,
+    get_parallelization_strategy,
 )
 
 

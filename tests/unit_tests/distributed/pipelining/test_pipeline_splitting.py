@@ -13,18 +13,20 @@
 # limitations under the License.
 
 import types
+
 import pytest
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-from torch.testing._internal.distributed.fake_pg import FakeStore
+import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo_automodel.components.distributed.pipelining.functional import (
-    split_model_into_stages,
     generate_hf_model_fqn_per_model_part,
+    split_model_into_stages,
 )
+
 # from nemo_automodel.components.training import pp_utils as pp_utils_mod  # Not available
 
 

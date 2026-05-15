@@ -501,7 +501,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         quantization_config=None,
         force_hf: bool = False,
         device_mesh: Optional["DeviceMesh"] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
         tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
@@ -552,7 +551,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
                 distributed training. Parallelism sizes (tp, pp, cp, ep) are inferred
                 from this. Default: None.
-            moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
                 parallelism. ep_size is inferred from this. Default: None.
             tp_plan (dict | None, optional): Custom tensor parallel plan. If provided,
                 overrides the tp_plan on distributed_config. Default: None.
@@ -583,7 +581,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
 
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        mesh = MeshContext.from_meshes(device_mesh)
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
@@ -646,7 +644,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         quantization_config=None,
         force_hf: bool = False,
         device_mesh: Optional["DeviceMesh"] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
         tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
@@ -675,7 +672,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
 
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        mesh = MeshContext.from_meshes(device_mesh)
 
         # Only instantiate infrastructure when distributed_config is provided
         model_wrapper = autopipeline = parallelize_fn = qat_quantizer = None
@@ -885,7 +882,6 @@ class _NeMoAutoModelForRetrievalBase:
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
         device_mesh: Optional["DeviceMesh"] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
         tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
@@ -910,7 +906,6 @@ class _NeMoAutoModelForRetrievalBase:
             sdpa_method: SDPA backend methods to use.
             torch_dtype: Data type passed to the underlying model initialization.
             device_mesh: Pre-created device mesh for distributed training.
-            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
             tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
             distributed_config: Strategy-specific distributed training configuration.
             moe_config: MoE parallelizer configuration.
@@ -939,7 +934,6 @@ class _NeMoAutoModelForRetrievalBase:
                 sdpa_method=sdpa_method,
                 torch_dtype=torch_dtype,
                 device_mesh=device_mesh,
-                moe_mesh=moe_mesh,
                 tp_plan=tp_plan,
                 distributed_config=distributed_config,
                 moe_config=moe_config,
@@ -956,7 +950,7 @@ class _NeMoAutoModelForRetrievalBase:
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
 
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        mesh = MeshContext.from_meshes(device_mesh)
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,

@@ -118,6 +118,7 @@ def test_is_triton_greater_or_equal(monkeypatch):
     """
 
     import pkg_resources
+
     from nemo_automodel.components.loss.linear_ce import new_is_triton_greater_or_equal
 
     class _DummyDist:
@@ -144,6 +145,7 @@ def test_is_triton_greater_or_equal_3_2_0(monkeypatch):
     """Ensure the convenience wrapper compares against 3.1.0 (despite name)."""
 
     import pkg_resources
+
     from nemo_automodel.components.loss.linear_ce import (
         new_is_triton_greater_or_equal_3_2_0,
     )

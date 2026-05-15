@@ -20,11 +20,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
-from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
-from nemo_automodel.components.datasets.llm import BiEncoderCollator
-from nemo_automodel.components.distributed.init_utils import initialize_distributed
+
 from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.datasets.llm import BiEncoderCollator
+from nemo_automodel.components.datasets.llm import retrieval_dataset_inline as rdi
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
 
 

@@ -16,7 +16,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules, patch_linear_module
+from nemo_automodel.components._peft.lora import (
+    LinearLoRA,
+    PeftConfig,
+    apply_lora_to_linear_modules,
+    patch_linear_module,
+)
 from nemo_automodel.shared.import_utils import safe_import_te
 
 HAS_TE, transformer_engine = safe_import_te()

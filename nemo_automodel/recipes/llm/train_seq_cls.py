@@ -116,7 +116,6 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
             device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )

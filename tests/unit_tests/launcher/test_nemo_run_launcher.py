@@ -22,7 +22,6 @@ import yaml
 from nemo_automodel.components.launcher.nemo_run.config import NemoRunConfig
 from nemo_automodel.components.launcher.nemo_run.launcher import NemoRunLauncher
 
-
 RECIPE_TARGET = "nemo_automodel.recipes.llm.train_ft.TrainRecipe"
 
 
@@ -189,8 +188,8 @@ class TestLaunch:
             launcher_config={"executor": "local", "job_dir": job_dir},
         )
 
-        import os
         import glob
+        import os
 
         job_dirs = glob.glob(os.path.join(job_dir, "*"))
         assert len(job_dirs) == 1
@@ -216,8 +215,8 @@ class TestLaunch:
             launcher_config={"executor": "local", "job_dir": job_dir},
         )
 
-        import os
         import glob
+        import os
 
         job_dirs = glob.glob(os.path.join(job_dir, "*"))
         assert len(job_dirs) == 1

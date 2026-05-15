@@ -9,7 +9,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
@@ -19,7 +18,6 @@ from nemo_automodel.components.models.common.packing import (
     get_seqlens_in_batch,
     get_unpad_data,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_seqlens_in_batch
