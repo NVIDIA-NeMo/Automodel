@@ -126,6 +126,7 @@ class MegatronFSDPManager:
                 model,
                 sequence_parallel=False,  # explicit: SP not supported here
                 tp_shard_plan=None,
+                tp_size=self.device_mesh["tp"].size(),
             )
         else:
             tp_shard_plan = None
