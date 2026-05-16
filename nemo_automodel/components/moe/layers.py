@@ -251,7 +251,6 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
-        self.output_dtype = config.gate_output_dtype
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -415,9 +414,8 @@ class Gate(nn.Module):
 
         weights = weights * self.route_scale
 
-        output_dtype = self.output_dtype or original_dtype
-        weights = weights.to(dtype=output_dtype)
         if self.gate_precision is not None:
+            weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
@@ -443,7 +441,7 @@ class Gate(nn.Module):
         if self._track_load_balance and aux_loss is not None:
             self._last_aux_loss = aux_loss.detach()
 
-        return weights, indices, aux_loss
+        return weights.type_as(x), indices, aux_loss
 
     def update_bias(self) -> None:
         """

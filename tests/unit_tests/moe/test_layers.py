@@ -696,26 +696,6 @@ class TestGate:
         torch.testing.assert_close(indices, expected_indices)
         torch.testing.assert_close(weights.detach(), expected_weights, rtol=1e-5, atol=1e-5)
 
-    def test_gate_output_dtype_override(self, moe_config, device):
-        """Models can keep routing weights fp32 even when activations are bf16."""
-        moe_config.score_func = "sigmoid_with_bias"
-        moe_config.gate_bias_update_factor = 0
-        moe_config.aux_loss_coeff = 0
-        moe_config.force_e_score_correction_bias = True
-        moe_config.gate_output_dtype = torch.float32
-        gate = Gate(moe_config, gate_precision=torch.float32).to(device)
-
-        with torch.no_grad():
-            gate.weight.normal_(0, 0.02)
-
-        num_tokens = 16
-        x = torch.randn(num_tokens, moe_config.dim, dtype=torch.bfloat16, device=device)
-        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
-
-        weights, _, _ = gate(x, token_mask, cp_mesh=None)
-
-        assert weights.dtype == torch.float32
-
     def test_gate_forward_sqrtsoftplus_basic(self, moe_config, device):
         """``score_func='sqrtsoftplus'`` should compute weights as sqrt(softplus(logits))."""
         moe_config.score_func = "sqrtsoftplus"

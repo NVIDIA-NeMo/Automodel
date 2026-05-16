@@ -326,10 +326,6 @@ class MiMoV2FlashBlock(nn.Module):
         dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
-            self.mlp.gate.weight = nn.Parameter(
-                self.mlp.gate.weight.to(torch.float32),
-                requires_grad=self.mlp.gate.weight.requires_grad,
-            )
         else:
             self.mlp = MLP(
                 config.hidden_size,
@@ -395,6 +391,11 @@ class MiMoV2FlashModel(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
+        # Route the gate compute in fp32 even when activations are bf16 to keep
+        # MiMo's routing decisions stable (mirrors step3p5 and nemotron_v3).
+        if self.backend.gate_precision is None:
+            self.backend.gate_precision = torch.float32
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -415,7 +416,6 @@ class MiMoV2FlashModel(nn.Module):
             expert_activation="swiglu",
             softmax_before_topk=False,
             force_e_score_correction_bias=True,
-            gate_output_dtype=torch.float32,
             dtype=get_dtype(config.torch_dtype, torch.bfloat16),
         )
         if moe_overrides:
@@ -579,7 +579,7 @@ class MiMoV2FlashModel(nn.Module):
 class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for MiMo-V2-Flash with Automodel checkpoint adapters."""
 
-    _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias", "attention_sink_bias"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "attention_sink_bias"]
     _pp_keep_self_forward = True
     _skip_init_weights_on_load = True
 

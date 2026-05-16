@@ -105,10 +105,6 @@ def _iter_moe_blocks(model_wrapper: nn.Module, backbone: nn.Module):
         yield from mtp_module.layers.children()
 
 
-def _has_fp32_parameters(module: nn.Module) -> bool:
-    return any(param.is_floating_point() and param.dtype == torch.float32 for param in module.parameters())
-
-
 def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None = None):
     """Applies EP to MoE module."""
     assert ep_mesh.size() > 1
@@ -272,21 +268,6 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
-            gate = getattr(moe_module, "gate", None)
-            if gate is not None and _has_fp32_parameters(gate):
-                ignored_params.update(gate.parameters())
-                gate_mp_policy = MixedPrecisionPolicy(
-                    param_dtype=torch.float32,
-                    reduce_dtype=torch.float32,
-                    output_dtype=torch.float32,
-                )
-                fully_shard_impl(
-                    gate,
-                    mesh=fsdp_mesh,
-                    reshard_after_forward=reshard_after_forward,
-                    mp_policy=gate_mp_policy,
-                    offload_policy=offload_policy,
-                )
         fully_shard_default(block, ignored_params=ignored_params)
 
     if hasattr(_model, "embed_tokens") and _model.embed_tokens is not None:
