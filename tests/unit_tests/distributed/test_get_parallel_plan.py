@@ -288,7 +288,37 @@ def test_default_plan_fallthrough_known_hf_arch_warns_at_tp_size_gt_1(monkeypatc
         result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_size=2)
 
     assert "model.embed_tokens" in result and "lm_head" in result
-    assert any("No tensor-parallel plan is registered" in r.message for r in caplog.records)
+    assert any("No usable tensor-parallel plan is registered" in r.message for r in caplog.records)
+
+
+def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkeypatch):
+    """Remote-code archs whose ``_tp_plan`` failed to translate get a diagnostic in the error.
+
+    Covers the case where the model author exposed a ``_tp_plan`` but
+    ``get_hf_tp_shard_plan`` raised while translating it (e.g. because the styles are
+    not recognized by nemo). The raised ``ValueError`` should fold the translator's
+    error message in so the user can distinguish "no `_tp_plan` at all" from
+    "`_tp_plan` defined but unusable". See
+    https://github.com/NVIDIA-NeMo/Automodel/pull/2244 discussion.
+    """
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+
+    def _raise_translator(_model):
+        raise ValueError("Unknown parallel style: foo_bar")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_translator, raising=True)
+    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
+
+    with pytest.raises(ValueError) as excinfo:
+        _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=2)
+
+    msg = str(excinfo.value)
+    # Diagnostic from get_hf_tp_shard_plan must be folded into the user-facing error.
+    assert "Unknown parallel style: foo_bar" in msg
+    # And the registration guidance must still be there.
+    assert "PARALLELIZE_FUNCTIONS" in msg
+    assert "_tp_plan" in msg
+    assert "tp_shard_plan" in msg
 
 
 def test_default_plan_fallthrough_tp_size_1_still_returns_base_plan(monkeypatch):

@@ -1424,6 +1424,12 @@ def _get_parallel_plan(
     https://github.com/NVIDIA-NeMo/Automodel/issues/2243); known HF
     architectures that happen to fall through (e.g. Mixtral) are left on the
     default plan with a warning, since they have been working in practice.
+
+    When the model *did* define a ``_tp_plan`` but ``get_hf_tp_shard_plan``
+    raised while translating it (e.g. styles nemo does not recognize), the
+    translator's error message is folded into the ``ValueError`` as a
+    diagnostic so the user can tell whether to add a ``_tp_plan`` from
+    scratch or fix the styles in the one they already have.
     """
     model_parallel_plan = None
     model_cls = type(model)
@@ -1485,9 +1491,11 @@ def _get_parallel_plan(
         # live under model.language_model.layers.* and would be missed by the
         # hardcoded llama-style wildcards below.
         hf_plan = None
+        hf_plan_error: Exception | None = None
         try:
             hf_plan = get_hf_tp_shard_plan(model)
         except Exception as e:
+            hf_plan_error = e
             logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
 
         if hf_plan:
@@ -1500,25 +1508,30 @@ def _get_parallel_plan(
             # only fail-fast for them. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
             is_remote_code = (model_cls.__module__ or "").startswith("transformers_modules.")
             if tp_size > 1 and is_remote_code:
+                # If the model author *did* define `_tp_plan` but it was unusable
+                # (e.g. styles nemo does not recognize), surface that diagnostic so the
+                # user knows whether to (a) add a missing `_tp_plan` from scratch or
+                # (b) fix the styles in the one they already have.
+                diag = f" Note: {hf_plan_error}." if hf_plan_error is not None else ""
                 raise ValueError(
                     f"No tensor-parallel plan is registered for the custom-code architecture "
-                    f"'{model_cls.__name__}' (loaded via trust_remote_code=True) and the model "
-                    f"does not expose a HuggingFace `_tp_plan`. The default base plan cannot be "
-                    f"used at tp_size={tp_size}: it produces DTensor placements without "
-                    "`shard_order` metadata, which trips an internal assert in "
+                    f"'{model_cls.__name__}' (loaded via trust_remote_code=True), and no usable "
+                    f"HuggingFace `_tp_plan` was found.{diag} The default base plan cannot be used "
+                    f"at tp_size={tp_size}: it produces DTensor placements without `shard_order` "
+                    "metadata, which trips an internal assert in "
                     "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
                     "Register a working plan in one of the following ways:\n"
                     f"  1. Add an entry for '{model_cls.__name__}' to "
                     "`nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS`.\n"
-                    "  2. Define a `_tp_plan` on the model class (HF-native per-model TP plan).\n"
+                    "  2. Define a `_tp_plan` on the model class with styles nemo recognizes "
+                    "(e.g. `colwise`, `rowwise`, `colwise_rep`, `rowwise_rep`).\n"
                     "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
                     "Alternatively, run with tp_size=1."
                 )
             if tp_size > 1:
                 logger.warning(
-                    "No tensor-parallel plan is registered for '%s' and the model does not "
-                    "expose a HuggingFace `_tp_plan`. Falling back to the default base plan at "
-                    "tp_size=%d. If you hit an internal assert in "
+                    "No usable tensor-parallel plan is registered for '%s'. Falling back to the "
+                    "default base plan at tp_size=%d. If you hit an internal assert in "
                     "`torch.distributed.tensor._redistribute` on `shard_order is not None`, "
                     "register a plan via `PARALLELIZE_FUNCTIONS`, `_tp_plan`, or `tp_shard_plan`.",
                     model_cls.__name__,
