@@ -86,7 +86,7 @@ class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         for key in list(hf_state_dict.keys()):
             if key.startswith("model."):
                 self._uses_model_prefix = True
-            if key.startswith("model.mtp_") or key.startswith("model.mtp_block."):
+            if key.startswith("model.mtp_"):
                 hf_state_dict.pop(key)
                 continue
             new_key = self._hf_key_to_native(key)
