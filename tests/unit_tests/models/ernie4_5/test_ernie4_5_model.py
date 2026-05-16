@@ -84,7 +84,9 @@ def moe_hf_config():
         moe_intermediate_size=16,
         moe_k=2,
         moe_num_experts=4,
-        moe_num_shared_experts=1,
+        # Use 0 shared experts so MoE.forward stays on CPU (the shared-experts
+        # path eagerly allocates torch.cuda.Stream, which crashes on CPU-only CI).
+        moe_num_shared_experts=0,
         moe_layer_start_index=1,
         moe_layer_end_index=3,
         moe_layer_interval=1,
@@ -456,8 +458,11 @@ class TestForwardShapes:
         model = self._dense_model(dense_config, backend_config)
         seq = 6
         input_ids = torch.randint(0, dense_config.vocab_size, (1, seq))
+        # squeeze_input_for_thd unconditionally squeezes position_ids, so callers
+        # must supply one when using qkv_format="thd".
+        position_ids = torch.arange(seq).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids, qkv_format="thd")
+            logits = model(input_ids, position_ids=position_ids, qkv_format="thd")
         # thd output is unsqueezed back to batch dimension.
         assert logits.shape == (1, seq, dense_config.vocab_size)
 
@@ -490,8 +495,10 @@ class TestForwardShapes:
         model = self._moe_model(moe_hf_config, backend_config)
         seq = 4
         input_ids = torch.randint(0, moe_hf_config.vocab_size, (1, seq))
+        # squeeze_input_for_thd requires position_ids to be a tensor.
+        position_ids = torch.arange(seq).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids, qkv_format="thd")
+            logits = model(input_ids, position_ids=position_ids, qkv_format="thd")
         assert logits.shape == (1, seq, moe_hf_config.vocab_size)
 
 
