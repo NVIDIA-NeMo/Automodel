@@ -417,8 +417,8 @@ class Gate(nn.Module):
 
         output_dtype = self.output_dtype or original_dtype
         weights = weights.to(dtype=output_dtype)
-        if self.output_dtype is not None or self.gate_precision is not None:
-            original_scores = original_scores.to(dtype=output_dtype)
+        if self.gate_precision is not None:
+            original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
