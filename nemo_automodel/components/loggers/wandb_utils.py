@@ -12,7 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from collections.abc import Mapping
 from typing import Any
+
+import wandb
+from wandb import Settings
+
+
+def build_wandb(
+    wandb_kwargs: Mapping[str, Any],
+    run_config: Mapping[str, Any] | None = None,
+    model_name: str | None = None,
+) -> wandb.Run:
+    """Instantiate wandb and return the run.
+
+    Args:
+        wandb_kwargs: Keyword arguments passed to wandb.init.
+        run_config: Optional run configuration logged to wandb.
+        model_name: Optional model name used to derive the run name.
+
+    Returns:
+        Initialized wandb run.
+    """
+    kwargs = dict(wandb_kwargs)
+    if kwargs.get("name", "") == "" and model_name:
+        kwargs["name"] = "_".join(model_name.split("/")[-2:])
+    run = wandb.init(
+        **kwargs,
+        config=dict(run_config) if run_config is not None else None,
+        settings=Settings(silent=True),
+    )
+    return run
 
 
 def suppress_wandb_log_messages() -> None:

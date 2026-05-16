@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.loggers.wandb_utils import build_wandb
+from __future__ import annotations
 
-__all__ = ["build_wandb"]
+from collections.abc import Callable, Mapping
+from typing import Any
+
+
+def build_loss_fn(loss_factory: Callable[..., Any], loss_kwargs: Mapping[str, Any] | None = None) -> Any:
+    """Build a loss function.
+
+    Args:
+        loss_factory: Callable or class that creates the loss function.
+        loss_kwargs: Optional keyword arguments passed to the loss factory.
+
+    Returns:
+        Instantiated loss function.
+    """
+    return loss_factory(**dict(loss_kwargs or {}))
