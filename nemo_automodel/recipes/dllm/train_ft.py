@@ -39,6 +39,7 @@ import time
 from contextlib import nullcontext
 from typing import Optional
 
+import mlflow
 import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -48,6 +49,7 @@ from nemo_automodel.components.datasets.dllm.collate import DLLMCollator
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     prepare_after_first_microbatch,
@@ -499,8 +501,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             remote_metrics = {k: v for k, v in log_data.to_dict().items() if k not in ("step", "epoch", "timestamp")}
             if wandb.run is not None:
                 wandb.log(remote_metrics, step=self.step_scheduler.step)
-            if self.mlflow_logger is not None:
-                self.mlflow_logger.log_metrics(remote_metrics, step=log_data.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(remote_metrics), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(remote_metrics, step=log_data.step)
 
