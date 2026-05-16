@@ -260,7 +260,7 @@ class MiMoV2FlashAttention(nn.Module):
             config.add_swa_attention_sink_bias and is_swa
         )
         if has_sink:
-            self.register_buffer("attention_sink_bias", torch.empty(config.num_attention_heads, dtype=torch.float32))
+            self.register_buffer("attention_sink_bias", torch.empty(self.num_attention_heads, dtype=torch.float32))
         else:
             self.attention_sink_bias = None
 

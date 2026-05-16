@@ -301,6 +301,44 @@ class TestMiMoV2FlashForCausalLM:
 
 
 # ---------------------------------------------------------------------------
+# Forward-pass smoke tests (CPU)
+# ---------------------------------------------------------------------------
+class TestForwardShapes:
+    """Tiny CPU forward passes through the full stack to catch wiring regressions
+    that structural tests alone can't surface (attention/MoE/norm integration)."""
+
+    def _model(self, tiny_config, backend_config):
+        torch.manual_seed(0)
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        return model.to(torch.float32).eval()
+
+    def test_forward_returns_logits_shape(self, tiny_config, backend_config):
+        model = self._model(tiny_config, backend_config)
+        batch, seq = 1, 4
+        input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
+        with torch.no_grad():
+            logits = model(input_ids)
+        assert logits.shape == (batch, seq, tiny_config.vocab_size)
+
+    def test_forward_with_explicit_position_ids(self, tiny_config, backend_config):
+        model = self._model(tiny_config, backend_config)
+        batch, seq = 1, 4
+        input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        with torch.no_grad():
+            logits = model(input_ids, position_ids=position_ids)
+        assert logits.shape == (batch, seq, tiny_config.vocab_size)
+
+    def test_forward_logits_to_keep_int(self, tiny_config, backend_config):
+        model = self._model(tiny_config, backend_config)
+        batch, seq = 1, 6
+        input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
+        with torch.no_grad():
+            logits = model(input_ids, logits_to_keep=2)
+        assert logits.shape == (batch, 2, tiny_config.vocab_size)
+
+
+# ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
 class TestModelClassExport:
