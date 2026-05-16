@@ -84,8 +84,7 @@ class Ernie4_5_MoeStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         **kwargs,
     ) -> dict[str, Any]:
         for key in list(hf_state_dict.keys()):
-            if key.startswith("model."):
-                self._uses_model_prefix = True
+            self._uses_model_prefix = key.startswith("model.")
             if key.startswith("model.mtp_"):
                 hf_state_dict.pop(key)
                 continue
