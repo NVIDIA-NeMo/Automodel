@@ -3,6 +3,10 @@ model:
   mode: "finetune"
   cache_dir: null
   attention_backend: "flash"
+  transformer_engine_fp8: true
+  transformer_engine_fp8_recipe: "delayed"
+  transformer_engine_fp8_amax_history_len: 1024
+  transformer_engine_fp8_amax_compute_algo: "max"
 
 optim:
   learning_rate: 2e-5
@@ -10,7 +14,8 @@ optim:
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
-    foreach: true
+    foreach: false
+    fused: true
 
 performance:
   check_loss: false
@@ -25,9 +30,10 @@ fsdp:
   activation_checkpointing: false
   cpu_offload: false
   defer_fsdp_grad_sync: true
+  enable_compile: false
   enable_fsdp2_prefetch: true
-  fsdp2_backward_prefetch_depth: 2
-  fsdp2_forward_prefetch_depth: 1
+  fsdp2_backward_prefetch_depth: 3
+  fsdp2_forward_prefetch_depth: 2
 
 flow_matching:
   adapter_type: "flux"
@@ -49,8 +55,8 @@ flow_matching:
 
 step_scheduler:
   num_epochs: 5000
-  local_batch_size: 1
-  global_batch_size: 8
+  local_batch_size: 4
+  global_batch_size: 32
   ckpt_every_steps: 500
   log_every: 1
   # max_steps: null  # Set to limit training to a specific number of steps

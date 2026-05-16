@@ -17,6 +17,7 @@ model:
   mode: "finetune"
   cache_dir: null
   attention_backend: "flash"
+  transformer_engine_fp8: false
 
 # ── LoRA / PEFT configuration ─────────────────────────────────────────────────
 # Remove this section for full fine-tune.
@@ -45,22 +46,18 @@ optim:
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    foreach: false
+    fused: true
 
 lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 100
   min_lr: 1e-6
 
-# FSDP2 with param_dtype=None when LoRA enabled:
-#   base weights (bf16): sharded, no grad comms
-#   LoRA weights (fp32): sharded, grad allreduced by FSDP2
-fsdp:
-  dp_size: 8
-  tp_size: 1
-  cp_size: 1
-  pp_size: 1
+# Best-performing Flux LoRA config from the local perf sweep uses replicated DDP.
+ddp:
+  backend: "nccl"
   activation_checkpointing: false
-  cpu_offload: false
 
 flow_matching:
   adapter_type: "flux"
@@ -82,8 +79,8 @@ flow_matching:
 
 step_scheduler:
   num_epochs: 5000
-  local_batch_size: 1
-  global_batch_size: 8
+  local_batch_size: 6
+  global_batch_size: 48
   ckpt_every_steps: 500
   log_every: 1
   # max_steps: null  # Set to limit training to a specific number of steps
