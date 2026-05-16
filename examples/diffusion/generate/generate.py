@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Pipeline class name -> output type mapping
 _PIPELINE_OUTPUT_TYPES = {
     "FluxPipeline": "image",
+    "Flux2Pipeline": "image",
     "QwenImagePipeline": "image",
     "WanPipeline": "video",
     "HunyuanVideoPipeline": "video",
@@ -232,11 +233,15 @@ def load_checkpoint_into_pipeline(pipe, cfg):
         pipe.transformer = type(pipe.transformer).from_pretrained(str(consolidated_st_dir), torch_dtype=torch_dtype)
         pipe.transformer.to("cuda")
         logger.info("Loaded consolidated safetensors checkpoint")
-    elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
-        logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
+    elif sharded_dir.is_dir() and any(
+        name.endswith(".distcp") or name.endswith(".safetensors")
+        for name in os.listdir(sharded_dir)
+        if not os.path.isdir(os.path.join(sharded_dir, name))
+    ):
+        logger.info("Loading sharded DCP checkpoint from %s", sharded_dir)
         pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
         pipe.transformer.to("cuda", dtype=torch_dtype)
-        logger.info("Loaded sharded FSDP checkpoint")
+        logger.info("Loaded sharded DCP checkpoint")
     else:
         logger.warning("No recognized checkpoint format found in %s, using base model weights", checkpoint_dir)
 
@@ -273,24 +278,25 @@ def load_lora_weights_into_pipeline(pipe, cfg):
 
 
 def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
-    """Load sharded FSDP/DCP checkpoint into a transformer module.
+    """Load sharded DCP checkpoint into a transformer module.
+
+    Handles two checkpoint formats:
+    - FSDP1 .distcp shards: wraps transformer in FSDP1 to reconstruct.
+    - FSDP2 safetensors DCP shards: loads directly into full state dict.
 
     Creates a temporary gloo process group for single-GPU loading if
     torch.distributed is not already initialized.
 
     Args:
         transformer: The transformer nn.Module to load weights into.
-        sharded_dir: Path to the directory containing .distcp shard files.
+        sharded_dir: Path to the directory containing DCP shard files.
         torch_dtype: The dtype to cast the transformer to before loading.
 
     Returns:
-        The unwrapped transformer module with loaded checkpoint weights.
+        The transformer module with loaded checkpoint weights.
     """
     from torch.distributed.checkpoint import FileSystemReader
     from torch.distributed.checkpoint import load as dist_load
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import StateDictType
-    from torch.distributed.fsdp.api import ShardedStateDictConfig
 
     init_dist = False
     if not dist.is_initialized():
@@ -299,22 +305,37 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bf
         dist.init_process_group(backend="gloo", rank=0, world_size=1)
         init_dist = True
 
+    files = os.listdir(sharded_dir)
+    is_distcp = any(f.endswith(".distcp") for f in files)
+
     try:
-        transformer.to(device="cuda", dtype=torch_dtype)
-        fsdp_transformer = FSDP(transformer, use_orig_params=True)
+        if is_distcp:
+            # FSDP1 path: reconstruct via FSDP1 sharded state dict API
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType
+            from torch.distributed.fsdp.api import ShardedStateDictConfig
 
-        FSDP.set_state_dict_type(
-            fsdp_transformer,
-            StateDictType.SHARDED_STATE_DICT,
-            state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
-        )
+            transformer.to(device="cuda", dtype=torch_dtype)
+            fsdp_transformer = FSDP(transformer, use_orig_params=True)
+            FSDP.set_state_dict_type(
+                fsdp_transformer,
+                StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
+            )
+            model_state = fsdp_transformer.state_dict()
+            dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
+            fsdp_transformer.load_state_dict(model_state)
+            return fsdp_transformer.module
+        else:
+            # FSDP2 DCP safetensors path: reads DCP_SHARDING_INFO from each shard's
+            # safetensors __metadata__ header — no binary .metadata file required
+            from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 
-        model_state = fsdp_transformer.state_dict()
-        dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
-        fsdp_transformer.load_state_dict(model_state)
-
-        # Unwrap back to the original module for inference
-        return fsdp_transformer.module
+            transformer.to(dtype=torch_dtype)
+            full_sd = transformer.state_dict()
+            dist_load(state_dict=full_sd, storage_reader=_HuggingFaceStorageReader(path=sharded_dir))
+            transformer.load_state_dict(full_sd, strict=True)
+            return transformer
     finally:
         if init_dist:
             dist.destroy_process_group()

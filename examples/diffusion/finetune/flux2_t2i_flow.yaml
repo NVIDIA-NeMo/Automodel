@@ -8,6 +8,7 @@ wandb:
 dist_env:
   backend: "nccl"
   init_method: "env://"
+  timeout_minutes: 30
 
 model:
   pretrained_model_name_or_path: "black-forest-labs/FLUX.2-dev"
@@ -59,7 +60,7 @@ flow_matching:
 step_scheduler:
   num_epochs: 1000
   local_batch_size: 1
-  global_batch_size: 4
+  global_batch_size: 8
   ckpt_every_steps: 500
   log_every: 10
   # max_steps: null  # Set to limit training to a specific number of steps
@@ -79,6 +80,6 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
-  diffusers_compatible: true
+  save_consolidated: false
+  diffusers_compatible: false
   restore_from: null
