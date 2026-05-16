@@ -92,6 +92,14 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
+        """Convert Automodel state_dict to the HF MiMo-V2-Flash layout.
+
+        Note: The ``quantization`` parameter is accepted for interface
+        compatibility but is **ignored**. MiMo-V2-Flash is distributed as an
+        FP8 HF checkpoint, so this adapter always emits FP8 weights plus
+        ``_scale_inv`` companions for keys that match ``_should_quantize_key``,
+        regardless of the caller's preference.
+        """
         hf_state_dict: dict[str, Any] = {}
         for fqn, tensor in state_dict.items():
             converted_tensors = self.convert_single_tensor_to_hf(
