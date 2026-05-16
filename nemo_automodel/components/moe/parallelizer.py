@@ -74,13 +74,10 @@ def _iter_transformer_and_mtp_blocks(model: nn.Module):
 
 
 def _get_moe_module(block: nn.Module) -> MoE | None:
-    moe_module = getattr(block, "moe", None)
-    if isinstance(moe_module, MoE):
-        return moe_module
-    moe_module = getattr(block, "mlp", None)
-    if isinstance(moe_module, MoE):
-        return moe_module
-    return None
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return module
 
 
 class ExpertParallel(ParallelStyle):
