@@ -115,11 +115,14 @@ class TestDerivePaddingMask:
         expected = torch.tensor([[False, False, False], [False, True, False]])
         torch.testing.assert_close(out, expected)
 
-    def test_4d_float_nonzero_diagonal_is_valid(self):
+    def test_4d_float_nonzero_diagonal_is_padding(self):
+        """In additive attention masks, valid positions have 0 on the diagonal and
+        padding positions have a large negative value; _derive_padding_mask treats
+        nonzero diagonals as padding (True)."""
         mask = torch.zeros(1, 1, 3, 3, dtype=torch.float32)
-        # Mark diagonals 0,2 as valid; index 1 stays 0 (padding)
-        mask[0, 0, 0, 0] = -1.0
-        mask[0, 0, 2, 2] = -1.0
+        min_val = torch.finfo(torch.float32).min
+        # Mark index 1 as padding (nonzero diagonal); 0 and 2 are valid (zero).
+        mask[0, 0, 1, 1] = min_val
         out = _derive_padding_mask(mask)
         expected = torch.tensor([[False, True, False]])
         torch.testing.assert_close(out, expected)
