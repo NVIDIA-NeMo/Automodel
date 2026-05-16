@@ -140,10 +140,12 @@ class TestFallbackAdditiveMask:
     def test_sliding_window_drops_far_keys(self):
         out = _fallback_additive_mask(1, 4, torch.float32, torch.device("cpu"), sliding_window=2)
         min_value = torch.finfo(torch.float32).min
-        # Query=3, sliding_window=2 → keys 0 are masked (3 - 0 >= 2), 1 and 2 allowed.
+        # Query=3, sliding_window=2 → keys 0 and 1 are masked (3-0>=2, 3-1>=2),
+        # only 2 and 3 are allowed.
         assert out[0, 0, 3, 0].item() == min_value
-        assert out[0, 0, 3, 1].item() == 0.0
+        assert out[0, 0, 3, 1].item() == min_value
         assert out[0, 0, 3, 2].item() == 0.0
+        assert out[0, 0, 3, 3].item() == 0.0
 
     def test_batch_expansion_with_2d_attention_mask(self):
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.float32)
