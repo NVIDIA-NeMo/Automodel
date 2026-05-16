@@ -165,6 +165,22 @@ class Engine:
         self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
         self.seed = seed
 
+        # CP / THD shaping passed through to make_cp_batch_and_ctx.
+        # Recipes that need non-default values (THD packed sequences with TE
+        # attention, custom padding token, multi-chunk PP) set these after
+        # construction, before calling forward_backward.
+        self.cp_use_te: bool = False
+        self.cp_padding_token_id: int = 0
+        self.cp_num_chunks: int = 1
+
+        # Optional context-manager factory applied around the forward (e.g.
+        # TE FP8 autocast). None means no extra context.
+        self.fp8_autocast: Callable[[], Any] | None = None
+        # Optional callable for an extra loss term added to the main loss.
+        # Signature: extra_loss_fn(out, model, labels, num_label_tokens) -> Tensor | None
+        # Used by LLM training for MTP (Multi-Token Prediction) auxiliary loss.
+        self.extra_loss_fn: Callable[..., torch.Tensor | None] | None = None
+
         # State, populated by build().
         self.model: nn.Module | Any = None          # nn.Module or AutoPipeline
         self.optimizer: torch.optim.Optimizer | None = None
@@ -333,14 +349,18 @@ class Engine:
 
     def forward_backward(
         self,
-        batch: dict,
+        batch,
         loss_fn: Callable | None = None,
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
         num_label_tokens: int | None = None,
     ) -> dict:
-        """Run forward + (optional) backward over ``num_microbatches`` slices.
+        """Run forward + (optional) backward over microbatches.
+
+        ``batch`` may be a single dict (split internally into ``num_microbatches``
+        slices along dim 0) or a list of dicts (used directly as pre-split
+        microbatches — ``num_microbatches`` is ignored).
 
         Everything is inline here. The orchestration is visible top-to-bottom:
         gradient-accumulation prep, the MoE aux-loss scaler mutation, the
@@ -356,6 +376,13 @@ class Engine:
         pp = self.model if self.pp_enabled else None
         is_fused_ce = isinstance(loss_fn, FusedLinearCrossEntropy)
 
+        # Accept either a dict (split internally) or a pre-split list of dicts.
+        if isinstance(batch, list):
+            microbatches = batch
+            num_microbatches = len(microbatches)
+        else:
+            microbatches = split_into_microbatches(batch, num_microbatches)
+
         # ── Pre-loop orchestration ──────────────────────────────────
         if is_train:
             prepare_for_grad_accumulation(self.parts, pp_enabled=self.pp_enabled)
@@ -367,7 +394,6 @@ class Engine:
                 else:
                     MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(self.dp_size))
 
-        microbatches = split_into_microbatches(batch, num_microbatches)
         losses: list[torch.Tensor] = []
 
         # ── Microbatch loop ────────────────────────────────────────
@@ -391,19 +417,33 @@ class Engine:
                 for k, v in mb.items()
             }
 
+            # Subclass hook: pre-CP preparation (e.g. VLM multimodal pre-embed).
+            # Default base implementation is a no-op.
+            mb = self._pre_cp_hook(mb)
+
             # CP / THD reshaping. `train_ctx()` is the CP attention context.
-            train_ctx, mb = make_cp_batch_and_ctx(device_mesh, mb)
+            train_ctx, mb = make_cp_batch_and_ctx(
+                device_mesh, mb,
+                use_te=self.cp_use_te,
+                padding_token_id=self.cp_padding_token_id,
+                num_chunks=self.cp_num_chunks,
+            )
             # If loss_fn is provided we pop labels (loss computed externally).
             # Otherwise leave labels in mb so the model's forward computes loss.
             labels = mb.pop("labels") if loss_fn is not None else mb.get("labels")
 
             # ── Pipeline-parallel branch ────────────────────────────
             if pp is not None:
-                with train_ctx():
+                fp8_ctx = self.fp8_autocast() if self.fp8_autocast is not None else _nullcontext()
+                with train_ctx(), fp8_ctx:
                     pp_losses = [] if pp.info.has_last_stage else None
                     targets = labels.clone() if pp.info.has_last_stage else None
                     input_ids = mb.pop("input_ids")
                     pp.update_seq_len(input_ids.shape[1])
+                    # Subclass hook: pre-PP-schedule preparation (e.g. VLM
+                    # media-tensor chunking). Default base implementation is
+                    # a no-op.
+                    mb = self._pre_pp_schedule_hook(mb, pp=pp, input_ids=input_ids)
                     pp_batch = {
                         k: v for k, v in mb.items()
                         if v is not None and not (isinstance(v, dict) and len(v) == 0)
@@ -425,7 +465,8 @@ class Engine:
                 get_sync_ctx(model, is_last, defer_fsdp_grad_sync=self.defer_fsdp_grad_sync)
                 if is_train else _nullcontext()
             )
-            with train_ctx(), sync_ctx:
+            fp8_ctx = self.fp8_autocast() if self.fp8_autocast is not None else _nullcontext()
+            with train_ctx(), sync_ctx, fp8_ctx:
                 fwd_kwargs = filter_forward_kwargs(model, mb)
                 if is_fused_ce:
                     out = model(logits_to_keep=1, **fwd_kwargs)
@@ -462,6 +503,14 @@ class Engine:
                         num_label_tokens=num_label_tokens,
                     )
 
+                # Optional extra loss term (e.g. MTP for DeepSeek-V3 models).
+                if self.extra_loss_fn is not None:
+                    extra = self.extra_loss_fn(
+                        out=out, model=model, labels=labels, num_label_tokens=num_label_tokens,
+                    )
+                    if extra is not None:
+                        loss = loss + extra
+
                 if is_train:
                     # Multiply by dp_group_size to cancel FSDP's grad averaging;
                     # we want a sum-of-grads across DP, not a mean.
@@ -470,7 +519,30 @@ class Engine:
                 losses.append(loss.detach())
 
         loss_tensor = torch.stack(losses).mean() if losses else torch.tensor(0.0, device=device)
-        return {"loss": loss_tensor, "metrics": {"loss": float(loss_tensor)}}
+        return {
+            "loss": loss_tensor,
+            "losses": losses,                       # per-microbatch detached losses
+            "metrics": {"loss": float(loss_tensor)},
+        }
+
+    # ── Subclass hooks (no-op by default) ────────────────────────────
+
+    def _pre_cp_hook(self, mb: dict) -> dict:
+        """Per-microbatch hook invoked AFTER device move, BEFORE CP shaping.
+
+        Default: identity. Subclasses (e.g. VLMEngine) override to insert
+        modality-specific preparation such as multimodal pre-embedding.
+        """
+        return mb
+
+    def _pre_pp_schedule_hook(self, mb: dict, *, pp: Any, input_ids: torch.Tensor) -> dict:
+        """Per-microbatch hook invoked inside the PP branch, BEFORE pp.schedule.step.
+
+        Default: identity. Subclasses (e.g. VLMEngine) override to pre-chunk
+        non-standard tensors (pixel_values, image_grid) along the PP dimension
+        and stash them on the stage0 model.
+        """
+        return mb
 
     @staticmethod
     def _resolve_lm_head_weight(model: nn.Module) -> torch.Tensor:
