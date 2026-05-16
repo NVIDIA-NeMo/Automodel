@@ -73,7 +73,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-**2.** Navigate to the AutoModel directory:
+**2. Navigate to the AutoModel directory**:
 
 ```bash
 cd /opt/Automodel
