@@ -75,7 +75,7 @@ from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
@@ -906,44 +906,6 @@ def calculate_mtp_loss(
         total = total + depth_loss
 
     return total * (scaling_factor / D)
-
-
-class PipelineCausalLMLoss(nn.Module):
-    """Pipeline schedule loss that can add DSV4 MTP auxiliary CE on the last stage."""
-
-    def __init__(self, loss_fn: nn.Module, model: nn.Module):
-        super().__init__()
-        self.loss_fn = loss_fn
-        self.model = model
-
-    def forward(self, output, labels: torch.Tensor) -> torch.Tensor:
-        logits = getattr(output, "logits", output)
-        hidden_states = get_final_hidden_states(output)
-        mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
-        scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
-
-        if isinstance(output, tuple):
-            logits = output[0]
-            hidden_states = None
-            mtp_per_depth_h = list(output[1:]) if len(output) > 1 else None
-            scaling_factor = get_mtp_loss_scaling_factor(self.model)
-
-        loss = calculate_loss(
-            self.loss_fn,
-            logits=logits,
-            labels=labels,
-            model=self.model,
-            hidden_states=hidden_states,
-        )
-        if mtp_per_depth_h is not None and self.model.training:
-            loss = loss + calculate_mtp_loss(
-                self.loss_fn,
-                mtp_per_depth_h=mtp_per_depth_h,
-                labels=labels,
-                model=self.model,
-                scaling_factor=scaling_factor,
-            )
-        return loss
 
 
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
