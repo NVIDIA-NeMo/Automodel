@@ -302,3 +302,121 @@ class TestNonQuantizedKeyPatterns:
             "self_attn.o_proj.weight",
         }
         assert set(NON_QUANTIZED_KEY_PATTERNS) == expected
+
+
+# ---------------------------------------------------------------------------
+# End-to-end round-trip
+# ---------------------------------------------------------------------------
+class TestRoundTrip:
+    """End-to-end state-dict round-trip: from_hf(to_hf(model.state_dict())) ≈ model.state_dict().
+
+    Validates that the expert merge/split path and key renaming are
+    self-inverse. FP8 quantization is disabled for the comparison because
+    fp8_e4m3fn has only ~7 bits of precision; the FP8 path itself is
+    validated separately above (via _should_quantize_key + scale_inv tests).
+    """
+
+    @pytest.fixture
+    def real_config(self):
+        from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
+
+        return MiMoV2FlashConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            v_head_dim=4,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=2,
+            swa_head_dim=4,
+            swa_v_head_dim=4,
+            max_position_embeddings=32,
+            layernorm_epsilon=1e-6,
+            rope_theta=10000.0,
+            swa_rope_theta=10000.0,
+            attention_value_scale=0.707,
+            add_full_attention_sink_bias=False,
+            add_swa_attention_sink_bias=False,  # avoid sink buffer noise
+            partial_rotary_factor=0.5,
+            sliding_window=4,
+            sliding_window_size=4,
+            attention_chunk_size=4,
+            n_routed_experts=4,
+            n_shared_experts=0,
+            num_experts_per_tok=2,
+            scoring_func="sigmoid",
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
+            moe_layer_freq=[0, 1],
+            hybrid_layer_pattern=[0, 0],
+            torch_dtype="float32",
+        )
+
+    @pytest.fixture
+    def tiny_model(self, real_config, backend_config):
+        from nemo_automodel.components.models.mimo_v2_flash.model import MiMoV2FlashForCausalLM
+
+        torch.manual_seed(0)
+        model = MiMoV2FlashForCausalLM(real_config, backend=backend_config)
+        return model.to(torch.float32).eval()
+
+    @pytest.fixture
+    def round_trip_adapter(self, real_config, backend_config):
+        moe_config = MoEConfig(
+            dim=real_config.hidden_size,
+            inter_dim=real_config.intermediate_size,
+            moe_inter_dim=real_config.moe_intermediate_size,
+            n_routed_experts=real_config.n_routed_experts,
+            n_shared_experts=real_config.n_shared_experts or 0,
+            n_activated_experts=real_config.num_experts_per_tok,
+            n_expert_groups=real_config.n_group,
+            n_limited_groups=real_config.topk_group,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            score_func="sigmoid_with_bias",
+            route_scale=real_config.routed_scaling_factor,
+            aux_loss_coeff=0.0,
+            norm_topk_prob=real_config.norm_topk_prob,
+            expert_bias=False,
+            router_bias=False,
+            expert_activation="swiglu",
+            softmax_before_topk=False,
+            force_e_score_correction_bias=True,
+            dtype=torch.float32,
+        )
+        return MiMoV2FlashStateDictAdapter(
+            config=real_config, moe_config=moe_config, backend=backend_config, dtype=torch.float32
+        )
+
+    def test_state_dict_roundtrip(self, tiny_model, round_trip_adapter):
+        """to_hf → from_hf should preserve every parameter value exactly when FP8 is off."""
+        original_sd = {k: v.detach().clone() for k, v in tiny_model.state_dict().items()}
+
+        # Disable FP8 quantization so the round-trip is lossless. The FP8 path
+        # itself is tested by TestConvertSingleTensorToHf above.
+        with patch(
+            "nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter._should_quantize_key",
+            return_value=False,
+        ):
+            hf_sd = round_trip_adapter.to_hf(original_sd)
+            restored_sd = round_trip_adapter.from_hf(hf_sd)
+
+        # Every original key must survive the round-trip with the same value.
+        missing = set(original_sd) - set(restored_sd)
+        assert not missing, f"Keys lost during round-trip: {sorted(missing)[:5]}"
+
+        for key, original in original_sd.items():
+            restored = restored_sd[key]
+            torch.testing.assert_close(
+                restored,
+                original,
+                atol=1e-5,
+                rtol=1e-5,
+                msg=f"Round-trip mismatch at {key}",
+            )
