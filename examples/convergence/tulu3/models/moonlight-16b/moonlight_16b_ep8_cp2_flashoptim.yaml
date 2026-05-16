@@ -1,6 +1,6 @@
 # Moonlight 16B (3B active) SFT on Tulu-3 with EP=8, CP=2, FSDP on 8 GPUs.
 # Uses ChatDataset with default collater.
-# Backend settings aligned with examples/benchmark/configs/moonlight_16b_te_deepep.yaml
+# Backend settings aligned with examples/llm_benchmark/moonlight/moonlight_16b_te_deepep.yaml
 # Uses FlashAdamW with 32-bit master weights and fp32 loss upcasting.
 
 step_scheduler:

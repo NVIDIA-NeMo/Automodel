@@ -113,7 +113,7 @@ class QwenImageAdapter(ModelAdapter):
         batch_size, channels, height, width = noisy_latents.shape
 
         # Get text embeddings from Qwen2 encoder
-        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
+        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype, non_blocking=True)
         if text_embeddings.ndim == 2:
             text_embeddings = text_embeddings.unsqueeze(0)
 

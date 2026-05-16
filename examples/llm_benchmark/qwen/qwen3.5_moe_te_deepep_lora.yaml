@@ -16,7 +16,7 @@
 # Benchmarking config for Qwen3.5 MoE LoRA Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/qwen3.5_moe_te_deepep_lora.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
