@@ -1336,22 +1336,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
         self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
-        mtp_config = getattr(last_stage_model, "mtp_config", None)
-        mtp_enabled = bool(mtp_config is not None and getattr(mtp_config, "enabled", False))
-        mtp_depth = int(getattr(mtp_config, "num_layers", 0) or 0) if mtp_config is not None else 0
-        mtp_msg = (
-            "PP MTP support active: "
-            f"rank={self.dist_env.rank}, "
-            f"pp_has_last_stage={self.pp.info.has_last_stage}, "
-            f"owns_mtp_module={getattr(last_stage_model, 'mtp', None) is not None}, "
-            f"mtp_enabled={mtp_enabled}, "
-            f"mtp_depth={mtp_depth}, "
-            f"mtp_loss_scaling_factor={get_mtp_loss_scaling_factor(last_stage_model)}, "
-            f"schedule_loss={type(self.pp.info.schedule._loss_fn).__name__}"
-        )
-        logger.info(mtp_msg)
-        if self.cfg.get("debug_mtp_pp", False):
-            print(f"[MTP-PP-DEBUG] {mtp_msg}", flush=True)
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
