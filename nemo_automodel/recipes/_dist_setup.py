@@ -196,18 +196,56 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     }
 
 
-def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext:
-    """Parse ``cfg.distributed`` and create device meshes.
+def _distributed_cfg_to_dict(cfg: Any | None) -> dict:
+    """Return a distributed config dict from ``cfg`` or an empty fallback."""
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg.copy()
+    distributed_cfg = cfg.distributed
+    return distributed_cfg.to_dict() if hasattr(distributed_cfg, "to_dict") else dict(distributed_cfg)
+
+
+def setup_distributed(
+    cfg: Any | None = None,
+    world_size: Optional[int] = None,
+    *,
+    strategy: str | None = None,
+    dp_size: int | None = None,
+    dp_replicate_size: int | None = None,
+    tp_size: int | None = None,
+    pp_size: int | None = None,
+    cp_size: int | None = None,
+    ep_size: int | None = None,
+    activation_checkpointing: bool | None = None,
+    pipeline: dict | None = None,
+    moe: dict | None = None,
+    **strategy_kwargs: Any,
+) -> MeshContext:
+    """Parse distributed settings and create device meshes.
 
     This is the main entry-point called by recipes.  It converts the
-    config section into a fully-initialised :class:`MeshContext`
-    (including ``device_mesh`` and ``moe_mesh``).
+    config section or programmatic keyword arguments into a fully-initialised
+    :class:`MeshContext` (including ``device_mesh`` and ``moe_mesh``).
 
     Args:
-        cfg: Top-level config (must have a ``distributed`` key).
+        cfg: Optional distributed config dict or top-level config with a
+            ``distributed`` key. Used as fallback when explicit keyword
+            arguments are omitted.
         world_size: Total number of processes in the job. If ``None`` (default),
             the value is auto-detected from ``torch.distributed`` if initialized,
             or from the ``WORLD_SIZE`` environment variable, falling back to ``1``.
+        strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``, or ``ddp``).
+        dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
+        dp_replicate_size: HSDP replicate size for FSDP2.
+        tp_size: Tensor-parallel size.
+        pp_size: Pipeline-parallel size.
+        cp_size: Context-parallel size.
+        ep_size: Expert-parallel size.
+        activation_checkpointing: Enable activation checkpointing.
+        pipeline: Optional pipeline sub-config.
+        moe: Optional MoE parallelizer sub-config.
+        **strategy_kwargs: Additional strategy-specific options.
 
     Returns:
         A :class:`MeshContext` with device meshes attached.
@@ -218,7 +256,27 @@ def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext
     if world_size is None:
         world_size = get_world_size_safe()
 
-    cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
+    cfg_dict = _distributed_cfg_to_dict(cfg)
+
+    explicit_overrides = {
+        "strategy": strategy,
+        "dp_size": dp_size,
+        "dp_replicate_size": dp_replicate_size,
+        "tp_size": tp_size,
+        "pp_size": pp_size,
+        "cp_size": cp_size,
+        "ep_size": ep_size,
+        "activation_checkpointing": activation_checkpointing,
+        "pipeline": pipeline,
+        "moe": moe,
+    }
+    for key, value in explicit_overrides.items():
+        if value is not None:
+            cfg_dict[key] = value
+    for key, value in strategy_kwargs.items():
+        if value is not None:
+            cfg_dict[key] = value
+
     parsed = parse_distributed_section(cfg_dict)
 
     device_mesh, moe_mesh = mesh_utils.create_device_mesh(

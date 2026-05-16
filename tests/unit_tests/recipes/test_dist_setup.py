@@ -455,3 +455,40 @@ class TestSetupDistributedWorldSizeAutoDetect:
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 16)
         setup_distributed({"strategy": "fsdp2"})
         assert patched_mesh["world_size"] == 16
+
+    def test_programmatic_args_without_cfg(self, patched_mesh):
+        result = setup_distributed(
+            strategy="fsdp2",
+            tp_size=2,
+            ep_size=2,
+            activation_checkpointing=True,
+            world_size=4,
+        )
+
+        assert patched_mesh["tp_size"] == 2
+        assert patched_mesh["ep_size"] == 2
+        assert isinstance(result["strategy_config"], FSDP2Config)
+        assert isinstance(result["moe_config"], MoEParallelizerConfig)
+        assert result["activation_checkpointing"] is True
+
+    def test_programmatic_args_override_cfg_fallback(self, patched_mesh):
+        setup_distributed(
+            {"strategy": "fsdp2", "tp_size": 1, "ep_size": 1},
+            tp_size=2,
+            ep_size=2,
+            world_size=4,
+        )
+
+        assert patched_mesh["tp_size"] == 2
+        assert patched_mesh["ep_size"] == 2
+
+    def test_strategy_kwargs_are_forwarded_to_strategy_config(self, patched_mesh):
+        result = setup_distributed(
+            strategy="fsdp2",
+            sequence_parallel=True,
+            defer_fsdp_grad_sync=False,
+            world_size=1,
+        )
+
+        assert result["strategy_config"].sequence_parallel is True
+        assert result["strategy_config"].defer_fsdp_grad_sync is False

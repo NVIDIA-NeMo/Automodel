@@ -111,6 +111,42 @@ _MAX_BUILD_RETRIES = 5
 _remote_code_compat_applied = False
 
 
+def _resolve_mesh_context(
+    *,
+    device_mesh: Optional[Union["DeviceMesh", MeshContext]],
+    moe_mesh: Optional["DeviceMesh"],
+    distributed_config: Optional[DistributedConfig],
+    pipeline_config: Optional[PipelineConfig],
+    moe_config: Optional[MoEParallelizerConfig],
+    activation_checkpointing: Optional[bool],
+) -> tuple[
+    MeshContext,
+    Optional[DistributedConfig],
+    Optional[PipelineConfig],
+    Optional[MoEParallelizerConfig],
+    bool,
+]:
+    """Resolve raw ``DeviceMesh`` or ``MeshContext`` input into effective configs."""
+    if isinstance(device_mesh, MeshContext):
+        return device_mesh
+
+    resolved_activation_checkpointing = False if activation_checkpointing is None else activation_checkpointing
+    return (
+        MeshContext.from_meshes(
+            device_mesh,
+            moe_mesh,
+            strategy_config=distributed_config,
+            pipeline_config=pipeline_config,
+            moe_config=moe_config,
+            activation_checkpointing=resolved_activation_checkpointing,
+        ),
+        distributed_config,
+        pipeline_config,
+        moe_config,
+        resolved_activation_checkpointing,
+    )
+
+
 def _patch_remote_code_compat():
     """Patch ``_finalize_model_loading`` for remote-code models written against older transformers.
 
@@ -500,14 +536,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: Optional[Union["DeviceMesh", MeshContext]] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
         tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
-        activation_checkpointing: bool = False,
+        activation_checkpointing: Optional[bool] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -549,9 +585,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
-            device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
-                distributed training. Parallelism sizes (tp, pp, cp, ep) are inferred
-                from this. Default: None.
+            device_mesh (DeviceMesh | MeshContext | None, optional): Pre-created device mesh
+                or complete mesh context for distributed training. Raw ``DeviceMesh`` inputs
+                are wrapped into a ``MeshContext`` internally. Default: None.
             moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
                 parallelism. ep_size is inferred from this. Default: None.
             tp_plan (dict | None, optional): Custom tensor parallel plan. If provided,
@@ -564,8 +600,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 configuration. Default: None.
             moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
                 configuration. Default: None.
-            activation_checkpointing (bool, default=False): Enable activation checkpointing
-                for transformer blocks to reduce memory usage. Default: False.
+            activation_checkpointing (bool | None, default=None): Enable activation checkpointing
+                for transformer blocks to reduce memory usage. If ``None`` and ``device_mesh``
+                is a ``MeshContext``, uses the context value; otherwise defaults to ``False``.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -580,10 +617,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             transformers.PreTrainedModel: The loaded (and possibly patched)
             model instance with all infrastructure applied.
         """
+        mesh, distributed_config, pipeline_config, moe_config, activation_checkpointing = _resolve_mesh_context(
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=distributed_config,
+            pipeline_config=pipeline_config,
+            moe_config=moe_config,
+            activation_checkpointing=activation_checkpointing,
+        )
+
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
-
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
@@ -607,7 +651,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
-        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+        sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
         return cls._build_model(
             pretrained_model_name_or_path,
@@ -645,14 +689,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: Optional[Union["DeviceMesh", MeshContext]] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
         tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
         pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
         moe_config: Optional[MoEParallelizerConfig] = None,
-        activation_checkpointing: bool = False,
+        activation_checkpointing: Optional[bool] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -672,10 +716,17 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             torch_dtype (str | torch.dtype, default="auto"):
                 Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
         """
+        mesh, distributed_config, pipeline_config, moe_config, activation_checkpointing = _resolve_mesh_context(
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=distributed_config,
+            pipeline_config=pipeline_config,
+            moe_config=moe_config,
+            activation_checkpointing=activation_checkpointing,
+        )
+
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
-
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
 
         # Only instantiate infrastructure when distributed_config is provided
         model_wrapper = autopipeline = parallelize_fn = qat_quantizer = None
@@ -711,7 +762,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
 
-        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+        sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
         return cls._build_model(
             config,
@@ -884,7 +935,7 @@ class _NeMoAutoModelForRetrievalBase:
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
-        device_mesh: Optional["DeviceMesh"] = None,
+        device_mesh: Optional[Union["DeviceMesh", MeshContext]] = None,
         moe_mesh: Optional["DeviceMesh"] = None,
         tp_plan: Optional[dict] = None,
         distributed_config: Optional[DistributedConfig] = None,
@@ -909,7 +960,7 @@ class _NeMoAutoModelForRetrievalBase:
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
             torch_dtype: Data type passed to the underlying model initialization.
-            device_mesh: Pre-created device mesh for distributed training.
+            device_mesh: Pre-created device mesh or complete mesh context for distributed training.
             moe_mesh: Device mesh for expert parallelism (FSDP2 only).
             tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
             distributed_config: Strategy-specific distributed training configuration.
@@ -953,16 +1004,24 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
 
+        mesh, distributed_config, _, moe_config, activation_checkpointing = _resolve_mesh_context(
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=distributed_config,
+            pipeline_config=None,
+            moe_config=moe_config,
+            activation_checkpointing=None,
+        )
+
         if tp_plan is not None and distributed_config is not None:
             distributed_config.tp_plan = tp_plan
-
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
             pipeline_config=None,
             qat_config=None,
             moe_config=moe_config,
+            activation_checkpointing=mesh.activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
