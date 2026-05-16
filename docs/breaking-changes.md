@@ -1,5 +1,32 @@
 # Breaking Changes
 
+## 0.5.0
+
+### FSDP2 default `reduce_dtype` is now `float32`
+
+The default
+[`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.MixedPrecisionPolicy)
+built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of
+`torch.bfloat16`. This matches the Megatron-LM and Lingua defaults and prevents
+gradient-accumulation error from compounding at large DP world sizes. The
+forward/backward compute dtype (`param_dtype`) is unchanged at `bfloat16`.
+
+To restore the previous behavior, override the policy explicitly:
+
+```yaml
+distributed:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+```
+
+See `docs/guides/mixed-precision.md` for the full set of recommended
+mixed-precision patterns and the bf16-storage trap that motivated the change
+(issue #1679).
+
 ## 0.4.0 · 26.04
 
 ### CLI Signature Change
