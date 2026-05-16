@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from transformers import LlamaConfig
 
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_token_mapping
 from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule, _compute_target_distribution
-from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel, _HAS_FA
 from nemo_automodel.components.speculative.eagle.target import _shift_left_with_zero
 
 
@@ -601,3 +602,139 @@ def test_target_shift_matches_reference_padding_behavior():
     shifted_mask = _shift_left_with_zero(mask)
     expected_mask = torch.tensor([[0, 1, 0]], dtype=torch.long)
     torch.testing.assert_close(shifted_mask, expected_mask)
+
+
+def _build_eagle3_config(attn_implementation: str) -> LlamaConfig:
+    """Realistically-sized layer config for FA2 equivalence checks."""
+    config = LlamaConfig(
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        vocab_size=1024,
+        max_position_embeddings=128,
+    )
+    config.torch_dtype = torch.bfloat16
+    config.draft_vocab_size = 128
+    config.target_hidden_size = 256
+    config.attn_implementation = attn_implementation
+    return config
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_FA,
+    reason="FA2 path requires a CUDA device and the 'flash-attn' package",
+)
+def test_eagle3_flash_attention_matches_eager():
+    """Multi-step TTT forward must match between eager and flash_attention_2 backends.
+
+    Builds two draft models with identical weights but different attention
+    backends, runs three chained TTT steps (exercising Block 1 + diagonal
+    extensions), and checks that the post-MLP hidden state agrees within
+    bf16 tolerances. Any regression in the log-space softmax merge between
+    FA's ``softmax_lse`` and the eager diagonal logits would surface here.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    eager_config = _build_eagle3_config("eager")
+    fa_config = _build_eagle3_config("flash_attention_2")
+
+    eager_draft = LlamaEagle3DraftModel(eager_config).to(device=device, dtype=dtype)
+    fa_draft = LlamaEagle3DraftModel(fa_config).to(device=device, dtype=dtype)
+    fa_draft.load_state_dict(eager_draft.state_dict())
+
+    batch_size, seq_len = 2, 32
+    input_ids = torch.randint(0, eager_config.vocab_size, (batch_size, seq_len), device=device)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
+    aux_hidden_states = torch.randn(
+        batch_size, seq_len, eager_config.hidden_size * 3, device=device, dtype=dtype
+    )
+    projected_eager = eager_draft.project_hidden_states(aux_hidden_states)
+    projected_fa = fa_draft.project_hidden_states(aux_hidden_states)
+
+    cache_eager: list[list[torch.Tensor]] = [[], []]
+    cache_fa: list[list[torch.Tensor]] = [[], []]
+    with torch.no_grad():
+        h_eager = projected_eager
+        h_fa = projected_fa
+        for _ in range(3):
+            h_eager = eager_draft(
+                input_ids=input_ids,
+                projected_hidden_states=h_eager,
+                attention_mask=attention_mask,
+                cache_hidden=cache_eager,
+            )
+            h_fa = fa_draft(
+                input_ids=input_ids,
+                projected_hidden_states=h_fa,
+                attention_mask=attention_mask,
+                cache_hidden=cache_fa,
+            )
+
+    max_diff = (h_eager - h_fa).abs().max().item()
+    torch.testing.assert_close(h_eager, h_fa, atol=1e-2, rtol=1e-2)
+    assert max_diff < 1e-1, f"FA2 vs eager TTT max abs diff = {max_diff}"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _HAS_FA,
+    reason="FA2 path requires a CUDA device and the 'flash-attn' package",
+)
+def test_eagle3_flash_attention_step0_matches_eager():
+    """Step-0 FA2 path (no diagonal extension) must match eager.
+
+    Isolates the simpler half of ``_flash_attention_forward`` -- when
+    ``step_idx == 0`` the merge math collapses to just rescaling FA's
+    output by ``exp(lse_fa - lse_full) == 1`` -- so any divergence here
+    points at the FA call itself (transpose / scale / causal) rather than
+    the diagonal-merge algebra.
+    """
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    eager_config = _build_eagle3_config("eager")
+    fa_config = _build_eagle3_config("flash_attention_2")
+
+    eager_draft = LlamaEagle3DraftModel(eager_config).to(device=device, dtype=dtype)
+    fa_draft = LlamaEagle3DraftModel(fa_config).to(device=device, dtype=dtype)
+    fa_draft.load_state_dict(eager_draft.state_dict())
+
+    batch_size, seq_len = 2, 32
+    input_ids = torch.randint(0, eager_config.vocab_size, (batch_size, seq_len), device=device)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
+    aux_hidden_states = torch.randn(
+        batch_size, seq_len, eager_config.hidden_size * 3, device=device, dtype=dtype
+    )
+
+    with torch.no_grad():
+        out_eager = eager_draft(
+            input_ids=input_ids,
+            projected_hidden_states=eager_draft.project_hidden_states(aux_hidden_states),
+            attention_mask=attention_mask,
+        )
+        out_fa = fa_draft(
+            input_ids=input_ids,
+            projected_hidden_states=fa_draft.project_hidden_states(aux_hidden_states),
+            attention_mask=attention_mask,
+        )
+
+    torch.testing.assert_close(out_eager, out_fa, atol=1e-2, rtol=1e-2)
+
+
+def test_eagle3_flash_attention_2_raises_without_flash_attn():
+    """Requesting FA2 must fail loudly when flash-attn is not installed."""
+    if _HAS_FA:
+        pytest.skip("flash-attn is installed; cannot exercise the missing-import path")
+    config = _build_eagle3_config("flash_attention_2")
+    with pytest.raises(ImportError, match="flash-attn"):
+        LlamaEagle3DraftModel(config)
+
+
+def test_eagle3_unknown_attn_implementation_raises():
+    config = _build_eagle3_config("xformers")  # unsupported
+    with pytest.raises(ValueError, match="attn_implementation"):
+        LlamaEagle3DraftModel(config)
