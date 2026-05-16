@@ -496,6 +496,124 @@ class TestForwardShapes:
 
 
 # ---------------------------------------------------------------------------
+# Layer equivalence against HF reference
+# ---------------------------------------------------------------------------
+class TestLayerEquivalence:
+    """Numerical equivalence between the rewritten NeMo layers and HF references.
+
+    The model-onboarding skill requires every rewritten layer to be compared
+    against the original HF implementation. These tests run on CPU in fp32
+    with matched weights.
+    """
+
+    @pytest.fixture
+    def equiv_config(self):
+        cfg = Ernie4_5Config(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            use_bias=False,
+            tie_word_embeddings=True,
+            pad_token_id=0,
+        )
+        cfg._attn_implementation = "eager"
+        cfg.torch_dtype = torch.float32
+        return cfg
+
+    def test_rope_equivalence(self, equiv_config):
+        """NeMo rope_utils must rotate q/k identically to HF's reference path."""
+        from transformers.models.ernie4_5.modeling_ernie4_5 import (
+            Ernie4_5RotaryEmbedding as HFRotary,
+        )
+        from transformers.models.ernie4_5.modeling_ernie4_5 import (
+            apply_rotary_pos_emb as hf_apply_rope,
+        )
+
+        from nemo_automodel.components.models.ernie4_5.rope_utils import (
+            Ernie4_5RotaryEmbedding as NeMoRotary,
+        )
+        from nemo_automodel.components.models.ernie4_5.rope_utils import (
+            apply_rotary_pos_emb as nemo_apply_rope,
+        )
+
+        torch.manual_seed(0)
+        batch, seq, heads, hdim = 1, 6, 2, equiv_config.head_dim
+        q_bshd = torch.randn(batch, seq, heads, hdim, dtype=torch.float32)
+        k_bshd = torch.randn(batch, seq, heads, hdim, dtype=torch.float32)
+        position_ids = torch.arange(seq).unsqueeze(0)
+
+        # HF path: rotary returns concat-of-freqs cos/sin; apply expects bhsd q/k.
+        hf_rotary = HFRotary(equiv_config)
+        cos_h, sin_h = hf_rotary(q_bshd, position_ids)
+        q_hf, k_hf = hf_apply_rope(q_bshd.transpose(1, 2), k_bshd.transpose(1, 2), cos_h, sin_h)
+        q_hf = q_hf.transpose(1, 2)
+        k_hf = k_hf.transpose(1, 2)
+
+        # NeMo path: rotary returns already-interleaved cos/sin; apply uses bshd q/k.
+        nemo_rotary = NeMoRotary(equiv_config)
+        cos_n, sin_n = nemo_rotary(q_bshd, position_ids)
+        q_nm, k_nm = nemo_apply_rope(q_bshd, k_bshd, cos_n, sin_n)
+
+        torch.testing.assert_close(q_nm, q_hf, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(k_nm, k_hf, atol=1e-5, rtol=1e-5)
+
+    def test_attention_equivalence(self, equiv_config, backend_config):
+        """NeMo Ernie4_5Attention must match HF reference attention with shared weights."""
+        from transformers.models.ernie4_5.modeling_ernie4_5 import (
+            Ernie4_5Attention as HFAttention,
+        )
+        from transformers.models.ernie4_5.modeling_ernie4_5 import (
+            Ernie4_5RotaryEmbedding as HFRotary,
+        )
+
+        from nemo_automodel.components.models.ernie4_5.rope_utils import (
+            Ernie4_5RotaryEmbedding as NeMoRotary,
+        )
+
+        torch.manual_seed(0)
+        batch, seq = 1, 4
+        hidden = torch.randn(batch, seq, equiv_config.hidden_size, dtype=torch.float32)
+        position_ids = torch.arange(seq).unsqueeze(0)
+
+        hf_attn = HFAttention(equiv_config, layer_idx=0).to(torch.float32).eval()
+        hf_rotary = HFRotary(equiv_config)
+        nemo_attn = Ernie4_5Attention(equiv_config, backend_config).to(torch.float32).eval()
+
+        # Share projection weights so both layers compute on identical q/k/v subspaces.
+        with torch.no_grad():
+            nemo_attn.q_proj.weight.copy_(hf_attn.q_proj.weight)
+            nemo_attn.k_proj.weight.copy_(hf_attn.k_proj.weight)
+            nemo_attn.v_proj.weight.copy_(hf_attn.v_proj.weight)
+            nemo_attn.o_proj.weight.copy_(hf_attn.o_proj.weight)
+
+        # Additive causal mask for HF eager attention (-inf above diagonal).
+        upper_triangle = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1)
+        causal_mask = torch.zeros(1, 1, seq, seq, dtype=torch.float32).masked_fill(upper_triangle, float("-inf"))
+
+        cos_h, sin_h = hf_rotary(hidden, position_ids)
+        with torch.no_grad():
+            hf_out, _ = hf_attn(
+                hidden,
+                position_embeddings=(cos_h, sin_h),
+                attention_mask=causal_mask,
+            )
+
+        nemo_rotary = NeMoRotary(equiv_config)
+        cos_n, sin_n = nemo_rotary(hidden, position_ids)
+        with torch.no_grad():
+            nemo_out = nemo_attn(hidden, position_embeddings=(cos_n, sin_n))
+
+        torch.testing.assert_close(hf_out, nemo_out, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
 class TestModelClassExport:
