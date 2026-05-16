@@ -21,9 +21,12 @@ on:
 
 jobs:
   check_uv_lock_and_update:
+    if: github.repository == 'NVIDIA-NeMo/Automodel'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      CAN_PUSH_LOCKS: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -31,7 +34,8 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          persist-credentials: ${{ env.CAN_PUSH_LOCKS }}
+          token: ${{ env.CAN_PUSH_LOCKS == 'true' && secrets.PAT || github.token }}
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -42,35 +46,36 @@ jobs:
         with:
           version: 0.8.22
 
-      - name: Check Uv lock
+      - name: Check or update uv lock files
         run: |
-          set +e
-          uv lock --check
-          EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo 'Uv lock file is update to date'
-          else
-            echo 'Updating uv lock file'
-            uv lock
-          fi
+          set -e
 
-      - name: Check Uv PyTorch lock
-        run: |
-          set +e
+          check_or_update_lock() {
+            lock_name="$1"
+
+            if uv lock --check; then
+              echo "$lock_name is up to date"
+            elif [ "$CAN_PUSH_LOCKS" = "true" ]; then
+              echo "Updating $lock_name"
+              uv lock
+            else
+              echo "::error::$lock_name is out of date. Run the lock update flow in CONTRIBUTING.md and commit the generated lock files."
+              exit 1
+            fi
+          }
+
+          check_or_update_lock "Uv lock file"
+
           mv uv.lock uv_main.lock
           bash docker/common/update_pyproject_pytorch.sh "$GITHUB_WORKSPACE"
-          uv lock --check
-          EXIT_CODE=$?
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo 'Uv PyTorch lock file is update to date'
-          else
-            echo 'Updating uv PyTorch lock file'
-            uv lock
+          check_or_update_lock "Uv PyTorch lock file"
+          if [ "$CAN_PUSH_LOCKS" = "true" ]; then
+            mv uv.lock docker/common/uv-pytorch.lock
           fi
-          mv uv.lock docker/common/uv-pytorch.lock
           mv uv_main.lock uv.lock
 
       - name: Commit and push uv lock updates
+        if: env.CAN_PUSH_LOCKS == 'true'
         run: |
           git config --global user.email "nemo-bot@nvidia.com"
           git config --global user.name "NeMo Bot"
