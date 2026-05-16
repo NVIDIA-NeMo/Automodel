@@ -39,7 +39,6 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     model_keeps_self_forward,
     patch_hf_model_for_pp,
 )
-from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
 
@@ -266,18 +265,6 @@ def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
     return hidden_size, vocab_size
 
 
-def _get_pipeline_activation_dtype(model_config, stage: PipelineStage) -> torch.dtype:
-    config_dtype = getattr(model_config, "torch_dtype", None)
-    if isinstance(config_dtype, torch.dtype):
-        return config_dtype
-    if isinstance(config_dtype, str):
-        return dtype_from_str(config_dtype, default=torch.bfloat16)
-    try:
-        return next(param.dtype for param in stage.submod.parameters() if param.is_floating_point())
-    except StopIteration:
-        return torch.bfloat16
-
-
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
     model_config,
@@ -312,7 +299,11 @@ def _precompute_stage_shapes(
     hc_mult = int(getattr(model_config, "hc_mult", 1) or 1) if is_v4 else 1
 
     for stage in stages:
-        model_dtype = _get_pipeline_activation_dtype(model_config, stage)
+        # Infer the computation dtype from the stage's parameters
+        try:
+            model_dtype = next(stage.submod.parameters()).dtype
+        except StopIteration:
+            model_dtype = torch.bfloat16
 
         inner_submod = getattr(stage.submod, "model", stage.submod)
         stage_has_norm = getattr(inner_submod, "norm", None) is not None
