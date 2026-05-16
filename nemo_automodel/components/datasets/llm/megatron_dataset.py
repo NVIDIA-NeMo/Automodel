@@ -25,6 +25,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
+from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import ObjectStorageConfig, _is_object_storage_path
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class MegatronPretraining:
         trainer_limit_test_batches: Union[int, float] = 1,
         mmap_bin_files: bool = True,
         splits_to_build: Optional[Union[str, List[str]]] = None,
+        object_storage_config: Optional[Union[Dict, "ObjectStorageConfig"]] = None,
     ) -> None:
         """Pretraining dataset class for Megatron-LM datasets.
         Args:
@@ -110,6 +112,9 @@ class MegatronPretraining:
             trainer_limit_val_batches (Union[int, float]): Limit for validation batches.
             trainer_limit_test_batches (Union[int, float]): Limit for test batches.
             splits_to_build (Optional[Union[str, List[str]]]): Splits to build. If None, builds all splits.
+            object_storage_config (Optional[Union[Dict, ObjectStorageConfig]]): Configuration for
+                reading .bin/.idx files from S3/MSC. A dict with ``path_to_idx_cache`` (required)
+                and ``bin_chunk_nbytes`` (optional, default 256 MiB) is also accepted.
         """
         if find_spec("nemo_automodel.components.datasets.llm.megatron.helpers_cpp") is None:
             try:
@@ -125,6 +130,10 @@ class MegatronPretraining:
                     "Could not compile megatron dataset C++ helper functions and therefore cannot import helpers python file."
                 )
 
+        # Normalise object_storage_config: accept plain dict from YAML
+        if isinstance(object_storage_config, dict):
+            object_storage_config = ObjectStorageConfig(**object_storage_config)
+
         if not isinstance(paths, (list, tuple, dict)):
             # Check if paths is a JSON file containing blend configuration
             blend_config_or_none = try_load_blend_from_json(paths)
@@ -132,7 +141,7 @@ class MegatronPretraining:
                 paths = blend_config_or_none
             else:
                 paths = get_list_of_files(paths)
-        validate_dataset_asset_accessibility(paths)
+        validate_dataset_asset_accessibility(paths, object_storage_config=object_storage_config)
 
         if isinstance(split, (list, tuple)):
             split = [str(s) for s in split]
@@ -177,6 +186,7 @@ class MegatronPretraining:
                 f"Invalid splits: {splits_to_build}"
             )
         self.splits_to_build = splits_to_build
+        self.object_storage_config = object_storage_config
 
         # Store trainer arguments
         self.trainer_max_steps = trainer_max_steps
@@ -275,6 +285,7 @@ class MegatronPretraining:
             reset_attention_mask=False,
             eod_mask_loss=False,
             num_dataset_builder_threads=self.num_dataset_builder_threads,
+            object_storage_config=self.object_storage_config,
             **self.build_kwargs,
         )
 
@@ -304,9 +315,10 @@ def is_zipped_list(paths):
     return is_num[0]
 
 
-def validate_dataset_asset_accessibility(paths):
+def validate_dataset_asset_accessibility(paths, object_storage_config=None):
     """
     Validate the accessibility of the dataset assets.
+    Skips local-filesystem checks for S3/MSC paths when object_storage_config is provided.
     """
     if paths is None:
         raise ValueError("Expected path to have a value.")
@@ -316,15 +328,19 @@ def validate_dataset_asset_accessibility(paths):
             # remove weights from paths.
             paths = paths[1::2]
         for p in paths:
-            validate_dataset_asset_accessibility(p)
+            validate_dataset_asset_accessibility(p, object_storage_config=object_storage_config)
         return
     elif isinstance(paths, dict):
         for p in paths.values():
-            validate_dataset_asset_accessibility(p)
+            validate_dataset_asset_accessibility(p, object_storage_config=object_storage_config)
         return
 
     if not isinstance(paths, str) and not isinstance(paths, Path):
         raise ValueError("Expected path to be of string or Path type.")
+
+    # Skip local filesystem checks for object-storage paths
+    if object_storage_config is not None and _is_object_storage_path(str(paths)):
+        return
 
     path = Path(paths)
 

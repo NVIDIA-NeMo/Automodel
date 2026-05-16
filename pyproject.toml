@@ -153,12 +153,19 @@ vlm = [
 cli = [
     "pyyaml",
 ]
+s3 = [
+    "boto3>=1.34",
+]
+msc = [
+    "multi-storage-client>=0.13",
+]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
     "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
     "nemo_automodel[fla]",
+    "nemo_automodel[s3]",
     "nemo_automodel[vlm]",
 ]
 
