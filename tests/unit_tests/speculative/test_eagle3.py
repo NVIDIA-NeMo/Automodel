@@ -19,7 +19,7 @@ from transformers import LlamaConfig
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_token_mapping
 from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule, _compute_target_distribution
-from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel, _HAS_FA
+from nemo_automodel.components.speculative.eagle.draft_llama import _HAS_FA, LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.target import _shift_left_with_zero
 
 
@@ -649,9 +649,7 @@ def test_eagle3_flash_attention_matches_eager():
     batch_size, seq_len = 2, 32
     input_ids = torch.randint(0, eager_config.vocab_size, (batch_size, seq_len), device=device)
     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
-    aux_hidden_states = torch.randn(
-        batch_size, seq_len, eager_config.hidden_size * 3, device=device, dtype=dtype
-    )
+    aux_hidden_states = torch.randn(batch_size, seq_len, eager_config.hidden_size * 3, device=device, dtype=dtype)
     projected_eager = eager_draft.project_hidden_states(aux_hidden_states)
     projected_fa = fa_draft.project_hidden_states(aux_hidden_states)
 
@@ -706,9 +704,7 @@ def test_eagle3_flash_attention_step0_matches_eager():
     batch_size, seq_len = 2, 32
     input_ids = torch.randint(0, eager_config.vocab_size, (batch_size, seq_len), device=device)
     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
-    aux_hidden_states = torch.randn(
-        batch_size, seq_len, eager_config.hidden_size * 3, device=device, dtype=dtype
-    )
+    aux_hidden_states = torch.randn(batch_size, seq_len, eager_config.hidden_size * 3, device=device, dtype=dtype)
 
     with torch.no_grad():
         out_eager = eager_draft(
@@ -738,3 +734,53 @@ def test_eagle3_unknown_attn_implementation_raises():
     config = _build_eagle3_config("xformers")  # unsupported
     with pytest.raises(ValueError, match="attn_implementation"):
         LlamaEagle3DraftModel(config)
+
+
+def test_eagle3_flash_attention_2_rejects_left_padded_attention_mask():
+    config = _build_eagle3_config("flash_attention_2" if _HAS_FA else "eager")
+    draft = LlamaEagle3DraftModel(config)
+    if not _HAS_FA:
+        draft.model.layers[0].self_attn.attn_implementation = "flash_attention_2"
+
+    batch_size, seq_len = 2, 8
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.tensor(
+        [
+            [0, 0, 1, 1, 1, 1, 1, 1],
+            [0, 1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+
+    with pytest.raises(ValueError, match="right-padded attention_mask"):
+        draft(
+            input_ids=input_ids,
+            projected_hidden_states=draft.project_hidden_states(aux_hidden_states),
+            attention_mask=attention_mask,
+        )
+
+
+def test_eagle3_flash_attention_2_rejects_non_monotonic_attention_mask():
+    config = _build_eagle3_config("flash_attention_2" if _HAS_FA else "eager")
+    draft = LlamaEagle3DraftModel(config)
+    if not _HAS_FA:
+        draft.model.layers[0].self_attn.attn_implementation = "flash_attention_2"
+
+    batch_size, seq_len = 2, 8
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 0, 1, 1, 0, 0, 0],
+            [1, 0, 1, 1, 0, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+
+    with pytest.raises(ValueError, match="right-padded attention_mask"):
+        draft(
+            input_ids=input_ids,
+            projected_hidden_states=draft.project_hidden_states(aux_hidden_states),
+            attention_mask=attention_mask,
+        )

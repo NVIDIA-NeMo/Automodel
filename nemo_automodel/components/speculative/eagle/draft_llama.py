@@ -36,6 +36,7 @@ at load time, so the un-fused storage above is the canonical on-disk format.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -49,7 +50,28 @@ from nemo_automodel.components.models.llama.rope_utils import (
 )
 from nemo_automodel.shared.import_utils import safe_import_from
 
-_HAS_FA, _flash_attn_func = safe_import_from("flash_attn", "flash_attn_func")
+logger = logging.getLogger(__name__)
+
+
+def _load_flash_attn_func() -> tuple[bool, object | None]:
+    """Best-effort load of flash-attn without breaking eager-only users.
+
+    ``safe_import_from`` already handles missing modules and missing symbols, but
+    some broken ``flash-attn`` installs fail with lower-level loader errors
+    (e.g. ABI / shared-library issues) that should not prevent importing this
+    module for the eager path.
+    """
+    try:
+        has_fa, flash_attn_func = safe_import_from("flash_attn", "flash_attn_func")
+    except Exception as exc:  # pragma: no cover - depends on local flash-attn loader failures.
+        logger.warning("Failed to import flash_attn.flash_attn_func; FlashAttention-2 path will be disabled: %s", exc)
+        return False, None
+    if not has_fa:
+        return False, None
+    return True, flash_attn_func
+
+
+_HAS_FA, _flash_attn_func = _load_flash_attn_func()
 
 _SUPPORTED_ATTN_IMPLEMENTATIONS = ("eager", "flash_attention_2")
 
@@ -66,6 +88,12 @@ def _build_causal_mask(
 
     expanded = (1.0 - attention_mask[:, None, None, :].to(dtype)) * torch.finfo(dtype).min
     return causal + expanded
+
+
+def _is_right_padded_attention_mask(attention_mask: torch.Tensor) -> bool:
+    """Return True when each row is a contiguous valid-prefix followed by padding."""
+    mask_bool = attention_mask.to(dtype=torch.bool)
+    return not bool((mask_bool[:, 1:] & ~mask_bool[:, :-1]).any())
 
 
 class Eagle3LlamaAttention(nn.Module):
@@ -465,6 +493,13 @@ class LlamaEagle3DraftModel(PreTrainedModel):
             position_ids = position_ids.expand(input_ids.shape[0], -1)
         if cache_hidden is None:
             cache_hidden = [[], []]
+        if self.model.layers[
+            0
+        ].self_attn.attn_implementation == "flash_attention_2" and not _is_right_padded_attention_mask(attention_mask):
+            raise ValueError(
+                "LlamaEagle3DraftModel: attn_implementation='flash_attention_2' requires a right-padded "
+                "attention_mask (each row must be contiguous 1s followed by 0s)."
+            )
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
