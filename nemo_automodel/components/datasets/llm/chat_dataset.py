@@ -377,3 +377,12 @@ class ChatDataset(Dataset):
             unshifted=self.unshifted,
         )
         return sample
+
+
+class OpenAIChatDataset(ChatDataset):
+    """Explicit name for OpenAI-format chat JSONL datasets.
+
+    ``ChatDataset`` remains supported for backward compatibility. New configs
+    should prefer this alias when the input rows are shaped like
+    ``{"messages": [...]}``.
+    """

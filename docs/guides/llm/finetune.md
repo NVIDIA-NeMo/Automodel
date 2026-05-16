@@ -50,6 +50,22 @@ Docker containers are ephemeral — files written inside the container are lost 
 
 For the full set of installation methods, see the [installation guide](../installation.md).
 
+## Fast LoRA From OpenAI Chat JSONL
+
+For OpenAI-format chat data, you can start a default LoRA SFT run without writing YAML:
+
+```bash
+automodel Qwen/Qwen2.5-1.5B-Instruct examples/quickstart/openai_chat.jsonl
+```
+
+Each JSONL row should contain a `messages` list. Single-turn and multiturn transcripts are both supported:
+
+```json
+{"messages":[{"role":"user","content":"Turn this into a title: memory efficient fine tuning"},{"role":"assistant","content":"Memory-Efficient Fine-Tuning"},{"role":"user","content":"Make it more specific."},{"role":"assistant","content":"Memory-Efficient Fine-Tuning with LoRA"}]}
+```
+
+This shorthand builds a LoRA config using `OpenAIChatDataset`. Use the YAML path below when you need a different dataset schema, custom optimizer settings, validation data, or non-LoRA training.
+
 ## Configure Your Training Recipe
 
 
