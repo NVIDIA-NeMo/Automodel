@@ -407,7 +407,8 @@ class TestDeepseekV4ModelSmoke:
         bsz, seq = 2, 8
         input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            # forward returns DeepseekV4CausalLMOutput; pull .logits.
+            logits = model(input_ids).logits
 
         assert logits.shape == (bsz, seq, cfg.vocab_size), f"unexpected shape {logits.shape}"
         assert not logits.isnan().any(), "logits contain NaN"
@@ -424,7 +425,7 @@ class TestDeepseekV4ModelSmoke:
         input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq))
         labels = torch.randint(0, cfg.vocab_size, (bsz, seq))
 
-        logits = model(input_ids)
+        logits = model(input_ids).logits
         loss = torch.nn.functional.cross_entropy(logits.view(-1, cfg.vocab_size), labels.view(-1))
         loss.backward()
 
@@ -514,7 +515,7 @@ class TestDeepseekV4ModelSmoke:
             for seq in [1, 4, 16, 32]:
                 input_ids = torch.randint(0, cfg.vocab_size, (1, seq))
                 with torch.no_grad():
-                    logits = model(input_ids)
+                    logits = model(input_ids).logits
                 assert logits.shape == (1, seq, cfg.vocab_size)
 
 

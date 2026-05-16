@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import inspect
 import logging
 import math
 import os
@@ -41,6 +42,15 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_optional_hook(module: object, name: str) -> Callable | None:
+    try:
+        inspect.getattr_static(module, name)
+    except AttributeError:
+        return None
+    hook = getattr(module, name)
+    return hook if callable(hook) else None
 
 
 class ParallelizeFnProtocol(Protocol):
@@ -289,15 +299,6 @@ def _precompute_stage_shapes(
     """
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
-    # DeepSeek V4 preserves an extra hc_mult axis between blocks, so inter-stage
-    # hidden state is [mb, seq, hc_mult, dim] until the last (norm) stage folds
-    # it back to [mb, seq, dim].
-    is_v4 = (
-        getattr(model_config, "model_type", None) == "deepseek_v4"
-        or getattr(getattr(model_config, "text_config", None), "model_type", None) == "deepseek_v4"
-    )
-    hc_mult = int(getattr(model_config, "hc_mult", 1) or 1) if is_v4 else 1
-
     for stage in stages:
         # Infer the computation dtype from the stage's parameters
         try:
@@ -305,36 +306,32 @@ def _precompute_stage_shapes(
         except StopIteration:
             model_dtype = torch.bfloat16
 
-        inner_submod = getattr(stage.submod, "model", stage.submod)
-        stage_has_norm = getattr(inner_submod, "norm", None) is not None
+        get_stage_metas = _get_optional_hook(stage.submod, "get_pipeline_stage_metas")
+        if get_stage_metas is not None:
+            stage.inputs_meta, outputs_meta = get_stage_metas(
+                is_first=stage.is_first,
+                microbatch_size=microbatch_size,
+                seq_len=seq_len,
+                dtype=model_dtype,
+            )
+            stage._configure_outputs_meta(outputs_meta)
+            continue
 
         # --- inputs_meta ---
         if stage.is_first:
             # First stage receives input_ids: [mb, seq_len] int64
             stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            if hc_mult > 1:
-                stage.inputs_meta = (
-                    torch.empty(microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype),
-                )
-            else:
-                stage.inputs_meta = (
-                    torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),
-                )
+            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
         if has_lm_head:
             # Last stage with lm_head produces logits: [mb, seq_len, vocab_size]
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype),)
-        elif hc_mult > 1 and not stage_has_norm:
-            # V4 mid-pipeline: tensor still carries the hc_mult axis.
-            outputs_meta = (
-                torch.empty(microbatch_size, seq_len, hc_mult, hidden_size, device="meta", dtype=model_dtype),
-            )
+            primary_output_meta = torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=model_dtype)
         else:
-            # Standard intermediate stage (or V4 final-norm stage without lm_head).
-            outputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
+        outputs_meta = (primary_output_meta,)
         stage._configure_outputs_meta(outputs_meta)
 
     logger.info(
@@ -480,12 +477,6 @@ def split_model_into_stages(
     else:
         lm_head_fqn = "lm_head"
 
-    # DeepSeek V4: model carries an extra compressor-rotary module on every stage
-    # and an HC head on the last stage; both must survive PP module pruning.
-    is_v4_keep = getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
-    has_rotary_emb_compress = is_v4_keep and hasattr(text_model, "rotary_emb_compress")
-    has_hc_head = is_v4_keep and hasattr(text_model, "hc_head")
-
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
         module_names_per_stage = generate_hf_model_fqn_per_model_part(
@@ -500,13 +491,15 @@ def split_model_into_stages(
             lm_head_fqn=lm_head_fqn,
         )
 
-        # V4 post-processing: keep the compressor rotary on every stage and the
-        # HC head on the last stage so the V4 PP forward can run end-to-end.
-        if has_rotary_emb_compress:
-            for stage_modules in module_names_per_stage:
-                stage_modules.append(f"{layers_prefix}rotary_emb_compress")
-        if has_hc_head:
-            module_names_per_stage[-1].append(f"{layers_prefix}hc_head")
+        customize_stage_modules = _get_optional_hook(model, "customize_pipeline_stage_modules")
+        if customize_stage_modules is not None:
+            custom_module_names = customize_stage_modules(
+                module_names_per_stage,
+                layers_prefix=layers_prefix,
+                text_model=text_model,
+            )
+            if custom_module_names is not None:
+                module_names_per_stage = custom_module_names
 
     def _build_stage_from_modules(
         stage_idx: int, module_names: list[str], num_stages: int

@@ -291,3 +291,199 @@ class TestDeepSeekV4StateDictAdapterToHF:
         assert by_key["layers.0.ffn.experts.0.w2.weight"].shape == (64, 16)
         assert by_key["layers.0.ffn.experts.0.w2.scale"].dtype == torch.float8_e8m0fnu
         assert by_key["layers.0.ffn.experts.0.w2.scale"].shape == (64, 1)
+
+
+class TestDeepSeekV4StateDictAdapterMTPRoundTrip:
+    """Cover the MTP-layer path on both directions of the adapter.
+
+    The current HF on-disk format places MTP layers at ``mtp.{k}.*``;
+    internally the model stores them under ``mtp.layers.{k}.*``.  These tests pin the
+    contract that:
+      * dequantization runs over MTP layers too (FP8 attention + FP4 experts);
+      * routed-expert weights aggregate into ``mtp.layers.{k}.mlp.experts.*``;
+      * the inverse path under ``to_hf`` produces native ``mtp.{k}.*`` keys
+        and goes through expert splitting + the standard rename.
+    """
+
+    def test_from_hf_renames_mtp_layer(self):
+        adapter = _make_adapter(num_nextn_predict_layers=2)
+        # Native depth 0 has a plain attn projection — covers the simple
+        # rename branch of the MTP path.
+        sd = {
+            "embed.weight": torch.zeros(256, 64),
+            "mtp.0.attn.wq_a.weight": torch.randn(32, 64),
+            "mtp.0.attn_norm.weight": torch.ones(64),
+            "mtp.1.ffn_norm.weight": torch.ones(64),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        # Backbone-side keys still rename normally.
+        assert "model.embed_tokens.weight" in out
+        # MTP keys now live under mtp.layers.{k}.* with internal sub-paths.
+        assert "mtp.layers.0.self_attn.wq_a.weight" in out
+        assert "mtp.layers.0.input_layernorm.weight" in out
+        assert "mtp.layers.1.post_attention_layernorm.weight" in out
+        # And the original ``mtp.{k}.*`` keys are gone.
+        assert "mtp.0.attn.wq_a.weight" not in out
+
+    def test_from_hf_drops_native_mtp_when_disabled(self):
+        adapter = _make_adapter(num_nextn_predict_layers=0)
+        sd = {
+            "embed.weight": torch.zeros(256, 64),
+            "mtp.0.e_proj.weight": torch.randn(64, 64),
+            "mtp.0.attn_norm.weight": torch.ones(64),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        assert "model.embed_tokens.weight" in out
+        assert all(not k.startswith("mtp.") for k in out)
+
+    def test_from_hf_renames_mtp_layer_with_model_prefix(self):
+        """HF V4 safetensors emit MTP layer keys as ``model.layers.{N+k}.*``
+        (with the ``model.`` prefix) for self_attn / mlp / norms. Prior to the
+        prefix-aware regex fix, those keys silently fell into the backbone
+        bucket and were dropped at DCP load — the MTP head trained from
+        random init. This regression locks in that the prefixed form is
+        recognized and routed to the ``mtp.layers.{k}.*`` namespace.
+        """
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        N = adapter.config.num_hidden_layers
+        # The exact rename target for ``self_attn.*`` depends on V4's
+        # internal-vs-HF mapping; use an attn key that has an internal alias
+        # (``attn.wq_a`` -> ``self_attn.wq_a``) plus two layernorms.
+        sd = {
+            f"model.layers.{N}.attn.wq_a.weight": torch.randn(32, 64),
+            f"model.layers.{N}.input_layernorm.weight": torch.ones(64),
+            f"model.layers.{N}.post_attention_layernorm.weight": torch.ones(64),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        assert "mtp.layers.0.self_attn.wq_a.weight" in out
+        assert "mtp.layers.0.input_layernorm.weight" in out
+        assert "mtp.layers.0.post_attention_layernorm.weight" in out
+        # The original ``model.layers.{N}.*`` keys must NOT leak through —
+        # the model has no ``model.layers.{N}`` (only 0..N-1), so any leftover
+        # would silently drop and the MTP weights would never load.
+        assert f"model.layers.{N}.input_layernorm.weight" not in out
+        assert f"model.layers.{N}.attn.wq_a.weight" not in out
+
+    def test_from_hf_dequantizes_mtp_fp8(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        weight_fp8 = torch.zeros(32, 64, dtype=torch.float8_e4m3fn)
+        scale = torch.ones((1, 1), dtype=torch.float32)
+        sd = {
+            "mtp.0.attn.wq_a.weight": weight_fp8,
+            "mtp.0.attn.wq_a.scale": scale,
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        # Weight should be dequantized to the adapter dtype (float32 here)
+        # and the standalone .scale companion key should be gone.
+        assert "mtp.layers.0.self_attn.wq_a.weight" in out
+        assert out["mtp.layers.0.self_attn.wq_a.weight"].dtype == torch.float32
+        assert all(not k.endswith(".scale") for k in out)
+
+    def test_from_hf_aggregates_mtp_experts(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        n_experts = adapter.moe_config.n_routed_experts
+        inter_dim = 32
+        hidden = 64
+        sd: dict[str, torch.Tensor] = {}
+        for eid in range(n_experts):
+            sd[f"mtp.0.ffn.experts.{eid}.w1.weight"] = torch.randn(inter_dim, hidden)
+            sd[f"mtp.0.ffn.experts.{eid}.w3.weight"] = torch.randn(inter_dim, hidden)
+            sd[f"mtp.0.ffn.experts.{eid}.w2.weight"] = torch.randn(hidden, inter_dim)
+        out = adapter.from_hf(sd, device_mesh=None)
+        # Aggregation must land under the MTP namespace, not on the backbone.
+        assert "mtp.layers.0.mlp.experts.gate_and_up_projs" in out
+        assert "mtp.layers.0.mlp.experts.down_projs" in out
+        assert "model.layers.0.mlp.experts.gate_and_up_projs" not in out
+        gate_up = out["mtp.layers.0.mlp.experts.gate_and_up_projs"]
+        down = out["mtp.layers.0.mlp.experts.down_projs"]
+        assert gate_up.shape == (n_experts, hidden, 2 * inter_dim)
+        assert down.shape == (n_experts, inter_dim, hidden)
+
+    def test_to_hf_renames_mtp_attention_key(self):
+        adapter = _make_adapter(num_nextn_predict_layers=2)
+        # Non-quantized branch: the rename should drop ``mtp.layers`` into
+        # the native ``mtp.{k}`` checkpoint namespace.
+        pairs = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.1.self_attn.wq_a.weight",
+            torch.zeros(32, 64),
+            quantization=False,
+        )
+        assert len(pairs) == 1
+        hf_key, _ = pairs[0]
+        assert hf_key == "mtp.1.attn.wq_a.weight"
+
+    def test_to_hf_splits_mtp_experts(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        n_experts = adapter.moe_config.n_routed_experts
+        hidden, inter = 64, 32
+        gate_up = torch.randn(n_experts, hidden, 2 * inter)
+        pairs = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.0.mlp.experts.gate_and_up_projs", gate_up, quantization=False
+        )
+        keys = {k for k, _ in pairs}
+        assert "mtp.0.ffn.experts.0.w1.weight" in keys
+        assert "mtp.0.ffn.experts.0.w3.weight" in keys
+        assert all(not k.startswith("mtp.layers.") for k in keys)
+
+    def test_to_hf_quantizes_mtp_attention_weight(self):
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        pairs = adapter.convert_single_tensor_to_hf(
+            "mtp.layers.0.self_attn.wq_a.weight",
+            torch.randn(32, 64),
+            quantization=True,
+        )
+        keys_to_dtypes = {k: v.dtype for k, v in pairs}
+        # Quantization must emit both the FP8 weight and the FP32 scale,
+        # symmetric with backbone behaviour.
+        assert keys_to_dtypes["mtp.0.attn.wq_a.weight"] == torch.float8_e4m3fn
+        assert keys_to_dtypes["mtp.0.attn.wq_a.scale"] == torch.float32
+
+    def test_from_hf_renames_mtp_fusion_only_keys(self):
+        """V4 MTP-only modules have no backbone rename rule but still need to
+        land under the ``mtp.layers.{k}.*`` namespace, otherwise DCP load
+        misses them and the MTP head trains from random init.
+        """
+        adapter = _make_adapter(num_nextn_predict_layers=1)
+        sd = {
+            "mtp.0.e_proj.weight": torch.randn(64, 64),
+            "mtp.0.h_proj.weight": torch.randn(64, 64),
+            "mtp.0.enorm.weight": torch.ones(64),
+            "mtp.0.hnorm.weight": torch.ones(64),
+            "mtp.0.norm.weight": torch.ones(64),
+            "mtp.0.hc_head_fn": torch.randn(4, 256),
+        }
+        out = adapter.from_hf(sd, device_mesh=None)
+        assert "mtp.layers.0.e_proj.weight" in out
+        assert "mtp.layers.0.h_proj.weight" in out
+        assert "mtp.layers.0.enorm.weight" in out
+        assert "mtp.layers.0.hnorm.weight" in out
+        assert "mtp.layers.0.norm.weight" in out
+        assert "mtp.layers.0.hc_head.hc_fn" in out
+        # And the original ``mtp.{k}.*`` keys must NOT leak through —
+        # those would dangle in the DCP load and cause "extra keys" errors.
+        assert "mtp.0.e_proj.weight" not in out
+
+    def test_to_hf_renames_mtp_fusion_only_keys(self):
+        """Inverse direction of ``test_from_hf_renames_mtp_fusion_only_keys``:
+        ``mtp.layers.{k}.e_proj.weight`` must export to
+        native ``mtp.{k}.e_proj.weight`` with no leftover ``model.`` prefix.
+        """
+        adapter = _make_adapter(num_nextn_predict_layers=2)
+        for internal_suffix, expected_suffix in [
+            ("e_proj.weight", "e_proj.weight"),
+            ("h_proj.weight", "h_proj.weight"),
+            ("enorm.weight", "enorm.weight"),
+            ("hnorm.weight", "hnorm.weight"),
+            ("norm.weight", "norm.weight"),
+            ("hc_head.hc_fn", "hc_head_fn"),
+        ]:
+            pairs = adapter.convert_single_tensor_to_hf(
+                f"mtp.layers.1.{internal_suffix}",
+                torch.zeros(64, 64),
+                quantization=False,
+            )
+            assert len(pairs) == 1
+            hf_key, _ = pairs[0]
+            assert hf_key == f"mtp.1.{expected_suffix}", (
+                f"unexpected key {hf_key!r} for internal suffix {internal_suffix!r}"
+            )
