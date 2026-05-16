@@ -46,7 +46,7 @@ class Ernie4_5StateDictAdapter(StateDictAdapter):
     ) -> dict[str, Any]:
         if exclude_key_regex is None:
             return dict(state_dict)
-        return {key: value for key, value in state_dict.items() if not re.search(exclude_key_regex, key)}
+        return {key: value for key, value in state_dict.items() if not re.match(exclude_key_regex, key)}
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
