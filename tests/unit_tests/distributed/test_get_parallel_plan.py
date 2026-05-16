@@ -229,6 +229,134 @@ def test_not_registered_and_hf_fail_base_plan(monkeypatch):
     assert "model.norm" in result_sp
 
 
+class _RemoteCodeDummyModel:
+    """Stand-in for an HF trust_remote_code model. HF places those classes
+    under the ``transformers_modules.*`` namespace at import time."""
+
+
+# Mimic HF's dynamic-module convention so the fail-fast guard triggers.
+_RemoteCodeDummyModel.__module__ = "transformers_modules.fake_repo.modeling_fake"
+
+
+def test_default_plan_fallthrough_raises_for_remote_code_at_tp_size_gt_1(monkeypatch):
+    """tp_size > 1 + custom-code arch with no registered plan should raise a clear ValueError.
+
+    The default base plan produces DTensor placements without ``shard_order`` metadata,
+    which trips an internal assert in ``torch.distributed.tensor._redistribute`` on the
+    first weight redistribute. We refuse early *only* for HF custom-code architectures
+    (loaded with ``trust_remote_code=True``, i.e. living under
+    ``transformers_modules.*``), so users get an actionable error instead of an opaque
+    PyTorch assertion. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
+    """
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+
+    def _raise_hf(_model):
+        raise RuntimeError("hf fail")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
+    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
+
+    for sp in (False, True):
+        with pytest.raises(ValueError) as excinfo:
+            _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=sp, tp_size=2)
+
+        msg = str(excinfo.value)
+        # The error must name the offending class and the three supported registration paths.
+        assert _RemoteCodeDummyModel.__name__ in msg
+        assert "PARALLELIZE_FUNCTIONS" in msg
+        assert "_tp_plan" in msg
+        assert "tp_shard_plan" in msg
+
+
+def test_default_plan_fallthrough_known_hf_arch_warns_at_tp_size_gt_1(monkeypatch, caplog):
+    """Known HF archs (not ``transformers_modules.*``) keep working at tp_size > 1.
+
+    They have been working in practice on the default base plan, so the guard only
+    logs a warning and still returns the base plan rather than raising.
+    """
+    import logging as _logging
+
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_DummyModel), None)
+
+    def _raise_hf(_model):
+        raise RuntimeError("hf fail")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    with caplog.at_level(_logging.WARNING, logger=parallelizer.logger.name):
+        result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_size=2)
+
+    assert "model.embed_tokens" in result and "lm_head" in result
+    assert any("No usable tensor-parallel plan is registered" in r.message for r in caplog.records)
+
+
+def test_default_plan_fallthrough_remote_code_folds_translator_diagnostic(monkeypatch):
+    """Remote-code archs whose ``_tp_plan`` failed to translate get a diagnostic in the error.
+
+    Covers the case where the model author exposed a ``_tp_plan`` but
+    ``get_hf_tp_shard_plan`` raised while translating it (e.g. because the styles are
+    not recognized by nemo). The raised ``ValueError`` should fold the translator's
+    error message in so the user can distinguish "no `_tp_plan` at all" from
+    "`_tp_plan` defined but unusable". See
+    https://github.com/NVIDIA-NeMo/Automodel/pull/2244 discussion.
+    """
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+
+    def _raise_translator(_model):
+        raise ValueError("Unknown parallel style: foo_bar")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_translator, raising=True)
+    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
+
+    with pytest.raises(ValueError) as excinfo:
+        _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=2)
+
+    msg = str(excinfo.value)
+    # Diagnostic from get_hf_tp_shard_plan must be folded into the user-facing error.
+    assert "Unknown parallel style: foo_bar" in msg
+    # And the registration guidance must still be there.
+    assert "PARALLELIZE_FUNCTIONS" in msg
+    assert "_tp_plan" in msg
+    assert "tp_shard_plan" in msg
+
+
+def test_default_plan_fallthrough_tp_size_1_still_returns_base_plan(monkeypatch):
+    """tp_size == 1 keeps the existing behavior: the default base plan is returned.
+
+    At tp_size == 1 no sharding actually happens, so the missing ``shard_order``
+    metadata never matters. This preserves backwards compatibility for callers that
+    do not pass ``tp_size`` (default is 1), including for custom-code archs.
+    """
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+
+    def _raise_hf(_model):
+        raise RuntimeError("hf fail")
+
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", _raise_hf, raising=True)
+    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
+
+    # Explicit tp_size=1 — should still return the base plan, even for remote-code archs.
+    result = _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=1)
+    assert "model.embed_tokens" in result and "lm_head" in result
+
+
+def test_hf_native_plan_unaffected_at_tp_size_gt_1(monkeypatch):
+    """Models that expose an HF-native ``_tp_plan`` must not trip the new guard.
+
+    The fail-fast check only fires when path 4 (default base plan) would be taken
+    *and* the model is a custom-code arch. If ``get_hf_tp_shard_plan`` returns a
+    non-empty plan, that plan must be used regardless of ``tp_size``.
+    """
+    hf_plan = {"model.embed_tokens": "embed", "lm_head": "head"}
+    parallelizer.PARALLELIZE_FUNCTIONS.pop(_get_class_qualname(_RemoteCodeDummyModel), None)
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", lambda _m: hf_plan, raising=True)
+    _set_global_model_cls(monkeypatch, _RemoteCodeDummyModel)
+
+    result = _get_parallel_plan(_RemoteCodeDummyModel(), sequence_parallel=False, tp_size=4)
+    assert result is hf_plan
+
+
 def test_custom_plan_imports_non_dict_raises(monkeypatch):
     """If import resolves but returns non-dict object, raise ValueError."""
 
