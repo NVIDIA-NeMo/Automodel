@@ -26,6 +26,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 500
   val_every_steps: 500
+  gc_every_steps: 10
   num_epochs: 1
   max_steps: 100
 

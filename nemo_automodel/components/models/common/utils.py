@@ -141,7 +141,9 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", or "flex").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
+            For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
+            indexer, and Sinkhorn kernels together.
         linear: Linear layer backend ("torch" or "te").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
@@ -151,6 +153,14 @@ class BackendConfig:
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+        dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
+            manager instance across MoE layers.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
+            and allocate dispatched tensors on the communication stream.
+        disable_shared_expert_overlap: When True, run shared experts sequentially on the
+            current CUDA stream instead of overlapping them on a side stream with the
+            grouped-expert dispatch. Useful as an escape hatch when the side-stream
+            overlap interacts poorly with the dispatcher backend.
         enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
@@ -165,7 +175,7 @@ class BackendConfig:
             torch.dtype or string (e.g., "torch.float32", "float32").
     """
 
-    attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
@@ -178,6 +188,9 @@ class BackendConfig:
         else "torch"
     )
     dispatcher_num_sms: int = 20
+    dispatcher_share_token_dispatcher: bool = True
+    dispatcher_async_dispatch: bool = False
+    disable_shared_expert_overlap: bool = False
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):

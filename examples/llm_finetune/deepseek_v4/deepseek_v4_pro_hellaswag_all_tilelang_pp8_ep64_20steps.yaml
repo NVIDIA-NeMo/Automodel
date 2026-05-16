@@ -12,32 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe with 16 H100 nodes (128 GPUs)
-#   torchrun --nproc-per-node 8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
-
+# DeepSeek-V4-Pro HellaSwag smoke/throughput run with DSV4 TileLang sparse
+# attention, indexer, and Sinkhorn enabled. Parallelism follows the 1T Kimi K2
+# example shape: 64 nodes, PP=8, EP=64, global batch 1024.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 256
+  global_batch_size: 1024
   local_batch_size: 8
   ckpt_every_steps: 500
+  save_checkpoint_every_epoch: false
   val_every_steps: 500
   gc_every_steps: 10
-  num_epochs: 1
-  max_steps: 100
+  num_epochs: 10
+  max_steps: 20
 
 distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4
-  ep_size: 32
+  pp_size: 8
+  ep_size: 64
 
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -49,6 +50,7 @@ distributed:
     patch_causal_lm_model: false
 
   moe:
+    ignore_router_for_ac: true
     reshard_after_forward: false
     wrap_outer_model: false
 
@@ -60,8 +62,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
-    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
-    name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Pro
+    name_or_path: deepseek-ai/DeepSeek-V4-Pro
     num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
@@ -87,35 +89,37 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Pro
 
 packed_sequence:
   packed_sequence_size: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
-  shuffle: true
+    pad_seq_len_divisible: 160
 
-validation_dataset:
+_validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Pro
 
-validation_dataloader:
+_validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
   shuffle: false
   drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 160
 
 optimizer:
   _target_: torch.optim.AdamW

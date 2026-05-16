@@ -829,9 +829,7 @@ class TestGate:
         assert aux_loss.requires_grad
 
     @pytest.mark.parametrize("gate_precision", [None, torch.float32])
-    def test_gate_aux_loss_under_activation_checkpointing(
-        self, moe_config, device, gate_precision
-    ):
+    def test_gate_aux_loss_under_activation_checkpointing(self, moe_config, device, gate_precision):
         """Aux-loss path must be activation-checkpoint safe: saved tensors that AC
         observes during forward must match dtype on backward recompute. Regression
         test for the case where Gate cast `original_scores` back to bf16 right
@@ -861,9 +859,7 @@ class TestGate:
             weights, _, aux_loss = gate(x_, token_mask, cp_mesh=None)
             # Inject the aux_loss gradient the same way the real model does, so
             # MoEAuxLossAutoScaler's saved tensor is exercised on backward.
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=x_.device
-            )
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0, device=x_.device)
             return weights.sum()
 
         # Wrap in bf16 autocast so any op that promotes to fp32 (e.g. softmax) on
@@ -946,8 +942,7 @@ class TestGate:
 
         loss = gate._compute_aux_loss(original_scores_bf16, expert_load_int, token_mask, cp_mesh=None)
         assert loss.dtype == torch.float32, (
-            f"_compute_aux_loss must return fp32 to satisfy the AC saved/recomputed "
-            f"dtype contract; got {loss.dtype}."
+            f"_compute_aux_loss must return fp32 to satisfy the AC saved/recomputed dtype contract; got {loss.dtype}."
         )
 
     def test_gate_update_bias(self, moe_config, device):
@@ -1290,6 +1285,22 @@ class TestMoE:
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
         assert moe.experts.dispatcher_backend == "hybridep"
         assert moe.experts.dispatcher_num_sms == backend_config.dispatcher_num_sms
+
+    def test_moe_forwards_dispatcher_config_to_experts(self, moe_config, backend_config):
+        """MoE should pass BackendConfig dispatcher knobs to flex dispatcher experts."""
+        backend_config.experts = "torch_mm"
+        backend_config.dispatcher = "deepep"
+        backend_config.dispatcher_num_sms = 12
+        backend_config.dispatcher_share_token_dispatcher = False
+        backend_config.dispatcher_async_dispatch = True
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.experts, GroupedExpertsDeepEP)
+        assert moe.experts.dispatcher_backend == "deepep"
+        assert moe.experts.dispatcher_num_sms == 12
+        assert moe.experts.dispatcher_share_token_dispatcher is False
+        assert moe.experts.dispatcher_async_dispatch is True
 
     def test_moe_init_with_shared_experts(self, moe_config, backend_config):
         """Test MoE initialization with shared experts."""

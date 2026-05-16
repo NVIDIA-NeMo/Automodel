@@ -43,8 +43,9 @@ HC (Hyper-Connections):
   Each Block maintains hc_mult=4 copies of the hidden state.
   hc_pre  reduces [bsz, seq, hc_mult, dim] -> [bsz, seq, dim] via Sinkhorn mixing.
   hc_post expands [bsz, seq, dim] -> [bsz, seq, hc_mult, dim].
-  See ``_hc_split_sinkhorn`` for the pure-torch port of the reference mixer
-  (ported from miles PR 1045's ``kernel/sinkhorn.py``).
+  See ``DeepseekV4HyperConnection.compute_weights`` and
+  ``optimized_kernels.dsv4_sinkhorn_normalize`` for the torch reference and
+  optional TileKernels Sinkhorn path.
 
 Compress-ratio attention (Compressor + Indexer) is wired into
 DeepseekV4Attention.forward for layers with compress_ratio > 0.
@@ -64,6 +65,23 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
+    build_dsv4_sparse_topk_indices,
+    dsv4_indexer_scores,
+    dsv4_sinkhorn_normalize,
+    dsv4_sparse_attention,
+)
+
+
+def _dsv4_kernel_backend(backend: BackendConfig) -> str:
+    """Use TileLang DSV4 kernels only when the attention backend requests them."""
+    return "tilelang" if backend.attn == "tilelang" else "torch"
+
+
+def _rms_norm_last_dim(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMS-normalize the last dim without materializing an ``x.square()`` tensor."""
+    return F.rms_norm(x, (x.shape[-1],), eps=eps)
+
 
 # ---------------------------------------------------------------------------
 # DeepSeek V4 attention + compressor + indexer + rotary embedding, ported
@@ -79,8 +97,8 @@ from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 #      per-forward scratch dict.  The KV-cache path is left for a future
 #      inference port.
 # The compressor + indexer modules are only constructed when a layer's
-# ``compress_ratio`` is non-zero; the ``validate`` YAML sets all ratios to 0
-# so those modules are dormant in the current smoke run but fully wired.
+# ``compress_ratio`` is non-zero; sparse attention and indexer execution are
+# selected through ``BackendConfig``.
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +134,6 @@ def _apply_partial_rope_interleaved(
     """
     rd = rope_head_dim
     half = rd // 2
-    input_dtype = x.dtype
     nope, rope = x[..., :-rd], x[..., -rd:]
     # Pair-reshape last dim: [..., rd] -> [..., rd/2, 2]
     rope_pairs = rope.float().unflatten(-1, (-1, 2))
@@ -127,10 +144,13 @@ def _apply_partial_rope_interleaved(
     while c.ndim < a.ndim:
         c = c.unsqueeze(1)
         s = s.unsqueeze(1)
-    new_a = a * c - b * s
-    new_b = a * s + b * c
-    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2).to(input_dtype)
-    return torch.cat([nope, new_rope], dim=-1)
+    out = torch.empty_like(x)
+    if nope.shape[-1] > 0:
+        out[..., :-rd] = nope
+    out_pairs = out[..., -rd:].unflatten(-1, (-1, 2))
+    out_pairs[..., 0] = a * c - b * s
+    out_pairs[..., 1] = a * s + b * c
+    return out
 
 
 def apply_rotary_pos_emb(
@@ -452,6 +472,42 @@ def build_causal_padding_mask(
     raise ValueError(f"Unsupported attention_mask rank: {attention_mask.dim()}")
 
 
+def build_packed_causal_padding_mask(
+    seq_lens: torch.Tensor,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """Build a 4D additive block-causal mask from packed-sequence lengths."""
+    if seq_lens.dim() == 1:
+        seq_lens = seq_lens.unsqueeze(0)
+    seq_lens = seq_lens.to(device=device, dtype=torch.long)
+    seq_lens = torch.where(seq_lens > 0, seq_lens, torch.zeros((), device=device, dtype=torch.long))
+
+    batch_size = seq_lens.shape[0]
+    positions = torch.arange(seq_len, device=device, dtype=torch.long).expand(batch_size, -1)
+    ends = seq_lens.cumsum(dim=-1)
+    total = ends[:, -1:]
+    doc_ids = torch.searchsorted(ends.contiguous(), positions.contiguous(), right=True) + 1
+    doc_ids = torch.where(positions < total, doc_ids, torch.zeros_like(doc_ids))
+
+    same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
+    not_padding = doc_ids > 0
+    idx = torch.arange(seq_len, device=device)
+    causal = idx.unsqueeze(0) <= idx.unsqueeze(1)
+    allowed = same_doc & causal.unsqueeze(0) & not_padding.unsqueeze(2) & not_padding.unsqueeze(1)
+    if sliding_window is not None and sliding_window > 0:
+        allowed = allowed & ((idx.unsqueeze(1) - idx.unsqueeze(0)) < sliding_window).unsqueeze(0)
+
+    min_value = torch.finfo(dtype).min if dtype.is_floating_point else -1e9
+    return torch.where(
+        allowed.unsqueeze(1),
+        torch.zeros((), dtype=dtype, device=device),
+        torch.full((), min_value, dtype=dtype, device=device),
+    )
+
+
 def eager_attention_with_sink(
     module: nn.Module,
     query: torch.Tensor,
@@ -489,8 +545,8 @@ def _build_indexer_topk_compressed_mask(
     min_val = torch.finfo(attention_mask.dtype).min
     indexer_topk = indexer_topk.to(device=attention_mask.device)
     batch, seq_len = indexer_topk.shape[:2]
-    valid = indexer_topk != -1  # [B, S, K]
-    safe_idx = indexer_topk.clamp(min=0)
+    valid = (indexer_topk >= 0) & (indexer_topk < n_pooled)  # [B, S, K]
+    safe_idx = indexer_topk.clamp(min=0, max=max(n_pooled - 1, 0))
     indicator_counts = torch.zeros(
         (batch, seq_len, n_pooled),
         dtype=torch.int32,
@@ -522,8 +578,9 @@ class DeepseekV4Indexer(nn.Module):
     query projection + weights_proj head-mixer.
     """
 
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(self, config: DeepseekV4Config, backend: BackendConfig | None = None):
         super().__init__()
+        self.backend = backend or BackendConfig()
         self.compress_ratio = 4
         # Indexer's pool is always at compress_ratio==4, which means overlap mode
         # (matching the released checkpoint's ``indexer.compressor.{ape,wkv,wgate}``
@@ -585,10 +642,15 @@ class DeepseekV4Indexer(nn.Module):
         cos, sin = position_embeddings
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
-        scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
-        scores = F.relu(scores) * self.softmax_scale
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
+        index_scores = dsv4_indexer_scores(
+            q,
+            pooled_kv,
+            weights,
+            compress_ratio=self.compress_ratio,
+            softmax_scale=self.softmax_scale,
+            backend=_dsv4_kernel_backend(self.backend),
+        )
         topk = min(self.index_topk, pooled_kv.shape[1])
         return index_scores.topk(topk, dim=-1).indices
 
@@ -598,8 +660,15 @@ class DeepseekV4Compressor(nn.Module):
     into one compressed KV; when ``ratio == 4`` the Indexer narrows the pool.
     """
 
-    def __init__(self, config: DeepseekV4Config, compress_ratio: int, head_dim: int):
+    def __init__(
+        self,
+        config: DeepseekV4Config,
+        compress_ratio: int,
+        head_dim: int,
+        backend: BackendConfig | None = None,
+    ):
         super().__init__()
+        self.backend = backend or BackendConfig()
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
         self.rope_head_dim = config.qk_rope_head_dim
@@ -616,7 +685,9 @@ class DeepseekV4Compressor(nn.Module):
         self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
-        self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
+        self.indexer: DeepseekV4Indexer | None = (
+            DeepseekV4Indexer(config, backend=self.backend) if compress_ratio == 4 else None
+        )
 
     @property
     def ape(self) -> torch.Tensor:
@@ -721,12 +792,14 @@ class DeepseekV4HyperConnection(nn.Module):
         hc_sinkhorn_iters: int,
         hc_eps: float,
         rms_norm_eps: float,
+        sinkhorn_backend: str = "torch",
     ):
         super().__init__()
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
         self.norm_eps = rms_norm_eps
+        self.sinkhorn_backend = sinkhorn_backend
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size, dtype=torch.float32))
         self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
@@ -734,9 +807,8 @@ class DeepseekV4HyperConnection(nn.Module):
 
     def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
-        mix = torch.nn.functional.linear(flat, self.fn.float()) * rsqrt  # [B, S, (2+H)*H]
+        mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.fn.float())  # [B, S, (2+H)*H]
         pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
         hc = self.hc_mult
 
@@ -761,11 +833,12 @@ class DeepseekV4HyperConnection(nn.Module):
         comb_logit = (
             mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale + self.base[2 * hc :].view(hc, hc).float()
         )
-        comb = torch.softmax(comb_logit, dim=-1) + self.hc_eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.hc_sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+        comb = dsv4_sinkhorn_normalize(
+            comb_logit,
+            backend=self.sinkhorn_backend,
+            repeat=self.hc_sinkhorn_iters,
+            eps=self.hc_eps,
+        )
         return pre, post, comb
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -792,8 +865,7 @@ class DeepseekV4HyperHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = torch.nn.functional.linear(flat, self.hc_fn.float()) * rsqrt
+        mixes = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.hc_fn.float())
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
@@ -808,9 +880,8 @@ class DeepseekV4HyperHead(nn.Module):
 #   - ``past_key_values`` always ``None`` on the training path; the compressor
 #     / indexer use a per-forward ``DeepseekV4TrainCache`` shim that behaves
 #     the same as HF's ``DeepseekV4Cache`` within a single call;
-#   - a fixed dispatch to ``eager_attention_with_sink`` (KAutomodel does not
-#     register attention backends in HF's ``ALL_ATTENTION_FUNCTIONS`` table,
-#     and the sink fold-in needs this path specifically).
+#   - explicit backend dispatch for SDPA, the dense torch reference, and the
+#     optional DeepSeek V4 sparse-attention kernels.
 # ---------------------------------------------------------------------------
 
 
@@ -825,6 +896,7 @@ class DeepseekV4Attention(nn.Module):
     def __init__(self, config: DeepseekV4Config, layer_idx: int, backend: BackendConfig | None = None):
         super().__init__()
         self.config = config
+        self.backend = backend or BackendConfig()
         self.layer_idx = layer_idx
         self.compress_ratio = int(config.compress_ratios[layer_idx]) if config.compress_ratios else 0
         self.num_heads = config.num_attention_heads
@@ -851,7 +923,9 @@ class DeepseekV4Attention(nn.Module):
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
         self.compressor = (
-            DeepseekV4Compressor(config, self.compress_ratio, self.head_dim) if self.compress_ratio else None
+            DeepseekV4Compressor(config, self.compress_ratio, self.head_dim, backend=self.backend)
+            if self.compress_ratio
+            else None
         )
 
     @property
@@ -889,12 +963,14 @@ class DeepseekV4Attention(nn.Module):
 
         # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
         # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.config.rms_norm_eps)
+        q = _rms_norm_last_dim(q, self.config.rms_norm_eps)
 
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
         full_kv = kv
+        n_pooled = 0
+        indexer_topk: torch.LongTensor | None = None
 
         if self.compressor is not None:
             assert rotary_compress is not None and position_embeddings_compress is not None, (
@@ -952,16 +1028,39 @@ class DeepseekV4Attention(nn.Module):
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        attn_output, attn_weights = eager_attention_with_sink(
-            self,
-            q,
-            full_kv,
-            full_kv,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-        )
-        # eager_attention_with_sink returns [B, S, H, D] (already transposed).
+        attn_backend = _dsv4_kernel_backend(self.backend)
+        if attn_backend == "tilelang":
+            topk_idxs = build_dsv4_sparse_topk_indices(
+                batch_size=batch,
+                seq_len=seq_len,
+                key_len=full_kv.shape[2],
+                window_size=self.sliding_window,
+                device=full_kv.device,
+                attention_mask=attention_mask,
+                compress_ratio=self.compress_ratio,
+                compressed_topk=indexer_topk,
+                n_pooled=n_pooled,
+            )
+            attn_output = dsv4_sparse_attention(
+                q.transpose(1, 2).contiguous(),
+                full_kv.squeeze(1).contiguous(),
+                self.sinks,
+                topk_idxs,
+                self.scaling,
+                backend=attn_backend,
+            )
+            attn_weights = None
+        else:
+            attn_output, attn_weights = eager_attention_with_sink(
+                self,
+                q,
+                full_kv,
+                full_kv,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+            )
+            # eager_attention_with_sink returns [B, S, H, D] (already transposed).
 
         # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
         # HF uses).  Reference: modular_deepseek_v4.py:607.

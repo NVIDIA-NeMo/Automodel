@@ -13,8 +13,7 @@
 # limitations under the License.
 
 # To run this recipe with 16 H100 nodes (128 GPUs)
-#   torchrun --nproc-per-node 8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
-
+#   automodel examples/llm_finetune/deepseek_v4/deepseek_v4_flash_packed_sequence_hellaswag.yaml --nproc-per-node 8
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -37,7 +36,7 @@ distributed:
   ep_size: 32
 
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -49,6 +48,7 @@ distributed:
     patch_causal_lm_model: false
 
   moe:
+    ignore_router_for_ac: true
     reshard_after_forward: false
     wrap_outer_model: false
 
@@ -87,33 +87,31 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: true
 

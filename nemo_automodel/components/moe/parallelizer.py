@@ -174,14 +174,23 @@ def apply_ac(
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
+    def _is_router_projection(func, args) -> bool:
+        aten = torch.ops.aten
+        mm = getattr(getattr(aten, "mm", None), "default", None)
+        addmm = getattr(getattr(aten, "addmm", None), "default", None)
+        linear = getattr(getattr(aten, "linear", None), "default", None)
+        if func == mm:
+            return len(args) == 2 and args[1].shape == (hidden_size, num_experts)
+        if func == addmm:
+            return len(args) >= 3 and args[2].shape == (hidden_size, num_experts)
+        if func == linear:
+            return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
+        return False
+
     def _custom_policy(ctx, func, *args, **kwargs):
-        if func == torch.ops.aten.mm.default:
-            if len(args) == 2 and (args[1].shape == (hidden_size, num_experts)):
-                return CheckpointPolicy.MUST_SAVE
-            else:
-                return CheckpointPolicy.PREFER_RECOMPUTE
-        else:
-            return CheckpointPolicy.PREFER_RECOMPUTE
+        if _is_router_projection(func, args):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
 
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
@@ -192,9 +201,13 @@ def apply_ac(
         _model = model
     _model = get_text_module(_model)
     for layer_id, block in _model.layers.named_children():
-        if ignore_router:
+        if ignore_router and hasattr(block, "set_activation_checkpointing"):
+            block.set_activation_checkpointing(True)
+        elif ignore_router:
             block = ptd_checkpoint_wrapper(
-                block, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
+                block,
+                preserve_rng_state=True,
+                context_fn=selective_checkpointing_context_fn,
             )
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)

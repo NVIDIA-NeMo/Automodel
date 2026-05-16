@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from contextlib import nullcontext
 from functools import partial
 from typing import Optional
 
@@ -617,6 +618,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
                 # experts == "te"
@@ -625,6 +628,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
         else:
             # Default to torch experts
@@ -663,6 +668,8 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
+        self._disable_shared_expert_overlap = backend.disable_shared_expert_overlap
+
     def forward(
         self,
         x: torch.Tensor,
@@ -699,37 +706,33 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        if self.shared_experts is None:
-            y = self.experts(x_latent, token_mask, weights, indices)
-            # Apply latent projection after MoE if enabled
-            if self.fc2_latent_proj is not None:
-                y = self.fc2_latent_proj(y)
-            return y.view(shape)
-
-        # Execute shared experts in a separate stream to overlap compute with the
-        # communication for grouped experts.
-        global _shared_experts_stream
-        if _shared_experts_stream is None:
-            _shared_experts_stream = torch.cuda.Stream()
-
-        _shared_experts_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(_shared_experts_stream):
-            z = self.shared_experts(x)
-            if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+        # Shared-expert output (optionally gated).  Run on a side CUDA stream
+        # to overlap with the grouped-expert dispatch comm, unless overlap is
+        # disabled (in which case run sequentially on the current stream).
+        z = None
+        side_stream = None
+        if self.shared_experts is not None:
+            if not self._disable_shared_expert_overlap:
+                global _shared_experts_stream
+                if _shared_experts_stream is None:
+                    _shared_experts_stream = torch.cuda.Stream()
+                side_stream = _shared_experts_stream
+                side_stream.wait_stream(torch.cuda.current_stream())
+            stream_ctx = torch.cuda.stream(side_stream) if side_stream is not None else nullcontext()
+            with stream_ctx:
+                z = self.shared_experts(x)
+                if self.shared_expert_gate is not None:
+                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
         y = self.experts(x_latent, token_mask, weights, indices)
+        if side_stream is not None:
+            torch.cuda.current_stream().wait_stream(side_stream)
 
-        # Apply latent projection after MoE if enabled
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
-
-        # Wait for the shared experts stream to complete all operations before
-        # adding together the outputs of grouped experts and shared experts.
-        torch.cuda.current_stream().wait_stream(_shared_experts_stream)
-
-        # Reshape the outputs back to 3-D.
-        return (y + z).view(shape)
+        if z is not None:
+            y = y + z
+        return y.view(shape)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
