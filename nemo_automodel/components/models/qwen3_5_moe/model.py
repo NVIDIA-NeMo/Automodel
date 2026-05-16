@@ -235,6 +235,11 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
+        # Resolve model dtype once; thread explicitly to every sub-module so
+        # fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # --------------- MoE config ---------------
         # Qwen3.5-MoE has MoE on every layer, with a shared expert + sigmoid gate.
         # No ``decoder_sparse_step`` — defaults to 1 so every layer is MoE.
@@ -259,14 +264,14 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             softmax_before_topk=True,
             shared_expert_gate=True,
             shared_expert_inter_dim=config.shared_expert_intermediate_size,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         # --------------- Layers ---------------
-        embed_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=embed_dtype)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx, dtype=model_dtype)
 
         # Use Qwen3_5MoeBlock — same as Qwen3Next Block but with native GatedDeltaNet
         self.layers = nn.ModuleDict(
@@ -433,6 +438,20 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         if not _QWEN3_5_MOE_HF_AVAILABLE:
             raise UnavailableError("transformers.models.qwen3_5_moe is not available.")
         backend = backend or BackendConfig()
+
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # VL configs the nested text_config / vision_config keep their original
+        # dtype (typically bf16 from the checkpoint's config.json). Propagate
+        # the user-requested dtype to every nested sub-config that exposes a
+        # torch_dtype attribute, before constructing the HF parent (whose
+        # vision encoder / multimodal code may read sub-config torch_dtype) and
+        # our text backend.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
+
         # Initialize HF parent (creates self.model, self.lm_head, vision encoder, etc.)
         super().__init__(config)
 
@@ -450,7 +469,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         # Replace lm_head with NeMo backend linear
         self.lm_head = initialize_linear_module(
-            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
+            self.backend.linear,
+            text_config.hidden_size,
+            text_config.vocab_size,
+            bias=False,
+            dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
         )
 
         # Expose moe_config for FSDP sync mixin

@@ -37,6 +37,10 @@ class Block(nn.Module):
         super().__init__()
         self.self_attn = DeepseekV32MLA(config, backend)
 
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         mlp_layer_types = getattr(config, "mlp_layer_types", None)
         if mlp_layer_types is not None:
             is_moe_layer = mlp_layer_types[layer_idx] == "sparse"
@@ -47,11 +51,13 @@ class Block(nn.Module):
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
         else:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
 
@@ -108,6 +114,11 @@ class GlmMoeDsaModel(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -127,18 +138,19 @@ class GlmMoeDsaModel(nn.Module):
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -246,10 +258,13 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):

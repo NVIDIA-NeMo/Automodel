@@ -253,11 +253,16 @@ def apply_fsdp(
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
+            # Forward the same mp_policy used elsewhere so that when params are
+            # kept in fp32 (e.g. for fp32 master weights under FSDP2) the
+            # all-gathered expert weights are still cast to param_dtype for
+            # forward compute (required by GMM / TE kernels that expect bf16).
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
                 shard_placement_fn=lambda _: Shard(1),
                 reshard_after_forward=reshard_after_forward,
+                mp_policy=mp_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
