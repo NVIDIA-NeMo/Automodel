@@ -1018,6 +1018,53 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+        # ── Construct Engine, injecting recipe-built state. ──────────
+        # build_model / build_optimizer / build_lr_scheduler ran above; we
+        # don't call engine.build(). The Engine just gives us a stable train-
+        # step surface (forward_backward / optimizer_step / lr_scheduler_step).
+        from nemo_automodel.engine import Engine
+
+        self.engine = Engine(
+            model_cfg=self.cfg.model,
+            distributed_cfg=self.dist_setup,
+            optimizer_cfg=self.cfg.optimizer,
+            lr_scheduler_cfg=self.cfg.get("lr_scheduler", None),
+            max_grad_norm=self.max_grad_norm,
+            moe_cfg=self.dist_setup.moe_config,
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+        )
+        # Inject already-built state — bypasses engine.build().
+        self.engine.model = self.pp if self.pp is not None else self.model_parts[0]
+        self.engine.optimizer = self.optimizer[0] if isinstance(self.optimizer, list) else self.optimizer
+        self.engine.lr_scheduler = (
+            self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
+        )
+        self.engine.mesh = self.dist_setup
+        # CP/THD shaping for the recipe's model + dataloader combo.
+        self.engine.cp_use_te = (
+            _uses_te_dot_product_attention(self.model_parts[0]) and _uses_thd_collater(self.cfg.dataloader)
+        )
+        self.engine.cp_padding_token_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
+        self.engine.cp_num_chunks = _get_num_thd_chunks(self.pp_enabled, self.cfg)
+        # FP8 autocast (TE) — engine wraps forward in this context when set.
+        self.engine.fp8_autocast = self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else None
+        # MTP (Multi-Token Prediction) auxiliary loss — kicks in only when the
+        # model emits mtp_per_depth_h. Closure captures self.loss_fn so MTP
+        # depths use the same loss class as the main path.
+        def _mtp_extra_loss(out, model, labels, num_label_tokens):
+            mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+            if mtp_per_depth_h is None:
+                return None
+            return calculate_mtp_loss(
+                self.loss_fn,
+                mtp_per_depth_h=mtp_per_depth_h,
+                labels=labels,
+                model=model,
+                scaling_factor=out.mtp_loss_scaling_factor,
+                num_label_tokens=num_label_tokens,
+            )
+        self.engine.extra_loss_fn = _mtp_extra_loss
+
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
 
@@ -1168,122 +1215,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.checkpointer.close()
 
     # ------------------ helpers ------------------
-    def _forward_backward_step(
-        self,
-        idx,
-        batch,
-        *,
-        loss_buffer,
-        num_label_tokens,
-        num_batches,
-        is_train: bool = True,
-    ):
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
-        train_ctx, batch = make_cp_batch_and_ctx(
-            self.device_mesh,
-            batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
-            )
-            and _uses_thd_collater(self.cfg.dataloader),
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
-        )
-        labels = batch.pop("labels")
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
-
-        if self.pp_enabled:
-            with train_ctx(), fp8_ctx:
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
-
-                input_ids = batch.pop("input_ids")
-
-                # Update PP stage shapes for the current batch's seq_len.
-                # This is a no-op when the length hasn't changed.
-                self.pp.update_seq_len(input_ids.shape[1])
-
-                # Filter out None values and empty dicts from batch to avoid PP chunking errors
-                batch_filtered = {
-                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
-                }
-
-                if is_train:
-                    # Use step for training (forward + backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
-                else:
-                    # Use eval for validation (forward only, no backward)
-                    if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
-                    else:
-                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
-
-            if self.pp.info.has_last_stage:
-                local_loss = torch.sum(torch.stack(losses))
-            else:
-                local_loss = torch.tensor(0.0, device=self.dist_env.device)
-
-            loss_buffer.append(local_loss.clone().detach())
-        else:
-            model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with train_ctx(), sync_ctx, fp8_ctx:
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
-
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=get_final_hidden_states(out),
-                    num_label_tokens=num_label_tokens,
-                )
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                if mtp_per_depth_h is not None:
-                    local_loss = local_loss + calculate_mtp_loss(
-                        self.loss_fn,
-                        mtp_per_depth_h=mtp_per_depth_h,
-                        labels=labels,
-                        model=model,
-                        scaling_factor=out.mtp_loss_scaling_factor,
-                        num_label_tokens=num_label_tokens,
-                    )
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
-
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
@@ -1297,77 +1228,47 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
-        # multiplies them by main_loss_backward_scale during backward.  This
-        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
-        # apply to *all* gradients (including aux loss):
-        #
-        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
-        #           Scale = dp_group_size  →  net = 1.
-        #
-        #   PP:     FSDP divides by dp_group_size, then
-        #           scale_grads_and_clip_grad_norm divides by
-        #           (num_label_tokens / dp_group_size).  The dp_group_size
-        #           factors cancel, leaving net 1/num_label_tokens.
-        #           Scale = num_label_tokens  →  net = 1.
-        if self.pp_enabled:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
-        else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                float(self._get_dp_group_size(include_cp=True))
-            )
-
-        loss_buffer = []
-
-        # number of tokens in the batch, excluding any tail padding.
+        # number of tokens in the batch, excluding any tail padding (for TPS).
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        # Allow per-call max_grad_norm override (caller passes self.max_grad_norm
+        # in practice; engine reads from its own attribute on optimizer_step).
+        if max_grad_norm is not None:
+            self.engine.max_grad_norm = max_grad_norm
 
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+        # Engine does: prepare_for_grad_accumulation → MoE aux-loss scale →
+        # microbatch loop with prepare_after_first_microbatch / prepare_for_final_backward
+        # → per-microbatch CP/PP/loss/backward (matches the inline orchestration
+        # this method used to do).
+        self.engine.zero_grad()
+        # If multiple optimizers (PP path), zero them all.
+        for opt in self.optimizer[1:] if isinstance(self.optimizer, list) and len(self.optimizer) > 1 else []:
+            opt.zero_grad()
 
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-            )
-
-            if i == 0:
-                prepare_after_first_microbatch()
-
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm,
-            self.model_parts,
-            norm_type=2.0,
-            pp_enabled=self.pp_enabled,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
-            foreach=True,
-            num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(include_cp=True),
+        result = self.engine.forward_backward(
+            batches, loss_fn=self.loss_fn, num_label_tokens=num_label_tokens,
         )
-
-        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
-        # self.model_parts[0].finish_grad_sync()
+        loss_buffer = result["losses"]
 
         self.checkpointer.maybe_wait_for_staging()
-        for opt in self.optimizer:
+
+        ok, grad_norm = self.engine.optimizer_step()
+        # Step any additional optimizers (PP path with one optimizer per stage).
+        for opt in self.optimizer[1:] if isinstance(self.optimizer, list) and len(self.optimizer) > 1 else []:
             opt.step()
-            opt.zero_grad()
 
         if hasattr(self.model_parts[0], "update_moe_gate_bias"):
             for mp in self.model_parts:
                 mp.update_moe_gate_bias()
 
-        if self.lr_scheduler is not None:
-            for scheduler in self.lr_scheduler:
+        self.engine.lr_scheduler_step()
+        # Step any additional LR schedulers.
+        if isinstance(self.lr_scheduler, list) and len(self.lr_scheduler) > 1:
+            for scheduler in self.lr_scheduler[1:]:
                 scheduler.step(1)
 
         # Precompute FP8 scales
@@ -1460,18 +1361,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = 0
 
             for batch in val_dataloader:
-                loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
-                self._forward_backward_step(
-                    0,
-                    batch,
-                    loss_buffer=loss_buffer,
+                result = self.engine.forward_backward(
+                    [batch],
+                    loss_fn=self.loss_fn,
+                    forward_only=True,
                     num_label_tokens=None,  # we will normalize outside.
-                    num_batches=1,
-                    is_train=False,
                 )
-
-                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_loss += torch.sum(torch.stack(result["losses"])).item()
                 total_num_label_tokens += num_label_tokens
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)

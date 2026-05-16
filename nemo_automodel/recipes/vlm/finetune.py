@@ -179,82 +179,15 @@ def _chunk_vlm_media(
     n_microbatches: int,
     n_images_per_sample: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Split VLM pixel_values and image_grid into PP microbatch chunks.
+    """Deprecated: use ``nemo_automodel.vlm_engine.chunk_vlm_media``.
 
-    Handles four layouts:
-    1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
-    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
-    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
-       ``n_images_per_sample`` (general case, works for packed sequences too).
-    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
+    Re-exported here for backwards compatibility with sibling recipes and
+    external callers. The body lives next to :class:`VLMEngine`.
     """
-    n_images = image_grid.shape[0]
-    pixel_values_chunks: list[torch.Tensor] = []
-    image_grid_chunks: list[torch.Tensor] = []
+    from nemo_automodel.vlm_engine import chunk_vlm_media
 
-    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
-        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
-        # Both are indexed by image along dim 0, one entry per sample.
-        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
-        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
-        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
-        # All images are padded to the same max_patches, so split by image count directly.
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        samples_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
-            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[img_start:img_end])
-            image_grid_chunks.append(image_grid[img_start:img_end])
-    elif n_images_per_sample is not None:
-        # General case: use per-sample image counts to associate images with
-        # batch items.  Works for packed sequences (multiple images per item).
-        patch_counts = image_grid.prod(dim=1)
-        cumsum_patches = torch.cumsum(patch_counts, dim=0)
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-
-        samples_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-
-            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
-            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
-            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    elif n_images == batch_size:
-        # Legacy: exactly 1 image per sample.
-        patch_counts = image_grid.prod(dim=1)
-        cumsum = torch.cumsum(patch_counts, dim=0)
-
-        images_per_mb = batch_size // n_microbatches
-        for mb_idx in range(n_microbatches):
-            img_start = mb_idx * images_per_mb
-            img_end = min(img_start + images_per_mb, n_images)
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    else:
-        pixel_values_chunks.append(pixel_values)
-        image_grid_chunks.append(image_grid)
-        for _ in range(n_microbatches - 1):
-            pixel_values_chunks.append(pixel_values[:0])
-            image_grid_chunks.append(image_grid[:0])
-        logging.warning(
-            f"VLM chunking: n_images={n_images} != batch_size={batch_size}, giving all images to first microbatch"
-        )
-
-    return pixel_values_chunks, image_grid_chunks
+    return chunk_vlm_media(pixel_values, image_grid, batch_size, n_microbatches,
+                            n_images_per_sample=n_images_per_sample)
 
 
 def build_dataloader(
@@ -700,6 +633,37 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
+        # ── Construct VLMEngine, injecting recipe-built state. ───────
+        # build_model / build_optimizer / build_lr_scheduler ran above; we
+        # don't call engine.build(). VLMEngine adds VLM-specific intercepts
+        # (CP multimodal pre-embed, PP media chunking) via subclass hooks.
+        from nemo_automodel.vlm_engine import VLMEngine
+
+        self.engine = VLMEngine(
+            model_cfg=self.cfg.model,
+            distributed_cfg=self.dist_setup,
+            optimizer_cfg=self.cfg.optimizer,
+            lr_scheduler_cfg=self.cfg.get("lr_scheduler", None),
+            max_grad_norm=self.max_grad_norm,
+            moe_cfg=self.dist_setup.moe_config,
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+        )
+        self.engine.model = self.pp if self.pp is not None else self.model_parts[0]
+        self.engine.optimizer = self.optimizer[0] if isinstance(self.optimizer, list) else self.optimizer
+        self.engine.lr_scheduler = (
+            self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
+        )
+        self.engine.mesh = self.dist_setup
+        # VLM neat-packing collators are THD-style; engine reads CP knobs from
+        # the recipe's own config helpers (same as train_ft.py).
+        self.engine.cp_padding_token_id = (
+            getattr(self.processor, "tokenizer", None) and getattr(self.processor.tokenizer, "pad_token_id", 0)
+        ) or 0
+        # FP8 autocast (TE) if configured.
+        self.engine.fp8_autocast = getattr(self.model_parts[0], "te_fp8", None)
+        if self.engine.fp8_autocast is not None:
+            self.engine.fp8_autocast = self.engine.fp8_autocast.maybe_te_autocast
+
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
@@ -752,149 +716,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.checkpointer.close()
 
     # ------------------ helpers ------------------
-    def _forward_backward_step(
-        self,
-        idx,
-        batch,
-        *,
-        loss_buffer,
-        num_label_tokens,
-        num_batches,
-        is_train: bool = True,
-    ):
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
-
-        # Routed through __call__ so FSDP2 forward pre-hook fires and
-        # unshards the vision tower's weights before the embed/scatter.
-        _model = self.model_parts[0]
-        _cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
-        )
-        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
-
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
-        labels = batch.pop("labels")
-
-        if self.pp_enabled:
-            if not is_train:
-                logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
-                return
-
-            with train_ctx():
-                losses = [] if self.pp.info.has_last_stage else None
-                if self.pp.info.has_last_stage:
-                    masked_labels = labels.clone()
-                    targets = masked_labels
-                else:
-                    targets = None
-
-                input_ids = batch.pop("input_ids")
-                self.pp.update_seq_len(input_ids.shape[1])
-
-                # VLM: Custom chunking for pixel_values and image_grid
-                # These tensors have non-standard structure that can't be naively chunked by dim 0
-                # TODO: @HuiyingLi properly handle pixel_values split
-                pixel_values = batch.pop("pixel_values", None)
-                image_grid_hws = batch.pop("image_grid_hws", None)
-                image_grid_thw = batch.pop("image_grid_thw", None)
-                image_sizes = batch.pop("image_sizes", None)
-                image_position_ids = batch.pop("image_position_ids", None)
-                n_images_per_sample = batch.pop("n_images_per_sample", None)
-
-                image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
-                if image_grid is None and image_sizes is not None:
-                    image_grid = image_sizes
-                if image_grid is None and image_position_ids is not None:
-                    image_grid = image_position_ids
-
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    n_microbatches = self.pp._info.schedule._n_microbatches
-                    batch_size = input_ids.shape[0]
-
-                    pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
-                        pixel_values,
-                        image_grid,
-                        batch_size,
-                        n_microbatches,
-                        n_images_per_sample=n_images_per_sample,
-                    )
-
-                    # Store pre-chunked tensors on model for forward to use
-                    stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-                    stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
-                    stage0_model._vlm_chunk_idx = 0
-
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
-                else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
-
-                # Clear stored VLM chunks after PP step
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    stage0_model._vlm_pixel_values_chunks = None
-                    stage0_model._vlm_image_grid_hws_chunks = None
-                    stage0_model._vlm_chunk_idx = None
-
-            if self.pp.info.has_last_stage:
-                local_loss = torch.sum(torch.stack(losses))
-            else:
-                local_loss = torch.tensor(0.0, device=self.dist_env.device)
-
-            loss_buffer.append(local_loss.clone().detach())
-        else:
-            model = self.model_parts[0]
-            sync_ctx = (
-                get_sync_ctx(
-                    model,
-                    idx == num_batches - 1,
-                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-                )
-                if is_train
-                else nullcontext()
-            )
-            with sync_ctx, train_ctx():
-                batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                    # use num_logits_to_keep to avoid full logits matrix in memory
-                    out = model(logits_to_keep=1, **batch)
-                    if "hidden_states" not in out:
-                        raise ValueError(
-                            "FusedLinearCrossEntropy requires the model to output hidden states. "
-                            "Set `model.text_config.output_hidden_states=True` in the config."
-                        )
-                else:
-                    out = model(**batch)
-
-                local_loss = calculate_loss(
-                    self.loss_fn,
-                    logits=getattr(out, "logits", out),
-                    labels=labels,
-                    model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
-                    num_label_tokens=num_label_tokens,
-                )
-                loss_buffer.append(local_loss.clone().detach())
-                if is_train:
-                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
-
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
@@ -907,65 +728,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
-        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
-        # multiplies them by main_loss_backward_scale during backward.  This
-        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
-        # apply to *all* gradients (including aux loss):
-        #
-        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
-        #           Scale = dp_group_size  →  net = 1.
-        #
-        #   PP:     FSDP divides by dp_group_size, then
-        #           scale_grads_and_clip_grad_norm divides by
-        #           (num_label_tokens / dp_group_size).  The dp_group_size
-        #           factors cancel, leaving net 1/num_label_tokens.
-        #           Scale = num_label_tokens  →  net = 1.
-        if self.pp_enabled:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
-        else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                float(self._get_dp_group_size(include_cp=True))
-            )
-
-        loss_buffer = []
-
-        # number of tokens in the batch, excluding any tail padding.
+        # number of tokens in the batch, excluding any tail padding (for TPS).
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
             dtype=torch.long,
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        num_batches = len(batches)
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        if max_grad_norm is not None:
+            self.engine.max_grad_norm = max_grad_norm
 
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+        # VLMEngine drives: prepare_for_grad_accumulation → MoE aux-loss scale →
+        # microbatch loop with VLM CP pre-embed (_pre_cp_hook) and PP media
+        # chunking (_pre_pp_schedule_hook) → prepare_for_final_backward.
+        self.engine.zero_grad()
+        for opt in self.optimizer[1:] if isinstance(self.optimizer, list) and len(self.optimizer) > 1 else []:
+            opt.zero_grad(set_to_none=True)
 
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-            )
-
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm=max_grad_norm,
-            model_parts=self.model_parts,
-            norm_type=2.0,
-            pp_enabled=self.pp_enabled,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
-            foreach=True,
-            num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(include_cp=True),
+        result = self.engine.forward_backward(
+            batches, loss_fn=self.loss_fn, num_label_tokens=num_label_tokens,
         )
-
-        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
-        # self.model.finish_grad_sync()
+        loss_buffer = result["losses"]
 
         self.checkpointer.maybe_wait_for_staging()
-        for opt in self.optimizer:
+
+        ok, grad_norm = self.engine.optimizer_step()
+        for opt in self.optimizer[1:] if isinstance(self.optimizer, list) and len(self.optimizer) > 1 else []:
             opt.step()
             opt.zero_grad(set_to_none=True)
 
@@ -973,8 +761,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for mp in self.model_parts:
                 mp.update_moe_gate_bias()
 
-        if self.lr_scheduler is not None:
-            for scheduler in self.lr_scheduler:
+        self.engine.lr_scheduler_step()
+        if isinstance(self.lr_scheduler, list) and len(self.lr_scheduler) > 1:
+            for scheduler in self.lr_scheduler[1:]:
                 scheduler.step(1)
 
         # Precompute FP8 scales
@@ -1051,48 +840,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {
-                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-                    for k, v in batch.items()
-                }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
-
-                _model = self.model_parts[0]
-                _cp_active = (
-                    self.device_mesh is not None
-                    and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-                    and self.device_mesh["cp"].size() > 1
-                    and not self.pp_enabled
+                # VLMEngine's _pre_cp_hook handles multimodal CP pre-embed and
+                # make_cp_batch_and_ctx is applied inside engine.forward_backward.
+                result = self.engine.forward_backward(
+                    [batch],
+                    loss_fn=self.loss_fn,
+                    forward_only=True,
+                    num_label_tokens=num_label_tokens,
                 )
-                if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-                    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                    with torch.no_grad():
-                        prepared = _model(_pre_embed_only=True, **mm_kwargs)
-                    for k in VLM_INPUT_KEYS:
-                        batch.pop(k, None)
-                    batch.update(prepared)
-
-                train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
-                labels = batch.pop("labels")
-                with train_ctx():
-                    batch = filter_forward_kwargs(self.model_parts[0], batch)
-                    if isinstance(self.loss_fn, FusedLinearCrossEntropy):
-                        out = self.model_parts[0](logits_to_keep=1, **batch)
-                    else:
-                        out = self.model_parts[0](**batch)
-                    local_loss = calculate_loss(
-                        self.loss_fn,
-                        logits=getattr(out, "logits", out),
-                        labels=labels,
-                        model=self.model_parts[0],
-                        hidden_states=out.hidden_states[-1]
-                        if getattr(out, "hidden_states", None) is not None
-                        else None,
-                        num_label_tokens=num_label_tokens,
-                    )
-                    total_num_label_tokens += num_label_tokens
-
-                total_loss += local_loss.item() * num_label_tokens
+                local_loss = result["losses"][0] if result["losses"] else torch.tensor(0.0)
+                total_num_label_tokens += num_label_tokens
+                total_loss += float(local_loss.item()) * num_label_tokens
                 total_tokens += num_label_tokens
 
         # Aggregate across ranks if distributed is initialized
