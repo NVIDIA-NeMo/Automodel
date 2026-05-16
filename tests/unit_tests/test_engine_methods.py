@@ -256,6 +256,54 @@ def test_optimizer_step_clips_and_steps(forward_engine):
     assert moved, "optimizer_step did not update any parameters"
 
 
+# ── List-of-microbatches path ─────────────────────────────────────────
+
+
+def test_forward_backward_accepts_list_of_batches(forward_engine):
+    """Engine accepts a pre-split list[dict] instead of a single batch + n."""
+    batches = [
+        {"input_ids": torch.randint(0, 16, (2, 8)), "labels": torch.randint(0, 16, (2, 8))}
+        for _ in range(3)
+    ]
+    out = forward_engine.forward_backward(batches, num_microbatches=1)  # n ignored when list
+    assert torch.is_tensor(out["loss"])
+    assert len(out["losses"]) == 3
+
+
+# ── MoE aux-loss scale (replaces TestRunTrainOptimStepSetsMoEScale) ───
+
+
+def test_moe_aux_loss_scale_set_when_moe_cfg_present(dist_env):
+    """Engine.forward_backward sets MoEAuxLossAutoScaler.main_loss_backward_scale
+    when mesh.moe_config is present (matches the recipe's pre-migration MoE path).
+    """
+    from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+    from nemo_automodel.engine import Engine
+
+    MoEAuxLossAutoScaler.main_loss_backward_scale = None
+
+    engine = Engine(
+        model_cfg=SimpleNamespace(), distributed_cfg=SimpleNamespace(),
+        optimizer_cfg=SimpleNamespace(), lr_scheduler_cfg=None,
+    )
+    model = _TinyLossModel()
+    engine.model = model
+    engine.optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    # mesh.moe_config presence is what gates the aux-loss scale logic.
+    engine.mesh = SimpleNamespace(
+        device_mesh=None, moe_mesh=None, moe_config=object(),
+        strategy_config=None, pipeline_config=None,
+    )
+
+    batch = {"input_ids": torch.randint(0, 16, (4, 8)), "labels": torch.randint(0, 16, (4, 8))}
+    engine.forward_backward([batch], loss_fn=None, num_label_tokens=10)
+
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale is not None
+    # Non-PP path uses dp_size; with single-rank dist init that's 1.
+    expected_dp = float(engine.dp_size)
+    assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(expected_dp)
+
+
 # ── export_weights ───────────────────────────────────────────────────
 
 
