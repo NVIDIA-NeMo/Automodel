@@ -284,9 +284,14 @@ class Ernie4_5Model(nn.Module):
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         if position_ids is None:
-            position_ids = (
-                torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
-            )
+            if input_ids.ndim == 1:
+                position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
+            else:
+                position_ids = (
+                    torch.arange(0, input_ids.shape[1], device=input_ids.device)
+                    .unsqueeze(0)
+                    .expand(input_ids.shape[0], -1)
+                )
         qkv_format = attn_kwargs.get("qkv_format", "bshd")
         position_embeddings = self.rotary_emb(input_ids, position_ids, qkv_format=qkv_format)
 

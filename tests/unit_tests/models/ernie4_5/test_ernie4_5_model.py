@@ -423,6 +423,79 @@ class TestErnie4_5_MoeForCausalLM:
 
 
 # ---------------------------------------------------------------------------
+# Forward-pass shape tests (CPU)
+# ---------------------------------------------------------------------------
+class TestForwardShapes:
+    """Run a tiny forward pass through the dense and MoE causal-LM heads.
+
+    These tests catch regressions in input/position-id handling, embedding
+    wiring, and the lm_head output shape across qkv_format variants. They
+    deliberately use a tiny config so they run on CPU in CI without GPUs.
+    """
+
+    def _dense_model(self, dense_config, backend_config):
+        torch.manual_seed(0)
+        model = Ernie4_5ForCausalLM(dense_config, backend=backend_config)
+        return model.to(torch.float32).eval()
+
+    def _moe_model(self, moe_hf_config, backend_config):
+        torch.manual_seed(0)
+        model = Ernie4_5_MoeForCausalLM(moe_hf_config, backend=backend_config)
+        return model.to(torch.float32).eval()
+
+    def test_dense_forward_bshd_shape(self, dense_config, backend_config):
+        model = self._dense_model(dense_config, backend_config)
+        batch, seq = 2, 4
+        input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
+        with torch.no_grad():
+            logits = model(input_ids)
+        assert logits.shape == (batch, seq, dense_config.vocab_size)
+
+    def test_dense_forward_thd_shape(self, dense_config, backend_config):
+        """thd path: 1-D position_ids must not crash dense Ernie4_5Model.forward."""
+        model = self._dense_model(dense_config, backend_config)
+        seq = 6
+        input_ids = torch.randint(0, dense_config.vocab_size, (1, seq))
+        with torch.no_grad():
+            logits = model(input_ids, qkv_format="thd")
+        # thd output is unsqueezed back to batch dimension.
+        assert logits.shape == (1, seq, dense_config.vocab_size)
+
+    def test_dense_forward_accepts_explicit_position_ids(self, dense_config, backend_config):
+        model = self._dense_model(dense_config, backend_config)
+        batch, seq = 1, 5
+        input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
+        position_ids = torch.arange(seq).unsqueeze(0)
+        with torch.no_grad():
+            logits = model(input_ids, position_ids=position_ids)
+        assert logits.shape == (batch, seq, dense_config.vocab_size)
+
+    def test_dense_forward_logits_to_keep_int(self, dense_config, backend_config):
+        model = self._dense_model(dense_config, backend_config)
+        batch, seq = 1, 8
+        input_ids = torch.randint(0, dense_config.vocab_size, (batch, seq))
+        with torch.no_grad():
+            logits = model(input_ids, logits_to_keep=2)
+        assert logits.shape == (batch, 2, dense_config.vocab_size)
+
+    def test_moe_forward_bshd_shape(self, moe_hf_config, backend_config):
+        model = self._moe_model(moe_hf_config, backend_config)
+        batch, seq = 1, 4
+        input_ids = torch.randint(0, moe_hf_config.vocab_size, (batch, seq))
+        with torch.no_grad():
+            logits = model(input_ids)
+        assert logits.shape == (batch, seq, moe_hf_config.vocab_size)
+
+    def test_moe_forward_thd_shape(self, moe_hf_config, backend_config):
+        model = self._moe_model(moe_hf_config, backend_config)
+        seq = 4
+        input_ids = torch.randint(0, moe_hf_config.vocab_size, (1, seq))
+        with torch.no_grad():
+            logits = model(input_ids, qkv_format="thd")
+        assert logits.shape == (1, seq, moe_hf_config.vocab_size)
+
+
+# ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
 class TestModelClassExport:
