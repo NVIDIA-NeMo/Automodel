@@ -141,6 +141,7 @@ class FakeBalancedGate(nn.Module):
         self.n_activated_experts = config.n_activated_experts
         self.skip_first_n_experts = skip_first_n_experts
         self.noise = noise
+        self.bias_update_factor = 0.0
 
     def forward(
         self,
