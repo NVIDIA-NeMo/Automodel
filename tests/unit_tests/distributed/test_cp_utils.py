@@ -35,11 +35,15 @@ from nemo_automodel.components.distributed import cp_utils as _cu
 class _DummySubMesh:
     """A minimal stub emulating ``torch.distributed.device_mesh.DeviceMesh`` slices."""
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, local_rank: int = 0):
         self._size = size
+        self._local_rank = local_rank
 
     def size(self) -> int:  # noqa: D401  (simple method)
         return self._size
+
+    def get_local_rank(self) -> int:
+        return self._local_rank
 
     def get_group(self):  # noqa: D401  (simple method)
         """Return None to simulate no distributed process group."""
@@ -49,9 +53,9 @@ class _DummySubMesh:
 class _DummyDeviceMesh(dict):
     """Dictionary-like container expected by :pyfunc:`make_cp_batch_and_ctx`."""
 
-    def __init__(self, cp_size: int, tp_size: int):
+    def __init__(self, cp_size: int, tp_size: int, cp_rank: int = 0):
         super().__init__()
-        self["cp"] = _DummySubMesh(cp_size)
+        self["cp"] = _DummySubMesh(cp_size, cp_rank)
         self["tp"] = _DummySubMesh(tp_size)
         self.mesh_dim_names = ["cp", "tp"]
 
@@ -108,21 +112,6 @@ def test_make_cp_batch_and_ctx_no_mesh():
 
 def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     """Verify correct interaction when Context-Parallelism *is* enabled."""
-
-    dummy_cp_ctx = object()
-
-    def _fake_create_ctx(**kwargs):  # noqa: D401
-        """Return a sentinel object so we can verify it was passed through."""
-        return dummy_cp_ctx
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-
-    def _fake_get_train_ctx(enable_loss_parallel, enable_compiled_autograd, cp_ctx):  # noqa: D401
-        assert cp_ctx is dummy_cp_ctx, "create_context_parallel_ctx output should feed into get_train_context"
-        return "dummy_train_ctx"
-
-    monkeypatch.setattr(_cu, "get_train_context", _fake_get_train_ctx)
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
     # seq_len=4 is divisible by cp_size*2=4 so the cp-divisor padding path is
     # not exercised here (covered by test_cp_utils_inputs_embeds.py).
@@ -131,34 +120,115 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     batch = {
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": labels,
+        "_cp_manual_allgather": True,
     }
 
     ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask)
 
-    # We expect the stub training context to be returned
-    assert ctx_obj == "dummy_train_ctx"
+    assert ctx_obj is contextlib.nullcontext
 
     # The function should have injected position_ids because CP>1
     assert "position_ids" in new_batch, "position_ids should be added when CP is enabled"
-    expected_pos = torch.arange(batch["input_ids"].shape[1]).unsqueeze(0)
+    expected_pos = torch.tensor([[0, 1]])
     assert torch.equal(new_batch["position_ids"], expected_pos)
+    assert torch.equal(new_batch["input_ids"], torch.tensor([[10, 20]]))
+    assert torch.equal(new_batch["labels"], torch.tensor([[10, 20]]))
+    assert torch.equal(new_batch["loss_mask"], torch.tensor([[1, 1]]))
 
     # Buffers inside *new_batch* should alias the originals (in-place modification)
     assert new_batch is batch
 
 
+def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
+    """CP buffers should be padded to a multiple of 2 * cp_size."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
+        "_cp_manual_allgather": True,
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+
+    assert batch["input_ids"].shape[1] == 2
+    assert batch["input_ids"][0, -1].item() == 99
+    assert batch["labels"][0, -1].item() == -100
+    assert batch["mm_token_type_ids"][0, -1].item() == 0
+
+
+def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual_allgather(monkeypatch):
+    """VLM metadata alone should not opt non-Gemma4 models into manual all-gather CP."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    calls = {}
+
+    def fake_create_context_parallel_ctx(**kwargs):
+        calls["cp_buffers"] = kwargs["cp_buffers"]
+        return "cp_ctx"
+
+    def fake_get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_context=None):
+        calls["cp_context"] = cp_context
+        return contextlib.nullcontext
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", fake_create_context_parallel_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", fake_get_train_context)
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+    }
+
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+
+    assert ctx_obj is contextlib.nullcontext
+    assert calls["cp_context"] == "cp_ctx"
+    assert len(calls["cp_buffers"]) == 3
+    assert torch.equal(new_batch["input_ids"], torch.tensor([[1, 2, 3, 4]]))
+    assert torch.equal(new_batch["mm_token_type_ids"], torch.tensor([[0, 1, 1, 0]]))
+
+
+def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monkeypatch):
+    """Gemma4 CP pre-embedding path should shard inputs_embeds side inputs."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    inputs_embeds = torch.randn(1, 4, 8)
+    labels = torch.tensor([[1, 2, 3, 4]])
+    per_layer_inputs = torch.randn(1, 4, 2, 3)
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "labels": labels,
+        "per_layer_inputs": per_layer_inputs,
+        "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
+        "_cp_manual_allgather": True,
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert batch["position_ids"].shape == (1, 2)
+    assert batch["inputs_embeds"].shape == (1, 2, 8)
+    assert batch["per_layer_inputs"].shape == (1, 2, 2, 3)
+    assert torch.equal(batch["labels"], torch.tensor([[1, 2]]))
+
+
+def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
+    """Packed document ids should stay aligned with the local CP shard."""
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[1, 2, 3]]),
+        "_packed_seq_ids": torch.tensor([[1, 1, 2]]),
+        "_cp_manual_allgather": True,
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+
+    assert torch.equal(batch["input_ids"], torch.tensor([[3, 99]]))
+    assert torch.equal(batch["labels"], torch.tensor([[3, -100]]))
+    assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[2, 0]]))
+
+
 def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
     """Verify that padding_mask is included in CP buffers when present in batch."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     # seq_len=4 is divisible by cp_size*2=4 (no padding triggered).
     padding_mask = torch.tensor([[True, False, True, True]])
@@ -166,29 +236,16 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": torch.tensor([[10, 20, 30, 40]]),
         "padding_mask": padding_mask,
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
 
-    # padding_mask should be in cp_buffers
-    assert any(
-        t is padding_mask for t in captured_kwargs["cp_buffers"]
-    ), "padding_mask must be included in cp_buffers"
-    assert padding_mask in captured_kwargs["cp_no_restore_buffers"]
+    assert torch.equal(batch["padding_mask"], torch.tensor([[True, False]]))
 
 
 def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
     """Verify that 3D mRoPE position_ids [3, B, S] are sharded on dim 2 (sequence), not dim 1 (batch)."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 8  # divisible by cp_size*2 to skip the cp-divisor padding path
     # mRoPE position_ids: [3, B, S] — temporal, height, width
@@ -197,57 +254,34 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": position_ids_3d,
+        "_cp_manual_allgather": True,
     }
 
     ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
-    # position_ids should not have been overwritten (already present)
-    assert new_batch["position_ids"] is position_ids_3d
-
-    # The seq dims passed to create_context_parallel_ctx should shard position_ids on dim 2
-    assert "cp_seq_dims" in captured_kwargs
-    # input_ids dim=1, labels dim=1, position_ids dim=2
-    assert captured_kwargs["cp_seq_dims"] == [1, 1, 2]
+    assert ctx_obj is contextlib.nullcontext
+    assert new_batch["position_ids"].shape == (3, 1, 4)
+    assert torch.equal(new_batch["position_ids"], position_ids_3d[:, :, :4])
 
 
 def test_make_cp_batch_and_ctx_2d_position_ids_seq_dim(monkeypatch):
     """Verify that standard 2D position_ids [B, S] are still sharded on dim 1."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 6
     batch = {
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": torch.arange(seq_len).unsqueeze(0),
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
-    # Standard 2D: all seq dims should be 1
-    assert captured_kwargs["cp_seq_dims"] == [1, 1, 1]
+    assert torch.equal(batch["position_ids"], torch.tensor([[0, 1, 2, 3]]))
 
 
 def test_make_cp_batch_and_ctx_3d_mrope_with_loss_mask(monkeypatch):
     """Verify 3D mRoPE position_ids work correctly with loss_mask."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 4
     position_ids_3d = torch.arange(3 * 1 * seq_len).view(3, 1, seq_len)
@@ -256,26 +290,17 @@ def test_make_cp_batch_and_ctx_3d_mrope_with_loss_mask(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": position_ids_3d,
+        "_cp_manual_allgather": True,
     }
 
     _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=loss_mask)
 
-    # input_ids dim=1, labels dim=1, position_ids dim=2, loss_mask dim=1
-    assert captured_kwargs["cp_seq_dims"] == [1, 1, 2, 1]
+    assert batch["position_ids"].shape == (3, 1, 2)
+    assert torch.equal(batch["loss_mask"], torch.ones(1, 2))
 
 
 def test_make_cp_batch_and_ctx_pops_attention_mask_when_cp_enabled(monkeypatch):
     """When CP is enabled, attention_mask should be removed from the batch."""
-
-    captured_kwargs = {}
-
-    def _fake_create_ctx(**kwargs):
-        captured_kwargs.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cu, "get_train_context", lambda *_args, **_kw: "dummy_train_ctx")
-
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -315,6 +340,17 @@ class _FakeModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.layers = torch.nn.ModuleList([_FakeTransformerBlock(), _FakeTransformerBlock()])
+
+
+class _FakeVLM(torch.nn.Module):
+    """Toy VLM with language and vision self-attention modules."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.language_model = _FakeModel()
+        self.model.vision_tower = torch.nn.Module()
+        self.model.vision_tower.encoder = _FakeModel()
 
 
 def test_attach_context_parallel_hooks_registers_on_self_attn():
@@ -372,6 +408,23 @@ def test_attach_context_parallel_hooks_skips_non_self_attn():
     assert len(model.layers._forward_pre_hooks) == 0
     for layer in model.layers:
         assert len(layer._forward_pre_hooks) == 0
+
+
+def test_attach_context_parallel_hooks_skips_vision_tower_self_attn():
+    """CP hooks should not alter full-sequence vision tower attention."""
+    model = _FakeVLM()
+
+    _cu.attach_context_parallel_hooks(model)
+
+    assert len(model.model.language_model.layers[0].self_attn._forward_pre_hooks) == 1
+    assert len(model.model.vision_tower.encoder.layers[0].self_attn._forward_pre_hooks) == 0
+
+
+def test_cp_attention_module_name_filter_excludes_multimodal_towers():
+    assert _cu._is_cp_attention_module_name("model.language_model.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.vision_tower.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.audio_tower.encoder.layers.0.self_attn")
+    assert not _cu._is_cp_attention_module_name("model.video_tower.encoder.layers.0.self_attn")
 
 
 # ============================================================================
@@ -454,7 +507,7 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
             return torch.arange(total_tokens)
 
     import sys
-    sys.modules['transformer_engine_torch'] = MockTex
+    sys.modules["transformer_engine_torch"] = MockTex
 
     monkeypatch.setattr(torch.distributed, "get_rank", mock_get_rank)
 
