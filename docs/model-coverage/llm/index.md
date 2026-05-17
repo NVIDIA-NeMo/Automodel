@@ -72,6 +72,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Stepfun AI | [Step-3.5](stepfun-ai/step-3-5.md) | `Step3p5ForCausalLM` |
 | Parasail AI | [GritLM](parasail-ai/gritlm.md) | `GritLM` |
 | Tencent | [Hy3-preview](tencent/hy3.md) | `HYV3ForCausalLM` |
+| Xiaomi MiMo | [MiMo-V2-Flash](xiaomimimo/mimo-v2-flash.md) | `MiMoV2FlashForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
@@ -142,4 +143,5 @@ stabilityai/stablelm
 stepfun-ai/step-3-5
 parasail-ai/gritlm
 tencent/hy3
+xiaomimimo/mimo-v2-flash
 ```
