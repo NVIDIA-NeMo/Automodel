@@ -20,11 +20,6 @@ import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.training.timers import Timers
-from nemo_automodel.components.training.utils import (
-    prepare_after_first_microbatch,
-    prepare_for_final_backward,
-    prepare_for_grad_accumulation,
-)
 from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops_formula_for_hf_config
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
@@ -270,41 +265,32 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
+                # Collect ga_steps microbatches and route through the Engine.
                 num_label_tokens = 0
-                loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
+                batches = []
                 for ga_step_idx in range(ga_steps):
-                    if ga_step_idx == ga_steps - 1:
-                        prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-                    # Get batch from dataloader
                     batch = next(dataloader_iter)
-                    torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
-
-                    # Accumulate label tokens locally
                     num_label_tokens += (batch["labels"] != -100).sum().item()
+                    batches.append(batch)
 
-                    with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
-                        )
+                torch.cuda.nvtx.range_push(f"iteration_{i}_forward_backward")
+                with self.timers("forward_backward", log_level=2):
+                    # Engine drives prepare_for_grad_accumulation → microbatch
+                    # loop → MoE aux-loss scale → prepare_after_first_microbatch
+                    # → prepare_for_final_backward.
+                    fb_result = self.engine.forward_backward(
+                        batches, loss_fn=self.loss_fn, num_label_tokens=None,
+                    )
+                    loss_buffer = fb_result["losses"]
+                torch.cuda.nvtx.range_pop()
 
-                    torch.cuda.nvtx.range_pop()
-
-                    if ga_step_idx == 0:
-                        prepare_after_first_microbatch()
-
-                # Optimizer step
+                # Optimizer step (Engine does scale_grads + clip + step)
                 with self.timers("optimizer", log_level=2):
-                    for opt in self.optimizer:
-                        opt.step()
+                    ok, grad_norm = self.engine.optimizer_step()
+                    # Step any additional optimizers (PP path with one per stage).
+                    if isinstance(self.optimizer, list) and len(self.optimizer) > 1:
+                        for opt in self.optimizer[1:]:
+                            opt.step()
                     logger.debug("Optimizer step")
 
             # Synchronize num_label_tokens across DP ranks
