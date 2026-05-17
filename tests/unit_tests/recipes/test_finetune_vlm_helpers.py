@@ -414,7 +414,7 @@ def test_autoprocessor_loads_inside_first_rank_per_node():
         return MagicMock()
 
     with (
-        patch("nemo_automodel.recipes.vlm.finetune.FirstRankPerNode", TrackingFirstRankPerNode),
+        patch("nemo_automodel.components.datasets.vlm.build.FirstRankPerNode", TrackingFirstRankPerNode),
         patch("transformers.AutoProcessor.from_pretrained", side_effect=tracking_from_pretrained),
         patch("nemo_automodel.components.training.rng.StatefulRNG"),
         patch("torch.utils.data.distributed.DistributedSampler"),

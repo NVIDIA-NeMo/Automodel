@@ -111,7 +111,7 @@ def test_build_validation_dataloader_collects_and_names_properly():
 
     expected_names = {"default", "val", "test", "foo"}
 
-    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
+    with patch("nemo_automodel.components.datasets.llm.build.build_dataloader", return_value=("dl", "tok")) as mock_build:
         result = build_validation_dataloader(cfg, dp_world_size=4, dp_rank=1, pp_enabled=False)
 
     # Assert keys are correctly generated
@@ -137,7 +137,7 @@ def test_build_validation_dataloader_no_validation_keys():
         }
     )
 
-    with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader") as mock_build:
+    with patch("nemo_automodel.components.datasets.llm.build.build_dataloader") as mock_build:
         result = build_validation_dataloader(cfg, dp_world_size=1, dp_rank=0, pp_enabled=False)
 
     assert result == {}
@@ -712,7 +712,7 @@ def test_compute_trust_remote_code_falls_back_to_resolve():
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "nvidia/foo"})
 
     with patch(
-        "nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code",
+        "nemo_automodel.components.utils.model_utils.resolve_trust_remote_code",
         return_value=True,
     ) as mock_resolve:
         result = compute_trust_remote_code_from_model(cfg_model)
