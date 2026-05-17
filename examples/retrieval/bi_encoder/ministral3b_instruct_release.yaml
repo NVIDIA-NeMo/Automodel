@@ -27,7 +27,7 @@ temperature: 0.02
 step_scheduler:
   global_batch_size: 128
   local_batch_size: 4
-  ckpt_every_steps: 2200
+  ckpt_every_steps: 5000
   val_every_steps: 1000
   log_remote_every_steps: 1
   num_epochs: 1
@@ -41,6 +41,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   trust_remote_code: true
+  extract_submodel: language_model
   pooling: last
   l2_normalize: true
   use_liger_kernel: true

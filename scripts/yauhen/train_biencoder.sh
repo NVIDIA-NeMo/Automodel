@@ -8,6 +8,9 @@ echo "GPUS_PER_NODE: $GPUS_PER_NODE"
 echo "Arguments: $@"
 
 /opt/venv/bin/python -m pip install -e .
+# /opt/venv/bin/python -m pip install -e . --no-deps
+# For 25.11 image
+# /opt/venv/bin/python -m pip install transformers==5.5.0
 export TRITON_CACHE_DIR="/lustre/fsw/portfolios/llmservice/users/$SLURM_JOB_USER/triton_cache"
 pip install --index-url=https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple --upgrade one-logger-utils
 
