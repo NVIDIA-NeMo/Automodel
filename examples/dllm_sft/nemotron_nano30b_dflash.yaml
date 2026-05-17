@@ -1,0 +1,133 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# DFlash draft-model SFT recipe for NVIDIA-Nemotron-3-Nano-30B-A3B.
+#
+# Trains a 7-layer DFlash draft (hidden=2688, 21 Q-heads, 3 KV-heads, head_dim=128)
+# conditioned on the frozen Nemotron-30B-A3B target.
+#
+# Data: Nemotron-Post-Training-Dataset-v2 chat+math+code mix (~1M samples),
+# matching the DFlash paper's data mixture.
+#
+# Prerequisite — create the initial draft checkpoint:
+#   python scripts/create_nemotron_nano30b_dflash_draft.py \
+#       --output_dir checkpoints/nemotron-nano-30b-dflash-b16/init
+#
+# Usage (8-GPU single node):
+#   python -m torch.distributed.run --nproc-per-node=8 \
+#       nemo_automodel/recipes/dllm/train_ft.py \
+#       -c examples/dllm_sft/nemotron_nano30b_dflash.yaml
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: null
+  num_epochs: 3
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+seed: 42
+
+wandb:
+  project: dflash-sft
+  name: dflash-nemotron-nano-30b-run
+
+# Draft model — 7-layer Qwen3-style full-attention, hidden=2688.
+# Created by scripts/create_nemotron_nano30b_dflash_draft.py.
+model:
+  _target_: transformers.AutoModel.from_pretrained
+  pretrained_model_name_or_path: checkpoints/nemotron-nano-30b-dflash-b16/init
+  trust_remote_code: true
+  dtype: bfloat16
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/nemotron-nano-30b-dflash-b16/training
+  model_save_format: safetensors
+
+distributed:
+  strategy: fsdp2
+  dp_size: null
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy: null
+
+dllm:
+  mode: dflash
+  mask_token_id: 18        # <SPECIAL_18> — safe unused token in Nemotron tokenizer
+  eps: 0.001
+  supervise_padding: true
+
+# target_model_id: frozen Nemotron-30B-A3B whose hidden states condition the draft.
+# block_size 0 reads block_size=16 from the draft model config.
+# loss_decay_gamma 0 uses the paper default for the block size.
+dflash:
+  target_model_id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  target_torch_dtype: bfloat16
+  block_size: 0
+  loss_decay_gamma: 0.0
+  num_blocks_per_sample: 1
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr: 6.0e-4
+  weight_decay: 0.0
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  init_lr: 0.0
+  min_lr: 0.0
+  warmup_ratio: 0.04
+
+# Nemotron-Post-Training-Dataset-v2: chat (627K) + math (239K) + code (175K) ≈ 1M samples.
+# HuggingFace datasets supports "split1+split2+split3" concatenation natively.
+# Tokenizer comes from the target model (shared vocab with the draft).
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: nvidia/Nemotron-Post-Training-Dataset-v2
+  split: "chat+math+code"
+  shuffle_seed: 42
+  seq_length: 4096
+  truncation: true
+  unshifted: true
+  tokenizer:
+    pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    trust_remote_code: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  group_by_length: true
