@@ -2,12 +2,13 @@
 # ------------------------------------------------------------------------------------------------
 # Ling-mini-2.0 (BailingMoeV2: 16B total / 1.43B activated) LoRA SFT on SQuAD.
 # ------------------------------------------------------------------------------------------------
-# Hardware: one H100/A100 80GB is enough for LoRA at local_batch_size=4 with bf16.
-# For multi-GPU expert parallelism, set distributed.ep_size to the GPU count.
+# Hardware: tested on 4x H100 80GB with FSDP2; LoRA + activation checkpointing
+# keeps per-rank memory under 25 GB.  For more / fewer GPUs, only adjust
+# --nproc-per-node; the YAML's per-rank fields stay the same.
 # ------------------------------------------------------------------------------------------------
 #
 # To run:
-#   automodel examples/llm_finetune/ling/ling_mini_2_0_squad.yaml --nproc-per-node 1
+#   automodel examples/llm_finetune/ling/ling_mini_2_0_squad.yaml --nproc-per-node 4
 #
 # Architecture notes for BailingMoeV2 (shared by Ling-mini / -flash / -1T):
 #   - GQA attention (16 / 4 heads on mini) with per-head QK-RMSNorm.
@@ -41,7 +42,7 @@ model:
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: sdpa
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
@@ -50,7 +51,7 @@ model:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules: ["*_proj"]
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   dropout: 0.0
@@ -66,7 +67,11 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 1
+  # ep_size must match --nproc-per-node (the framework's HF state-dict adapter
+  # for grouped MoE experts requires an `ep` mesh dimension to split sharded
+  # expert tensors back into per-expert HF tensors).  Override from the CLI
+  # if your GPU count differs from the recommended 4.
+  ep_size: 4
   sequence_parallel: false
   activation_checkpointing: true
 
@@ -75,9 +80,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  tokenizer:
-    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: inclusionAI/Ling-mini-2.0
+  dataset_name: rajpurkar/squad
   split: train
   seq_length: 2048
 
@@ -89,12 +92,10 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  tokenizer:
-    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: inclusionAI/Ling-mini-2.0
+  dataset_name: rajpurkar/squad
   split: validation
   seq_length: 2048
-  num_samples_limit: 128
+  limit_dataset_samples: 128
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -107,3 +108,7 @@ optimizer:
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
