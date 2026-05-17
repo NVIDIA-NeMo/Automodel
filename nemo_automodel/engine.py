@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext as _nullcontext
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -114,12 +115,12 @@ class Engine:
 
     Usage::
 
-        engine = Engine(
-            model_cfg=cfg.model,
-            distributed_cfg=cfg.distributed,         # dict OR a pre-built MeshContext
-            optimizer_cfg=cfg.optimizer,
-            lr_scheduler_cfg=cfg.lr_scheduler,
-        )
+        engine = Engine(Engine.Config(
+            model=cfg.model,
+            distributed=cfg.distributed,       # dict OR a pre-built MeshContext
+            optimizer=cfg.optimizer,
+            lr_scheduler=cfg.lr_scheduler,
+        ))
         engine.build()
 
         with engine.train_mode():
@@ -129,41 +130,41 @@ class Engine:
             lr = engine.lr_scheduler_step()
     """
 
+    # ── Nested Config (TorchTitan / bumblebee pattern) ───────────────
+
+    @dataclass
+    class Config:
+        """All Engine knobs in one dataclass.
+
+        Field types are intentionally loose (``Any``) so callers can pass
+        their existing ConfigNode / dataclass / dict sub-configs without
+        forcing a schema change.
+        """
+
+        # Required: built/provided by the recipe before Engine construction.
+        model: Any = None                       # arbitrary model config object
+        distributed: Any = None                 # MeshContext OR distributed dict
+        optimizer: Any = None                   # optimizer config (carries _target_)
+
+        # Optional sub-configs.
+        lr_scheduler: Any = None                # LR scheduler config (or None)
+        dist_env: Any = None                    # {backend, timeout_minutes}
+        peft: Any = None
+        quantization: Any = None
+        fp8: Any = None
+        pipeline: Any = None
+        moe: Any = None
+
+        # Scalars.
+        activation_checkpointing: bool = False
+        max_grad_norm: float = 1.0
+        defer_fsdp_grad_sync: bool = True
+        seed: int = 0
+
     # ── Construction ─────────────────────────────────────────────────
 
-    def __init__(
-        self,
-        *,
-        model_cfg,
-        distributed_cfg,
-        optimizer_cfg,
-        lr_scheduler_cfg=None,
-        dist_env_cfg=None,
-        peft_cfg=None,
-        quantization_cfg=None,
-        fp8_cfg=None,
-        pipeline_cfg=None,
-        moe_cfg=None,
-        activation_checkpointing: bool = False,
-        max_grad_norm: float = 1.0,
-        defer_fsdp_grad_sync: bool = True,
-        seed: int = 0,
-    ):
-        # Configs are direct attributes; no wrapping object.
-        self.model_cfg = model_cfg
-        self.distributed_cfg = distributed_cfg              # MeshContext OR dict-like
-        self.dist_env_cfg = dist_env_cfg                    # optional {backend, timeout_minutes}
-        self.optimizer_cfg = optimizer_cfg
-        self.lr_scheduler_cfg = lr_scheduler_cfg
-        self.peft_cfg = peft_cfg
-        self.quantization_cfg = quantization_cfg
-        self.fp8_cfg = fp8_cfg
-        self.pipeline_cfg = pipeline_cfg
-        self.moe_cfg = moe_cfg
-        self.activation_checkpointing = activation_checkpointing
-        self.max_grad_norm = max_grad_norm
-        self.defer_fsdp_grad_sync = defer_fsdp_grad_sync
-        self.seed = seed
+    def __init__(self, config: "Engine.Config"):
+        self.config = config
 
         # CP / THD shaping passed through to make_cp_batch_and_ctx.
         # Recipes that need non-default values (THD packed sequences with TE
@@ -189,6 +190,42 @@ class Engine:
 
         # Per-step state. Stashed by forward_backward, consumed by optimizer_step.
         self._num_label_tokens: int | None = None
+
+    # ── Convenience accessors for config fields ──────────────────────
+    # These wrappers keep call sites readable (``self.max_grad_norm`` vs
+    # ``self.config.max_grad_norm``) and let recipes mutate the live values
+    # (e.g. updating max_grad_norm per call) without touching the dataclass.
+
+    @property
+    def model_cfg(self): return self.config.model
+    @property
+    def distributed_cfg(self): return self.config.distributed
+    @property
+    def optimizer_cfg(self): return self.config.optimizer
+    @property
+    def lr_scheduler_cfg(self): return self.config.lr_scheduler
+    @property
+    def dist_env_cfg(self): return self.config.dist_env
+    @property
+    def peft_cfg(self): return self.config.peft
+    @property
+    def quantization_cfg(self): return self.config.quantization
+    @property
+    def fp8_cfg(self): return self.config.fp8
+    @property
+    def pipeline_cfg(self): return self.config.pipeline
+    @property
+    def moe_cfg(self): return self.config.moe
+    @property
+    def activation_checkpointing(self): return self.config.activation_checkpointing
+    @property
+    def defer_fsdp_grad_sync(self): return self.config.defer_fsdp_grad_sync
+    @property
+    def seed(self): return self.config.seed
+    @property
+    def max_grad_norm(self): return self.config.max_grad_norm
+    @max_grad_norm.setter
+    def max_grad_norm(self, value): self.config.max_grad_norm = value
 
     # ── Build ────────────────────────────────────────────────────────
 

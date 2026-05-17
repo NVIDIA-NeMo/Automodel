@@ -1024,15 +1024,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # step surface (forward_backward / optimizer_step / lr_scheduler_step).
         from nemo_automodel.engine import Engine
 
-        self.engine = Engine(
-            model_cfg=self.cfg.model,
-            distributed_cfg=self.dist_setup,
-            optimizer_cfg=self.cfg.optimizer,
-            lr_scheduler_cfg=self.cfg.get("lr_scheduler", None),
+        self.engine = Engine(Engine.Config(
+            model=self.cfg.model,
+            distributed=self.dist_setup,
+            optimizer=self.cfg.optimizer,
+            lr_scheduler=self.cfg.get("lr_scheduler", None),
             max_grad_norm=self.max_grad_norm,
-            moe_cfg=self.dist_setup.moe_config,
+            moe=self.dist_setup.moe_config,
             defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-        )
+        ))
         # Inject already-built state — bypasses engine.build().
         self.engine.model = self.pp if self.pp is not None else self.model_parts[0]
         self.engine.optimizer = self.optimizer[0] if isinstance(self.optimizer, list) else self.optimizer

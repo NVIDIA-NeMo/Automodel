@@ -46,13 +46,13 @@ def test_engine_construction_does_not_run_distributed():
     """Constructing an Engine must not call into distributed init."""
     from nemo_automodel.engine import Engine
 
-    engine = Engine(
-        model_cfg=_stub_cfg(pretrained_model_name_or_path="hf-internal-testing/tiny-random-LlamaForCausalLM"),
-        distributed_cfg=_stub_cfg(),
-        optimizer_cfg=_stub_cfg(_target_="torch.optim.AdamW", lr=1e-4),
-        lr_scheduler_cfg=None,
+    engine = Engine(Engine.Config(
+        model=_stub_cfg(pretrained_model_name_or_path="hf-internal-testing/tiny-random-LlamaForCausalLM"),
+        distributed=_stub_cfg(),
+        optimizer=_stub_cfg(_target_="torch.optim.AdamW", lr=1e-4),
+        lr_scheduler=None,
         max_grad_norm=1.0,
-    )
+    ))
     # State attributes are present but unbuilt.
     assert engine.model is None
     assert engine.optimizer is None
@@ -64,11 +64,11 @@ def test_engine_introspection_defaults_when_unbuilt():
     """Introspection properties return safe defaults when not yet built."""
     from nemo_automodel.engine import Engine
 
-    engine = Engine(
-        model_cfg=_stub_cfg(),
-        distributed_cfg=_stub_cfg(),
-        optimizer_cfg=_stub_cfg(),
-    )
+    engine = Engine(Engine.Config(
+        model=_stub_cfg(),
+        distributed=_stub_cfg(),
+        optimizer=_stub_cfg(),
+    ))
     assert engine.parts == []
     assert engine.pp_enabled is False
     # dp_rank / dp_size fall back to torch.distributed.get_world_size() when
