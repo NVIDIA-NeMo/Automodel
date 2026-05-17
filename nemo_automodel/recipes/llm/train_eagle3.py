@@ -137,6 +137,12 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = target_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
+        # Draft attention backend. Defaults to ``eager`` to preserve the
+        # pre-FA2 numerics. Set ``recipe_args.draft_attn_implementation:
+        # flash_attention_2`` in YAML to opt into FlashAttention for the
+        # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
+        # with the diagonal-extension columns in log space).
+        draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
