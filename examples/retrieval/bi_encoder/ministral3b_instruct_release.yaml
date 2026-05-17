@@ -13,9 +13,9 @@
 # limitations under the License.
 
 # To run this recipe, please use the following command:
-# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
+# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3b_instruct_release.yaml
 # Or with torchrun for multi-GPU:
-# torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
+# torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3b_instruct_release.yaml
 
 
 recipe: TrainBiEncoderRecipe
@@ -100,7 +100,6 @@ dataloader:
     use_dataset_instruction: false
   shuffle: true
   num_workers: 8
-  drop_last: true
   pin_memory: true
 
 validation_dataloader:
@@ -126,7 +125,6 @@ validation_dataloader:
     use_dataset_instruction: false
   shuffle: false
   num_workers: 8
-  drop_last: false
   pin_memory: true
 
 # LoRA/PEFT configuration

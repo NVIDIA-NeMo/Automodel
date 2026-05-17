@@ -99,7 +99,6 @@ dataloader:
     use_dataset_instruction: false
   shuffle: true
   num_workers: 8
-  drop_last: true
   pin_memory: true
 
 validation_dataloader:
@@ -125,7 +124,6 @@ validation_dataloader:
     use_dataset_instruction: false
   shuffle: false
   num_workers: 8
-  drop_last: false
   pin_memory: true
 
 # LoRA/PEFT configuration

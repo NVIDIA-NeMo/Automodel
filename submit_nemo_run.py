@@ -165,11 +165,25 @@ def get_args():
             return int(value) if '.' not in value else float(value)
         return value  # Keep as string if not numeric
 
-    # Treating extra args separated by "="  (like "--seed=123"), as that is how wandb sweeps injects args
-    extra_args = [s for arg in extra_args for s in arg.split("=")]
-    # Convert extra_args list to dictionary with proper type conversion    
-    extra_args_dict = {extra_args[i].lstrip('-'): convert_value(extra_args[i + 1]) 
-                    for i in range(0, len(extra_args), 2)}
+    # Treat extra args separated by "="  (like "--seed=123"), as that is how wandb sweeps injects args
+    extra_args_dict = {}
+    arg_index = 0
+    while arg_index < len(extra_args):
+        arg = extra_args[arg_index]
+        if "=" in arg:
+            key, value = arg.split("=", 1)
+        else:
+            if arg_index + 1 >= len(extra_args):
+                parser.error(f"Expected a value after extra argument {arg!r}.")
+            key = arg
+            value = extra_args[arg_index + 1]
+            arg_index += 1
+
+        key = key.lstrip("-")
+        if not key:
+            parser.error(f"Unexpected empty extra argument name in {arg!r}.")
+        extra_args_dict[key] = convert_value(value)
+        arg_index += 1
     
     return args, extra_args_dict
 
@@ -209,7 +223,10 @@ def log_metrics_to_wandb(eval_metrics):
         eval_metrics["avg_recall_at_5"] = avg_recall_at_5
         wandb.log(eval_metrics)
     else:
-        logger.info("The average metrics cannot be logged because some metrics were not found: ", set(valid_metric_names) - set(valid_metrics.keys()))
+        logger.info(
+            "The average metrics cannot be logged because some metrics were not found: %s",
+            set(valid_metric_names) - set(valid_metrics.keys()),
+        )
 
 def main():
     username = os.getenv("USER")
@@ -346,7 +363,7 @@ def main():
                 while tasks_status is None or not experiment_has_finished(tasks_status):
                     time.sleep(30)                
                     tasks_status = experiment_tasks_status(exp)
-                    logger.info("Tasks status:", tasks_status)
+                    logger.info("Tasks status: %s", tasks_status)
 
                 failed_tasks = [task for task in tasks_status.keys() if tasks_status[task] != AppState.SUCCEEDED]
                 if failed_tasks:                    
@@ -355,7 +372,7 @@ def main():
                 logger.info("All tasks succeeded")
 
                 eval_metrics = read_eval_metrics(experiment_checkpoint_directory, args.results_dir_name)
-                logger.info("Eval metrics:\n", eval_metrics)
+                logger.info("Eval metrics:\n%s", eval_metrics)
                 if args.log_wandb:                    
                     log_metrics_to_wandb(eval_metrics)
             else:

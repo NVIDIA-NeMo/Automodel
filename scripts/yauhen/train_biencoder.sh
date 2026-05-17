@@ -5,7 +5,9 @@ echo "MASTER_ADDR: $MASTER_ADDR"
 echo "MASTER_PORT: $MASTER_PORT"
 echo "N_NODES: $N_NODES"
 echo "GPUS_PER_NODE: $GPUS_PER_NODE"
-echo "Arguments: $@"
+printf "Arguments:"
+printf " %q" "$@"
+printf "\n"
 
 /opt/venv/bin/python -m pip install -e .
 # /opt/venv/bin/python -m pip install -e . --no-deps
@@ -18,16 +20,16 @@ pip install --index-url=https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf
 if [ "$N_NODES" -gt 1 ]; then
     echo "Running multi-node training with torchrun"
     torchrun \
-        --nproc-per-node=$GPUS_PER_NODE \
-        --nnodes=$N_NODES \
+        --nproc-per-node="$GPUS_PER_NODE" \
+        --nnodes="$N_NODES" \
         --rdzv-backend=c10d \
-        --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
+        --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
         examples/retrieval/bi_encoder/finetune.py \
         "$@"
 else
     echo "Running single-node training with torchrun"
     torchrun \
-        --nproc-per-node=$GPUS_PER_NODE \
+        --nproc-per-node="$GPUS_PER_NODE" \
         examples/retrieval/bi_encoder/finetune.py \
         "$@"
 fi

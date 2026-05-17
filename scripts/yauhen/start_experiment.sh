@@ -1,3 +1,5 @@
+#!/bin/bash
+
 python3 submit_nemo_run.py \
     --experiment_name ministral3_3b_true_bidirectional_last_explicit_config_fresh_pull_tokenizer_arch_5_5_0_deps \
     --num_nodes 4 \

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 
-cd /lustre/fs12/portfolios/llmservice/users/$SLURM_JOB_USER/git/nemo-retriever-research
+cd "/lustre/fs12/portfolios/llmservice/users/$SLURM_JOB_USER/git/nemo-retriever-research"
 
-echo $HF_HOME
+echo "$HF_HOME"
 echo "$@"
 
 /opt/venv/bin/python -m pip install beir==2.0.0 mteb[xet]==2.10.0 polars==1.35.2
@@ -42,11 +42,49 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-set -- "${PASS_THROUGH_ARGS[@]}"
+if ((${#PASS_THROUGH_ARGS[@]} > 0)); then
+    set -- "${PASS_THROUGH_ARGS[@]}"
+else
+    set --
+fi
 
 echo "Eval type: $EVAL_TYPE"
 echo "Model suffix: $MODEL_SUFFIX"
-echo "Pass-through args: $@"
+printf "Pass-through args:"
+printf " %q" "$@"
+printf "\n"
+
+MTEB_ARGS=("$@")
+if [[ "$EVAL_TYPE" == "mteb" ]]; then
+    # mteb_text_eval.py forwards unknown args into model construction, so keep
+    # eval result/export metadata only for text_embedding_eval.
+    MTEB_ARGS=()
+    ORIGINAL_ARGS=("$@")
+    ARG_INDEX=0
+    while ((ARG_INDEX < ${#ORIGINAL_ARGS[@]})); do
+        ARG="${ORIGINAL_ARGS[$ARG_INDEX]}"
+        case "$ARG" in
+            --eval_group_name|--results_dir_name|--dataset_mapping)
+                if ((ARG_INDEX + 1 >= ${#ORIGINAL_ARGS[@]})); then
+                    echo "Error: $ARG requires a value"
+                    exit 1
+                fi
+                ARG_INDEX=$((ARG_INDEX + 2))
+                ;;
+            --eval_group_name=*|--results_dir_name=*|--dataset_mapping=*)
+                ARG_INDEX=$((ARG_INDEX + 1))
+                ;;
+            *)
+                MTEB_ARGS+=("$ARG")
+                ARG_INDEX=$((ARG_INDEX + 1))
+                ;;
+        esac
+    done
+
+    printf "MTEB args:"
+    printf " %q" "${MTEB_ARGS[@]}"
+    printf "\n"
+fi
 
 case "$EVAL_TYPE" in
     mteb)
@@ -56,13 +94,13 @@ case "$EVAL_TYPE" in
 
         # Sanity check: warn if TOTAL_CORES is not divisible by NUM_GPUS
         REMAINDER=$((TOTAL_CORES % NUM_GPUS))
-        if [ $REMAINDER -ne 0 ]; then
+        if [ "$REMAINDER" -ne 0 ]; then
             echo "Warning: Total cores ($TOTAL_CORES) is not divisible by $NUM_GPUS. Some cores will be unused."
             echo "Using $CPUS_PER_PROCESS cores per process, leaving $REMAINDER cores unused."
         fi
 
         # Ensure we have at least 1 core per process
-        if [ $CPUS_PER_PROCESS -lt 1 ]; then
+        if [ "$CPUS_PER_PROCESS" -lt 1 ]; then
             echo "Error: Not enough cores ($TOTAL_CORES) for $NUM_GPUS processes. Need at least $NUM_GPUS cores."
             exit 1
         fi
@@ -78,9 +116,9 @@ case "$EVAL_TYPE" in
             LOG_FILE="logs/mteb_gpu_${i}_$(date +%Y%m%d_%H%M%S)${MODEL_SUFFIX}.log"
 
             # Run process bound to specific CPU cores with logging
-            CUDA_VISIBLE_DEVICES=$i taskset -c $START_CPU-$END_CPU python3 src/nemo_retriever_research/evaluation/mteb_text_eval.py \
-            --part=$i \
-            --total_parts=$NUM_GPUS \
+            CUDA_VISIBLE_DEVICES="$i" taskset -c "$START_CPU-$END_CPU" python3 src/nemo_retriever_research/evaluation/mteb_text_eval.py \
+            --part="$i" \
+            --total_parts="$NUM_GPUS" \
             --max_length 4096 \
             --embedding_dim 16384 \
             --batch_size 4 \
@@ -89,7 +127,7 @@ case "$EVAL_TYPE" in
             --attn_implementation flash_attention_2 \
             --padding_side left \
             --pooling avg \
-            --normalize_embeddings True "$@" > "$LOG_FILE" 2>&1 &
+            --normalize_embeddings True "${MTEB_ARGS[@]}" > "$LOG_FILE" 2>&1 &
 
         done
 
@@ -99,7 +137,7 @@ case "$EVAL_TYPE" in
     text_embedding_eval)
         LOG_FILE="logs/text_embedding_eval_$(date +%Y%m%d_%H%M%S)${MODEL_SUFFIX}.log"
 
-        torchrun --nproc_per_node=$NUM_GPUS --master_port=29510 \
+        torchrun --nproc_per_node="$NUM_GPUS" --master_port=29510 \
             src/nemo_retriever_research/evaluation/embedding_eval.py \
             --max_length 4096 \
             --embedding_dim 16384 \

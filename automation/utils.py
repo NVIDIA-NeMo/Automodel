@@ -132,7 +132,7 @@ def validate_args(args, add_args):
 
 def draco(
     account: str = "datascience_nemo_retriever",
-    container_image: str = "/lustre/fsw/portfolios/llmservice/users/mengyaox/inform/images/inform-python3.10-vidore-beir-flashattn.sqsh",
+    container_image: str = "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh",
     partition: str = None,
     nodes: int=1,
     gpus_per_node: int = 8,
@@ -158,7 +158,6 @@ def draco(
         run.Config[run.SlurmExecutor]: The Slurm executor configuration for the DRACO cluster.
     """
     env_vars = {}
-    num_processes = nodes * gpus_per_node 
     env_vars['N_NODES'] = str(nodes)
     env_vars['GPUS_PER_NODE'] = str(gpus_per_node)
     env_vars['CUDA_VISIBLE_DEVICES'] = ",".join([str(i) for i in list(range(gpus_per_node))])
