@@ -1003,3 +1003,200 @@ class TestMakeFp32GetattrFallback:
         la = fake_model.layers[0].linear_attn
         # conv1d is a real submodule — should resolve fine
         assert la.conv1d is not None
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage for packing-aware paths (PR #2147)
+# ---------------------------------------------------------------------------
+
+
+class TestIsIndexedPackedMaskExtra:
+    """Branches of is_indexed_packed_mask not covered by TestPackingHelpers."""
+
+    def test_4d_mask_returns_false(self):
+        """A 4D bool/float mask is never an indexed packing mask."""
+        from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+
+        mask_4d = torch.zeros(1, 1, 4, 4, dtype=torch.int64)
+        # Even with values > 1 set, dim() != 2 short-circuits to False.
+        mask_4d[..., 0, 0] = 2
+        assert is_indexed_packed_mask(mask_4d) is False
+
+
+class TestDecoderLayerFullAttentionBranch:
+    """Exercise the full_attention branch of Qwen3_5DecoderLayerWithPacking.forward."""
+
+    def test_full_attention_calls_self_attn(self):
+        from nemo_automodel.components.models.qwen3_5.decoder_layer import (
+            Qwen3_5DecoderLayerWithPacking,
+        )
+
+        class _RecorderSelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.called_with = None
+
+            def forward(self, **kwargs):
+                self.called_with = kwargs
+                return kwargs["hidden_states"], None
+
+        layer = Qwen3_5DecoderLayerWithPacking.__new__(Qwen3_5DecoderLayerWithPacking)
+        nn.Module.__init__(layer)
+        layer.layer_type = "full_attention"
+        layer.input_layernorm = nn.Identity()
+        layer.self_attn = _RecorderSelfAttn()
+        layer.post_attention_layernorm = nn.Identity()
+        layer.mlp = nn.Identity()
+
+        hs = torch.zeros(1, 5, 4)
+        mask = torch.ones(1, 5, dtype=torch.long)
+        out = layer(
+            hs,
+            position_embeddings=(torch.empty(0), torch.empty(0)),
+            attention_mask=mask,
+            position_ids=torch.arange(5).unsqueeze(0),
+            extra_fa_kwarg="passthrough",
+        )
+        # Output shape preserved through identity residuals.
+        assert out.shape == hs.shape
+        called = layer.self_attn.called_with
+        assert called["attention_mask"] is mask
+        # Extra kwargs are forwarded to self_attn so FA2 wiring stays intact.
+        assert called.get("extra_fa_kwarg") == "passthrough"
+
+
+class TestPatchHfModelDecoderLayerSwap:
+    """Cover the Qwen3_5DecoderLayer class-swap branch of patch_hf_model."""
+
+    def test_decoder_layers_class_swapped(self, monkeypatch):
+        """patch_hf_model swaps Qwen3_5DecoderLayer -> Qwen3_5DecoderLayerWithPacking
+        for linear_attention layers and leaves full_attention layers unswapped."""
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        from nemo_automodel.components.models.qwen3_5.decoder_layer import (
+            Qwen3_5DecoderLayerWithPacking,
+        )
+
+        # Make two thin instances of the HF base class — one linear, one full.
+        linear_layer = Qwen3_5DecoderLayer.__new__(Qwen3_5DecoderLayer)
+        nn.Module.__init__(linear_layer)
+        linear_layer.layer_type = "linear_attention"
+        linear_layer.linear_attn = _FakeGatedDeltaNet()
+
+        full_layer = Qwen3_5DecoderLayer.__new__(Qwen3_5DecoderLayer)
+        nn.Module.__init__(full_layer)
+        full_layer.layer_type = "full_attention"
+        # No GatedDeltaNet on full_attention layers.
+
+        model = nn.Module()
+        model.layers = nn.ModuleList([linear_layer, full_layer])
+
+        from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import patch_hf_model
+
+        patch_hf_model(model, cp_enabled=False)
+
+        assert isinstance(linear_layer, Qwen3_5DecoderLayerWithPacking)
+        # full_attention layers must NOT be swapped — they don't need packing.
+        assert not isinstance(full_layer, Qwen3_5DecoderLayerWithPacking)
+
+
+class TestForwardNoCpPacking:
+    """Cover the packed-sample branches of _forward_no_cp (PR #2147 fix)."""
+
+    def test_forward_no_cp_with_cu_seqlens_no_unpad(self, monkeypatch):
+        """is_packed=True + needs_unpad=False: cu_seqlens flows into FLA; no unpad/repad."""
+        mod, _ = _build_forward_module(monkeypatch)
+        seen = {}
+
+        def _fake_chunk_gdn(query, key, value, *, g, beta, initial_state, output_final_state,
+                            use_qk_l2norm_in_kernel, cu_seqlens=None):
+            seen["cu_seqlens"] = cu_seqlens
+            seen["q_shape"] = tuple(query.shape)
+            return value.clone(), None
+
+        mod.chunk_gated_delta_rule = _fake_chunk_gdn
+
+        def _fake_conv(*, x, weight, bias, activation, seq_idx):
+            seen["seq_idx_shape"] = None if seq_idx is None else tuple(seq_idx.shape)
+            return torch.nn.functional.silu(x)
+
+        mod.causal_conv1d_fn = _fake_conv
+
+        # B=1 packed: indexed mask covers full T (no padding) → needs_unpad=False.
+        x = torch.randn(1, 6, _HIDDEN)
+        indexed_mask = torch.tensor([[1, 1, 2, 2, 2, 2]], dtype=torch.long)
+        cu = torch.tensor([0, 2, 6], dtype=torch.long)
+        indices = torch.arange(6)
+        out = mod._forward_no_cp(
+            x,
+            attention_mask=indexed_mask,
+            cu_seqlens=cu,
+            indices=indices,
+        )
+        assert out.shape == (1, 6, _HIDDEN)
+        # FLA received the cu_seqlens we passed in.
+        assert torch.equal(seen["cu_seqlens"], cu)
+        # seq_idx for conv comes straight from the indexed mask (B,T shape).
+        assert seen["seq_idx_shape"] == (1, 6)
+
+    def test_forward_no_cp_with_unpad(self, monkeypatch):
+        """needs_unpad=True path: B>1 with real padding → unpad to [1, total_valid, H], repad on exit."""
+        mod, _ = _build_forward_module(monkeypatch)
+        seen = {}
+
+        def _fake_chunk_gdn(query, key, value, *, g, beta, initial_state, output_final_state,
+                            use_qk_l2norm_in_kernel, cu_seqlens=None):
+            seen["q_shape"] = tuple(query.shape)
+            return value.clone(), None
+
+        mod.chunk_gated_delta_rule = _fake_chunk_gdn
+
+        def _fake_conv(*, x, weight, bias, activation, seq_idx):
+            seen["seq_idx_shape"] = tuple(seq_idx.shape)
+            return torch.nn.functional.silu(x)
+
+        mod.causal_conv1d_fn = _fake_conv
+
+        # B=2, T=4: row 0 has 1 token padded, row 1 fully filled.
+        x = torch.randn(2, 4, _HIDDEN)
+        indexed_mask = torch.tensor(
+            [[1, 1, 2, 0], [1, 2, 2, 2]],
+            dtype=torch.long,
+        )
+        # 7 non-padding tokens at flattened positions [0, 1, 2, 4, 5, 6, 7]
+        indices = torch.tensor([0, 1, 2, 4, 5, 6, 7], dtype=torch.long)
+        cu = torch.tensor([0, 2, 3, 4, 7], dtype=torch.long)
+
+        out = mod._forward_no_cp(
+            x,
+            attention_mask=indexed_mask,
+            cu_seqlens=cu,
+            indices=indices,
+        )
+        # Repad reconstructs the [B, T, H] shape.
+        assert out.shape == (2, 4, _HIDDEN)
+        # FLA saw the unpadded layout [1, 7, ...].
+        assert seen["q_shape"][:2] == (1, 7)
+        # Conv saw a matching unpadded seq_idx [1, 7].
+        assert seen["seq_idx_shape"] == (1, 7)
+        # Padded positions are zeroed in the output.
+        assert torch.all(out[0, 3] == 0)
+
+    def test_forward_no_cp_derives_cu_seqlens_from_mask_fallback(self, monkeypatch):
+        """Direct caller (no decoder-layer subclass) passes only the indexed mask; layer derives cu_seqlens."""
+        mod, _ = _build_forward_module(monkeypatch)
+        seen = {}
+
+        def _fake_chunk_gdn(query, key, value, *, g, beta, initial_state, output_final_state,
+                            use_qk_l2norm_in_kernel, cu_seqlens=None):
+            seen["cu_seqlens"] = None if cu_seqlens is None else cu_seqlens.tolist()
+            return value.clone(), None
+
+        mod.chunk_gated_delta_rule = _fake_chunk_gdn
+
+        x = torch.randn(1, 5, _HIDDEN)
+        indexed_mask = torch.tensor([[1, 1, 2, 2, 2]], dtype=torch.long)
+        # cu_seqlens / indices not passed — the layer must derive them.
+        out = mod._forward_no_cp(x, attention_mask=indexed_mask)
+        assert out.shape == (1, 5, _HIDDEN)
+        assert seen["cu_seqlens"] == [0, 2, 5]
