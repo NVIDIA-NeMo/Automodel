@@ -48,7 +48,7 @@ model:
   _target_: transformers.AutoModel.from_pretrained
   pretrained_model_name_or_path: z-lab/Qwen3-4B-DFlash-b16
   trust_remote_code: true
-  torch_dtype: bfloat16
+  dtype: bfloat16
 
 checkpoint:
   enabled: true

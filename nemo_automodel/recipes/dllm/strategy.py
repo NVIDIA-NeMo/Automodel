@@ -189,7 +189,7 @@ class DFlashStrategy(DLLMStrategy):
     YAML configuration (under the ``dflash:`` key):
 
     - ``target_model_id`` (**required**) — frozen causal LM hub ID.
-    - ``target_torch_dtype`` (default ``"bfloat16"``) — target dtype.
+    - ``target_torch_dtype`` (default ``"bfloat16"``) — target dtype string.
     - ``block_size`` (default 0) — draft block size; 0 reads from draft config.
     - ``loss_decay_gamma`` (default 0.0) — γ for Eq. 4; 0 uses paper defaults.
     - ``num_blocks_per_sample`` (default 1) — N anchor blocks per sequence per
@@ -254,7 +254,9 @@ class DFlashStrategy(DLLMStrategy):
         target_dtype = getattr(torch, target_dtype_str, torch.bfloat16)
 
         logger.info("DFlash: loading frozen target model %s (%s)", target_model_id, target_dtype_str)
-        self.target_model = AutoModelForCausalLM.from_pretrained(target_model_id, torch_dtype=target_dtype)
+        self.target_model = AutoModelForCausalLM.from_pretrained(
+            target_model_id, dtype=target_dtype, trust_remote_code=True
+        )
         self.target_model.eval()
         self.target_model.requires_grad_(False)
         self.target_model = self.target_model.to(recipe.dist_env.device)
