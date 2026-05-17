@@ -28,7 +28,6 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -51,25 +50,18 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.utils import (
-    count_tail_padding,
-    prepare_for_final_backward,
-    prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
-)
+from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep
 from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
     build_loss_fn,

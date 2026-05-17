@@ -29,7 +29,6 @@ import inspect
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -57,27 +56,18 @@ from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPret
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.utils import (
-    count_tail_padding,
-    prepare_after_first_microbatch,
-    prepare_for_final_backward,
-    prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
-)
+from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
 )
@@ -85,7 +75,6 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     _supports_seq_lens,
-    filter_forward_kwargs,
     resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._component_builders import (
