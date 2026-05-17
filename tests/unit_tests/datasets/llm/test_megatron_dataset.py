@@ -130,13 +130,13 @@ def test_try_load_blend_from_json_invalid_json(tmp_path):
         try_load_blend_from_json(json_file)
 
 
-def test_try_load_blend_from_json_wrong_type(tmp_path):
-    """Test that ValueError is raised when JSON is not a dictionary."""
-    json_file = tmp_path / "list.json"
+def test_try_load_blend_from_json_invalid_root_type(tmp_path):
+    """Test that ValueError is raised when the JSON root is neither dict nor list."""
+    json_file = tmp_path / "scalar.json"
     with open(json_file, "w") as f:
-        json.dump(["not", "a", "dict"], f)
+        json.dump("just-a-string", f)
 
-    with pytest.raises(ValueError, match="Blend JSON file must contain a dictionary"):
+    with pytest.raises(ValueError, match="Blend JSON file must contain a list or dictionary"):
         try_load_blend_from_json(json_file)
 
 

@@ -163,7 +163,7 @@ The processor handles token placement automatically via the chat template.
 
 ## References
 
-- [LLaVA-OneVision-1.5 Original Repo](https://github.com/LLaVA-VL/LLaVA-OneVision-1.5)
+- [LLaVA-OneVision Original Repo](https://github.com/EvolvingLMMs-Lab/LLaVA-OneVision-2)
 - [NeMo AutoModel Documentation](https://github.com/NVIDIA-NeMo/Automodel)
 - [Qwen3 Documentation](https://qwenlm.github.io/blog/qwen3/)
 

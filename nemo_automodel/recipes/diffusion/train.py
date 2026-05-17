@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from math import ceil
 from typing import Any, Dict, Optional
 
@@ -33,8 +34,55 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.training.utils import (
+    clip_grad_norm,
+    prepare_after_first_microbatch,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+)
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
+
+
+def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:
+    """Return the number of samples in one local diffusion micro-batch."""
+    for key in ("video_latents", "image_latents", "latents", "text_embeddings", "text_embeddings_2"):
+        value = batch.get(key)
+        if value is not None and hasattr(value, "shape") and len(value.shape) > 0:
+            return int(value.shape[0])
+    return 0
+
+
+def _count_local_batch_group_samples(batch_group: list[Dict[str, Any]]) -> int:
+    """Count local samples processed by one optimizer step."""
+    return sum(_get_diffusion_microbatch_size(batch) for batch in batch_group)
+
+
+def _calculate_throughput_metrics(
+    *,
+    elapsed_seconds: float,
+    optimizer_steps: int,
+    global_samples: int,
+    world_size: int,
+) -> Dict[str, float]:
+    """Calculate directly measured training throughput metrics."""
+    elapsed_seconds = max(float(elapsed_seconds), 1e-12)
+    optimizer_steps = max(int(optimizer_steps), 0)
+    global_samples = max(int(global_samples), 0)
+    world_size = max(int(world_size), 1)
+    nonzero_steps = max(optimizer_steps, 1)
+
+    samples_per_sec = global_samples / elapsed_seconds
+    return {
+        "step_time": elapsed_seconds / nonzero_steps,
+        "optimizer_steps_per_sec": optimizer_steps / elapsed_seconds,
+        "samples_per_sec": samples_per_sec,
+        "samples_per_sec_per_gpu": samples_per_sec / world_size,
+        "samples_per_step": global_samples / nonzero_steps,
+        "log_window_seconds": elapsed_seconds,
+        "log_window_steps": float(optimizer_steps),
+        "log_window_samples": float(global_samples),
+    }
 
 
 def build_model_and_optimizer(
@@ -142,7 +190,16 @@ def build_model_and_optimizer(
             "backend": "nccl",
             "world_size": world_size,
             "use_hf_tp_plan": fsdp_cfg.get("use_hf_tp_plan", False),
+            "sequence_parallel": fsdp_cfg.get("sequence_parallel", False),
+            "tp_plan": fsdp_cfg.get("tp_plan", None),
+            "patch_is_packed_sequence": fsdp_cfg.get("patch_is_packed_sequence", False),
             "activation_checkpointing": fsdp_cfg.get("activation_checkpointing", True),
+            "defer_fsdp_grad_sync": fsdp_cfg.get("defer_fsdp_grad_sync", True),
+            "enable_async_tensor_parallel": fsdp_cfg.get("enable_async_tensor_parallel", False),
+            "enable_compile": fsdp_cfg.get("enable_compile", False),
+            "enable_fsdp2_prefetch": fsdp_cfg.get("enable_fsdp2_prefetch", True),
+            "fsdp2_backward_prefetch_depth": fsdp_cfg.get("fsdp2_backward_prefetch_depth", 2),
+            "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
                 reduce_dtype=torch.float32,
@@ -215,11 +272,24 @@ def build_model_and_optimizer(
 
     optimizer_cfg = optimizer_cfg or {}
     weight_decay = optimizer_cfg.get("weight_decay", 0.01)
-    betas = optimizer_cfg.get("betas", (0.9, 0.999))
+    betas = tuple(optimizer_cfg.get("betas", (0.9, 0.999)))
+    adamw_kwargs = {
+        "lr": learning_rate,
+        "weight_decay": weight_decay,
+        "betas": betas,
+        "eps": optimizer_cfg.get("eps", 1e-8),
+        "amsgrad": optimizer_cfg.get("amsgrad", False),
+    }
+    for key in ("foreach", "fused", "capturable", "maximize"):
+        value = optimizer_cfg.get(key, None)
+        if value is not None:
+            adamw_kwargs[key] = value
+    if adamw_kwargs.get("foreach", False) and adamw_kwargs.get("fused", False):
+        raise ValueError("torch.optim.AdamW does not support foreach=True and fused=True at the same time")
     # TODO: Support other optimizers
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay, betas=betas)
+    optimizer = torch.optim.AdamW(trainable_params, **adamw_kwargs)
 
-    logging.info("[INFO] Optimizer config: lr=%s, weight_decay=%s, betas=%s", learning_rate, weight_decay, betas)
+    logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
 
     trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
     frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
@@ -355,6 +425,9 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
         self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
         self.bf16 = torch.bfloat16
+        performance_cfg = self.cfg.get("performance", {}) or {}
+        self.check_loss = bool(performance_cfg.get("check_loss", False))
+        self.grad_clip_foreach = bool(performance_cfg.get("grad_clip_foreach", True))
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -374,6 +447,11 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
         logging.info(f"[INFO] Learning rate: {self.learning_rate}")
+        logging.info(
+            "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
+            self.check_loss,
+            self.grad_clip_foreach,
+        )
 
         # Get distributed training configs (mutually exclusive)
         fsdp_cfg = self.cfg.get("fsdp", None)
@@ -562,7 +640,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             local_batch_size=self.cfg.step_scheduler.local_batch_size,
             dp_size=int(self.dp_size),
             ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
-            save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", True),
+            save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
             dataloader=self.dataloader,
             val_every_steps=None,
             start_step=int(self.global_step),
@@ -609,6 +687,12 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Keep global_step synchronized with scheduler
         global_step = int(self.step_scheduler.step)
+        self._sync_device()
+        perf_window_start_time = time.perf_counter()
+        perf_window_steps = 0
+        perf_window_local_samples = 0
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         for epoch in self.step_scheduler.epochs:
             if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
@@ -629,14 +713,21 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.optimizer.zero_grad(set_to_none=True)
 
                 micro_losses = []
-                for micro_batch in batch_group:
+                prepare_for_grad_accumulation([self.model], pp_enabled=False)
+                num_microbatches = len(batch_group)
+                for microbatch_idx, micro_batch in enumerate(batch_group):
+                    if microbatch_idx == num_microbatches - 1:
+                        prepare_for_final_backward([self.model], pp_enabled=False)
+
                     try:
-                        weighted_loss, average_weighted_loss, loss_mask, metrics = self.flow_matching_pipeline.step(
+                        _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
                             model=self.model,
                             batch=micro_batch,
                             device=self.device,
                             dtype=self.bf16,
                             global_step=global_step,
+                            collect_metrics=False,
+                            check_loss=self.check_loss,
                         )
                     except Exception as exc:
                         logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
@@ -646,10 +737,13 @@ class TrainDiffusionRecipe(BaseRecipe):
                         raise
 
                     # Use average_weighted_loss for backprop (scalar for gradient accumulation)
-                    (average_weighted_loss / len(batch_group)).backward()
-                    micro_losses.append(float(average_weighted_loss.item()))
+                    (average_weighted_loss / num_microbatches).backward()
+                    micro_losses.append(average_weighted_loss.detach())
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.clip_grad_max_norm)
+                    if microbatch_idx == 0:
+                        prepare_after_first_microbatch()
+
+                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
                 grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────
@@ -669,12 +763,29 @@ class TrainDiffusionRecipe(BaseRecipe):
                 if self.lr_scheduler is not None:
                     self.lr_scheduler[0].step(1)
 
-                group_loss_mean = float(sum(micro_losses) / len(micro_losses))
+                perf_window_steps += 1
+                perf_window_local_samples += _count_local_batch_group_samples(batch_group)
+                group_loss_mean = float(torch.stack(micro_losses).mean().item())
                 epoch_loss += group_loss_mean
                 num_steps += 1
                 global_step = int(self.step_scheduler.step)
 
-                if self.log_every and self.log_every > 0 and is_main_process() and (global_step % self.log_every == 0):
+                should_log = self.log_every and self.log_every > 0 and global_step % self.log_every == 0
+                if should_log:
+                    elapsed_seconds, perf_window_end_time = self._elapsed_seconds_since(perf_window_start_time)
+                    perf_window_global_samples = self._count_global_samples(perf_window_local_samples)
+                    throughput_metrics = _calculate_throughput_metrics(
+                        elapsed_seconds=elapsed_seconds,
+                        optimizer_steps=perf_window_steps,
+                        global_samples=perf_window_global_samples,
+                        world_size=self.world_size,
+                    )
+                    memory_metrics = self._get_memory_metrics()
+                    perf_window_start_time = perf_window_end_time
+                    perf_window_steps = 0
+                    perf_window_local_samples = 0
+
+                if should_log and is_main_process():
                     avg_loss = epoch_loss / num_steps
                     log_dict = {
                         "train_loss": group_loss_mean,
@@ -683,9 +794,25 @@ class TrainDiffusionRecipe(BaseRecipe):
                         "grad_norm": grad_norm,
                         "epoch": epoch,
                         "global_step": global_step,
+                        **throughput_metrics,
+                        **memory_metrics,
                     }
                     if wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
+                    logging.info(
+                        "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
+                        "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f mem=%.2fGB",
+                        global_step,
+                        epoch,
+                        group_loss_mean,
+                        avg_loss,
+                        self.optimizer.param_groups[0]["lr"],
+                        grad_norm,
+                        throughput_metrics["step_time"],
+                        throughput_metrics["samples_per_sec"],
+                        throughput_metrics["samples_per_sec_per_gpu"],
+                        memory_metrics["max_memory_allocated_gb"],
+                    )
 
                     # Update tqdm if present
                     if hasattr(self.step_scheduler.dataloader, "set_postfix"):
@@ -695,6 +822,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                                 "avg": f"{(avg_loss):.4f}",
                                 "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                                 "gn": f"{grad_norm:.2f}",
+                                "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
+                                "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",
                             }
                         )
 
@@ -734,3 +863,68 @@ class TrainDiffusionRecipe(BaseRecipe):
             return dist.get_world_size() if dist.is_initialized() else 1
         # Otherwise, use the parent implementation
         return super()._get_dp_group_size(include_cp=include_cp)
+
+    def _sync_device(self) -> None:
+        """Wait for queued CUDA work so timing reflects completed training work."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def _get_collective_device(self) -> torch.device:
+        """Return a tensor device compatible with the active distributed backend."""
+        if dist.is_initialized() and str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():
+            return self.device
+        return torch.device("cpu")
+
+    def _elapsed_seconds_since(self, start_time: float) -> tuple[float, float]:
+        """Return the max elapsed wall-clock seconds across ranks since start_time."""
+        self._sync_device()
+        end_time = time.perf_counter()
+        elapsed_seconds = max(end_time - start_time, 1e-12)
+        if dist.is_initialized():
+            elapsed = torch.tensor(elapsed_seconds, device=self._get_collective_device(), dtype=torch.float64)
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+            elapsed_seconds = float(elapsed.item())
+        return elapsed_seconds, end_time
+
+    def _count_global_samples(self, local_samples: int) -> int:
+        """Count samples processed across the data-parallel group."""
+        global_samples = int(local_samples)
+        if dist.is_initialized():
+            sample_count = torch.tensor(global_samples, device=self._get_collective_device(), dtype=torch.long)
+            dist.all_reduce(sample_count, op=dist.ReduceOp.SUM, group=self._get_dp_group())
+            global_samples = int(sample_count.item())
+        return global_samples
+
+    def _get_memory_metrics(self) -> Dict[str, float]:
+        """Return PyTorch CUDA allocator memory counters, max-reduced across ranks."""
+        if not torch.cuda.is_available():
+            return {
+                "mem": 0.0,
+                "memory_allocated_gb": 0.0,
+                "memory_reserved_gb": 0.0,
+                "max_memory_allocated_gb": 0.0,
+                "max_memory_reserved_gb": 0.0,
+            }
+
+        scale = 1024**3
+        memory = torch.tensor(
+            [
+                torch.cuda.memory_allocated(self.device) / scale,
+                torch.cuda.memory_reserved(self.device) / scale,
+                torch.cuda.max_memory_allocated(self.device) / scale,
+                torch.cuda.max_memory_reserved(self.device) / scale,
+            ],
+            device=self._get_collective_device(),
+            dtype=torch.float64,
+        )
+        if dist.is_initialized():
+            dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+
+        allocated, reserved, max_allocated, max_reserved = memory.tolist()
+        return {
+            "mem": max_allocated,
+            "memory_allocated_gb": allocated,
+            "memory_reserved_gb": reserved,
+            "max_memory_allocated_gb": max_allocated,
+            "max_memory_reserved_gb": max_reserved,
+        }
