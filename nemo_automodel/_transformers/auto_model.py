@@ -88,6 +88,7 @@ from nemo_automodel._transformers.kernel_patches import (
     _patch_attention,
     _patch_liger_kernel,
     _verify_sdpa_support,
+    apply_model_runtime_patches,
 )
 from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
@@ -426,6 +427,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logger.warning("Falling back to %s attention.", attn_implementation)
                 return _retry(attn_implementation=attn_implementation)
             raise
+
+        model = apply_model_runtime_patches(model, mesh)
 
         # Kernel patching
         try:

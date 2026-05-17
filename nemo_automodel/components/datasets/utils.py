@@ -442,12 +442,15 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     else:
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
 
-    return {
+    result = {
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
         "attention_mask": mask_out,
     }
+    if attention_mask.max() > 1:
+        result["_packed_seq_ids"] = attention_mask
+    return result
 
 
 class SFTSingleTurnPreprocessor:
