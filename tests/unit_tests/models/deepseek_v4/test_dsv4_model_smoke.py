@@ -438,21 +438,22 @@ class TestDeepseekV4ModelSmoke:
         assert indices.dtype == torch.long
 
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
-        """Both HC expand sites mix residual streams as ``comb.T @ x``."""
+        """Both HC expand sites mix residual streams as ``comb.T @ x``.
+
+        The fake HC modules intentionally expose only ``forward`` so this also
+        guards against bypassing module hooks via direct ``compute_weights`` calls.
+        """
 
         class _FixedHC(torch.nn.Module):
             def __init__(self, comb):
                 super().__init__()
                 self.register_buffer("comb", comb)
 
-            def compute_weights(self, hidden_streams):
+            def forward(self, hidden_streams):
                 bsz, seq, hc_mult = hidden_streams.shape[:3]
                 pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
                 post = torch.zeros_like(pre)
                 return pre, post, self.comb.expand(bsz, seq, -1, -1)
-
-            def forward(self, hidden_streams):
-                return self.compute_weights(hidden_streams)
 
         class _ZeroAttention(torch.nn.Module):
             def forward(self, hidden_states, **kwargs):

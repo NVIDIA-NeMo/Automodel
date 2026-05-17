@@ -169,7 +169,7 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         def attention_site(hidden_streams: torch.Tensor) -> torch.Tensor:
-            pre, post, comb = self.attn_hc.compute_weights(hidden_streams)
+            pre, post, comb = self.attn_hc(hidden_streams)
             collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
             attn_out, _ = self.self_attn(
                 hidden_states=self.input_layernorm(collapsed),
@@ -185,7 +185,7 @@ class DeepseekV4Block(nn.Module):
             )
 
         def ffn_prepare(hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            pre, post, comb = self.ffn_hc.compute_weights(hidden_streams)
+            pre, post, comb = self.ffn_hc(hidden_streams)
             collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
             return collapsed, post, comb
 
