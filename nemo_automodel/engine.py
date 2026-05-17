@@ -141,13 +141,11 @@ class Engine:
         forcing a schema change.
         """
 
-        # Required: built/provided by the recipe before Engine construction.
+        # ── Build inputs (sub-configs) ────────────────────────────────
         model: Any = None                       # arbitrary model config object
         distributed: Any = None                 # MeshContext OR distributed dict
         optimizer: Any = None                   # optimizer config (carries _target_)
-
-        # Optional sub-configs.
-        lr_scheduler: Any = None                # LR scheduler config (or None)
+        lr_scheduler: Any = None
         dist_env: Any = None                    # {backend, timeout_minutes}
         peft: Any = None
         quantization: Any = None
@@ -155,34 +153,32 @@ class Engine:
         pipeline: Any = None
         moe: Any = None
 
-        # Scalars.
+        # ── Behavior toggles ─────────────────────────────────────────
         activation_checkpointing: bool = False
         max_grad_norm: float = 1.0
         defer_fsdp_grad_sync: bool = True
         seed: int = 0
+
+        # ── CP / THD batch shaping (passed to make_cp_batch_and_ctx) ──
+        cp_use_te: bool = False
+        cp_padding_token_id: int = 0
+        cp_num_chunks: int = 1
+
+        # ── Optional callable hooks ──────────────────────────────────
+        # Context-manager factory applied around the forward (e.g. TE FP8 autocast).
+        fp8_autocast: Callable[[], Any] | None = None
+        # Extra loss term added to the main loss.
+        # Signature: extra_loss_fn(out, model, labels, num_label_tokens) -> Tensor | None.
+        # LLM training uses this for MTP (Multi-Token Prediction) auxiliary loss.
+        extra_loss_fn: Callable[..., torch.Tensor | None] | None = None
 
     # ── Construction ─────────────────────────────────────────────────
 
     def __init__(self, config: "Engine.Config"):
         self.config = config
 
-        # CP / THD shaping passed through to make_cp_batch_and_ctx.
-        # Recipes that need non-default values (THD packed sequences with TE
-        # attention, custom padding token, multi-chunk PP) set these after
-        # construction, before calling forward_backward.
-        self.cp_use_te: bool = False
-        self.cp_padding_token_id: int = 0
-        self.cp_num_chunks: int = 1
-
-        # Optional context-manager factory applied around the forward (e.g.
-        # TE FP8 autocast). None means no extra context.
-        self.fp8_autocast: Callable[[], Any] | None = None
-        # Optional callable for an extra loss term added to the main loss.
-        # Signature: extra_loss_fn(out, model, labels, num_label_tokens) -> Tensor | None
-        # Used by LLM training for MTP (Multi-Token Prediction) auxiliary loss.
-        self.extra_loss_fn: Callable[..., torch.Tensor | None] | None = None
-
-        # State, populated by build().
+        # Runtime state, populated by build() or injected by a recipe that
+        # already built the model/optimizer/mesh itself.
         self.model: nn.Module | Any = None          # nn.Module or AutoPipeline
         self.optimizer: torch.optim.Optimizer | None = None
         self.lr_scheduler: OptimizerParamScheduler | None = None
@@ -226,6 +222,30 @@ class Engine:
     def max_grad_norm(self): return self.config.max_grad_norm
     @max_grad_norm.setter
     def max_grad_norm(self, value): self.config.max_grad_norm = value
+
+    # CP / THD shaping (proxied to config so recipes can read/write either)
+    @property
+    def cp_use_te(self): return self.config.cp_use_te
+    @cp_use_te.setter
+    def cp_use_te(self, v): self.config.cp_use_te = v
+    @property
+    def cp_padding_token_id(self): return self.config.cp_padding_token_id
+    @cp_padding_token_id.setter
+    def cp_padding_token_id(self, v): self.config.cp_padding_token_id = v
+    @property
+    def cp_num_chunks(self): return self.config.cp_num_chunks
+    @cp_num_chunks.setter
+    def cp_num_chunks(self, v): self.config.cp_num_chunks = v
+
+    # Optional callable hooks
+    @property
+    def fp8_autocast(self): return self.config.fp8_autocast
+    @fp8_autocast.setter
+    def fp8_autocast(self, v): self.config.fp8_autocast = v
+    @property
+    def extra_loss_fn(self): return self.config.extra_loss_fn
+    @extra_loss_fn.setter
+    def extra_loss_fn(self, v): self.config.extra_loss_fn = v
 
     # ── Build ────────────────────────────────────────────────────────
 
