@@ -45,9 +45,12 @@ expert and a per-expert correction bias (aux-loss-free routing).
 
 ## Example Recipes
 
-| Recipe | Description |
-|---|---|
-| {download}`ling_mini_2_0_squad.yaml <../../../../examples/llm_finetune/ling/ling_mini_2_0_squad.yaml>` | LoRA SFT — Ling-mini-2.0 on SQuAD |
+| Recipe | Description | Min HW |
+|---|---|---|
+| {download}`ling_mini_2_0_squad.yaml <../../../../examples/llm_finetune/ling/ling_mini_2_0_squad.yaml>` | LoRA SFT — Ling-mini-2.0 on SQuAD | 2× H100 80GB |
+| {download}`ling_mini_2_0_hellaswag.yaml <../../../../examples/llm_finetune/ling/ling_mini_2_0_hellaswag.yaml>` | LoRA SFT — Ling-mini-2.0 on HellaSwag | 2× H100 80GB |
+| {download}`ling_flash_2_0_lora.yaml <../../../../examples/llm_finetune/ling/ling_flash_2_0_lora.yaml>` | LoRA SFT — Ling-flash-2.0 on HellaSwag | 8× H100 80GB |
+| {download}`ling_1t_lora_pp.yaml <../../../../examples/llm_finetune/ling/ling_1t_lora_pp.yaml>` | LoRA SFT — Ling-1T on HellaSwag, FSDP2 + PP=4 + EP=8 | 32× H100 80GB (4 nodes) |
 
 ## Try with NeMo AutoModel
 
