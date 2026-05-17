@@ -184,9 +184,6 @@ class Engine:
         self.lr_scheduler: OptimizerParamScheduler | None = None
         self.mesh: MeshContext | None = None
 
-        # Per-step state. Stashed by forward_backward, consumed by optimizer_step.
-        self._num_label_tokens: int | None = None
-
     # ── Convenience accessors for config fields ──────────────────────
     # These wrappers keep call sites readable (``self.max_grad_norm`` vs
     # ``self.config.max_grad_norm``) and let recipes mutate the live values
@@ -427,7 +424,6 @@ class Engine:
         Returns ``{"loss": tensor, "metrics": {"loss": float}}``.
         """
         is_train = not forward_only
-        self._num_label_tokens = num_label_tokens
         device = self.device
         device_mesh = self.mesh.device_mesh if self.mesh is not None else None
         pp = self.model if self.pp_enabled else None
@@ -620,8 +616,13 @@ class Engine:
         if self.optimizer is not None:
             self.optimizer.zero_grad()
 
-    def optimizer_step(self) -> tuple[bool, float]:
-        """Scale + clip grads and step. Returns ``(update_succeeded, grad_norm)``."""
+    def optimizer_step(self, num_label_tokens: int | None = None) -> tuple[bool, float]:
+        """Scale + clip grads and step. Returns ``(update_succeeded, grad_norm)``.
+
+        ``num_label_tokens`` is required only when PP is enabled — used to scale
+        gradients by num_label_tokens / dp_group_size before clipping. Non-PP
+        callers can leave it at ``None``.
+        """
         if self.optimizer is None:
             raise RuntimeError("optimizer is None; did you call build()?")
 
@@ -637,7 +638,7 @@ class Engine:
             moe_mesh=moe_mesh,
             ep_axis_name="ep" if moe_mesh is not None and "ep" in moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
-            num_label_tokens=self._num_label_tokens,
+            num_label_tokens=num_label_tokens,
             dp_group_size=self.dp_size,
         )
 

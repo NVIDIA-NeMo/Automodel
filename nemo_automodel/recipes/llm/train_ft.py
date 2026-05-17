@@ -1256,7 +1256,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         self.checkpointer.maybe_wait_for_staging()
 
-        ok, grad_norm = self.engine.optimizer_step()
+        ok, grad_norm = self.engine.optimizer_step(num_label_tokens=num_label_tokens)
         # Step any additional optimizers (PP path with one optimizer per stage).
         for opt in self.optimizer[1:] if isinstance(self.optimizer, list) and len(self.optimizer) > 1 else []:
             opt.step()

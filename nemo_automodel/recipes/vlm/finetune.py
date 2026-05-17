@@ -753,7 +753,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.checkpointer.maybe_wait_for_staging()
 
-        ok, grad_norm = self.engine.optimizer_step()
+        ok, grad_norm = self.engine.optimizer_step(num_label_tokens=num_label_tokens)
         for opt in self.optimizer[1:] if isinstance(self.optimizer, list) and len(self.optimizer) > 1 else []:
             opt.step()
             opt.zero_grad(set_to_none=True)
