@@ -1,0 +1,109 @@
+
+# ------------------------------------------------------------------------------------------------
+# Ling-mini-2.0 (BailingMoeV2: 16B total / 1.43B activated) LoRA SFT on SQuAD.
+# ------------------------------------------------------------------------------------------------
+# Hardware: one H100/A100 80GB is enough for LoRA at local_batch_size=4 with bf16.
+# For multi-GPU expert parallelism, set distributed.ep_size to the GPU count.
+# ------------------------------------------------------------------------------------------------
+#
+# To run:
+#   automodel examples/llm_finetune/ling/ling_mini_2_0_squad.yaml --nproc-per-node 1
+#
+# Architecture notes for BailingMoeV2 (shared by Ling-mini / -flash / -1T):
+#   - GQA attention (16 / 4 heads on mini) with per-head QK-RMSNorm.
+#   - Half-RoPE: partial_rotary_factor=0.5 rotates only first 64 / 128 dims.
+#   - Sigmoid routing + per-expert bias (aux-loss-free), grouped topk
+#     (n_group=8, topk_group=4), 1 shared expert.
+#   - first_k_dense_replace=1: layer 0 uses a dense MLP, layers 1-19 are MoE.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 4
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 1
+  max_steps: 500
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: inclusionAI/Ling-mini-2.0
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    enable_hf_state_dict_adapter: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: ["*_proj"]
+  dim: 16
+  alpha: 32
+  dropout: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/ling_mini_2_0_lora
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: inclusionAI/Ling-mini-2.0
+  split: train
+  seq_length: 2048
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 2
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: inclusionAI/Ling-mini-2.0
+  split: validation
+  seq_length: 2048
+  num_samples_limit: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1e-8
