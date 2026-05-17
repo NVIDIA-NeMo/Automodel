@@ -89,25 +89,10 @@ def _cfg_to_dict(cfg: Any) -> dict:
     return {k: getattr(cfg, k) for k in dir(cfg) if not k.startswith("_")}
 
 
-def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
-    """Resolve ``_target_``-style configs into ``(factory, kwargs)``.
-
-    Mirrors ``recipes._component_builders._callable_and_kwargs`` but kept
-    inline so engine.py doesn't import from recipes/.
-    """
-    if hasattr(cfg, "to_dict") or isinstance(cfg, Mapping):
-        d = _cfg_to_dict(cfg)
-        target = d.pop("_target_", None)
-        if target is not None:
-            return target, d
-    target = getattr(cfg, "_target_", None)
-    if target is not None:
-        return target, {}
-    if callable(cfg):
-        return cfg, {}
-    if hasattr(cfg, "instantiate"):
-        return cfg.instantiate, {}
-    raise AttributeError("Config must provide _target_, be callable, or provide instantiate()")
+# ``_target_`` resolution lives in the config-loader layer
+# (nemo_automodel.components.config.loader); we import the canonical helper
+# rather than duplicating it here.
+from nemo_automodel.components.config.loader import target_and_kwargs as _callable_and_kwargs  # noqa: E402
 
 
 class Engine:

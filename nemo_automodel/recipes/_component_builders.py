@@ -36,20 +36,7 @@ def _as_dict(cfg: Any | None) -> dict[str, Any]:
     raise TypeError(f"Expected a mapping-like config, got {type(cfg).__name__}")
 
 
-def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
-    if hasattr(cfg, "to_dict") or isinstance(cfg, Mapping):
-        cfg_dict = _as_dict(cfg)
-        target = cfg_dict.pop("_target_", None)
-        if target is not None:
-            return target, cfg_dict
-    target = getattr(cfg, "_target_", None)
-    if target is not None:
-        return target, {}
-    if callable(cfg):
-        return cfg, {}
-    if hasattr(cfg, "instantiate"):
-        return cfg.instantiate, {}
-    raise AttributeError("Config must provide _target_, be callable, or provide instantiate()")
+from nemo_automodel.components.config.loader import target_and_kwargs as _callable_and_kwargs  # noqa: E402
 
 
 def build_checkpoint_config(

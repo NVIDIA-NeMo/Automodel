@@ -320,6 +320,45 @@ def _resolve_target(dotted_path: str) -> Any:
     raise ImportError(f"Cannot resolve target (blocked or not found): {dotted_path}")
 
 
+def target_and_kwargs(cfg: Any) -> tuple[Any, dict[str, Any]]:
+    """Split a Hydra-style config into ``(factory, kwargs)``.
+
+    Accepts any of:
+      - dict / Mapping / ConfigNode with a ``_target_`` key
+      - object with a ``_target_`` attribute
+      - a callable (returned as-is with empty kwargs)
+      - an object with an ``instantiate`` method
+
+    This is the canonical helper for builder functions that take
+    ``(factory, kwargs)`` separately. Belongs in the config-loader layer
+    so engine.py and recipes/_component_builders.py don't each have to
+    duplicate ``_target_`` knowledge.
+
+    Returns:
+        ``(factory, kwargs)``. The factory is the resolved callable; the
+        kwargs are the remaining fields from the config dict (or empty
+        if the config was just a callable / target-only object).
+
+    Raises:
+        AttributeError: if ``cfg`` provides none of the supported forms.
+    """
+    from collections.abc import Mapping as _Mapping  # local to avoid top-of-file shuffle
+
+    if hasattr(cfg, "to_dict") or isinstance(cfg, _Mapping):
+        cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
+        target = cfg_dict.pop("_target_", None)
+        if target is not None:
+            return target, cfg_dict
+    target = getattr(cfg, "_target_", None)
+    if target is not None:
+        return target, {}
+    if callable(cfg):
+        return cfg, {}
+    if hasattr(cfg, "instantiate"):
+        return cfg.instantiate, {}
+    raise AttributeError("Config must provide _target_, be callable, or provide instantiate()")
+
+
 class ConfigNode:
     """
     A configuration node that wraps a dictionary (or parts of it) from a YAML file.
