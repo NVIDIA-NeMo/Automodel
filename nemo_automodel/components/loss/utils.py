@@ -12,10 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any, Optional
+
 import torch
+import torch.nn as nn
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.utils.model_utils import get_lm_head_weight
+
+
+def _get_lm_head_module(model: nn.Module) -> Optional[nn.Module]:
+    """Return the model's LM-head module, if one can be found.
+
+    Local copy of ``components.utils.model_utils.get_lm_head_module`` to keep
+    ``components/loss/`` import-independent from ``components/utils/`` (see the
+    ``Components must not import each other`` import-linter contract).
+    """
+    if hasattr(model, "get_output_embeddings"):
+        lm_head = model.get_output_embeddings()
+        if lm_head is not None:
+            return lm_head
+    for name, module in model.named_modules():
+        if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
+            return module
+    return None
+
+
+def _get_lm_head_weight(model: nn.Module) -> torch.Tensor:
+    """Return the model's LM-head weight, materializing DTensor weights when needed."""
+    lm_head = _get_lm_head_module(model)
+    if lm_head is not None:
+        weight = lm_head.weight
+        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if "lm_head" in name and name.endswith(".weight"):
+            return param.full_tensor() if hasattr(param, "full_tensor") else param
+    raise ValueError("lm_head.weight not found in model")
+
+
+def _get_final_hidden_states(model_output: Any) -> Optional[Any]:
+    """Return the final hidden-states tensor from an HF-like model output.
+
+    Local copy of ``components.training.model_output_utils.get_final_hidden_states``
+    to keep ``components/loss/`` import-independent from ``components/training/``.
+    """
+    if model_output is None:
+        return None
+    if isinstance(model_output, dict):
+        hidden_states = model_output.get("hidden_states", None)
+    else:
+        hidden_states = getattr(model_output, "hidden_states", None)
+    if hidden_states is None:
+        return None
+    if isinstance(hidden_states, (list, tuple)):
+        for item in reversed(hidden_states):
+            if item is not None:
+                return item
+        return None
+    return hidden_states
 
 
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
@@ -32,7 +85,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     if isinstance(loss_fn, FusedLinearCrossEntropy):
         model = kwargs.pop("model")
         labels = kwargs.pop("labels")
-        lm_head = get_lm_head_weight(model)
+        lm_head = _get_lm_head_weight(model)
         loss_fn_kwargs.update(
             {
                 "hidden_states": kwargs.pop("hidden_states"),

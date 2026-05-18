@@ -18,10 +18,8 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.components.loss.utils import _get_final_hidden_states, _get_lm_head_module, calculate_loss
 from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
-from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.utils.model_utils import get_lm_head_module
 
 
 def calculate_mtp_loss(
@@ -75,7 +73,7 @@ def calculate_mtp_loss(
                 num_label_tokens=num_label_tokens,
             )
         else:
-            lm_head = get_lm_head_module(model)
+            lm_head = _get_lm_head_module(model)
             if lm_head is None:
                 raise ValueError("lm_head module not found in model")
             depth_loss = calculate_loss(
@@ -106,7 +104,7 @@ class PipelineCausalLMLoss(nn.Module):
             scaling_factor = get_mtp_loss_scaling_factor(self.model)
         else:
             logits = getattr(output, "logits", output)
-            hidden_states = get_final_hidden_states(output)
+            hidden_states = _get_final_hidden_states(output)
             mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
             scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
 
