@@ -182,13 +182,11 @@ def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str,
     return "\n".join(error_msg)
 
 
-def _format_checkpoint_load_error(
-    checkpoint_dir: str, ckpt_dir: str, restore_from: str | None, original_error: Exception
-) -> str:
-    """Format a helpful message when a checkpoint exists but cannot be loaded."""
+def _format_checkpoint_load_error(checkpoint_dir: str, ckpt_dir: str, original_error: Exception) -> str:
+    """Format a helpful message when an auto-detected checkpoint exists but cannot be loaded."""
     return "\n".join(
         [
-            "Failed to load an auto-detected checkpoint from the current checkpoint.checkpoint_dir.",
+            f"Failed to load an auto-detected checkpoint from checkpoint_dir={checkpoint_dir!r}.",
             f"Checkpoint: {ckpt_dir}",
             "To start a fresh run, use a different checkpoint.checkpoint_dir or remove the existing checkpoint.",
             "To resume, make sure the current command matches the saved run.",
@@ -587,7 +585,6 @@ class BaseRecipe:
                 _format_checkpoint_load_error(
                     checkpoint_dir=self.checkpointer.config.checkpoint_dir,
                     ckpt_dir=ckpt_dir,
-                    restore_from=restore_from,
                     original_error=e,
                 )
             ) from e
