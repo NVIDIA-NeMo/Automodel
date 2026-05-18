@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 class ParallelizeFnProtocol(Protocol):
+    """Callable protocol for applying distributed parallelism to a model."""
+
     def __call__(
         self,
         model: torch.nn.Module,
@@ -63,6 +65,7 @@ def scale_grads_by_divisor(
     stages: list[PipelineStage],
     divisor: int,
 ) -> None:
+    """Scale pipeline stage gradients by a common divisor when supported."""
     for stage in stages:
         if hasattr(stage, "scale_grads"):
             stage.scale_grads(divisor)
@@ -171,6 +174,7 @@ def calculate_virtual_stages(
     is_single_stage_schedule: bool,
     round_to_pp_multiple: str | None = None,
 ) -> tuple[int, int]:
+    """Calculate virtual pipeline stages and layers per stage."""
     if layers_per_stage is not None:
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
@@ -481,6 +485,7 @@ def split_model_into_stages(
     is_v4_keep = getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4"
     has_rotary_emb_compress = is_v4_keep and hasattr(text_model, "rotary_emb_compress")
     has_hc_head = is_v4_keep and hasattr(text_model, "hc_head")
+    has_swa_rotary_emb = hasattr(text_model, "swa_rotary_emb")
 
     # Auto-generate module split if not provided
     if module_names_per_stage is None:
@@ -501,6 +506,9 @@ def split_model_into_stages(
         if has_rotary_emb_compress:
             for stage_modules in module_names_per_stage:
                 stage_modules.append(f"{layers_prefix}rotary_emb_compress")
+        if has_swa_rotary_emb:
+            for stage_modules in module_names_per_stage:
+                stage_modules.append(f"{layers_prefix}swa_rotary_emb")
         if has_hc_head:
             module_names_per_stage[-1].append(f"{layers_prefix}hc_head")
 

@@ -16,7 +16,7 @@
 # Benchmarking config for GLM-5 LoRA
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/glm5_lora.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/glm/glm5_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction

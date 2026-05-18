@@ -137,6 +137,7 @@ class MetaFilesDataset(Dataset):
 
 
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Collate encoded video metadata samples into a training batch."""
     if len(batch) > 0:
         assert batch[0]["text_embeddings"].ndim == 3, "Expected text_embeddings.ndim to be 3"
         assert batch[0]["video_latents"].ndim == 5, "Expected video_latents.ndim to be 5"
@@ -163,6 +164,7 @@ def build_node_parallel_sampler(
     dp_world_size: int,
     shuffle: bool = True,
 ) -> Optional["DistributedSampler"]:
+    """Build a distributed sampler when torch.distributed is initialized."""
     if not dist.is_initialized():
         return None
 
@@ -189,6 +191,7 @@ def build_dataloader(
     filter_fn: Optional[Callable[[Dict], bool]] = None,
     max_files: Optional[int] = None,
 ) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+    """Build a dataloader for pre-encoded diffusion metadata files."""
     dataset = MetaFilesDataset(
         meta_folder=meta_folder,
         transform_text=transform_text,
@@ -219,6 +222,7 @@ def create_dataloader(
     batch_size: int,
     num_nodes: int,
 ) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+    """Create a default metadata dataloader for node-parallel loading."""
     return build_dataloader(
         meta_folder=meta_folder,
         batch_size=batch_size,

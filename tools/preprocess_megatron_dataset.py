@@ -49,6 +49,8 @@ from nemo_automodel.components.datasets.llm.megatron import indexed_dataset
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
 class CustomLanguageVars(PunktLanguageVars):
+    """Punkt language variables that preserve empty lines while tokenizing."""
+
     _period_context_fmt = r"""
         \S*                          # some word material
         %(SentEndChars)s             # a potential sentence ending
@@ -61,6 +63,8 @@ class CustomLanguageVars(PunktLanguageVars):
 
 
 class IdentitySplitter(object):
+    """Sentence splitter that returns input text unchanged."""
+
     def tokenize(self, *text):
         return text
 
@@ -75,6 +79,8 @@ def parquet_row_iterator(file_path, text_column, batch_size=10000):
 
 
 class Encoder(object):
+    """Encode JSON or parquet text records into token id documents."""
+
     def __init__(self, args):
         self.args = args
 
@@ -139,6 +145,8 @@ class Encoder(object):
 
 
 class Partition(object):
+    """Process input file partitions into Megatron indexed dataset shards."""
+
     def __init__(self, args, workers):
         self.args = args
         self.workers = workers
@@ -260,6 +268,8 @@ class Partition(object):
 
 
 def get_args():
+    """Parse command-line options for Megatron dataset preprocessing."""
+
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title="input data")
     group.add_argument("--input", type=str, required=True, help="Path to input JSON or Parquet file(s)")
@@ -330,6 +340,8 @@ def detect_file_type(file_path):
 
 
 def check_files_exist(in_ss_out_names, key, num_items):
+    """Return whether all expected files exist for a partition key."""
+
     for i in range(num_items):
         if not os.path.exists(in_ss_out_names[i][key]):
             return False
@@ -337,6 +349,8 @@ def check_files_exist(in_ss_out_names, key, num_items):
 
 
 def main():
+    """Run Megatron indexed dataset preprocessing."""
+
     args = get_args()
 
     if args.split_sentences:

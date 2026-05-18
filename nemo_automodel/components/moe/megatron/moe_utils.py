@@ -194,12 +194,16 @@ def unpermute(
 
 @torch.compile
 def swiglu(y):
+    """Apply SwiGLU activation to an interleaved gate/up tensor."""
+
     y_1, y_2 = torch.chunk(y, 2, -1)
     return F.silu(y_1) * y_2
 
 
 @torch.compile
 def weighted_swiglu(y, weights):
+    """Apply SwiGLU activation and token-wise routing weights."""
+
     dtype = y.dtype
     res = swiglu(y) * weights
     return res.to(dtype)
@@ -210,6 +214,8 @@ def weighted_swiglu(y, weights):
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
 @torch.compile
 def swiglu_back(g, y):
+    """Compute the input gradient for SwiGLU activation."""
+
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(
         (
@@ -222,6 +228,8 @@ def swiglu_back(g, y):
 
 @torch.compile
 def weighted_swiglu_back(g, y, weights):
+    """Compute input and weight gradients for weighted SwiGLU."""
+
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
@@ -245,6 +253,8 @@ def geglu(y):
 
 @torch.compile
 def weighted_geglu(y, weights):
+    """Apply GEGLU activation and token-wise routing weights."""
+
     dtype = y.dtype
     res = geglu(y) * weights
     return res.to(dtype)
@@ -252,6 +262,8 @@ def weighted_geglu(y, weights):
 
 @torch.compile
 def geglu_back(g, y):
+    """Compute the input gradient for tanh-approximated GEGLU activation."""
+
     y_1, y_2 = torch.chunk(y, 2, -1)
     # d/dx gelu_tanh(x) ≈ 0.5*(1+tanh(k)) + 0.5*x*(1-tanh(k)^2)*dk/dx
     # where k = sqrt(2/pi)*(x + 0.044715*x^3)
@@ -276,6 +288,8 @@ def geglu_back(g, y):
 
 @torch.compile
 def weighted_geglu_back(g, y, weights):
+    """Compute input and weight gradients for weighted GEGLU."""
+
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = geglu_back(g * weights, y)
@@ -285,6 +299,8 @@ def weighted_geglu_back(g, y, weights):
 
 
 class WeightedGEGLUFunction(torch.autograd.Function):
+    """Autograd function for token-wise weighted GEGLU."""
+
     @staticmethod
     def forward(ctx, input, weights, fp8_input_store):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
@@ -313,6 +329,8 @@ def weighted_bias_geglu_impl(input, weights, fp8_input_store=False):
 
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
+    """Autograd function for token-wise weighted SwiGLU."""
+
     @staticmethod
     # bias is an optional argument
     def forward(ctx, input, weights, fp8_input_store):
@@ -380,6 +398,8 @@ def weighted_quick_geglu(y: torch.Tensor, weights: torch.Tensor, linear_offset: 
 # gradient of sigmoid approximation of gelu
 @torch.compile
 def quick_geglu_back(g, y, linear_offset: float = 0.0) -> torch.Tensor:
+    """Compute the input gradient for Quick-GEGLU activation."""
+
     y_1, y_2 = torch.chunk(y, 2, -1)
     sigmoid_out = torch.sigmoid(1.702 * y_1)
     dy_1 = g * sigmoid_out * (1 + 1.702 * y_1 * (1 - sigmoid_out)) * (y_2 + linear_offset)

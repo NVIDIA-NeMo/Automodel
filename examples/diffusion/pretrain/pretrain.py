@@ -19,6 +19,8 @@ from nemo_automodel.recipes.diffusion.train import TrainDiffusionRecipe
 
 
 def main(default_config_path="examples/diffusion/pretrain/wan2_1_t2v_flow.yaml"):
+    """Run diffusion pretraining with the configured recipe."""
+
     cfg = parse_args_and_load_config(default_config_path)
     recipe = TrainDiffusionRecipe(cfg)
     recipe.setup()

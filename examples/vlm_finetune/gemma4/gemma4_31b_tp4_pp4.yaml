@@ -29,7 +29,7 @@ recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 8
-  local_batch_size: 1
+  local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: 500
   num_epochs: 2
@@ -49,7 +49,7 @@ model:
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
-  attn_implementation: sdpa
+  attn_implementation: eager
   text_config:
     use_cache: false
 
@@ -115,3 +115,8 @@ freeze_config:
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
+
+ci:
+  recipe_owner: athitten
+  time: "00:30:00"
+  nodes: 4

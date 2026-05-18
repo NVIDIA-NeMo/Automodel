@@ -462,6 +462,8 @@ def _resolve_dtype(dtype_str):
 
 
 def main():
+    """Run diffusion generation from a recipe configuration."""
+
     cfg = parse_args_and_load_config()
     setup_logging()
 

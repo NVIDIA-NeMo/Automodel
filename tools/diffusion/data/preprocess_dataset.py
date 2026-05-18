@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 
 def resize_and_center_crop(image, target_width, target_height):
+    """Resize an image and center-crop it to the target dimensions."""
+
     if target_height == image.shape[0] and target_width == image.shape[1]:
         return image
 
@@ -215,6 +217,8 @@ def preprocess_video(frames: np.ndarray, target_height: int, target_width: int) 
 
 
 class VideoPreprocessor:
+    """Preprocess videos and captions into HunyuanVideo training metadata."""
+
     def __init__(
         self,
         pretrained_model_root: str,
@@ -394,6 +398,8 @@ class VideoPreprocessor:
 
 
 def main():
+    """Run HunyuanVideo dataset preprocessing from the CLI."""
+
     parser = argparse.ArgumentParser(description="Preprocess videos and captions for HunyuanVideo-1.5 training")
 
     # Data parameters

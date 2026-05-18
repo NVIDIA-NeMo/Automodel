@@ -13,7 +13,7 @@
 
 ## Available Models
 
-- **Qwen3-Omni-30B-A3B**: 30B total, 3B activated (MoE)
+- **Qwen3-Omni-30B-A3B-Instruct**: 30B total, 3B activated (MoE)
 
 ## Architecture
 
@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Qwen3-Omni 30B A3B | [`Qwen/Qwen3-Omni-30B-A3B`](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B) |
+| Qwen3-Omni 30B A3B Instruct | [`Qwen/Qwen3-Omni-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) |
 
 ## Example Recipes
 
@@ -84,4 +84,4 @@ See the [VLM / Omni Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- [Qwen/Qwen3-Omni-30B-A3B](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B)
+- [Qwen/Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct)

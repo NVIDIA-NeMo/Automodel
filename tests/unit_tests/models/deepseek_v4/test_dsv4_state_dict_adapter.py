@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -71,9 +71,20 @@ class TestRenameHfKey:
         assert _rename_hf_key("layers.0.attn.wkv.weight") == "model.layers.0.self_attn.wkv.weight"
 
     def test_attn_attn_sink(self):
-        # ``attn_sink`` (HF) maps to ``self_attn.sinks`` to match the
-        # ``module.sinks`` attribute consumed by ``eager_attention_with_sink``.
-        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks"
+        # ``attn_sink`` (HF) maps to a callable parameter holder so FSDP2 can
+        # shard it as its own fp32 unit while ``module.sinks`` still exposes
+        # the tensor to attention.
+        assert _rename_hf_key("layers.0.attn.attn_sink") == "model.layers.0.self_attn.sinks_param.weight"
+
+    def test_attn_compressor_ape(self):
+        assert _rename_hf_key("layers.2.attn.compressor.ape") == (
+            "model.layers.2.self_attn.compressor.ape_param.weight"
+        )
+
+    def test_attn_indexer_compressor_ape(self):
+        assert _rename_hf_key("layers.2.attn.indexer.compressor.ape") == (
+            "model.layers.2.self_attn.compressor.indexer.ape_param.weight"
+        )
 
     def test_gate_weight(self):
         assert _rename_hf_key("layers.1.ffn.gate.weight") == "model.layers.1.mlp.gate.weight"
@@ -162,6 +173,42 @@ class TestDeepSeekV4StateDictAdapterFromHF:
         down = out["model.layers.0.mlp.experts.down_projs"]
         assert down.shape == (n_experts, inter_dim, hidden)
 
+    def test_expert_fp8_base_layout_uses_fp8_dequantizer(self):
+        adapter = _make_adapter()
+        weight = torch.zeros(4, 4, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(1, 1, dtype=torch.float32)
+        sentinel = torch.empty(4, 4)
+
+        with patch(
+            "nemo_automodel.components.models.deepseek_v4.state_dict_adapter.dequantize_from_fp8",
+            return_value=sentinel,
+        ) as mock_dequantize:
+            out = adapter._dequantize_expert_weight("layers.0.ffn.experts.0.w1.weight", weight, scale)
+
+        assert out is sentinel
+        mock_dequantize.assert_called_once_with(
+            weight,
+            scale,
+            dtype=adapter.dtype,
+            name="layers.0.ffn.experts.0.w1.weight",
+        )
+
+    def test_expert_fp4_flash_layout_uses_fp4_dequantizer(self):
+        adapter = _make_adapter()
+        weight = torch.zeros(4, 2, dtype=torch.int8)
+        scale = torch.ones(4, 1, dtype=torch.float8_e8m0fnu)
+        sentinel = torch.empty(4, 4)
+
+        with patch.object(
+            DeepSeekV4StateDictAdapter,
+            "_dequantize_expert_fp4",
+            return_value=sentinel,
+        ) as mock_dequantize:
+            out = adapter._dequantize_expert_weight("layers.0.ffn.experts.0.w1.weight", weight, scale)
+
+        assert out is sentinel
+        mock_dequantize.assert_called_once_with(weight, scale, adapter.dtype)
+
 
 class TestDeepSeekV4StateDictAdapterToHF:
     def test_split_gate_up(self):
@@ -193,8 +240,54 @@ class TestDeepSeekV4StateDictAdapterToHF:
         assert adapter._internal_key_to_hf("model.layers.1.mlp.gate.weight") == "layers.1.ffn.gate.weight"
         assert adapter._internal_key_to_hf("model.layers.1.mlp.gate.tid2eid") == "layers.1.ffn.gate.tid2eid"
 
+    def test_internal_key_to_hf_fp32_holders(self):
+        adapter = _make_adapter()
+        assert adapter._internal_key_to_hf("model.layers.0.self_attn.sinks_param.weight") == "layers.0.attn.attn_sink"
+        assert (
+            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.ape_param.weight")
+            == "layers.2.attn.compressor.ape"
+        )
+        assert (
+            adapter._internal_key_to_hf("model.layers.2.self_attn.compressor.indexer.ape_param.weight")
+            == "layers.2.attn.indexer.compressor.ape"
+        )
+
     def test_non_quantized_gate_bias(self):
         adapter = _make_adapter()
         assert adapter._is_non_quantized("ffn.gate.bias")
         assert adapter._is_non_quantized("ffn.gate.tid2eid")
         assert adapter._is_non_quantized("attn.attn_sink")
+
+    def test_to_hf_quantization_creates_fp8_expert_placeholders_for_base(self, monkeypatch):
+        monkeypatch.setenv("NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT", "base")
+        adapter = _make_adapter()
+        down = torch.randn(4, 32, 64)
+
+        pairs = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.mlp.experts.down_projs",
+            down,
+            quantization=True,
+        )
+        by_key = dict(pairs)
+
+        assert by_key["layers.0.ffn.experts.0.w2.weight"].dtype == torch.float8_e4m3fn
+        assert by_key["layers.0.ffn.experts.0.w2.weight"].shape == (64, 32)
+        assert by_key["layers.0.ffn.experts.0.w2.scale"].dtype == torch.float32
+        assert by_key["layers.0.ffn.experts.0.w2.scale"].shape == (1, 1)
+
+    def test_to_hf_quantization_keeps_fp4_expert_placeholders_for_flash(self, monkeypatch):
+        monkeypatch.setenv("NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT", "flash")
+        adapter = _make_adapter()
+        down = torch.randn(4, 32, 64)
+
+        pairs = adapter.convert_single_tensor_to_hf(
+            "model.layers.0.mlp.experts.down_projs",
+            down,
+            quantization=True,
+        )
+        by_key = dict(pairs)
+
+        assert by_key["layers.0.ffn.experts.0.w2.weight"].dtype == torch.int8
+        assert by_key["layers.0.ffn.experts.0.w2.weight"].shape == (64, 16)
+        assert by_key["layers.0.ffn.experts.0.w2.scale"].dtype == torch.float8_e8m0fnu
+        assert by_key["layers.0.ffn.experts.0.w2.scale"].shape == (64, 1)

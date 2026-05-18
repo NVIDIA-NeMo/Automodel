@@ -27,6 +27,12 @@
 #   sky logs <cluster_name>
 
 # ---------------------------------------------------------------------------
+# Training config (forwarded to the VM unchanged)
+# ---------------------------------------------------------------------------
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
+# ---------------------------------------------------------------------------
 # SkyPilot launcher config (removed before the job config reaches the VM)
 # ---------------------------------------------------------------------------
 skypilot:
@@ -45,12 +51,6 @@ skypilot:
   # Extra setup commands run on the VM after `pip install -e .`
   # setup: |
   #   pip install some-extra-dependency
-
-# ---------------------------------------------------------------------------
-# Training config (forwarded to the VM unchanged)
-# ---------------------------------------------------------------------------
-recipe:
-  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64

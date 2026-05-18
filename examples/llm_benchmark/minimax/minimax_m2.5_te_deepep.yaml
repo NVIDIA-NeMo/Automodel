@@ -15,7 +15,7 @@
 # Benchmarking config for MiniMax M2.5 Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/minimax_m2.5_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/minimax/minimax_m2.5_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction

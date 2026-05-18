@@ -22,6 +22,9 @@
 #   sky check kubernetes
 #   sky show-gpus --infra k8s
 
+recipe:
+  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
+
 skypilot:
   cloud: kubernetes
   accelerators: H100:1
@@ -30,9 +33,6 @@ skypilot:
   num_nodes: 1
   job_name: llama3-2-1b-k8s
   hf_token: ${HF_TOKEN}
-
-recipe:
-  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64

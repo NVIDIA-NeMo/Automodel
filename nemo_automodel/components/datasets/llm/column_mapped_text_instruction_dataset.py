@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 
 class ColumnTypes(Enum):
+    """Supported logical column roles for text instruction datasets."""
+
     Context = "context"
     Question = "question"
     Answer = "answer"

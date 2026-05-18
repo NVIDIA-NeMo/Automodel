@@ -1,6 +1,6 @@
 # ChatGLM
 
-[ChatGLM](https://github.com/THUDM/ChatGLM-6B) is a bilingual (Chinese-English) conversational language model from Tsinghua University (THUDM). ChatGLM2 and ChatGLM3 extend the original with improved performance, longer context, and more efficient attention.
+[ChatGLM](https://github.com/zai-org/ChatGLM-6B) is a bilingual (Chinese-English) conversational language model from Zhipu AI. ChatGLM2 and ChatGLM3 extend the original with improved performance, longer context, and more efficient attention.
 
 :::{card}
 | | |
@@ -8,7 +8,7 @@
 | **Task** | Text Generation |
 | **Architecture** | `ChatGLMModel` |
 | **Parameters** | 6B |
-| **HF Org** | [THUDM](https://huggingface.co/THUDM) |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
 :::
 
 ## Available Models
@@ -24,8 +24,8 @@
 
 | Model | HF ID |
 |---|---|
-| ChatGLM3 6B | [`THUDM/chatglm3-6b`](https://huggingface.co/THUDM/chatglm3-6b) |
-| ChatGLM2 6B | [`THUDM/chatglm2-6b`](https://huggingface.co/THUDM/chatglm2-6b) |
+| ChatGLM3 6B | [`zai-org/chatglm3-6b`](https://huggingface.co/zai-org/chatglm3-6b) |
+| ChatGLM2 6B | [`zai-org/chatglm2-6b`](https://huggingface.co/zai-org/chatglm2-6b) |
 
 
 ## Try with NeMo AutoModel
@@ -86,5 +86,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- [THUDM/chatglm3-6b](https://huggingface.co/THUDM/chatglm3-6b)
-- [THUDM/chatglm2-6b](https://huggingface.co/THUDM/chatglm2-6b)
+- [zai-org/chatglm3-6b](https://huggingface.co/zai-org/chatglm3-6b)
+- [zai-org/chatglm2-6b](https://huggingface.co/zai-org/chatglm2-6b)

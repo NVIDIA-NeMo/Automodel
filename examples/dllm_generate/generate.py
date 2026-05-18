@@ -321,6 +321,8 @@ def trim_response(tokenizer, seq_ids_list, input_ids_list):
 
 
 def main():
+    """Run diffusion-language-model text generation from the CLI."""
+
     parser = argparse.ArgumentParser(
         description="Generate text from Automodel LLaDA checkpoints",
         formatter_class=argparse.RawDescriptionHelpFormatter,

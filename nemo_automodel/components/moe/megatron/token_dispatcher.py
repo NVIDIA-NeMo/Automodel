@@ -460,6 +460,8 @@ class _HybridEPManager(_DispatchManager):
 
 @dataclass
 class TokenDispatcherConfig:
+    """Configuration for MoE token dispatch and combine backends."""
+
     moe_enable_deepep: bool = True
     """Enable DeepEP for efficient token dispatching and combine in MoE models."""
 

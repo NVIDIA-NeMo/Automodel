@@ -17,6 +17,8 @@ from datasets import load_dataset
 
 
 def json2token(obj, sort_json_key=True):
+    """Convert a JSON-like invoice object into structured target tokens."""
+
     if isinstance(obj, dict):
         if len(obj) == 1 and "text_sequence" in obj:
             return obj["text_sequence"]
@@ -31,6 +33,8 @@ def json2token(obj, sort_json_key=True):
 
 
 def make_invoice_dataset(path_or_dataset="katanaml-org/invoices-donut-data-v1", split="train", **kwargs):
+    """Build invoice conversation samples from a Hugging Face dataset split."""
+
     ds = load_dataset(path_or_dataset, split=split)
     samples = []
     for ex in ds:

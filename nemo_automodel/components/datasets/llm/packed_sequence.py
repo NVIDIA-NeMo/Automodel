@@ -15,7 +15,7 @@
 import logging
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
@@ -225,11 +225,11 @@ def pack_dataset(
             divisible by 2*cp_size for context parallel processing. Default: 1 (no CP).
     """
     packs: list[PACK_TYPE] = []
-    try:
-        split_dataset = dataset[split]
-        dataset = split_dataset
-    except:
-        logger.warning(f"Dataset {split} not found. Using entire dataset.")
+    if isinstance(dataset, DatasetDict):
+        if split in dataset:
+            dataset = dataset[split]
+        else:
+            logger.warning(f"Dataset {split} not found. Using entire dataset.")
 
     # Buffer to hold samples until they are long enough to be added to packs
     current_pack = {

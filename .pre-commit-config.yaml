@@ -56,3 +56,9 @@ repos:
         files: '.*\/[^\/]*_[^\/]*\.md$'
         exclude: '^\.github/'
         types: [file]
+      - id: lint-example-yamls
+        name: "Lint example YAMLs"
+        language: system
+        entry: python tools/lint_example_yamls.py
+        files: '^examples/.*\.ya?ml$'
+        types: [file]

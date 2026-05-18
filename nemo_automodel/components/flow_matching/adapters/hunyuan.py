@@ -111,7 +111,7 @@ class HunyuanAdapter(ModelAdapter):
         dtype = context.dtype
 
         # Get text embeddings
-        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
+        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype, non_blocking=True)
         if text_embeddings.ndim == 2:
             text_embeddings = text_embeddings.unsqueeze(0)
 
@@ -127,22 +127,22 @@ class HunyuanAdapter(ModelAdapter):
         # padding positions to produce NaN gradients.  By removing padding
         # tokens entirely the mask becomes all-ones and masking is unnecessary.
         if text_mask is not None:
-            text_mask = text_mask.to(device, dtype=dtype)
+            text_mask = text_mask.to(device, dtype=dtype, non_blocking=True)
             valid_len = max(int(text_mask.sum(dim=-1).max().item()), 1)
             text_embeddings = text_embeddings[:, :valid_len, :]
             text_mask = text_mask[:, :valid_len]
         if text_mask_2 is not None:
-            text_mask_2 = text_mask_2.to(device, dtype=dtype)
+            text_mask_2 = text_mask_2.to(device, dtype=dtype, non_blocking=True)
             valid_len_2 = max(int(text_mask_2.sum(dim=-1).max().item()), 1)
             text_mask_2 = text_mask_2[:, :valid_len_2]
         if text_embeddings_2 is not None:
-            text_embeddings_2 = text_embeddings_2.to(device, dtype=dtype)
+            text_embeddings_2 = text_embeddings_2.to(device, dtype=dtype, non_blocking=True)
             if text_mask_2 is not None:
                 text_embeddings_2 = text_embeddings_2[:, :valid_len_2, :]
 
         # Handle image embeds for i2v
         if context.task_type == "i2v" and "image_embeds" in batch:
-            image_embeds = batch["image_embeds"].to(device, dtype=dtype)
+            image_embeds = batch["image_embeds"].to(device, dtype=dtype, non_blocking=True)
         else:
             seq_len, dim = self.default_image_embed_shape
             image_embeds = torch.zeros(

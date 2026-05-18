@@ -1,6 +1,6 @@
 # GLM-4
 
-[GLM-4](https://github.com/THUDM/GLM-4) is Tsinghua University (THUDM)'s fourth-generation General Language Model, featuring strong multilingual capabilities and tool-use support.
+[GLM-4](https://github.com/zai-org/GLM-4) is Zhipu AI's fourth-generation General Language Model, featuring strong multilingual capabilities and tool-use support.
 
 :::{card}
 | | |
@@ -8,7 +8,7 @@
 | **Task** | Text Generation |
 | **Architecture** | `GlmForCausalLM` / `Glm4ForCausalLM` |
 | **Parameters** | 9B – 32B |
-| **HF Org** | [THUDM](https://huggingface.co/THUDM) |
+| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
 :::
 
 ## Available Models
@@ -25,8 +25,8 @@
 
 | Model | HF ID |
 |---|---|
-| GLM-4-9B-Chat-HF | [`THUDM/glm-4-9b-chat-hf`](https://huggingface.co/THUDM/glm-4-9b-chat-hf) |
-| GLM-4-32B-0414 | [`THUDM/GLM-4-32B-0414`](https://huggingface.co/THUDM/GLM-4-32B-0414) |
+| GLM-4-9B-Chat-HF | [`zai-org/glm-4-9b-chat-hf`](https://huggingface.co/zai-org/glm-4-9b-chat-hf) |
+| GLM-4-32B-0414 | [`zai-org/GLM-4-32B-0414`](https://huggingface.co/zai-org/GLM-4-32B-0414) |
 
 ## Example Recipes
 
@@ -88,5 +88,5 @@ See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
-- [THUDM/glm-4-9b-chat-hf](https://huggingface.co/THUDM/glm-4-9b-chat-hf)
-- [THUDM/GLM-4-32B-0414](https://huggingface.co/THUDM/GLM-4-32B-0414)
+- [zai-org/glm-4-9b-chat-hf](https://huggingface.co/zai-org/glm-4-9b-chat-hf)
+- [zai-org/GLM-4-32B-0414](https://huggingface.co/zai-org/GLM-4-32B-0414)
