@@ -398,6 +398,8 @@ class TestDeepseekV4AttentionMask:
             sliding_window=cfg.sliding_window,
         )
         return hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask
+
+
 class TestRMSNormLastDim:
     def _reference(self, x, eps):
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -540,6 +542,36 @@ class TestDeepseekV4HyperConnection:
 
 class TestDeepseekV4OptimizedKernels:
     """Numerical equivalence tests for optional DSV4 kernel dispatch."""
+
+    def test_eager_attention_with_sink_passes_reference_to_sinks_holder(self):
+        """FSDP2-wrapped fp32 sink holders need a tensor input during recompute."""
+        batch, heads, seq_len, dim = 1, 2, 3, 4
+        q = torch.randn(batch, heads, seq_len, dim)
+        kv = torch.randn(batch, 1, seq_len, dim)
+        sinks = torch.randn(heads)
+
+        class SinksParam:
+            def __init__(self, value):
+                self.value = value
+                self.reference_shape = None
+
+            def __call__(self, reference):
+                self.reference_shape = reference.shape
+                return self.value
+
+        class DummyModule:
+            num_key_value_groups = heads
+            training = False
+
+            def __init__(self, value):
+                self.sinks_param = SinksParam(value)
+
+        module = DummyModule(sinks)
+
+        output, _ = eager_attention_with_sink(module, q, kv, kv, None, scaling=dim**-0.5)
+
+        assert output.shape == (batch, seq_len, heads, dim)
+        assert module.sinks_param.reference_shape == q.shape
 
     @pytest.mark.parametrize(
         "device",
@@ -1035,7 +1067,7 @@ class TestDeepseekV4OptimizedKernels:
     )
     def test_indexer_tilelang_backend_matches_torch(self):
         torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled = 2, 16, 8, 128, 4
+        bsz, seq, heads, dim, pooled = 2, 17, 8, 128, 5
         q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
         pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
         weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
@@ -1067,7 +1099,7 @@ class TestDeepseekV4OptimizedKernels:
     )
     def test_indexer_topk_tilelang_backend_matches_torch(self):
         torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled, topk = 1, 16, 8, 128, 4, 4
+        bsz, seq, heads, dim, pooled, topk = 1, 17, 8, 128, 5, 4
         q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
         pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
         weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01

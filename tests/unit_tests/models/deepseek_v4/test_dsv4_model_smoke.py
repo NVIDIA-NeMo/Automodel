@@ -501,6 +501,23 @@ class TestDeepseekV4ModelSmoke:
         torch.testing.assert_close(actual, expected)
         assert not torch.allclose(expected, wrong_orientation)
 
+    def test_thd_pp_intermediate_hidden_state_keeps_shape(self):
+        """Packed-sequence PP stages must not add a fake batch dim to hidden states."""
+
+        class _HiddenStage(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                del input_ids, kwargs
+                return torch.zeros(1, 8, 4, 16)
+
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.model = _HiddenStage()
+        model.lm_head = None
+
+        out = model(torch.ones(1, 8, dtype=torch.long), qkv_format="thd")
+
+        assert out.shape == (1, 8, 4, 16)
+
     @_REQUIRES_CUDA
     def test_forward_shape(self):
         """Forward pass produces logits of the right shape."""

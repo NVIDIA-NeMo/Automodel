@@ -529,7 +529,11 @@ def eager_attention_with_sink(
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]]
-    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    if hasattr(module, "sinks_param"):
+        sinks = module.sinks_param(query)
+    else:
+        sinks = module.sinks
+    sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined, dim=-1, dtype=torch.float32)[..., :-1]
@@ -569,7 +573,8 @@ class DeepseekV4FP32Parameter(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(value.to(torch.float32))
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, reference: torch.Tensor | None = None) -> torch.Tensor:
+        del reference
         return self.weight
 
 
@@ -626,7 +631,7 @@ class DeepseekV4Indexer(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape,
+                self.ape_param(hidden_states_fp32),
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -763,7 +768,7 @@ class DeepseekV4Compressor(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape,
+                self.ape_param(hidden_states_fp32),
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -1100,7 +1105,7 @@ class DeepseekV4Attention(nn.Module):
             attn_output = dsv4_sparse_attention(
                 q.transpose(1, 2).contiguous(),
                 full_kv.squeeze(1).contiguous(),
-                self.sinks,
+                self.sinks_param(q),
                 topk_idxs,
                 self.scaling,
                 backend=attn_backend,

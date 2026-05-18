@@ -211,7 +211,7 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
 
     logits = torch.empty([padded_seq_len, padded_seq_len_kv], device=q.device, dtype=torch.float32)
     tl_indexer_fwd_kernel(
-        q.view(seq_len * heads, index_dim),
+        q.view(padded_seq_len * heads, index_dim),
         kv,
         logits,
         weights.float(),
