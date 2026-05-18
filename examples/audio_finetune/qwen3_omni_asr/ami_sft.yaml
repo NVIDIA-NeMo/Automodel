@@ -31,7 +31,7 @@
 # To run (AMI is a public dataset, so any stub satisfies the legacy
 # WENETSPEECH_WU_PATH precondition baked into train.sh):
 #   export WENETSPEECH_WU_PATH=unused
-#   CONFIG=examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml \
+#   CONFIG=examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml \
 #       examples/vlm_finetune/qwen3_omni_asr/train.sh
 
 recipe: FinetuneRecipeForVLM
