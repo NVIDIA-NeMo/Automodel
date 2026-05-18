@@ -201,22 +201,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self._setup_distributed_env()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
-            suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
-            logging.info("🚀 View run at {}".format(run.url))
-
-        self.mlflow_logger = None
-        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            self.mlflow_logger = build_mlflow(self.cfg)
-            self.mlflow_logger.log_params(self.cfg.to_dict())
-            logging.info("MLflow experiment tracking enabled")
-
-        self.comet_logger = None
-        if self.dist_env.is_main and hasattr(self.cfg, "comet"):
-            self.comet_logger = build_comet(self.cfg)
-            self.comet_logger.log_params(self.cfg.to_dict())
-            logging.info("Comet experiment tracking enabled")
+        self._setup_remote_loggers()
 
         # Log experiment details on main rank
         self._log_experiment_details()

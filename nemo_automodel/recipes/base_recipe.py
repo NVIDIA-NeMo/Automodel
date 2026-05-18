@@ -46,11 +46,15 @@ from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.recipes._component_builders import build_wandb
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.shared.te_patches import apply_te_patches
 
@@ -718,6 +722,28 @@ class BaseRecipe:
         self.moe_mesh = self.dist_setup.moe_mesh
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
+
+    def _setup_remote_loggers(self) -> None:
+        """Initialise WandB / MLflow / Comet trackers when the YAML configures
+        them. Populates ``self.mlflow_logger`` and ``self.comet_logger`` (or
+        ``None`` when disabled / non-main rank). WandB attaches to the global
+        ``wandb.run``; no instance attribute is needed for it."""
+        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+            suppress_wandb_log_messages()
+            run = build_wandb(self.cfg)
+            logging.info("🚀 View run at {}".format(run.url))
+
+        self.mlflow_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            self.mlflow_logger = build_mlflow(self.cfg)
+            self.mlflow_logger.log_params(self.cfg.to_dict())
+            logging.info("MLflow experiment tracking enabled")
+
+        self.comet_logger = None
+        if self.dist_env.is_main and hasattr(self.cfg, "comet"):
+            self.comet_logger = build_comet(self.cfg)
+            self.comet_logger.log_params(self.cfg.to_dict())
+            logging.info("Comet experiment tracking enabled")
 
     def _setup_garbage_collection(self, step_scheduler: StepScheduler | None = None) -> None:
         """Initialize manual garbage collection based on step scheduler config."""

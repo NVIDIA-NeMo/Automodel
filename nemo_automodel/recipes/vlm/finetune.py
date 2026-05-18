@@ -155,10 +155,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """
         self._setup_distributed_env()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
-            suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
-            logging.info("🚀 View run at {}".format(run.url))
+        self._setup_remote_loggers()
 
         # Log experiment details on main rank
         self._log_experiment_details()
