@@ -200,11 +200,17 @@ class Engine:
         from nemo_automodel._transformers.auto_model import is_nemo_auto_factory
         from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
-        model_factory, model_kwargs = _callable_and_kwargs(self.config.model)
+        # Use ``ConfigNode.instantiate`` as the factory so nested sub-configs
+        # (e.g. ``backend`` with its own ``_target_: BackendConfig``) get
+        # recursively instantiated. ``target_and_kwargs`` is still useful for
+        # the is_nemo_auto_factory identity check below — but using its
+        # ``to_dict()`` output for kwargs would leave nested ``_target_`` keys
+        # intact, breaking ``BackendConfig(**dict)`` downstream.
+        target_for_check, _ = _callable_and_kwargs(self.config.model)
         self.model = _build_model_typed(
-            model_factory=model_factory,
-            model_kwargs=model_kwargs,
-            is_nemo_auto_model=is_nemo_auto_factory(model_factory),
+            model_factory=self.config.model.instantiate,
+            model_kwargs={},
+            is_nemo_auto_model=is_nemo_auto_factory(target_for_check),
             peft_config=self.config.peft,
             seed=self.config.seed,
             has_packed_sequence=self.config.has_packed_sequence,
