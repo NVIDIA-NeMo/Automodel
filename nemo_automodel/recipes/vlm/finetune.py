@@ -502,47 +502,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
     @torch.no_grad()
-    def _run_validation_epoch(self, val_dataloader):
-        """Run one pass over `self.val_dataloader`."""
-        with ScopedRNG(seed=1, ranked=True):
-            for mp in self.model_parts:
-                mp.eval()
-
-            total_loss = 0.0
-            total_tokens = 0
-            total_num_label_tokens = 0
-            for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
-                # VLMEngine's _pre_cp_hook handles multimodal CP pre-embed and
-                # make_cp_batch_and_ctx is applied inside engine.forward_backward.
-                result = self.engine.forward_backward(
-                    [batch],
-                    loss_fn=self.loss_fn,
-                    forward_only=True,
-                    num_label_tokens=num_label_tokens,
-                )
-                local_loss = result["losses"][0] if result["losses"] else torch.tensor(0.0)
-                total_num_label_tokens += num_label_tokens
-                total_loss += float(local_loss.item()) * num_label_tokens
-                total_tokens += num_label_tokens
-
-        # Aggregate across ranks if distributed is initialized
-        total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
-        total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
-
-        val_loss = total_loss / max(total_tokens, 1e-8)
-
-        return MetricsSample(
-            step=self.step_scheduler.step,
-            epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
-        )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
         log_validation_metrics(

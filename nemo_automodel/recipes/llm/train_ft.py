@@ -738,64 +738,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     @torch.no_grad()
-    def _run_validation_epoch(self, val_dataloader):
-        """Run one pass over a single validation dataloader.
-
-        Args:
-            val_name: Name of the validation dataset.
-            val_dataloader: DataLoader for the validation dataset.
-        """
-        with ScopedRNG(seed=1, ranked=True):
-            for mp in self.model_parts:
-                mp.eval()
-
-            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            total_num_label_tokens = 0
-
-            for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
-                result = self.engine.forward_backward(
-                    [batch],
-                    loss_fn=self.loss_fn,
-                    forward_only=True,
-                    num_label_tokens=None,  # we will normalize outside.
-                )
-                total_loss += torch.sum(torch.stack(result["losses"])).item()
-                total_num_label_tokens += num_label_tokens
-
-        total_loss = self._dp_allreduce(total_loss, include_cp=True)
-        total_num_label_tokens = self._dp_allreduce(
-            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-        ).item()
-        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
-
-        # For PP, send val_loss and num_label_tokens from last stage to main rank
-        if self.pp_enabled:
-            val_loss = val_loss.to(self.dist_env.device)
-            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
-            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(val_loss, dst=0)
-                torch.distributed.send(pp_num_tokens, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(val_loss, src=src_rank)
-                torch.distributed.recv(pp_num_tokens, src=src_rank)
-                total_num_label_tokens = pp_num_tokens.item()
-
-        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
-
-        return MetricsSample(
-            step=self.step_scheduler.step,
-            epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
-        )
-
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
         log_validation_metrics(
             log_data,
