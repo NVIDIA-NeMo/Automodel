@@ -351,6 +351,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.step_scheduler.set_epoch(epoch)
                 for batch_idx, batches in enumerate(self.step_scheduler):
                     log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # MoE load-balance metrics (all-reduce on all ranks).
+                    self._collect_moe_load_balance()
                     # log
                     self.log_train_metrics(log_data)
                     self._update_progress_bar(pbar, log_data.metrics)
@@ -522,7 +524,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
             step=self.step_scheduler.step,
             metric_logger=self.metric_logger_train,
             wandb_run=wandb.run,
+            mlflow_logger=self.mlflow_logger,
+            comet_logger=self.comet_logger,
         )
+        if self.dist_env.is_main and self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if self.comet_logger is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
 
 
 # ---------------------------------------------------------------------------

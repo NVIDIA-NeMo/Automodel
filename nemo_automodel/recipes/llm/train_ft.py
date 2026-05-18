@@ -457,55 +457,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
         self.engine.extra_loss_fn = _mtp_extra_loss
 
-    def _collect_moe_load_balance(self):
-        """Collect MoE load balance metrics with DP all-reduce.
-
-        Must be called on ALL ranks (the all-reduce is collective).
-        Stores the result in ``self._moe_layer_loads`` for rank-0 logging.
-        """
-        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
-        if not (moe_metrics_cfg and moe_metrics_cfg.get("enabled", False)):
-            self._moe_layer_loads = None
-            return
-
-        from nemo_automodel.components.moe.load_balance_metrics import collect_expert_loads
-
-        dp_group = self._get_dp_group(include_cp=True)
-        all_loads: dict = {}
-        for mp in self.model_parts:
-            all_loads.update(collect_expert_loads(mp, dp_group=dp_group))
-        self._moe_layer_loads = all_loads if all_loads else None
-
-    def _log_moe_metrics(self, step: int, wandb_log_fn) -> None:
-        """Log MoE load balance metrics to wandb.
-
-        Call after :meth:`_collect_moe_load_balance`.  Only logs when
-        ``_moe_layer_loads`` is populated and a wandb log function is provided.
-
-        Args:
-            step: Current training/benchmark step for wandb x-axis.
-            wandb_log_fn: Callable like ``wandb.log`` or ``wandb_run.log``.
-        """
-        if not getattr(self, "_moe_layer_loads", None):
-            return
-
-        from nemo_automodel.components.moe.load_balance_metrics import (
-            compute_brief_metrics,
-            compute_detailed_metrics,
-        )
-
-        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
-        mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
-        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
-        if mode == "detailed":
-            detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
-            if detailed_every is None or step % detailed_every == 0:
-                wandb_log_fn(compute_detailed_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-            else:
-                wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-        else:
-            wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
-
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
