@@ -784,6 +784,52 @@ class BaseRecipe:
             },
         )
 
+    def _setup_qat(self, cfg, model_parts):
+        """Wire the QAT delayed-fake-quant scheduler.
+
+        Returns ``(disable_fn, enable_fn, enable_after)``. When QAT is
+        disabled or the model has no ``_qat_mode``, returns ``(None, None,
+        None)``. The caller should store these on ``self._qat_*`` so the
+        training loop can call :meth:`_enable_qat_if_delayed`."""
+        if not cfg.get("qat.enabled", False):
+            return None, None, None
+        from nemo_automodel.components.quantization.qat import (
+            get_disable_fake_quant_fn,
+            get_enable_fake_quant_fn,
+        )
+
+        qat_cfg = cfg.qat
+        _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
+        qat_mode = getattr(model_parts[0], "_qat_mode", None)
+        if qat_mode is None:
+            return None, None, None
+
+        _qat_disable_fn = get_disable_fake_quant_fn(qat_mode)
+        _qat_enable_fn = get_enable_fake_quant_fn(qat_mode)
+        if _qat_disable_fn is not None and _qat_enable_after is not None:
+            try:
+                for part in model_parts:
+                    _qat_disable_fn(part)
+                logging.info(
+                    "QAT fake-quant disabled initially; will enable after %s steps", _qat_enable_after
+                )
+            except Exception as e:
+                logging.warning("Failed to disable fake-quant at setup: %s", e)
+        return _qat_disable_fn, _qat_enable_fn, _qat_enable_after
+
+    def _enable_qat_if_delayed(self, step: int) -> None:
+        if getattr(self, "_qat_enable_after", None) is None:
+            return
+        if step < self._qat_enable_after or self._qat_enable_fn is None:
+            return
+        try:
+            for mp in self.model_parts:
+                self._qat_enable_fn(mp)
+            logging.info("Enabled QAT fake-quant after step %s", step)
+            self._qat_enable_after = None
+        except Exception as e:
+            logging.warning("Failed to enable fake-quant: %s", e)
+
     def _collect_moe_load_balance(self) -> None:
         """Collect MoE load balance metrics with DP all-reduce.
 

@@ -304,6 +304,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         restore_from = self.cfg.get("checkpoint.restore_from", None)
 
         # Initialize JSONL loggers
+        self._qat_disable_fn, self._qat_enable_fn, self._qat_enable_after = self._setup_qat(self.cfg, self.model_parts)
+
         self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
@@ -350,6 +352,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
                 for batch_idx, batches in enumerate(self.step_scheduler):
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
                     log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                     # MoE load-balance metrics (all-reduce on all ranks).
                     self._collect_moe_load_balance()
@@ -374,7 +377,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             epoch,
                             self.step_scheduler.step,
                             log_data.metrics["loss"],
-                            val_loss,
+                            val_losses,
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
