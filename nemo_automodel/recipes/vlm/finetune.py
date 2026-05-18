@@ -67,7 +67,7 @@ from nemo_automodel.components.datasets.vlm.build import (  # noqa: E402, F401
     build_vlm_dataloader as build_dataloader,
 )
 from nemo_automodel.components.loss.calculate import calculate_loss  # noqa: E402, F401
-from nemo_automodel.components.training.build import build_vlm_model as _build_vlm_model_impl  # noqa: E402
+from nemo_automodel.components.training.build import build_model as _build_model_impl  # noqa: E402
 from nemo_automodel.vlm_engine import chunk_vlm_media as _chunk_vlm_media  # noqa: E402, F401
 
 
@@ -85,12 +85,10 @@ def build_model(
     cfg_moe=None,
     activation_checkpointing=False,
 ):
-    """Recipe-layer wrapper around the typed :func:`components.training.build.build_vlm_model`.
-
-    Translates recipe ``cfg_*`` ConfigNodes into the typed kwargs the
-    component expects. Validates the model target is a NeMoAutoModelFor*
-    classmethod (VLM requires NeMoAutoModel — no fallback path).
-    """
+    """Recipe-layer wrapper. Translates the VLM recipe's ``cfg_*`` ConfigNodes
+    into typed kwargs for :func:`components.training.build.build_model`, and
+    enforces that the model target is one of the ``NeMoAutoModelFor*``
+    classmethods (VLM has no bare-model fallback)."""
     from nemo_automodel._transformers.auto_model import is_nemo_auto_factory
     from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
@@ -101,9 +99,10 @@ def build_model(
             f"Got model target: {target}"
         )
 
-    return _build_vlm_model_impl(
+    return _build_model_impl(
         model_factory=cfg_model.instantiate,
         model_kwargs={},
+        is_nemo_auto_model=True,
         seed=seed,
         peft_config=cfg_peft,
         freeze_config=cfg_freeze.to_dict() if cfg_freeze is not None else None,
