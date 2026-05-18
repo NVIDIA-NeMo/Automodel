@@ -301,6 +301,12 @@ class TrainEagle3Recipe(BaseRecipe):
             running_steps = 0
             self.optimizer.zero_grad(set_to_none=True)
 
+            # Track batches-seen explicitly so the epoch-summary log below is
+            # well-defined even when the dataloader is empty (e.g. a filter
+            # that drops every sample, or an empty split). Without this the
+            # for-loop never binds ``batch_idx`` and the subsequent
+            # ``batch_idx + 1`` raises ``UnboundLocalError``.
+            batches_seen = 0
             for batch_idx, batch in enumerate(self.train_dataloader):
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 target_batch = self.target_wrapper.generate_batch(
@@ -321,6 +327,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
                 running_steps += 1
+                batches_seen = batch_idx + 1
 
                 if (batch_idx + 1) % self.grad_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
@@ -350,7 +357,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 logger.info(
                     "Epoch %s done: total_batches_seen=%s global_step=%s",
                     epoch,
-                    batch_idx + 1,
+                    batches_seen,
                     self.runtime.global_step,
                 )
 
