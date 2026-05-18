@@ -73,6 +73,11 @@ distributed:
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
     layers_per_stage: 5  # 80 layers / pp=4 / 4 virtual stages
+    # See note in ling_1t_lora_pp.yaml.  These flags pair with the
+    # _pp_keep_self_forward=True class attribute on BailingMoeV2ForCausalLM
+    # and keep our freqs_cis-based forward intact under PP.
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
   moe:
     reshard_after_forward: false

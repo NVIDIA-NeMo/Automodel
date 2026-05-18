@@ -6,14 +6,16 @@
 # first_k_dense_replace=4, rotary_dim=64 -> half-RoPE).
 #
 # Memory: bf16 base weights ~ 2 TB.  Even with LoRA the BASE model must be
-# loaded -> requires a multi-node setup with pipeline parallelism.  This
-# config targets 32 x H100 80GB (4 nodes x 8) with FSDP2 + PP=4 + EP=8 + LoRA
-# + activation checkpointing, modelled after deepseek_v32_hellaswag_pp.yaml.
-# For larger node counts increase pp_size or ep_size; do NOT try to run this
-# on fewer than ~32 H100 80GB.
+# loaded -> requires a multi-node setup with pipeline parallelism.  Validated
+# topology (per Huiying @ NVIDIA): 64 x H100 80GB (8 nodes x 8) with
+# FSDP2 + PP=8 + EP=8 + LoRA + activation checkpointing.  At pp=8 each stage
+# holds ~10 of the 80 layers; combined with ep=8 the per-rank base weight
+# footprint stays ~33 GB which leaves room for activations + LoRA state on
+# 80 GB cards.  Smaller setups (pp=4, ep=8 on 4 nodes / 32 GPUs) will OOM at
+# load-time.
 # ------------------------------------------------------------------------------------------------
 #
-# To run this recipe on 32 H100 80GB (4 nodes x 8) via Slurm:
+# To run this recipe on 64 H100 80GB (8 nodes x 8) via Slurm:
 #   sbatch slurm.sub examples/llm_finetune/ling/ling_1t_lora_pp.yaml
 #
 # Architecture: same BailingMoeV2 family as Ling-mini / Ling-flash.  The 1T
@@ -70,7 +72,7 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 4
+  pp_size: 8
   ep_size: 8
   sequence_parallel: false
   activation_checkpointing: true
@@ -80,7 +82,13 @@ distributed:
     pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
-    layers_per_stage: 5  # 80 layers / pp_size 4 / virtual_stages 4 = 5
+    layers_per_stage: 2  # 80 layers / pp_size 8 / virtual_stages 5 = 2
+    # BailingMoeV2ForCausalLM declares _pp_keep_self_forward=True, so the PP
+    # splitter preserves our gpt_oss-style freqs_cis forward.  These two
+    # explicit flags are defensive and prevent any future regression where
+    # someone overrides _pp_keep_self_forward at the recipe level.
+    patch_inner_model: false
+    patch_causal_lm_model: false
 
   moe:
     reshard_after_forward: false

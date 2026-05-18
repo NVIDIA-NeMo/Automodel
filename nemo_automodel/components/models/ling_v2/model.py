@@ -266,6 +266,16 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     # model is bf16; tiny quantization errors in the bias change routing.
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
+    # PP compatibility: our forward computes ``freqs_cis`` inline and threads it
+    # through the decoder blocks (gpt_oss-style rotary convention).  The generic
+    # ``patch_hf_model_for_pp`` would replace our forward with an HF-style one
+    # that calls ``self.model.rotary_emb(hidden_states, position_ids)`` expecting
+    # a ``(cos, sin)`` return — that signature mismatches our
+    # ``RotaryEmbedding.forward(query, key)`` and crashes inside
+    # ``apply_rotary_emb`` with a tensor-shape mismatch at ``torch.cat``.
+    # Setting this flag instructs the PP split to leave our forwards intact.
+    _pp_keep_self_forward: bool = True
+
     @classmethod
     def from_config(
         cls,

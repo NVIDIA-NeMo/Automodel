@@ -95,6 +95,20 @@ def _moe_cfg(cfg: BailingMoeV2Config) -> MoEConfig:
     )
 
 
+def test_pp_keep_self_forward_is_declared():
+    """Pipeline parallelism opts out of patch_hf_model_for_pp via this class flag.
+    Without it, the framework replaces our forward with a generic HF-style one
+    that calls rotary_emb(hidden_states, position_ids) and crashes inside
+    apply_rotary_emb because our gpt_oss-style RotaryEmbedding.forward(query, key)
+    rotates q and k rather than returning (cos, sin).  See PR #2255 for the
+    original symptom (RuntimeError: Sizes of tensors must match... at torch.cat
+    in apply_rotary_emb)."""
+    assert getattr(BailingMoeV2ForCausalLM, "_pp_keep_self_forward", False) is True, (
+        "BailingMoeV2ForCausalLM must declare _pp_keep_self_forward = True so "
+        "the PP wrapper preserves the model's own freqs_cis-based forward."
+    )
+
+
 @pytest.mark.parametrize("variant", ["mini", "flash", "1T"])
 def test_tiny_variant_forward(variant):
     cfg = _tiny_cfg_for_variant(variant)
