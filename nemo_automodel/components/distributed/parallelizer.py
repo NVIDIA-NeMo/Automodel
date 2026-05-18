@@ -46,9 +46,17 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
-from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration,
-)
+
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4ForConditionalGeneration,
+    )
+except (ImportError, ModuleNotFoundError):
+
+    class Gemma4ForConditionalGeneration:  # type: ignore[no-redef]
+        """Placeholder when the installed transformers build has no Gemma4."""
+
+        pass
 
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
@@ -283,6 +291,24 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         if hasattr(layer, "post_attention_layernorm"):
                             layers[i].post_attention_layernorm = checkpoint_wrapper(
                                 layers[i].post_attention_layernorm  # type: ignore
+                            )
+
+                        # MoT (mixture-of-transformers) sibling submodules — present
+                        # in BAGEL's Qwen2MoTDecoderLayer for the generation expert.
+                        # mlp_moe_gen is a full Qwen2MLP duplicate (same size as
+                        # mlp), so omitting it from AC roughly doubles per-layer
+                        # activation memory in Stage-2 BAGEL training.
+                        if hasattr(layer, "mlp_moe_gen"):
+                            layers[i].mlp_moe_gen = checkpoint_wrapper(
+                                layers[i].mlp_moe_gen  # type: ignore
+                            )
+                        if hasattr(layer, "input_layernorm_moe_gen"):
+                            layers[i].input_layernorm_moe_gen = checkpoint_wrapper(
+                                layers[i].input_layernorm_moe_gen  # type: ignore
+                            )
+                        if hasattr(layer, "post_attention_layernorm_moe_gen"):
+                            layers[i].post_attention_layernorm_moe_gen = checkpoint_wrapper(
+                                layers[i].post_attention_layernorm_moe_gen  # type: ignore
                             )
 
         # Set up mixed precision policy
@@ -1384,6 +1410,18 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         Gemma4ForConditionalGeneration: ["model.language_model.layers"],
         # String fallback in case of class identity mismatch across imports
         "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
+        # BAGEL (text-to-image + understanding). String-keyed to avoid an
+        # import cycle: parallelizer is core distributed code, the BAGEL
+        # model lives under components/models/bagel/. Lists both the Qwen2
+        # decoder ModuleList and the SigLIP encoder ModuleList so each
+        # member becomes its own FSDP unit (matching upstream BAGEL's
+        # transformer_auto_wrap_policy class set; without the SigLIP
+        # entry, Stage 2 OOMs on 8x80GB because the SigLIP layers sit in
+        # the root FSDP unit's all-gather peak).
+        "BagelForUnifiedMultimodal": [
+            "model.language_model.model.layers",
+            "model.vit_model.vision_model.encoder.layers",
+        ],
     }
     LLM_MODEL_CLS_TO_LAYERS = {
         "NemotronHForCausalLM": ["backbone.layers"],
