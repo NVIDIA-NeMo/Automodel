@@ -531,11 +531,15 @@ def apply_model_infrastructure(
             ]
         )
     )
+    # When FSDP2 CPU offload is enabled, params must be materialized on CPU —
+    # FSDP2 manages GPU placement itself during forward/backward.
+    _has_cpu_offload = model_wrapper is not None and getattr(model_wrapper, "offload_policy", None) is not None
     if need_materialize:
+        init_device = torch.device("cpu") if _has_cpu_offload else device
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
-            checkpointer.initialize_model_weights(mp, device, peft_init_method=lora_a_init)
+            checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded
     # (e.g., by HF's from_pretrained on a real device, which also handles BnB
@@ -578,7 +582,9 @@ def apply_model_infrastructure(
         from torch.distributed.tensor import DTensor
 
         has_sharded_params = any(isinstance(p, DTensor) for p in model.parameters())
-        if not (should_load_checkpoint and has_sharded_params):
+        # Skip model.to(device) when CPU offload is on — FSDP2 expects params on
+        # CPU and moves them to GPU during forward/backward itself.
+        if not _has_cpu_offload and not (should_load_checkpoint and has_sharded_params):
             try:
                 model.to(device, non_blocking=True)
             except NotImplementedError as e:
