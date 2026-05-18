@@ -43,6 +43,7 @@ repos:
       - id: no-underscore-md
         name: "Disallow '_' in Markdown filenames"
         language: system
+        # With `bash -c`, the first extra arg becomes `$0`, so `--` keeps matched filenames in `"$@"`.
         entry: |
           bash -c '
             # Report the offending files
@@ -51,7 +52,13 @@ repos:
               echo "  - $file (use hyphens instead)" >&2
             done
             exit 1
-          '
+          ' --
         files: '.*\/[^\/]*_[^\/]*\.md$'
         exclude: '^\.github/'
+        types: [file]
+      - id: lint-example-yamls
+        name: "Lint example YAMLs"
+        language: system
+        entry: python tools/lint_example_yamls.py
+        files: '^examples/.*\.ya?ml$'
         types: [file]

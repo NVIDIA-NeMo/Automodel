@@ -64,6 +64,8 @@ DEFAULT_PROMPTS = [
 
 
 def parse_args():
+    """Parse command-line options for activation comparison."""
+
     parser = argparse.ArgumentParser(
         description="Compare layer-by-layer activations: NeMo AutoModel vs HF Transformers.",
     )
@@ -262,6 +264,8 @@ def compare_and_report(
 
 
 def main():
+    """Run NeMo and Hugging Face activation comparison."""
+
     args, extra_args = parse_args()
 
     model_path = args.model_path or _read_model_name_from_config(args.config)

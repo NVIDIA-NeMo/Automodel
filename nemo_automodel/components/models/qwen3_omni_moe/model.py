@@ -43,15 +43,24 @@ class Qwen3OmniMoeThinkerTextModel(
 ):  # corresponding to qwen3_moe/model.py Qwen3MoeModel, diff: use MRopeRotaryEmbedding instead of RotaryEmbedding
     """Qwen3OmniMoe Thinker Text Model with MRoPE and sparse MoE layers."""
 
-    def __init__(self, config: Qwen3OmniMoeTextConfig, backend: BackendConfig, *, moe_config: MoEConfig | None = None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeTextConfig,
+        backend: BackendConfig,
+        *,
+        moe_config: MoEConfig | None = None,
+        moe_overrides: dict | None = None,
+    ):
         super().__init__()
         self.backend = backend
         self.config = config
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
         # Map HF Qwen3OmniMoe config -> our MoE wrapper
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.moe_config = moe_config or MoEConfig(
+        moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
             moe_inter_dim=getattr(config, "moe_intermediate_size", config.intermediate_size),
@@ -71,6 +80,9 @@ class Qwen3OmniMoeThinkerTextModel(
             expert_activation="swiglu",
             softmax_before_topk=True,
         )
+        if moe_overrides:
+            moe_defaults.update(moe_overrides)
+        self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -215,7 +227,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.backend = backend
 
         text_config = base_config.text_config if hasattr(base_config, "text_config") else base_config
-        self.model = Qwen3OmniMoeThinkerTextModel(text_config, backend=self.backend, moe_config=moe_config)
+        moe_overrides = kwargs.pop("moe_overrides", None)
+        self.model = Qwen3OmniMoeThinkerTextModel(
+            text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
+        )
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
         )
@@ -299,6 +314,42 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
             attention_mask = None
+
+        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        consumed_vlm_chunk = False
+
+        if pixel_values is None:
+            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            if image_chunks is not None and chunk_idx < len(image_chunks):
+                image_chunk = image_chunks[chunk_idx]
+                if image_chunk.numel() > 0:
+                    pixel_values = image_chunk
+                    image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                    if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
+                        image_grid = image_grid_chunks[chunk_idx]
+                        if image_grid is not None and image_grid.numel() > 0:
+                            if image_grid.shape[-1] == 2:
+                                ones = torch.ones(
+                                    image_grid.shape[0], 1, dtype=image_grid.dtype, device=image_grid.device
+                                )
+                                image_grid_thw = torch.cat([ones, image_grid], dim=-1)
+                            else:
+                                image_grid_thw = image_grid
+                consumed_vlm_chunk = True
+
+        if pixel_values_videos is None:
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if video_chunks is not None and chunk_idx < len(video_chunks):
+                video_chunk = video_chunks[chunk_idx]
+                if video_chunk.numel() > 0:
+                    pixel_values_videos = video_chunk
+                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
+                        video_grid_thw = video_grid_chunks[chunk_idx]
+                consumed_vlm_chunk = True
+
+        if consumed_vlm_chunk:
+            self._vlm_chunk_idx = chunk_idx + 1
 
         # 1. Get input embeddings
         if inputs_embeds is None:

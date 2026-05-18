@@ -1,0 +1,93 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# To run (from the repository root):
+#   Intended layout: 64 ranks (8 nodes x 8 GPUs; matches tp=1, cp=2, auto dp=32 in distributed.*).
+#   The interactive `automodel` CLI only launches a single node. For 8 nodes use torchrun or your
+#   cluster's multi-process wrapper, e.g.:
+#     torchrun --nnodes=8 --nproc_per_node=8 --node_rank=<rank> --master_addr=<host> --master_port=<port> \
+#       -m nemo_automodel.cli.app \
+#       examples/llm_pretrain/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 42
+
+benchmark:
+  warmup_steps: 5
+  peak_tflops: 989  # H100: 989, A100: 312
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 8
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1   # dp=32: grad_acc=4 steps per rank
+  ckpt_every_steps: 2000
+  num_epochs: 1
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
+  torch_dtype: bf16
+  trust_remote_code: True
+  attn_implementation: sdpa  # required for cp>1
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    rms_norm: torch_fp32
+
+checkpoint:
+  enabled: False
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 100
+  seq_len: 8192
+  num_samples: 1000000
+  batch_size: 1  # Must match step_scheduler.local_batch_size
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 0.0002
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  adam_w_mode: True
+
+distributed:
+  strategy: fsdp2
+  dp_size: null     # auto: 64 / (tp1 * cp2 * pp1) = 32
+  tp_size: 1
+  cp_size: 2
+  pp_size: 1
+  sequence_parallel: False
+  activation_checkpointing: True
+  enable_async_tensor_parallel: False
+  enable_fsdp2_prefetch: True
+  enable_compile: True
+  patch_is_packed_sequence: True  # Patch transformers._is_packed_sequence to always return False: removes CPU-GPU sync per attention layer and ensures static shapes for torch.compile. Safe for non-packed (standard) training only.
+  defer_fsdp_grad_sync: False   # Must be False with GA>1: True → delayed resharding → OOM

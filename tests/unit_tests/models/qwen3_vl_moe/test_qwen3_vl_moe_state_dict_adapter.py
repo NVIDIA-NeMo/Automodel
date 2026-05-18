@@ -17,9 +17,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_vl_moe.state_dict_adapter import Qwen3VLMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 
 @pytest.fixture
@@ -295,9 +295,7 @@ class TestFromHFEpShard:
                 return mock_ep_shard_sub
             return Mock()
 
-        monkeypatch.setattr(
-            "nemo_automodel.components.moe.state_dict_utils.get_submesh", fake_get_submesh
-        )
+        monkeypatch.setattr("nemo_automodel.components.moe.state_dict_utils.get_submesh", fake_get_submesh)
 
         captured_list = []
 

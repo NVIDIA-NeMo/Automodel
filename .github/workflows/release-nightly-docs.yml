@@ -20,8 +20,11 @@ on:
       - main
     paths:
       - 'docs/**'
-  schedule:
-    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-docs-publish
+  cancel-in-progress: false
 
 jobs:
   call-release-docs:
@@ -31,4 +34,4 @@ jobs:
       publish-as-latest: false
       docs-version-override: "nightly"
       update-version-picker: false
-    secrets: inherit
+    secrets: inherit  # pragma: allowlist secret

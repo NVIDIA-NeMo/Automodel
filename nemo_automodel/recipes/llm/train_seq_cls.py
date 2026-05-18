@@ -30,6 +30,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
@@ -184,29 +185,35 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             mp.train()
         self.timestamp = time.perf_counter()
 
-        for epoch in self.step_scheduler.epochs:
-            self.step_scheduler.set_epoch(epoch)
-            for batches in self.step_scheduler:
-                train_log_data = self._run_train_optim_step(batches)
-                self.log_train_metrics(train_log_data)
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                for batches in self.step_scheduler:
+                    train_log_data = self._run_train_optim_step(batches)
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
 
-                val_loss = {}
-                if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                    val_log_data = self._validate_one_epoch(self.val_dataloader)
-                    val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                    self.log_val_metrics(val_log_data)
-                    for mp in self.model_parts:
-                        mp.train()
+                    val_loss = {}
+                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                        val_log_data = self._validate_one_epoch(self.val_dataloader)
+                        val_loss["val_loss"] = val_log_data.metrics["val_loss"]
+                        self.log_val_metrics(val_log_data)
+                        for mp in self.model_parts:
+                            mp.train()
 
-                if self.step_scheduler.is_ckpt_step:
-                    self.save_checkpoint(
-                        epoch,
-                        self.step_scheduler.step,
-                        train_log_data.metrics["loss"],
-                        val_loss,
-                        best_metric_key=self.best_metric_key,
-                    )
-                self._maybe_collect_garbage()
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_loss,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
@@ -230,6 +237,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
             }
             labels = batch.pop("labels")
+            batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
@@ -333,6 +341,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
             }
             labels = batch.pop("labels")
+            batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
             loss = self.loss_fn(logits, labels.view(-1))
@@ -451,6 +460,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
 
 def main(config_path: str | None = None):
+    """Run the sequence-classification fine-tuning recipe."""
     if config_path is None:
         config_path = (
             pathlib.Path(__file__).parent.resolve()

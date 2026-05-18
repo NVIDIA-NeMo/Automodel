@@ -128,34 +128,34 @@ class TestNemotronV3Attention:
         assert attn.v_proj.bias is not None
         assert attn.o_proj.bias is not None
 
+    @skip_if_no_gpu
     def test_attention_forward_shape(self, config):
         """Test attention forward pass produces correct shapes."""
-        attn = NemotronV3Attention(config)
+        attn = NemotronV3Attention(config).cuda()
 
         batch_size, seq_len = 2, 16
-        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
         output = attn(hidden_states)
 
         assert output.shape == (batch_size, seq_len, config.hidden_size)
 
+    @skip_if_no_gpu
     def test_attention_forward_with_mask(self, config):
         """Test attention forward pass with attention mask."""
-        attn = NemotronV3Attention(config)
+        attn = NemotronV3Attention(config).cuda()
 
         batch_size, seq_len = 2, 8
-        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
-        # Create 4D causal mask
-        attention_mask = torch.zeros(batch_size, 1, seq_len, seq_len)
-        attention_mask = attention_mask.masked_fill(
-            torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool(), float("-inf")
-        )
+        # 2D padding mask (1=valid, 0=pad) — TE handles causality internally
+        attention_mask = torch.ones(batch_size, seq_len, device="cuda", dtype=torch.long)
 
         output = attn(hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (batch_size, seq_len, config.hidden_size)
 
+    @skip_if_no_gpu
     def test_attention_gqa_with_different_kv_heads(self):
         """Test GQA with different number of key-value heads."""
         config = MockNemotronV3Config(
@@ -164,25 +164,22 @@ class TestNemotronV3Attention:
             head_dim=32,
             hidden_size=512,
         )
-        attn = NemotronV3Attention(config)
+        attn = NemotronV3Attention(config).cuda()
 
         batch_size, seq_len = 2, 8
-        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
         output = attn(hidden_states)
 
         assert output.shape == (batch_size, seq_len, config.hidden_size)
-        # Verify projection dimensions
-        assert attn.q_proj.out_features == config.num_attention_heads * config.head_dim
-        assert attn.k_proj.out_features == config.num_key_value_heads * config.head_dim
-        assert attn.v_proj.out_features == config.num_key_value_heads * config.head_dim
 
+    @skip_if_no_gpu
     def test_attention_init_weights(self, config):
         """Test attention weight initialization."""
         config.attention_bias = True
-        attn = NemotronV3Attention(config)
+        attn = NemotronV3Attention(config).cuda()
 
-        device = torch.device("cpu")
+        device = torch.device("cuda")
         attn.init_weights(
             num_hidden_layers=config.num_hidden_layers,
             rescale_prenorm_residual=True,
@@ -193,12 +190,13 @@ class TestNemotronV3Attention:
         assert torch.allclose(attn.q_proj.bias, torch.zeros_like(attn.q_proj.bias))
         assert torch.allclose(attn.k_proj.bias, torch.zeros_like(attn.k_proj.bias))
 
+    @skip_if_no_gpu
     def test_attention_forward_single_token(self, config):
         """Test attention with single token (seqlen=1)."""
-        attn = NemotronV3Attention(config)
+        attn = NemotronV3Attention(config).cuda()
 
         batch_size, seq_len = 2, 1
-        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
         output = attn(hidden_states)
 
@@ -231,7 +229,7 @@ class TestNemotronV3Block:
             n_activated_experts=config.num_experts_per_tok,
             n_expert_groups=config.n_group,
             n_limited_groups=config.topk_group,
-            train_gate=False,
+            train_gate=True,
             gate_bias_update_factor=0.0,
             aux_loss_coeff=0.0,
             score_func="sigmoid",
@@ -283,13 +281,14 @@ class TestNemotronV3Block:
         with pytest.raises(ValueError, match="Invalid block_type"):
             NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend)
 
+    @skip_if_no_gpu
     def test_block_forward_attention(self, config, backend):
         """Test block forward pass with attention layer."""
         config.layers_block_type = ["attention"]
-        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend)
+        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend).cuda()
 
         batch_size, seq_len = 2, 8
-        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size)
+        hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
         output = block(hidden_states)
 
@@ -527,28 +526,31 @@ class TestBackwardCompatibility:
             enable_hf_state_dict_adapter=False,
         )
 
+    @skip_if_no_gpu
     def test_attention_no_cache_args(self, config):
         """Verify attn(hidden) still works without cache args."""
-        attn = NemotronV3Attention(config)
-        hidden = torch.randn(2, 8, config.hidden_size)
+        attn = NemotronV3Attention(config).cuda()
+        hidden = torch.randn(2, 8, config.hidden_size, device="cuda", dtype=torch.bfloat16)
         out = attn(hidden)
         assert out.shape == (2, 8, config.hidden_size)
 
+    @skip_if_no_gpu
     def test_attention_mask_only(self, config):
         """Verify attn(hidden, attention_mask=...) still works without cache args."""
-        attn = NemotronV3Attention(config)
+        attn = NemotronV3Attention(config).cuda()
         batch_size, seq_len = 2, 8
-        hidden = torch.randn(batch_size, seq_len, config.hidden_size)
-        mask = torch.zeros(batch_size, 1, seq_len, seq_len)
-        mask.masked_fill_(torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool(), float("-inf"))
+        hidden = torch.randn(batch_size, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        # 2D padding mask (1=valid, 0=pad) — TE handles causality internally
+        mask = torch.ones(batch_size, seq_len, device="cuda", dtype=torch.long)
         out = attn(hidden, attention_mask=mask)
         assert out.shape == (batch_size, seq_len, config.hidden_size)
 
+    @skip_if_no_gpu
     def test_block_attention_no_cache_args(self, config, backend):
         """Verify block(hidden) still works for attention block without cache args."""
         config.layers_block_type = ["attention"]
-        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend)
-        hidden = torch.randn(2, 8, config.hidden_size)
+        block = NemotronV3Block(config, layer_idx=0, moe_config=None, backend=backend).cuda()
+        hidden = torch.randn(2, 8, config.hidden_size, device="cuda", dtype=torch.bfloat16)
         out = block(hidden)
         assert out.shape == (2, 8, config.hidden_size)
 

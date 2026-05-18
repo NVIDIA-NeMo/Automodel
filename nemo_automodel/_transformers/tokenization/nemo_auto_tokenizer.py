@@ -22,7 +22,24 @@ from jinja2.exceptions import TemplateError
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 
+try:
+    from huggingface_hub.errors import StrictDataclassClassValidationError
+except ImportError:
+    StrictDataclassClassValidationError = ValueError
+
 logger = logging.getLogger(__name__)
+
+
+def _ensure_pad_token_id(tokenizer, model_name: str) -> None:
+    """Default pad_token_id to 0 when the tokenizer does not define one."""
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = 0
+        logger.warning(
+            "Tokenizer '%s' has pad_token_id=None; defaulting to 0. "
+            "This can cause incorrect MoE auxiliary loss calculations if valid tokens "
+            "share token ID 0. Set pad_token_id explicitly in your tokenizer config to avoid this.",
+            model_name,
+        )
 
 
 _PRESERVED_SPECIAL_TOKEN_KEYS = frozenset(
@@ -81,6 +98,36 @@ def _read_tokenizer_class(pretrained_model_name_or_path, **kwargs):
     if config is None:
         return None
     return config.get("tokenizer_class")
+
+
+def _retry_tokenizer_via_auto_map(pretrained_model_name_or_path, *args, **kwargs):
+    """Load a tokenizer by resolving ``auto_map['AutoTokenizer']`` directly.
+
+    Fallback for transformers>=5, where models whose tokenizer_config.json only
+    registers a slow ``PreTrainedTokenizer`` subclass (e.g. Moonlight's
+    TikTokenTokenizer) fail in ``AutoTokenizer.from_pretrained`` with
+    "Couldn't instantiate the backend tokenizer ...". Bypasses AutoTokenizer
+    by resolving the class from the remote module itself.
+
+    Returns ``None`` when ``auto_map`` has no ``AutoTokenizer`` entry, so the
+    caller can re-raise the original error.
+    """
+    config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+    if config is None:
+        return None
+    ref = (config.get("auto_map") or {}).get("AutoTokenizer")
+    if isinstance(ref, (list, tuple)):
+        ref = next((r for r in ref if r), None)
+    if not ref:
+        return None
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        cls = get_class_from_dynamic_module(ref, str(pretrained_model_name_or_path))
+    except Exception:
+        logger.debug("Failed to resolve tokenizer class from auto_map", exc_info=True)
+        return None
+    return cls.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
 
 
 def _resolve_source_dir(pretrained_model_name_or_path, **kwargs):
@@ -255,6 +302,47 @@ def _remap_system_role(conversation):
     return remapped
 
 
+def _try_convert_tiktoken_to_native(tokenizer):
+    """Convert a TikToken-based tokenizer to a native HF tokenizer.
+
+    This enables char_to_token() for {% generation %} mask computation
+    without needing a heuristic fallback for char_to_token().
+    Returns the original tokenizer unchanged if conversion is not applicable.
+    """
+    if getattr(tokenizer, "is_fast", True):
+        return tokenizer
+    if not (hasattr(tokenizer, "vocab_file") and hasattr(tokenizer, "special_tokens")):
+        return tokenizer
+
+    try:
+        from transformers.convert_slow_tokenizer import TikTokenConverter
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+        fast_backend = TikTokenConverter(
+            vocab_file=tokenizer.vocab_file,
+            pattern=getattr(tokenizer, "pat_str", None),
+            extra_special_tokens=tokenizer.special_tokens,
+        ).converted()
+
+        fast = TokenizersBackend(
+            tokenizer_object=fast_backend,
+            bos_token=getattr(tokenizer, "bos_token", None),
+            eos_token=getattr(tokenizer, "eos_token", None),
+            unk_token=getattr(tokenizer, "unk_token", None),
+            pad_token=getattr(tokenizer, "pad_token", None),
+        )
+
+        # Carry over chat template and any other custom attributes.
+        if hasattr(tokenizer, "chat_template"):
+            fast.chat_template = tokenizer.chat_template
+
+        logger.info("Converted TikToken tokenizer to fast backend for char_to_token() support.")
+        return fast
+    except Exception:
+        logger.debug("TikToken-to-fast conversion failed, keeping original tokenizer.", exc_info=True)
+        return tokenizer
+
+
 class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
     A wrapper around HuggingFace's AutoTokenizer that ensures consistent BOS/EOS token handling.
@@ -273,7 +361,35 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
         """
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        try:
+            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        except (ValueError, StrictDataclassClassValidationError) as e:
+            err = str(e)
+            if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
+                # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
+                # so configs whose layer_types length differs from num_hidden_layers (e.g.
+                # stepfun-ai/Step-3.5-Flash) trip validate_layer_type before the tokenizer
+                # is built. The tokenizer itself doesn't depend on layer_types, so relax
+                # the validator globally and retry.
+                from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+                relax_layer_types_validator()
+                tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            elif "backend tokenizer" in err and kwargs.get("trust_remote_code"):
+                # transformers>=5 removed the slow-only tokenizer path, so models whose
+                # auto_map registers only a slow PreTrainedTokenizer subclass (e.g.
+                # Moonlight's TikTokenTokenizer) fail with a misleading "install
+                # sentencepiece or tiktoken" message even when both are installed.
+                # Retry by resolving the class from the remote module directly.
+                tokenizer = _retry_tokenizer_via_auto_map(pretrained_model_name_or_path, *args, **kwargs)
+                if tokenizer is None:
+                    raise
+            else:
+                raise
+
+        # Convert TikToken-based tokenizers to fast (Rust-backed) tokenizers so that
+        # char_to_token() works natively for {% generation %} mask computation.
+        tokenizer = _try_convert_tiktoken_to_native(tokenizer)
 
         # Transformers >=5.0.0 defaults special_tokens_pattern to "cls_sep", which inserts
         # cls_token_id / sep_token_id into input_ids via build_inputs_with_special_tokens.
@@ -286,22 +402,29 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         ):
             tokenizer.special_tokens_pattern = "none"
 
+        # Only set add_bos/eos_token if the tokenizer already declares the attribute.
+        # Forcing them on tokenizers that don't natively support them (e.g. TikToken)
+        # causes spurious BOS/EOS insertion around every text segment.
         if add_bos_token and getattr(tokenizer, "bos_token", None) is not None:
-            try:
-                tokenizer.add_bos_token = add_bos_token
-            except ValueError:
-                tokenizer._add_bos_token = add_bos_token
+            if hasattr(tokenizer, "add_bos_token"):
+                try:
+                    tokenizer.add_bos_token = add_bos_token
+                except ValueError:
+                    tokenizer._add_bos_token = add_bos_token
         if add_eos_token and getattr(tokenizer, "eos_token", None) is not None:
-            try:
-                tokenizer.add_eos_token = add_eos_token
-            except ValueError:
-                tokenizer._add_eos_token = add_eos_token
+            if hasattr(tokenizer, "add_eos_token"):
+                try:
+                    tokenizer.add_eos_token = add_eos_token
+                except ValueError:
+                    tokenizer._add_eos_token = add_eos_token
         # Keep the wrapper class name at runtime, but remember the original HF tokenizer class
         # so we can save an HF-compatible `tokenizer_class` in `save_pretrained()`.
         base_tokenizer_cls = type(tokenizer)
         tokenizer._base_class = base_tokenizer_cls
         tokenizer._original_tokenizer_config = _read_tokenizer_config(pretrained_model_name_or_path, **kwargs)
         tokenizer._original_tokenizer_class = (tokenizer._original_tokenizer_config or {}).get("tokenizer_class")
+
+        _ensure_pad_token_id(tokenizer, pretrained_model_name_or_path)
 
         tokenizer._source_dir = _resolve_source_dir(pretrained_model_name_or_path, **kwargs)
 
@@ -332,8 +455,8 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             return tokenized
         if isinstance(tokenized, BatchEncoding):
             _tokenized_keys = {"input_ids", "attention_mask", "assistant_masks"}
-            add_bos_ids = self.add_bos_token and (getattr(self, "bos_token_id", None) is not None)
-            add_eos_ids = self.add_eos_token and (getattr(self, "eos_token_id", None) is not None)
+            add_bos_ids = getattr(self, "add_bos_token", False) and (getattr(self, "bos_token_id", None) is not None)
+            add_eos_ids = getattr(self, "add_eos_token", False) and (getattr(self, "eos_token_id", None) is not None)
             if not "input_ids" in tokenized:
                 return tokenized
             if add_bos_ids:
@@ -354,10 +477,10 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
         encoded = super().encode(*args, **kwargs)
         if not kwargs.get("add_special_tokens", True):
             return encoded
-        if self.add_bos_token:
+        if getattr(self, "add_bos_token", False):
             if encoded and (getattr(self, "bos_token_id", None) is not None) and encoded[0] != self.bos_token_id:
                 encoded = [self.bos_token_id] + encoded
-        if self.add_eos_token:
+        if getattr(self, "add_eos_token", False):
             if encoded and (getattr(self, "eos_token_id", None) is not None) and encoded[-1] != self.eos_token_id:
                 encoded = encoded + [self.eos_token_id]
         return encoded

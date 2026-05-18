@@ -94,8 +94,14 @@ class GptOssAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        # Detect THD format: either 2D [T, hidden] or 3D [1, T, hidden] with
+        # cu_seqlens in kwargs (from PP schedule splitting [N, T, hidden] → [1, T, hidden]).
         if len(x.shape) == 2:
             qkv_format = "thd"
+            num_tokens = x.shape[0]
+        elif "cu_seqlens" in attn_kwargs and x.shape[0] == 1:
+            qkv_format = "thd"
+            x = x.squeeze(0)
             num_tokens = x.shape[0]
         else:
             qkv_format = "bshd"

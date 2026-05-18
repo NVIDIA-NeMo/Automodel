@@ -249,4 +249,3 @@ def test_dataset_two_column_mapping_non_chat(tmp_path: Path):
     assert len(sample["input_ids"]) == 32
     assert len(sample["labels"]) == 32
     assert len(sample["attention_mask"]) == 32
-

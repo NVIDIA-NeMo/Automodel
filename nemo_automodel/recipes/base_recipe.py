@@ -43,10 +43,13 @@ except ImportError:
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+
+logger = logging.getLogger(__name__)
 
 
 def has_load_restore_state(object):
@@ -235,7 +238,8 @@ class BaseRecipe:
         )
 
         if should_track and not any(substr in key.lower() for substr in ("val", "eval", "test", "loss")):
-            assert key not in self.__dict__["__state_tracked"]
+            if key in self.__dict__["__state_tracked"]:
+                raise RuntimeError(f"State key {key!r} is already tracked")
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
 
@@ -294,9 +298,10 @@ class BaseRecipe:
         )
 
         if is_rank_0:
-            assert not os.path.exists(path), f"Checkpoint directory {path} already exists"
+            if os.path.exists(path):
+                raise FileExistsError(f"Checkpoint directory {path} already exists")
             os.makedirs(path, exist_ok=True)
-            print(f"Saving checkpoint to {path}", flush=True)
+            logger.info("Saving checkpoint to %s", path)
 
             def to_item(x):
                 if isinstance(x, torch.Tensor):
@@ -307,13 +312,16 @@ class BaseRecipe:
             loss_dict = {"train_loss": train_loss}
             if val_loss:
                 # the name of the key can be "default", so we rename it to "val_loss"
-                key = next(iter(val_loss.keys()))
-                loss_dict["val_loss"] = val_loss.pop(key) if len(val_loss) == 1 else loss_dict.update(val_loss)
+                if len(val_loss) == 1:
+                    key = next(iter(val_loss.keys()))
+                    loss_dict["val_loss"] = val_loss[key]
+                else:
+                    loss_dict.update(val_loss)
             with open(os.path.join(path, "losses.json"), "w") as f:
                 try:
                     json.dump({k: to_item(v) for k, v in loss_dict.items()}, f)
-                except:
-                    pass
+                except (TypeError, ValueError, OSError):
+                    logger.warning("Failed to write checkpoint loss metadata to %s", f.name, exc_info=True)
 
         if is_dist_initialized:
             torch.distributed.barrier()
@@ -583,7 +591,7 @@ class BaseRecipe:
             details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()
             for line in ("Experiment_details:\n" + details_yaml).splitlines():
                 logging.info(line)
-        except Exception:
+        except yaml.YAMLError:
             logging.info(f"Experiment details: {details}")
         # Config (print original placeholders for reproducibility; no internal keys like _original_strings)
         try:
@@ -591,24 +599,26 @@ class BaseRecipe:
             cfg_yaml = config_to_yaml_str(cfg_obj, use_orig_values=True)
             if cfg_yaml:
                 print(cfg_yaml, flush=True)
-        except Exception:
-            logging.info("Recipe config: <unavailable>")
+        except (AttributeError, TypeError, ValueError, yaml.YAMLError):
+            logger.info("Recipe config: <unavailable>", exc_info=True)
 
     def _log_library_versions(self):
         """Log import paths and versions for nemo_automodel, transformers, and torch."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
+        nemo_am = None
         try:
             import nemo_automodel as nemo_am
 
             nemo_path = Path(getattr(nemo_am, "__file__", "<unknown>")).resolve().as_posix()
-        except Exception:
+        except (ImportError, OSError, RuntimeError):
             nemo_path = "<unknown>"
+        hf_transformers = None
         try:
             import transformers as hf_transformers
 
             tfm_path = Path(getattr(hf_transformers, "__file__", "<unknown>")).resolve().as_posix()
-        except Exception:
+        except (ImportError, OSError, RuntimeError):
             tfm_path = "<unknown>"
         libs = {
             "nemo_automodel": {"version": getattr(nemo_am, "__version__", None), "import_path": nemo_path},
@@ -705,9 +715,10 @@ class BaseRecipe:
     def _get_dp_group(self, include_cp: bool = False):
         if not self.device_mesh:
             return None
+
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh["dp_cp"].get_group()
-        return self.device_mesh["dp"].get_group()
+            return get_flat_mesh(self.device_mesh, "dp_cp").get_group()
+        return get_flat_mesh(self.device_mesh, "dp").get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
@@ -730,9 +741,10 @@ class BaseRecipe:
             if dist.is_initialized():
                 return dist.get_rank()
             return 0
+
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return self.device_mesh.get_local_rank("dp_cp")
-        return self.device_mesh.get_local_rank("dp")
+            return get_flat_mesh(self.device_mesh, "dp_cp").get_local_rank()
+        return get_flat_mesh(self.device_mesh, "dp").get_local_rank()
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -752,6 +764,40 @@ class BaseRecipe:
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
+
+    def _make_progress_bar(self):
+        """Create a tqdm progress bar on rank 0; returns None on other ranks."""
+        if not _is_rank_0():
+            return None
+        from tqdm import tqdm
+
+        return tqdm(
+            total=getattr(self.step_scheduler, "max_steps", None),
+            initial=getattr(self.step_scheduler, "step", 0),
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
+        )
+
+    def _update_progress_bar(self, pbar, metrics: dict) -> None:
+        """Update tqdm bar with loss/lr/tps from a metrics dict (no-op if pbar is None)."""
+        if pbar is None:
+            return
+        postfix = {}
+        for loss_key in ("loss", "Loss/Train_Total"):
+            if loss_key in metrics:
+                postfix["loss"] = f"{metrics[loss_key]:.4f}"
+                break
+        for lr_key in ("lr", "Train/lr"):
+            if lr_key in metrics:
+                postfix["lr"] = f"{metrics[lr_key]:.2e}"
+                break
+        for tps_key in ("tps", "Train/tps"):
+            if tps_key in metrics:
+                postfix["tps"] = f"{metrics[tps_key]:.0f}"
+                break
+        pbar.set_postfix(**postfix)
+        pbar.update(1)
 
 
 def _find_latest_checkpoint(checkpoint_dir):
@@ -900,7 +946,7 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
     try:
         with open(config_path, "r") as f:
             ckpt_cfg = yaml.safe_load(f) or {}
-    except Exception as e:
+    except (OSError, yaml.YAMLError) as e:
         return True, f"failed to read checkpoint config.yaml (cannot validate): {e}"
 
     # Prefer raw_config (same representation that was saved) to avoid
@@ -912,7 +958,7 @@ def _is_checkpoint_model_config_compatible(current_cfg, ckpt_dir: str) -> tuple[
             cur_cfg = current_cfg.to_dict()
         else:
             cur_cfg = dict(current_cfg)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         cur_cfg = {}
 
     ckpt_sig = _extract_model_signature(ckpt_cfg)

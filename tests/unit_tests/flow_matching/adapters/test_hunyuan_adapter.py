@@ -37,7 +37,6 @@ from nemo_automodel.components.flow_matching.adapters import (
     HunyuanAdapter,
 )
 
-
 # =============================================================================
 # Mock Model
 # =============================================================================
@@ -61,6 +60,7 @@ class MockHunyuanModel(nn.Module):
         encoder_attention_mask_2=None,
         image_embeds=None,
         return_dict=False,
+        **kwargs,
     ):
         self.call_count += 1
         self.last_inputs = {

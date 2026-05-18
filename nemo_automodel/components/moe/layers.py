@@ -60,6 +60,7 @@ class MLP(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         activation: str = "swiglu",
         bias: bool = False,
+        swiglu_limit: float = 0.0,
     ):
         """
         Initializes the MLP layer.
@@ -71,6 +72,9 @@ class MLP(nn.Module):
             dtype (torch.dtype): Data type for weights.
             activation (str): Activation function - "swiglu" (default) or "relu2".
             bias (bool): Whether to use bias in linear layers.
+            swiglu_limit (float): When > 0 and activation is gated, run SwiGLU
+                in fp32 with one-sided gate clamp ``max=limit`` and symmetric
+                up clamp ``±limit``. Matches DSV4 reference ``Expert.forward``.
         """
         super().__init__()
         if activation not in ("swiglu", "relu2"):
@@ -78,6 +82,7 @@ class MLP(nn.Module):
 
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        self.swiglu_limit = float(swiglu_limit)
 
         self.up_proj = initialize_linear_module(
             linear_impl=backend, in_features=dim, out_features=inter_dim, bias=bias, dtype=dtype
@@ -103,10 +108,16 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        if self.is_gated:
-            return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-        else:
+        if not self.is_gated:
             return self.down_proj(F.relu(self.up_proj(x)).pow(2))
+        if self.swiglu_limit > 0.0:
+            # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
+            # gate clamp and symmetric up clamp; cast back before down_proj.
+            dtype = x.dtype
+            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
+            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            return self.down_proj((F.silu(gate) * up).to(dtype))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -130,6 +141,7 @@ class FakeBalancedGate(nn.Module):
         self.n_activated_experts = config.n_activated_experts
         self.skip_first_n_experts = skip_first_n_experts
         self.noise = noise
+        self.bias_update_factor = 0.0
 
     def forward(
         self,
@@ -207,7 +219,8 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax', 'sigmoid', or 'softmax_with_bias').
+        score_func (str): Scoring function ('softmax', 'sigmoid', 'sigmoid_with_bias',
+            'softmax_with_bias', or 'sqrtsoftplus').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -341,6 +354,36 @@ class Gate(nn.Module):
 
             indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
             # Final weights gathered from UNBIASED softmax scores
+            weights = original_scores.gather(1, indices)
+        elif self.score_func == "sqrtsoftplus":
+            # sqrt(softplus(x)) = sqrt(log(1 + exp(x))), used in DeepSeek V4.
+            scores = torch.sqrt(F.softplus(scores.float()))
+            original_scores = scores
+
+            if self.e_score_correction_bias is not None:
+                scores = scores + self.e_score_correction_bias
+
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.score_func == "sigmoid_with_bias":
+            scores = scores.sigmoid()
+            original_scores = scores
+            scores_for_choice = scores
+
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores_for_choice + self.e_score_correction_bias
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+                group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
+                group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
+                scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
+                    ~score_mask.bool(), float("-inf")
+                )
+
+            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
@@ -512,6 +555,16 @@ class Gate(nn.Module):
             torch.Tensor: Auxiliary loss for load balancing.
                 Shape is [].
         """
+        # Pin aux-loss arithmetic to fp32. The activation-checkpoint recompute pass
+        # does not replay FSDP2 MixedPrecisionPolicy cast_forward_inputs, so `x` and
+        # anything derived from `x.dtype` (including original_scores in some MoE
+        # configs) can differ between forward and recompute. Doing the cast inside
+        # the AC region — rather than at the Gate level — guarantees the saved
+        # tensors of this region (expert_scores [n_experts] and the aux-loss scalar)
+        # are fp32 on both passes regardless of upstream behavior.
+        original_scores = original_scores.float()
+        expert_load = expert_load.float()
+
         context_length = token_mask.sum()
         expert_scores = (original_scores * token_mask.unsqueeze(-1)).sum(dim=0)
 
@@ -570,21 +623,30 @@ class MoE(nn.Module):
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
-        if backend.dispatcher == "deepep" and get_world_size_safe() == 1:
+        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
-                "DeepEP dispatcher is enabled in config, but world size is 1. "
-                "DeepEP requires multiple GPUs. Falling back to standard GroupedExperts.",
+                f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
+                "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
                 category=UserWarning,
                 stacklevel=2,
             )
             self.experts = GroupedExperts(config, backend=backend)
-        elif backend.dispatcher == "deepep":
-            # DeepEP dispatcher requires TE, GMM, or torch_mm experts (validated in BackendConfig)
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
             if backend.experts in ("gmm", "torch_mm"):
-                self.experts = GroupedExpertsDeepEP(config, backend=backend)
+                self.experts = GroupedExpertsDeepEP(
+                    config,
+                    backend=backend,
+                    dispatcher_backend=backend.dispatcher,
+                    dispatcher_num_sms=backend.dispatcher_num_sms,
+                )
             else:
                 # experts == "te"
-                self.experts = GroupedExpertsTE(config, backend=backend)
+                self.experts = GroupedExpertsTE(
+                    config,
+                    backend=backend,
+                    dispatcher_backend=backend.dispatcher,
+                    dispatcher_num_sms=backend.dispatcher_num_sms,
+                )
         else:
             # Default to torch experts
             self.experts = GroupedExperts(config, backend=backend)
@@ -597,6 +659,7 @@ class MoE(nn.Module):
                 dtype=config.dtype,
                 activation=config.shared_expert_activation,
                 bias=config.expert_bias,
+                swiglu_limit=config.swiglu_limit,
             )
             if config.shared_expert_gate:
                 self.shared_expert_gate = initialize_linear_module(backend.linear, config.dim, 1, False)

@@ -27,6 +27,8 @@ EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
 
 class AbstractDataset(ABC):
+    """Interface for corpus datasets addressable by document id."""
+
     @abstractmethod
     def get_document_by_id(self, id):
         pass
@@ -37,6 +39,8 @@ class AbstractDataset(ABC):
 
 
 class TextQADataset(AbstractDataset):
+    """Load TextQA corpus documents from a HuggingFace dataset path."""
+
     def __init__(self, path):
         self.path = path
         self.data = load_dataset(path)["train"]
@@ -130,6 +134,7 @@ class CorpusInfo:
 
 
 def load_corpus_metadata(path: str):
+    """Load Merlin corpus metadata from a corpus directory."""
     path_metadata = os.path.join(path, "merlin_metadata.json")
     if not os.path.isfile(path_metadata):
         raise ValueError("Metadata File for Corpus does not exist: " + path_metadata)
@@ -139,6 +144,7 @@ def load_corpus_metadata(path: str):
 
 
 def load_corpus(path, metadata: Optional[dict] = None):
+    """Instantiate a corpus dataset from a path and optional metadata."""
     if metadata is None:
         metadata = load_corpus_metadata(path)
     if metadata["class"] not in DATASETS:
@@ -149,6 +155,7 @@ def load_corpus(path, metadata: Optional[dict] = None):
 
 
 def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
+    """Add one or more corpus paths to a corpus dictionary."""
     if corpus_dict is None:
         raise ValueError("Corpus dictionary is not provided")
     if not isinstance(qa_corpus_paths, list):
@@ -435,6 +442,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     batch_negatives = examples["neg_doc"]
 
     cur_pos_neg_doc_batch = []
+    cur_pos_neg_doc_id_batch = []
 
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
@@ -459,6 +467,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
             cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
+        cur_pos_neg_doc_id_batch.append([d["id"] for d in cur_pos_neg_doc])
 
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []
@@ -505,6 +514,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         "question": questions,
         "doc_text": cur_pos_neg_text_batch,
         "doc_image": cur_pos_neg_image_batch,
+        "doc_id": cur_pos_neg_doc_id_batch,
         "query_instruction": query_instruction_batch,
         "passage_instruction": passage_instruction_batch,
     }

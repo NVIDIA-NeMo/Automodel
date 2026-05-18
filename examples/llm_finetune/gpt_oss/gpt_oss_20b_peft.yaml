@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 512
   local_batch_size: 32
@@ -111,6 +113,18 @@ optimizer:
   lr: 1.0e-4
   weight_decay: 0.0
   # min_lr: 1.0e-5
+
+ci:
+  vllm_deploy: true
+  vllm_smoke_test: true
+  recipe_owner: akoumpa
+  time: "00:15:00"
+  checkpoint_robustness:
+    hf_kl_threshold: 5e-2
+    tokenizer_name: openai/gpt-oss-20b
+    no_check_resume: true
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
 
 # Uncomment and configure for W&B logging
 # wandb:

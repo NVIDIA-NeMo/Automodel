@@ -22,12 +22,12 @@ from unittest.mock import patch
 import pytest
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 from nemo_automodel._transformers.capabilities import (
     _build_class_dict,
     attach_capabilities_and_validate,
     validate_for_mesh,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 
 _PARALLELIZE_PATH = "nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS"
 

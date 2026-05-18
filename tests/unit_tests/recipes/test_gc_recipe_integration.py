@@ -16,8 +16,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.recipes.llm.train_seq_cls import TrainFinetuneRecipeForSequenceClassification
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -28,6 +28,7 @@ class _OneStepScheduler:
         self.epochs = [0]
         self.is_val_step = False
         self.is_ckpt_step = False
+        self.sigterm_flag = False
 
     def set_epoch(self, epoch):
         self.epoch = epoch

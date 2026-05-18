@@ -138,9 +138,7 @@ def test_cross_encoder_collator_labels_from_num_labels():
 
 def test_cross_encoder_collator_pad_to_multiple_of():
     tok = FakeTokenizer()
-    collator = rc.CrossEncoderCollator(
-        rerank_max_length=512, tokenizer=tok, padding=True, pad_to_multiple_of=8
-    )
+    collator = rc.CrossEncoderCollator(rerank_max_length=512, tokenizer=tok, padding=True, pad_to_multiple_of=8)
     batch = [
         {"question": "short", "doc_text": "short"},
         {"question": "this is a much longer query text about many things", "doc_text": "document"},

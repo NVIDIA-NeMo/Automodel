@@ -27,6 +27,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
+HAVE_UCCL_EP = importlib.util.find_spec("uccl") is not None or importlib.util.find_spec("ep") is not None
 HAVE_GMM = importlib.util.find_spec("grouped_gemm") is not None
 
 # ---------------------------------------------------------------------------
@@ -148,7 +149,8 @@ class BackendConfig:
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
             "torch_mm" uses torch._grouped_mm.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP for token dispatch.
+            "deepep" uses DeepEP for token dispatch,
+            "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
         enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
@@ -168,7 +170,14 @@ class BackendConfig:
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm"] = "torch_mm" if torch.cuda.is_available() else "torch"
-    dispatcher: Literal["torch", "deepep"] = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
+        "deepep"
+        if HAVE_DEEP_EP and torch.cuda.is_available()
+        else "uccl_ep"
+        if HAVE_UCCL_EP and torch.cuda.is_available()
+        else "torch"
+    )
+    dispatcher_num_sms: int = 20
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -205,12 +214,13 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        if self.experts in ("te", "gmm") and self.dispatcher != "deepep":
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
                 logger.info(
-                    f"experts='{self.experts}' requires dispatcher='deepep', but got dispatcher='{self.dispatcher}'. "
+                    f"experts='{self.experts}' requires dispatcher='deepep' or 'uccl_ep', "
+                    f"but got dispatcher='{self.dispatcher}'. "
                     "Setting dispatcher to torch and experts to torch_mm."
                 )
             self.dispatcher = "torch"
@@ -222,6 +232,15 @@ class BackendConfig:
                 "te_fp8 requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
             )
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
+    input_dtype = x.dtype
+    x = x.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return (weight * x).to(input_dtype)
 
 
 class Float32RMSNorm(nn.Module):
@@ -240,12 +259,8 @@ class Float32RMSNorm(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    @torch.compile(fullgraph=True, dynamic=True)
     def forward(self, x):
-        input_dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(input_dtype)
+        return _float32_rms_norm_fwd(x, self.weight, self.eps)
 
 
 def initialize_rms_norm_module(
@@ -356,7 +371,10 @@ def _make_lazy_te_patcher():
         _original_grouped_linear_forward = TEGroupedLinear.forward
 
         def _patched_rmsnorm_forward(self, x):
-            if is_tensor_unallocated(x):
+            # Skip the unallocated-tensor short-circuit during torch.compile tracing:
+            # fake tensors used by inductor have data_ptr()==0 but are NOT unallocated --
+            # returning empty_like here produces a leaf with no grad_fn, breaking AOT autograd.
+            if is_tensor_unallocated(x) and not torch.compiler.is_compiling():
                 return torch.empty_like(x)
             return _original_rmsnorm_forward(self, x)
 
@@ -461,11 +479,13 @@ def _has_dtensor_params(model: nn.Module) -> bool:
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
-    """Cast modules matching *fp32_keywords* back to float32.
+    """Cast modules or individual tensors matching *fp32_keywords* back to float32.
 
-    Only safe for unsharded models (plain tensors).  FSDP2 requires uniform
-    dtype within each parameter group, so this must not be called on
-    DTensor-sharded models.
+    Only safe for unsharded models (plain tensors). FSDP2 requires uniform
+    dtype within each parameter group, so this must not be called on DTensor-sharded
+    models. Keywords may name modules (for example ``norm``) or individual
+    parameters (for example ``attn_hc.fn``), matching HuggingFace's strict fp32
+    module declarations.
 
     Args:
         model: The model (already cast to the target dtype).
@@ -474,10 +494,18 @@ def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
     for name, module in model.named_modules():
         if any(kw in name for kw in fp32_keywords):
             module.to(torch.float32)
+    for name, param in model.named_parameters():
+        if any(kw in name for kw in fp32_keywords):
+            param.data = param.data.to(torch.float32)
+    for name, buf in model.named_buffers():
+        if any(kw in name for kw in fp32_keywords):
+            module_name, _, buffer_name = name.rpartition(".")
+            module = model.get_submodule(module_name) if module_name else model
+            module._buffers[buffer_name] = buf.to(torch.float32)
 
 
 def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
-    """Cast only buffers (not parameters) of matching modules back to float32.
+    """Cast only matching buffers (not parameters) back to float32.
 
     Safe for FSDP2-sharded models because buffers are plain tensors, not
     DTensors managed by FSDP2.
@@ -490,6 +518,11 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
         if any(kw in name for kw in fp32_keywords):
             for buf_name, buf in module.named_buffers(recurse=False):
                 module._buffers[buf_name] = buf.to(torch.float32)
+    for name, buf in model.named_buffers():
+        if any(kw in name for kw in fp32_keywords):
+            module_name, _, buffer_name = name.rpartition(".")
+            module = model.get_submodule(module_name) if module_name else model
+            module._buffers[buffer_name] = buf.to(torch.float32)
 
 
 __all__ = [

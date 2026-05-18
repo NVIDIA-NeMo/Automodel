@@ -211,6 +211,3 @@ def test_prepare_qat_model_with_fake_torchao(monkeypatch):
     model2 = SimpleMLP()
     m2, mode2 = qat.prepare_qat_model(model2, fake.Int4WeightOnlyQATQuantizer())
     assert m2 is model2 and mode2 == "4w-qat" and getattr(model2, "quantizer_applied") == "4w"
-
-
-

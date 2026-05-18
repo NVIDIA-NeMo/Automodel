@@ -600,10 +600,12 @@ class IndexedDatasetBuilder(object):
 
 
 def get_idx_path(path_prefix: str) -> str:
+    """Return the index-file path for a Megatron dataset prefix."""
     return path_prefix + ".idx"
 
 
 def get_bin_path(path_prefix: str) -> str:
+    """Return the binary-data path for a Megatron dataset prefix."""
     return path_prefix + ".bin"
 
 

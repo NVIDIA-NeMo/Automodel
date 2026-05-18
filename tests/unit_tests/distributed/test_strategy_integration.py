@@ -65,16 +65,25 @@ def mock_device_mesh():
     """Create a mock device mesh."""
     mesh = MagicMock()
     mesh.device_type = "cuda"
+    mesh.mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
 
     # Mock submeshes
     tp_mesh = MagicMock()
-    dp_mesh = MagicMock()
-
     tp_mesh.size.return_value = 1
+    dp_mesh = MagicMock()
     dp_mesh.size.return_value = 2
+    dp_rep_mesh = MagicMock()
+    dp_rep_mesh.size.return_value = 1
+    dp_shard_cp_mesh = MagicMock()
+    dp_shard_cp_mesh.size.return_value = 2
+
+    # Support get_flat_mesh / get_submesh lookups
+    mesh._get_root_mesh = MagicMock(return_value=mesh)
+    mesh._flatten_mapping = {"dp_shard_cp": dp_shard_cp_mesh}
 
     mesh.__getitem__.side_effect = lambda key: {
         "tp": tp_mesh,
+        "dp_replicate": dp_rep_mesh,
         ("dp_replicate", "dp_shard_cp"): dp_mesh,
     }.get(key, dp_mesh)
 
@@ -99,13 +108,14 @@ def test_strategy_selection_nemotron_model():
     assert not isinstance(strategy, DefaultParallelizationStrategy)
 
 
+@patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
 @patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively")
 @patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers")
 @patch("nemo_automodel.components.distributed.parallelizer._get_parallel_plan")
 def test_backward_compatibility_standard_model(
     mock_get_plan, mock_extract_layers, mock_apply_fsdp, mock_fully_shard,
-    mock_device_mesh
+    mock_gpgr, mock_device_mesh
 ):
     """Test that the refactored code maintains backward compatibility for standard models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
@@ -130,10 +140,11 @@ def test_backward_compatibility_standard_model(
     mock_fully_shard.assert_called()
 
 
+@patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
 @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
 def test_backward_compatibility_nemotron_model(
-    mock_parallelize_module, mock_fully_shard, mock_device_mesh
+    mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh
 ):
     """Test that the refactored code maintains backward compatibility for NemotronH models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
@@ -181,9 +192,10 @@ def test_function_signature_preserved():
 
 def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
     """Test that both model types can be processed without runtime errors."""
-    with patch("nemo_automodel.components.distributed.parallelizer.fully_shard",
-               side_effect=lambda model, **kwargs: model):
-        with patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
+    with patch("torch.distributed.get_process_group_ranks", return_value=[0]), \
+         patch("nemo_automodel.components.distributed.parallelizer.fully_shard",
+               side_effect=lambda model, **kwargs: model), \
+         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
             with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
                 with patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers",
                           return_value=[]):

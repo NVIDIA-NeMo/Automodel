@@ -101,8 +101,7 @@ For a complete training example:
 
 ```bash
 # Run fine-tuning with 2-way pipeline parallelism using Llama 3.1 8B
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
-    --config examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml
 ```
 
 ## Configuration Options
@@ -155,7 +154,7 @@ These two flags switch AutoPipeline to lightweight, pipeline-friendly `forward()
 #### When Should I Change These?
 
 - **Leave both `True` (default)** for standard Hugging Face `AutoModelForCausalLM` / `...ForCausalLM` models. This is the common case and gives the expected behavior: token IDs -> hidden states -> logits across stages.
-- **Set both `False`** when your model already has a pipeline-friendly forward (returns tensors and can accept hidden states when embeddings are absent) or it needs custom kwargs/paths that the HF patch doesn't preserve (common for NeMo AutoModel-native model implementations, packed-sequence/`thd` paths, extra args like `padding_mask`, etc.). Many benchmark configs for NeMo-native models do this (for example `examples/benchmark/configs/qwen3_moe_30b_torch.yaml`).
+- **Set both `False`** when your model already has a pipeline-friendly forward (returns tensors and can accept hidden states when embeddings are absent) or it needs custom kwargs/paths that the HF patch doesn't preserve (common for NeMo AutoModel-native model implementations, packed-sequence/`thd` paths, extra args like `padding_mask`, etc.). Many benchmark configs for NeMo-native models do this (for example `examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml`).
 - **Set `patch_inner_model=False, patch_causal_lm_model=True`** when your inner model is already stage-friendly, but the wrapper forward still returns a `ModelOutput` and you only want the wrapper simplified to “hidden states or logits”.
 
 If you disable `patch_causal_lm_model`, your last stage will typically output hidden states instead of logits; in that case, make sure your `loss_fn` (or your last-stage module) applies the LM head explicitly.
@@ -606,8 +605,7 @@ You can easily add pipeline parallelism to any existing training configuration t
 Add pipeline parallelism to an existing config using command-line arguments:
 
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
-    --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
     --distributed.pipeline.pp_schedule 1f1b \
@@ -617,7 +615,7 @@ uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py \
 ```
 
 Key parameters to override:
-- `--distributed.pp_size`: Number of pipeline stages (must match nproc_per_node)
+- `--distributed.pp_size`: Number of pipeline stages (must match nproc-per-node)
 - `pp_batch_size` is automatically inferred from `--dataloader.batch_size`
 - `--distributed.pipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
 
@@ -646,8 +644,7 @@ distributed:
 
 #### Pipeline + Data Parallelism (4 GPUs Total)
 ```bash
-uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
-    --config your_config.yaml \
+automodel --nproc-per-node=4 your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
     --dataloader.batch_size 16
@@ -655,8 +652,7 @@ uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
 
 #### Pipeline + Tensor Parallelism (4 GPUs Total)
 ```bash
-uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
-    --config your_config.yaml \
+automodel --nproc-per-node=4 your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.tp_size 2 \
     --dataloader.batch_size 8
@@ -664,8 +660,7 @@ uv run torchrun --nproc-per-node=4 examples/llm_finetune/finetune.py \
 
 #### Full Hybrid: PP + DP + TP (8 GPUs Total)
 ```bash
-uv run torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py \
-    --config your_config.yaml \
+automodel --nproc-per-node=8 your_config.yaml \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
     --distributed.tp_size 2 \
@@ -713,7 +708,7 @@ dataloader:
 Run training with:
 ```bash
 # Run with 2 GPUs for 2-way pipeline parallelism
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config config.yaml
+automodel --nproc-per-node=2 config.yaml
 ```
 
 ## Troubleshooting
