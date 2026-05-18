@@ -692,6 +692,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             self.epochs = [0]
             self.is_val_step = False
             self.is_ckpt_step = False
+            self.sigterm_flag = False
 
         def set_epoch(self, epoch):
             self.epoch = epoch

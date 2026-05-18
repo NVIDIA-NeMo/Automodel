@@ -137,6 +137,12 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = target_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
+        # Draft attention backend. Defaults to ``eager`` to preserve the
+        # pre-FA2 numerics. Set ``recipe_args.draft_attn_implementation:
+        # flash_attention_2`` in YAML to opt into FlashAttention for the
+        # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
+        # with the diagonal-extension columns in log space).
+        draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -295,6 +301,12 @@ class TrainEagle3Recipe(BaseRecipe):
             running_steps = 0
             self.optimizer.zero_grad(set_to_none=True)
 
+            # Track batches-seen explicitly so the epoch-summary log below is
+            # well-defined even when the dataloader is empty (e.g. a filter
+            # that drops every sample, or an empty split). Without this the
+            # for-loop never binds ``batch_idx`` and the subsequent
+            # ``batch_idx + 1`` raises ``UnboundLocalError``.
+            batches_seen = 0
             for batch_idx, batch in enumerate(self.train_dataloader):
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 target_batch = self.target_wrapper.generate_batch(
@@ -315,6 +327,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
                 running_steps += 1
+                batches_seen = batch_idx + 1
 
                 if (batch_idx + 1) % self.grad_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
@@ -344,7 +357,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 logger.info(
                     "Epoch %s done: total_batches_seen=%s global_step=%s",
                     epoch,
-                    batch_idx + 1,
+                    batches_seen,
                     self.runtime.global_step,
                 )
 

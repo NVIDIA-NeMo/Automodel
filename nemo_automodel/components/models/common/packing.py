@@ -97,6 +97,25 @@ def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return indices, cu_seqlens, max_seqlen_in_batch
 
 
+def is_indexed_packed_mask(attention_mask: torch.Tensor | None) -> bool:
+    """Return ``True`` iff ``attention_mask`` is an Automodel-style indexed packing mask.
+
+    The Automodel ``neat_packed_vlm_collater`` (and the LLM equivalent) encode
+    packed-sample boundaries by marking document ``i`` (1-based) with the
+    integer ``i`` and using ``0`` for padding (e.g. ``[1, 1, 1, 2, 2, 3, 3, 0, 0]``).
+    Any value greater than ``1`` is therefore a sufficient signal that two or
+    more documents are packed into the same row.  A standard 0/1 attention mask
+    never has values > 1.
+    """
+    if attention_mask is None:
+        return False
+    if attention_mask.dtype == torch.bool:
+        return False
+    if attention_mask.dim() != 2:
+        return False
+    return bool((attention_mask > 1).any().item())
+
+
 def _passthrough_create_causal_mask(
     config=None,
     input_embeds=None,
