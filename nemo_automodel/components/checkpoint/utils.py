@@ -49,6 +49,7 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     """
     non_tied_lm_head_models = {
         "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
+        "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
     }
     model_class_name = type(model).__name__
     for m in non_tied_lm_head_models:
