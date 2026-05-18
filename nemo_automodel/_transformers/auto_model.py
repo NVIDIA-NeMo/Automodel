@@ -1083,3 +1083,27 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     """
 
     _ENCODER_CLS_NAME = "CrossEncoderModel"
+
+
+# ── Factory identity ─────────────────────────────────────────────────────
+# Predicate used by the Engine + recipe wrappers to detect whether a config's
+# ``_target_`` (or already-resolved callable) is one of our ``NeMoAutoModelFor*``
+# ``from_config`` / ``from_pretrained`` classmethods. The NeMoAutoModelFor*
+# entry points apply distributed / PEFT / quantization / FP8 / compile / MoE
+# infrastructure internally; bare model factories don't.
+
+NEMO_AUTO_FACTORIES: frozenset = frozenset({
+    NeMoAutoModelForCausalLM.from_config,
+    NeMoAutoModelForCausalLM.from_pretrained,
+    NeMoAutoModelForSequenceClassification.from_config,
+    NeMoAutoModelForSequenceClassification.from_pretrained,
+    NeMoAutoModelForImageTextToText.from_config,
+    NeMoAutoModelForImageTextToText.from_pretrained,
+    NeMoAutoModelForMultimodalLM.from_config,
+    NeMoAutoModelForMultimodalLM.from_pretrained,
+})
+
+
+def is_nemo_auto_factory(target) -> bool:
+    """``True`` if ``target`` is a NeMoAutoModelFor* ``from_*`` classmethod."""
+    return target in NEMO_AUTO_FACTORIES

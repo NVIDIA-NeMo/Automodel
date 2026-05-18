@@ -31,6 +31,7 @@ Tier conventions (informal — duck-typed):
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext as _nullcontext
 from dataclasses import dataclass
@@ -86,9 +87,8 @@ class LRSchedulerConfig:
 
 
 class Engine:
-    """Training engine. TorchTitan-style: ``__init__`` owns construction —
-    mesh + model + optimizer + lr_scheduler are all built eagerly from the
-    :class:`Engine.Config`.
+    """Training engine. ``__init__`` owns construction — mesh + model +
+    optimizer + lr_scheduler are all built eagerly from the :class:`Engine.Config`.
 
     Usage::
 
@@ -134,8 +134,6 @@ class Engine:
         fp8: Any = None                         # ConfigNode (translated to FP8Config)
         compile: Any = None                     # ConfigNode (translated to CompileConfig)
         qat: Any = None                         # ConfigNode (translated to QATConfig)
-        moe: Any = None                         # MoEParallelizerConfig OR ConfigNode
-        pipeline: Any = None                    # PipelineConfig (sourced from mesh)
         sdpa_method: list[str] | None = None
         has_packed_sequence: bool = False
         unfreeze_modules: list[str] | None = None
@@ -160,10 +158,7 @@ class Engine:
         # LLM training uses this for MTP (Multi-Token Prediction) auxiliary loss.
         extra_loss_fn: Callable[..., torch.Tensor | None] | None = None
 
-    # ── Construction (TorchTitan-style: eager in __init__) ───────────
-
-    # Set of NeMoAutoModelFor* factories — populated lazily.
-    _NEMO_AUTO_TARGETS: frozenset = frozenset()
+    # ── Construction ─────────────────────────────────────────────────
 
     def __init__(self, config: "Engine.Config"):
         self.config = config
@@ -196,11 +191,14 @@ class Engine:
         # 2. Build model via the typed component builder; do cfg→typed
         #    translation inline so the legacy build_model wrapper at the recipe
         #    layer is no longer needed.
+        from nemo_automodel._transformers.auto_model import is_nemo_auto_factory
+        from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
         model_factory, model_kwargs = _callable_and_kwargs(self.config.model)
         self.model = _build_model_typed(
             model_factory=model_factory,
             model_kwargs=model_kwargs,
-            is_nemo_auto_model=self._is_nemo_automodel_target(model_factory),
+            is_nemo_auto_model=is_nemo_auto_factory(model_factory),
             peft_config=self.config.peft,
             seed=self.config.seed,
             has_packed_sequence=self.config.has_packed_sequence,
@@ -208,11 +206,11 @@ class Engine:
             compile_config=self._build_compile_config(),
             quantization_config=self._build_quantization_config(),
             qat_config=self._build_qat_config(),
-            moe_config=self._resolve_moe_config(),
+            moe_config=MoEParallelizerConfig.coerce(getattr(self.mesh, "moe_config", None)),
             device_mesh=getattr(self.mesh, "device_mesh", None),
             moe_mesh=getattr(self.mesh, "moe_mesh", None),
             distributed_config=getattr(self.mesh, "strategy_config", None),
-            pipeline_config=getattr(self.mesh, "pipeline_config", None) or self.config.pipeline,
+            pipeline_config=getattr(self.mesh, "pipeline_config", None),
             activation_checkpointing=(
                 getattr(self.mesh, "activation_checkpointing", False) or self.config.activation_checkpointing
             ),
@@ -271,27 +269,6 @@ class Engine:
 
     # ── Internal cfg→typed translators (called from _construct) ───────
 
-    def _is_nemo_automodel_target(self, target) -> bool:
-        if not Engine._NEMO_AUTO_TARGETS:
-            from nemo_automodel._transformers import (
-                NeMoAutoModelForCausalLM,
-                NeMoAutoModelForImageTextToText,
-                NeMoAutoModelForMultimodalLM,
-                NeMoAutoModelForSequenceClassification,
-            )
-
-            Engine._NEMO_AUTO_TARGETS = frozenset({
-                NeMoAutoModelForCausalLM.from_config,
-                NeMoAutoModelForCausalLM.from_pretrained,
-                NeMoAutoModelForSequenceClassification.from_config,
-                NeMoAutoModelForSequenceClassification.from_pretrained,
-                NeMoAutoModelForImageTextToText.from_config,
-                NeMoAutoModelForImageTextToText.from_pretrained,
-                NeMoAutoModelForMultimodalLM.from_config,
-                NeMoAutoModelForMultimodalLM.from_pretrained,
-            })
-        return target in Engine._NEMO_AUTO_TARGETS
-
     def _build_fp8_config(self):
         from nemo_automodel.components.quantization.fp8 import build_fp8_config
 
@@ -322,27 +299,10 @@ class Engine:
         return None
 
     def _resolve_freeze_config(self):
-        """Coerce ``Engine.Config.freeze_config`` to a plain dict, or None."""
         cfg_freeze = self.config.freeze_config
-        if cfg_freeze is None:
-            return None
-        if isinstance(cfg_freeze, dict):
+        if cfg_freeze is None or isinstance(cfg_freeze, dict):
             return cfg_freeze
         return cfg_freeze.to_dict()
-
-    def _resolve_moe_config(self):
-        """Accept either ``MoEParallelizerConfig``, a ConfigNode, or None."""
-        from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-        cfg_moe = getattr(self.mesh, "moe_config", None) or self.config.moe
-        if cfg_moe is None:
-            return None
-        if isinstance(cfg_moe, MoEParallelizerConfig):
-            return cfg_moe
-        moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
-        moe_dict.pop("activation_checkpointing", None)
-        moe_dict.pop("_target_", None)
-        return MoEParallelizerConfig(**moe_dict)
 
     def _build_lr_scheduler(self, optimizer: torch.optim.Optimizer) -> OptimizerParamScheduler | None:
         """Construct an :class:`OptimizerParamScheduler` from the typed config."""
@@ -664,7 +624,7 @@ class Engine:
         )
 
         grad_norm_val = float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
-        ok = bool(torch.isfinite(torch.tensor(grad_norm_val)))
+        ok = math.isfinite(grad_norm_val)
         if ok:
             self.optimizer.step()
         else:

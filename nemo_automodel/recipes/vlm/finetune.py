@@ -71,31 +71,6 @@ from nemo_automodel.components.training.build import build_vlm_model as _build_v
 from nemo_automodel.vlm_engine import chunk_vlm_media as _chunk_vlm_media  # noqa: E402, F401
 
 
-_NEMO_AUTOMODEL_VLM_TARGETS = None  # lazy
-
-
-def _is_nemo_automodel_vlm_target(target):
-    global _NEMO_AUTOMODEL_VLM_TARGETS
-    if _NEMO_AUTOMODEL_VLM_TARGETS is None:
-        from nemo_automodel._transformers import (
-            NeMoAutoModelForCausalLM,
-            NeMoAutoModelForImageTextToText,
-            NeMoAutoModelForMultimodalLM,
-        )
-
-        _NEMO_AUTOMODEL_VLM_TARGETS = frozenset(
-            {
-                NeMoAutoModelForImageTextToText.from_config,
-                NeMoAutoModelForImageTextToText.from_pretrained,
-                NeMoAutoModelForMultimodalLM.from_config,
-                NeMoAutoModelForMultimodalLM.from_pretrained,
-                NeMoAutoModelForCausalLM.from_config,
-                NeMoAutoModelForCausalLM.from_pretrained,
-            }
-        )
-    return target in _NEMO_AUTOMODEL_VLM_TARGETS
-
-
 def build_model(
     cfg_model,
     cfg_freeze,
@@ -116,24 +91,15 @@ def build_model(
     component expects. Validates the model target is a NeMoAutoModelFor*
     classmethod (VLM requires NeMoAutoModel — no fallback path).
     """
+    from nemo_automodel._transformers.auto_model import is_nemo_auto_factory
     from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
     target = cfg_model.get("_target_", None)
-    if not _is_nemo_automodel_vlm_target(target):
+    if not is_nemo_auto_factory(target):
         raise ValueError(
             f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
             f"Got model target: {target}"
         )
-
-    if cfg_moe is None:
-        moe_config = None
-    elif isinstance(cfg_moe, MoEParallelizerConfig):
-        moe_config = cfg_moe
-    else:
-        moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
-        moe_dict.pop("activation_checkpointing", None)
-        moe_dict.pop("_target_", None)
-        moe_config = MoEParallelizerConfig(**moe_dict)
 
     return _build_vlm_model_impl(
         model_factory=cfg_model.instantiate,
@@ -143,11 +109,11 @@ def build_model(
         freeze_config=cfg_freeze.to_dict() if cfg_freeze is not None else None,
         fp8_config=build_fp8_config(cfg_fp8) if cfg_fp8 is not None else None,
         compile_config=build_compile_config(cfg_compile) if cfg_compile is not None else None,
+        moe_config=MoEParallelizerConfig.coerce(cfg_moe),
         device_mesh=device_mesh,
         moe_mesh=moe_mesh,
         distributed_config=distributed_config,
         pipeline_config=pipeline_config,
-        moe_config=moe_config,
         activation_checkpointing=activation_checkpointing,
     )
 
@@ -264,9 +230,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        # Construct VLMEngine — TorchTitan-style: __init__ builds mesh + model +
-        # optimizer. Recipe keeps the existing lr_scheduler path (driven by
-        # step_scheduler), so we pass lr_scheduler=None and attach it later.
+        # lr_scheduler is built later from step_scheduler; attach to engine after.
         from nemo_automodel.engine import Engine
         from nemo_automodel.vlm_engine import VLMEngine
 
@@ -361,8 +325,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
-        # VLMEngine was constructed earlier (eager build of mesh + model + optimizer).
-        # Attach the recipe-built lr_scheduler and the CP/FP8 shaping params.
         self.engine.lr_scheduler = (
             self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
         )

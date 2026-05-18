@@ -36,6 +36,18 @@ class MoEParallelizerConfig:
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
+    @classmethod
+    def coerce(cls, cfg: Any) -> Optional["MoEParallelizerConfig"]:
+        """Accept a ``MoEParallelizerConfig``, a ConfigNode/dict, or None."""
+        if cfg is None:
+            return None
+        if isinstance(cfg, cls):
+            return cfg
+        d = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
+        d.pop("activation_checkpointing", None)
+        d.pop("_target_", None)
+        return cls(**d)
+
 
 @dataclass(kw_only=True)
 class MoEConfig:

@@ -100,30 +100,6 @@ from nemo_automodel.components.loss.mtp import calculate_mtp_loss  # noqa: E402,
 from nemo_automodel.components.training.build import build_model as _build_model_impl  # noqa: E402
 
 
-_NEMO_AUTOMODEL_LLM_TARGETS = None  # lazy
-
-
-def _is_nemo_automodel_llm_target(target):
-    """``True`` if ``target`` is one of the ``NeMoAutoModelForCausalLM`` /
-    ``NeMoAutoModelForSequenceClassification`` ``from_*`` classmethods."""
-    global _NEMO_AUTOMODEL_LLM_TARGETS
-    if _NEMO_AUTOMODEL_LLM_TARGETS is None:
-        from nemo_automodel._transformers import (
-            NeMoAutoModelForCausalLM,
-            NeMoAutoModelForSequenceClassification,
-        )
-
-        _NEMO_AUTOMODEL_LLM_TARGETS = frozenset(
-            {
-                NeMoAutoModelForCausalLM.from_config,
-                NeMoAutoModelForCausalLM.from_pretrained,
-                NeMoAutoModelForSequenceClassification.from_config,
-                NeMoAutoModelForSequenceClassification.from_pretrained,
-            }
-        )
-    return target in _NEMO_AUTOMODEL_LLM_TARGETS
-
-
 def build_model(
     cfg_model,
     cfg_peft,
@@ -142,12 +118,8 @@ def build_model(
     unfreeze_modules: list[str] | None = None,
     sdpa_method: list[str] | None = None,
 ):
-    """Recipe-layer wrapper around the typed :func:`components.training.build.build_model`.
-
-    Translates recipe ``cfg_*`` ConfigNodes / configs into the typed kwargs the
-    component expects. Lives here (not in components/) because the YAML-shaped
-    coupling belongs at the recipe layer.
-    """
+    """Recipe-layer wrapper translating ``cfg_*`` ConfigNodes into the typed
+    kwargs that :func:`components.training.build.build_model` expects."""
     fp8_config = build_fp8_config(cfg_fp8) if cfg_fp8 is not None else None
     compile_config = build_compile_config(cfg_compile) if cfg_compile is not None else None
 
@@ -167,10 +139,13 @@ def build_model(
         elif (quantizer_attr := getattr(cfg_qat, "quantizer", None)) is not None:
             qat_config = quantizer_attr.instantiate()
 
+    from nemo_automodel._transformers.auto_model import is_nemo_auto_factory
+    from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
     return _build_model_impl(
         model_factory=cfg_model.instantiate,
         model_kwargs={},
-        is_nemo_auto_model=_is_nemo_automodel_llm_target(cfg_model.get("_target_", None)),
+        is_nemo_auto_model=is_nemo_auto_factory(cfg_model.get("_target_", None)),
         peft_config=cfg_peft,
         seed=seed,
         has_packed_sequence=has_packed_sequence,
@@ -182,25 +157,13 @@ def build_model(
         distributed_config=distributed_config,
         pipeline_config=pipeline_config,
         qat_config=qat_config,
-        moe_config=_coerce_moe_config(cfg_moe),
+        moe_config=MoEParallelizerConfig.coerce(cfg_moe),
         activation_checkpointing=activation_checkpointing,
         unfreeze_modules=unfreeze_modules,
         sdpa_method=sdpa_method,
     )
 
 
-def _coerce_moe_config(moe_config):
-    """Accept either ``MoEParallelizerConfig`` or a ConfigNode-shaped dict."""
-    if moe_config is None:
-        return None
-    from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-    if isinstance(moe_config, MoEParallelizerConfig):
-        return moe_config
-    moe_dict = moe_config.to_dict() if hasattr(moe_config, "to_dict") else dict(moe_config)
-    moe_dict.pop("activation_checkpointing", None)
-    moe_dict.pop("_target_", None)
-    return MoEParallelizerConfig(**moe_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -348,10 +311,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        # Construct Engine — TorchTitan-style: __init__ builds mesh + model +
-        # optimizer + lr_scheduler. Recipe keeps the existing lr_scheduler path
-        # (driven by step_scheduler), so we pass lr_scheduler=None here and
-        # attach it post-step_scheduler-construction below.
+        # lr_scheduler is built later from step_scheduler; attach to engine after.
         from nemo_automodel.engine import Engine
 
         self.engine = Engine(Engine.Config(
@@ -496,8 +456,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
-        # Engine was constructed earlier (eager build of mesh + model + optimizer).
-        # Attach the recipe-built lr_scheduler and the CP/THD/FP8 shaping params.
         self.engine.lr_scheduler = (
             self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
         )
