@@ -341,6 +341,7 @@ def test_load_checkpoint_autodetect_failure_has_helpful_message(tmp_path, monkey
 
     msg = str(exc.value)
     assert "Failed to load an auto-detected checkpoint" in msg
+    assert f"checkpoint_dir={str(tmp_path)!r}" in msg
     assert "use a different checkpoint.checkpoint_dir or remove the existing checkpoint" in msg
     assert "To resume, make sure the current command matches the saved run." in msg
 
