@@ -71,6 +71,20 @@ def test_shallow_model_with_explicit_aux_layer_ids_is_allowed():
     assert target.aux_layer_ids == [0, 2, 4]
 
 
+def test_explicit_aux_layer_ids_raises_when_count_does_not_match_recipe():
+    model = _build_tiny_target(num_hidden_layers=8)
+    with pytest.raises(ValueError, match="exactly 3 aux_layer_ids"):
+        HFEagle3TargetModel(model, aux_layer_ids=[1, 3])
+    with pytest.raises(ValueError, match="exactly 3 aux_layer_ids"):
+        HFEagle3TargetModel(model, aux_layer_ids=[0, 2, 4, 6])
+
+
+def test_explicit_aux_layer_ids_raises_when_not_distinct():
+    model = _build_tiny_target(num_hidden_layers=8)
+    with pytest.raises(ValueError, match="must be distinct"):
+        HFEagle3TargetModel(model, aux_layer_ids=[1, 3, 3])
+
+
 def test_generate_batch_aux_hidden_states_shape_and_layer_capture():
     """``aux_hidden_states`` must be the per-layer hiddens concatenated along H.
 
@@ -133,14 +147,5 @@ def test_generate_batch_shifts_logits_input_ids_and_loss_mask():
 
 def test_generate_batch_raises_for_out_of_bounds_aux_layer_id():
     model = _build_tiny_target(num_hidden_layers=4)
-    target = HFEagle3TargetModel(model, aux_layer_ids=[1, 2, 99])
-
-    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids)
-    loss_mask = torch.ones_like(input_ids)
-    try:
-        target.generate_batch(input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask)
-    except ValueError as exc:
-        assert "out of bounds" in str(exc)
-    else:
-        raise AssertionError("expected ValueError for out-of-bounds aux layer id")
+    with pytest.raises(ValueError, match="out of bounds"):
+        HFEagle3TargetModel(model, aux_layer_ids=[1, 2, 99])

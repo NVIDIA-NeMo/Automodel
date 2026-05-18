@@ -51,7 +51,8 @@ class HFEagle3TargetModel:
 
     def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None):
         self.model = model.eval()
-        self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids is not None else self._default_aux_layer_ids()
+        candidate_ids = list(aux_layer_ids) if aux_layer_ids is not None else self._default_aux_layer_ids()
+        self.aux_layer_ids = self._validate_aux_layer_ids(candidate_ids)
 
     def _default_aux_layer_ids(self) -> list[int]:
         # EAGLE-3 default 3-layer recipe (low / mid / high).
@@ -74,6 +75,25 @@ class HFEagle3TargetModel:
                 f"draft model's num_aux_hidden_states)."
             )
         return candidates
+
+    def _validate_aux_layer_ids(self, aux_layer_ids: Sequence[int]) -> list[int]:
+        """Validate aux-layer selection before any forward hooks are registered."""
+        num_layers = self.model.config.num_hidden_layers
+        aux_layer_ids = list(aux_layer_ids)
+        if len(aux_layer_ids) != 3:
+            raise ValueError(
+                f"EAGLE-3 expects exactly 3 aux_layer_ids, but got {len(aux_layer_ids)}: "
+                f"{aux_layer_ids}. This must match the draft model's num_aux_hidden_states."
+            )
+        if len(set(aux_layer_ids)) != len(aux_layer_ids):
+            raise ValueError(
+                f"EAGLE-3 aux_layer_ids must be distinct, but got {aux_layer_ids}. "
+                "Duplicate ids would collapse the captured aux hidden states."
+            )
+        for layer_id in aux_layer_ids:
+            if layer_id < 0 or layer_id >= num_layers:
+                raise ValueError(f"aux layer id {layer_id} is out of bounds for model with {num_layers} layers")
+        return aux_layer_ids
 
     def _get_transformer_layers(self) -> Iterable[nn.Module]:
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
