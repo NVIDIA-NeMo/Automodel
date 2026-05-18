@@ -827,8 +827,6 @@ class NeMoAutoModelForCausalLM(_BaseNeMoAutoModelClass, AutoModelForCausalLM):
     functional model.
 
 
-    TODO(@akoumpa): extend this beyond liger_kernel.
-
     Notes:
     -----
     - No changes are made to the model's public API; forward signatures,
@@ -856,8 +854,6 @@ class NeMoAutoModelForImageTextToText(_BaseNeMoAutoModelClass, AutoModelForImage
     retried once with ``use_liger_kernel=False`` so that users still obtain a
     functional model.
 
-
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
 
     Notes:
     -----
