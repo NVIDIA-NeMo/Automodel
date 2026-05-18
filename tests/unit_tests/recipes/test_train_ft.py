@@ -111,7 +111,9 @@ def test_build_validation_dataloader_collects_and_names_properly():
 
     expected_names = {"default", "val", "test", "foo"}
 
-    with patch("nemo_automodel.components.datasets.llm.build.build_dataloader", return_value=("dl", "tok")) as mock_build:
+    with patch(
+        "nemo_automodel.components.datasets.llm.build.build_dataloader", return_value=("dl", "tok")
+    ) as mock_build:
         result = build_validation_dataloader(cfg, dp_world_size=4, dp_rank=1, pp_enabled=False)
 
     # Assert keys are correctly generated

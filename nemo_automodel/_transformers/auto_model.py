@@ -1092,16 +1092,18 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
 # entry points apply distributed / PEFT / quantization / FP8 / compile / MoE
 # infrastructure internally; bare model factories don't.
 
-NEMO_AUTO_FACTORIES: frozenset = frozenset({
-    NeMoAutoModelForCausalLM.from_config,
-    NeMoAutoModelForCausalLM.from_pretrained,
-    NeMoAutoModelForSequenceClassification.from_config,
-    NeMoAutoModelForSequenceClassification.from_pretrained,
-    NeMoAutoModelForImageTextToText.from_config,
-    NeMoAutoModelForImageTextToText.from_pretrained,
-    NeMoAutoModelForMultimodalLM.from_config,
-    NeMoAutoModelForMultimodalLM.from_pretrained,
-})
+NEMO_AUTO_FACTORIES: frozenset = frozenset(
+    {
+        NeMoAutoModelForCausalLM.from_config,
+        NeMoAutoModelForCausalLM.from_pretrained,
+        NeMoAutoModelForSequenceClassification.from_config,
+        NeMoAutoModelForSequenceClassification.from_pretrained,
+        NeMoAutoModelForImageTextToText.from_config,
+        NeMoAutoModelForImageTextToText.from_pretrained,
+        NeMoAutoModelForMultimodalLM.from_config,
+        NeMoAutoModelForMultimodalLM.from_pretrained,
+    }
+)
 
 
 def is_nemo_auto_factory(target) -> bool:

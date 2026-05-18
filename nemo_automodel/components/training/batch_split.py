@@ -56,10 +56,7 @@ def split_into_microbatches(batch: dict[str, Any], num_microbatches: int) -> lis
         return [batch] * num_microbatches
 
     if batch_dim_size < num_microbatches:
-        raise ValueError(
-            f"Cannot split a batch of size {batch_dim_size} into "
-            f"{num_microbatches} microbatches."
-        )
+        raise ValueError(f"Cannot split a batch of size {batch_dim_size} into {num_microbatches} microbatches.")
 
     # Compute chunk sizes (roughly equal; remainder pushed to the front).
     base, rem = divmod(batch_dim_size, num_microbatches)

@@ -36,7 +36,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 
-
 # ── Rank derivation from MeshContext ──────────────────────────────────
 
 

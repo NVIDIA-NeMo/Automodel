@@ -44,7 +44,7 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.training.rng import ScopedRNG
 
 if TYPE_CHECKING:
-    from torch.optim import Optimizer
+    pass
 
 logger = logging.getLogger(__name__)
 

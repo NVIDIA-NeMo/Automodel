@@ -810,9 +810,7 @@ class BaseRecipe:
             try:
                 for part in model_parts:
                     _qat_disable_fn(part)
-                logging.info(
-                    "QAT fake-quant disabled initially; will enable after %s steps", _qat_enable_after
-                )
+                logging.info("QAT fake-quant disabled initially; will enable after %s steps", _qat_enable_after)
             except Exception as e:
                 logging.warning("Failed to disable fake-quant at setup: %s", e)
         return _qat_disable_fn, _qat_enable_fn, _qat_enable_after

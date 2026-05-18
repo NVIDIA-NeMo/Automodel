@@ -28,13 +28,11 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 
 # ── Shared fixtures ──────────────────────────────────────────────────
 
@@ -64,20 +62,22 @@ def tiny_model_engine(dist_env):
     """Build an Engine wrapping a tiny manually-constructed nn.Linear model."""
     from nemo_automodel.engine import Engine
 
-    engine = Engine(Engine.Config(
-        model=None,
-        distributed=SimpleNamespace(),         # not used — we skip build()
-        optimizer=SimpleNamespace(),
-        lr_scheduler=None,
-        max_grad_norm=1.0,
-    ))
+    engine = Engine(
+        Engine.Config(
+            model=None,
+            distributed=SimpleNamespace(),  # not used — we skip build()
+            optimizer=SimpleNamespace(),
+            lr_scheduler=None,
+            max_grad_norm=1.0,
+        )
+    )
 
     # Manually populate state — same as what build() would leave behind,
     # minus the real model/distributed plumbing.
     model = nn.Linear(8, 8)
     engine.model = model
     engine.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    engine.mesh = None   # no mesh → Engine falls back to safe defaults
+    engine.mesh = None  # no mesh → Engine falls back to safe defaults
     return engine
 
 
@@ -88,18 +88,20 @@ def test_lr_scheduler_direct_construction(dist_env):
     """The fix bypasses recipes.build_lr_scheduler; verify the direct path works."""
     from nemo_automodel.engine import Engine, LRSchedulerConfig
 
-    engine = Engine(Engine.Config(
-        model=None,
-        distributed=SimpleNamespace(),
-        optimizer=SimpleNamespace(),
-        lr_scheduler=LRSchedulerConfig(
-            total_steps=100,
-            lr_warmup_steps=10,
-            lr_decay_style="cosine",
-            init_lr_ratio=0.1,
-            min_lr_ratio=0.01,
-        ),
-    ))
+    engine = Engine(
+        Engine.Config(
+            model=None,
+            distributed=SimpleNamespace(),
+            optimizer=SimpleNamespace(),
+            lr_scheduler=LRSchedulerConfig(
+                total_steps=100,
+                lr_warmup_steps=10,
+                lr_decay_style="cosine",
+                init_lr_ratio=0.1,
+                min_lr_ratio=0.01,
+            ),
+        )
+    )
 
     model = nn.Linear(4, 4)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
@@ -116,12 +118,14 @@ def test_lr_scheduler_direct_construction(dist_env):
 def test_lr_scheduler_none_when_cfg_missing(dist_env):
     from nemo_automodel.engine import Engine
 
-    engine = Engine(Engine.Config(
-        model=None,
-        distributed=SimpleNamespace(),
-        optimizer=SimpleNamespace(),
-        lr_scheduler=None,
-    ))
+    engine = Engine(
+        Engine.Config(
+            model=None,
+            distributed=SimpleNamespace(),
+            optimizer=SimpleNamespace(),
+            lr_scheduler=None,
+        )
+    )
     assert engine._build_lr_scheduler(torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1)) is None
 
 
@@ -129,11 +133,14 @@ def test_lr_scheduler_warmup_ratio(dist_env):
     """Warmup steps can be specified as a ratio of total_steps."""
     from nemo_automodel.engine import Engine, LRSchedulerConfig
 
-    engine = Engine(Engine.Config(
-        model=None, distributed=SimpleNamespace(),
-        optimizer=SimpleNamespace(),
-        lr_scheduler=LRSchedulerConfig(total_steps=200, lr_warmup_steps_ratio=0.05),
-    ))
+    engine = Engine(
+        Engine.Config(
+            model=None,
+            distributed=SimpleNamespace(),
+            optimizer=SimpleNamespace(),
+            lr_scheduler=LRSchedulerConfig(total_steps=200, lr_warmup_steps_ratio=0.05),
+        )
+    )
     model = nn.Linear(2, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
     scheduler = engine._build_lr_scheduler(optimizer)
@@ -174,11 +181,15 @@ def forward_engine(dist_env):
     """Engine wired to the TinyLossModel — exercises forward_backward end-to-end."""
     from nemo_automodel.engine import Engine
 
-    engine = Engine(Engine.Config(
-        model=None, distributed=SimpleNamespace(),
-        optimizer=SimpleNamespace(), lr_scheduler=None,
-        max_grad_norm=1.0,
-    ))
+    engine = Engine(
+        Engine.Config(
+            model=None,
+            distributed=SimpleNamespace(),
+            optimizer=SimpleNamespace(),
+            lr_scheduler=None,
+            max_grad_norm=1.0,
+        )
+    )
     model = _TinyLossModel()
     engine.model = model
     engine.optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
@@ -237,10 +248,7 @@ def test_optimizer_step_clips_and_steps(forward_engine):
     ok, grad_norm = forward_engine.optimizer_step()
     assert ok is True
     assert grad_norm >= 0
-    moved = any(
-        not torch.allclose(before[n], p.detach())
-        for n, p in forward_engine.model.named_parameters()
-    )
+    moved = any(not torch.allclose(before[n], p.detach()) for n, p in forward_engine.model.named_parameters())
     assert moved, "optimizer_step did not update any parameters"
 
 
@@ -249,10 +257,7 @@ def test_optimizer_step_clips_and_steps(forward_engine):
 
 def test_forward_backward_accepts_list_of_batches(forward_engine):
     """Engine accepts a pre-split list[dict] instead of a single batch + n."""
-    batches = [
-        {"input_ids": torch.randint(0, 16, (2, 8)), "labels": torch.randint(0, 16, (2, 8))}
-        for _ in range(3)
-    ]
+    batches = [{"input_ids": torch.randint(0, 16, (2, 8)), "labels": torch.randint(0, 16, (2, 8))} for _ in range(3)]
     out = forward_engine.forward_backward(batches, num_microbatches=1)  # n ignored when list
     assert torch.is_tensor(out["loss"])
     assert len(out["losses"]) == 3
@@ -270,17 +275,24 @@ def test_moe_aux_loss_scale_set_when_moe_cfg_present(dist_env):
 
     MoEAuxLossAutoScaler.main_loss_backward_scale = None
 
-    engine = Engine(Engine.Config(
-        model=None, distributed=SimpleNamespace(),
-        optimizer=SimpleNamespace(), lr_scheduler=None,
-    ))
+    engine = Engine(
+        Engine.Config(
+            model=None,
+            distributed=SimpleNamespace(),
+            optimizer=SimpleNamespace(),
+            lr_scheduler=None,
+        )
+    )
     model = _TinyLossModel()
     engine.model = model
     engine.optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
     # mesh.moe_config presence is what gates the aux-loss scale logic.
     engine.mesh = SimpleNamespace(
-        device_mesh=None, moe_mesh=None, moe_config=object(),
-        strategy_config=None, pipeline_config=None,
+        device_mesh=None,
+        moe_mesh=None,
+        moe_config=object(),
+        strategy_config=None,
+        pipeline_config=None,
     )
 
     batch = {"input_ids": torch.randint(0, 16, (4, 8)), "labels": torch.randint(0, 16, (4, 8))}

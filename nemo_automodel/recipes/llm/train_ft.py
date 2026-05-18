@@ -31,29 +31,23 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch.nn as nn
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+from transformers import AutoConfig  # noqa: F401 — patched by recipe PP tests
 
 from nemo_automodel._transformers.mfu import AutoMFU
-from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.loggers.comet_utils import build_comet
-from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import (
     MetricsSample,
     build_metric_logger,
     log_training_metrics,
     log_validation_metrics,
 )
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
@@ -63,19 +57,14 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     resolve_trust_remote_code,  # noqa: F401 — patched by recipe tests
 )
-from transformers import AutoConfig  # noqa: F401 — patched by recipe PP tests
 from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
     build_loss_fn,
     build_lr_scheduler,
-    build_mlflow,
     build_optimizer,  # noqa: F401 — re-exported for sibling recipes (kd.py) + tests
     build_step_scheduler,
-    build_wandb,
 )
-from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
     pass
@@ -167,8 +156,6 @@ def build_model(
         unfreeze_modules=unfreeze_modules,
         sdpa_method=sdpa_method,
     )
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -287,22 +274,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # lr_scheduler is built later from step_scheduler; attach to engine after.
         from nemo_automodel.engine import Engine
 
-        self.engine = Engine(Engine.Config(
-            model=self.cfg.model,
-            distributed=self.dist_setup,
-            optimizer=self.cfg.optimizer,
-            lr_scheduler=None,
-            peft=self.peft_config,
-            fp8=self.cfg.get("fp8", None),
-            compile=self.cfg.get("compile", None),
-            quantization=self.cfg.get("quantization", None),
-            qat=self.cfg.get("qat", None),
-            sdpa_method=self.cfg.get("sdpa_method", None),
-            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-            seed=self.cfg.get("seed", 42),
-            max_grad_norm=self.max_grad_norm,
-            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-        ))
+        self.engine = Engine(
+            Engine.Config(
+                model=self.cfg.model,
+                distributed=self.dist_setup,
+                optimizer=self.cfg.optimizer,
+                lr_scheduler=None,
+                peft=self.peft_config,
+                fp8=self.cfg.get("fp8", None),
+                compile=self.cfg.get("compile", None),
+                quantization=self.cfg.get("quantization", None),
+                qat=self.cfg.get("qat", None),
+                sdpa_method=self.cfg.get("sdpa_method", None),
+                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                seed=self.cfg.get("seed", 42),
+                max_grad_norm=self.max_grad_norm,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+        )
         model = self.engine.model
         self.optimizer = [self.engine.optimizer]
 
@@ -433,13 +422,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
         )
         # CP/THD shaping for the recipe's model + dataloader combo.
-        self.engine.cp_use_te = (
-            _uses_te_dot_product_attention(self.model_parts[0]) and _uses_thd_collater(self.cfg.dataloader)
+        self.engine.cp_use_te = _uses_te_dot_product_attention(self.model_parts[0]) and _uses_thd_collater(
+            self.cfg.dataloader
         )
         self.engine.cp_padding_token_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
         self.engine.cp_num_chunks = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         # FP8 autocast (TE) — engine wraps forward in this context when set.
         self.engine.fp8_autocast = self.te_fp8.maybe_te_autocast if self.te_fp8 is not None else None
+
         # MTP (Multi-Token Prediction) auxiliary loss — kicks in only when the
         # model emits mtp_per_depth_h. Closure captures self.loss_fn so MTP
         # depths use the same loss class as the main path.
@@ -455,8 +445,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 scaling_factor=out.mtp_loss_scaling_factor,
                 num_label_tokens=num_label_tokens,
             )
-        self.engine.extra_loss_fn = _mtp_extra_loss
 
+        self.engine.extra_loss_fn = _mtp_extra_loss
 
     # ------------------ main loop ------------------
     def run_train_validation_loop(self):
@@ -552,7 +542,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             opt.zero_grad()
 
         result = self.engine.forward_backward(
-            batches, loss_fn=self.loss_fn, num_label_tokens=num_label_tokens,
+            batches,
+            loss_fn=self.loss_fn,
+            num_label_tokens=num_label_tokens,
         )
         loss_buffer = result["losses"]
 

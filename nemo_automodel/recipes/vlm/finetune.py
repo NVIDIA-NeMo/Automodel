@@ -34,24 +34,26 @@ import torch
 import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
-from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.shared.te_patches import apply_te_patches
+# Re-exports (back-compat for vlm/kd.py and external test imports).
+# Builders/helpers were moved out of this recipe in the engine refactor.
+from nemo_automodel._transformers.auto_tokenizer import _get_model_name  # noqa: E402, F401
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed import build_distributed
+from nemo_automodel.components.datasets.vlm.build import (  # noqa: E402, F401
+    build_vlm_dataloader as build_dataloader,
+)
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import (
     MetricsSample,
     build_metric_logger,
     log_training_metrics,
     log_validation_metrics,
 )
-from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.calculate import calculate_loss  # noqa: E402, F401
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.build import build_model as _build_model_impl  # noqa: E402
 from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
@@ -61,19 +63,8 @@ from nemo_automodel.recipes._component_builders import (
     build_lr_scheduler,
     build_optimizer,  # noqa: F401 — re-exported for vlm/kd.py + tests
     build_step_scheduler,
-    build_wandb,
 )
-from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-
-# Re-exports (back-compat for vlm/kd.py and external test imports).
-# Builders/helpers were moved out of this recipe in the engine refactor.
-from nemo_automodel._transformers.auto_tokenizer import _get_model_name  # noqa: E402, F401
-from nemo_automodel.components.datasets.vlm.build import (  # noqa: E402, F401
-    build_vlm_dataloader as build_dataloader,
-)
-from nemo_automodel.components.loss.calculate import calculate_loss  # noqa: E402, F401
-from nemo_automodel.components.training.build import build_model as _build_model_impl  # noqa: E402
 from nemo_automodel.vlm_engine import chunk_vlm_media as _chunk_vlm_media  # noqa: E402, F401
 
 
@@ -100,10 +91,7 @@ def build_model(
 
     target = cfg_model.get("_target_", None)
     if not is_nemo_auto_factory(target):
-        raise ValueError(
-            f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
-            f"Got model target: {target}"
-        )
+        raise ValueError(f"VLM finetuning requires NeMoAutoModelForImageTextToText. Got model target: {target}")
 
     return _build_model_impl(
         model_factory=cfg_model.instantiate,
@@ -121,6 +109,7 @@ def build_model(
         pipeline_config=pipeline_config,
         activation_checkpointing=activation_checkpointing,
     )
+
 
 if TYPE_CHECKING:
     pass
@@ -222,19 +211,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
         from nemo_automodel.engine import Engine
         from nemo_automodel.vlm_engine import VLMEngine
 
-        self.engine = VLMEngine(Engine.Config(
-            model=self.cfg.model,
-            distributed=self.dist_setup,
-            optimizer=self.cfg.optimizer,
-            lr_scheduler=None,
-            peft=self.peft_config,
-            fp8=self.cfg.get("fp8", None),
-            compile=self.cfg.get("compile", None),
-            freeze_config=self.cfg.get("freeze_config", None),
-            seed=self.cfg.get("seed", 42),
-            max_grad_norm=self.max_grad_norm,
-            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-        ))
+        self.engine = VLMEngine(
+            Engine.Config(
+                model=self.cfg.model,
+                distributed=self.dist_setup,
+                optimizer=self.cfg.optimizer,
+                lr_scheduler=None,
+                peft=self.peft_config,
+                fp8=self.cfg.get("fp8", None),
+                compile=self.cfg.get("compile", None),
+                freeze_config=self.cfg.get("freeze_config", None),
+                seed=self.cfg.get("seed", 42),
+                max_grad_norm=self.max_grad_norm,
+                defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+            )
+        )
         model = self.engine.model
         self.optimizer = [self.engine.optimizer]
 
@@ -423,7 +414,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             opt.zero_grad(set_to_none=True)
 
         result = self.engine.forward_backward(
-            batches, loss_fn=self.loss_fn, num_label_tokens=num_label_tokens,
+            batches,
+            loss_fn=self.loss_fn,
+            num_label_tokens=num_label_tokens,
         )
         loss_buffer = result["losses"]
 
@@ -507,7 +500,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
     @torch.no_grad()
-
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
         log_validation_metrics(
             log_data,

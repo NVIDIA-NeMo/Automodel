@@ -49,10 +49,7 @@ def _to_dict(cfg: Any) -> dict:
         return cfg.to_dict()
     if dataclasses.is_dataclass(cfg):
         return dataclasses.asdict(cfg)
-    raise TypeError(
-        f"Cannot coerce {type(cfg).__name__} to dict. "
-        "Pass a dict, ConfigNode, or dataclass."
-    )
+    raise TypeError(f"Cannot coerce {type(cfg).__name__} to dict. Pass a dict, ConfigNode, or dataclass.")
 
 
 def init_distributed_and_build_mesh(
@@ -86,8 +83,7 @@ def init_distributed_and_build_mesh(
 
     dist_env = dict(dist_env_cfg or {})
     dist_info = build_distributed(
-        {"backend": dist_env.get("backend", "nccl"),
-         "timeout_minutes": dist_env.get("timeout_minutes", 1)}
+        {"backend": dist_env.get("backend", "nccl"), "timeout_minutes": dist_env.get("timeout_minutes", 1)}
     )
 
     cfg_dict = _to_dict(distributed_cfg)

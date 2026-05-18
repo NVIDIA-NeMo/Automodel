@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext as _nullcontext
+from contextlib import contextmanager
+from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,13 +43,23 @@ import torch.nn as nn
 
 from nemo_automodel.components.checkpoint.api import (
     export_weights as _export_weights,
+)
+from nemo_automodel.components.checkpoint.api import (
     load_checkpoint as _load_checkpoint,
+)
+from nemo_automodel.components.checkpoint.api import (
     save_checkpoint as _save_checkpoint,
 )
 from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+
+# ``_target_`` resolution lives in the config-loader layer
+# (nemo_automodel.components.config.loader); we import the canonical helper
+# rather than duplicating it here.
+from nemo_automodel.components.config.loader import target_and_kwargs as _callable_and_kwargs  # noqa: E402
 from nemo_automodel.components.distributed.build import init_distributed_and_build_mesh
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.device import offload as _offload, onload as _onload
+from nemo_automodel.components.distributed.device import offload as _offload
+from nemo_automodel.components.distributed.device import onload as _onload
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -64,12 +75,6 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
-
-
-# ``_target_`` resolution lives in the config-loader layer
-# (nemo_automodel.components.config.loader); we import the canonical helper
-# rather than duplicating it here.
-from nemo_automodel.components.config.loader import target_and_kwargs as _callable_and_kwargs  # noqa: E402
 
 
 @dataclass
@@ -124,20 +129,20 @@ class Engine:
         """
 
         # ── Build inputs (sub-configs from YAML, translated by Engine) ──
-        model: Any = None                       # ConfigNode with _target_
-        distributed: Any = None                 # MeshContext OR distributed dict
-        optimizer: Any = None                   # ConfigNode with _target_
+        model: Any = None  # ConfigNode with _target_
+        distributed: Any = None  # MeshContext OR distributed dict
+        optimizer: Any = None  # ConfigNode with _target_
         lr_scheduler: LRSchedulerConfig | None = None
-        dist_env: Any = None                    # {backend, timeout_minutes}
-        peft: Any = None                        # already-instantiated PEFT config
-        quantization: Any = None                # ConfigNode (translated to BnbConfig)
-        fp8: Any = None                         # ConfigNode (translated to FP8Config)
-        compile: Any = None                     # ConfigNode (translated to CompileConfig)
-        qat: Any = None                         # ConfigNode (translated to QATConfig)
+        dist_env: Any = None  # {backend, timeout_minutes}
+        peft: Any = None  # already-instantiated PEFT config
+        quantization: Any = None  # ConfigNode (translated to BnbConfig)
+        fp8: Any = None  # ConfigNode (translated to FP8Config)
+        compile: Any = None  # ConfigNode (translated to CompileConfig)
+        qat: Any = None  # ConfigNode (translated to QATConfig)
         sdpa_method: list[str] | None = None
         has_packed_sequence: bool = False
         unfreeze_modules: list[str] | None = None
-        freeze_config: Any = None               # VLM freeze rules; translated to dict
+        freeze_config: Any = None  # VLM freeze rules; translated to dict
 
         # ── Behavior toggles ─────────────────────────────────────────
         activation_checkpointing: bool = False
@@ -185,7 +190,8 @@ class Engine:
             self.mesh = self.config.distributed
         else:
             _dist_info, self.mesh = init_distributed_and_build_mesh(
-                self.config.distributed, dist_env_cfg=self.config.dist_env,
+                self.config.distributed,
+                dist_env_cfg=self.config.dist_env,
             )
 
         # 2. Build model via the typed component builder; do cfg→typed
@@ -238,34 +244,56 @@ class Engine:
     # ── Convenience accessors ────────────────────────────────────────
 
     @property
-    def max_grad_norm(self): return self.config.max_grad_norm
+    def max_grad_norm(self):
+        return self.config.max_grad_norm
+
     @max_grad_norm.setter
-    def max_grad_norm(self, value): self.config.max_grad_norm = value
+    def max_grad_norm(self, value):
+        self.config.max_grad_norm = value
 
     @property
-    def defer_fsdp_grad_sync(self): return self.config.defer_fsdp_grad_sync
+    def defer_fsdp_grad_sync(self):
+        return self.config.defer_fsdp_grad_sync
 
     @property
-    def cp_use_te(self): return self.config.cp_use_te
+    def cp_use_te(self):
+        return self.config.cp_use_te
+
     @cp_use_te.setter
-    def cp_use_te(self, v): self.config.cp_use_te = v
-    @property
-    def cp_padding_token_id(self): return self.config.cp_padding_token_id
-    @cp_padding_token_id.setter
-    def cp_padding_token_id(self, v): self.config.cp_padding_token_id = v
-    @property
-    def cp_num_chunks(self): return self.config.cp_num_chunks
-    @cp_num_chunks.setter
-    def cp_num_chunks(self, v): self.config.cp_num_chunks = v
+    def cp_use_te(self, v):
+        self.config.cp_use_te = v
 
     @property
-    def fp8_autocast(self): return self.config.fp8_autocast
-    @fp8_autocast.setter
-    def fp8_autocast(self, v): self.config.fp8_autocast = v
+    def cp_padding_token_id(self):
+        return self.config.cp_padding_token_id
+
+    @cp_padding_token_id.setter
+    def cp_padding_token_id(self, v):
+        self.config.cp_padding_token_id = v
+
     @property
-    def extra_loss_fn(self): return self.config.extra_loss_fn
+    def cp_num_chunks(self):
+        return self.config.cp_num_chunks
+
+    @cp_num_chunks.setter
+    def cp_num_chunks(self, v):
+        self.config.cp_num_chunks = v
+
+    @property
+    def fp8_autocast(self):
+        return self.config.fp8_autocast
+
+    @fp8_autocast.setter
+    def fp8_autocast(self, v):
+        self.config.fp8_autocast = v
+
+    @property
+    def extra_loss_fn(self):
+        return self.config.extra_loss_fn
+
     @extra_loss_fn.setter
-    def extra_loss_fn(self, v): self.config.extra_loss_fn = v
+    def extra_loss_fn(self, v):
+        self.config.extra_loss_fn = v
 
     # ── Internal cfg→typed translators (called from _construct) ───────
 
@@ -441,11 +469,16 @@ class Engine:
             # Move batch to device (tensors and dict-of-tensors values both).
             mb = {
                 k: (
-                    v.to(device, non_blocking=True) if isinstance(v, torch.Tensor)
+                    v.to(device, non_blocking=True)
+                    if isinstance(v, torch.Tensor)
                     else (
-                        {dk: (dv.to(device, non_blocking=True) if isinstance(dv, torch.Tensor) else dv)
-                         for dk, dv in v.items() if dv is not None}
-                        if isinstance(v, dict) else v
+                        {
+                            dk: (dv.to(device, non_blocking=True) if isinstance(dv, torch.Tensor) else dv)
+                            for dk, dv in v.items()
+                            if dv is not None
+                        }
+                        if isinstance(v, dict)
+                        else v
                     )
                 )
                 for k, v in mb.items()
@@ -457,7 +490,8 @@ class Engine:
 
             # CP / THD reshaping. `train_ctx()` is the CP attention context.
             train_ctx, mb = make_cp_batch_and_ctx(
-                device_mesh, mb,
+                device_mesh,
+                mb,
                 use_te=self.cp_use_te,
                 padding_token_id=self.cp_padding_token_id,
                 num_chunks=self.cp_num_chunks,
@@ -479,8 +513,7 @@ class Engine:
                     # a no-op.
                     mb = self._pre_pp_schedule_hook(mb, pp=pp, input_ids=input_ids)
                     pp_batch = {
-                        k: v for k, v in mb.items()
-                        if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                        k: v for k, v in mb.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                     }
                     schedule_fn = pp.info.schedule.step if is_train else pp.info.schedule.eval
                     if pp.info.has_first_stage:
@@ -497,7 +530,8 @@ class Engine:
             model = self.parts[0]
             sync_ctx = (
                 get_sync_ctx(model, is_last, defer_fsdp_grad_sync=self.defer_fsdp_grad_sync)
-                if is_train else _nullcontext()
+                if is_train
+                else _nullcontext()
             )
             fp8_ctx = self.fp8_autocast() if self.fp8_autocast is not None else _nullcontext()
             with train_ctx(), sync_ctx, fp8_ctx:
@@ -540,7 +574,10 @@ class Engine:
                 # Optional extra loss term (e.g. MTP for DeepSeek-V3 models).
                 if self.extra_loss_fn is not None:
                     extra = self.extra_loss_fn(
-                        out=out, model=model, labels=labels, num_label_tokens=num_label_tokens,
+                        out=out,
+                        model=model,
+                        labels=labels,
+                        num_label_tokens=num_label_tokens,
                     )
                     if extra is not None:
                         loss = loss + extra
@@ -555,7 +592,7 @@ class Engine:
         loss_tensor = torch.stack(losses).mean() if losses else torch.tensor(0.0, device=device)
         return {
             "loss": loss_tensor,
-            "losses": losses,                       # per-microbatch detached losses
+            "losses": losses,  # per-microbatch detached losses
             "metrics": {"loss": float(loss_tensor)},
         }
 
@@ -669,14 +706,23 @@ class Engine:
 
     def save_checkpoint(self, path: str, *, ckpt_cfg: CheckpointingConfig, **kw) -> None:
         _save_checkpoint(
-            self.model, self.optimizer, self.lr_scheduler,
-            mesh=self.mesh, path=path, config=ckpt_cfg, **kw,
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            mesh=self.mesh,
+            path=path,
+            config=ckpt_cfg,
+            **kw,
         )
 
     def load_checkpoint(self, path: str, *, ckpt_cfg: CheckpointingConfig) -> None:
         _load_checkpoint(
-            self.model, self.optimizer, self.lr_scheduler,
-            mesh=self.mesh, path=path, config=ckpt_cfg,
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            mesh=self.mesh,
+            path=path,
+            config=ckpt_cfg,
         )
 
     # ── Weight export (RL-ready tier) ────────────────────────────────
@@ -698,13 +744,19 @@ class Engine:
         """Move model / optimizer / grad to ``device`` (``"cpu"`` or ``"cuda"``)."""
         if device == "cpu":
             _offload(
-                self.model, self.optimizer,
-                model_to_cpu=model, optimizer_to_cpu=optimizer, drop_grad=grad,
+                self.model,
+                self.optimizer,
+                model_to_cpu=model,
+                optimizer_to_cpu=optimizer,
+                drop_grad=grad,
             )
         else:
             _onload(
-                self.model, self.optimizer, device,
-                model_to_device=model, optimizer_to_device=optimizer,
+                self.model,
+                self.optimizer,
+                device,
+                model_to_device=model,
+                optimizer_to_device=optimizer,
             )
 
 

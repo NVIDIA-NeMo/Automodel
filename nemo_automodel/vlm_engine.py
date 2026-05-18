@@ -117,7 +117,8 @@ def chunk_vlm_media(
             image_grid_chunks.append(image_grid[:0])
         logger.warning(
             "VLM chunking: n_images=%d != batch_size=%d, giving all images to first microbatch",
-            n_images, batch_size,
+            n_images,
+            batch_size,
         )
 
     return pixel_values_chunks, image_grid_chunks
@@ -196,7 +197,10 @@ class VLMEngine(Engine):
         batch_size = input_ids.shape[0]
 
         pixel_values_chunks, image_grid_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size, n_microbatches,
+            pixel_values,
+            image_grid,
+            batch_size,
+            n_microbatches,
             n_images_per_sample=n_images_per_sample,
         )
 

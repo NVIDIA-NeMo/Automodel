@@ -279,7 +279,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     # loop → MoE aux-loss scale → prepare_after_first_microbatch
                     # → prepare_for_final_backward.
                     fb_result = self.engine.forward_backward(
-                        batches, loss_fn=self.loss_fn, num_label_tokens=None,
+                        batches,
+                        loss_fn=self.loss_fn,
+                        num_label_tokens=None,
                     )
                     loss_buffer = fb_result["losses"]
                 torch.cuda.nvtx.range_pop()
