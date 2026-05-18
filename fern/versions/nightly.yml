@@ -311,7 +311,7 @@ navigation:
       - page: "Run on a Cluster"
         path: ./nightly/pages/launcher/slurm.mdx
         slug: slurm-cluster
-      - page: "Run with NeMo-Run"
+      - page: "Run with NeMo Run"
         path: ./nightly/pages/launcher/nemo-run.mdx
         slug: nemo-run
       - page: "Run on Any Cloud with SkyPilot"
