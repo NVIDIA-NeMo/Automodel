@@ -105,7 +105,6 @@ class Eagle3TrainerModule(nn.Module):
         running_valid = hidden_states.new_zeros(())
 
         cur_input_ids = input_ids
-        cur_loss_mask = loss_mask
         cur_position_mask = position_mask
         cur_target_probs = target_probs
         cur_hidden_states = hidden_states
@@ -147,7 +146,6 @@ class Eagle3TrainerModule(nn.Module):
 
             if step_idx + 1 < self.ttt_steps:
                 cur_input_ids = _shift_left_with_zero(cur_input_ids)
-                cur_loss_mask = _shift_left_with_zero(cur_loss_mask)
                 cur_position_mask = _shift_left_with_zero(cur_position_mask)
                 cur_target_probs = _shift_left_with_zero(cur_target_probs)
 
