@@ -276,19 +276,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             get_rope_index=get_rope_index,
         )
 
-        # Build validation dataloader if the config provides it
-        self.val_dataloader = None
-        if "validation_dataset" in self.cfg:
-            self.val_dataloader, _ = build_dataloader(
-                self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
-                _get_model_name(self.cfg.model),
-                self.cfg.get("processor", None),
-                device_mesh=self.device_mesh,
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                get_rope_index=get_rope_index,
-            )
+        from nemo_automodel.components.datasets.vlm.build import build_validation_dataloader
+
+        self.val_dataloaders = build_validation_dataloader(
+            self.cfg,
+            device_mesh=self.device_mesh,
+            pretrained_model_name_or_path=_get_model_name(self.cfg.model),
+            get_rope_index=get_rope_index,
+        )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
@@ -312,9 +307,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.metric_logger_train = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
         )
-        self.metric_logger_valid = build_metric_logger(
-            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
-        )
+        self.metric_logger_valid = {
+            name: build_metric_logger(
+                pathlib.Path(self.checkpointer.config.checkpoint_dir)
+                / (f"validation_{name}.jsonl" if name != "default" else "validation.jsonl")
+            )
+            for name in self.val_dataloaders.keys()
+        }
 
         # Optionally resume
         self.load_checkpoint(restore_from)
@@ -356,14 +355,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.log_train_metrics(log_data)
                     self._update_progress_bar(pbar, log_data.metrics)
 
-                    val_loss = {}
-                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
                         if self.pp_enabled:
                             logger.warning("Validation is not supported for pipeline parallelism")
                         else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
+                            for val_name, val_dataloader in self.val_dataloaders.items():
+                                val_log_data = self._run_validation_epoch(val_dataloader)
+                                val_losses[val_name] = val_log_data.metrics["val_loss"]
+                                self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
                         for mp in self.model_parts:
                             mp.train()
 
@@ -382,7 +382,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
-        self.metric_logger_valid.close()
+        for v in self.metric_logger_valid.values():
+            v.close()
 
         self.checkpointer.close()
 
@@ -543,12 +544,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             },
         )
 
-    def log_val_metrics(self, log_data):
+    def log_val_metrics(self, val_name, log_data, metric_logger=None):
         log_validation_metrics(
             log_data,
             is_main=self.dist_env.is_main,
-            metric_logger=self.metric_logger_valid,
+            val_name=val_name,
+            metric_logger=metric_logger,
             wandb_run=wandb.run,
+            mlflow_logger=self.mlflow_logger,
+            comet_logger=self.comet_logger,
         )
 
     def log_train_metrics(self, log_data) -> None:

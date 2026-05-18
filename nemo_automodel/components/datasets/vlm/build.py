@@ -228,4 +228,45 @@ def build_vlm_dataloader(
         ), processor
 
 
-__all__ = ["build_vlm_dataloader"]
+def build_validation_dataloader(
+    cfg,
+    *,
+    device_mesh,
+    pretrained_model_name_or_path: str,
+    get_rope_index=None,
+) -> dict:
+    """Build VLM validation dataloaders from ``validation_dataset*`` cfg entries.
+
+    Mirrors the LLM-side helper: scans ``cfg.to_dict().keys()`` for any key
+    starting with ``validation_dataset`` (e.g. ``validation_dataset``,
+    ``validation_dataset_val``, ``validation_dataset-test``,
+    ``validation_dataset.foo``) and builds one DataLoader per entry, keyed by
+    the suffix (``default`` for the bare key)."""
+
+    def _prepare_val_ds_name(val_ds_name):
+        val_ds_name = val_ds_name.replace("validation_dataset", "")
+        if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
+            val_ds_name = val_ds_name[1:]
+        if val_ds_name == "":
+            val_ds_name = "default"
+        return val_ds_name
+
+    val_dataloaders = {}
+    for val_ds_name in filter(lambda x: x.startswith("validation_dataset"), cfg.to_dict().keys()):
+        val_ds_cfg = cfg.get(val_ds_name, None)
+        val_ds_name = _prepare_val_ds_name(val_ds_name)
+        val_dataloaders[val_ds_name] = build_vlm_dataloader(
+            val_ds_cfg,
+            cfg.validation_dataloader,
+            pretrained_model_name_or_path,
+            cfg.get("processor", None),
+            device_mesh=device_mesh,
+            seed=cfg.get("seed", 42),
+            local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
+            get_rope_index=get_rope_index,
+        )[0]
+
+    return val_dataloaders
+
+
+__all__ = ["build_validation_dataloader", "build_vlm_dataloader"]
