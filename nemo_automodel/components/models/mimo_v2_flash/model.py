@@ -674,7 +674,6 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             hidden = hidden[:, logits_to_keep, :]
         return self.lm_head(hidden)
 
-    @torch.no_grad()
     def customize_pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
@@ -692,6 +691,7 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     modules.append(fqn)
         return stage_modules
 
+    @torch.no_grad()
     def initialize_weights(
         self,
         buffer_device: torch.device | None = None,
