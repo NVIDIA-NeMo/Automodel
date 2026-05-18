@@ -532,11 +532,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
                 f"(n_passages > 1). Provide negatives."
             )
         cur_corpus_id = corpus_ids[i_example]
-        if (
-            num_neg_docs > 0
-            and len(negatives) < num_neg_docs
-            and cur_corpus_id not in _OVERSAMPLING_WARNED_CORPORA
-        ):
+        if num_neg_docs > 0 and len(negatives) < num_neg_docs and cur_corpus_id not in _OVERSAMPLING_WARNED_CORPORA:
             _OVERSAMPLING_WARNED_CORPORA.add(cur_corpus_id)
             logging.warning(
                 f"corpus_id={cur_corpus_id}: a sample has only {len(negatives)} negatives "
