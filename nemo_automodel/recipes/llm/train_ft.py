@@ -189,27 +189,6 @@ def build_model(
     )
 
 
-def _resolve_lr_scheduler_config(cfg_lr):
-    """Translate the recipe's ``lr_scheduler:`` ConfigNode into a typed
-    :class:`LRSchedulerConfig` for the Engine. Returns ``None`` if not set."""
-    if cfg_lr is None:
-        return None
-    from nemo_automodel.engine import LRSchedulerConfig
-
-    total = cfg_lr.get("total_steps", cfg_lr.get("lr_decay_steps", None))
-    if total is None:
-        raise ValueError("lr_scheduler must include 'total_steps' (or 'lr_decay_steps').")
-    return LRSchedulerConfig(
-        total_steps=int(total),
-        lr_warmup_steps=int(cfg_lr.get("lr_warmup_steps", 0) or 0),
-        lr_warmup_steps_ratio=float(cfg_lr.get("lr_warmup_steps_ratio", 0.0) or 0.0),
-        lr_decay_style=cfg_lr.get("lr_decay_style", "cosine"),
-        init_lr_ratio=float(cfg_lr.get("init_lr_ratio", 0.1)),
-        min_lr_ratio=float(cfg_lr.get("min_lr_ratio", 0.01)),
-        wd_incr_style=cfg_lr.get("wd_incr_style", "constant"),
-    )
-
-
 def _coerce_moe_config(moe_config):
     """Accept either ``MoEParallelizerConfig`` or a ConfigNode-shaped dict."""
     if moe_config is None:

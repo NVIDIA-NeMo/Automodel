@@ -145,15 +145,6 @@ def test_lr_scheduler_warmup_ratio(dist_env):
     assert optimizer.param_groups[0]["lr"] > 0
 
 
-def test_lr_scheduler_missing_total_steps_raises():
-    """The recipe-layer resolver rejects cfg without ``total_steps``."""
-    from nemo_automodel.components.config.loader import ConfigNode
-    from nemo_automodel.recipes.llm.train_ft import _resolve_lr_scheduler_config
-
-    with pytest.raises(ValueError, match="total_steps"):
-        _resolve_lr_scheduler_config(ConfigNode({"lr_warmup_steps": 10}))
-
-
 # ── forward_backward — manual model path ─────────────────────────────
 
 
