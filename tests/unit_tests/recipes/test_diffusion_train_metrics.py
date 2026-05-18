@@ -93,6 +93,207 @@ def test_calculate_throughput_metrics_clamps_invalid_inputs():
     assert metrics["log_window_samples"] == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("bf16", torch.bfloat16),
+        ("torch.float32", torch.float32),
+        ("unknown", "unknown"),
+        (0.125, 0.125),
+    ],
+)
+def test_normalize_optimizer_value_converts_dtype_aliases(value, expected):
+    assert diffusion_train._normalize_optimizer_value(value) == expected
+
+
+def test_resolve_optimizer_class_handles_default_callable_and_imported_targets(monkeypatch):
+    class CustomOptimizer:
+        pass
+
+    def fake_safe_import_from(module_name, symbol_name, msg):
+        assert module_name == "custom.optim"
+        assert symbol_name == "CustomOptimizer"
+        assert "custom.optim.CustomOptimizer" in msg
+        return True, CustomOptimizer
+
+    monkeypatch.setattr(diffusion_train, "safe_import_from", fake_safe_import_from)
+
+    assert diffusion_train._resolve_optimizer_class("torch.optim.AdamW") is torch.optim.AdamW
+    assert diffusion_train._resolve_optimizer_class(CustomOptimizer) is CustomOptimizer
+    assert diffusion_train._resolve_optimizer_class("custom.optim.CustomOptimizer") is CustomOptimizer
+
+
+@pytest.mark.parametrize("target", ["AdamW", object()])
+def test_resolve_optimizer_class_rejects_invalid_targets(target):
+    with pytest.raises(ValueError, match="Optimizer target must be"):
+        diffusion_train._resolve_optimizer_class(target)
+
+
+def test_resolve_optimizer_class_raises_when_import_fails(monkeypatch):
+    monkeypatch.setattr(diffusion_train, "safe_import_from", lambda *_args, **_kwargs: (False, None))
+
+    with pytest.raises(ImportError, match="could not be imported"):
+        diffusion_train._resolve_optimizer_class("missing.optim.CustomOptimizer")
+
+
+def test_filter_optimizer_kwargs_keeps_only_supported_parameters():
+    class OptimizerWithoutKwargs:
+        def __init__(self, params, lr=0.1, *, beta=0.9):
+            self.params = params
+            self.lr = lr
+            self.beta = beta
+
+    optimizer_kwargs = {"lr": 0.01, "beta": 0.95, "weight_decay": 0.1}
+
+    assert diffusion_train._filter_optimizer_kwargs(
+        "custom.OptimizerWithoutKwargs", OptimizerWithoutKwargs, optimizer_kwargs
+    ) == {"lr": 0.01, "beta": 0.95}
+
+
+def test_filter_optimizer_kwargs_passes_all_kwargs_when_target_accepts_var_kwargs():
+    class OptimizerWithKwargs:
+        def __init__(self, params, **kwargs):
+            self.params = params
+            self.kwargs = kwargs
+
+    optimizer_kwargs = {"lr": 0.01, "weight_decay": 0.1}
+
+    assert (
+        diffusion_train._filter_optimizer_kwargs("custom.OptimizerWithKwargs", OptimizerWithKwargs, optimizer_kwargs)
+        is optimizer_kwargs
+    )
+
+
+def test_filter_optimizer_kwargs_passes_all_kwargs_when_signature_cannot_be_inspected(monkeypatch):
+    optimizer_kwargs = {"lr": 0.01, "weight_decay": 0.1}
+
+    def raise_value_error(_target):
+        raise ValueError("no signature")
+
+    monkeypatch.setattr(diffusion_train.inspect, "signature", raise_value_error)
+
+    assert (
+        diffusion_train._filter_optimizer_kwargs("custom.NoSignature", object(), optimizer_kwargs) is optimizer_kwargs
+    )
+
+
+def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch):
+    class DelayedScaling:
+        def __init__(self, *, amax_history_len, amax_compute_algo):
+            self.amax_history_len = amax_history_len
+            self.amax_compute_algo = amax_compute_algo
+
+    class Float8CurrentScaling:
+        pass
+
+    class MXFP8BlockScaling:
+        pass
+
+    recipe_classes = {
+        "DelayedScaling": DelayedScaling,
+        "Float8CurrentScaling": Float8CurrentScaling,
+        "MXFP8BlockScaling": MXFP8BlockScaling,
+    }
+
+    def fake_safe_import_from(module_name, symbol_name, msg):
+        assert module_name == "transformer_engine.common.recipe"
+        assert "Transformer Engine" in msg
+        return True, recipe_classes[symbol_name]
+
+    monkeypatch.setattr(diffusion_train, "safe_import_from", fake_safe_import_from)
+
+    delayed = diffusion_train._build_transformer_engine_fp8_recipe(
+        "delayed-scaling",
+        amax_history_len=32,
+        amax_compute_algo="max",
+    )
+    current = diffusion_train._build_transformer_engine_fp8_recipe(
+        "current",
+        amax_history_len=32,
+        amax_compute_algo="max",
+    )
+    mxfp8 = diffusion_train._build_transformer_engine_fp8_recipe(
+        "mx",
+        amax_history_len=32,
+        amax_compute_algo="max",
+    )
+
+    assert isinstance(delayed, DelayedScaling)
+    assert delayed.amax_history_len == 32
+    assert delayed.amax_compute_algo == "max"
+    assert isinstance(current, Float8CurrentScaling)
+    assert isinstance(mxfp8, MXFP8BlockScaling)
+
+
+def test_build_transformer_engine_fp8_recipe_rejects_unknown_recipe():
+    with pytest.raises(ValueError, match="must be one of"):
+        diffusion_train._build_transformer_engine_fp8_recipe(
+            "unknown",
+            amax_history_len=32,
+            amax_compute_algo="max",
+        )
+
+
+def test_build_transformer_engine_fp8_recipe_requires_optional_dependency(monkeypatch):
+    monkeypatch.setattr(diffusion_train, "safe_import_from", lambda *_args, **_kwargs: (False, None))
+
+    with pytest.raises(ImportError, match="DelayedScaling"):
+        diffusion_train._build_transformer_engine_fp8_recipe(
+            "delayed",
+            amax_history_len=32,
+            amax_compute_algo="max",
+        )
+
+
+def test_resolve_transformer_engine_autocast_returns_imported_context_manager(monkeypatch):
+    autocast = object()
+
+    def fake_safe_import_from(module_name, symbol_name, msg):
+        assert module_name == "transformer_engine.pytorch.quantization"
+        assert symbol_name == "autocast"
+        assert "autocast" in msg
+        return True, autocast
+
+    monkeypatch.setattr(diffusion_train, "safe_import_from", fake_safe_import_from)
+
+    assert diffusion_train._resolve_transformer_engine_autocast() is autocast
+
+
+def test_resolve_transformer_engine_autocast_requires_optional_dependency(monkeypatch):
+    monkeypatch.setattr(diffusion_train, "safe_import_from", lambda *_args, **_kwargs: (False, None))
+
+    with pytest.raises(ImportError, match="autocast"):
+        diffusion_train._resolve_transformer_engine_autocast()
+
+
+def test_transformer_engine_fp8_context_returns_nullcontext_when_disabled():
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.transformer_engine_fp8 = False
+
+    with recipe._transformer_engine_fp8_context():
+        pass
+
+
+def test_transformer_engine_fp8_context_calls_transformer_engine_autocast():
+    recipe = object.__new__(TrainDiffusionRecipe)
+    context = MagicMock()
+    context.__enter__.return_value = None
+    context.__exit__.return_value = None
+    recipe.transformer_engine_fp8 = True
+    recipe._te_fp8_autocast = MagicMock(return_value=context)
+    recipe._te_fp8_recipe = "recipe"
+    recipe._te_fp8_group = "group"
+
+    with recipe._transformer_engine_fp8_context():
+        pass
+
+    recipe._te_fp8_autocast.assert_called_once_with(
+        enabled=True,
+        recipe="recipe",
+        amax_reduction_group="group",
+    )
+
+
 class _TinyTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -139,6 +340,10 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
             "fsdp2_forward_prefetch_depth": 3,
         },
         attention_backend="flash",
+        transformer_engine_linear=True,
+        transformer_engine_fp8_safe_only=True,
+        fuse_qkv_projections=True,
+        compact_fused_qkv_projections=True,
         optimizer_cfg={
             "weight_decay": 0.25,
             "betas": [0.8, 0.95],
@@ -159,6 +364,10 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert manager_args["enable_fsdp2_prefetch"] is False
     assert manager_args["fsdp2_backward_prefetch_depth"] == 4
     assert manager_args["fsdp2_forward_prefetch_depth"] == 3
+    assert calls["transformer_engine_linear"] is True
+    assert calls["transformer_engine_fp8_safe_only"] is True
+    assert calls["fuse_qkv_projections"] is True
+    assert calls["compact_fused_qkv_projections"] is True
     assert pipe.transformer.attention_backend == "flash"
     assert device_mesh == "mesh"
     assert optimizer.defaults["lr"] == pytest.approx(0.125)
@@ -332,6 +541,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.check_loss = True
     recipe.clip_grad_max_norm = 0.5
     recipe.grad_clip_foreach = False
+    recipe.transformer_engine_fp8 = False
     recipe.peft_cfg = None
     recipe.log_every = 1
     recipe._elapsed_seconds_since = MagicMock(return_value=(2.0, 10.0))
