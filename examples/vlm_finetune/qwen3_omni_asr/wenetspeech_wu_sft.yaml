@@ -14,6 +14,10 @@
 
 # Full-FT Wu Chinese ASR of Qwen3-Omni-30B-A3B-Instruct on yuekai/WenetSpeech_Wu_1k.
 #
+# The ``_1k`` in the dataset name is 1000 *hours* of Wu Chinese (the
+# WenetSpeech naming convention), not 1000 samples; the HF size_categories
+# tag is ``100K<n<1M`` (hundreds of thousands of utterances).
+#
 # Schedule:
 #   * No system turn; the user turn carries an explicit Shanghainese / Wu
 #     transcription instruction followed by the audio.
@@ -21,27 +25,39 @@
 #     Vision tower is frozen (the recipe never feeds images).
 #   * WandB enabled by default; override project/entity/save_dir via env vars
 #     WANDB_PROJECT / WANDB_ENTITY / WANDB_DIR.
-#   * Checkpoints land under result/checkpoints/... every 100 steps (consolidated
+#   * Checkpoints every 200 steps under result/checkpoints/... (consolidated
 #     HF safetensors; result/ is gitignored).
+#
+# Measured profile on 8x H100 80GB (same model + same parallelism as AMI):
+#   ~1.4 step/s steady-state, ~7500 tps, peak ~36-40 GB / GPU
+#   One Wu epoch (~100k+ samples) at the settings below takes ~1-2 h depending
+#   on average utterance length. Peak memory is dominated by FSDP / expert
+#   all-gather (~36 GB), so larger batches only push activation memory
+#   marginally while linearly scaling tps.
 #
 # To run on a single 8-GPU node:
 #   export WENETSPEECH_WU_PATH=/path/to/wenetspeech_wu_1k  # local mirror or HF id
 #   examples/vlm_finetune/qwen3_omni_asr/train.sh
 #
 # The env var WENETSPEECH_WU_PATH has no default; OmegaConf will raise a clear
-# missing-variable error if it is unset. Full FT of a 30B-A3B MoE plus the
-# audio tower is memory-tight on 8x H100 80GB; if you OOM, drop
-# step_scheduler.global_batch_size, enable activation checkpointing in the
-# moe parallelizer config, or freeze the audio_tower.
+# missing-variable error if it is unset. If you do OOM at the GBS=64 setting
+# below (e.g. a noticeably longer-utterance dataset variant), drop
+# step_scheduler.local_batch_size to 4 or 2, enable activation checkpointing
+# in the moe parallelizer config, or freeze the audio_tower.
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
-  ckpt_every_steps: 100
+  # GBS=64 (local_bs=8 x 8 GPUs) is the validated throughput sweet spot for
+  # Qwen3-Omni-30B-A3B on 8x H100: peak memory is dominated by FSDP/expert
+  # all-gather (~36 GB), so larger batches only push activation memory
+  # marginally while linearly scaling tps. See docs/guides/audio/qwen3-omni-asr.md
+  # for the back-of-envelope memory math and the AMI benchmark.
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 200
   num_epochs: 1
-  max_steps: 500
+  max_steps: 2000             # safety cap; epoch typically exhausts first
 
 dist_env:
   backend: nccl
@@ -103,6 +119,12 @@ dataset:
   system_prompt: null
   user_prompt: >-
     请将这段上海话（吴语）语音逐字转写成纯文本。原则：忠实于发音。如果听到的是明显的吴语方言词（如阿拉、侬、伊拉、辰光、搿、勿、覅、辣海、老酒、物事、哪能、伐、唻），就用对应的吴语方言字；如果听到的是普通话发音，就用普通话用字，不要硬替换。不要做普通话↔吴语之间的翻译。只输出转写文本，不要加任何引导语、解释或标点。
+  # Same defensive floor as the AMI recipe: Qwen3-Omni's Whisper feature
+  # extractor has a known off-by-one between ``input_features`` and
+  # ``feature_attention_mask`` on sub-second clips. WenetSpeech-Wu is more
+  # tightly segmented than AMI so this rarely fires here, but the cost of
+  # the header-only sf.info probe is negligible.
+  min_audio_duration_seconds: 1.0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

@@ -175,7 +175,7 @@ node. The defaults:
 | `recipe`           | `FinetuneRecipeForVLM`                                   |
 | `distributed`      | `fsdp2`, `ep_size=8`, `tp=cp=pp=1`                       |
 | `freeze_config`    | `freeze_vision_tower=true`, `freeze_audio_tower=false`, `freeze_language_model=false`  |
-| `step_scheduler`   | `global_batch_size=8`, `local_batch_size=1`, `ckpt_every_steps=100`, `max_steps=500` |
+| `step_scheduler`   | `global_batch_size=64`, `local_batch_size=8`, `ckpt_every_steps=200`, `max_steps=2000` (validated on 8x H100) |
 | `optimizer`        | `AdamW(lr=2.0e-5, betas=[0.9, 0.95], weight_decay=0.0)`  |
 | `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=true` |
 | `wandb`            | enabled by default; project / name / dir via env vars     |
@@ -186,23 +186,26 @@ tower are trainable, vision tower stays frozen. With `ep_size=8` the MoE
 experts are sharded across all 8 GPUs.
 
 `examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml` is a sibling config that
-mirrors the Wu recipe with `path_or_dataset: edinburghcstr/ami` + `name: ihm`
-and an English transcription `user_prompt`; see the "Using a different HF
-audio dataset" subsection above for column overrides on other datasets.
+swaps the dataset to `edinburghcstr/ami` (subset `ihm`) and uses an English
+transcription `user_prompt`. Unlike the Wu YAML it ships with a higher-
+throughput `step_scheduler` (`global_batch_size=64`, `local_batch_size=8`,
+`ckpt_every_steps=200`) — those numbers were measured on 8x H100 80GB:
+~1.4 step/s steady-state, ~36–40 GB peak / GPU, one epoch over the ~69k
+post-1.0s-filter AMI IHM train clips in ~22 min (vs ~2 h at `local_batch_size=1`).
+The reason batch can be pushed this high is that peak memory on this MoE is
+dominated by FSDP/expert all-gather (~36 GB), not by activations.
+See "Using a different HF audio dataset" above for column overrides on other
+datasets.
 
 ### Launch
 
 `examples/vlm_finetune/qwen3_omni_asr/train.sh` is the canonical entry point.
 It validates `NPROC_PER_NODE=8` and `WENETSPEECH_WU_PATH` up front, then
-`exec`s the standard NeMo AutoModel launcher:
+`exec`s the standard NeMo AutoModel launcher. Pick the YAML by setting the
+`CONFIG` env var (the CLI takes the YAML as a positional argument; do *not*
+try to pass `--config-file <yaml>` at the end — it is silently ignored):
 
 ```bash
-export WENETSPEECH_WU_PATH=yuekai/WenetSpeech_Wu_1k   # gated HF id or local mirror
-# AMI / other public datasets just need a stub value for this precondition:
-#   export WENETSPEECH_WU_PATH=unused
-# and a `--config-file examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml`
-# override to point at the AMI YAML.
-
 # WandB: as long as WANDB_API_KEY is set in the environment (either via
 # `wandb login`, or by exporting WANDB_API_KEY=<key> from your shell rc),
 # the run streams online and shows up in the configured project. To dry-run
@@ -211,8 +214,17 @@ export WENETSPEECH_WU_PATH=yuekai/WenetSpeech_Wu_1k   # gated HF id or local mir
 # and `wandb sync result/wandb/<run-dir>` later.
 export WANDB_PROJECT=${WANDB_PROJECT:-qwen3-omni-asr-wenetspeech-wu}
 
+# Wu (default): the Wu YAML resolves `${oc.env:WENETSPEECH_WU_PATH}` from
+# this var, so it is genuinely required.
+export WENETSPEECH_WU_PATH=yuekai/WenetSpeech_Wu_1k   # gated HF id or local mirror
 examples/vlm_finetune/qwen3_omni_asr/train.sh \
     --dataset.split 'train[:5000]'                    # any CLI override is forwarded
+
+# AMI / any public dataset (path is hard-coded in the YAML): the
+# WENETSPEECH_WU_PATH precondition still fires, so set a stub.
+CONFIG=examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml \
+WENETSPEECH_WU_PATH=unused \
+    examples/vlm_finetune/qwen3_omni_asr/train.sh
 ```
 
 The launcher pins the Python interpreter to

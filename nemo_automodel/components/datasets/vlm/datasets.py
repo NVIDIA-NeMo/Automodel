@@ -287,6 +287,7 @@ def make_hf_audio_asr_dataset(
     audio_column="audio",
     text_column="text",
     drop_empty_text=True,
+    min_audio_duration_seconds=None,
     **load_kwargs,
 ):
     """Lazy HuggingFace audio→text dataset builder for Qwen3-Omni ASR fine-tuning.
@@ -342,6 +343,14 @@ def make_hf_audio_asr_dataset(
             whitespace are dropped via ``dataset.filter`` (Arrow-level, no
             audio decode). If False, an empty transcript triggers a
             ``ValueError`` inside the transform at access time.
+        min_audio_duration_seconds: Optional minimum audio duration. Samples
+            shorter than this threshold are dropped via ``dataset.filter``
+            using ``soundfile.info`` (header-only read, no full decode). The
+            HF Qwen3-Omni Whisper feature extractor has a known off-by-one
+            between ``input_features`` and ``feature_attention_mask`` for
+            sub-second clips (~0.27 s manifests as a 27-vs-26 frame
+            mismatch); set this to ``1.0`` for AMI / CommonVoice-style
+            corpora that contain very short utterances.
         **load_kwargs: Forwarded to ``datasets.load_dataset`` (e.g.
             ``trust_remote_code=True``).
 
@@ -374,6 +383,24 @@ def make_hf_audio_asr_dataset(
             lambda batch: [bool(t) and bool(t.strip()) for t in batch[text_column]],
             batched=True,
         )
+
+    if min_audio_duration_seconds is not None:
+        # Header-only duration probe via soundfile.info — no PCM decode.
+        # Bytes branch: wrap in BytesIO; path branch: pass path directly.
+        def _duration_at_least(batch):
+            keep = []
+            for cell in batch[audio_column]:
+                try:
+                    if cell.get("bytes"):
+                        info = sf.info(io.BytesIO(cell["bytes"]))
+                    else:
+                        info = sf.info(cell["path"])
+                    keep.append((info.frames / info.samplerate) >= min_audio_duration_seconds)
+                except Exception:
+                    keep.append(False)
+            return keep
+
+        dataset = dataset.filter(_duration_at_least, batched=True)
 
     has_system = isinstance(system_prompt, str) and bool(system_prompt.strip())
     has_user_text = isinstance(user_prompt, str) and bool(user_prompt.strip())

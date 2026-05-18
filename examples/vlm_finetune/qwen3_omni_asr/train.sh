@@ -2,11 +2,23 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Launch single-node 8-GPU ASR fine-tuning of Qwen3-Omni-30B-A3B-Instruct on
-# yuekai/WenetSpeech_Wu_1k.
+# any HF audio dataset (default: yuekai/WenetSpeech_Wu_1k).
+#
+# Which YAML is launched is controlled by the CONFIG env var:
+#   CONFIG=examples/vlm_finetune/qwen3_omni_asr/wenetspeech_wu_sft.yaml  (default)
+#   CONFIG=examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml             (AMI demo)
+#
+# `automodel`'s CLI only accepts the YAML as a positional argument, so do NOT
+# pass --config-file at the script's end — set CONFIG instead.
 #
 # Required environment:
-#   WENETSPEECH_WU_PATH  Local HF-cached path or HuggingFace dataset id for the
-#                        gated yuekai/WenetSpeech_Wu_1k. Has no default.
+#   WENETSPEECH_WU_PATH  HF-cached path / HuggingFace dataset id for the gated
+#                        yuekai/WenetSpeech_Wu_1k. The Wu YAML resolves
+#                        ``${oc.env:WENETSPEECH_WU_PATH}`` from this var, so it
+#                        is genuinely required for the Wu recipe. Other YAMLs
+#                        (e.g. ami_sft.yaml) hard-code the dataset path and
+#                        only need a non-empty stub here:
+#                          export WENETSPEECH_WU_PATH=unused
 #
 # Optional environment:
 #   PY                   Python interpreter (default: the bundled
@@ -14,10 +26,12 @@
 #                        soundfile, scipy, transformers; lacks qwen_omni_utils and
 #                        torchcodec by design).
 #   CONFIG               YAML config to launch (default: wenetspeech_wu_sft.yaml
-#                        next to this script).
+#                        next to this script). See note above.
 #   NPROC_PER_NODE       GPUs per node (default: 8).
 #
 # Any extra arguments are forwarded verbatim to `nemo_automodel.cli.app`, e.g.:
+#   CONFIG=examples/vlm_finetune/qwen3_omni_asr/ami_sft.yaml \
+#   WENETSPEECH_WU_PATH=unused \
 #   examples/vlm_finetune/qwen3_omni_asr/train.sh \
 #       --step_scheduler.max_steps 3 \
 #       --checkpoint.checkpoint_dir /tmp/smoke_ckpt

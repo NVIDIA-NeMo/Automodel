@@ -1621,3 +1621,67 @@ def test_make_hf_audio_asr_dataset_passes_name_to_load_dataset(monkeypatch):
     assert captured_kwargs["path"] == "edinburghcstr/ami"
     assert captured_kwargs["name"] == "ihm"
     assert captured_kwargs["split"] == "train[:1]"
+
+
+def test_make_hf_audio_asr_dataset_min_duration_filters_short_bytes(monkeypatch):
+    """``min_audio_duration_seconds`` drops sub-threshold samples in the bytes branch.
+
+    The HF Qwen3-Omni Whisper feature extractor crashes on sub-second clips
+    due to an off-by-one between ``input_features`` and
+    ``feature_attention_mask``; the builder exposes this filter to keep
+    AMI / CommonVoice-style corpora trainable.
+    """
+    short_wav = _make_wav_bytes(duration_seconds=0.25)
+    long_wav = _make_wav_bytes(duration_seconds=1.5)
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": short_wav, "path": None}, "text": "short"},
+            {"audio": {"bytes": long_wav, "path": None}, "text": "long"},
+            {"audio": {"bytes": short_wav, "path": None}, "text": "short2"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        min_audio_duration_seconds=1.0,
+    )
+    assert len(rows) == 1
+    assert rows[0]["conversation"][1]["content"][0]["text"] == "long"
+
+
+def test_make_hf_audio_asr_dataset_min_duration_filters_short_paths(monkeypatch, tmp_path):
+    """``min_audio_duration_seconds`` also covers the path branch via sf.info."""
+    short_path = tmp_path / "short.wav"
+    long_path = tmp_path / "long.wav"
+    _sf.write(str(short_path), _np.zeros(800, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
+    _sf.write(str(long_path), _np.zeros(24000, dtype=_np.float32), 16000, format="WAV", subtype="PCM_16")
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": None, "path": str(short_path)}, "text": "short"},
+            {"audio": {"bytes": None, "path": str(long_path)}, "text": "long"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(
+        path_or_dataset="ignored",
+        min_audio_duration_seconds=1.0,
+    )
+    assert len(rows) == 1
+    assert rows[0]["conversation"][1]["content"][0]["text"] == "long"
+
+
+def test_make_hf_audio_asr_dataset_min_duration_none_keeps_all(monkeypatch):
+    """``min_audio_duration_seconds=None`` (default) skips the filter entirely."""
+    short_wav = _make_wav_bytes(duration_seconds=0.25)
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": short_wav, "path": None}, "text": "a"},
+            {"audio": {"bytes": short_wav, "path": None}, "text": "b"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
+
+    rows = ds.make_hf_audio_asr_dataset(path_or_dataset="ignored")
+    assert len(rows) == 2
