@@ -773,6 +773,27 @@ class Checkpointer:
             torch.load(os.path.join(state_dir, f"{state_name}_dp_rank_{self.dp_rank}.pt"), weights_only=False)
         )
 
+    def save_distributed_state(self, state: Any, state_name: str, path: str) -> None:
+        """Save a custom stateful object through DCP on all ranks.
+
+        This is intended for auxiliary objects whose state dict contains
+        sharded tensors, for example BAGEL EMA shadows under FSDP2. Rank-0
+        ``torch.save`` would only persist rank 0's local shard; DCP sees the
+        DTensor metadata and writes all shards correctly.
+        """
+        state_dir = os.path.join(path, state_name)
+        _ensure_dirs(state_dir)
+        state_dict = state.state_dict()
+        planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
+        dcp.save(state_dict, checkpoint_id=state_dir, planner=planner)
+
+    def load_distributed_state(self, state: Any, state_name: str, path: str) -> None:
+        """Load a custom stateful object previously saved with DCP."""
+        state_dir = os.path.join(path, state_name)
+        state_dict = state.state_dict()
+        dcp.load(state_dict, checkpoint_id=state_dir)
+        state.load_state_dict(state_dict)
+
     def close(self) -> None:
         """
         Close the checkpointer.

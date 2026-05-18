@@ -117,6 +117,13 @@ def is_optimizer(object):
     )
 
 
+def is_distributed_stateful(object):
+    """
+    Checks whether object should be saved through distributed checkpointing.
+    """
+    return bool(getattr(object, "use_distributed_checkpointing", False)) and has_load_restore_state(object)
+
+
 def is_model(object):
     """
     Checks whether object is a model.
@@ -240,6 +247,14 @@ class BaseRecipe:
             self.__dict__["__state_tracked"].add(key)
         super().__setattr__(key, value)
 
+    def untrack_state(self, *keys: str) -> None:
+        """Stop tracking one or more attributes for BaseRecipe checkpointing."""
+        tracked = self.__dict__.get("__state_tracked")
+        if tracked is None:
+            return
+        for key in keys:
+            tracked.discard(key)
+
     def save_checkpoint(
         self,
         epoch: int,
@@ -336,6 +351,8 @@ class BaseRecipe:
                 tokenizer = getattr(self, key)
             elif is_dataloader(getattr(self, key)) or isinstance(getattr(self, key), StatefulRNG):
                 self.checkpointer.save_on_dp_ranks(getattr(self, key), key, path)
+            elif is_distributed_stateful(getattr(self, key)):
+                self.checkpointer.save_distributed_state(getattr(self, key), key, path)
             else:
                 if is_rank_0:
                     torch.save(
@@ -478,6 +495,8 @@ class BaseRecipe:
                 scheduler = obj
             elif is_dataloader(obj) or isinstance(obj, StatefulRNG):
                 self.checkpointer.load_on_dp_ranks(obj, key, ckpt_dir)
+            elif is_distributed_stateful(obj):
+                self.checkpointer.load_distributed_state(obj, key, ckpt_dir)
             elif is_tokenizer(obj) or isinstance(obj, ConfigNode):
                 # we don't need to load the tokenizer or config from the checkpoint
                 # we only save the tokenizer for consolidated checkpoints for downstream use
