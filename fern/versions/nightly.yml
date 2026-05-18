@@ -19,6 +19,9 @@ navigation:
       - page: "Repository Structure"
         path: ./nightly/pages/repository-structure.mdx
         slug: repo-structure
+      - page: "Release Notes"
+        path: ./nightly/pages/release-notes.mdx
+        slug: release-notes
   - section: "Announcements"
     contents:
       - page: "Announcements"
@@ -57,6 +60,8 @@ navigation:
             path: ./nightly/pages/model-coverage/llm/qwen/qwen3-moe.mdx
           - page: "Qwen3-Next"
             path: ./nightly/pages/model-coverage/llm/qwen/qwen3-next.mdx
+          - page: "ERNIE 4.5"
+            path: ./nightly/pages/model-coverage/llm/baidu/ernie4-5.mdx
           - page: "DeepSeek"
             path: ./nightly/pages/model-coverage/llm/deepseek-ai/deepseek.mdx
           - page: "DeepSeek-V3"
@@ -149,6 +154,8 @@ navigation:
             path: ./nightly/pages/model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
             path: ./nightly/pages/model-coverage/llm/tencent/hy3.mdx
+          - page: "MiMo-V2-Flash"
+            path: ./nightly/pages/model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
       - section: "Vision Language Models (VLMs)"
         slug: vision-language-models
         contents:
