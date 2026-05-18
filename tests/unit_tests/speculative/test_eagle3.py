@@ -90,6 +90,61 @@ def test_llama_eagle3_draft_forward_shape():
     assert logits.shape == (batch_size, seq_len, config.draft_vocab_size)
 
 
+def test_build_eagle3_token_mapping_rejects_non_positive_draft_vocab_size():
+    """``draft_vocab_size`` must be a positive int or ``None``.
+
+    Without validation, ``draft_vocab_size=0`` returns an empty selection
+    and ``draft_vocab_size=-1`` slices the special-token list (which has
+    nothing to do with the requested vocab size). Both are silent
+    miscompilations -- raise instead.
+    """
+
+    class DummyLoader:
+        def __iter__(self):
+            yield {
+                "input_ids": torch.tensor([[5, 9, 9, 3]], dtype=torch.long),
+                "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.long),
+            }
+
+    for bad in (0, -1, -16):
+        with pytest.raises(ValueError, match="draft_vocab_size"):
+            build_eagle3_token_mapping(
+                DummyLoader(),
+                target_vocab_size=16,
+                draft_vocab_size=bad,
+                special_token_ids=[0, 1],
+            )
+
+    # Non-int (e.g. a float coming from YAML) is also rejected.
+    with pytest.raises(ValueError, match="draft_vocab_size"):
+        build_eagle3_token_mapping(
+            DummyLoader(),
+            target_vocab_size=16,
+            draft_vocab_size=4.0,  # type: ignore[arg-type]
+            special_token_ids=[0, 1],
+        )
+
+
+def test_build_eagle3_token_mapping_rejects_non_positive_target_vocab_size():
+    """``target_vocab_size`` must be a positive int; it sizes the count tensor."""
+
+    class DummyLoader:
+        def __iter__(self):
+            yield {
+                "input_ids": torch.tensor([[5, 9, 9, 3]], dtype=torch.long),
+                "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.long),
+            }
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="target_vocab_size"):
+            build_eagle3_token_mapping(
+                DummyLoader(),
+                target_vocab_size=bad,
+                draft_vocab_size=4,
+                special_token_ids=[0, 1],
+            )
+
+
 def test_build_eagle3_token_mapping_keeps_requested_vocab_size():
     class DummyLoader:
         def __iter__(self):
