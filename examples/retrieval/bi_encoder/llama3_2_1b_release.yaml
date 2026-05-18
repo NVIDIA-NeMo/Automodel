@@ -43,10 +43,10 @@ model:
   trust_remote_code: true
   pooling: avg
   l2_normalize: true
-  use_liger_kernel: true
-  use_sdpa_patching: true
+  use_liger_kernel: false
+  use_sdpa_patching: false
   torch_dtype: bfloat16
-  attn_implementation: flash_attention_2
+  attn_implementation: eager
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
@@ -99,6 +99,7 @@ dataloader:
     use_dataset_instruction: false
   shuffle: true
   num_workers: 8
+  drop_last: true
   pin_memory: true
 
 validation_dataloader:
@@ -124,6 +125,7 @@ validation_dataloader:
     use_dataset_instruction: false
   shuffle: false
   num_workers: 8
+  drop_last: false
   pin_memory: true
 
 # LoRA/PEFT configuration
