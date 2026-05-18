@@ -205,6 +205,23 @@ def test_load_datasets_normalizes_and_errors(tmp_path, monkeypatch):
     with pytest.raises(ValueError):
         rd.load_datasets(str(f_bad))
 
+    empty_pos = {
+        "corpus": [{"path": str(corpus_dir)}],
+        "data": [
+            {
+                "question_id": "q-empty",
+                "question": "What?",
+                "corpus_id": "corpusA",
+                "pos_doc": [],
+                "neg_doc": [{"id": "n1"}],
+            }
+        ],
+    }
+    f_empty_pos = tmp_path / "empty_pos.json"
+    f_empty_pos.write_text(json.dumps(empty_pos))
+    with pytest.raises(ValueError, match="pos_doc cannot be empty"):
+        rd.load_datasets(str(f_empty_pos))
+
 
 def test_transform_func_single_batched():
     corpus_dict = {
@@ -372,8 +389,8 @@ def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch
                 "question_id": "q",
                 "question": "Q",
                 "corpus_id": "C",
-                "pos_doc": [101],  # int -> coerced to "101" via lines 140-141
-                "neg_doc": [202, "x"],  # 202 -> "202" via lines 149-150; "x" unchanged
+                "pos_doc": [{"id": 101}],
+                "neg_doc": [{"id": 202}, "x"],
             }
         ],
     }
@@ -389,15 +406,21 @@ def test_load_datasets_type_coercion_and_concatenate_false(tmp_path, monkeypatch
 
 def test_parse_data_entry():
     assert rd._parse_data_entry("/tmp/data.json") == (None, "/tmp/data.json")
-    assert rd._parse_data_entry([3, "/tmp/data.json"]) == (3, "/tmp/data.json")
-    assert rd._parse_data_entry((3, "/tmp/data.json")) == (3, "/tmp/data.json")
+    assert rd._parse_data_entry({"path": "/tmp/data.json", "num_samples": 3}) == (3, "/tmp/data.json")
+    assert rd._parse_data_entry({"path": "/tmp/data.json"}) == (None, "/tmp/data.json")
 
     with pytest.raises(ValueError, match="num_samples must be non-negative"):
-        rd._parse_data_entry([-1, "/tmp/data.json"])
+        rd._parse_data_entry({"path": "/tmp/data.json", "num_samples": -1})
     with pytest.raises(ValueError, match="num_samples must be an integer"):
-        rd._parse_data_entry(["3", "/tmp/data.json"])
+        rd._parse_data_entry({"path": "/tmp/data.json", "num_samples": "3"})
     with pytest.raises(ValueError, match="path must be a string"):
-        rd._parse_data_entry([3, 4])
+        rd._parse_data_entry({"path": 4, "num_samples": 3})
+    with pytest.raises(ValueError, match="must contain a 'path' field"):
+        rd._parse_data_entry({"num_samples": 3})
+    with pytest.raises(ValueError, match="Unsupported data entry field"):
+        rd._parse_data_entry({"path": "/tmp/data.json", "sample_fraction": 0.5})
+    with pytest.raises(ValueError, match="Invalid data entry format"):
+        rd._parse_data_entry([3, "/tmp/data.json"])
 
 
 def test_load_datasets_samples_single_top_level_entry_once(tmp_path, monkeypatch):
@@ -414,9 +437,9 @@ def test_load_datasets_samples_single_top_level_entry_once(tmp_path, monkeypatch
 
     train_file = _make_train_file(tmp_path, corpus_dir, data_len=5, corpus_id="S")
 
-    dataset_a, _ = rd.load_datasets([2, str(train_file)], seed=7)
-    dataset_b, _ = rd.load_datasets([2, str(train_file)], seed=7)
-    dataset_c, _ = rd.load_datasets([2, str(train_file)], seed=8)
+    dataset_a, _ = rd.load_datasets({"path": str(train_file), "num_samples": 2}, seed=7)
+    dataset_b, _ = rd.load_datasets({"path": str(train_file), "num_samples": 2}, seed=7)
+    dataset_c, _ = rd.load_datasets({"path": str(train_file), "num_samples": 2}, seed=8)
 
     assert len(dataset_a) == 2
     assert dataset_a["question_id"] == dataset_b["question_id"]
@@ -473,7 +496,7 @@ def test_make_retrieval_dataset_mixed_sampled_and_full_entries(tmp_path, monkeyp
     )
 
     ds = rd.make_retrieval_dataset(
-        data_dir_list=[[2, str(sampled_file)], str(full_file)],
+        data_dir_list=[{"path": str(sampled_file), "num_samples": 2}, str(full_file)],
         data_type="train",
         n_passages=2,
         seed=123,

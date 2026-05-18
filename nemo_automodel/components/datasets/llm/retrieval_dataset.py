@@ -174,19 +174,30 @@ def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
             corpus_dict[corpus_id] = CorpusInfo(corpus_metadata, corpus)
 
 
-def _parse_data_entry(entry: Union[str, Tuple[Optional[int], str], List[Any]]) -> Tuple[Optional[int], str]:
+DataEntry = Union[str, dict[str, Any]]
+
+
+def _parse_data_entry(entry: DataEntry) -> Tuple[Optional[int], str]:
     """
     Parse a data entry.
 
     Supported forms:
     - "path_or_hf_uri": use all samples
-    - [num_samples, "path_or_hf_uri"]: sample num_samples once from that source
+    - {"path": "path_or_hf_uri", "num_samples": N}: sample N examples once from that source
     """
     if isinstance(entry, str):
         return None, entry
 
-    if isinstance(entry, (list, tuple)) and len(entry) == 2:
-        num_samples, path = entry
+    if isinstance(entry, dict):
+        allowed_keys = {"path", "num_samples"}
+        unknown_keys = set(entry) - allowed_keys
+        if unknown_keys:
+            raise ValueError(f"Unsupported data entry field(s): {sorted(unknown_keys)}")
+        if "path" not in entry:
+            raise ValueError("data entry dictionary must contain a 'path' field")
+
+        path = entry["path"]
+        num_samples = entry.get("num_samples")
         if num_samples is not None:
             if isinstance(num_samples, bool) or not isinstance(num_samples, int):
                 raise ValueError(f"num_samples must be an integer or None, got {type(num_samples)}")
@@ -196,29 +207,22 @@ def _parse_data_entry(entry: Union[str, Tuple[Optional[int], str], List[Any]]) -
             raise ValueError(f"path must be a string, got {type(path)}")
         return num_samples, path
 
-    raise ValueError(f"Invalid data entry format: {entry}. Expected a string path or [num_samples, path]")
+    raise ValueError(f"Invalid data entry format: {entry}. Expected a string path or a dictionary with 'path'")
 
 
-def _normalize_data_entries(
-    data_dir_list: Union[List[Union[str, Tuple[Optional[int], str], List[Any]]], Tuple[Optional[int], str], str],
-) -> List[Tuple[Optional[int], str]]:
+def _normalize_data_entries(data_dir_list: Union[List[DataEntry], DataEntry]) -> List[Tuple[Optional[int], str]]:
     """Normalize a single source or list of sources into parsed entries."""
-    if isinstance(data_dir_list, str):
-        entries = [data_dir_list]
-    elif isinstance(data_dir_list, tuple):
+    if isinstance(data_dir_list, (str, dict)):
         entries = [data_dir_list]
     elif isinstance(data_dir_list, list):
-        if len(data_dir_list) == 2 and (data_dir_list[0] is None or isinstance(data_dir_list[0], int)):
-            entries = [data_dir_list]
-        else:
-            entries = data_dir_list
+        entries = data_dir_list
     else:
         raise ValueError(
-            f"Invalid data_dir_list format: {data_dir_list}. Expected a string path, [num_samples, path], "
-            "or a list of those entries"
+            f"Invalid data_dir_list format: {data_dir_list}. Expected a string path, a dictionary entry, "
+            "or a list of those entries."
         )
 
-    return [_parse_data_entry(entry) for entry in entries]
+    return [entry if isinstance(entry, tuple) else _parse_data_entry(entry) for entry in entries]
 
 
 def _sample_data_items(data_items: List[dict], num_samples: Optional[int], source: str, seed: int) -> List[dict]:
@@ -237,15 +241,15 @@ def _sample_data_items(data_items: List[dict], num_samples: Optional[int], sourc
 
 
 def load_datasets(
-    data_dir_list: Union[List[Union[str, Tuple[Optional[int], str], List[Any]]], Tuple[Optional[int], str], str],
+    data_dir_list: Union[List[DataEntry], DataEntry],
     concatenate: bool = True,
     seed: int = 42,
 ):
     """
     Load datasets from JSON files.
 
-    Entries can be strings (use all samples) or [num_samples, path] pairs
-    (sample a fixed subset once while loading).
+    Entries can be strings (use all samples) or dictionaries with path and optional
+    num_samples fields (sample a fixed subset once while loading).
 
     Returns:
         Tuple of (dataset, corpus_dict)
@@ -288,10 +292,12 @@ def load_datasets(
                 "corpus_id": item["corpus_id"],
             }
             # Extract pos_doc with only id field
+            if not item["pos_doc"]:
+                raise ValueError(f"pos_doc cannot be empty in train_data item: {item}")
             normalized_item["pos_doc"] = []
             for doc in item["pos_doc"]:
                 if isinstance(doc, dict) and "id" in doc:
-                    normalized_item["pos_doc"].append({"id": doc["id"]})
+                    normalized_item["pos_doc"].append({"id": str(doc["id"])})
                 else:
                     # Handle case where doc might be just a string ID
                     doc_id = doc if isinstance(doc, str) else str(doc)
@@ -300,7 +306,7 @@ def load_datasets(
             normalized_item["neg_doc"] = []
             for doc in item["neg_doc"]:
                 if isinstance(doc, dict) and "id" in doc:
-                    normalized_item["neg_doc"].append({"id": doc["id"]})
+                    normalized_item["neg_doc"].append({"id": str(doc["id"])})
                 else:
                     # Handle case where doc might be just a string ID
                     doc_id = doc if isinstance(doc, str) else str(doc)
@@ -648,7 +654,7 @@ def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_
 
 
 def make_retrieval_dataset(
-    data_dir_list: Union[List[Union[str, Tuple[Optional[int], str], List[Any]]], Tuple[Optional[int], str], str] = None,
+    data_dir_list: Union[List[DataEntry], DataEntry] = None,
     model_type: str = "bi_encoder",
     data_type: str = "train",
     n_passages: int = 5,
@@ -665,18 +671,21 @@ def make_retrieval_dataset(
     Entries in *data_dir_list* can be local JSON file paths **or** ``hf://`` URIs
     pointing to a HuggingFace dataset repository (e.g.
     ``hf://nvidia/embed-nemotron-dataset-v1/SciFact``). A source can also be
-    provided as ``[num_samples, path_or_uri]`` to sample a fixed subset once
-    while loading. Uses ``set_transform()`` for lazy evaluation — tokenization
-    is handled by the collator.
+    provided as ``{"path": path_or_uri, "num_samples": N}`` to sample a fixed
+    subset once while loading. Uses ``set_transform()`` for lazy evaluation —
+    tokenization is handled by the collator.
 
     Args:
-        data_dir_list: Path(s) to JSON file(s), ``hf://`` URIs, or [num_samples, source] entries.
+        data_dir_list: Path(s) to JSON file(s), ``hf://`` URIs, or dictionary entries with path and
+            num_samples.
         model_type: "bi_encoder" (default) or "cross_encoder"
         data_type: Type of data ("train" or "eval")
         n_passages: Number of passages (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
         seed: Random seed for reproducibility (for shuffling if needed)
-        do_shuffle: Whether to shuffle the dataset
+        do_shuffle: Shuffle dataset rows before subset selection. Only applied when
+            ``max_train_samples`` is set; otherwise iteration order is controlled by
+            the dataloader's sampler (e.g. ``StatefulDistributedSampler``).
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
         use_dataset_instruction: Whether to use instruction from dataset's metadata
