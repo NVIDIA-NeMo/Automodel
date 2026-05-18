@@ -385,6 +385,22 @@ def freeze_unused_kv_sharing_params(model):
         )
 
 
+def freeze_deepseek_v4_indexer_params(model):
+    """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if ".self_attn.compressor.indexer." in name:
+            param.requires_grad_(False)
+            frozen_count += 1
+
+    if frozen_count > 0:
+        logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
+
+
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():
