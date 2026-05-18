@@ -128,7 +128,32 @@ def _resolve_mesh_context(
 ]:
     """Resolve raw ``DeviceMesh`` or ``MeshContext`` input into effective configs."""
     if isinstance(device_mesh, MeshContext):
-        return device_mesh
+        if moe_mesh is not None:
+            raise ValueError("Pass moe_mesh only with a raw DeviceMesh")
+
+        resolved_distributed_config = (
+            distributed_config if distributed_config is not None else device_mesh.strategy_config
+        )
+        resolved_pipeline_config = pipeline_config if pipeline_config is not None else device_mesh.pipeline_config
+        resolved_moe_config = moe_config if moe_config is not None else device_mesh.moe_config
+        resolved_activation_checkpointing = (
+            device_mesh.activation_checkpointing if activation_checkpointing is None else activation_checkpointing
+        )
+        mesh = MeshContext(
+            strategy_config=resolved_distributed_config,
+            pipeline_config=resolved_pipeline_config,
+            moe_config=resolved_moe_config,
+            activation_checkpointing=resolved_activation_checkpointing,
+            device_mesh=device_mesh.device_mesh,
+            moe_mesh=device_mesh.moe_mesh,
+        )
+        return (
+            mesh,
+            resolved_distributed_config,
+            resolved_pipeline_config,
+            resolved_moe_config,
+            resolved_activation_checkpointing,
+        )
 
     resolved_activation_checkpointing = False if activation_checkpointing is None else activation_checkpointing
     return (
@@ -1021,7 +1046,7 @@ class _NeMoAutoModelForRetrievalBase:
             pipeline_config=None,
             qat_config=None,
             moe_config=moe_config,
-            activation_checkpointing=mesh.activation_checkpointing,
+            activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
