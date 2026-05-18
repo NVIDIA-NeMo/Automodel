@@ -32,6 +32,20 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
+from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+
+
+def apply_model_runtime_patches(model, mesh=None):
+    """Apply Qwen3.5 runtime patches after model construction.
+
+    The GatedDeltaNet wrapper is needed for both distributed training and
+    single-GPU packed-sequence runs, so it must run before sharding or first
+    forward rather than only from the FSDP parallelization strategy.
+    """
+    cp_enabled = getattr(mesh, "cp_size", 1) > 1
+    patch_hf_model(model, cp_enabled=cp_enabled)
+    return model
+
 
 class _AllGatherConcatFn(Function):
     """All-gather + concat with autograd-safe backward.
@@ -94,36 +108,75 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         cache_params=None,
         cache_position=None,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        indices: torch.Tensor | None = None,
     ):
         """HF GatedDeltaNet forward with FSDP-safe fp32 gate computation.
 
-        Mirrors transformers==5.5 Qwen3_5GatedDeltaNet.forward (uses the
-        per-layer cache API: ``has_previous_state(layer_idx)``,
-        ``cache_params.layers[layer_idx].{conv,recurrent}_states``, and the
-        ``update_{conv,recurrent}_state`` methods) with the gate computation
-        replaced by ``self._compute_gate(a)``.
+        Mirrors transformers==5.5 ``Qwen3_5GatedDeltaNet.forward`` (per-layer
+        cache API; gate via ``self._compute_gate(a)``) and adds packing-aware
+        plumbing:
+
+        * ``cu_seqlens`` -- per-document cumulative lengths from the indexed
+          attention mask. When supplied, FLA's chunk kernel resets state at
+          every document boundary.
+        * ``indices`` -- non-padding token indices. When supplied AND padding
+          is actually present (B>1 case), the layer unpads activations to
+          ``[1, total_valid, ...]`` before conv/FLA and re-pads on the way
+          out. For B=1 with no padding, ``indices`` covers the whole sequence
+          and unpadding is skipped (preserves the bit-exact fast path).
+
+        Both kwargs are produced by ``Qwen3_5DecoderLayerWithPacking``. As a
+        safety net for direct callers (e.g. unit tests that bypass the
+        decoder-layer subclass), the layer derives them from ``attention_mask``
+        when both are ``None`` and the mask is indexed.
         """
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        batch_size, seq_len, _ = hidden_states.shape
+        batch_size, seq_len, hidden_dim = hidden_states.shape
 
         use_precomputed_states = (
             cache_params is not None and cache_params.has_previous_state(self.layer_idx) and seq_len == 1
         )
 
+        # Resolve packing kwargs. Fallback to mask-derivation only when neither
+        # was passed in (bypasses the decoder-layer subclass).
+        if not use_precomputed_states and cu_seqlens is None and indices is None:
+            if is_indexed_packed_mask(attention_mask):
+                indices_t, cu_seqlens_t, _ = get_unpad_data(attention_mask)
+                cu_seqlens = cu_seqlens_t.to(torch.long)
+                indices = indices_t
+
+        is_packed = (not use_precomputed_states) and cu_seqlens is not None
+        # Only unpad when there is actually padding to remove. For B=1 packs
+        # without padding, ``indices`` covers ``[0, B*T)`` and we keep the
+        # ``[B, T, ...]`` layout (bit-for-bit identical to the prior fast path).
+        needs_unpad = is_packed and indices is not None and indices.numel() != batch_size * seq_len
+
+        # Padding-token zero-out: skip under packing because either we unpad
+        # (which drops padding entirely) or there is no padding to begin with.
+        # Outside packing the original behavior is preserved.
+        if not is_packed:
+            hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+
         if use_precomputed_states:
             conv_state = cache_params.layers[self.layer_idx].conv_states
             recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
+
+        # Unpad on entry: ``[B, T, H] -> [1, total_valid, H]``. All projections,
+        # conv1d, FLA and norm below run in this dense layout.
+        if needs_unpad:
+            hidden_states = hidden_states.reshape(batch_size * seq_len, hidden_dim)[indices].unsqueeze(0)
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         z = self.in_proj_z(hidden_states)
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
+
+        eff_batch, eff_seq_len = mixed_qkv.shape[0], mixed_qkv.shape[2]
+        z = z.reshape(eff_batch, eff_seq_len, -1, self.head_v_dim)
 
         if use_precomputed_states:
             mixed_qkv = self.causal_conv1d_update(
@@ -138,22 +191,31 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
+                # ``seq_idx`` for causal_conv1d_fn marks per-token segment ids.
+                # Source is the indexed mask, gathered at the same ``indices``
+                # used for unpadding so it lines up with the unpadded layout.
+                if not is_packed:
+                    seq_idx_for_conv = None
+                elif needs_unpad:
+                    seq_idx_for_conv = attention_mask.reshape(-1)[indices].unsqueeze(0).to(torch.int32).contiguous()
+                else:
+                    seq_idx_for_conv = attention_mask.to(torch.int32).contiguous()
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias,
                     activation=self.activation,
-                    seq_idx=None,
+                    seq_idx=seq_idx_for_conv,
                 )
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :eff_seq_len])
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
 
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        query = query.reshape(eff_batch, eff_seq_len, -1, self.head_k_dim)
+        key = key.reshape(eff_batch, eff_seq_len, -1, self.head_k_dim)
+        value = value.reshape(eff_batch, eff_seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
         g = self._compute_gate(a)
@@ -163,16 +225,39 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if is_packed:
+                # FLA requires ``q.shape[0] == 1`` when cu_seqlens is supplied.
+                # When already unpadded eff_batch==1; otherwise flatten now.
+                if not needs_unpad:
+                    query = query.reshape(1, batch_size * seq_len, *query.shape[2:])
+                    key = key.reshape(1, batch_size * seq_len, *key.shape[2:])
+                    value = value.reshape(1, batch_size * seq_len, *value.shape[2:])
+                    g = g.reshape(1, batch_size * seq_len, *g.shape[2:])
+                    beta = beta.reshape(1, batch_size * seq_len, *beta.shape[2:])
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens,
+                )
+                if not needs_unpad:
+                    core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
+            else:
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=cache_params is not None,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
@@ -191,9 +276,22 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        core_attn_out = core_attn_out.reshape(eff_batch, eff_seq_len, -1)
+        output = self.out_proj(core_attn_out)
 
-        return self.out_proj(core_attn_out)
+        # Repad on exit: scatter ``[1, total_valid, H]`` back into ``[B, T, H]``.
+        if needs_unpad:
+            output = output.squeeze(0)
+            padded = torch.zeros(
+                batch_size * seq_len,
+                output.shape[-1],
+                dtype=output.dtype,
+                device=output.device,
+            )
+            padded.index_copy_(0, indices, output)
+            output = padded.reshape(batch_size, seq_len, -1)
+
+        return output
 
     def forward(
         self,
@@ -204,21 +302,19 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         position_ids: torch.Tensor | None = None,
         qkv_format: str | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        indices: torch.Tensor | None = None,
         seq_index: torch.Tensor | None = None,
     ):
-        # Fast path: no CP → run HF forward with fp32-safe gate computation
+        # Fast path: no CP → run HF forward with fp32-safe gate computation.
         if self._cp_mesh is None or self._cp_mesh.size() <= 1:
             return self._forward_no_cp(
                 hidden_states,
                 cache_params=cache_params,
                 attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
+                indices=indices,
             )
 
-        # HF decoder layers don't pass position_ids to linear_attn.
-        # Use cached value from the decoder layer pre-hook, then clear it.
-        if position_ids is None:
-            position_ids = getattr(self, "_cached_position_ids", None)
-            self._cached_position_ids = None
         return self._forward_with_cp(
             hidden_states,
             position_ids=position_ids,
@@ -497,10 +593,16 @@ def patch_hf_model(model, cp_enabled=False):
     ``_fp32_params`` submodule so ``fully_shard_by_dtype`` can wrap them
     in a separate FSDP group.
 
-    Every module's ``__class__`` is swapped to ``CPAwareGatedDeltaNet``
-    whose ``forward()`` calls ``self._fp32_params()`` to trigger FSDP
-    unshard before accessing the fp32 params.  When ``cp_enabled=True``,
-    the CP mesh is also configured.
+    Every ``Qwen3_5GatedDeltaNet`` instance's ``__class__`` is swapped to
+    ``CPAwareGatedDeltaNet`` whose ``forward()`` calls ``self._fp32_params()``
+    to trigger FSDP unshard before accessing the fp32 params.  When
+    ``cp_enabled=True``, the CP mesh is also configured.
+
+    Additionally, every ``Qwen3_5DecoderLayer`` instance is class-swapped to
+    ``Qwen3_5DecoderLayerWithPacking`` so that NEAT-packed sequence metadata
+    (``cu_seqlens``, ``indices``, ``position_ids``) reaches ``linear_attn``
+    via real keyword arguments instead of relying on instance-attribute
+    side-channels (issue #2131).
     """
     import logging
 
@@ -509,11 +611,30 @@ def patch_hf_model(model, cp_enabled=False):
     except ImportError:
         return
 
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        from nemo_automodel.components.models.qwen3_5.decoder_layer import Qwen3_5DecoderLayerWithPacking
+    except (AttributeError, ImportError):
+        Qwen3_5DecoderLayer = None
+        Qwen3_5DecoderLayerWithPacking = None
+
     _logger = logging.getLogger(__name__)
     _PATCHED_ATTR = "_fp32_getattr_patched"
     patched = 0
     patched_classes = set()
     for name, mod in model.named_modules():
+        # Class-swap decoder layers so their forward threads packing kwargs
+        # into linear_attn. Doing this before the GatedDeltaNet pass means
+        # the swap is independent of which (if any) inner layer is patched.
+        if (
+            Qwen3_5DecoderLayer is not None
+            and isinstance(mod, Qwen3_5DecoderLayer)
+            and not isinstance(mod, Qwen3_5DecoderLayerWithPacking)
+            and getattr(mod, "layer_type", None) == "linear_attention"
+        ):
+            mod.__class__ = Qwen3_5DecoderLayerWithPacking
+
         if not isinstance(mod, Qwen3_5GatedDeltaNet):
             continue
 

@@ -10,6 +10,11 @@ optim:
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    foreach: true
+
+performance:
+  check_loss: false
+  grad_clip_foreach: true
 
 #adjust dp_size to the total number of GPUs
 fsdp:
@@ -19,6 +24,10 @@ fsdp:
   pp_size: 1
   activation_checkpointing: false
   cpu_offload: false
+  defer_fsdp_grad_sync: true
+  enable_fsdp2_prefetch: true
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
 
 flow_matching:
   adapter_type: "flux"
@@ -45,7 +54,7 @@ step_scheduler:
   ckpt_every_steps: 500
   log_every: 1
   # max_steps: null  # Set to limit training to a specific number of steps
-  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
+  save_checkpoint_every_epoch: false
 
 data:
   dataloader:

@@ -48,6 +48,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
+            "Ernie4_5_MoeForCausalLM",
+            ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
+        ),
+        (
             "Glm4MoeForCausalLM",
             ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
@@ -98,6 +102,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "MiniMaxM2ForCausalLM",
             ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
+        ),
+        (
+            "MiMoV2FlashForCausalLM",
+            ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
         ),
         (
             "Ministral3ForCausalLM",
@@ -197,6 +205,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
+    "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
 }
 

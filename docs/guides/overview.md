@@ -44,7 +44,7 @@ Recipes for distilling knowledge from a large teacher model into a smaller, more
 
 Curated configurations for benchmarking different training stacks and settings (e.g., Torch vs. TransformerEngine + DeepEP, various model sizes, MoE variants).
 
-- Folder: [examples/benchmark/configs](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/benchmark/configs)
+- Folder: [examples/llm_benchmark](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark)
 - Representative configurations: DeepSeek-V3, GPT-OSS (20B/120B), Kimi K2, Moonlight 16B, Qwen3 MoE 30B
 
 

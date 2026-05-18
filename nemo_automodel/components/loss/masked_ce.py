@@ -20,6 +20,8 @@ from torch.distributed.tensor import DTensor
 
 
 class MaskedCrossEntropy(nn.Module):
+    """Cross-entropy loss that handles ignored or masked target positions."""
+
     def __init__(self, fp32_upcast: bool = True, ignore_index: int = -100, reduction: str = "sum"):
         """
         Masked cross-entropy loss.

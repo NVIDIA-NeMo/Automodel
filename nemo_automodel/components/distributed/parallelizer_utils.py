@@ -110,6 +110,7 @@ def _fully_shard(module, mesh, mp_policy, offload_policy):
 
 
 def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
+    """Fully shard a module, splitting mixed-dtype subtrees when needed."""
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
     grouped_params = _group_params_by_dtype(module)

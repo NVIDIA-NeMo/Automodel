@@ -22,6 +22,8 @@ from diffusers.utils import export_to_video
 
 
 def parse_args():
+    """Parse command-line options for Wan text-to-video validation."""
+
     p = argparse.ArgumentParser("WAN 2.1 T2V Validation")
 
     # Model configuration
@@ -95,6 +97,8 @@ def load_prompts_from_meta_files(meta_folder: str):
 
 
 def main():
+    """Run Wan text-to-video validation."""
+
     args = parse_args()
 
     print("=" * 80)

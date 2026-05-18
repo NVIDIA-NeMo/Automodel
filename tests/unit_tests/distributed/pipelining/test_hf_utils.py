@@ -1128,7 +1128,7 @@ class TestPipelineForwardMistral3Vlm:
         forward retrieves the current microbatch's chunk and advances the
         chunk index — fixing the original PP-VLM bug."""
         m = self._make_first_stage_model(image_token_id=10)
-        # Pre-stage chunks like the recipe does via _chunk_vlm_media.
+        # Pre-stage chunks like the VLM dataloader PP media prep does for schedule.step.
         chunk0 = torch.zeros(1, 3, 8, 8, dtype=torch.bfloat16)
         chunk1 = torch.ones(1, 3, 8, 8, dtype=torch.bfloat16)
         m._vlm_pixel_values_chunks = [chunk0, chunk1]

@@ -69,6 +69,8 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
+    """Parse command-line options for dataset prefiltering."""
+
     p = argparse.ArgumentParser(description="Benchmark filter_long strategies and cache filtered datasets.")
     p.add_argument("--dataset", type=str, required=True, help="HF dataset ID or local path")
     p.add_argument("--model", type=str, default="Qwen/Qwen3-30B-A3B", help="Tokenizer model name")
@@ -108,6 +110,8 @@ def parse_args():
 
 
 def load_hf_dataset(dataset_id, split, name=None, shuffle_seed=None):
+    """Load an OpenAI-message dataset as a Hugging Face Dataset."""
+
     from datasets import Dataset
 
     from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
@@ -307,6 +311,8 @@ def print_length_distribution(lengths, seq_length):
 
 
 def run_benchmark(dataset, tokenizer, seq_length, strategies, num_proc=None):
+    """Benchmark configured filtering strategies and return their metrics."""
+
     results = {}
     for name in strategies:
         fn = STRATEGIES[name]
@@ -334,6 +340,8 @@ def run_benchmark(dataset, tokenizer, seq_length, strategies, num_proc=None):
 
 
 def print_benchmark_summary(results, dataset_len):
+    """Print timing and retention summaries for benchmark results."""
+
     logger.info("\n" + "=" * 70)
     logger.info("BENCHMARK SUMMARY (%d samples)", dataset_len)
     logger.info("=" * 70)
@@ -418,6 +426,8 @@ def verify_cached_dataset(cache_path):
 
 
 def main():
+    """Run the prefiltering and caching CLI."""
+
     args = parse_args()
 
     if args.hf_home:

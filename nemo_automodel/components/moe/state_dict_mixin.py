@@ -518,20 +518,30 @@ class MoESplitExpertsStateDictMixin:
         return state_dict
 
     def _convert_single_merged_expert_to_hf_split_experts(
-        self, fqn: str, tensor: torch.Tensor, **kwargs
+        self,
+        fqn: str,
+        tensor: torch.Tensor,
+        *,
+        prefix_override: str | None = None,
+        **kwargs,
     ) -> list[tuple[str, torch.Tensor]]:
         """Convert a single merged expert tensor from native format to split HuggingFace format.
 
         Args:
-            fqn: Fully qualified name of the tensor in native format
-            tensor: The tensor to convert
+            fqn: Fully qualified name of the tensor in native format.
+            tensor: The tensor to convert.
+            prefix_override: When provided, replaces ``self._hf_prefix`` in
+                emitted HF keys. Used to route conversions through namespaces
+                outside the main backbone, e.g. ``"mtp."`` for the MTP head.
+            **kwargs: Absorbed for forward-compatibility with base callers
+                that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
         Returns:
             List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
-        prefix = self._hf_prefix
+        prefix = prefix_override if prefix_override is not None else self._hf_prefix
         expert_segment = self._expert_path_segment
 
         if f".{expert_segment}.gate_and_up_projs" in fqn and fqn.endswith(".gate_and_up_projs"):

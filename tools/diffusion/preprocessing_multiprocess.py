@@ -992,6 +992,8 @@ def preprocess_video_dataset(
 
 
 def main():
+    """Run image or video preprocessing from the command line."""
+
     parser = argparse.ArgumentParser(
         description="Unified preprocessing tool for images and videos",
         formatter_class=argparse.RawDescriptionHelpFormatter,

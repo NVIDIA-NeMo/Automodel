@@ -361,6 +361,8 @@ class FlowMatchingPipeline:
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.bfloat16,
         global_step: int = 0,
+        collect_metrics: bool = True,
+        check_loss: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """
         Execute a single training step with flow matching.
@@ -381,6 +383,10 @@ class FlowMatchingPipeline:
             device: Device to use
             dtype: Data type for operations
             global_step: Current training step (for logging)
+            collect_metrics: Whether to collect scalar diagnostics. Disable in
+                hot training paths to avoid host/device synchronizations.
+            check_loss: Whether to run scalar loss explosion checks. Disable in
+                hot training paths to avoid host/device synchronizations.
 
         Returns:
             weighted_loss: Per-element weighted loss
@@ -394,9 +400,9 @@ class FlowMatchingPipeline:
 
         # Extract and prepare batch data (either image_latents or video_latents)
         if "video_latents" in batch:
-            latents = batch["video_latents"].to(device, dtype=dtype)
+            latents = batch["video_latents"].to(device, dtype=dtype, non_blocking=True)
         elif "image_latents" in batch:
-            latents = batch["image_latents"].to(device, dtype=dtype)
+            latents = batch["image_latents"].to(device, dtype=dtype, non_blocking=True)
         else:
             raise KeyError("Batch must contain either 'video_latents' or 'image_latents'")
 
@@ -471,7 +477,7 @@ class FlowMatchingPipeline:
         )
 
         # Safety check
-        if torch.isnan(average_weighted_loss) or average_weighted_loss > 100:
+        if check_loss and (torch.isnan(average_weighted_loss) or average_weighted_loss > 100):
             logger.error(f"[ERROR] Loss explosion! Loss={average_weighted_loss.item():.3f}")
             raise ValueError(f"Loss exploded: {average_weighted_loss.item()}")
 
@@ -486,23 +492,24 @@ class FlowMatchingPipeline:
                 f"w=[{loss_weight.min():.2f},{loss_weight.max():.2f}]"
             )
 
-        # Collect metrics
-        metrics = {
-            "loss": average_weighted_loss.item(),
-            "unweighted_loss": average_unweighted_loss.item(),
-            "sigma_min": sigma.min().item(),
-            "sigma_max": sigma.max().item(),
-            "sigma_mean": sigma.mean().item(),
-            "weight_min": loss_weight.min().item(),
-            "weight_max": loss_weight.max().item(),
-            "timestep_min": timesteps.min().item(),
-            "timestep_max": timesteps.max().item(),
-            "noisy_min": noisy_latents.min().item(),
-            "noisy_max": noisy_latents.max().item(),
-            "sampling_method": sampling_method,
-            "task_type": task_type,
-            "data_type": data_type,
-        }
+        metrics = {}
+        if collect_metrics:
+            metrics = {
+                "loss": average_weighted_loss.item(),
+                "unweighted_loss": average_unweighted_loss.item(),
+                "sigma_min": sigma.min().item(),
+                "sigma_max": sigma.max().item(),
+                "sigma_mean": sigma.mean().item(),
+                "weight_min": loss_weight.min().item(),
+                "weight_max": loss_weight.max().item(),
+                "timestep_min": timesteps.min().item(),
+                "timestep_max": timesteps.max().item(),
+                "noisy_min": noisy_latents.min().item(),
+                "noisy_max": noisy_latents.max().item(),
+                "sampling_method": sampling_method,
+                "task_type": task_type,
+                "data_type": data_type,
+            }
 
         return weighted_loss, average_weighted_loss, loss_mask, metrics
 

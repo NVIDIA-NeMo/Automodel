@@ -1,6 +1,6 @@
 # LLaVA-OneVision 1.5
 
-[LLaVA-OneVision 1.5](https://github.com/LLaVA-VL/LLaVA-OneVision-1.5) is a vision-language model combining a **Rice ViT** encoder with a **Qwen3** language backbone, capable of handling both image and video understanding. NeMo AutoModel ships a custom NVIDIA implementation (`LlavaOneVisionForConditionalGeneration`) with FSDP2/HSDP support, LoRA fine-tuning and distributed training.
+[LLaVA-OneVision 1.5](https://github.com/EvolvingLMMs-Lab/LLaVA-OneVision-2) is a vision-language model combining a **Rice ViT** encoder with a **Qwen3** language backbone, capable of handling both image and video understanding. NeMo AutoModel ships a custom NVIDIA implementation (`LlavaOneVisionForConditionalGeneration`) with FSDP2/HSDP support, LoRA fine-tuning and distributed training.
 
 :::{card}
 | | |

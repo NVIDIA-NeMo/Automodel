@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
+    """Parse command-line options for the truncation report."""
+
     parser = argparse.ArgumentParser(description="Calculate truncation percentage for a dataset and sequence length.")
     parser.add_argument("--dataset", type=str, required=True, help="HF dataset ID or local path")
     parser.add_argument("--seq_length", type=int, nargs="+", required=True, help="Sequence length(s) to check")
@@ -119,6 +121,8 @@ def print_report(lengths, seq_lengths):
 
 
 def main():
+    """Run the truncation analysis CLI."""
+
     args = parse_args()
 
     if args.hf_home:

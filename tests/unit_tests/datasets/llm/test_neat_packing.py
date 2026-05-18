@@ -389,3 +389,18 @@ class TestNeatPackedCollater:
         assert result["position_ids"].shape == (2, 4)
         assert result["attention_mask"].shape == (2, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
+
+    def test_sdpa_preserves_indexed_packed_seq_ids(self):
+        batch = [
+            {
+                "input_ids": torch.tensor([1, 2, 3, 4]),
+                "labels": torch.tensor([10, 20, 30, 40]),
+                "attention_mask": torch.tensor([1, 1, 2, 2]),
+                "position_ids": torch.tensor([0, 1, 0, 1]),
+            },
+        ]
+        result = neat_packed_collater(batch, attn_implementation="sdpa")
+
+        assert result["attention_mask"].shape == (1, 1, 4, 4)
+        assert result["attention_mask"].dtype == torch.bool
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]

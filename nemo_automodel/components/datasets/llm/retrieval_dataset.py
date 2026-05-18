@@ -27,6 +27,8 @@ EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
 
 class AbstractDataset(ABC):
+    """Interface for corpus datasets addressable by document id."""
+
     @abstractmethod
     def get_document_by_id(self, id):
         pass
@@ -37,6 +39,8 @@ class AbstractDataset(ABC):
 
 
 class TextQADataset(AbstractDataset):
+    """Load TextQA corpus documents from a HuggingFace dataset path."""
+
     def __init__(self, path):
         self.path = path
         self.data = load_dataset(path)["train"]
@@ -130,6 +134,7 @@ class CorpusInfo:
 
 
 def load_corpus_metadata(path: str):
+    """Load Merlin corpus metadata from a corpus directory."""
     path_metadata = os.path.join(path, "merlin_metadata.json")
     if not os.path.isfile(path_metadata):
         raise ValueError("Metadata File for Corpus does not exist: " + path_metadata)
@@ -139,6 +144,7 @@ def load_corpus_metadata(path: str):
 
 
 def load_corpus(path, metadata: Optional[dict] = None):
+    """Instantiate a corpus dataset from a path and optional metadata."""
     if metadata is None:
         metadata = load_corpus_metadata(path)
     if metadata["class"] not in DATASETS:
@@ -149,6 +155,7 @@ def load_corpus(path, metadata: Optional[dict] = None):
 
 
 def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
+    """Add one or more corpus paths to a corpus dictionary."""
     if corpus_dict is None:
         raise ValueError("Corpus dictionary is not provided")
     if not isinstance(qa_corpus_paths, list):

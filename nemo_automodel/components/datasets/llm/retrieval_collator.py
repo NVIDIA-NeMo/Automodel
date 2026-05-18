@@ -259,6 +259,8 @@ class BiEncoderCollator:
 
 
 class CrossEncoderCollator(DataCollatorWithPadding):
+    """Collate query-document pairs for cross-encoder reranking."""
+
     def __init__(
         self, rerank_max_length: int, *args, prompt_template: str = "question:{query} \n \n passage:{passage}", **kwargs
     ):

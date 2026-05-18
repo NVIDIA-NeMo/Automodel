@@ -525,6 +525,8 @@ def quick_geglu_deepep(
     limit: float = 7.0,
     linear_offset: float = 1.0,
 ):
+    """Apply DeepEP Quick-GEGLU activation and routing probabilities."""
+
     gate_out, up_out = x[..., ::2], x[..., 1::2]
     # Clamp the input values
     gate_out = gate_out.clamp(min=None, max=limit)
@@ -572,6 +574,8 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float):
 
 
 def get_expert_activation_for_deepep(config: MoEConfig):
+    """Return the DeepEP expert activation function selected by the MoE config."""
+
     if config.expert_activation == "swiglu":
         # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
         if getattr(config, "swiglu_limit", 0.0) > 0.0:

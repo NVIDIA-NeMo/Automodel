@@ -809,6 +809,7 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
 
 
 def glm4_moe_flops(config, gbs=1, seq_len=None):
+    """Estimate FLOPs for GLM4 MoE model configurations."""
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
 

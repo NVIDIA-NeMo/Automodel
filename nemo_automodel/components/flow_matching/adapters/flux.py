@@ -140,15 +140,15 @@ class FluxAdapter(ModelAdapter):
         batch_size, channels, height, width = noisy_latents.shape
 
         # Get text embeddings (T5)
-        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype)
+        text_embeddings = batch["text_embeddings"].to(device, dtype=dtype, non_blocking=True)
         if text_embeddings.ndim == 2:
             text_embeddings = text_embeddings.unsqueeze(0)
 
         # Get pooled embeddings (CLIP) - may or may not be present
         if "pooled_prompt_embeds" in batch:
-            pooled_projections = batch["pooled_prompt_embeds"].to(device, dtype=dtype)
+            pooled_projections = batch["pooled_prompt_embeds"].to(device, dtype=dtype, non_blocking=True)
         elif "clip_pooled" in batch:
-            pooled_projections = batch["clip_pooled"].to(device, dtype=dtype)
+            pooled_projections = batch["clip_pooled"].to(device, dtype=dtype, non_blocking=True)
         else:
             # Create zero embeddings if not provided
             pooled_projections = torch.zeros(batch_size, 768, device=device, dtype=dtype)

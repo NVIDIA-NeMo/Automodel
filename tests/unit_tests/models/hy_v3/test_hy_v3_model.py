@@ -14,6 +14,7 @@
 
 """Unit tests for the HYV3 Block / HYV3Model / HYV3ForCausalLM layers."""
 
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,7 +29,7 @@ from nemo_automodel.components.models.hy_v3.model import (
     ModelClass,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import FakeBalancedGate, MLP, MoE
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -333,6 +334,25 @@ class TestHYV3ForCausalLM:
                 with patch.object(layer.mlp.gate, "update_bias") as mock:
                     model.update_moe_gate_bias()
                     mock.assert_not_called()
+
+    def test_update_moe_gate_bias_no_op_with_fake_balanced_gate(self, config, backend_config, device):
+        config.num_hidden_layers = 4
+        backend_config.fake_balanced_gate = True
+        model = HYV3ForCausalLM(config, backend=backend_config).to(device)
+        moe_layers = [layer for layer in model.model.layers.values() if isinstance(layer.mlp, MoE)]
+
+        assert len(model.model.layers) == 4
+        assert moe_layers
+        for layer in moe_layers:
+            assert isinstance(layer.mlp.gate, FakeBalancedGate)
+            assert layer.mlp.gate.bias_update_factor == 0.0
+
+        with ExitStack() as stack:
+            update_mocks = [stack.enter_context(patch.object(layer.mlp.gate, "update_bias")) for layer in moe_layers]
+            model.update_moe_gate_bias()
+
+        for update_mock in update_mocks:
+            update_mock.assert_not_called()
 
     def test_update_moe_gate_bias_calls_when_factor_positive(self, config, backend_config, device):
         model = HYV3ForCausalLM(
