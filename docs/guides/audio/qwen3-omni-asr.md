@@ -139,7 +139,6 @@ One epoch over the ~69k post-1.0s-filter AMI IHM train clips finishes in
 dominated by FSDP / expert all-gather (~36 GB), not by activations, so batch
 can be pushed this high without OOM.
 
-End-of-epoch WER on AMI IHM test: **8.31%** (base Qwen3-Omni: 15.81%).
 
 ### Launch
 
@@ -237,37 +236,18 @@ python tools/wrap_thinker_ckpt_as_omni.py \
 The output directory is a drop-in replacement for the public Qwen3-Omni
 snapshot — only the `thinker.*` weights differ.
 
-### Sanity-check the export
-
-```bash
-python -c "
-from transformers import AutoConfig
-cfg = AutoConfig.from_pretrained('/tmp/qwen3_omni_asr_step_199_wrapped')
-print('model_type:', cfg.model_type)               # qwen3_omni_moe
-print('architectures:', cfg.architectures)         # ['Qwen3OmniMoeForConditionalGeneration']
-"
-```
-
-The wrapped export loads with any HuggingFace `AutoModel*` and with vLLM.
-
 ---
 
-## 4. Tips and Pitfalls
+## 4. Results: AMI IHM
 
-| Symptom                                                                     | Likely cause                                                                                                | Fix                                                                                                                                       |
-|-----------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `AttributeError: 'BaseModelOutputWithPooling' object has no attribute 'to'` | Pre-existing bug: `get_audio_features()` returns a named output, the forward code called `.to()` on it directly | Fixed in `nemo_automodel/components/models/qwen3_omni_moe/model.py`; regression covered by `tests/unit_tests/models/qwen3_omni_moe/test_qwen3_omni_moe_model.py` |
-| `ValueError: model type 'qwen3_omni_moe_thinker' not recognized`            | Loading the NEMO consolidated checkpoint directly with HF or vLLM                                            | Run `tools/wrap_thinker_ckpt_as_omni.py` to wrap the thinker as a full Omni export                                                        |
-| `ModuleNotFoundError: torchcodec`                                           | Some other ASR/audio loader is being imported                                                                | The built-in dataset builder uses soundfile only; check that no `Audio(decode=True)` path is invoked outside the recipe                   |
-| OOM during full FT                                                          | 30B + audio tower trainable plus AdamW states                                                                | Drop `step_scheduler.global_batch_size`; enable activation checkpointing; or freeze the audio tower                                       |
+End-of-epoch evaluation on the AMI IHM `test` split, comparing the
+zero-shot base Qwen3-Omni against the same model after one epoch of full
+fine-tuning with the recipe above (audio tower trainable). WER drops by
+roughly half:
 
----
+![AMI IHM WER: base vs fine-tuned Qwen3-Omni](./qwen_omni_asr.png)
 
-## Reference: files added or relied on by this guide
-
-| Path                                                                  | Role                                                            |
-|-----------------------------------------------------------------------|-----------------------------------------------------------------|
-| `nemo_automodel/components/datasets/vlm/datasets.py`                  | `make_hf_audio_asr_dataset` (lazy `with_transform` builder)     |
-| `nemo_automodel/components/datasets/vlm/collate_fns.py`               | `qwen3_omni_asr_collate_fn` (no `qwen_omni_utils` dependency)   |
-| `examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml`                 | Full-FT English ASR recipe on AMI                               |
-| `tools/wrap_thinker_ckpt_as_omni.py`                                  | Convert thinker checkpoint → HF Omni export                     |
+| Stage           | Model                                                 | WER (AMI IHM test) |
+|-----------------|-------------------------------------------------------|--------------------|
+| Before training | Base `Qwen/Qwen3-Omni-30B-A3B-Instruct` (zero-shot)   | 15.81%             |
+| After training  | 1 epoch full FT (audio tower trainable)               | **8.31%**          |
