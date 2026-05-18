@@ -65,6 +65,18 @@ class Eagle3TrainerModule(nn.Module):
         ttt_steps: int,
     ):
         super().__init__()
+        # The forward pass weighs each TTT step by ``0.8 ** i`` and divides
+        # the running loss by ``sum_{i=0}^{ttt_steps-1} 0.8 ** i``. With
+        # ``ttt_steps <= 0`` the loop never runs and the divisor is zero,
+        # which would silently produce a NaN loss instead of an actionable
+        # error. Catch the misconfiguration here so it surfaces during
+        # recipe setup rather than mid-training.
+        if not isinstance(ttt_steps, int) or ttt_steps < 1:
+            raise ValueError(
+                f"Eagle3TrainerModule requires ttt_steps to be an integer >= 1 "
+                f"(the draft must run at least one forward step to produce a "
+                f"loss), got ttt_steps={ttt_steps!r}."
+            )
         self.draft_model = draft_model
         self.register_buffer("selected_token_ids", selected_token_ids, persistent=True)
         self.register_buffer("selected_token_mask", selected_token_mask, persistent=True)

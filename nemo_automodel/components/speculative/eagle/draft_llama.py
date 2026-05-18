@@ -36,6 +36,7 @@ at load time, so the un-fused storage above is the canonical on-disk format.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
@@ -47,6 +48,32 @@ from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from nemo_automodel.shared.import_utils import safe_import_from
+
+logger = logging.getLogger(__name__)
+
+
+def _load_flash_attn_func() -> tuple[bool, object | None]:
+    """Best-effort load of flash-attn without breaking eager-only users.
+
+    ``safe_import_from`` already handles missing modules and missing symbols, but
+    some broken ``flash-attn`` installs fail with lower-level loader errors
+    (e.g. ABI / shared-library issues) that should not prevent importing this
+    module for the eager path.
+    """
+    try:
+        has_fa, flash_attn_func = safe_import_from("flash_attn", "flash_attn_func")
+    except Exception as exc:  # pragma: no cover - depends on local flash-attn loader failures.
+        logger.warning("Failed to import flash_attn.flash_attn_func; FlashAttention-2 path will be disabled: %s", exc)
+        return False, None
+    if not has_fa:
+        return False, None
+    return True, flash_attn_func
+
+
+_HAS_FA, _flash_attn_func = _load_flash_attn_func()
+
+_SUPPORTED_ATTN_IMPLEMENTATIONS = ("eager", "flash_attention_2")
 
 
 def _build_causal_mask(
@@ -61,6 +88,12 @@ def _build_causal_mask(
 
     expanded = (1.0 - attention_mask[:, None, None, :].to(dtype)) * torch.finfo(dtype).min
     return causal + expanded
+
+
+def _is_right_padded_attention_mask(attention_mask: torch.Tensor) -> bool:
+    """Return True when each row is a contiguous valid-prefix followed by padding."""
+    mask_bool = attention_mask.to(dtype=torch.bool)
+    return not bool((mask_bool[:, 1:] & ~mask_bool[:, :-1]).any())
 
 
 class Eagle3LlamaAttention(nn.Module):
@@ -106,6 +139,23 @@ class Eagle3LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
+
+        # Read only the explicit ``attn_implementation`` field; HF's private
+        # ``_attn_implementation`` is owned by ``PreTrainedModel`` and may be
+        # auto-set to "sdpa"/"flash_attention_2" by HF before this module
+        # supports those backends.
+        attn_impl = getattr(config, "attn_implementation", None) or "eager"
+        if attn_impl not in _SUPPORTED_ATTN_IMPLEMENTATIONS:
+            raise ValueError(
+                f"Eagle3LlamaAttention: unsupported attn_implementation={attn_impl!r}; "
+                f"expected one of {_SUPPORTED_ATTN_IMPLEMENTATIONS}"
+            )
+        if attn_impl == "flash_attention_2" and not _HAS_FA:
+            raise ImportError(
+                "Eagle3LlamaAttention: attn_implementation='flash_attention_2' requires the "
+                "'flash-attn' package to be installed."
+            )
+        self.attn_implementation = attn_impl
 
         in_features = config.hidden_size * 2
         self.q_proj = nn.Linear(in_features, self.num_heads * self.head_dim, bias=config.attention_bias)
@@ -161,6 +211,24 @@ class Eagle3LlamaAttention(nn.Module):
         cache_k.append(k)
         cache_v.append(v)
 
+        if self.attn_implementation == "flash_attention_2":
+            attn_output = self._flash_attention_forward(q, cache_k, cache_v, step_idx, batch_size, seq_len)
+        else:
+            attn_output = self._eager_attention_forward(
+                q, cache_k, cache_v, attention_mask, step_idx, batch_size, seq_len
+            )
+        return self.o_proj(attn_output)
+
+    def _eager_attention_forward(
+        self,
+        q: torch.Tensor,
+        cache_k: list[torch.Tensor],
+        cache_v: list[torch.Tensor],
+        attention_mask: torch.Tensor,
+        step_idx: int,
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
         # Block 1: full T x T causal attention against the step-0 keys.
         k0, v0 = cache_k[0], cache_v[0]
         attn_weights = torch.matmul(q, k0.transpose(-2, -1)) * self.scaling
@@ -190,8 +258,75 @@ class Eagle3LlamaAttention(nn.Module):
             diag_probs = attn_probs[..., seq_len:]  # [B, H, T, step_idx]
             attn_output = attn_output + torch.einsum("bhts,sbhtd->bhtd", diag_probs, later_v)
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        return self.o_proj(attn_output)
+        return attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+
+    def _flash_attention_forward(
+        self,
+        q: torch.Tensor,
+        cache_k: list[torch.Tensor],
+        cache_v: list[torch.Tensor],
+        step_idx: int,
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """EAGLE-3 attention via FlashAttention-2 for the T x T causal block.
+
+        FA2 covers Block 1 (full ``T x T`` causal attention against ``K_0``) and
+        returns the un-normalized log-sum-exp (``softmax_lse``) alongside the
+        per-token output. The diagonal extension columns (Block 2) for cached
+        steps ``i >= 1`` are computed in eager mode, then merged into a single
+        softmax via the log-space identity
+        ``lse_full = logaddexp(lse_fa, logsumexp(diag))``; the FA output is
+        rescaled by ``exp(lse_fa - lse_full)`` and the diagonal contribution
+        is added with weights ``exp(diag - lse_full)``.
+
+        Padding handling: FA2 is invoked with ``causal=True``. For right-padded
+        batches, padding keys always lie strictly above the diagonal relative
+        to any non-padded query position, so causal masking alone yields the
+        same output as the eager additive padding mask at every valid query
+        position. Outputs at padding query positions differ, but those are
+        masked out at loss time.
+        """
+        # FA2 expects (B, T, H, D); eager cache is (B, H, T, D).
+        k0, v0 = cache_k[0], cache_v[0]
+        q_fa = q.transpose(1, 2).contiguous()
+        k0_fa = k0.transpose(1, 2).contiguous()
+        v0_fa = v0.transpose(1, 2).contiguous()
+        # ``softmax_lse`` is fp32 with shape (B, H, T): the log-sum-exp of the
+        # SCALED Block-1 logits (the FA kernel folds in ``softmax_scale``).
+        out_fa, lse_fa, _ = _flash_attn_func(
+            q_fa,
+            k0_fa,
+            v0_fa,
+            softmax_scale=self.scaling,
+            causal=True,
+            return_attn_probs=True,
+        )
+        # FA output is (B, T, H, D); bring back to (B, H, T, D) for downstream merge.
+        attn_output_bhtd = out_fa.transpose(1, 2)
+
+        if step_idx >= 1:
+            # Diagonal logits share the same ``self.scaling`` factor as FA's
+            # internal softmax, so ``lse_fa`` and ``diag_logits`` are commensurate.
+            later_k = torch.stack(cache_k[1:], dim=0)  # [step_idx, B, H, T, D]
+            diag_logits = torch.einsum("bhtd,sbhtd->bhts", q, later_k) * self.scaling
+
+            # Combine softmax in log-space:
+            #   lse_full = log( exp(lse_fa) + sum_i exp(diag_i) )
+            #            = logaddexp(lse_fa, logsumexp(diag, dim=-1))
+            lse_fa_f32 = lse_fa.float()  # [B, H, T]
+            diag_f32 = diag_logits.float()  # [B, H, T, step_idx]
+            diag_lse = torch.logsumexp(diag_f32, dim=-1)  # [B, H, T]
+            lse_full = torch.logaddexp(lse_fa_f32, diag_lse)  # [B, H, T]
+
+            w1 = torch.exp(lse_fa_f32 - lse_full).to(q.dtype)  # [B, H, T]
+            w2 = torch.exp(diag_f32 - lse_full.unsqueeze(-1)).to(q.dtype)  # [B, H, T, step_idx]
+
+            attn_output_bhtd = attn_output_bhtd * w1.unsqueeze(-1)
+            later_v = torch.stack(cache_v[1:], dim=0)  # [step_idx, B, H, T, D]
+            attn_output_bhtd = attn_output_bhtd + torch.einsum("bhts,sbhtd->bhtd", w2, later_v)
+
+        return attn_output_bhtd.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
 
 
 class Eagle3LlamaMLP(nn.Module):
@@ -358,6 +493,13 @@ class LlamaEagle3DraftModel(PreTrainedModel):
             position_ids = position_ids.expand(input_ids.shape[0], -1)
         if cache_hidden is None:
             cache_hidden = [[], []]
+        if self.model.layers[
+            0
+        ].self_attn.attn_implementation == "flash_attention_2" and not _is_right_padded_attention_mask(attention_mask):
+            raise ValueError(
+                "LlamaEagle3DraftModel: attn_implementation='flash_attention_2' requires a right-padded "
+                "attention_mask (each row must be contiguous 1s followed by 0s)."
+            )
 
         draft_input_embeds = self.embed_input_ids(input_ids)
         causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)

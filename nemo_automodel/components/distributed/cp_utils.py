@@ -193,26 +193,6 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
-def attach_linear_attn_position_hooks(model: torch.nn.Module):
-    """Forward pre-hook on decoder layers to pass position_ids to linear_attn.
-
-    HF Qwen3.5 decoder layers don't pass position_ids to linear_attn, but
-    CPAwareGatedDeltaNet needs them under CP to undo load-balanced sharding.
-    This hook captures position_ids from the decoder layer's kwargs and
-    stores it on the linear_attn module so its forward can read it.
-    """
-
-    def _decoder_pre_hook(_module, _args, kwargs):
-        _module.linear_attn._cached_position_ids = kwargs.get("position_ids", None)
-        return None
-
-    for _, mod in model.named_modules():
-        if hasattr(mod, "linear_attn") and hasattr(mod, "layer_type"):
-            if not getattr(mod, "_linear_attn_pos_hook_registered", False):
-                mod.register_forward_pre_hook(_decoder_pre_hook, with_kwargs=True)
-                mod._linear_attn_pos_hook_registered = True
-
-
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,

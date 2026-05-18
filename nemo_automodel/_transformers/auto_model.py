@@ -43,6 +43,7 @@ from transformers import (  # noqa: E402
     AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
+    AutoModelForTokenClassification,
     PreTrainedModel,
 )
 from transformers.initialization import no_init_weights  # noqa: E402
@@ -88,6 +89,7 @@ from nemo_automodel._transformers.kernel_patches import (
     _patch_attention,
     _patch_liger_kernel,
     _verify_sdpa_support,
+    apply_model_runtime_patches,
 )
 from nemo_automodel._transformers.model_init import (
     _consume_config_overrides,
@@ -426,6 +428,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 logger.warning("Falling back to %s attention.", attn_implementation)
                 return _retry(attn_implementation=attn_implementation)
             raise
+
+        model = apply_model_runtime_patches(model, mesh)
 
         # Kernel patching
         try:
@@ -828,6 +832,33 @@ class NeMoAutoModelForSequenceClassification(_BaseNeMoAutoModelClass, AutoModelF
     >>> model = NeMoAutoModelForSequenceClassification.from_pretrained("bert-base-uncased") # try Liger
     >>> model = NeMoAutoModelForSequenceClassification.from_pretrained(
     ...     "bert-base-uncased", use_liger_kernel=False)                            # skip Liger
+    """
+
+    pass
+
+
+class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForTokenClassification):
+    """Drop-in replacement for ``transformers.AutoModelForTokenClassification`` with custom-kernels.
+
+    The class only overrides ``from_pretrained`` and ``from_config`` to add the
+    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
+    the Liger kernel is available, the model's attention layers are
+    monkey-patched in place.  If patching fails for any reason, the call is
+    retried once with ``use_liger_kernel=False`` so that users still obtain a
+    functional model.
+
+    Notes:
+    -----
+    - No changes are made to the model's public API; forward signatures,
+      generation utilities, and weight shapes remain identical.
+    - Only decoder-style (causal) architectures are currently supported by the
+      Liger patch.  Unsupported models will silently fall back.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english") # try Liger
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
+    ...     "dbmdz/bert-large-cased-finetuned-conll03-english", use_liger_kernel=False)   # skip Liger
     """
 
     pass
