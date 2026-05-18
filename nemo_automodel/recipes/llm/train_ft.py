@@ -25,7 +25,6 @@ try:
 except ImportError:
     pass
 
-import inspect
 import logging
 import pathlib
 import time
@@ -34,36 +33,19 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn as nn
 import wandb
-from huggingface_hub import constants as hf_constants
-from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import AutoConfig
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel._transformers.infrastructure import (
-    apply_model_infrastructure,
-    instantiate_infrastructure,
-)
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
-from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
-from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -74,15 +56,15 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
-    _supports_seq_lens,
-    resolve_trust_remote_code,
+    resolve_trust_remote_code,  # noqa: F401 — patched by recipe tests
 )
+from transformers import AutoConfig  # noqa: F401 — patched by recipe PP tests
 from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
     build_loss_fn,
     build_lr_scheduler,
     build_mlflow,
-    build_optimizer,
+    build_optimizer,  # noqa: F401 — re-exported for sibling recipes (kd.py) + tests
     build_step_scheduler,
     build_wandb,
 )
@@ -91,7 +73,7 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
-    from torch.optim import Optimizer
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +186,27 @@ def build_model(
         activation_checkpointing=activation_checkpointing,
         unfreeze_modules=unfreeze_modules,
         sdpa_method=sdpa_method,
+    )
+
+
+def _resolve_lr_scheduler_config(cfg_lr):
+    """Translate the recipe's ``lr_scheduler:`` ConfigNode into a typed
+    :class:`LRSchedulerConfig` for the Engine. Returns ``None`` if not set."""
+    if cfg_lr is None:
+        return None
+    from nemo_automodel.engine import LRSchedulerConfig
+
+    total = cfg_lr.get("total_steps", cfg_lr.get("lr_decay_steps", None))
+    if total is None:
+        raise ValueError("lr_scheduler must include 'total_steps' (or 'lr_decay_steps').")
+    return LRSchedulerConfig(
+        total_steps=int(total),
+        lr_warmup_steps=int(cfg_lr.get("lr_warmup_steps", 0) or 0),
+        lr_warmup_steps_ratio=float(cfg_lr.get("lr_warmup_steps_ratio", 0.0) or 0.0),
+        lr_decay_style=cfg_lr.get("lr_decay_style", "cosine"),
+        init_lr_ratio=float(cfg_lr.get("init_lr_ratio", 0.1)),
+        min_lr_ratio=float(cfg_lr.get("min_lr_ratio", 0.01)),
+        wd_incr_style=cfg_lr.get("wd_incr_style", "constant"),
     )
 
 
@@ -366,24 +369,30 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        model = build_model(
-            self.cfg.model,
-            self.peft_config,
+        # Construct Engine — TorchTitan-style: __init__ builds mesh + model +
+        # optimizer + lr_scheduler. Recipe keeps the existing lr_scheduler path
+        # (driven by step_scheduler), so we pass lr_scheduler=None here and
+        # attach it post-step_scheduler-construction below.
+        from nemo_automodel.engine import Engine
+
+        self.engine = Engine(Engine.Config(
+            model=self.cfg.model,
+            distributed=self.dist_setup,
+            optimizer=self.cfg.optimizer,
+            lr_scheduler=None,
+            peft=self.peft_config,
+            fp8=self.cfg.get("fp8", None),
+            compile=self.cfg.get("compile", None),
+            quantization=self.cfg.get("quantization", None),
+            qat=self.cfg.get("qat", None),
+            sdpa_method=self.cfg.get("sdpa_method", None),
             has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
             seed=self.cfg.get("seed", 42),
-            cfg_fp8=self.cfg.get("fp8", None),
-            cfg_compile=self.cfg.get("compile", None),
-            cfg_quantization=self.cfg.get("quantization", None),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            pipeline_config=self.pipeline_config,
-            cfg_qat=self.cfg.get("qat", None),
-            cfg_moe=self.dist_setup.moe_config,
-            activation_checkpointing=self.dist_setup.activation_checkpointing,
-            sdpa_method=self.cfg.get("sdpa_method", None),
-        )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+            max_grad_norm=self.max_grad_norm,
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+        ))
+        model = self.engine.model
+        self.optimizer = [self.engine.optimizer]
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -508,28 +517,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
-        # ── Construct Engine, injecting recipe-built state. ──────────
-        # build_model / build_optimizer / build_lr_scheduler ran above; we
-        # don't call engine.build(). The Engine just gives us a stable train-
-        # step surface (forward_backward / optimizer_step / lr_scheduler_step).
-        from nemo_automodel.engine import Engine
-
-        self.engine = Engine(Engine.Config(
-            model=self.cfg.model,
-            distributed=self.dist_setup,
-            optimizer=self.cfg.optimizer,
-            lr_scheduler=self.cfg.get("lr_scheduler", None),
-            max_grad_norm=self.max_grad_norm,
-            moe=self.dist_setup.moe_config,
-            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-        ))
-        # Inject already-built state — bypasses engine.build().
-        self.engine.model = self.pp if self.pp is not None else self.model_parts[0]
-        self.engine.optimizer = self.optimizer[0] if isinstance(self.optimizer, list) else self.optimizer
+        # Engine was constructed earlier (eager build of mesh + model + optimizer).
+        # Attach the recipe-built lr_scheduler and the CP/THD/FP8 shaping params.
         self.engine.lr_scheduler = (
             self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
         )
-        self.engine.mesh = self.dist_setup
         # CP/THD shaping for the recipe's model + dataloader combo.
         self.engine.cp_use_te = (
             _uses_te_dot_product_attention(self.model_parts[0]) and _uses_thd_collater(self.cfg.dataloader)

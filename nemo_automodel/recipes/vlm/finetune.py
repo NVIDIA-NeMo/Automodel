@@ -31,42 +31,29 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch.nn as nn
 import wandb
-from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoProcessor
-from transformers.processing_utils import ProcessorMixin
 
-from nemo_automodel._transformers import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
-    NeMoAutoModelForMultimodalLM,
-)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
-from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep
+from nemo_automodel.components.utils.model_utils import _supports_logits_to_keep
 from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
     build_loss_fn,
     build_lr_scheduler,
-    build_optimizer,
+    build_optimizer,  # noqa: F401 — re-exported for vlm/kd.py + tests
     build_step_scheduler,
     build_wandb,
 )
@@ -165,7 +152,7 @@ def build_model(
     )
 
 if TYPE_CHECKING:
-    from torch.optim import Optimizer
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -277,21 +264,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        model = build_model(
-            self.cfg.model,
-            self.cfg.get("freeze_config", None),
-            self.peft_config,
+        # Construct VLMEngine — TorchTitan-style: __init__ builds mesh + model +
+        # optimizer. Recipe keeps the existing lr_scheduler path (driven by
+        # step_scheduler), so we pass lr_scheduler=None and attach it later.
+        from nemo_automodel.engine import Engine
+        from nemo_automodel.vlm_engine import VLMEngine
+
+        self.engine = VLMEngine(Engine.Config(
+            model=self.cfg.model,
+            distributed=self.dist_setup,
+            optimizer=self.cfg.optimizer,
+            lr_scheduler=None,
+            peft=self.peft_config,
+            fp8=self.cfg.get("fp8", None),
+            compile=self.cfg.get("compile", None),
+            freeze_config=self.cfg.get("freeze_config", None),
             seed=self.cfg.get("seed", 42),
-            cfg_fp8=self.cfg.get("fp8", None),
-            cfg_compile=self.cfg.get("compile", None),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            pipeline_config=self.pipeline_config,
-            cfg_moe=self.dist_setup.moe_config,
-            activation_checkpointing=self.dist_setup.activation_checkpointing,
-        )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+            max_grad_norm=self.max_grad_norm,
+            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+        ))
+        model = self.engine.model
+        self.optimizer = [self.engine.optimizer]
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -368,28 +361,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
 
-        # ── Construct VLMEngine, injecting recipe-built state. ───────
-        # build_model / build_optimizer / build_lr_scheduler ran above; we
-        # don't call engine.build(). VLMEngine adds VLM-specific intercepts
-        # (CP multimodal pre-embed, PP media chunking) via subclass hooks.
-        from nemo_automodel.engine import Engine
-        from nemo_automodel.vlm_engine import VLMEngine
-
-        self.engine = VLMEngine(Engine.Config(
-            model=self.cfg.model,
-            distributed=self.dist_setup,
-            optimizer=self.cfg.optimizer,
-            lr_scheduler=self.cfg.get("lr_scheduler", None),
-            max_grad_norm=self.max_grad_norm,
-            moe=self.dist_setup.moe_config,
-            defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
-        ))
-        self.engine.model = self.pp if self.pp is not None else self.model_parts[0]
-        self.engine.optimizer = self.optimizer[0] if isinstance(self.optimizer, list) else self.optimizer
+        # VLMEngine was constructed earlier (eager build of mesh + model + optimizer).
+        # Attach the recipe-built lr_scheduler and the CP/FP8 shaping params.
         self.engine.lr_scheduler = (
             self.lr_scheduler[0] if isinstance(self.lr_scheduler, list) and self.lr_scheduler else None
         )
-        self.engine.mesh = self.dist_setup
         # VLM neat-packing collators are THD-style; engine reads CP knobs from
         # the recipe's own config helpers (same as train_ft.py).
         self.engine.cp_padding_token_id = (

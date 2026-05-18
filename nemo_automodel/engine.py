@@ -31,9 +31,9 @@ Tier conventions (informal — duck-typed):
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext as _nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -65,54 +65,50 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
 
-def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
-    """Read a key from a dict, ConfigNode, or dataclass."""
-    if cfg is None:
-        return default
-    if isinstance(cfg, Mapping):
-        return cfg.get(key, default)
-    return getattr(cfg, key, default)
-
-
-def _cfg_to_dict(cfg: Any) -> dict:
-    """Best-effort dict coercion."""
-    import dataclasses
-
-    if cfg is None:
-        return {}
-    if isinstance(cfg, Mapping):
-        return dict(cfg)
-    if hasattr(cfg, "to_dict"):
-        return cfg.to_dict()
-    if dataclasses.is_dataclass(cfg):
-        return dataclasses.asdict(cfg)
-    return {k: getattr(cfg, k) for k in dir(cfg) if not k.startswith("_")}
-
-
 # ``_target_`` resolution lives in the config-loader layer
 # (nemo_automodel.components.config.loader); we import the canonical helper
 # rather than duplicating it here.
 from nemo_automodel.components.config.loader import target_and_kwargs as _callable_and_kwargs  # noqa: E402
 
 
+@dataclass
+class LRSchedulerConfig:
+    """Typed config for :class:`OptimizerParamScheduler`. Recipes translate
+    their YAML ``lr_scheduler:`` section into this before passing to ``Engine``."""
+
+    total_steps: int
+    lr_warmup_steps: int = 0
+    lr_warmup_steps_ratio: float = 0.0
+    lr_decay_style: str = "cosine"
+    init_lr_ratio: float = 0.1
+    min_lr_ratio: float = 0.01
+    wd_incr_style: str = "constant"
+
+
 class Engine:
-    """Training engine. One model, one optimizer, one lifecycle.
+    """Training engine. TorchTitan-style: ``__init__`` owns construction —
+    mesh + model + optimizer + lr_scheduler are all built eagerly from the
+    :class:`Engine.Config`.
 
     Usage::
 
         engine = Engine(Engine.Config(
-            model=cfg.model,
-            distributed=cfg.distributed,       # dict OR a pre-built MeshContext
+            model=cfg.model,                       # ConfigNode w/ _target_
+            distributed=dist_setup,                # MeshContext OR a dist-setup ns
             optimizer=cfg.optimizer,
-            lr_scheduler=cfg.lr_scheduler,
+            lr_scheduler=LRSchedulerConfig(...),
         ))
-        engine.build()
+        # engine.model, engine.optimizer, engine.lr_scheduler are now ready.
 
         with engine.train_mode():
             engine.zero_grad()
             out = engine.forward_backward(batch, num_microbatches=8)
             ok, grad_norm = engine.optimizer_step()
             lr = engine.lr_scheduler_step()
+
+    Construction is skipped when ``config.model is None`` — useful for tests
+    that want to construct an Engine shell and inject ``self.model`` /
+    ``self.optimizer`` manually.
     """
 
     # ── Nested Config (TorchTitan / bumblebee pattern) ───────────────
@@ -121,22 +117,29 @@ class Engine:
     class Config:
         """All Engine knobs in one dataclass.
 
-        Field types are intentionally loose (``Any``) so callers can pass
-        their existing ConfigNode / dataclass / dict sub-configs without
-        forcing a schema change.
+        Sub-config fields (``model``, ``optimizer``, ``peft``, ``fp8``, ...)
+        are typed loose (``Any``) so recipes can pass their existing ConfigNode
+        sub-configs straight through; Engine handles the cfg→typed translation
+        internally before calling the typed component builders.
         """
 
-        # ── Build inputs (sub-configs) ────────────────────────────────
-        model: Any = None                       # arbitrary model config object
+        # ── Build inputs (sub-configs from YAML, translated by Engine) ──
+        model: Any = None                       # ConfigNode with _target_
         distributed: Any = None                 # MeshContext OR distributed dict
-        optimizer: Any = None                   # optimizer config (carries _target_)
-        lr_scheduler: Any = None
+        optimizer: Any = None                   # ConfigNode with _target_
+        lr_scheduler: LRSchedulerConfig | None = None
         dist_env: Any = None                    # {backend, timeout_minutes}
-        peft: Any = None
-        quantization: Any = None
-        fp8: Any = None
-        pipeline: Any = None
-        moe: Any = None
+        peft: Any = None                        # already-instantiated PEFT config
+        quantization: Any = None                # ConfigNode (translated to BnbConfig)
+        fp8: Any = None                         # ConfigNode (translated to FP8Config)
+        compile: Any = None                     # ConfigNode (translated to CompileConfig)
+        qat: Any = None                         # ConfigNode (translated to QATConfig)
+        moe: Any = None                         # MoEParallelizerConfig OR ConfigNode
+        pipeline: Any = None                    # PipelineConfig (sourced from mesh)
+        sdpa_method: list[str] | None = None
+        has_packed_sequence: bool = False
+        unfreeze_modules: list[str] | None = None
+        freeze_config: Any = None               # VLM freeze rules; translated to dict
 
         # ── Behavior toggles ─────────────────────────────────────────
         activation_checkpointing: bool = False
@@ -157,55 +160,93 @@ class Engine:
         # LLM training uses this for MTP (Multi-Token Prediction) auxiliary loss.
         extra_loss_fn: Callable[..., torch.Tensor | None] | None = None
 
-    # ── Construction ─────────────────────────────────────────────────
+    # ── Construction (TorchTitan-style: eager in __init__) ───────────
+
+    # Set of NeMoAutoModelFor* factories — populated lazily.
+    _NEMO_AUTO_TARGETS: frozenset = frozenset()
 
     def __init__(self, config: "Engine.Config"):
         self.config = config
 
-        # Runtime state, populated by build() or injected by a recipe that
-        # already built the model/optimizer/mesh itself.
-        self.model: nn.Module | Any = None          # nn.Module or AutoPipeline
+        self.model: nn.Module | Any = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.lr_scheduler: OptimizerParamScheduler | None = None
         self.mesh: MeshContext | None = None
 
-    # ── Convenience accessors for config fields ──────────────────────
-    # These wrappers keep call sites readable (``self.max_grad_norm`` vs
-    # ``self.config.max_grad_norm``) and let recipes mutate the live values
-    # (e.g. updating max_grad_norm per call) without touching the dataclass.
+        if config.model is not None:
+            self._construct()
 
-    @property
-    def model_cfg(self): return self.config.model
-    @property
-    def distributed_cfg(self): return self.config.distributed
-    @property
-    def optimizer_cfg(self): return self.config.optimizer
-    @property
-    def lr_scheduler_cfg(self): return self.config.lr_scheduler
-    @property
-    def dist_env_cfg(self): return self.config.dist_env
-    @property
-    def peft_cfg(self): return self.config.peft
-    @property
-    def quantization_cfg(self): return self.config.quantization
-    @property
-    def fp8_cfg(self): return self.config.fp8
-    @property
-    def pipeline_cfg(self): return self.config.pipeline
-    @property
-    def moe_cfg(self): return self.config.moe
-    @property
-    def activation_checkpointing(self): return self.config.activation_checkpointing
-    @property
-    def defer_fsdp_grad_sync(self): return self.config.defer_fsdp_grad_sync
-    @property
-    def seed(self): return self.config.seed
+    def _construct(self) -> None:
+        """Build mesh + model + optimizer + lr_scheduler from ``self.config``."""
+        from nemo_automodel.components.optim.build import build_optimizer as _build_optimizer_typed
+        from nemo_automodel.components.training.build import build_model as _build_model_typed
+
+        # 1. Resolve mesh — accept either a pre-built MeshContext or a dist-setup ns.
+        if isinstance(self.config.distributed, MeshContext):
+            self.mesh = self.config.distributed
+        elif hasattr(self.config.distributed, "device_mesh"):
+            # SimpleNamespace from recipe's setup_distributed (carries device_mesh,
+            # strategy_config, pipeline_config, moe_config, etc.)
+            self.mesh = self.config.distributed
+        else:
+            _dist_info, self.mesh = init_distributed_and_build_mesh(
+                self.config.distributed, dist_env_cfg=self.config.dist_env,
+            )
+
+        # 2. Build model via the typed component builder; do cfg→typed
+        #    translation inline so the legacy build_model wrapper at the recipe
+        #    layer is no longer needed.
+        model_factory, model_kwargs = _callable_and_kwargs(self.config.model)
+        self.model = _build_model_typed(
+            model_factory=model_factory,
+            model_kwargs=model_kwargs,
+            is_nemo_auto_model=self._is_nemo_automodel_target(model_factory),
+            peft_config=self.config.peft,
+            seed=self.config.seed,
+            has_packed_sequence=self.config.has_packed_sequence,
+            fp8_config=self._build_fp8_config(),
+            compile_config=self._build_compile_config(),
+            quantization_config=self._build_quantization_config(),
+            qat_config=self._build_qat_config(),
+            moe_config=self._resolve_moe_config(),
+            device_mesh=getattr(self.mesh, "device_mesh", None),
+            moe_mesh=getattr(self.mesh, "moe_mesh", None),
+            distributed_config=getattr(self.mesh, "strategy_config", None),
+            pipeline_config=getattr(self.mesh, "pipeline_config", None) or self.config.pipeline,
+            activation_checkpointing=(
+                getattr(self.mesh, "activation_checkpointing", False) or self.config.activation_checkpointing
+            ),
+            unfreeze_modules=self.config.unfreeze_modules,
+            sdpa_method=self.config.sdpa_method,
+            freeze_config=self._resolve_freeze_config(),
+        )
+
+        # 3. Optimizer via the typed component builder.
+        if self.config.optimizer is not None:
+            optimizer_factory, optimizer_kwargs = _callable_and_kwargs(self.config.optimizer)
+            optimizers = _build_optimizer_typed(
+                model=self.model,
+                optimizer_factory=optimizer_factory,
+                optimizer_kwargs=optimizer_kwargs,
+                distributed_config=getattr(self.mesh, "strategy_config", None),
+                device_mesh=getattr(self.mesh, "device_mesh", None),
+            )
+            self.optimizer = optimizers[0] if isinstance(optimizers, list) else optimizers
+
+        # 4. LR scheduler.
+        if self.optimizer is not None:
+            self.lr_scheduler = self._build_lr_scheduler(self.optimizer)
+
+    # ── Convenience accessors ────────────────────────────────────────
+
     @property
     def max_grad_norm(self): return self.config.max_grad_norm
     @max_grad_norm.setter
     def max_grad_norm(self, value): self.config.max_grad_norm = value
 
-    # CP / THD shaping (proxied to config so recipes can read/write either)
+    @property
+    def defer_fsdp_grad_sync(self): return self.config.defer_fsdp_grad_sync
+
     @property
     def cp_use_te(self): return self.config.cp_use_te
     @cp_use_te.setter
@@ -219,7 +260,6 @@ class Engine:
     @cp_num_chunks.setter
     def cp_num_chunks(self, v): self.config.cp_num_chunks = v
 
-    # Optional callable hooks
     @property
     def fp8_autocast(self): return self.config.fp8_autocast
     @fp8_autocast.setter
@@ -229,110 +269,106 @@ class Engine:
     @extra_loss_fn.setter
     def extra_loss_fn(self, v): self.config.extra_loss_fn = v
 
-    # ── Build ────────────────────────────────────────────────────────
+    # ── Internal cfg→typed translators (called from _construct) ───────
 
-    def build(self) -> None:
-        """Construct mesh, model, optimizer, scheduler. Read back via attributes."""
-        # PR 2190 keeps build_model in the recipe (it's complex; not part of the
-        # config-targets-out-of-components refactor). Imported lazily so the
-        # heavy recipe chain isn't pulled at module load.
-        from nemo_automodel.recipes.llm.train_ft import build_model
-        from nemo_automodel.components.optim.build import build_optimizer as _build_optimizer_typed
-
-        # 1. Resolve mesh — accept either a pre-built MeshContext or a dict/cfg.
-        if isinstance(self.distributed_cfg, MeshContext):
-            self.mesh = self.distributed_cfg
-        else:
-            _dist_info, self.mesh = init_distributed_and_build_mesh(
-                self.distributed_cfg, dist_env_cfg=self.dist_env_cfg,
+    def _is_nemo_automodel_target(self, target) -> bool:
+        if not Engine._NEMO_AUTO_TARGETS:
+            from nemo_automodel._transformers import (
+                NeMoAutoModelForCausalLM,
+                NeMoAutoModelForImageTextToText,
+                NeMoAutoModelForMultimodalLM,
+                NeMoAutoModelForSequenceClassification,
             )
 
-        # 2. Build model. build_model returns (model_or_pp, list[optimizer]).
-        #    The optimizer list is non-empty only when megatron_fsdp's
-        #    fully_shard_optimizer path runs; otherwise it's empty.
-        result = build_model(
-            self.model_cfg,
-            self.peft_cfg,
-            self.seed,
-            cfg_fp8=self.fp8_cfg,
-            cfg_quantization=self.quantization_cfg,
-            device_mesh=self.mesh.device_mesh,
-            moe_mesh=self.mesh.moe_mesh,
-            distributed_config=self.mesh.strategy_config,
-            pipeline_config=self.mesh.pipeline_config,
-            cfg_moe=self.mesh.moe_config or self.moe_cfg,
-            activation_checkpointing=self.mesh.activation_checkpointing or self.activation_checkpointing,
-        )
-        if isinstance(result, tuple) and len(result) == 2:
-            self.model, opts_from_build = result
-        else:
-            self.model, opts_from_build = result, []
+            Engine._NEMO_AUTO_TARGETS = frozenset({
+                NeMoAutoModelForCausalLM.from_config,
+                NeMoAutoModelForCausalLM.from_pretrained,
+                NeMoAutoModelForSequenceClassification.from_config,
+                NeMoAutoModelForSequenceClassification.from_pretrained,
+                NeMoAutoModelForImageTextToText.from_config,
+                NeMoAutoModelForImageTextToText.from_pretrained,
+                NeMoAutoModelForMultimodalLM.from_config,
+                NeMoAutoModelForMultimodalLM.from_pretrained,
+            })
+        return target in Engine._NEMO_AUTO_TARGETS
 
-        # 3. Optimizer. Prefer the one returned by build_model (megatron_fsdp
-        #    path); otherwise build via the typed component builder. We do the
-        #    _target_ resolution here so Engine never imports from recipes/_*.
-        if opts_from_build:
-            self.optimizer = opts_from_build[0] if isinstance(opts_from_build, list) else opts_from_build
-        else:
-            optimizer_factory, optimizer_kwargs = _callable_and_kwargs(self.optimizer_cfg)
-            optimizers = _build_optimizer_typed(
-                model=self.model,
-                optimizer_factory=optimizer_factory,
-                optimizer_kwargs=optimizer_kwargs,
-                distributed_config=self.mesh.strategy_config,
-                device_mesh=self.mesh.device_mesh,
-            )
-            self.optimizer = optimizers[0] if isinstance(optimizers, list) else optimizers
+    def _build_fp8_config(self):
+        from nemo_automodel.components.quantization.fp8 import build_fp8_config
 
-        # 4. LR scheduler — construct OptimizerParamScheduler directly, bypassing
-        #    the recipe's build_lr_scheduler (which is tied to a StepScheduler).
-        self.lr_scheduler = self._build_lr_scheduler(self.optimizer)
+        return build_fp8_config(self.config.fp8) if self.config.fp8 is not None else None
+
+    def _build_compile_config(self):
+        from nemo_automodel.components.utils.compile_utils import build_compile_config
+
+        return build_compile_config(self.config.compile) if self.config.compile is not None else None
+
+    def _build_quantization_config(self):
+        if self.config.quantization is None:
+            return None
+        from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+        return create_bnb_config(self.config.quantization)
+
+    def _build_qat_config(self):
+        cfg_qat = self.config.qat
+        if cfg_qat is None or not cfg_qat.get("enabled", False):
+            return None
+        if self.config.peft is not None:
+            raise ValueError("QAT with PEFT is not currently supported")
+        if (qat_attr := getattr(cfg_qat, "qat_config", None)) is not None:
+            return qat_attr.instantiate()
+        if (quantizer_attr := getattr(cfg_qat, "quantizer", None)) is not None:
+            return quantizer_attr.instantiate()
+        return None
+
+    def _resolve_freeze_config(self):
+        """Coerce ``Engine.Config.freeze_config`` to a plain dict, or None."""
+        cfg_freeze = self.config.freeze_config
+        if cfg_freeze is None:
+            return None
+        if isinstance(cfg_freeze, dict):
+            return cfg_freeze
+        return cfg_freeze.to_dict()
+
+    def _resolve_moe_config(self):
+        """Accept either ``MoEParallelizerConfig``, a ConfigNode, or None."""
+        from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+        cfg_moe = getattr(self.mesh, "moe_config", None) or self.config.moe
+        if cfg_moe is None:
+            return None
+        if isinstance(cfg_moe, MoEParallelizerConfig):
+            return cfg_moe
+        moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
+        moe_dict.pop("activation_checkpointing", None)
+        moe_dict.pop("_target_", None)
+        return MoEParallelizerConfig(**moe_dict)
 
     def _build_lr_scheduler(self, optimizer: torch.optim.Optimizer) -> OptimizerParamScheduler | None:
-        """Construct an :class:`OptimizerParamScheduler` from ``self.lr_scheduler_cfg``.
-
-        Required keys (read via ``_cfg_get``):
-            ``total_steps``  (or ``lr_decay_steps``) — total optimizer steps.
-        Optional:
-            ``lr_warmup_steps`` (default ``0``)
-            ``lr_warmup_steps_ratio`` (default ``0.0``; only used if ``lr_warmup_steps == 0``)
-            ``lr_decay_style`` (default ``"cosine"``)
-            ``init_lr_ratio`` (default ``0.1``; init_lr = ``base_lr * init_lr_ratio``)
-            ``min_lr_ratio`` (default ``0.01``)
-            ``wd_incr_style`` (default ``"constant"``)
-        """
-        cfg = self.lr_scheduler_cfg
+        """Construct an :class:`OptimizerParamScheduler` from the typed config."""
+        cfg: LRSchedulerConfig | None = self.config.lr_scheduler
         if cfg is None:
             return None
 
-        total_steps = _cfg_get(cfg, "total_steps", _cfg_get(cfg, "lr_decay_steps"))
-        if total_steps is None:
-            raise ValueError(
-                "lr_scheduler_cfg must include 'total_steps' (or 'lr_decay_steps')."
-            )
-
-        warmup_steps = _cfg_get(cfg, "lr_warmup_steps", 0) or 0
+        warmup_steps = cfg.lr_warmup_steps
         if warmup_steps == 0:
-            warmup_ratio = _cfg_get(cfg, "lr_warmup_steps_ratio", 0.0) or 0.0
-            warmup_steps = int(warmup_ratio * total_steps)
+            warmup_steps = int(cfg.lr_warmup_steps_ratio * cfg.total_steps)
 
         base_lr = optimizer.param_groups[0]["lr"]
-        init_lr_ratio = _cfg_get(cfg, "init_lr_ratio", 0.1)
-        min_lr_ratio = _cfg_get(cfg, "min_lr_ratio", 0.01)
         base_wd = optimizer.param_groups[0].get("weight_decay", 0.0)
 
         return OptimizerParamScheduler(
             optimizer=optimizer,
-            init_lr=base_lr * init_lr_ratio,
+            init_lr=base_lr * cfg.init_lr_ratio,
             max_lr=base_lr,
-            min_lr=base_lr * min_lr_ratio,
+            min_lr=base_lr * cfg.min_lr_ratio,
             lr_warmup_steps=int(warmup_steps),
-            lr_decay_steps=int(total_steps),
-            lr_decay_style=_cfg_get(cfg, "lr_decay_style", "cosine"),
+            lr_decay_steps=int(cfg.total_steps),
+            lr_decay_style=cfg.lr_decay_style,
             start_wd=base_wd,
             end_wd=base_wd,
-            wd_incr_steps=int(total_steps),
-            wd_incr_style=_cfg_get(cfg, "wd_incr_style", "constant"),
+            wd_incr_steps=int(cfg.total_steps),
+            wd_incr_style=cfg.wd_incr_style,
         )
 
     # ── Introspection (no wrapper class needed) ──────────────────────

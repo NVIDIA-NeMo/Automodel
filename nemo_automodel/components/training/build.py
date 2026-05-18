@@ -69,6 +69,7 @@ def build_model(
     activation_checkpointing: bool = False,
     unfreeze_modules: Optional[list[str]] = None,
     sdpa_method: Optional[list[str]] = None,
+    freeze_config: Optional[dict[str, Any]] = None,
 ) -> nn.Module | AutoPipeline:
     """Build and initialize an LLM model.
 
@@ -114,6 +115,8 @@ def build_model(
             "pipeline_config": pipeline_config,
             "sdpa_method": sdpa_method,
         }
+        if freeze_config is not None:
+            infra_kwargs["freeze_config"] = freeze_config
         if qat_config is not None:
             infra_kwargs["qat_config"] = qat_config
         if moe_config is not None:

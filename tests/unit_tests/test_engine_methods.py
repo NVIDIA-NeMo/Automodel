@@ -65,7 +65,7 @@ def tiny_model_engine(dist_env):
     from nemo_automodel.engine import Engine
 
     engine = Engine(Engine.Config(
-        model=SimpleNamespace(),
+        model=None,
         distributed=SimpleNamespace(),         # not used — we skip build()
         optimizer=SimpleNamespace(),
         lr_scheduler=None,
@@ -86,19 +86,19 @@ def tiny_model_engine(dist_env):
 
 def test_lr_scheduler_direct_construction(dist_env):
     """The fix bypasses recipes.build_lr_scheduler; verify the direct path works."""
-    from nemo_automodel.engine import Engine
+    from nemo_automodel.engine import Engine, LRSchedulerConfig
 
     engine = Engine(Engine.Config(
-        model=SimpleNamespace(),
+        model=None,
         distributed=SimpleNamespace(),
         optimizer=SimpleNamespace(),
-        lr_scheduler={
-            "total_steps": 100,
-            "lr_warmup_steps": 10,
-            "lr_decay_style": "cosine",
-            "init_lr_ratio": 0.1,
-            "min_lr_ratio": 0.01,
-        },
+        lr_scheduler=LRSchedulerConfig(
+            total_steps=100,
+            lr_warmup_steps=10,
+            lr_decay_style="cosine",
+            init_lr_ratio=0.1,
+            min_lr_ratio=0.01,
+        ),
     ))
 
     model = nn.Linear(4, 4)
@@ -117,7 +117,7 @@ def test_lr_scheduler_none_when_cfg_missing(dist_env):
     from nemo_automodel.engine import Engine
 
     engine = Engine(Engine.Config(
-        model=SimpleNamespace(),
+        model=None,
         distributed=SimpleNamespace(),
         optimizer=SimpleNamespace(),
         lr_scheduler=None,
@@ -127,12 +127,12 @@ def test_lr_scheduler_none_when_cfg_missing(dist_env):
 
 def test_lr_scheduler_warmup_ratio(dist_env):
     """Warmup steps can be specified as a ratio of total_steps."""
-    from nemo_automodel.engine import Engine
+    from nemo_automodel.engine import Engine, LRSchedulerConfig
 
     engine = Engine(Engine.Config(
-        model=SimpleNamespace(), distributed=SimpleNamespace(),
+        model=None, distributed=SimpleNamespace(),
         optimizer=SimpleNamespace(),
-        lr_scheduler={"total_steps": 200, "lr_warmup_steps_ratio": 0.05},
+        lr_scheduler=LRSchedulerConfig(total_steps=200, lr_warmup_steps_ratio=0.05),
     ))
     model = nn.Linear(2, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
@@ -145,16 +145,13 @@ def test_lr_scheduler_warmup_ratio(dist_env):
     assert optimizer.param_groups[0]["lr"] > 0
 
 
-def test_lr_scheduler_missing_total_steps_raises(dist_env):
-    from nemo_automodel.engine import Engine
+def test_lr_scheduler_missing_total_steps_raises():
+    """The recipe-layer resolver rejects cfg without ``total_steps``."""
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes.llm.train_ft import _resolve_lr_scheduler_config
 
-    engine = Engine(Engine.Config(
-        model=SimpleNamespace(), distributed=SimpleNamespace(),
-        optimizer=SimpleNamespace(),
-        lr_scheduler={"lr_warmup_steps": 10},
-    ))
     with pytest.raises(ValueError, match="total_steps"):
-        engine._build_lr_scheduler(torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=0.1))
+        _resolve_lr_scheduler_config(ConfigNode({"lr_warmup_steps": 10}))
 
 
 # ── forward_backward — manual model path ─────────────────────────────
@@ -187,7 +184,7 @@ def forward_engine(dist_env):
     from nemo_automodel.engine import Engine
 
     engine = Engine(Engine.Config(
-        model=SimpleNamespace(), distributed=SimpleNamespace(),
+        model=None, distributed=SimpleNamespace(),
         optimizer=SimpleNamespace(), lr_scheduler=None,
         max_grad_norm=1.0,
     ))
@@ -283,7 +280,7 @@ def test_moe_aux_loss_scale_set_when_moe_cfg_present(dist_env):
     MoEAuxLossAutoScaler.main_loss_backward_scale = None
 
     engine = Engine(Engine.Config(
-        model=SimpleNamespace(), distributed=SimpleNamespace(),
+        model=None, distributed=SimpleNamespace(),
         optimizer=SimpleNamespace(), lr_scheduler=None,
     ))
     model = _TinyLossModel()

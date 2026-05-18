@@ -42,18 +42,17 @@ def test_engine_import_path():
     assert A is B
 
 
-def test_engine_construction_does_not_run_distributed():
-    """Constructing an Engine must not call into distributed init."""
+def test_engine_skips_construction_when_model_is_none():
+    """Engine.__init__ with model=None skips the build chain entirely."""
     from nemo_automodel.engine import Engine
 
     engine = Engine(Engine.Config(
-        model=_stub_cfg(pretrained_model_name_or_path="hf-internal-testing/tiny-random-LlamaForCausalLM"),
+        model=None,
         distributed=_stub_cfg(),
         optimizer=_stub_cfg(_target_="torch.optim.AdamW", lr=1e-4),
         lr_scheduler=None,
         max_grad_norm=1.0,
     ))
-    # State attributes are present but unbuilt.
     assert engine.model is None
     assert engine.optimizer is None
     assert engine.lr_scheduler is None
@@ -65,7 +64,7 @@ def test_engine_introspection_defaults_when_unbuilt():
     from nemo_automodel.engine import Engine
 
     engine = Engine(Engine.Config(
-        model=_stub_cfg(),
+        model=None,
         distributed=_stub_cfg(),
         optimizer=_stub_cfg(),
     ))
@@ -84,7 +83,6 @@ def test_engine_methods_match_design():
     from nemo_automodel.engine import Engine
 
     expected_methods = {
-        "build",
         "forward_backward",
         "zero_grad",
         "optimizer_step",

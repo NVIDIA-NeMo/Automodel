@@ -1335,6 +1335,27 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_optimizer", lambda *a, **k: [dummy_opt])
+
+    # The recipe's setup() now constructs a VLMEngine that eagerly builds
+    # model + optimizer. Replace Engine/VLMEngine with thin stand-ins so
+    # the construction chain doesn't fire on the test's mock cfg.
+    class _FakeEngine:
+        Config = staticmethod(lambda **kw: SimpleNamespace(**kw))
+
+        def __init__(self, config):
+            self.config = config
+            self.model = dummy_model
+            self.optimizer = dummy_opt
+            self.lr_scheduler = None
+            self.mesh = None
+            self.cp_use_te = False
+            self.cp_padding_token_id = 0
+            self.cp_num_chunks = 1
+            self.fp8_autocast = None
+            self.extra_loss_fn = None
+
+    monkeypatch.setattr("nemo_automodel.engine.Engine", _FakeEngine)
+    monkeypatch.setattr("nemo_automodel.vlm_engine.VLMEngine", _FakeEngine)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.build_step_scheduler",

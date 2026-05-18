@@ -492,6 +492,26 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         lambda *a, **k: [dummy_opt],
     )
 
+    # The recipe's setup() now constructs an Engine that eagerly builds
+    # model + optimizer. Replace Engine with a thin stand-in so the
+    # construction chain doesn't fire on the test's mock cfg.
+    class _FakeEngine:
+        Config = staticmethod(lambda **kw: SimpleNamespace(**kw))
+
+        def __init__(self, config):
+            self.config = config
+            self.model = dummy_model
+            self.optimizer = dummy_opt
+            self.lr_scheduler = None
+            self.mesh = None
+            self.cp_use_te = False
+            self.cp_padding_token_id = 0
+            self.cp_num_chunks = 1
+            self.fp8_autocast = None
+            self.extra_loss_fn = None
+
+    monkeypatch.setattr("nemo_automodel.engine.Engine", _FakeEngine)
+
     # Data-related stubs
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
@@ -635,6 +655,28 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     # Override the default stubs to return a pipeline-wrapped model
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_optimizer", _build_optimizer_stub)
+
+    # The recipe builds an Engine internally; override the FakeEngine from
+    # ``_patch_setup_minimals`` so it surfaces the AutoPipeline-shaped model.
+    pp_model = _build_model_stub()
+    pp_opt = _build_optimizer_stub()[0]
+
+    class _PPFakeEngine:
+        Config = staticmethod(lambda **kw: SimpleNamespace(**kw))
+
+        def __init__(self, config):
+            self.config = config
+            self.model = pp_model
+            self.optimizer = pp_opt
+            self.lr_scheduler = None
+            self.mesh = None
+            self.cp_use_te = False
+            self.cp_padding_token_id = 0
+            self.cp_num_chunks = 1
+            self.fp8_autocast = None
+            self.extra_loss_fn = None
+
+    monkeypatch.setattr("nemo_automodel.engine.Engine", _PPFakeEngine)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)
