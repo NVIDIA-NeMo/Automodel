@@ -183,6 +183,56 @@ def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = Tr
         return MetricLogger(filepath, flush=flush, append=append)
 
 
+def log_training_metrics(
+    log_data: Optional[MetricsSample],
+    *,
+    is_main: bool,
+    is_remote_logging_step: bool,
+    step: int,
+    metric_logger: Optional[MetricLogger] = None,
+    wandb_run=None,
+    mlflow_logger=None,
+    comet_logger=None,
+) -> None:
+    """Fan out a training :class:`MetricsSample` to wandb / mlflow / comet
+    (gated by ``is_remote_logging_step``) and JSONL (always), then emit the
+    standard ``step ... loss ...`` info line and reset peak-memory stats.
+    No-op on non-main ranks."""
+    import logging as _logging
+
+    if not is_main:
+        return
+
+    if is_remote_logging_step:
+        payload = log_data.to_dict()
+        if wandb_run is not None:
+            wandb_run.log(payload, step=step)
+        if mlflow_logger is not None:
+            mlflow_logger.log_metrics(payload, step=log_data.step)
+        if comet_logger is not None:
+            comet_logger.log_metrics(payload, step=log_data.step)
+
+    if metric_logger is not None:
+        metric_logger.log(log_data)
+
+    _logging.info(
+        "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | "
+        "mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            log_data.step,
+            log_data.epoch,
+            log_data.metrics["loss"],
+            log_data.metrics["grad_norm"],
+            log_data.metrics["lr"],
+            log_data.metrics["mem"],
+            log_data.metrics["tps"],
+            log_data.metrics["tps_per_gpu"],
+            log_data.metrics["num_label_tokens"],
+        )
+    )
+
+    torch.cuda.reset_peak_memory_stats()
+
+
 def log_validation_metrics(
     log_data: Optional[MetricsSample],
     *,

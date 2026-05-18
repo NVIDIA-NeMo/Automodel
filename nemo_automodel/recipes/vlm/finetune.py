@@ -44,6 +44,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import (
     MetricsSample,
     build_metric_logger,
+    log_training_metrics,
     log_validation_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -557,39 +558,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             wandb_run=wandb.run,
         )
 
-    def log_train_metrics(self, log_data) -> float:
-        """Log metrics to wandb.
-
-        Args:
-            train_loss: Training loss.
-            grad_norm: Grad norm from the training step.
-            num_tokens_in_batch: Total number of loss tokens.
-            tps: Tokens per second.
-        """
-        if not self.dist_env.is_main:
-            return
-
-        # Log to remote services (WandB) according to step_scheduler frequency
-        if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
-                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-
-        # JSONL training log (always log for detailed local records)
-        self.metric_logger_train.log(log_data)
-        logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
-                log_data.step,
-                log_data.epoch,
-                log_data.metrics["loss"],
-                log_data.metrics["grad_norm"],
-                log_data.metrics["lr"],
-                log_data.metrics["mem"],
-                log_data.metrics["tps"],
-                log_data.metrics["tps_per_gpu"],
-                log_data.metrics["num_label_tokens"],
-            )
+    def log_train_metrics(self, log_data) -> None:
+        log_training_metrics(
+            log_data,
+            is_main=self.dist_env.is_main,
+            is_remote_logging_step=self.step_scheduler.is_remote_logging_step,
+            step=self.step_scheduler.step,
+            metric_logger=self.metric_logger_train,
+            wandb_run=wandb.run,
         )
-        torch.cuda.reset_peak_memory_stats()
 
 
 # ---------------------------------------------------------------------------
