@@ -115,7 +115,110 @@ from nemo_automodel.components.datasets.llm.build import (  # noqa: E402, F401
 )
 from nemo_automodel.components.loss.calculate import calculate_loss  # noqa: E402, F401
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss  # noqa: E402, F401
-from nemo_automodel.components.training.build import build_model  # noqa: E402, F401
+from nemo_automodel.components.training.build import build_model as _build_model_impl  # noqa: E402
+
+
+_NEMO_AUTOMODEL_LLM_TARGETS = None  # lazy
+
+
+def _is_nemo_automodel_llm_target(target):
+    """``True`` if ``target`` is one of the ``NeMoAutoModelForCausalLM`` /
+    ``NeMoAutoModelForSequenceClassification`` ``from_*`` classmethods."""
+    global _NEMO_AUTOMODEL_LLM_TARGETS
+    if _NEMO_AUTOMODEL_LLM_TARGETS is None:
+        from nemo_automodel._transformers import (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForSequenceClassification,
+        )
+
+        _NEMO_AUTOMODEL_LLM_TARGETS = frozenset(
+            {
+                NeMoAutoModelForCausalLM.from_config,
+                NeMoAutoModelForCausalLM.from_pretrained,
+                NeMoAutoModelForSequenceClassification.from_config,
+                NeMoAutoModelForSequenceClassification.from_pretrained,
+            }
+        )
+    return target in _NEMO_AUTOMODEL_LLM_TARGETS
+
+
+def build_model(
+    cfg_model,
+    cfg_peft,
+    seed,
+    has_packed_sequence=False,
+    cfg_fp8=None,
+    cfg_compile=None,
+    cfg_quantization=None,
+    device_mesh=None,
+    moe_mesh=None,
+    distributed_config=None,
+    pipeline_config=None,
+    cfg_qat=None,
+    cfg_moe=None,
+    activation_checkpointing=False,
+    unfreeze_modules: list[str] | None = None,
+    sdpa_method: list[str] | None = None,
+):
+    """Recipe-layer wrapper around the typed :func:`components.training.build.build_model`.
+
+    Translates recipe ``cfg_*`` ConfigNodes / configs into the typed kwargs the
+    component expects. Lives here (not in components/) because the YAML-shaped
+    coupling belongs at the recipe layer.
+    """
+    fp8_config = build_fp8_config(cfg_fp8) if cfg_fp8 is not None else None
+    compile_config = build_compile_config(cfg_compile) if cfg_compile is not None else None
+
+    quantization_config = None
+    if cfg_quantization is not None:
+        from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+        logger.info("Model weight quantization enabled with BitsAndBytes")
+        quantization_config = create_bnb_config(cfg_quantization)
+
+    qat_config = None
+    if cfg_qat is not None and cfg_qat.get("enabled", False):
+        if cfg_peft is not None:
+            raise ValueError("QAT with PEFT is not currently supported")
+        if (qat_attr := getattr(cfg_qat, "qat_config", None)) is not None:
+            qat_config = qat_attr.instantiate()
+        elif (quantizer_attr := getattr(cfg_qat, "quantizer", None)) is not None:
+            qat_config = quantizer_attr.instantiate()
+
+    return _build_model_impl(
+        model_factory=cfg_model.instantiate,
+        model_kwargs={},
+        is_nemo_auto_model=_is_nemo_automodel_llm_target(cfg_model.get("_target_", None)),
+        peft_config=cfg_peft,
+        seed=seed,
+        has_packed_sequence=has_packed_sequence,
+        fp8_config=fp8_config,
+        compile_config=compile_config,
+        quantization_config=quantization_config,
+        device_mesh=device_mesh,
+        moe_mesh=moe_mesh,
+        distributed_config=distributed_config,
+        pipeline_config=pipeline_config,
+        qat_config=qat_config,
+        moe_config=_coerce_moe_config(cfg_moe),
+        activation_checkpointing=activation_checkpointing,
+        unfreeze_modules=unfreeze_modules,
+        sdpa_method=sdpa_method,
+    )
+
+
+def _coerce_moe_config(moe_config):
+    """Accept either ``MoEParallelizerConfig`` or a ConfigNode-shaped dict."""
+    if moe_config is None:
+        return None
+    from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+    if isinstance(moe_config, MoEParallelizerConfig):
+        return moe_config
+    moe_dict = moe_config.to_dict() if hasattr(moe_config, "to_dict") else dict(moe_config)
+    moe_dict.pop("activation_checkpointing", None)
+    moe_dict.pop("_target_", None)
+    return MoEParallelizerConfig(**moe_dict)
 
 
 # ---------------------------------------------------------------------------
