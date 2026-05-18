@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
-# To run this recipe, please use the following command:
-# uv run recipes/llm_finetune/finetune.py --config recipes/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 64
@@ -61,7 +64,7 @@ distributed:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: True
+  target_modules: '*_proj'
   dim: 8
   alpha: 32
   use_triton: True
@@ -111,4 +114,6 @@ lr_scheduler:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 
-
+ci:
+  recipe_owner: adil-a
+  known_issue_id: AM-151

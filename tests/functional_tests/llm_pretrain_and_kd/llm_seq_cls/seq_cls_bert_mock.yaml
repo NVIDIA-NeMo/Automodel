@@ -1,0 +1,67 @@
+# Tiny BERT config for testing sequence classification.
+# Uses random weights (from_config) and a mock dataset — no downloads needed.
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 4
+  ckpt_every_steps: 2
+  val_every_steps: 2
+  num_epochs: 1
+  max_steps: 4
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForSequenceClassification.from_config
+  config:
+    _target_: transformers.BertConfig
+    num_hidden_layers: 2
+    num_attention_heads: 2
+    hidden_size: 64
+    intermediate_size: 128
+    vocab_size: 256
+    max_position_embeddings: 128
+    num_labels: 2
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+dataset:
+  _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset
+  num_samples: 32
+  num_labels: 2
+  vocab_size: 256
+  max_seq_len: 32
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset
+  num_samples: 8
+  num_labels: 2
+  vocab_size: 256
+  max_seq_len: 32
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_seq_cls_test/

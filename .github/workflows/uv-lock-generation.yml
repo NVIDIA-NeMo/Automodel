@@ -26,7 +26,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
@@ -34,7 +34,7 @@ jobs:
           token: ${{ secrets.PAT }}
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Set up UV
@@ -58,8 +58,7 @@ jobs:
         run: |
           set +e
           mv uv.lock uv_main.lock
-          mv docker/common/uv-pytorch.lock uv.lock
-          sed -i '/\[tool\.uv\]/r docker/common/uv-pytorch.toml' pyproject.toml
+          bash docker/common/update_pyproject_pytorch.sh "$GITHUB_WORKSPACE"
           uv lock --check
           EXIT_CODE=$?
           if [ $EXIT_CODE -eq 0 ]; then

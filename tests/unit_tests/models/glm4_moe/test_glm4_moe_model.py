@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -88,7 +86,7 @@ def moe_config():
         n_expert_groups=1,
         n_limited_groups=1,
         train_gate=True,
-        gate_bias_update_factor=0.001,
+        gate_bias_update_factor=1e-3,
         score_func="sigmoid",
         route_scale=1.0,
         aux_loss_coeff=0.0,
@@ -531,7 +529,7 @@ def magic_moe_config(config: Glm4MoeConfig) -> MoEConfig:
         n_expert_groups=config.n_group,
         n_limited_groups=config.topk_group,
         train_gate=True,
-        gate_bias_update_factor=0.001,
+        gate_bias_update_factor=1e-3,
         score_func="sigmoid",
         route_scale=config.routed_scaling_factor,
         aux_loss_coeff=0.0,

@@ -44,10 +44,32 @@ fi
 
 UV_PYTORCH_ARGS="$AUTOMODEL_DIR/docker/common/uv-pytorch.toml"
 UV_PYTORCH_LOCK="$AUTOMODEL_DIR/docker/common/uv-pytorch.lock"
-SED_SCRIPT="/\\[tool\\.uv\\]/r $UV_PYTORCH_ARGS"
+PYPROJECT_FILE="$AUTOMODEL_DIR/pyproject.toml"
+SED_INSERT_SCRIPT="/^\[tool\.uv\]$/r $UV_PYTORCH_ARGS"
 
-# Inject additional uv configurations into pyproject.toml
-sed -i "$SED_SCRIPT" pyproject.toml
+if [ ! -f "$PYPROJECT_FILE" ]; then
+    echo "Error: '$PYPROJECT_FILE' does not exist."
+    exit 1
+fi
+
+if [ ! -f "$UV_PYTORCH_ARGS" ]; then
+    echo "Error: '$UV_PYTORCH_ARGS' does not exist."
+    exit 1
+fi
+
+if [ ! -f "$UV_PYTORCH_LOCK" ]; then
+    echo "Error: '$UV_PYTORCH_LOCK' does not exist."
+    exit 1
+fi
+
+if ! grep -q "^\[tool\.uv\]$" "$PYPROJECT_FILE"; then
+    echo "Error: '$PYPROJECT_FILE' is missing the [tool.uv] section."
+    exit 1
+fi
+
+# Replace existing override-dependencies and inject PyTorch overrides in [tool.uv].
+sed -i '/^override-dependencies[[:space:]]*=[[:space:]]*\[/,/]/d' "$PYPROJECT_FILE"
+sed -i "$SED_INSERT_SCRIPT" "$PYPROJECT_FILE"
 
 # Update uv lock with additonal uv configurations
-cp $UV_PYTORCH_LOCK $AUTOMODEL_DIR/uv.lock
+cp "$UV_PYTORCH_LOCK" "$AUTOMODEL_DIR/uv.lock"

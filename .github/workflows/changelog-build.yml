@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
@@ -80,7 +80,7 @@ jobs:
         run: cat CHANGELOG.md
 
       - name: Create or update label
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           script: |
             const labelName = '${{ inputs.release-branch }}';

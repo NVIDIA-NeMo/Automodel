@@ -173,14 +173,15 @@ def _create_fsdp2_device_mesh(
     # HSDP usecase: dp_size = dp_replicate_size * dp_shard_size
     assert dp_size % dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
     assert dp_replicate_size < dp_size or dp_replicate_size == 1, (
-        "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
+        f"dp_replicate_size={dp_replicate_size} must be less than dp_size={dp_size} "
+        "since DDP usecase is not supported by FSDP2"
     )
 
-    # Expert parallelism calculations
-    dp_cp_size = dp_size * cp_size
-    assert dp_cp_size % ep_size == 0, f"{dp_cp_size=} must be a multiple of {ep_size=}"
-    if ep_size < dp_cp_size:
-        ep_shard_size = dp_cp_size // ep_size
+    # Expert parallelism: EP spans all non-pp dims (dp, cp, tp)
+    non_pp_size = dp_size * cp_size * tp_size
+    assert non_pp_size % ep_size == 0, f"{non_pp_size=} must be a multiple of {ep_size=}"
+    if ep_size < non_pp_size:
+        ep_shard_size = non_pp_size // ep_size
     else:
         ep_shard_size = 1
 
@@ -222,19 +223,30 @@ def _create_fsdp2_device_mesh(
     dp_shard_cp_mesh_dim_names.append(MeshAxisName.CP)
     dp_cp_mesh_dim_names.append(MeshAxisName.CP)
 
-    # Flatten submeshes
-    device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
-    device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
-    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    # Flatten submeshes.
+    # PyTorch >= 2.10 stores results in root._flatten_mapping automatically.
+    # PyTorch 2.9.x returns the mesh but does NOT store it, so we keep our own
+    # mapping and attach it to the root mesh for use in get_flat_mesh().
+    _dp_flat = device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
+    _dp_shard_cp_flat = device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
+    _dp_cp_flat = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    if not hasattr(device_mesh, "_flatten_mapping"):
+        device_mesh._flatten_mapping = {}
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP, _dp_flat)
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_SHARD_CP, _dp_shard_cp_flat)
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
-    # Create MOE mesh if ep_size > 1
+    # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
+    # EP spans dp, cp, and tp — the full non-pp rank space.
     moe_mesh = None
     if ep_size > 1:
-        moe_mesh = _create_moe_mesh(
-            pp_size=pp_size,
-            ep_shard_size=ep_shard_size,
-            ep_size=ep_size,
-            backend=backend,
+        non_pp_dims = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
+        non_pp_mesh = device_mesh[non_pp_dims]._flatten()
+        moe_mesh = _unflatten_compat(
+            non_pp_mesh,
+            0,
+            (ep_shard_size, ep_size),
+            (MeshAxisName.EP_SHARD, MeshAxisName.EP),
         )
 
     return device_mesh, moe_mesh
@@ -294,41 +306,152 @@ def _create_megatron_fsdp_device_mesh(
 
     # Flatten dp+cp if cp > 1
     if cp_size > 1:
-        device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+        _dp_cp_flat = device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+        if not hasattr(device_mesh, "_flatten_mapping"):
+            device_mesh._flatten_mapping = {}
+        device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
     return device_mesh
 
 
-def _create_moe_mesh(
-    pp_size: int,
-    ep_shard_size: int,
-    ep_size: int,
-    backend: str,
-) -> DeviceMesh:
-    """
-    Create MOE mesh for expert parallelism.
+def _unflatten_compat(flat_mesh: "DeviceMesh", dim: int, sizes: tuple, names: tuple) -> "DeviceMesh":
+    """Compatibility shim for DeviceMesh._unflatten(), which was added in PyTorch 2.10.
 
-    Mesh shape: (pp_size, ep_shard_size, ep_size)
-    Mesh names: ("pp", "ep_shard", "ep")
+    Reconstructs a multi-dimensional mesh from a flat mesh by reshaping its
+    rank tensor.  ``dim`` must be 0 (only case used in this codebase).
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+
+    if hasattr(flat_mesh, "_unflatten"):
+        return flat_mesh._unflatten(dim, sizes, names)
+    # PyTorch 2.9.x fallback: reshape the underlying rank tensor directly.
+    new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
+    return DeviceMesh(flat_mesh.device_type, new_mesh_tensor, mesh_dim_names=names)
+
+
+def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
+    """Access a 1D submesh by parallelism name (e.g. ``"dp"``, ``"tp"``, ``"dp_cp"``).
+
+    PyTorch 2.11 deprecates ``root_mesh["name"]`` for dimensions created via
+    ``_flatten()``.  This reads the ``_flatten()`` result directly.
 
     Args:
-        pp_size: Pipeline parallel size.
-        ep_shard_size: Expert shard size (dp_cp_size // ep_size).
-        ep_size: Expert parallel size.
-        backend: Distributed backend ('nccl' or 'gloo').
-
-    Returns:
-        DeviceMesh: The MOE mesh for expert parallelism.
+        device_mesh: Any DeviceMesh (root or submesh).
+        name: Parallelism dimension name.
     """
-    mesh_shape = (pp_size, ep_shard_size, ep_size)
-    mesh_names = (MeshAxisName.PP, MeshAxisName.EP_SHARD, MeshAxisName.EP)
-    for shape, name in zip(mesh_shape, mesh_names):
-        assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
-        assert shape > 0, f"Expected {name} > 0, got {shape}"
-
-    moe_mesh = init_device_mesh(
-        device_type="cuda" if backend == "nccl" else "cpu",
-        mesh_shape=mesh_shape,
-        mesh_dim_names=mesh_names,
+    if name in device_mesh.mesh_dim_names:
+        return device_mesh[name]
+    # _get_root_mesh() was added in PyTorch 2.10; fall back for 2.9.x.
+    if hasattr(device_mesh, "_get_root_mesh"):
+        root = device_mesh._get_root_mesh()
+    else:
+        root = device_mesh
+    if hasattr(root, "_flatten_mapping") and name in root._flatten_mapping:
+        return root._flatten_mapping[name]
+    raise KeyError(
+        f"Mesh dim {name!r} not found in mesh_dim_names {device_mesh.mesh_dim_names} "
+        f"or root _flatten_mapping {set(getattr(root, '_flatten_mapping', {}))}"
     )
-    return moe_mesh
+
+
+def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
+    """Access a submesh by parallelism dim names.
+
+    Handles all cases: single dims, multi-dim slices, and combinations that
+    include ``_flatten()``-created dims (e.g. ``("dp_replicate", "dp_shard_cp")``).
+    For the latter, finds the parent ``_flatten()`` result and calls ``_unflatten()``
+    to decompose it into the requested shape.
+
+    Args:
+        device_mesh: Any DeviceMesh (root or submesh).
+        names: Tuple of dimension names.
+    """
+    if len(names) == 1:
+        return get_flat_mesh(device_mesh, names[0])
+    if all(n in device_mesh.mesh_dim_names for n in names):
+        return device_mesh[names]
+
+    # Some dims were created via _flatten(); resolve sizes and unflatten from parent.
+    # Strategy: find a parent flattened mesh whose size equals the product of
+    # requested dims, unflatten it, then validate that process groups for any
+    # dim that also exists on the root mesh are identical (guards against
+    # ambiguous size collisions between different flattened meshes).
+    from math import prod
+
+    import torch.distributed as dist
+
+    sizes = tuple(get_flat_mesh(device_mesh, n).size() for n in names)
+    target = prod(sizes)
+    if hasattr(device_mesh, "_get_root_mesh"):
+        root = device_mesh._get_root_mesh()
+    else:
+        root = device_mesh
+
+    for fm in getattr(root, "_flatten_mapping", {}).values():
+        if fm.size() != target:
+            continue
+        try:
+            result = _unflatten_compat(fm, 0, sizes, names)
+        except (ValueError, RuntimeError):
+            continue
+        # Validate: for each requested dim, verify its process group matches
+        # what get_flat_mesh returns (works for both mesh dims and flattened dims).
+        valid = True
+        for name in names:
+            expected = set(dist.get_process_group_ranks(get_flat_mesh(device_mesh, name).get_group()))
+            actual = set(dist.get_process_group_ranks(result[name].get_group()))
+            if expected != actual:
+                valid = False
+                break
+        if valid:
+            return result
+    raise KeyError(
+        f"No parent flattened mesh found for dims {names} with target size {target}. "
+        f"Available: {set(root._flatten_mapping)}"
+    )
+
+
+def get_fsdp_dp_mesh(
+    device_mesh: "DeviceMesh",
+    dp_replicate_name: str = MeshAxisName.DP_REPLICATE,
+    dp_shard_cp_name: str = MeshAxisName.DP_SHARD_CP,
+) -> "DeviceMesh":
+    """Return the DP mesh for FSDP2 without losing the original root mesh.
+
+    ``get_submesh()`` may rebuild a fresh DeviceMesh when asked to compose native
+    and flattened dims like ``("dp_replicate", "dp_shard_cp")``. That is fine
+    for many local operations, but FSDP2 expects its DP mesh to share the same
+    root mesh as TP/EP meshes. On multi-node TP runs this can break group
+    construction in non-obvious ways.
+
+    Prefer native dimensions whenever possible:
+    - cp=1, dp_replicate=1  -> ``device_mesh["dp_shard"]``
+    - cp=1, dp_replicate>1  -> ``device_mesh[("dp_replicate", "dp_shard")]``
+    - cp>1, dp_replicate=1  -> ``device_mesh[("dp_shard", "cp")]``
+
+    When both CP and replicated DP are active we fall back to ``get_submesh()``
+    because the composed mesh is genuinely multi-level.
+    """
+
+    dp_shard_name = MeshAxisName.DP_SHARD
+    cp_name = MeshAxisName.CP
+
+    native_dims_available = (
+        dp_replicate_name in device_mesh.mesh_dim_names
+        and dp_shard_name in device_mesh.mesh_dim_names
+        and cp_name in device_mesh.mesh_dim_names
+    )
+    if native_dims_available:
+        cp_size = device_mesh[cp_name].size()
+        dp_replicate_size = device_mesh[dp_replicate_name].size()
+
+        if dp_replicate_size > 1 and cp_size > 1:
+            pass
+        elif dp_replicate_size > 1:
+            return device_mesh[(dp_replicate_name, dp_shard_name)]
+        elif cp_size > 1:
+            return device_mesh[(dp_shard_name, cp_name)]
+        else:
+            return device_mesh[dp_shard_name]
+
+    return get_submesh(device_mesh, (dp_replicate_name, dp_shard_cp_name))

@@ -27,6 +27,8 @@ from typing import Any, Dict
 import torch
 from torch import autocast
 
+from nemo_automodel.shared.transformers_patches import patch_t5_layer_norm
+
 from .base import BaseModelProcessor
 from .registry import ProcessorRegistry
 
@@ -69,6 +71,9 @@ class FluxProcessor(BaseModelProcessor):
         from diffusers import FluxPipeline
 
         logger.info("[FLUX] Loading models from %s via FluxPipeline...", model_name)
+
+        # Patch T5 layer norm so it can run in bf16 (apex FusedRMSNorm doesn't support it)
+        patch_t5_layer_norm()
 
         # Load pipeline without transformer (not needed for preprocessing)
         pipeline = FluxPipeline.from_pretrained(
@@ -172,7 +177,7 @@ class FluxProcessor(BaseModelProcessor):
         clip_hidden = clip_output.hidden_states[-2]
         pooled_prompt_embeds = clip_output.pooler_output
 
-        # T5 encoding
+        # T5 encoding (native T5LayerNorm patch allows running in bf16)
         t5_tokens = models["t5_tokenizer"](
             prompt,
             padding="max_length",
@@ -185,10 +190,10 @@ class FluxProcessor(BaseModelProcessor):
 
         return {
             "clip_tokens": clip_tokens["input_ids"].cpu(),
-            "clip_hidden": clip_hidden.detach().cpu(),
-            "pooled_prompt_embeds": pooled_prompt_embeds.detach().cpu(),
+            "clip_hidden": clip_hidden.detach().cpu().to(torch.bfloat16),
+            "pooled_prompt_embeds": pooled_prompt_embeds.detach().cpu().to(torch.bfloat16),
             "t5_tokens": t5_tokens["input_ids"].cpu(),
-            "prompt_embeds": prompt_embeds.detach().cpu(),
+            "prompt_embeds": prompt_embeds.detach().cpu().to(torch.bfloat16),
         }
 
     def verify_latent(

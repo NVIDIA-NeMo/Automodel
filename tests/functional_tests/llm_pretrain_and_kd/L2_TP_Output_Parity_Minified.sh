@@ -23,7 +23,7 @@ KL_THRESHOLD="${KL_THRESHOLD:-2e-6}"
 
 TRANSFORMERS_OFFLINE=1 python3 \
 -m torch.distributed.run --nproc_per_node=2 --nnodes=1 \
--m coverage run --data-file=/workspace/.coverage --source=/workspace/ --parallel-mode \
+-m coverage run \
     tests/functional_tests/llm_pretrain_and_kd/run_tp_output_parity_minified.py \
     --models qwen3 qwen3_seq_cls ministral3 llama qwen2 baichuan \
     --sequence_parallel both \

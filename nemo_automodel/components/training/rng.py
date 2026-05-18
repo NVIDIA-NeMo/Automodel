@@ -26,7 +26,7 @@ def init_all_rng(seed: int, ranked: bool = False):
         seed (int): Base seed value.
         ranked (bool): Adjust seed by process rank if True.
     """
-    assert isinstance(seed, int) and seed > 0, ("Seed must be a positive integer", seed)
+    assert isinstance(seed, int) and seed >= 0, ("Seed must be a non-negative integer", seed)
     assert isinstance(ranked, bool), "Ranked must be a boolean"
 
     if ranked:
@@ -48,6 +48,8 @@ def init_all_rng(seed: int, ranked: bool = False):
 
 @dataclass
 class RNGState:
+    """Snapshot of Python, NumPy, Torch, and CUDA RNG states."""
+
     random_rng_state: tuple
     np_rng_state: tuple
     torch_rng_state: torch.Tensor

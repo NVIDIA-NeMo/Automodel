@@ -158,6 +158,11 @@ class MeshContext:
         """HSDP replication degree (from ``device_mesh``, default ``None``)."""
         return _get_axis_size(self.device_mesh, MeshAxisName.DP_REPLICATE, default=None)
 
+    @property
+    def dp_shard_size(self) -> int:
+        """DP shard degree (from ``device_mesh``, default ``1``)."""
+        return _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD, default=1)
+
     # Axis-name helpers (used by AutoPipeline and parallelize_model)
     def _dp_axis_names(self) -> Tuple[str, ...]:
         """DP axis names for FSDP mesh slicing."""
@@ -218,8 +223,17 @@ class MeshContext:
 # misc utils
 def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> Optional[int]:
     """Return the size of *axis* if present in *mesh*, else *default*."""
-    if mesh is not None and axis in mesh.mesh_dim_names:
+    if mesh is None:
+        return default
+    # Check mesh dims and _flatten() results on root mesh
+    if axis in mesh.mesh_dim_names:
         return mesh[axis].size()
+    if hasattr(mesh, "_get_root_mesh"):
+        root = mesh._get_root_mesh()
+    else:
+        root = mesh
+    if hasattr(root, "_flatten_mapping") and axis in root._flatten_mapping:
+        return root._flatten_mapping[axis].size()
     return default
 
 

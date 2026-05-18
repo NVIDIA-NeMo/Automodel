@@ -15,8 +15,11 @@
 # QLora configuration for Llama-3.1-8B on SQuAD dataset
 # Uses 4-bit quantization with LoRA adapters
 # 
-# To run this recipe, please use the following command:
-# torchrun --nproc-per-node=1 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml
+# To run this recipe:
+#   automodel examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
@@ -38,11 +41,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   torch_dtype: bfloat16
-  force_hf: true # @akoumpa: remove once checkpointer works with quantization
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  match_all_linear: true
+  target_modules: '*_proj'
   dim: 16
   alpha: 32
   dropout: 0.1
@@ -101,4 +103,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: llama3_1_8b_squad_qlora
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: adil-a

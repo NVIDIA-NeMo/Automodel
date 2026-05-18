@@ -77,6 +77,7 @@ def pad_within_micro(batch, pad_token_id, pad_seq_len_divisible=None):
 
 
 def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
+    """Return the last non-padding index before a trailing padding run."""
     # lst = [optional-value .., non-value, ..., non-value, value, ...]
     # return the index of the last non-value token
     i = len(lst) - 1
@@ -94,6 +95,7 @@ def find_last_non_pad_token(lst: list[int], value: int) -> int | None:
 
 
 def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = None) -> int | None:
+    """Return the default pad token id for a batch field name."""
     PAD_TOKEN_IDS = {
         "labels": -100,
         "attention_mask": 0,
@@ -107,6 +109,7 @@ def get_pad_token_from_key(val: str, pad_token_ids: Optional[dict[str, int]] = N
 
 
 def make_attention_mask_from_labels(ids: list[int], ignore_token: int = -100) -> list[int]:
+    """Build an attention mask from labels with trailing ignored positions."""
     # if the last token is not an ignore token, then the attention mask is all 1s
     if len(ids) == 0:
         return []
@@ -161,7 +164,7 @@ def create_causal_mask_mapping(
     # Prepare mask creation kwargs
     mask_kwargs = {
         "config": model_config,
-        "input_embeds": torch.empty((batch_size, seq_len), device=device),
+        "inputs_embeds": torch.empty((batch_size, seq_len), device=device),
         "attention_mask": attention_mask,
         "cache_position": position_ids[0],  # Use first row (all rows identical for non-padded data)
         "past_key_values": None,  # Training only
@@ -409,14 +412,19 @@ def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tens
     return mask_4d.unsqueeze(1)  # [B, 1, S, S]
 
 
-def neat_packed_collater(batch: list[dict]) -> dict:
+def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
     """Collater for neat-packed LLM sequences.
 
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
-    indexed ``attention_mask`` into a 4D block-causal mask.
+    indexed ``attention_mask`` to the format required by the attention backend.
+
+    For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
+    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
         batch: List of sample dicts produced by ``neat_pack_dataset``.
+        attn_implementation: Attention backend (``"flash_attention_2"``,
+            ``"sdpa"``, or ``"eager"``).
 
     Returns:
         Dict with batched tensors ready for model forward.
@@ -429,14 +437,20 @@ def neat_packed_collater(batch: list[dict]) -> dict:
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    attention_mask_4d = _indexed_mask_to_4d_block_causal(attention_mask)
+    if attn_implementation == "flash_attention_2":
+        mask_out = attention_mask
+    else:
+        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
 
-    return {
+    result = {
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": attention_mask_4d,
+        "attention_mask": mask_out,
     }
+    if attention_mask.max() > 1:
+        result["_packed_seq_ids"] = attention_mask
+    return result
 
 
 class SFTSingleTurnPreprocessor:

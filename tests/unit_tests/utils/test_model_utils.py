@@ -65,6 +65,7 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     and prints to stdout only when rank == 0.
     """
     import logging
+
     caplog.set_level(logging.DEBUG)
     dummy_model.other.weight.requires_grad = False
     trainable, total = model_utils.print_trainable_parameters(dummy_model)
@@ -75,6 +76,7 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     # Check logging output
     assert "Trainable parameters" in caplog.text
     assert "Total parameters" in caplog.text
+
 
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
     """
@@ -291,3 +293,253 @@ def test_init_empty_weights_handles_missing_is_hf_initialized():
     assert m.w.device.type == "meta"
     # _is_hf_initialized should NOT be present since it wasn't set originally
     assert not hasattr(m.w, "_is_hf_initialized")
+
+
+# =============================================================================
+# Tests for freeze_audio_tower with "speech" pattern
+# =============================================================================
+
+
+@pytest.fixture()
+def audio_model() -> nn.Module:
+    """Model with audio and speech submodules for freeze tests."""
+
+    class AudioModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.audio_encoder = nn.Linear(4, 4)
+            self.speech_adapter = nn.Linear(4, 4)
+            self.language_head = nn.Linear(4, 4)
+
+        def forward(self, x):
+            pass
+
+    return AudioModel()
+
+
+def test_freeze_audio_tower_freezes_speech_pattern(audio_model):
+    """freeze_audio_tower=True should freeze modules matching 'audio' and 'speech'."""
+    model_utils.apply_parameter_freezing(audio_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+
+    assert not _any_requires_grad(audio_model.audio_encoder)
+    assert not _any_requires_grad(audio_model.speech_adapter)
+    assert _all_requires_grad(audio_model.language_head)
+
+
+def test_freeze_audio_tower_false_keeps_speech_trainable(audio_model):
+    """freeze_audio_tower=False should keep speech modules trainable."""
+    model_utils.apply_parameter_freezing(audio_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+
+    assert _all_requires_grad(audio_model.audio_encoder)
+    assert _all_requires_grad(audio_model.speech_adapter)
+
+
+@pytest.fixture()
+def sound_model() -> nn.Module:
+    """Model with a NemotronOmni-style ``sound_*`` submodule."""
+
+    class SoundModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.sound_encoder = nn.Linear(4, 4)
+            self.sound_projection = nn.Linear(4, 4)
+            self.language_head = nn.Linear(4, 4)
+
+        def forward(self, x):
+            pass
+
+    return SoundModel()
+
+
+def test_freeze_audio_tower_freezes_sound_pattern(sound_model):
+    """``freeze_audio_tower=True`` must also freeze NemotronOmni's ``sound_*`` modules."""
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": True, "freeze_vision_tower": False})
+
+    assert not _any_requires_grad(sound_model.sound_encoder)
+    assert not _any_requires_grad(sound_model.sound_projection)
+    assert _all_requires_grad(sound_model.language_head)
+
+
+def test_freeze_audio_tower_false_keeps_sound_trainable(sound_model):
+    """Sound modules stay trainable when audio freeze is off."""
+    model_utils.apply_parameter_freezing(sound_model, {"freeze_audio_tower": False, "freeze_vision_tower": False})
+
+    assert _all_requires_grad(sound_model.sound_encoder)
+    assert _all_requires_grad(sound_model.sound_projection)
+
+
+# =============================================================================
+# Tests for cast_mixed_dtype_params_to_bf16
+# =============================================================================
+
+
+def test_cast_mixed_dtype_params_to_bf16():
+    """cast_mixed_dtype_params_to_bf16 converts fp32 params and buffers to bf16."""
+    m = nn.Linear(4, 4)  # fp32 by default
+    m.register_buffer("my_buf", torch.ones(3, dtype=torch.float32))
+    assert m.weight.dtype == torch.float32
+    assert m.my_buf.dtype == torch.float32
+
+    model_utils.cast_mixed_dtype_params_to_bf16(m)
+
+    assert m.weight.dtype == torch.bfloat16
+    assert m.bias.dtype == torch.bfloat16
+    assert m.my_buf.dtype == torch.bfloat16
+
+
+def test_cast_mixed_dtype_preserves_bf16():
+    """Already-bf16 params should not be changed."""
+    m = nn.Linear(4, 4).to(torch.bfloat16)
+    model_utils.cast_mixed_dtype_params_to_bf16(m)
+    assert m.weight.dtype == torch.bfloat16
+
+
+# =============================================================================
+# Tests for phi4mm-specific logic in apply_parameter_freezing
+# =============================================================================
+
+
+def test_phi4mm_use_cache_disabled():
+    """For phi4mm models, apply_parameter_freezing sets use_cache=False."""
+    import types
+
+    m = nn.Linear(4, 4)
+    m.config = types.SimpleNamespace(model_type="phi4mm", use_cache=True)
+
+    model_utils.apply_parameter_freezing(m, {"freeze_vision_tower": False})
+    assert m.config.use_cache is False
+
+
+def test_non_phi4mm_use_cache_unchanged():
+    """For non-phi4mm models, use_cache should not be changed."""
+    import types
+
+    m = nn.Linear(4, 4)
+    m.config = types.SimpleNamespace(model_type="gemma3", use_cache=True)
+
+    model_utils.apply_parameter_freezing(m, {"freeze_vision_tower": False})
+    assert m.config.use_cache is True
+
+
+class TestFilterForwardKwargs:
+    def test_drops_unsupported_kwargs(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, attention_mask=None):
+                return input_ids
+
+        model = Model()
+        batch = {
+            "input_ids": torch.ones(2, 3, dtype=torch.long),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+            "padding_mask": torch.zeros(2, 3, dtype=torch.bool),
+        }
+
+        filtered = model_utils.filter_forward_kwargs(model, batch)
+
+        assert set(filtered.keys()) == {"input_ids", "attention_mask"}
+        assert "padding_mask" in batch  # original dict is unchanged
+
+    def test_keeps_kwargs_when_forward_accepts_var_keyword(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return input_ids, kwargs
+
+        model = Model()
+        batch = {
+            "input_ids": torch.ones(2, 3, dtype=torch.long),
+            "padding_mask": torch.zeros(2, 3, dtype=torch.bool),
+        }
+
+        filtered = model_utils.filter_forward_kwargs(model, batch)
+
+        assert filtered == batch
+
+
+class TestSqueezeInputForThd:
+    """``squeeze_input_for_thd`` strips the placeholder batch dim (``[1, T, ...] -> [T, ...]``)
+    before THD attention/Mamba kernels see the inputs. The contract has to handle
+    ``input_ids=None`` because callers feeding the model via ``inputs_embeds`` only
+    (multimodal LMs, speech-language models) leave ``input_ids`` unset; the embeddings
+    are squeezed inside the model forward instead.
+    """
+
+    def _attn_kwargs(self, *, padded: bool = False, with_max_seqlen: bool = True):
+        """Build the kwargs dict in the canonical [1, num_seqs+1] layout, padded
+        with the ``-1000`` sentinel that ``squeeze_input_for_thd`` filters out."""
+        kwargs: dict = {
+            "cu_seqlens": torch.tensor([[0, 3, 5, -1000]], dtype=torch.int32),
+        }
+        if padded:
+            kwargs["cu_seqlens_padded"] = torch.tensor([[0, 4, 6, -1000]], dtype=torch.int32)
+        if with_max_seqlen:
+            kwargs["max_seqlen"] = torch.tensor([3])
+        return kwargs
+
+    def test_squeezes_input_ids_when_provided(self):
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        padding_mask = torch.tensor([[False, False, False, False, False]])
+        kwargs = self._attn_kwargs()
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(input_ids, position_ids, padding_mask, kwargs)
+
+        assert ids.shape == (5,)
+        assert pos.shape == (5,)
+        assert mask.shape == (5,)
+        # Sentinel filtered out and dtype/shape preserved.
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["cu_seqlens"].dtype == torch.int32
+        # max_seqlen tensor → Python int.
+        assert kw["max_seqlen"] == 3
+        assert isinstance(kw["max_seqlen"], int)
+
+    def test_accepts_input_ids_none_for_inputs_embeds_callers(self):
+        """The bug: prior code did ``input_ids.squeeze(0)`` unconditionally and
+        crashed when the caller used ``inputs_embeds`` only. The fix returns
+        ``None`` for the ``input_ids`` slot and squeezes everything else."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        padding_mask = torch.tensor([[False, False, False, False, False]])
+        kwargs = self._attn_kwargs()
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, padding_mask, kwargs)
+
+        assert ids is None
+        assert pos.shape == (5,)
+        assert mask.shape == (5,)
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["max_seqlen"] == 3
+
+    def test_padding_mask_none_is_passed_through(self):
+        """Existing behavior: ``padding_mask`` may be ``None`` (unmasked path).
+        The new ``input_ids=None`` branch must compose with this."""
+        position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert ids is None
+        assert mask is None
+        assert pos.shape == (5,)
+
+    def test_3d_inputs_embeds_via_input_ids_slot_still_works(self):
+        """Belt-and-braces: the docstring claims ``input_ids`` may carry a 3D
+        ``[1, T, H]`` embedding tensor. Squeezing dim 0 of that yields ``[T, H]``."""
+        embeds = torch.randn(1, 5, 16)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+
+        ids, pos, _mask, _kw = model_utils.squeeze_input_for_thd(embeds, position_ids, None, kwargs)
+
+        assert ids.shape == (5, 16)
+        assert pos.shape == (5,)
+
+    def test_cu_seqlens_padded_filtered_alongside_cu_seqlens(self):
+        """Both ``cu_seqlens`` and ``cu_seqlens_padded`` (CP path) get the
+        sentinel filter — the bug fix must not regress this."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        kwargs = self._attn_kwargs(padded=True, with_max_seqlen=False)
+
+        _ids, _pos, _mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["cu_seqlens_padded"].tolist() == [0, 4, 6]

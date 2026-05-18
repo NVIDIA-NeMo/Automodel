@@ -17,8 +17,8 @@ import warnings
 import pytest
 import torch
 
-from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig
 
 
 class TestBackendConfigGatePrecision:
@@ -152,9 +152,6 @@ class TestBackendConfigEnableDeepepDeprecation:
 
     def test_enable_deepep_none_no_warning(self):
         """Test that enable_deepep=None (default) does not trigger warning."""
-        from nemo_automodel.components.models.common.utils import HAVE_DEEP_EP
-
-        expected_dispatcher = "deepep" if HAVE_DEEP_EP and torch.cuda.is_available() else "torch"
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             config = BackendConfig()
@@ -203,6 +200,37 @@ class TestBackendConfigEnableDeepepDeprecation:
             assert "dispatcher='deepep'" in warning_message
             assert "dispatcher='torch'" in warning_message
             assert "will be removed in a future release" in warning_message
+
+
+class TestBackendConfigHybridEP:
+    """Test BackendConfig HybridEP dispatcher support."""
+
+    def test_hybridep_dispatcher_valid(self):
+        """Test that BackendConfig accepts hybridep dispatcher."""
+        config = BackendConfig(dispatcher="hybridep")
+        assert config.dispatcher == "hybridep"
+
+    def test_hybridep_dispatcher_num_sms_default(self):
+        """Test that dispatcher_num_sms defaults to 20."""
+        config = BackendConfig(dispatcher="hybridep")
+        assert config.dispatcher_num_sms == 20
+
+    def test_hybridep_dispatcher_num_sms_custom(self):
+        """Test that dispatcher_num_sms accepts a custom value."""
+        config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
+        assert config.dispatcher_num_sms == 24
+
+    def test_te_experts_falls_back_with_hybridep(self):
+        """Test that te experts with hybridep dispatcher is valid (no fallback)."""
+        config = BackendConfig(experts="te", dispatcher="hybridep")
+        assert config.experts == "te"
+        assert config.dispatcher == "hybridep"
+
+    def test_gmm_experts_falls_back_with_hybridep(self):
+        """Test that gmm experts with hybridep dispatcher is valid (no fallback)."""
+        config = BackendConfig(experts="gmm", dispatcher="hybridep")
+        assert config.experts == "gmm"
+        assert config.dispatcher == "hybridep"
 
 
 class TestMoEConfig:
@@ -273,3 +301,14 @@ class TestMoEConfig:
 
         config = MoEConfigFromLayers(**base_moe_config_kwargs)
         assert config.n_routed_experts == 8
+
+    def test_swiglu_limit_default_zero(self, base_moe_config_kwargs):
+        """``swiglu_limit`` defaults to 0.0 (preserves the legacy fused swiglu path)."""
+        config = MoEConfig(**base_moe_config_kwargs)
+        assert config.swiglu_limit == 0.0
+
+    @pytest.mark.parametrize("limit", [1.0, 7.0, 100.5])
+    def test_swiglu_limit_custom_positive(self, base_moe_config_kwargs, limit):
+        """``swiglu_limit`` accepts positive floats for the DSV4 clamped variant."""
+        config = MoEConfig(**base_moe_config_kwargs, swiglu_limit=limit)
+        assert config.swiglu_limit == limit

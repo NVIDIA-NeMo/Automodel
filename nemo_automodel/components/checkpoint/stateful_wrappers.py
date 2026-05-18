@@ -56,7 +56,12 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
-from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import (
+    get_lm_head_weight_and_name,
+    has_local_tied_lm_head,
+    is_tied_word_embeddings,
+    materialize_missing_tied_lm_head,
+)
 
 _PREFIX = "model."
 
@@ -96,6 +101,9 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
     state_dict = {}
     for name, param in model.named_parameters():
         if param.requires_grad:
+            # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
+            # Without this, activation checkpointing causes key mismatches on reload.
+            name = name.replace("_checkpoint_wrapped_module.", "")
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
@@ -110,7 +118,9 @@ def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> 
     """
     from torch.distributed.tensor import DTensor, Replicate
 
-    param_dict = dict(model.named_parameters())
+    # Strip _checkpoint_wrapped_module. from FQNs to match DCP's normalization.
+    # Without this, activation checkpointing causes key mismatches on reload.
+    param_dict = {name.replace("_checkpoint_wrapped_module.", ""): param for name, param in model.named_parameters()}
     loaded, skipped = 0, 0
 
     for name, saved_tensor in state_dict.items():
@@ -149,10 +159,11 @@ def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
             sd[k[len(prefix) :]] = sd.pop(k)
 
 
-def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] = []) -> None:
+def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] | None = None) -> None:
     """
     Prepend `prefix` once to every key in-place (inverse of `_drop_outer_prefix`).
     """
+    skip_keys = [] if skip_keys is None else skip_keys
     for k in list(sd.keys()):
         if not k.startswith(prefix) and k not in skip_keys:
             sd[prefix + k] = sd.pop(k)
@@ -188,12 +199,7 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
 
 
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> Optional[tuple[torch.Tensor, str]]:
-    for name, param in model.named_parameters(remove_duplicate=False):
-        if "lm_head" in name and name.endswith(".weight"):
-            normalized_name = name.replace("_orig_mod.", "")
-            return param, normalized_name
-
-    return None, None
+    return get_lm_head_weight_and_name(model)
 
 
 # modified from pytorch tutorial https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
@@ -235,9 +241,10 @@ class ModelState:
                 - ["score."] for some classification heads
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
-        self.is_tied_lm_head = is_tied_word_embeddings(self.model[0])
+        self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
+        self.has_local_tied_lm_head = has_local_tied_lm_head(self.model[0])
 
-        if self.is_tied_lm_head:
+        if self.uses_tied_lm_head:
             _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
             self.lm_head_param_name = lm_head_param_name
         self.is_peft = is_peft
@@ -270,13 +277,19 @@ class ModelState:
             func = partial(get_model_state_dict, options=options)
             model_state_dict = {k: v for sd in map(func, self.model) for k, v in sd.items()}
 
-        if self.is_tied_lm_head:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+        # @akoumpa: the second is_peft statement above keeps buffers in the state dict
+        # this filtering removes them.
+        # TODO: this is a hack and we should find a better way to do this.
+        if self.is_peft:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+
+        if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
-        if self.is_peft and not _has_quantized_params(self.model[0]):
+        if self.is_peft:
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
-            # correctly with the HF PEFT API.
+            # correctly with the HF PEFT API. Quantized PEFT bypasses DCP above, but the collected
+            # trainable tensors still need the same on-disk key normalization.
             _add_outer_prefix(model_state_dict, "base_model.model.")
             # DoRA: rename lora_magnitude to match HF PEFT's expected key format
             _rename_dora_keys_to_hf(model_state_dict)
@@ -300,6 +313,7 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
+            # @akoumpa: I'm not sure about this code.
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.
@@ -312,22 +326,20 @@ class ModelState:
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.
         # To be fully compatible we inject a reference tensor so the key exists.
-        if self.is_tied_lm_head and not self.is_peft:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
-            lm_head_weight, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
-            # Skip for Biencoder models as it doesn't have a lm_head at the top level
-            if lm_head_weight is not None and lm_head_param_name not in state_dict:
-                # weight tying guarantees this is identical to the embedding weight
-                state_dict[lm_head_param_name] = lm_head_weight.detach()
+        if self.uses_tied_lm_head and not self.is_peft:
+            materialize_missing_tied_lm_head(
+                state_dict,
+                self.model[0],
+                allow_current_lm_head_fallback=True,
+            )
 
-        func = partial(set_model_state_dict, model_state_dict=state_dict, options=options)
-        list(map(func, self.model))
+        for model_part in self.model:
+            set_model_state_dict(model_part, state_dict, options=options)
 
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
 
-        if self.is_tied_lm_head:
-            # PP models don't have tied embeddings. Safe to pass in model[0] here.
+        if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
         if self.is_peft:

@@ -19,6 +19,8 @@ step_scheduler:
   ckpt_every_steps: 1000
   num_epochs: 100
   log_every: 2
+  # max_steps: null  # Set to limit training to a specific number of steps
+  save_checkpoint_every_epoch: false
 
 data:
   dataloader:
@@ -29,13 +31,18 @@ data:
     dynamic_batch_size: false
     shuffle: true
     drop_last: false
-    num_workers: 0
+    num_workers: 2
 
 optim:
   learning_rate: 5e-6
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    foreach: true
+
+performance:
+  check_loss: false
+  grad_clip_foreach: true
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -65,10 +72,19 @@ fsdp:
   pp_size: 1
   dp_replicate_size: 1
   dp_size: 8
+  defer_fsdp_grad_sync: true
+  enable_fsdp2_prefetch: true
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
 
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: null
+
+ci:
+  recipe_owner: pthombre
+  time: "00:30:00"

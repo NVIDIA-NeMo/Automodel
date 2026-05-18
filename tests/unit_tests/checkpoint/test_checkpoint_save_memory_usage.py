@@ -18,7 +18,6 @@ import gc
 import os
 import sys
 import threading
-import time
 import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
@@ -355,4 +354,3 @@ def test_hf_safetensors_dcp_save_tracks_cpu_and_gpu_peaks(tmp_path: Path):
     )
 
     assert any(p.name.endswith(".safetensors") for p in ckpt_dir.glob("*.safetensors"))
-

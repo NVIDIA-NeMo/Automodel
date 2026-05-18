@@ -24,7 +24,7 @@ import logging
 from typing import Callable, Dict, List, Tuple
 
 import torch
-from torch.utils.data import DataLoader
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from .sampler import SequentialBucketSampler
 from .text_to_image_dataset import TextToImageDataset
@@ -62,14 +62,10 @@ def collate_fn_production(batch: List[Dict]) -> Dict:
         "aspect_ratio": aspect_ratios,
     }
 
-    # Handle text encodings
-    if "clip_hidden" in batch[0]:
-        output["clip_hidden"] = torch.stack([item["clip_hidden"] for item in batch])
-        output["pooled_prompt_embeds"] = torch.stack([item["pooled_prompt_embeds"] for item in batch])
-        output["prompt_embeds"] = torch.stack([item["prompt_embeds"] for item in batch])
-    else:
-        output["clip_tokens"] = torch.stack([item["clip_tokens"] for item in batch])
-        output["t5_tokens"] = torch.stack([item["t5_tokens"] for item in batch])
+    # Handle text encodings — model-agnostic: stack whichever keys are present
+    for key in ("clip_hidden", "pooled_prompt_embeds", "prompt_embeds", "clip_tokens", "t5_tokens"):
+        if key in batch[0]:
+            output[key] = torch.stack([item[key] for item in batch])
 
     return output
 
@@ -110,8 +106,9 @@ def collate_fn_text_to_image(batch: List[Dict]) -> Dict:
     if "prompt_embeds" in production_batch:
         # Pre-encoded text embeddings
         image_batch["text_embeddings"] = production_batch["prompt_embeds"]
-        image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
-        # Also include CLIP hidden for models that need it
+        # Include optional model-specific fields if present
+        if "pooled_prompt_embeds" in production_batch:
+            image_batch["pooled_prompt_embeds"] = production_batch["pooled_prompt_embeds"]
         if "clip_hidden" in production_batch:
             image_batch["clip_hidden"] = production_batch["clip_hidden"]
     else:
@@ -139,7 +136,7 @@ def _build_multiresolution_dataloader_core(
     num_workers: int = 4,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
+) -> Tuple[StatefulDataLoader, SequentialBucketSampler]:
     """Internal helper: create sampler + DataLoader from dataset and collate fn."""
     sampler = SequentialBucketSampler(
         dataset,
@@ -153,7 +150,7 @@ def _build_multiresolution_dataloader_core(
         rank=dp_rank,
     )
 
-    dataloader = DataLoader(
+    dataloader = StatefulDataLoader(
         dataset,
         batch_sampler=sampler,
         collate_fn=collate_fn,
@@ -182,7 +179,7 @@ def build_text_to_image_multiresolution_dataloader(
     num_workers: int = 4,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
+) -> Tuple[StatefulDataLoader, SequentialBucketSampler]:
     """
     Build a text-to-image multiresolution dataloader for TrainDiffusionRecipe.
 
@@ -286,7 +283,7 @@ def build_video_multiresolution_dataloader(
     num_workers: int = 2,
     pin_memory: bool = True,
     prefetch_factor: int = 2,
-) -> Tuple[DataLoader, SequentialBucketSampler]:
+) -> Tuple[StatefulDataLoader, SequentialBucketSampler]:
     """
     Build a multiresolution video dataloader for TrainDiffusionRecipe.
 

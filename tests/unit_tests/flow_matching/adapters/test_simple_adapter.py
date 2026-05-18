@@ -45,7 +45,7 @@ class MockSimpleModel(nn.Module):
         self.call_count = 0
         self.last_inputs = {}
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
         self.call_count += 1
         self.last_inputs = {
             "hidden_states": hidden_states,
@@ -271,7 +271,7 @@ class TestSimpleAdapterForward:
         """Test that tuple outputs from model are handled correctly."""
 
         class TupleOutputModel(nn.Module):
-            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False):
+            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
                 return (torch.randn_like(hidden_states), "extra_data", {"key": "value"})
 
         model = TupleOutputModel()
@@ -285,7 +285,7 @@ class TestSimpleAdapterForward:
         """Test that direct tensor outputs from model are handled correctly."""
 
         class TensorOutputModel(nn.Module):
-            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False):
+            def forward(self, hidden_states, timestep, encoder_hidden_states, return_dict=False, **kwargs):
                 return torch.randn_like(hidden_states)
 
         model = TensorOutputModel()

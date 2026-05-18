@@ -291,6 +291,38 @@ def test_peft_with_tp_disables_triton(caplog):
     assert "Disabling Triton with TP" in caplog.text
 
 
+def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog):
+    """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+    from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+    from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
+
+    cfg_ckpt = MagicMock()
+    cfg_ckpt.to_dict.return_value = {
+        "model_save_format": "torch_save",
+        "checkpoint_dir": "/user/ckpt/",
+        # torch_save-specific / incompatible options that must be discarded:
+        "save_consolidated": False,
+        "is_async": True,
+    }
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.recipes.llm.train_ft"):
+        config = build_checkpoint_config(
+            cfg_ckpt=cfg_ckpt,
+            cache_dir=None,
+            model_repo_id="org/model",
+            is_peft=True,
+        )
+
+    assert any("discarding" in rec.message.lower() for rec in caplog.records)
+    assert config.is_peft is True
+    assert config.model_save_format == SerializationFormat.SAFETENSORS
+    # checkpoint_dir is preserved from the user config
+    assert config.checkpoint_dir == "/user/ckpt/"
+    # other user-provided torch_save options are discarded (defaults restored)
+    assert config.save_consolidated is True
+    assert config.is_async is False
+
+
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
     # cfg_ds: target resolves to this test module dataset class
     cfg_ds = ConfigNode(
@@ -627,6 +659,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             self.epochs = [0]
             self.is_val_step = False
             self.is_ckpt_step = False
+            self.sigterm_flag = False
 
         def set_epoch(self, epoch):
             self.epoch = epoch
@@ -760,7 +793,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", True)
-    object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
+    object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
     object.__setattr__(recipe, "te_fp8", None)
 
@@ -1694,7 +1727,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         if pp_enabled:
             pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
-            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info))
+            object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
             mock_mesh = MagicMock()
             mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
             object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))

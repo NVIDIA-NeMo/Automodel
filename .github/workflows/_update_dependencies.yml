@@ -40,7 +40,12 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
       - name: Install Azure CLI
-        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        run: |
+          for i in 1 2 3; do
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Azure Login
         uses: azure/login@v2
@@ -53,7 +58,7 @@ jobs:
         run: az acr login --name nemoci
 
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.TARGET_BRANCH }}
 
@@ -74,7 +79,7 @@ jobs:
           fi
 
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.SOURCE_BRANCH }}
 
@@ -91,7 +96,7 @@ jobs:
           bash -c 'source /opt/venv/env.sh && uv lock --upgrade'
 
       - name: Upload lock file
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lock-file-${{ env.SOURCE_BRANCH }}
           path: uv.lock
@@ -105,13 +110,18 @@ jobs:
       TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ secrets.PAT }}
           ref: ${{ env.TARGET_BRANCH }}
 
       - name: Install GPG
-        run: sudo apt-get install -y gnupg2
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y gnupg2 && break
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
@@ -122,7 +132,7 @@ jobs:
           git_commit_gpgsign: true
 
       - name: Download lock file
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: lock-file-${{ env.SOURCE_BRANCH }}
 

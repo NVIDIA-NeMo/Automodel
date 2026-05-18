@@ -1,4 +1,4 @@
-# Knowledge Distillation with NeMo AutoModel
+# Knowledge Distillation
 
 This guide walks through fine-tuning a **student** LLM with the help of a
 larger **teacher** model using the `kd` (knowledge distillation) recipe.
@@ -40,7 +40,7 @@ Feel free to tweak these values as required.
 ```yaml
 # Example config for knowledge distillation fine-tuning
 # Run with:
-#   automodel kd llm -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
+#   automodel examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 
 step_scheduler:
   global_batch_size: 32
@@ -87,7 +87,7 @@ distributed:
 # PEFT can be enabled by uncommenting below – student weights will remain small
 # peft:
 #   _target_: nemo_automodel.components._peft.lora.PeftConfig
-#   match_all_linear: true
+#   target_modules: '*_proj'
 #   dim: 16
 #   alpha: 32
 #   use_triton: true
@@ -145,7 +145,7 @@ validation_dataloader:
 
 ```bash
 # Runs on a single device of the current host
-automodel kd llm --nproc-per-node=1 -c examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
+automodel examples/llm_kd/llama3_2/llama3_2_1b_kd.yaml
 ```
 
 ### Multi-GPU (Single Node)

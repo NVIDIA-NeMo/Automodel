@@ -165,6 +165,16 @@ def get_model_conversion_mapping(
     )
 
 
+_VLM_KEY_MAPPINGS: dict[str, dict[str, str]] = {
+    "gemma3": {
+        r"^language_model\.model\.": "model.language_model.",
+        r"^vision_tower\.": "model.vision_tower.",
+        r"^multi_modal_projector\.": "model.multi_modal_projector.",
+        r"^language_model\.lm_head\.": "lm_head.",
+    },
+}
+
+
 def get_combined_key_mapping(
     model_type: str,
     model_key_mapping: Optional[dict[str, str]] = None,
@@ -188,6 +198,13 @@ def get_combined_key_mapping(
         Combined key mapping dictionary (regex pattern -> replacement),
         or None if no mappings are defined.
     """
+    # VLM models with known restructured hierarchies get explicit mappings
+    # that override the generic transformers conversion (e.g. transformers 5.5.0
+    # aliases gemma3→llava, but the llava mapping produces wrong FQNs for
+    # Gemma3's model.language_model.* hierarchy).
+    if model_type in _VLM_KEY_MAPPINGS:
+        return dict(_VLM_KEY_MAPPINGS[model_type])
+
     result = {}
 
     # First add model-specific key mapping (takes precedence)

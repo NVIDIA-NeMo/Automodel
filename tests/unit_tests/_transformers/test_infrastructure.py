@@ -190,6 +190,160 @@ class TestApplyModelInfrastructurePostShardInit:
 
         mock_ckpt.initialize_model_weights.assert_not_called()
 
+    def test_calls_model_to_device_when_checkpoint_loaded_without_dtensor(self):
+        """Unsharded post-shard checkpoint loads should still move buffers with model.to(device)."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", wraps=model.to) as mock_to,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            # from_pretrained on meta device: should_load_checkpoint = True
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+            )
+
+            mock_to.assert_called_once_with(torch.device("cpu"), non_blocking=True)
+
+    def test_skips_model_to_device_when_checkpoint_loaded_with_dtensor(self, monkeypatch):
+        """DTensor-sharded post-shard checkpoint loads should skip model.to(device)."""
+        import torch.distributed.tensor as dist_tensor
+
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        class FakeDTensor:
+            pass
+
+        class ModelWithShardedParameter(_DummyModel):
+            def parameters(self, recurse=True):
+                return iter([FakeDTensor()])
+
+        monkeypatch.setattr(dist_tensor, "DTensor", FakeDTensor)
+        model = ModelWithShardedParameter()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", wraps=model.to) as mock_to,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+            )
+
+            mock_to.assert_not_called()
+
+    def test_calls_model_to_device_when_from_config_meta(self):
+        """model.to(device) should still be called on the from_config meta path (no checkpoint loaded)."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", wraps=model.to) as mock_to,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            # from_config on meta device: need_post_shard_init = True,
+            # but should_load_checkpoint = False (no pretrained path).
+            # model.to(device) should still be called to move buffers.
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pretrained_model_name_or_path="",
+            )
+
+            mock_to.assert_called_once_with(torch.device("cpu"), non_blocking=True)
+
+    def test_model_to_falls_back_to_to_empty_on_meta_tensor_error(self):
+        """model.to() raising 'Cannot copy out of meta tensor' should fall back to model.to_empty()."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", side_effect=NotImplementedError("Cannot copy out of meta tensor; no data!")),
+            patch.object(model, "to_empty") as mock_to_empty,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=False,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pretrained_model_name_or_path="",
+            )
+
+            mock_to_empty.assert_called_once_with(device=torch.device("cpu"))
+
+    def test_model_to_reraises_other_not_implemented_error(self):
+        """model.to() raising NotImplementedError without meta tensor message should re-raise."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+            patch.object(model, "to", side_effect=NotImplementedError("Some other error")),
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            with pytest.raises(NotImplementedError, match="Some other error"):
+                apply_model_infrastructure(
+                    model=model,
+                    is_meta_device=False,
+                    device=torch.device("cpu"),
+                    load_base_model=False,
+                    pretrained_model_name_or_path="",
+                )
+
     def test_peft_init_method_forwarded_to_initialize_model_weights(self):
         """peft_config.lora_A_init should be forwarded as peft_init_method."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
@@ -221,6 +375,66 @@ class TestApplyModelInfrastructurePostShardInit:
             mock_ckpt.initialize_model_weights.assert_called_once_with(
                 model, torch.device("cpu"), peft_init_method="xavier"
             )
+
+    def test_applies_rotary_fix_automatically_when_needed(self):
+        """Nemotron Flash rotary workaround should run from shared infrastructure, not the train loop."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.should_fix_rotary_embeddings", return_value=True) as mock_should_fix,
+            patch(f"{_INFRA_MODULE}.fix_rotary_embeddings") as mock_fix_rotary,
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=False,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pretrained_model_name_or_path="",
+            )
+
+            mock_should_fix.assert_called_once_with([model])
+            mock_fix_rotary.assert_called_once_with([model])
+
+    def test_skips_rotary_fix_when_not_needed(self):
+        """Shared infrastructure should leave non-Nemotron models untouched."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.should_fix_rotary_embeddings", return_value=False) as mock_should_fix,
+            patch(f"{_INFRA_MODULE}.fix_rotary_embeddings") as mock_fix_rotary,
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=False,
+                device=torch.device("cpu"),
+                load_base_model=False,
+                pretrained_model_name_or_path="",
+            )
+
+            mock_should_fix.assert_called_once_with([model])
+            mock_fix_rotary.assert_not_called()
 
 
 # =============================================================================
@@ -265,9 +479,7 @@ class TestLoadBeforeShardPath:
         """load_before_shard should call initialize_model_weights before load_base_model."""
         _, mock_ckpt, model = _run_apply_model_infrastructure_load_before_shard()
 
-        mock_ckpt.initialize_model_weights.assert_called_once_with(
-            model, torch.device("cpu"), peft_init_method=None
-        )
+        mock_ckpt.initialize_model_weights.assert_called_once_with(model, torch.device("cpu"), peft_init_method=None)
         mock_ckpt.load_base_model.assert_called_once_with(
             model, torch.device("cpu"), "/tmp/cache", "test/model", load_base_model=True
         )

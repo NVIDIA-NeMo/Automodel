@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import sys
+import types
 
 import pytest
 import torch
 import torch.nn as nn
-import types
-import importlib
-import sys
 
 import nemo_automodel.components.quantization.qat as qat
 
@@ -211,6 +210,3 @@ def test_prepare_qat_model_with_fake_torchao(monkeypatch):
     model2 = SimpleMLP()
     m2, mode2 = qat.prepare_qat_model(model2, fake.Int4WeightOnlyQATQuantizer())
     assert m2 is model2 and mode2 == "4w-qat" and getattr(model2, "quantizer_applied") == "4w"
-
-
-

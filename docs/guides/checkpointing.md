@@ -1,4 +1,4 @@
-# Checkpointing in NeMo Automodel
+# Checkpointing
 
 ## Introduction
 
@@ -6,7 +6,7 @@ During machine-learning experiments, the model-training routine regularly saves 
 
 NeMo Automodel checkpoints capture the complete state of a distributed training run across multiple GPUs or nodes. This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy.
 
-NeMo Automodel writes checkpoints in two formats: [Hugging Face Safetensors](https://github.com/huggingface/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). It also supports two layouts:
+NeMo Automodel writes checkpoints in two formats: [Hugging Face Safetensors](https://github.com/safetensors/safetensors) and [PyTorch Distributed Checkpointing (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). It also supports two layouts:
 
 - **Consolidated Checkpoints**: The complete model state is saved as a Hugging Face-compatible bundle, typically in a single file or a compact set of files with an index. Because tensors are not split across GPUs (unsharded), tools like Hugging Face, vLLM, and SGLang can load these checkpoints directly.
 
@@ -45,7 +45,7 @@ NeMo Automodel automatically creates symbolic links in the checkpoint directory 
 These symbolic links eliminate the need to manually track checkpoint names or search through directories to find the best model. When validation is enabled in your training run, both links are automatically maintained and updated as training progresses.
 
 ## Safetensors
-To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/huggingface/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
+To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel saves checkpoints in the [Safetensors](https://github.com/safetensors/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
 
 ### Key Benefits:
 - **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools, including vLLM, SGLang, and others.
@@ -58,12 +58,23 @@ To ensure seamless integration with the Hugging Face ecosystem, NeMo Automodel s
 
 The following command runs the LLM fine-tuning recipe on two GPUs and saves the resulting checkpoint in the Safetensors format:
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --step_scheduler.ckpt_every_steps 20 \
+    --checkpoint.model_save_format safetensors \
+    --checkpoint.save_consolidated True
 ```
+
+::: {note}
+In the above command we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example, adjust as necessary to your case.
+More config examples can be found in our [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
+:::
 
 If you're running on a single GPU, you can run:
 ```bash
-uv run examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors --checkpoint.save_consolidated True
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --step_scheduler.ckpt_every_steps 20 \
+    --checkpoint.model_save_format safetensors \
+    --checkpoint.save_consolidated True
 ```
 
 After running for a few seconds, the standard output should be:
@@ -133,7 +144,7 @@ Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary
 
 To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --config examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
 After training, you'll get a compact, consolidated Safetensors checkpoint that can be loaded directly with Hugging Face tools:
@@ -190,7 +201,9 @@ NeMo Automodel also offers native PyTorch DCP checkpointing support (`.distcp` e
 
 As a simple example, we can run the following command to launch the training recipe on two GPUs.
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --step_scheduler.ckpt_every_steps 20 \
+    --checkpoint.model_save_format torch_save
 
 ...
 > Saving checkpoint to checkpoints/epoch_0_step_20
@@ -219,7 +232,9 @@ checkpoints/
 
 If you rerun the script, NeMo Automodel automatically detects and restores the most recent checkpoint.
 ```bash
-uv run torchrun --nproc-per-node=2 examples/llm_finetune/finetune.py --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format torch_save
+automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --step_scheduler.ckpt_every_steps 20 \
+    --checkpoint.model_save_format torch_save
 
 ...
 > Loading checkpoint from checkpoints/epoch_0_step_20
@@ -244,7 +259,8 @@ checkpoint:
 ```
 ```bash
 # Or via CLI override:
-automodel finetune llm -c config.yaml --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
 ```
 
 When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.

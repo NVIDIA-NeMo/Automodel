@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Export a HuggingFace biencoder / embedding checkpoint to ONNX.
+Export a HuggingFace encoder / embedding checkpoint to ONNX.
 
 The resulting ONNX graph maps:
     (input_ids, attention_mask) -> embeddings   [batch, hidden_dim]
@@ -23,7 +23,7 @@ The export wraps the bare transformer with average-pooling and L2
 normalisation so that the ONNX model produces ready-to-use embeddings.
 
 Usage (standalone):
-    python -m nemo_automodel.components.models.biencoder.export_onnx \
+    python -m nemo_automodel.components.models.llama_bidirectional.export_onnx \
         --model-path /path/to/hf_checkpoint \
         --output-dir /path/to/onnx_output \
         [--pooling avg] [--normalize] [--opset 17] [--dtype fp32]
@@ -259,7 +259,7 @@ def verify_onnx(onnx_path: str, tokenizer) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a HuggingFace biencoder/embedding model to ONNX.")
+    parser = argparse.ArgumentParser(description="Export a HuggingFace encoder/embedding model to ONNX.")
     parser.add_argument(
         "--model-path",
         type=str,

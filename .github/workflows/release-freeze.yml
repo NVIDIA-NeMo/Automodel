@@ -1,0 +1,122 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: "Code freeze"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-type:
+        type: choice
+        description: Type of release
+        options:
+          - major
+          - minor
+      freeze-commit:
+        type: string
+        description: Commit SHA to use for cut-off
+        required: false
+        default: main
+      dry-run:
+        type: boolean
+        description: Dry-run of code-freeze
+        required: false
+        default: true
+
+jobs:
+  code-freeze:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v0.86.0
+    with:
+      library-name: NeMo-Automodel
+      python-package: nemo_automodel
+      has-src-dir: false
+      release-type: ${{ inputs.release-type }}
+      freeze-commit: ${{ inputs.freeze-commit }}
+      dry-run: ${{ inputs.dry-run }}
+      use-pat: true
+    secrets:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
+      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      PAT: ${{ secrets.PAT }}
+
+  bump-docs-versions:
+    needs: [code-freeze]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.code-freeze.outputs.release-branch }}
+      DRY_RUN: ${{ inputs.dry-run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ secrets.PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update versions1.json
+        run: |
+          version_number=$(echo ${VERSION} | sed 's/^r//')
+
+          # Remove (latest) tag from previous latest entry, insert new version after nightly
+          jq --arg ver "$version_number" '
+            map(if .name then del(.name) else . end)
+            | [.[0]] + [{"name": ($ver + " (latest)"), "version": $ver, "url": "https://docs.nvidia.com/nemo/automodel/latest/"}] + .[1:]
+          ' docs/versions1.json > tmp.json && mv tmp.json docs/versions1.json
+
+      - name: Commit changes
+        id: commit-versions1
+        run: |
+          git add docs/versions1.json
+          git commit -m "[bot]: Update docs-versions after code-freeze for ${VERSION}"
+          commit_hash=$(git rev-parse HEAD)
+          echo "commit_hash=${commit_hash}" | tee -a $GITHUB_OUTPUT
+
+          if [[ "$DRY_RUN" != "true" ]]; then
+            git push
+          fi
+
+      - name: Switch to release branch
+        run: |
+          git fetch origin ${{ needs.code-freeze.outputs.release-branch }}
+          git checkout ${{ needs.code-freeze.outputs.release-branch }}
+
+      - name: Cherry-pick docs-versions commit
+        run: |
+          git cherry-pick ${{ steps.commit-versions1.outputs.commit_hash }}
+
+      - name: Update project.json
+        run: |
+          version_number=$(echo ${VERSION} | sed 's/^r//')
+
+          jq --arg ver "$version_number" \
+            '. = {"version": $ver, "name": "nemo-automodel"}' \
+            docs/project.json > tmp.json && mv tmp.json docs/project.json
+
+      - name: Update conf.py
+        run: |
+          version_number=$(echo ${VERSION} | sed 's/^r//')
+          sed -i "s/release = .*/release = \"${version_number}\"/" docs/conf.py
+
+      - name: Commit changes
+        run: |
+          git add docs/project.json
+          git add docs/conf.py
+          git commit -m "Bump docs version to ${VERSION}"
+
+          if [[ "$DRY_RUN" != "true" ]]; then
+            git push
+          fi

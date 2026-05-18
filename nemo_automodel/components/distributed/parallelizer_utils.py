@@ -135,20 +135,7 @@ def fully_shard_by_dtype(
     mp_policy: Optional[MixedPrecisionPolicy],
     offload_policy: Optional[OffloadPolicy],
 ) -> None:
-    """
-    Traverse the module and shard the parameters by dtype.
-
-    The module's parameter dtype will dictate MixedPrecisionPolicy.param_dtype.
-
-    Args:
-        module: The module to shard.
-        mesh: The device mesh to shard the module on.
-        mp_policy: The mixed precision policy to use.
-        offload_policy: The offload policy to use.
-
-    Returns:
-        None
-    """
+    """Fully shard a module, splitting mixed-dtype subtrees when needed."""
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
     grouped_params = _group_params_by_dtype(module)

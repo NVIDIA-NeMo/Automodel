@@ -172,6 +172,138 @@ def test_default_registry_has_static_entries():
         assert arch_name in inst.model_arch_name_to_cls.keys()
 
 
+def test_resolve_custom_model_cls_found():
+    """resolve_custom_model_cls returns the class when it exists and has no supports_config."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class PlainModel:
+        pass
+
+    inst.register("PlainModel", PlainModel)
+    assert inst.resolve_custom_model_cls("PlainModel", object()) is PlainModel
+
+
+def test_resolve_custom_model_cls_not_found():
+    """resolve_custom_model_cls returns None for unregistered architectures."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+    assert inst.resolve_custom_model_cls("NonExistent", object()) is None
+
+
+def test_resolve_custom_model_cls_supports_config_true():
+    """resolve_custom_model_cls returns the class when supports_config returns True."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class SupportedModel:
+        @classmethod
+        def supports_config(cls, config):
+            return True
+
+    inst.register("SupportedModel", SupportedModel)
+    assert inst.resolve_custom_model_cls("SupportedModel", object()) is SupportedModel
+
+
+def test_resolve_custom_model_cls_supports_config_false():
+    """resolve_custom_model_cls returns None when supports_config returns False."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class UnsupportedModel:
+        @classmethod
+        def supports_config(cls, config):
+            return False
+
+    inst.register("UnsupportedModel", UnsupportedModel)
+    assert inst.resolve_custom_model_cls("UnsupportedModel", object()) is None
+
+
+def test_resolve_custom_model_cls_passes_config_to_supports():
+    """resolve_custom_model_cls passes the config to supports_config for inspection."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class ConfigAwareModel:
+        @classmethod
+        def supports_config(cls, config):
+            return getattr(config, "ok", False)
+
+    inst.register("ConfigAwareModel", ConfigAwareModel)
+
+    good = types.SimpleNamespace(ok=True)
+    bad = types.SimpleNamespace(ok=False)
+    assert inst.resolve_custom_model_cls("ConfigAwareModel", good) is ConfigAwareModel
+    assert inst.resolve_custom_model_cls("ConfigAwareModel", bad) is None
+
+
+def test_custom_config_registrations_in_config_mapping():
+    """Models in _CUSTOM_CONFIG_REGISTRATIONS must be registered in CONFIG_MAPPING after import.
+
+    This ensures that AutoConfig.from_pretrained can resolve custom model types
+    (e.g. kimi_k25, kimi_vl) from local checkpoints without trust_remote_code=True.
+    """
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
+    missing = []
+    for model_type in _CUSTOM_CONFIG_REGISTRATIONS:
+        if model_type not in CONFIG_MAPPING:
+            missing.append(model_type)
+
+    assert not missing, (
+        f"Model type(s) {missing} are in _CUSTOM_CONFIG_REGISTRATIONS but not in "
+        f"CONFIG_MAPPING. The _register_custom_configs() call at module level may "
+        f"have failed for these entries."
+    )
+
+
+def test_kimi_k25_arch_alias_in_model_arch_mapping():
+    """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    assert "KimiK25ForConditionalGeneration" in MODEL_ARCH_MAPPING, (
+        "KimiK25ForConditionalGeneration missing from MODEL_ARCH_MAPPING. "
+        "Kimi-K2.5 checkpoints use this architecture name and need it mapped "
+        "to KimiK25VLForConditionalGeneration."
+    )
+    module_path, cls_name = MODEL_ARCH_MAPPING["KimiK25ForConditionalGeneration"]
+    assert cls_name == "KimiK25VLForConditionalGeneration"
+
+
+def test_deepseek_v4_registered_in_arch_mapping():
+    """DeepseekV4ForCausalLM must be registered in MODEL_ARCH_MAPPING."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+
+    assert "DeepseekV4ForCausalLM" in MODEL_ARCH_MAPPING, (
+        "DeepseekV4ForCausalLM missing from MODEL_ARCH_MAPPING. "
+        "DSV4 checkpoints declare this architecture and need it routed to the "
+        "in-tree model implementation."
+    )
+    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"]
+    assert module_path == "nemo_automodel.components.models.deepseek_v4.model"
+    assert cls_name == "DeepseekV4ForCausalLM"
+
+
+def test_deepseek_v4_in_custom_config_registrations():
+    """deepseek_v4 model_type must be registered in _CUSTOM_CONFIG_REGISTRATIONS."""
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
+    assert "deepseek_v4" in _CUSTOM_CONFIG_REGISTRATIONS, (
+        "deepseek_v4 must be in _CUSTOM_CONFIG_REGISTRATIONS so AutoConfig.from_pretrained "
+        "can resolve DSV4 configs without trust_remote_code=True."
+    )
+    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS["deepseek_v4"]
+    assert module_path == "nemo_automodel.components.models.deepseek_v4.config"
+    assert cls_name == "DeepseekV4Config"
+
+
 def test_all_model_folders_registered_in_auto_map():
     """Every model folder with a model.py must have at least one entry in MODEL_ARCH_MAPPING.
 
@@ -186,7 +318,7 @@ def test_all_model_folders_registered_in_auto_map():
     models_root = pathlib.Path(__file__).resolve().parents[3] / "nemo_automodel" / "components" / "models"
 
     # Collect the set of module paths referenced by the auto_map
-    registered_module_paths = {module_path for module_path, _ in MODEL_ARCH_MAPPING.values()}
+    registered_module_paths = {v[0] for v in MODEL_ARCH_MAPPING.values()}
 
     missing = []
     for model_dir in sorted(models_root.iterdir()):

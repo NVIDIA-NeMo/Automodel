@@ -23,5 +23,5 @@ if [ "${PYTEST_PROPAGATE_S:-}" = "1" ]; then
     PYTEST_S_FLAG="-s"
 fi
 
-coverage run --data-file=/workspace/.coverage --source=/workspace --parallel-mode \
+coverage run \
     -m pytest $PYTEST_S_FLAG tests/functional_tests/hf_peft/test_merge_lora.py::TestDenseLoRAMerge -v

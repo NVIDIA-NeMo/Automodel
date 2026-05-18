@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
-import importlib.util
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Mock fast_hadamard_transform before importing deepseek_v32 modules
 if 'fast_hadamard_transform' not in sys.modules:
@@ -135,7 +135,7 @@ class TestDeepseekV32Block:
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-3,
             aux_loss_coeff=0.0,
             score_func="sigmoid",
             route_scale=1.0,
@@ -144,8 +144,8 @@ class TestDeepseekV32Block:
 
     def test_block_with_dense_layer(self):
         """Test DeepseekV32Block initialization with dense layer (layer_idx < first_k_dense_replace)."""
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -187,8 +187,8 @@ class TestDeepseekV32Block:
 
     def test_block_with_moe_layer(self):
         """Test DeepseekV32Block initialization with MoE layer (layer_idx >= first_k_dense_replace)."""
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Block
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -228,8 +228,8 @@ class TestDeepseekV32Block:
 class TestDeepseekV32Model:
     def test_model_initialization(self):
         """Test DeepseekV32Model initialization."""
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
 
         cfg = DeepseekV32Config(
             vocab_size=100,
@@ -264,8 +264,8 @@ class TestDeepseekV32Model:
 
     def test_model_initialization_with_moe_config(self):
         """Test DeepseekV32Model initialization with explicit MoE config."""
-        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
         from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32Model
         from nemo_automodel.components.moe.config import MoEConfig
 
         cfg = DeepseekV32Config(
@@ -300,7 +300,7 @@ class TestDeepseekV32Model:
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-3,
             aux_loss_coeff=0.0,
             score_func="sigmoid",
             route_scale=1.0,
@@ -383,7 +383,7 @@ class TestDeepseekV32ForCausalLM:
             n_expert_groups=1,
             n_limited_groups=1,
             train_gate=True,
-            gate_bias_update_factor=0.001,
+            gate_bias_update_factor=1e-3,
             aux_loss_coeff=0.0,
             score_func="sigmoid",
             route_scale=1.0,

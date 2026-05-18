@@ -12,20 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from nemo_automodel.components.checkpoint._backports.hf_storage import _DIFFUSERS_INDEX_FN
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
+    CheckpointingConfig,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
-    _reinit_rope_buffers,
+    _reinit_non_persistent_buffers,
+    _summarize_state_dict_key_diff,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.utils import (
+    has_local_tied_lm_head,
+    materialize_missing_tied_lm_head,
+)
 
 
 def _make_keys(count: int) -> list[str]:
@@ -72,6 +81,31 @@ def test_equally_divide_layers_num_shards_one():
 
     assert len(mapping) == len(keys)
     assert set(mapping.values()) == {1}
+
+
+def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
+    summary = _summarize_state_dict_key_diff(
+        {"a.weight", "b.bias", "c.weight"},
+        {"a.weight", "c.weight", "extra.weight"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 1
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["b.bias"]
+    assert summary["unexpected_examples"] == ["extra.weight"]
+
+
+def test_summarize_state_dict_key_diff_limits_examples():
+    summary = _summarize_state_dict_key_diff(
+        {"a", "b", "c", "d"},
+        {"x"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 4
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["a", "b"]
 
 
 # =============================================================================
@@ -132,13 +166,50 @@ class TestGetLmHeadWeightAndName:
         assert "_orig_mod" not in name
 
 
+class _PipelineLastStageLikeModel(torch.nn.Module):
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(tie_word_embeddings=True)
+        self.lm_head = torch.nn.Linear(4, 4, bias=False)
+
+
+def test_has_local_tied_lm_head_is_false_for_pp_last_stage_like_partition():
+    model = _PipelineLastStageLikeModel()
+
+    assert has_local_tied_lm_head(model) is False
+
+
+def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
+    model = _PipelineLastStageLikeModel()
+    embed_weight = torch.full_like(model.lm_head.weight, 3.0)
+    state_dict = {"model.language_model.embed_tokens.weight": embed_weight}
+
+    materialized = materialize_missing_tied_lm_head(state_dict, model, allow_current_lm_head_fallback=False)
+
+    assert materialized is True
+    assert "lm_head.weight" in state_dict
+    assert torch.equal(state_dict["lm_head.weight"], embed_weight)
+    assert not torch.equal(state_dict["lm_head.weight"], model.lm_head.weight.detach())
+
+
+def test_model_state_keeps_pp_last_stage_lm_head_in_saved_state_dict():
+    model = _PipelineLastStageLikeModel()
+
+    model_state = ModelState(model, is_peft=False, is_init_step=False)
+    saved_state_dict = model_state.state_dict()
+
+    assert "lm_head.weight" in saved_state_dict
+
+
 # =============================================================================
-# Tests for _reinit_rope_buffers
+# Tests for _reinit_non_persistent_buffers
 # =============================================================================
 
 
 class TestReinitRopeBuffers:
-    """Test cases for _reinit_rope_buffers RoPE buffer reinitialization."""
+    """Test cases for _reinit_non_persistent_buffers RoPE buffer reinitialization."""
 
     def test_non_deci_model_returns_early(self):
         """Non-DeciLM model (e.g. llama) returns early without changes."""
@@ -153,7 +224,7 @@ class TestReinitRopeBuffers:
         original_inv_freq = rope.inv_freq.clone()
         model.rope = rope
 
-        _reinit_rope_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="llama")
 
         assert torch.equal(model.rope.inv_freq, original_inv_freq)
 
@@ -180,7 +251,7 @@ class TestReinitRopeBuffers:
         real_model.config = config
         # We need to mock named_modules to return our mock rope
         with patch.object(real_model, "named_modules", return_value=[("", real_model), ("layers.0.rotary", rope)]):
-            _reinit_rope_buffers(real_model, torch.device("cpu"))
+            _reinit_non_persistent_buffers(real_model, torch.device("cpu"), model_type="nemotron-nas")
 
         rope.rope_init_fn.assert_called_once_with(rope.config, torch.device("cpu"), seq_len=128)
         assert rope.inv_freq is new_inv_freq
@@ -202,7 +273,7 @@ class TestReinitRopeBuffers:
         rope.original_inv_freq = torch.zeros(3)
 
         with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
-            _reinit_rope_buffers(model, torch.device("cpu"))
+            _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
 
         assert rope.inv_freq is new_inv_freq
         # original_inv_freq should be a clone of new_inv_freq
@@ -219,14 +290,14 @@ class TestReinitRopeBuffers:
         model.layer = torch.nn.Linear(4, 4)
 
         # Should not raise
-        _reinit_rope_buffers(model, torch.device("cpu"))
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
 
     def test_no_config_returns_early(self):
         """Model without config attribute returns early."""
         model = torch.nn.Module()
 
-        # Should not raise
-        _reinit_rope_buffers(model, torch.device("cpu"))
+        # Should not raise — model_type=None is not in the allowlist
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type=None)
 
     def test_rope_init_fn_failure_logs_warning(self):
         """If rope_init_fn raises, a warning is logged and other modules continue."""
@@ -243,7 +314,56 @@ class TestReinitRopeBuffers:
 
         with patch.object(model, "named_modules", return_value=[("", model), ("layers.0.rotary", rope)]):
             # Should not raise, just log a warning
-            _reinit_rope_buffers(model, torch.device("cpu"))
+            _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="nemotron-nas")
+
+    def test_embed_scale_reinitialized_from_scalar(self):
+        """ScaledWordEmbedding embed_scale buffer is recomputed from scalar_embed_scale."""
+        model = torch.nn.Module()
+        emb = torch.nn.Embedding(10, 8)
+        emb.scalar_embed_scale = 48.0
+        emb.register_buffer("embed_scale", torch.tensor(float("nan")), persistent=False)
+        model.embed_tokens = emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        assert emb.embed_scale.item() == 48.0
+
+    def test_embed_scale_without_scalar_attr_is_skipped(self):
+        """Modules without scalar_embed_scale are not touched."""
+        model = torch.nn.Module()
+        emb = torch.nn.Embedding(10, 8)
+        emb.register_buffer("embed_scale", torch.tensor(float("nan")), persistent=False)
+        model.embed_tokens = emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        # embed_scale should remain NaN because there's no scalar_embed_scale to recover from
+        assert torch.isnan(emb.embed_scale)
+
+    def test_position_ids_reinitialized_from_num_positions(self):
+        """Vision embedding position_ids buffer is recomputed from num_positions."""
+        model = torch.nn.Module()
+        vis_emb = torch.nn.Module()
+        vis_emb.num_positions = 16
+        vis_emb.register_buffer("position_ids", torch.full((1, 16), 999999, dtype=torch.long), persistent=False)
+        model.vision_embeddings = vis_emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        expected = torch.arange(16).expand((1, -1))
+        assert torch.equal(vis_emb.position_ids, expected)
+
+    def test_position_ids_without_num_positions_is_skipped(self):
+        """Modules with position_ids but no num_positions are not touched."""
+        model = torch.nn.Module()
+        vis_emb = torch.nn.Module()
+        garbage = torch.full((1, 16), 999999, dtype=torch.long)
+        vis_emb.register_buffer("position_ids", garbage.clone(), persistent=False)
+        model.vision_embeddings = vis_emb
+
+        _reinit_non_persistent_buffers(model, torch.device("cpu"), model_type="gemma3")
+
+        assert torch.equal(vis_emb.position_ids, garbage)
 
 
 # =============================================================================
@@ -601,3 +721,439 @@ class TestInitializeModelWeights:
 
         sig = inspect.signature(Checkpointer.load_base_model)
         assert "peft_init_method" not in sig.parameters
+
+
+class TestLmHeadWeightTying:
+    """Tests that load_base_model calls tie_weights for tied models."""
+
+    def test_tie_weights_called_when_tied(self):
+        """load_base_model should call model.tie_weights() when tie_word_embeddings=True."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=True)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.lm_head.weight = self.embed_tokens.weight
+                self.tie_weights_called = True
+
+        model = FakeModel()
+        assert model.lm_head.weight.data_ptr() != model.embed_tokens.weight.data_ptr()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert model.tie_weights_called
+        assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+
+    def test_tie_weights_skipped_when_not_tied(self):
+        """load_base_model should skip tie_weights when tie_word_embeddings=False."""
+        import torch.nn as nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(4, 10, bias=False)
+                self.config = SimpleNamespace(tie_word_embeddings=False)
+                self.tie_weights_called = False
+
+            def tie_weights(self, **kwargs):
+                self.tie_weights_called = True
+
+        model = FakeModel()
+
+        from nemo_automodel.components.checkpoint.checkpointing import is_tied_word_embeddings
+
+        is_tied = is_tied_word_embeddings(model)
+        if hasattr(model, "tie_weights") and is_tied:
+            model.tie_weights()
+
+        assert not model.tie_weights_called
+
+
+# =============================================================================
+# Tests for Checkpointer.save_model — diffusers_compatible rename (all-ranks path)
+# =============================================================================
+
+
+class TestCheckpointerSaveModelDiffusersRename:
+    """Tests that save_model() renames the index on the all-ranks consolidation path."""
+
+    def _make_checkpointer(self, tmp_path, diffusers_compatible):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=True,
+            is_peft=False,
+            diffusers_compatible=diffusers_compatible,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+        # Mock internals to isolate the consolidation + rename logic
+        checkpointer._should_write_consolidated_safetensors = MagicMock(return_value=True)
+        checkpointer._should_write_hf_metadata = MagicMock(return_value=True)
+        checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"w": 1})
+        checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+        checkpointer._do_save = MagicMock(return_value=None)
+        checkpointer._addons = []
+        return checkpointer
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch(
+        "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+        side_effect=lambda *a, **kw: a[1],
+    )
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_renames_index_on_all_ranks_path(self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=True)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        mock_consolidate.assert_called_once()
+        assert not (consolidated_dir / "model.safetensors.index.json").exists()
+        assert (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+    @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
+    @patch(
+        "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+        side_effect=lambda *a, **kw: a[1],
+    )
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_save_model_preserves_index_when_not_diffusers_compatible(
+        self, mock_dist_init, mock_adapt, mock_consolidate, tmp_path
+    ):
+        weights_path = tmp_path / "step_100"
+        consolidated_dir = weights_path / "model" / "consolidated"
+
+        def _fake_consolidate(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            index_path = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index_path, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        mock_consolidate.side_effect = _fake_consolidate
+
+        checkpointer = self._make_checkpointer(tmp_path, diffusers_compatible=False)
+
+        model = MagicMock()
+        model.state_dict.return_value = {"w": MagicMock()}
+
+        checkpointer.save_model(model, str(weights_path))
+
+        assert (consolidated_dir / "model.safetensors.index.json").exists()
+        assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+
+# =============================================================================
+# Tests for _get_storage_reader: is_init_step uses backport, not upstream HF reader
+# =============================================================================
+
+
+class TestGetStorageReaderInitStep:
+    """``_get_storage_reader`` must prefer the in-tree backport when ``is_init_step=True``.
+
+    The upstream ``HuggingFaceStorageReader`` (in ``torch.distributed.checkpoint.hf_storage``)
+    delegates dtype decoding to ``safetensors.torch._TYPES``, which does not
+    yet recognise the FP8 scale dtypes (``F8_E5M2``/``F8_E8M0``) emitted by
+    quantised HF checkpoints such as DSV4.  For base-model HF loads
+    (``is_init_step=True``) we must therefore use the in-tree backport whose
+    ``DTYPE_MAP`` was extended for those dtypes.  Mid-training DCP loads
+    (``is_init_step=False`` and no key remap) may still use the faster upstream
+    reader.
+    """
+
+    def _make_checkpointer(self):
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            Checkpointer,
+            CheckpointingConfig,
+        )
+
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/test",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_init_step_returns_backport_reader_not_upstream(self):
+        """is_init_step=True with no key_mapping should still go through the in-tree backport."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=True)
+
+        # Upstream reader must NOT be constructed for init-step base-model loads
+        upstream_marker.assert_not_called()
+        # Backport reader must be constructed instead
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=None)
+        assert reader is backport_marker.return_value
+
+    def test_non_init_step_no_keymap_uses_upstream(self):
+        """For mid-training safetensors loads (is_init_step=False, no key_mapping),
+        the faster upstream reader is preferred."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=None, is_init_step=False)
+
+        upstream_marker.assert_called_once_with(path="/fake/path")
+        backport_marker.assert_not_called()
+        assert reader is upstream_marker.return_value
+
+    def test_keymap_always_uses_backport(self):
+        """When a key_mapping is supplied, the backport reader is always used (regardless of is_init_step)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=False)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
+
+    def test_init_step_with_keymap_uses_backport(self):
+        """is_init_step=True + key_mapping must also use the backport (only one path remains)."""
+        checkpointer = self._make_checkpointer()
+
+        upstream_marker = MagicMock(name="UpstreamHFReader")
+        backport_marker = MagicMock(name="BackportHFReader")
+
+        with (
+            patch(
+                "torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader",
+                upstream_marker,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._HuggingFaceStorageReader",
+                backport_marker,
+            ),
+        ):
+            mapping = {"old.key": "new.key"}
+            reader = checkpointer._get_storage_reader(model_path="/fake/path", key_mapping=mapping, is_init_step=True)
+
+        upstream_marker.assert_not_called()
+        backport_marker.assert_called_once_with(path="/fake/path", key_mapping=mapping)
+        assert reader is backport_marker.return_value
+
+
+# Tests for the _skip_init_weights_on_load gate (Mistral3 FP8 VLM PR)
+# =============================================================================
+
+
+class TestSkipInitWeightsOnLoadGate:
+    """The Checkpointer.initialize_model_weights gate that lets a model opt
+    out of HF's initialize_weights() via a class attribute.
+
+    Without this gate, Mistral3FP8VLMForConditionalGeneration's PP load
+    deadlocks on stage-divergent DTensor collectives inside HF's init.
+    """
+
+    def _make_meta_model(self):
+        with torch.device("meta"):
+            model = torch.nn.Linear(4, 4)
+        model._is_hf_initialized = True
+        model.config = SimpleNamespace(architectures=["TestModel"])
+        return model
+
+    def test_skip_when_attr_true(self):
+        """A model with _skip_init_weights_on_load=True takes the skip branch."""
+        model = self._make_meta_model()
+        model._skip_init_weights_on_load = True
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_not_called()
+        # And the _is_hf_initialized flag is left alone (not reset to False).
+        assert model._is_hf_initialized is True
+
+    def test_does_not_skip_when_attr_false(self):
+        """attr=False (or attr-missing default) does NOT take the skip branch."""
+        model = self._make_meta_model()
+        model._skip_init_weights_on_load = False
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+    def test_does_not_skip_when_attr_missing(self):
+        """No attr at all → default behavior (initialize_weights runs)."""
+        model = self._make_meta_model()
+        assert not hasattr(model, "_skip_init_weights_on_load")
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
+
+
+class TestConsolidatedIndexUnderPPWithoutSourceIndex:
+    """_maybe_build_consolidated_index else-branch (NVIDIA-NeMo/Automodel#1512)."""
+
+    def _make_checkpointer(self, tmp_path):
+        # empty_cache is created but contains no model.safetensors.index.json so
+        # get_safetensors_index_path returns None.
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "empty_cache"),
+            model_repo_id="fake/repo-without-index",
+            save_consolidated=True,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+        return checkpointer
+
+    @staticmethod
+    def _fake_model_state(pre_shard_hf_state_dict_keys=None):
+        """ModelState-like stub used by _maybe_build_consolidated_index."""
+        if pre_shard_hf_state_dict_keys is None:
+            model = SimpleNamespace(config=SimpleNamespace(model_type="nemotron_h"))
+        else:
+            model = MagicMock(spec=torch.nn.Module)
+            model.config = SimpleNamespace(model_type="nemotron_h")
+            model._pre_shard_hf_state_dict_keys = list(pre_shard_hf_state_dict_keys)
+        return SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+
+    @pytest.mark.run_only_on("CPU")
+    def test_falls_back_to_local_state_dict_when_pre_shard_keys_missing(self, tmp_path):
+        """No HF index AND no _pre_shard_hf_state_dict_keys → legacy local-keys fallback."""
+        checkpointer = self._make_checkpointer(tmp_path)
+        os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
+
+        rank_state_dict = {
+            "backbone.embeddings.weight": torch.empty(0),
+            "backbone.layers.0.mixer.qkv_proj.weight": torch.empty(0),
+        }
+        model_state = self._fake_model_state(pre_shard_hf_state_dict_keys=None)
+
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, rank_state_dict)
+
+        assert mapping == {k: 1 for k in rank_state_dict.keys()}
+
+    @pytest.mark.run_only_on("CPU")
+    def test_global_pre_shard_keys_yield_consistent_mapping_across_pp_ranks(self, tmp_path):
+        """Disjoint per-rank PP state dicts but the same global pre-shard key set →
+        every rank produces the identical mapping covering every FQN, so
+        consolidate_safetensors_files_on_every_rank's idx%world_size partitioning
+        cannot drop any keys.
+        """
+        checkpointer = self._make_checkpointer(tmp_path)
+        os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
+
+        global_pre_shard_keys = sorted(
+            [
+                "backbone.embeddings.weight",
+                *[f"backbone.layers.{i}.mixer.qkv_proj.weight" for i in range(52)],
+                "backbone.norm_f.weight",
+                "lm_head.weight",
+            ]
+        )
+
+        # Per-rank disjoint state_dicts (PP slicing).
+        world_size = 8
+        layer_chunks = [list(range(i * 7, (i + 1) * 7)) for i in range(world_size - 1)]
+        layer_chunks.append(list(range(7 * (world_size - 1), 52)))
+        per_rank_state_dicts: list[dict[str, torch.Tensor]] = []
+        for r in range(world_size):
+            sd: dict[str, torch.Tensor] = {}
+            if r == 0:
+                sd["backbone.embeddings.weight"] = torch.empty(0)
+            for layer_idx in layer_chunks[r]:
+                sd[f"backbone.layers.{layer_idx}.mixer.qkv_proj.weight"] = torch.empty(0)
+            if r == world_size - 1:
+                sd["backbone.norm_f.weight"] = torch.empty(0)
+                sd["lm_head.weight"] = torch.empty(0)
+            per_rank_state_dicts.append(sd)
+
+        # Every rank produces the SAME mapping (and it covers every global FQN).
+        per_rank_mappings = []
+        for sd in per_rank_state_dicts:
+            mapping = checkpointer._maybe_build_consolidated_index(self._fake_model_state(global_pre_shard_keys), sd)
+            per_rank_mappings.append(mapping)
+
+        first = per_rank_mappings[0]
+        assert sorted(first.keys()) == global_pre_shard_keys
+        assert "backbone.norm_f.weight" in first  # every rank sees rank-7's norm_f
+        for r, m in enumerate(per_rank_mappings[1:], start=1):
+            assert sorted(m.keys()) == global_pre_shard_keys, f"rank {r} mapping diverges"
+
+        # Round-robin: any rank consolidating idx 1 covers every global FQN.
+        consolidated_keys: set[str] = set()
+        for r, mapping in enumerate(per_rank_mappings):
+            indices_for_this_rank = {idx for idx in set(mapping.values()) if idx % world_size == r}
+            for fqn, idx in mapping.items():
+                if idx in indices_for_this_rank:
+                    consolidated_keys.add(fqn)
+        assert consolidated_keys == set(global_pre_shard_keys)

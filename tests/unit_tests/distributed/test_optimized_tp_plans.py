@@ -14,31 +14,20 @@
 
 """Unit tests for optimized_tp_plans module."""
 
-import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
-    ParallelStyle,
     PrepareModuleInput,
     PrepareModuleOutput,
     RowwiseParallel,
     SequenceParallel,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
-
-from nemo_automodel.components.distributed.optimized_tp_plans import (
-    RotaryEmbedParallel,
-    _parallelize_gemma3,
-    _parallelize_llama,
-    _parallelize_qwen,
-    PARALLELIZE_FUNCTIONS,
-)
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
@@ -46,6 +35,15 @@ from transformers.models.gemma3.modeling_gemma3 import (
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
+
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    PARALLELIZE_FUNCTIONS,
+    RotaryEmbedParallel,
+    _get_class_qualname,
+    _parallelize_gemma3,
+    _parallelize_llama,
+    _parallelize_qwen,
+)
 
 
 class MockModel:
@@ -406,7 +404,7 @@ class TestParallelizeFunctionsMapping:
         ]
 
         for model_type in expected_types:
-            assert model_type in PARALLELIZE_FUNCTIONS
+            assert _get_class_qualname(model_type) in PARALLELIZE_FUNCTIONS
 
     def test_mapping_functions_are_callable(self):
         """Test that all functions in the mapping are callable."""
@@ -415,8 +413,16 @@ class TestParallelizeFunctionsMapping:
 
     def test_mapping_functions_return_dict(self):
         """Test that all mapping functions return dictionaries."""
-        for model_type, func in PARALLELIZE_FUNCTIONS.items():
-            # Create a mock model of the appropriate type
+        all_model_types = [
+            Qwen2ForCausalLM,
+            Qwen3ForCausalLM,
+            Qwen3ForSequenceClassification,
+            LlamaForCausalLM,
+            Gemma3ForCausalLM,
+            Gemma3ForConditionalGeneration,
+        ]
+        for model_type in all_model_types:
+            func = PARALLELIZE_FUNCTIONS[_get_class_qualname(model_type)]
             mock_model = Mock()
             mock_model.__class__ = model_type
             # @akoumparouli: explicitly deleting the lm_head because the parallelizer asserts on it
@@ -429,16 +435,16 @@ class TestParallelizeFunctionsMapping:
 
     def test_qwen2_and_qwen3_use_same_function(self):
         """Test that Qwen2 and Qwen3 models use the same parallelization function."""
-        qwen2_func = PARALLELIZE_FUNCTIONS[Qwen2ForCausalLM]
-        qwen3_func = PARALLELIZE_FUNCTIONS[Qwen3ForCausalLM]
+        qwen2_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen2ForCausalLM)]
+        qwen3_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Qwen3ForCausalLM)]
 
         assert qwen2_func is qwen3_func
         assert qwen2_func is _parallelize_qwen
 
     def test_gemma3_models_use_same_function(self):
         """Test that both Gemma3 model types use the same function."""
-        causal_func = PARALLELIZE_FUNCTIONS[Gemma3ForCausalLM]
-        conditional_func = PARALLELIZE_FUNCTIONS[Gemma3ForConditionalGeneration]
+        causal_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Gemma3ForCausalLM)]
+        conditional_func = PARALLELIZE_FUNCTIONS[_get_class_qualname(Gemma3ForConditionalGeneration)]
 
         assert causal_func is conditional_func
         assert causal_func is _parallelize_gemma3
@@ -512,6 +518,74 @@ class TestParallelPlanStructure:
             for pattern in plan_basic:
                 assert pattern in plan_sp
 
+
+
+
+class TestParallelizeMistral3Vlm:
+    """_parallelize_mistral3_vlm + PARALLELIZE_FUNCTIONS registration for Mistral3 VLM."""
+
+    def test_paths_under_model_language_model_prefix(self):
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
+        plan = _parallelize_mistral3_vlm(model=None)
+        # Every text-decoder rule must be scoped to model.language_model.* —
+        # without this prefix scoping (the original bug), MLP weights stayed
+        # unsharded across TP and FP8 dequant OOMed.
+        text_keys = [k for k in plan if k != "lm_head"]
+        assert text_keys, "plan must include text-decoder rules"
+        for k in text_keys:
+            assert k.startswith("model.language_model."), f"{k!r} not under model.language_model"
+
+    def test_attention_and_mlp_styles(self):
+        from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
+        plan = _parallelize_mistral3_vlm(model=None)
+        prefix = "model.language_model.layers.*"
+        # qkv + gate + up are colwise; o + down are rowwise (Ministral3 GQA pattern).
+        for k in (
+            f"{prefix}.self_attn.q_proj",
+            f"{prefix}.self_attn.k_proj",
+            f"{prefix}.self_attn.v_proj",
+            f"{prefix}.mlp.gate_proj",
+            f"{prefix}.mlp.up_proj",
+        ):
+            assert isinstance(plan[k], ColwiseParallel), f"{k} should be colwise"
+        for k in (
+            f"{prefix}.self_attn.o_proj",
+            f"{prefix}.mlp.down_proj",
+        ):
+            assert isinstance(plan[k], RowwiseParallel), f"{k} should be rowwise"
+
+    def test_lm_head_is_top_level_colwise(self):
+        from torch.distributed.tensor.parallel import ColwiseParallel
+
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
+        plan = _parallelize_mistral3_vlm(model=None)
+        # lm_head sits at the top level (not nested under model.language_model)
+        # in HF's Mistral3ForConditionalGeneration; sharding it on dim=-1
+        # follows VocabParallelEmbedding to match the embed table sharding.
+        assert "lm_head" in plan
+        assert isinstance(plan["lm_head"], ColwiseParallel)
+
+    def test_both_class_qualnames_registered(self):
+        """Both HF native Mistral3ForConditionalGeneration AND our FP8 VLM
+        subclass must be registered — otherwise the parallelizer falls
+        through to the default plan (whose paths don't match) and weights
+        stay unsharded."""
+        from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
+
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _get_class_qualname,
+            _parallelize_mistral3_vlm,
+        )
+        from nemo_automodel.components.models.mistral3_vlm.model import (
+            Mistral3FP8VLMForConditionalGeneration,
+        )
+        for cls in (Mistral3ForConditionalGeneration, Mistral3FP8VLMForConditionalGeneration):
+            qn = _get_class_qualname(cls)
+            assert qn in PARALLELIZE_FUNCTIONS, f"{qn} not registered"
+            assert PARALLELIZE_FUNCTIONS[qn] is _parallelize_mistral3_vlm
 
 if __name__ == "__main__":
     pytest.main([__file__])

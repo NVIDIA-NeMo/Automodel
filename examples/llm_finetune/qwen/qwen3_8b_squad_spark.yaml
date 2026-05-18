@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 2
@@ -90,3 +96,5 @@ lr_scheduler:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 
+ci:
+  recipe_owner: akoumpa

@@ -2,7 +2,7 @@ model:
   pretrained_model_name_or_path: "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
   mode: "finetune"
   cache_dir: null
-  attention_backend: "_flash_3_hub"
+  attention_backend: "flash"
 
 optim:
   learning_rate: 5e-6
@@ -50,6 +50,8 @@ step_scheduler:
   global_batch_size: 8
   ckpt_every_steps: 1000
   log_every: 10
+  # max_steps: null  # Set to limit training to a specific number of steps
+  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
 
 data:
   dataloader:
@@ -60,13 +62,14 @@ data:
     dynamic_batch_size: false
     shuffle: true
     drop_last: false
-    num_workers: 0
+    num_workers: 2
 
 checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
   restore_from: null
 
 wandb:
@@ -79,3 +82,7 @@ dist_env:
   init_method: "env://"
 
 seed: 42
+
+ci:
+  recipe_owner: pthombre
+  time: "01:30:00"

@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.biencoder.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
+from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,14 +50,14 @@ def _make_recipe(mining_overrides=None):
 def _run_setup_and_capture_from_pretrained(mining_overrides=None):
     """Run recipe.setup() with only the truly heavy pieces stubbed out.
 
-    build_distributed, NeMoAutoModelBiencoder, _configure_tokenizer,
+    build_distributed, NeMoAutoModelBiEncoder, _configure_tokenizer,
     _load_data, _build_document_mappings, and _prepare_data are mocked
     because they require GPU / filesystem / model weights.
 
     _extract_mining_params and _validate_mining_params run for real so
     we test the actual wiring end-to-end.
 
-    Returns the mock for NeMoAutoModelBiencoder so callers can inspect
+    Returns the mock for NeMoAutoModelBiEncoder so callers can inspect
     from_pretrained call args.
     """
     mining_dict = dict(_BASE_MINING, **(mining_overrides or {}))
@@ -68,8 +68,8 @@ def _run_setup_and_capture_from_pretrained(mining_overrides=None):
     mock_model.to.return_value = mock_model
 
     with (
-        patch("nemo_automodel.recipes.biencoder.mine_hard_negatives.build_distributed") as mock_dist,
-        patch("nemo_automodel.recipes.biencoder.mine_hard_negatives.NeMoAutoModelBiencoder") as mock_auto,
+        patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.build_distributed") as mock_dist,
+        patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.NeMoAutoModelBiEncoder") as mock_auto,
         patch.object(recipe, "_configure_tokenizer"),
         patch.object(recipe, "_load_data"),
         patch.object(recipe, "_build_document_mappings"),

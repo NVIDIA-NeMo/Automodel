@@ -6,17 +6,18 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 
 | Auto Class | Task | Status | Details |
 |------------|------|--------|---------|
-| `AutoModelForCausalLM` | Text Generation (LLM) | Supported | See [LLM model list](llm.md). |
-| `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](vlm.md). |
+| `AutoModelForCausalLM` | Text Generation (LLM) | Supported | See [LLM model list](llm/index.md). |
+| `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](vlm/index.md). |
 | `AutoModelForSequenceClassification` | Sequence Classification | WIP | Early support; interfaces may change. |
+| Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](diffusion/index.md). |
 
 ## Release Log
 
-The table below tracks when model support and key features were added across NeMo AutoModel releases. For the full list of tested architectures and example configs, see the [LLM](llm.md) and [VLM](vlm.md) pages.
+The table below tracks when model support and key features were added across NeMo AutoModel releases. For the full list of tested architectures and example configs, see the [LLM](llm/index.md) and [VLM](vlm/index.md) pages.
 
 | Release | Date | New Models | Key Features |
 |---------|------|------------|--------------|
-| **0.3.0** (upcoming) | — | Kimi-VL, Kimi-K25-VL, Gemma 3n, Nemotron-Parse, Qwen3-VL-MoE, Qwen3-Omni, InternVL 3.5, Ministral3, Phi-4-multimodal, Devstral-Small-2, Step-3.5-Flash, Qwen3-Next, Nemotron-3-Nano-30B | MoE LoRA, expanded VLM coverage |
+| **0.3.0** (upcoming) | — | Kimi-VL, Kimi-K25-VL, Gemma 3n, Nemotron-Parse, Qwen3-VL-MoE, Qwen3-Omni, InternVL 3.5, Ministral3, Phi-4-multimodal, Devstral-Small-2, Step-3.5-Flash, Qwen3-Next, Nemotron-3-Nano-30B, FLUX.1-dev, Wan 2.1 T2V, HunyuanVideo 1.5 | MoE LoRA, expanded VLM coverage, diffusion model training (flow matching) |
 | **0.2.0** | Dec 2025 | GPT-OSS 20B/120B, Qwen3, Qwen3-MoE, GLM-4/4-MoE, Qwen2.5-VL, Qwen3-VL | Single- and multi-turn tool calling, streaming dataset, QAT for SFT, sequence classification, async DCP checkpointing, MLflow, CP + sequence packing for MoE |
 | **0.1.0** | Oct 2025 | DeepSeek V3/V3.2, 40+ LLM architectures, Gemma 3 VLM | Pretraining, knowledge distillation, FP8 (torchao), pipeline parallelism, HSDP, auto pipelining, ColumnMapped dataset |
 | **0.1.0a0** | Sep 2025 | Initial LLM and VLM support (Llama, Mistral, Qwen2, Gemma, Phi, and more) | MegatronFSDP, packed sequences, Triton LoRA kernels |

@@ -213,74 +213,34 @@ The following section lists important requirements and caveats for correct usage
 
 For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration. This section configures the Slurm batch job parameters and automatically generates the appropriate `#SBATCH` directives.
 
-### Basic Slurm Configuration
+### Slurm Configuration
 
-Add the following section to your YAML configuration:
+SLURM jobs are submitted with `sbatch` directly — no YAML section needed.
+Copy the reference script, set the `CONFIG` variable to your YAML, and submit:
 
-```yaml
-# Your existing model, dataset, training config...
-step_scheduler:
-  grad_acc_steps: 4
-  num_epochs: 1
-
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
-
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: Muennighoff/natural-instructions
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-
-# Add Slurm configuration
-slurm:
-  job_name: llm-finetune
-  nodes: 1
-  ntasks_per_node: 8
-  time: 00:30:00
-  account: your_account
-  partition: gpu
-  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00
-  gpus_per_node: 8
+```sh
+cp slurm.sub my_cluster.sub
+# Edit my_cluster.sub — change CONFIG, #SBATCH directives, container, mounts, etc.
+sbatch my_cluster.sub
 ```
+
+All cluster-specific settings (nodes, GPUs, partition, container, mounts, secrets)
+live in your sbatch script. See the [cluster guide](../../launcher/slurm.md) for
+full examples (Pyxis, bare-metal, Apptainer).
 
 ### Multi-Node Slurm Configuration
 
 :::{note}
-**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set the `HF_DATASETS_CACHE` environment variable to point to a shared directory (e.g., `HF_DATASETS_CACHE=/shared/hf_cache`) in the YAML file as shown, to ensure all nodes can access the cached datasets.
+**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set `HF_DATASETS_CACHE` to a shared directory in your sbatch script (e.g., `export HF_DATASETS_CACHE=/shared/hf_cache`) to ensure all nodes can access the cached datasets.
 :::
 
 When using multiple nodes with Hugging Face datasets:
 
 1. **Shared Storage**: Ensure all nodes can access the same storage paths
-2. **HF Cache**: Set `hf_home` to a shared directory accessible by all nodes
-3. **Environment Variables**: Use `env_vars` to set `HF_DATASETS_CACHE` to the shared location
+2. **HF Cache**: Export `HF_HOME` and `HF_DATASETS_CACHE` in your sbatch script pointing to shared directories
+3. **Mounts**: Add shared directories as container mounts in your sbatch script
 
-```yaml
-slurm:
-  job_name: llm-finetune-multi-node # name of the slurm job
-  nodes: 4 # number of nodes to use
-  ntasks_per_node: 8 # Number of tasks per node (typically equals number of GPUs)
-  time: 02:00:00 # Maximum job runtime (format: `HH:MM:SS`)
-  account: your_account # Slurm account to charge resources to
-  partition: gpu # Slurm partition to submit to
-  container_image: nvcr.io/nvidia/nemo-automodel:25.11.00 # Container image to use for the job
-  gpus_per_node: 8 # Number of GPUs per node (adds `#SBATCH --gpus-per-node=N`)
-  # Optional: Add extra mount points if needed
-  extra_mounts: # Additional mount points for the container
-    - /lustre:/lustre
-    - /shared:/shared
-  # Optional: Specify custom HF_HOME location
-  hf_home: /shared/hf_cache # Custom Hugging Face cache directory on shared disk space.
-  # Optional: Specify custom env vars
-  env_vars: # Additional environment variables
-     HF_DATASETS_CACHE: /shared/hf_cache  # Similar to hf_home; useful when you use a different directory for datasets.
-  # Optional: Specify custom job directory
-  job_dir: /path/to/slurm/jobs
-```
+Configure all of this in your sbatch script (`my_cluster.sub`), not in the YAML.
 
 
 ---
