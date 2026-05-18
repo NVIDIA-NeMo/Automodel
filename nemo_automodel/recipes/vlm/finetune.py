@@ -35,6 +35,7 @@ import wandb
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.shared.te_patches import apply_te_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed import build_distributed
@@ -152,21 +153,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Raises:
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
-        torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
-        setup_logging()
-
-        apply_cache_compatibility_patches()
-
-        # Set up the stateful random number generator
-        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
-
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        self._setup_distributed_env()
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -261,7 +248,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                for i, part in enumerate(self.model_parts):
+                    autonvtx.patch(part, name=f"PipelineStage_{i}")
         else:
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
 

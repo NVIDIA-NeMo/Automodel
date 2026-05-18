@@ -1297,19 +1297,19 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
 def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     """Patch heavy dependencies so FinetuneRecipeForVLM.setup() runs lightly."""
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_distributed",
+        "nemo_automodel.recipes.base_recipe.build_distributed",
         lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.setup_logging", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.apply_cache_compatibility_patches", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.StatefulRNG", lambda *a, **k: "rng")
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_loss_fn", lambda cfg: "loss_fn")
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.build_checkpoint_config",
         lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.setup_distributed",
+        "nemo_automodel.recipes.base_recipe.setup_distributed",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=None,
             pipeline_config=None,

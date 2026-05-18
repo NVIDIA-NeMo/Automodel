@@ -443,12 +443,12 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
     # Lightweight distributed/env/logging
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
+        "nemo_automodel.recipes.base_recipe.build_distributed",
         lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.setup_logging", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.apply_cache_compatibility_patches", lambda: None)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.StatefulRNG", lambda *a, **k: "rng")
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
@@ -456,7 +456,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     )
     # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.base_recipe.setup_distributed",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=None,
             pipeline_config=None,
@@ -1386,7 +1386,7 @@ def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
     # Override setup_distributed to expose the desired cp_size
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.base_recipe.setup_distributed",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=None,
             pipeline_config=None,

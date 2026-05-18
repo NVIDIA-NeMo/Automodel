@@ -41,13 +41,18 @@ except ImportError:
     # < v5
     from transformers.tokenization_utils import PreTrainedTokenizerBase
 
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
+from nemo_automodel.components.distributed import build_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.shared.te_patches import apply_te_patches
 
 logger = logging.getLogger(__name__)
 
@@ -690,6 +695,29 @@ class BaseRecipe:
         logging.info("Step scheduler:")
         for k, v in attrs.items():
             logging.info(f"- {k}: {v}")
+
+    def _setup_distributed_env(self) -> None:
+        """Boot the distributed env + RNG + apply standard runtime patches.
+
+        Populates ``self.dist_env``, ``self.rng``, ``self.dist_setup`` and the
+        derived mesh attributes (``distributed_config``, ``device_mesh``,
+        ``moe_mesh``, ``pp_enabled``, ``pipeline_config``). Also reads
+        ``cfg.nvtx`` into ``self.enable_nvtx``."""
+        torch.cuda.reset_peak_memory_stats()
+        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        setup_logging()
+
+        apply_cache_compatibility_patches()
+        apply_te_patches()
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+        self.enable_nvtx = bool(self.cfg.get("nvtx", False))
+
+        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.dist_setup.strategy_config
+        self.device_mesh = self.dist_setup.device_mesh
+        self.moe_mesh = self.dist_setup.moe_mesh
+        self.pp_enabled = self.dist_setup.pp_enabled
+        self.pipeline_config = self.dist_setup.pipeline_config
 
     def _setup_garbage_collection(self, step_scheduler: StepScheduler | None = None) -> None:
         """Initialize manual garbage collection based on step scheduler config."""
