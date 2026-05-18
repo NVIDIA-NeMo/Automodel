@@ -44,7 +44,11 @@ from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.metric_logger import (
+    MetricsSample,
+    build_metric_logger,
+    log_validation_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
@@ -824,43 +828,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
-        """Log metrics to wandb, MLflow and other loggers
-        Args:
-            log_data: MetricsSample object, containing:
-                step: int, the current step.
-                epoch: int, the current epoch.
-                metrics: Dict[str, float], containing:
-                    "val_loss": Validation loss.
-                    "lr": Learning rate.
-                    "num_label_tokens": Number of label tokens.
-                    "mem": Memory allocated.
-        """
-
-        if not self.dist_env.is_main or log_data is None:
-            return
-
-        if wandb.run is not None:
-            wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
-
-        if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
-
-        if self.comet_logger is not None:
-            self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
-
-        # JSONL validation log
-        if not metric_logger is None:
-            metric_logger.log(log_data)
-
-        logging.info(
-            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}'.format(
-                val_name,
-                log_data.step,
-                log_data.epoch,
-                log_data.metrics["val_loss"],
-                log_data.metrics["lr"],
-                log_data.metrics["num_label_tokens"],
-            )
+        log_validation_metrics(
+            log_data,
+            is_main=self.dist_env.is_main,
+            val_name=val_name,
+            metric_logger=metric_logger,
+            wandb_run=wandb.run,
+            mlflow_logger=self.mlflow_logger,
+            comet_logger=self.comet_logger,
         )
 
     def log_train_metrics(self, log_data):

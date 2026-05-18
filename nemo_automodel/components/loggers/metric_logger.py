@@ -17,7 +17,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -181,3 +181,49 @@ def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = Tr
         return MetricLoggerDist(filepath, flush=flush, append=append)
     else:
         return MetricLogger(filepath, flush=flush, append=append)
+
+
+def log_validation_metrics(
+    log_data: Optional[MetricsSample],
+    *,
+    is_main: bool,
+    val_name: str = "default",
+    metric_logger: Optional[MetricLogger] = None,
+    wandb_run=None,
+    mlflow_logger=None,
+    comet_logger=None,
+) -> None:
+    """Fan out a validation :class:`MetricsSample` to wandb / mlflow / comet /
+    JSONL, and emit a standard ``[val] ...`` info line. No-op on non-main ranks
+    or when ``log_data`` is ``None``.
+
+    ``val_name`` is included in the wandb/comet payload when not ``"default"``
+    (LLM recipe supports multiple validation datasets; VLM has a single one)."""
+    import logging as _logging
+
+    if not is_main or log_data is None:
+        return
+
+    payload = log_data.to_dict()
+    annotated = payload | {"val_name": val_name} if val_name != "default" else payload
+
+    if wandb_run is not None:
+        wandb_run.log(annotated, step=log_data.step)
+    if mlflow_logger is not None:
+        mlflow_logger.log_metrics(payload, step=log_data.step)
+    if comet_logger is not None:
+        comet_logger.log_metrics(annotated, step=log_data.step)
+    if metric_logger is not None:
+        metric_logger.log(log_data)
+
+    name_part = f' name "{val_name}"' if val_name != "default" else ""
+    _logging.info(
+        "[val]{} | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}".format(
+            name_part,
+            log_data.step,
+            log_data.epoch,
+            log_data.metrics["val_loss"],
+            log_data.metrics["lr"],
+            log_data.metrics["num_label_tokens"],
+        )
+    )
