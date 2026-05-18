@@ -364,6 +364,18 @@ class TestRoundTrip:
 
         torch.manual_seed(0)
         model = MiMoV2FlashForCausalLM(real_config, backend=backend_config)
+        # Run the model's own weight initializer. Several parameters --
+        # notably ``Gate.weight`` -- are created via ``nn.Parameter(torch.empty(...))``
+        # and only filled by ``init_weights`` / ``initialize_weights``. Without
+        # this call the underlying storage is whatever ``torch.empty`` happens
+        # to return: on CPU malloc usually hands back a zeroed page so the
+        # round-trip silently passes, but on CUDA ``cudaMalloc`` reuses freed
+        # device memory and the buffer often contains NaNs. NaNs are not
+        # mutated by ``to_hf`` / ``from_hf`` either, but
+        # ``torch.testing.assert_close`` defaults to ``equal_nan=False`` and
+        # treats NaN != NaN, so the test flakes only on the GPU L0 job at
+        # ``model.layers.1.mlp.gate.weight``.
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
         return model.to(torch.float32).eval()
 
     @pytest.fixture
