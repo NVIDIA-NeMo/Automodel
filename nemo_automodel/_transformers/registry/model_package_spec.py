@@ -50,32 +50,6 @@ class ModelPackageSpec:
         object.__setattr__(self, "model_types", tuple(self.model_types))
 
     @classmethod
-    def from_module_path(
-        cls,
-        module_path: str,
-        class_name: str,
-        *,
-        config_module: str | None = None,
-        config_class_name: str | None = None,
-        architectures: list[str] | tuple[str, ...] = (),
-        model_types: tuple[str, ...] = (),
-    ) -> "ModelPackageSpec":
-        """Create a spec from a fully qualified model module path."""
-        package, sep, model_module = module_path.rpartition(".")
-        if not sep:
-            package = ""
-            model_module = module_path
-        return cls(
-            package=package,
-            class_name=class_name,
-            model_module=model_module,
-            config_module=config_module,
-            config_class_name=config_class_name,
-            architectures=architectures,
-            model_types=model_types,
-        )
-
-    @classmethod
     def from_model_class(
         cls,
         model_cls: type,
