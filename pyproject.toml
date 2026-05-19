@@ -153,19 +153,26 @@ vlm = [
 cli = [
     "pyyaml",
 ]
+s3 = [
+    "boto3>=1.34",
+]
+msc = [
+    "multi-storage-client>=0.13",
+]
 all = [
     "nemo_automodel[cuda]",
     "nemo_automodel[delta-databricks]",
     "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
     "nemo_automodel[fla]",
+    "nemo_automodel[s3]",
     "nemo_automodel[vlm]",
 ]
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
-Repository = "https://github.com/NVIDIA/NeMo-Automodel"
-Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
+Repository = "https://github.com/NVIDIA-NeMo/Automodel"
+Download = "https://github.com/NVIDIA-NeMo/Automodel/releases"
 
 [project.scripts]
 automodel = "nemo_automodel.cli.app:main"

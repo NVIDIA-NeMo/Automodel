@@ -1,0 +1,132 @@
+
+# ------------------------------------------------------------------------------------------------
+# WARNING: HARDWARE REQUIREMENTS
+# ------------------------------------------------------------------------------------------------
+# Ling-1T (BailingMoeV2: ~1T total / ~50B activated, 80 layers, 256 experts,
+# first_k_dense_replace=4, rotary_dim=64 -> half-RoPE).
+#
+# Memory: bf16 base weights ~ 2 TB.  Even with LoRA the BASE model must be
+# loaded -> requires a multi-node setup with pipeline parallelism.  Validated
+# topology (per Huiying @ NVIDIA): 64 x H100 80GB (8 nodes x 8) with
+# FSDP2 + PP=8 + EP=8 + LoRA + activation checkpointing.  At pp=8 each stage
+# holds ~10 of the 80 layers; combined with ep=8 the per-rank base weight
+# footprint stays ~33 GB which leaves room for activations + LoRA state on
+# 80 GB cards.  Smaller setups (pp=4, ep=8 on 4 nodes / 32 GPUs) will OOM at
+# load-time.
+# ------------------------------------------------------------------------------------------------
+#
+# To run this recipe on 64 H100 80GB (8 nodes x 8) via Slurm:
+#   sbatch slurm.sub examples/llm_finetune/ling/ling_1t_lora_pp.yaml
+#
+# Uses dispatcher=hybridep (DeepEP times out at hidden_size=8192).
+# Requires NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 (set in ci.env_vars).
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 4
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 1
+  max_steps: 500
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: inclusionAI/Ling-1T
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa  # TE attention needs latest cuDNN; sdpa is safer baseline at 1T scale
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: '*_proj'
+  dim: 16
+  alpha: 32
+  dropout: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/ling_1t_lora_pp
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 8
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    layers_per_stage: 2  # 80 / pp=8 / virtual=5
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1e-8
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+ci:
+  recipe_owner: Hayden727
+  nodes: 8
+  time: "01:00:00"
+  env_vars:
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"

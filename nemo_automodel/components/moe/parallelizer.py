@@ -40,11 +40,44 @@ logger = logging.getLogger(__name__)
 _CP_STREAM = None
 
 
+def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        return True
+
+    inner_model = getattr(model, "model", None)
+    inner_config = getattr(inner_model, "config", None)
+    return getattr(inner_config, "model_type", None) == "deepseek_v4"
+
+
 def _get_cp_stream() -> torch.cuda.Stream:
     global _CP_STREAM
     if _CP_STREAM is None:
         _CP_STREAM = torch.cuda.Stream()
     return _CP_STREAM
+
+
+def _iter_transformer_and_mtp_blocks(model: nn.Module):
+    inner = model.model if hasattr(model, "model") and model.model is not None else model
+    text_model = get_text_module(inner)
+
+    layers = getattr(text_model, "layers", None)
+    if layers is not None:
+        for layer_id, block in layers.named_children():
+            yield layers, layer_id, block
+
+    mtp = getattr(model, "mtp", None)
+    mtp_layers = getattr(mtp, "layers", None)
+    if mtp_layers is not None:
+        for layer_id, block in mtp_layers.named_children():
+            yield mtp_layers, layer_id, block
+
+
+def _get_moe_module(block: nn.Module) -> MoE | None:
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return module
 
 
 class ExpertParallel(ParallelStyle):
@@ -107,8 +140,8 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
     _model = get_text_module(_model)
 
     for block in _iter_moe_blocks(model, _model):
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
-        if not isinstance(moe_module, MoE):
+        moe_module = _get_moe_module(block)
+        if moe_module is None:
             continue
         # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
         # local experts directly. It doesn't support DTensor wrapping, so we
@@ -176,12 +209,7 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
-    _model = get_text_module(_model)
-    for layer_id, block in _model.layers.named_children():
+    for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
@@ -189,7 +217,7 @@ def apply_ac(
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
-        _model.layers.register_module(layer_id, block)
+        parent_layers.register_module(layer_id, block)
 
 
 def apply_fsdp(
@@ -217,8 +245,14 @@ def apply_fsdp(
             cast_forward_inputs=True,
         )
 
+    fully_shard_impl = fully_shard
+    if _is_deepseek_v4_model(model):
+        from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
+
+        fully_shard_impl = fully_shard_deepseek_v4
+
     fully_shard_default = functools.partial(
-        fully_shard,
+        fully_shard_impl,
         mesh=fsdp_mesh,
         reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
@@ -229,11 +263,11 @@ def apply_fsdp(
         _model = model.model
     else:
         _model = model
-    # handle VLM
+    # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
     for block in _iter_moe_blocks(model, _model):
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).
