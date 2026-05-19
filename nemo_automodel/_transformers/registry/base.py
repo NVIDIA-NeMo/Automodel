@@ -16,7 +16,6 @@
 import importlib
 import inspect
 import logging
-import warnings
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -62,7 +61,6 @@ class _BaseModelRegistry:
     _loaded_model_classes: dict[str, type[nn.Module]] = field(default_factory=dict)
     _extra_model_classes: dict[str, type[nn.Module]] = field(default_factory=dict)
     _discarded_architectures: set[str] = field(default_factory=set)
-    _manual_architecture_tags: dict[str, set[str]] = field(default_factory=dict)
     _architecture_to_specs: dict[str, tuple[ModelPackageSpec, ...]] = field(default_factory=dict)
     _model_type_to_specs: dict[str, tuple[ModelPackageSpec, ...]] = field(default_factory=dict)
 
@@ -100,7 +98,6 @@ class _BaseModelRegistry:
         self._architecture_to_specs.pop(architecture, None)
         self._extra_model_classes.pop(architecture, None)
         self._loaded_model_classes.pop(architecture, None)
-        self._manual_architecture_tags.pop(architecture, None)
 
     def _load_model_class(self, architecture: str) -> type[nn.Module]:
         if architecture in self._loaded_model_classes:
@@ -148,11 +145,6 @@ class _BaseModelRegistry:
             f"extra={len(self._extra_model_classes)}, loaded={len(self._loaded_model_classes)})"
         )
 
-    def _architecture_has_tag(self, architecture: str, tag: str) -> bool:
-        if tag in self._manual_architecture_tags.get(architecture, set()):
-            return True
-        return any(tag in spec.tags for spec in self.get_model_package_specs_for_architecture(architecture))
-
     @property
     def supported_models(self):
         return self.keys()
@@ -163,28 +155,6 @@ class _BaseModelRegistry:
     def has_custom_model(self, arch_name: str) -> bool:
         """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
         return arch_name in self
-
-    def has_retrieval_model(self, arch_name: str) -> bool:
-        """Return ``True`` if *arch_name* is a registered retrieval/encoder architecture."""
-        warnings.warn(
-            "has_retrieval_model() is deprecated; use RetrievalModelRegistry.get_model_package_spec() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if self._architecture_has_tag(arch_name, "retrieval"):
-            return True
-        from nemo_automodel._transformers.registry import RetrievalModelRegistry
-
-        return RetrievalModelRegistry.get_model_package_spec(arch_name) is not None
-
-    def register_retrieval(self, arch_name: str) -> None:
-        """Mark *arch_name* as a retrieval/encoder architecture."""
-        warnings.warn(
-            "register_retrieval() is deprecated; register retrieval classes with RetrievalModelRegistry.register().",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._manual_architecture_tags.setdefault(arch_name, set()).add("retrieval")
 
     def get_model_package_spec(self, architecture: str) -> ModelPackageSpec | None:
         """Return package metadata for an architecture without importing ``model.py``."""

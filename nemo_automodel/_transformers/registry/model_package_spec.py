@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -31,8 +31,6 @@ class ModelPackageSpec:
         config_class_name: Explicit config class name to register from
             ``config_module_path``. If unset, the registry can discover a local
             ``PretrainedConfig`` subclass by ``model_type``.
-        tags: Registry metadata flags for the model class. For example,
-            ``retrieval`` marks bidirectional encoder architectures.
         architectures: HF ``config.architectures`` names that should resolve to this
             model class. These are expanded into the architecture-to-spec lookup.
         model_types: HF ``config.model_type`` names associated with this package,
@@ -44,12 +42,10 @@ class ModelPackageSpec:
     model_module: str = "model"
     config_module: str | None = None
     config_class_name: str | None = None
-    tags: frozenset[str] = field(default_factory=frozenset)
     architectures: tuple[str, ...] = ()
     model_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "tags", frozenset(self.tags))
         object.__setattr__(self, "architectures", tuple(self.architectures))
         object.__setattr__(self, "model_types", tuple(self.model_types))
 
@@ -61,7 +57,6 @@ class ModelPackageSpec:
         *,
         config_module: str | None = None,
         config_class_name: str | None = None,
-        tags: set[str] | frozenset[str] | tuple[str, ...] = (),
         architectures: list[str] | tuple[str, ...] = (),
         model_types: tuple[str, ...] = (),
     ) -> "ModelPackageSpec":
@@ -76,7 +71,6 @@ class ModelPackageSpec:
             model_module=model_module,
             config_module=config_module,
             config_class_name=config_class_name,
-            tags=frozenset(tags),
             architectures=architectures,
             model_types=model_types,
         )
@@ -88,7 +82,6 @@ class ModelPackageSpec:
         *,
         config_module: str | None = None,
         config_class_name: str | None = None,
-        tags: set[str] | frozenset[str] | tuple[str, ...] = (),
         architectures: list[str] | tuple[str, ...] = (),
         model_types: tuple[str, ...] = (),
     ) -> "ModelPackageSpec":
@@ -98,7 +91,6 @@ class ModelPackageSpec:
             model_cls.__name__,
             config_module=config_module,
             config_class_name=config_class_name,
-            tags=tags,
             architectures=architectures,
             model_types=model_types,
         )

@@ -95,27 +95,6 @@ def test_duplicate_register_exist_ok():
     assert inst.model_arch_name_to_cls["MyArch"] is ReplacementClass
 
 
-def test_deprecated_retrieval_registration_methods_warn():
-    from nemo_automodel._transformers import registry as reg
-
-    inst = _new_registry_instance(reg)
-
-    with pytest.warns(DeprecationWarning, match="register_retrieval"):
-        inst.register_retrieval("ManualRetrieval")
-
-    with pytest.warns(DeprecationWarning, match="has_retrieval_model"):
-        assert inst.has_retrieval_model("ManualRetrieval") is True
-
-
-def test_deprecated_retrieval_lookup_delegates_to_retrieval_registry():
-    from nemo_automodel._transformers import registry as reg
-
-    inst = _new_registry_instance(reg)
-
-    with pytest.warns(DeprecationWarning, match="has_retrieval_model"):
-        assert inst.has_retrieval_model("LlamaBidirectionalModel") is True
-
-
 def test_supported_models_and_getter():
     from nemo_automodel._transformers import registry as reg
 
