@@ -367,13 +367,9 @@ def make_hf_audio_asr_dataset(
     dataset = load_dataset(path_or_dataset, name=name, split=split, **load_kwargs)
 
     if audio_column not in dataset.column_names:
-        raise ValueError(
-            f"audio_column={audio_column!r} not found in dataset columns: {dataset.column_names}"
-        )
+        raise ValueError(f"audio_column={audio_column!r} not found in dataset columns: {dataset.column_names}")
     if text_column not in dataset.column_names:
-        raise ValueError(
-            f"text_column={text_column!r} not found in dataset columns: {dataset.column_names}"
-        )
+        raise ValueError(f"text_column={text_column!r} not found in dataset columns: {dataset.column_names}")
 
     dataset = dataset.cast_column(audio_column, Audio(decode=False))
 
@@ -414,9 +410,7 @@ def make_hf_audio_asr_dataset(
         conversations = []
         for audio_cell, transcript in zip(audio_cells, transcripts):
             if not isinstance(transcript, str) or not transcript.strip():
-                raise ValueError(
-                    f"empty transcript in {text_column!r}; refusing to emit zero-label sample"
-                )
+                raise ValueError(f"empty transcript in {text_column!r}; refusing to emit zero-label sample")
             waveform, _ = _decode_audio_cell_to_mono_float32(audio_cell, sampling_rate)
             conversations.append(
                 _build_asr_conversation(
