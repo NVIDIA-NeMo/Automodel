@@ -296,6 +296,7 @@ class TestMoeMeshDerivation:
         """Mock device_mesh that has EP dims in _flatten_mapping."""
         ep_mesh = Mock()
         ep_mesh.mesh_dim_names = ("ep",)
+        ep_mesh.size = Mock(return_value=2)
 
         root = Mock()
         root.mesh_dim_names = ("dp_replicate", "dp_shard", "cp", "tp")
