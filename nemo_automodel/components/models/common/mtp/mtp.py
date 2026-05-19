@@ -51,6 +51,14 @@ def roll_tensor(t: torch.Tensor, shifts: int = -1, dim: int = -1) -> torch.Tenso
     return rolled
 
 
+def get_mtp_loss_scaling_factor(model: nn.Module, default: float = 0.1) -> float:
+    """Return the model's configured MTP auxiliary-loss scaling factor."""
+    mtp_config = getattr(model, "mtp_config", None)
+    if mtp_config is not None:
+        return float(getattr(mtp_config, "loss_scaling_factor", default))
+    return default
+
+
 @dataclass
 class MTPConfig:
     """Runtime configuration for the MTP block.
@@ -95,11 +103,11 @@ class MTPModule(nn.Module):
     """Multi-Token Prediction block.
 
     Holds a flat :class:`nn.ModuleList` of sublayers (length
-    ``num_layers * pattern_length``) where the first sublayer of each depth
-    carries the fusion modules (``enorm``, ``hnorm``, ``eh_proj``) and the
-    last sublayer of each depth carries ``final_layernorm``. This flat layout
-    matches the HuggingFace export format used by Nemotron-V3
-    (``mtp.layers.{i}.*``).
+    ``num_physical_depths * pattern_length``) where the first sublayer of
+    each physical depth carries the fusion modules (``enorm``, ``hnorm``,
+    ``eh_proj``) and the last sublayer of each physical depth carries
+    ``final_layernorm``. This flat layout matches the HuggingFace export
+    format used by Nemotron-V3 (``mtp.layers.{i}.*``).
 
     The model-specific sublayer construction (which decoder block to use, how
     to handle MoE / attention / Mamba) is delegated to the caller via
