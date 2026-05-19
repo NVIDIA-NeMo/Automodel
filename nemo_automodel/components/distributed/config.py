@@ -74,8 +74,8 @@ class FSDP2Config:
                   reduce_dtype: float32
                   output_dtype: bfloat16
 
-            See ``docs/guides/mixed-precision.md`` for the full set of recommended
-            patterns and the bf16-storage trap (issue #1679).
+            See ``docs/guides/mixed-precision-training.md`` for the full set of recommended
+            patterns and the bf16-storage trap.
         offload_policy (Optional[CPUOffloadPolicy]): CPUOffloadPolicy for CPU offloading.
         autocast_dtype (Optional[torch.dtype]): If set, wraps the forward pass in
             ``torch.autocast(device_type="cuda", dtype=autocast_dtype)``.  Use with
@@ -122,7 +122,7 @@ class FSDP2Config:
         if self.mp_policy is None:
             # FSDP2 default: bf16 compute and fp32 gradient reduction. Pair with
             # ``model.torch_dtype: float32`` for fp32 optimizer state. See
-            # ``docs/guides/mixed-precision.md``.
+            # ``docs/guides/mixed-precision-training.md``.
             self.mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,

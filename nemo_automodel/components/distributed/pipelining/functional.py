@@ -270,6 +270,7 @@ def _precompute_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tensor_dtype: torch.dtype | None = None,
 ) -> None:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
@@ -299,11 +300,13 @@ def _precompute_stage_shapes(
     hc_mult = int(getattr(model_config, "hc_mult", 1) or 1) if is_v4 else 1
 
     for stage in stages:
-        # Infer the computation dtype from the stage's parameters
-        try:
-            model_dtype = next(stage.submod.parameters()).dtype
-        except StopIteration:
-            model_dtype = torch.bfloat16
+        if tensor_dtype is None:
+            try:
+                model_dtype = next(stage.submod.parameters()).dtype
+            except StopIteration:
+                model_dtype = torch.bfloat16
+        else:
+            model_dtype = tensor_dtype
 
         inner_submod = getattr(stage.submod, "model", stage.submod)
         stage_has_norm = getattr(inner_submod, "norm", None) is not None
@@ -349,6 +352,7 @@ def reset_pp_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tensor_dtype: torch.dtype | None = None,
 ) -> None:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
@@ -380,7 +384,7 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len)
+    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
@@ -716,6 +720,7 @@ def pipeline_model(
     patch_stage_backward_maybe_with_nosync: bool = False,
     reduce_grad_per_microbatch: bool = False,
     seq_len: int | None = None,
+    tensor_dtype: torch.dtype | None = None,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
@@ -754,7 +759,7 @@ def pipeline_model(
     # Precompute stage shapes to bypass serial P2P shape inference.
     # This must happen *after* parallelization so that dtypes are final.
     if seq_len is not None:
-        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len)
+        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Build pipeline schedule
     pp_schedule = build_pipeline_schedule(

@@ -254,6 +254,10 @@ Unlike the sections above, `step_scheduler` has **no `_target_`** — it is not 
 
 All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
 
+:::{note}
+Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and need higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [mixed-precision training guide](../mixed-precision-training.md) for the recommended TE and torch AdamW patterns.
+:::
+
 ### Full Config YAML
 
 :::{dropdown} finetune_config.yaml (click to expand)
@@ -784,7 +788,7 @@ optimizer:
 | `step_scheduler` | Yes | `grad_acc_steps` sets how many micro-batches accumulate per gradient step. `ckpt_every_steps` and `val_every_steps` are counted in gradient steps. |
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
-| `optimizer` | Optional | Defaults are reasonable. Any `torch.optim` class can be substituted via `_target_`. |
+| `optimizer` | Optional | Defaults are reasonable. Any `torch.optim` class can be substituted via `_target_`. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](../mixed-precision-training.md) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). For more example configs, browse [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune).

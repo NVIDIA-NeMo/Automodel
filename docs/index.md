@@ -144,7 +144,7 @@ Mixed-precision FP8 training with torchao.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.5em;sd-mr-1` Mixed-Precision Training
-:link: guides/mixed-precision
+:link: guides/mixed-precision-training
 :link-type: doc
 fp32 master weights, bf16 compute, and the precision traps to avoid.
 +++
@@ -300,7 +300,7 @@ SkyPilot k8s <launcher/skypilot-kubernetes.md>
 guides/checkpointing.md
 Gradient Checkpointing <guides/gradient-checkpointing.md>
 Pipeline Parallelism <guides/pipelining.md>
-Mixed-Precision Training <guides/mixed-precision.md>
+Mixed-Precision Training <guides/mixed-precision-training.md>
 guides/fp8-training.md
 guides/mlflow-logging.md
 API Reference <apidocs/index.rst>
