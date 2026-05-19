@@ -852,8 +852,6 @@ class TrainDiffusionRecipe(BaseRecipe):
                         world_size=self.world_size,
                     )
                     memory_metrics = self._get_memory_metrics()
-                    if torch.cuda.is_available():
-                        torch.cuda.reset_peak_memory_stats(self.device)
                     perf_window_start_time = perf_window_end_time
                     perf_window_steps = 0
                     perf_window_local_samples = 0
@@ -884,21 +882,21 @@ class TrainDiffusionRecipe(BaseRecipe):
                         throughput_metrics["step_time"],
                         throughput_metrics["samples_per_sec"],
                         throughput_metrics["samples_per_sec_per_gpu"],
-                        memory_metrics["mem"],
+                        memory_metrics["max_memory_allocated_gb"],
                     )
 
                     # Update tqdm if present
                     if hasattr(self.step_scheduler.dataloader, "set_postfix"):
-                        postfix = {
-                            "loss": f"{group_loss_mean:.4f}",
-                            "avg": f"{(avg_loss):.4f}",
-                            "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                            "gn": f"{grad_norm:.2f}",
-                            "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
-                            "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",
-                            "mem": f"{log_dict['mem']:.2f}GiB",
-                        }
-                        self.step_scheduler.dataloader.set_postfix(postfix)
+                        self.step_scheduler.dataloader.set_postfix(
+                            {
+                                "loss": f"{group_loss_mean:.4f}",
+                                "avg": f"{(avg_loss):.4f}",
+                                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                                "gn": f"{grad_norm:.2f}",
+                                "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
+                                "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",
+                            }
+                        )
 
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
@@ -969,17 +967,35 @@ class TrainDiffusionRecipe(BaseRecipe):
         return global_samples
 
     def _get_memory_metrics(self) -> Dict[str, float]:
-        """Return peak allocated CUDA memory in GiB, max-reduced across ranks."""
+        """Return PyTorch CUDA allocator memory counters, max-reduced across ranks."""
         if not torch.cuda.is_available():
-            return {"mem": 0.0}
+            return {
+                "mem": 0.0,
+                "memory_allocated_gb": 0.0,
+                "memory_reserved_gb": 0.0,
+                "max_memory_allocated_gb": 0.0,
+                "max_memory_reserved_gb": 0.0,
+            }
 
         scale = 1024**3
         memory = torch.tensor(
-            torch.cuda.max_memory_allocated(self.device) / scale,
+            [
+                torch.cuda.memory_allocated(self.device) / scale,
+                torch.cuda.memory_reserved(self.device) / scale,
+                torch.cuda.max_memory_allocated(self.device) / scale,
+                torch.cuda.max_memory_reserved(self.device) / scale,
+            ],
             device=self._get_collective_device(),
             dtype=torch.float64,
         )
         if dist.is_initialized():
             dist.all_reduce(memory, op=dist.ReduceOp.MAX)
 
-        return {"mem": float(memory.item())}
+        allocated, reserved, max_allocated, max_reserved = memory.tolist()
+        return {
+            "mem": max_allocated,
+            "memory_allocated_gb": allocated,
+            "memory_reserved_gb": reserved,
+            "max_memory_allocated_gb": max_allocated,
+            "max_memory_reserved_gb": max_reserved,
+        }
