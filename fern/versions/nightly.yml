@@ -156,6 +156,8 @@ navigation:
             path: ./nightly/pages/model-coverage/llm/tencent/hy3.mdx
           - page: "MiMo-V2-Flash"
             path: ./nightly/pages/model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
+          - page: "Ling 2.0"
+            path: ./nightly/pages/model-coverage/llm/inclusionai/ling-2.mdx
       - section: "Vision Language Models (VLMs)"
         slug: vision-language-models
         contents:
