@@ -10,13 +10,14 @@
 # Use ling_1t_lora_pp.yaml (32 GPUs) if full SFT is not feasible.
 # ------------------------------------------------------------------------------------------------
 #
-# Modelled after deepseek_v32_hellaswag_pp.yaml (671B / 256 H100 / pp=4 / ep=64).
-# Topology: PP=4 across 4 node-groups, EP=64 across 8 nodes, FSDP shards
-# remaining params across data-parallel groups.
+# Topology: PP=4, EP=64; FSDP shards the rest.
+# Uses dispatcher=hybridep (DeepEP times out at hidden_size=8192).
+# Requires env vars (set in ci.env_vars):
+#   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8
+#   NUM_OF_STAGES_G2S_COMBINE_API=4   # multi-node ep=64 backward combine
 #
 # To run:
 #   automodel examples/llm_finetune/ling/ling_1t_sft.yaml --nproc-per-node 8
-# (Launch on 32 nodes via slurm.sub or the SkyPilot launcher; see launcher-config skill.)
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -46,7 +47,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -72,10 +73,7 @@ distributed:
     pp_microbatch_size: 1
     round_virtual_stages_to_pp_multiple: down
     scale_grads_in_schedule: false
-    layers_per_stage: 5  # 80 layers / pp=4 / 4 virtual stages
-    # See note in ling_1t_lora_pp.yaml.  These flags pair with the
-    # _pp_keep_self_forward=True class attribute on BailingMoeV2ForCausalLM
-    # and keep our freqs_cis-based forward intact under PP.
+    layers_per_stage: 5  # 80 / pp=4 / virtual=4
     patch_inner_model: false
     patch_causal_lm_model: false
 
@@ -122,3 +120,11 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
+
+ci:
+  recipe_owner: Hayden727
+  nodes: 32
+  time: "01:00:00"
+  env_vars:
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
+    NUM_OF_STAGES_G2S_COMBINE_API: "4"
