@@ -4,7 +4,7 @@
 
 ### FSDP2 default `reduce_dtype` is now `float32`
 
-The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.MixedPrecisionPolicy) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in fp32 to reduce communication-rounding error at larger data-parallel world sizes.
+The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in fp32 to reduce communication-rounding error at larger data-parallel world sizes.
 
 To restore the previous behavior, override the policy explicitly:
 
