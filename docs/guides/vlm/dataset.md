@@ -16,6 +16,24 @@ Multi-modal datasets combine text with other input types (e.g., images, audio, o
 
 NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
 
+### Fast LoRA From OpenAI-Style VLM JSONL
+
+For OpenAI-style multimodal chat data, you can start a default VLM LoRA run without writing YAML:
+
+```bash
+automodel Qwen/Qwen2.5-VL-3B-Instruct examples/quickstart/openai_vlm_chat.jsonl
+```
+
+AutoModel detects image or video content parts in the `messages` list and routes the run to `FinetuneRecipeForVLM`. Text-only rows use the LLM quick path; multimodal rows use `make_openai_vlm_chat_dataset`.
+
+Rows may contain single-turn or multiturn conversations. Image content can use OpenAI chat `image_url` parts, OpenAI responses `input_image` parts, existing Automodel `image` parts, relative file paths, absolute file paths, HTTP(S) URLs, or inline base64 `data:image/...` URLs:
+
+```json
+{"messages":[{"role":"user","content":[{"type":"text","text":"What color is the square?"},{"type":"image_url","image_url":{"url":"images/square.png"}}]},{"role":"assistant","content":"White."},{"role":"user","content":"Answer in one word."},{"role":"assistant","content":"White."}]}
+```
+
+Relative media paths are resolved relative to the JSONL file location. For non-OpenAI schemas, use the YAML configuration path below and point `dataset._target_` at a custom preprocessing function.
+
 ### Typical Types in Multi-modal Datasets
 A multi-modal dataset typically contains:
 - **Images, videos, audios** or other non-text modalities.

@@ -9,7 +9,7 @@ Components are modular, plug-and-play building blocks referenced using the `_tar
 This page maps the ready-to-run recipes found in the `examples/` directory to their intended use cases, representative model families, and the most relevant how-to guides.
 
 - Examples root: [examples/ (GitHub)](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples)
-- Getting started: [Installation](installation.md)
+- Getting started: [Quickstart](quickstart.md)
 
 ## Large Language Models (LLM)
 This section provides practical recipes and configurations for working with large language models across three core workflows: fine-tuning, pretraining, and knowledge distillation.
@@ -103,4 +103,4 @@ Preprocessing pipeline to create `.meta` files containing VAE latents and text e
 
 ---
 
-If you are new to the project, begin with the [Installation](installation.md) guide. Then, select a recipe category above and follow its linked how-to guide(s). The provided YAML configurations can serve as templates—customize them by adapting model names, datasets, and precision settings to match your specific needs.
+If you are new to the project, begin with the [Quickstart](quickstart.md) guide. Then, select a recipe category above and follow its linked how-to guide(s). The provided YAML configurations can serve as templates—customize them by adapting model names, datasets, and precision settings to match your specific needs.

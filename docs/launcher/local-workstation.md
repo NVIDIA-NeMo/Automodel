@@ -9,6 +9,7 @@ NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipe
 
 - **CLI (recommended)**
   ```bash
+  automodel Qwen/Qwen2.5-1.5B-Instruct examples/quickstart/openai_chat.jsonl
   automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
   ```
 
@@ -30,14 +31,23 @@ The AutoModel CLI is the preferred method for most users. It offers a unified in
 
 The CLI follows this format:
 ```bash
+automodel [--nproc-per-node N] <hf-model-id> <openai-chat-data.jsonl> [--key.subkey=override ...]
 automodel [--nproc-per-node N] <config.yaml> [--key.subkey=override ...]
 ```
 
 A short alias `am` is also available. Both commands also work with `uv run` (e.g., `uv run automodel <config.yaml>`).
 
 Where:
+- `<hf-model-id> <openai-chat-data.jsonl>`: A zero-YAML LoRA run for OpenAI-format chat rows shaped like `{"messages": [...]}`. Multiturn text data uses `OpenAIChatDataset`; rows with image/video content parts are routed to the VLM recipe.
 - `<config.yaml>`: Path to your YAML configuration file (must contain a `recipe._target_` key)
 - `--nproc-per-node`: Optional override for the number of GPUs to use
+
+Examples:
+
+```bash
+automodel Qwen/Qwen2.5-1.5B-Instruct examples/quickstart/openai_chat.jsonl
+automodel Qwen/Qwen2.5-VL-3B-Instruct examples/quickstart/openai_vlm_chat.jsonl
+```
 
 The recipe class is specified inside the YAML via the `recipe._target_` key:
 ```yaml

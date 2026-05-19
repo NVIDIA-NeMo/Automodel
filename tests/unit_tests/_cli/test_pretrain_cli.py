@@ -18,9 +18,14 @@ import nemo_automodel.cli.app as app
 def test_cli_accepts_config_positional(tmp_path):
     parser = app.build_parser()
     cfg = tmp_path / "cfg.yaml"
-    cfg.write_text(
-        "recipe:\n  _target_: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction\n"
-    )
+    recipe_target = "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
+    cfg.write_text(f"recipe:\n  _target_: {recipe_target}\n")
+
     args, _ = parser.parse_known_args([str(cfg)])
-    assert args.config == cfg
+    config_path, config, generated_config = app._resolve_invocation(args, parser)
+
+    assert args.inputs == [str(cfg)]
+    assert config_path == cfg.resolve()
+    assert config["recipe"]["_target_"] == recipe_target
+    assert generated_config is False
     assert args.nproc_per_node is None

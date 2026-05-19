@@ -27,7 +27,7 @@ content_type: index
 # NeMo AutoModel Documentation
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
-**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md)
+**Quick links:** [Quickstart](guides/quickstart.md) | [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md)
 
 ::::{grid} 2 2 2 2
 :gutter: 1 1 1 2
@@ -61,11 +61,12 @@ Built on `transformers` for day-0 model support and OOTB compatibility.
 ## Get Started
 
 ```bash
-uv pip install nemo-automodel
+pip install nemo-automodel
 
-automodel --nproc-per-node=2 llama3_2_1b_squad.yaml
+automodel Qwen/Qwen2.5-1.5B-Instruct examples/quickstart/openai_chat.jsonl
 ```
 
+Start with the [quickstart guide](guides/quickstart.md) for zero-YAML LoRA fine-tuning from OpenAI-format chat JSONL.
 See the [installation guide](guides/installation.md) for Docker, source builds, and multi-node setup.
 See the [configuration guide](guides/configuration.md) for YAML recipes and CLI overrides.
 Launch on a [local workstation](launcher/local-workstation.md) or [SLURM cluster](launcher/slurm.md).
@@ -209,6 +210,7 @@ Drop-in accelerated backend for TRL, lm-eval-harness, OpenRLHF, or any code that
 :caption: Get Started
 About <about/index.md>
 Key Features <about/key-features.md>
+Quickstart <guides/quickstart.md>
 Installation <guides/installation.md>
 Configuration <guides/configuration.md>
 🤗 HF Compatibility <guides/huggingface-api-compatibility.md>

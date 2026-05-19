@@ -20,6 +20,8 @@ import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import torch.utils.data
 from datasets import load_dataset
@@ -368,6 +370,228 @@ def _convert_sharegpt_to_conversation(
     return result
 
 
+def _as_media_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    return [value]
+
+
+def _resolve_media_path(value, media_dir=None):
+    if not isinstance(value, str):
+        return value
+    if value.startswith("file://"):
+        return unquote(urlparse(value).path)
+    if value.startswith(("data:", "http://", "https://")) or "::" in value or os.path.isabs(value):
+        return value
+    if media_dir:
+        return os.path.join(media_dir, value)
+    return value
+
+
+def _media_ref_from_value(value):
+    if isinstance(value, dict):
+        return value.get("url") or value.get("path")
+    return value
+
+
+def _extract_media_ref(part, media_type):
+    if media_type == "image":
+        candidates = (part.get("image"), part.get("image_url"), part.get("url"), part.get("path"))
+    else:
+        candidates = (part.get("video"), part.get("video_url"), part.get("url"), part.get("path"))
+    for candidate in candidates:
+        ref = _media_ref_from_value(candidate)
+        if ref:
+            return ref
+    return None
+
+
+def _media_extra_fields(value, media_type):
+    if not isinstance(value, dict):
+        return {}
+    if media_type == "image":
+        reserved = {"type", "text", "image", "image_url", "url", "path"}
+    else:
+        reserved = {"type", "text", "video", "video_url", "url", "path"}
+    return {key: val for key, val in value.items() if key not in reserved}
+
+
+def _append_media_entry(content_parts, media_type, media_entry, media_dir=None):
+    ref = _media_ref_from_value(media_entry)
+    if not ref:
+        return
+    key = "image" if media_type == "image" else "video"
+    content_parts.append(
+        {
+            "type": media_type,
+            key: _resolve_media_path(ref, media_dir=media_dir),
+            **_media_extra_fields(media_entry, media_type),
+        }
+    )
+
+
+def _append_text_with_placeholders(content_parts, text, images, videos, state, media_dir=None):
+    pattern = re.compile(r"(<image>|<video>)", re.IGNORECASE)
+    for segment in pattern.split(str(text)):
+        lowered = segment.lower()
+        if lowered == "<image>":
+            if state["image_idx"] < len(images):
+                _append_media_entry(content_parts, "image", images[state["image_idx"]], media_dir=media_dir)
+                state["image_idx"] += 1
+            continue
+        if lowered == "<video>":
+            if state["video_idx"] < len(videos):
+                _append_media_entry(content_parts, "video", videos[state["video_idx"]], media_dir=media_dir)
+                state["video_idx"] += 1
+            continue
+        if segment:
+            content_parts.append({"type": "text", "text": segment})
+
+
+def _append_openai_content_part(content_parts, part, images, videos, state, media_dir=None):
+    if isinstance(part, str):
+        _append_text_with_placeholders(content_parts, part, images, videos, state, media_dir=media_dir)
+        return
+
+    if not isinstance(part, dict):
+        content_parts.append({"type": "text", "text": str(part)})
+        return
+
+    part_type = str(part.get("type", "")).lower()
+    if part_type in {"image", "image_url", "input_image"} or "image" in part or "image_url" in part:
+        ref = _extract_media_ref(part, "image")
+        if ref:
+            content_parts.append(
+                {
+                    "type": "image",
+                    "image": _resolve_media_path(ref, media_dir=media_dir),
+                    **_media_extra_fields(part, "image"),
+                }
+            )
+            return
+
+    if part_type in {"video", "video_url", "input_video"} or "video" in part or "video_url" in part:
+        ref = _extract_media_ref(part, "video")
+        if ref:
+            content_parts.append(
+                {
+                    "type": "video",
+                    "video": _resolve_media_path(ref, media_dir=media_dir),
+                    **_media_extra_fields(part, "video"),
+                }
+            )
+            return
+
+    if "text" in part:
+        _append_text_with_placeholders(content_parts, part["text"], images, videos, state, media_dir=media_dir)
+
+
+def _resolve_automodel_content_media(content, media_dir=None):
+    if not isinstance(content, list):
+        return content
+    resolved = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "image" and "image" in item:
+            resolved.append({**item, "image": _resolve_media_path(item["image"], media_dir=media_dir)})
+        elif isinstance(item, dict) and item.get("type") == "video" and "video" in item:
+            resolved.append({**item, "video": _resolve_media_path(item["video"], media_dir=media_dir)})
+        else:
+            resolved.append(item)
+    return resolved
+
+
+def _convert_openai_vlm_messages_to_conversation(example, media_dir=None):
+    """Convert OpenAI-style multimodal chat rows to Automodel VLM conversations.
+
+    Supports string text content, content-part lists with ``text``,
+    ``image_url``/``input_image``/``image`` items, ``video`` items, and
+    multi-turn transcripts. Relative media paths are resolved against
+    ``media_dir`` when provided.
+    """
+    if "conversation" in example:
+        result = {
+            "conversation": [
+                {
+                    **message,
+                    "content": _resolve_automodel_content_media(message.get("content"), media_dir=media_dir),
+                }
+                for message in example["conversation"]
+            ]
+        }
+    else:
+        messages = example.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("Each VLM sample must contain a `messages` list or `conversation` list")
+
+        images = _as_media_list(example.get("images"))
+        videos = _as_media_list(example.get("videos"))
+        state = {"image_idx": 0, "video_idx": 0}
+        conversation = []
+
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role == "developer":
+                role = "system"
+            if role not in {"system", "user", "assistant"}:
+                continue
+
+            content = message.get("content")
+            content_parts = []
+            if isinstance(content, list):
+                for part in content:
+                    _append_openai_content_part(content_parts, part, images, videos, state, media_dir=media_dir)
+            elif isinstance(content, dict):
+                _append_openai_content_part(content_parts, content, images, videos, state, media_dir=media_dir)
+            elif content is not None:
+                _append_text_with_placeholders(content_parts, content, images, videos, state, media_dir=media_dir)
+
+            if not content_parts:
+                content_parts.append({"type": "text", "text": ""})
+            conversation.append({"role": role, "content": content_parts})
+
+        result = {"conversation": conversation}
+
+    if "mm_inputs_meta" in example:
+        result["mm_inputs_meta"] = example["mm_inputs_meta"]
+    if "_text_tokens" in example:
+        result["_text_tokens"] = example["_text_tokens"]
+    return result
+
+
+def make_openai_vlm_chat_dataset(
+    path_or_dataset,
+    split="train",
+    media_dir=None,
+    limit_dataset_samples=None,
+    **kwargs,
+):
+    """Load OpenAI-style multimodal chat JSON/JSONL or HF datasets for VLM SFT."""
+    local_path = Path(path_or_dataset).expanduser() if isinstance(path_or_dataset, str) else None
+    resolved_media_dir = media_dir
+
+    if local_path is not None and local_path.exists() and local_path.is_file():
+        raw_data = _load_json_or_jsonl(str(local_path))
+        if resolved_media_dir is None:
+            resolved_media_dir = str(local_path.parent.resolve())
+        elif not os.path.isabs(str(resolved_media_dir)):
+            resolved_media_dir = str((local_path.parent / str(resolved_media_dir)).resolve())
+    else:
+        raw_data = load_dataset(path_or_dataset, split=split, **kwargs)
+
+    if limit_dataset_samples is not None:
+        limit = int(limit_dataset_samples)
+        if hasattr(raw_data, "select"):
+            raw_data = raw_data.select(range(min(limit, len(raw_data))))
+        else:
+            raw_data = list(raw_data)[:limit]
+
+    return [_convert_openai_vlm_messages_to_conversation(example, media_dir=resolved_media_dir) for example in raw_data]
+
+
 def _load_json_or_jsonl(file_path):
     """Load data from a JSON or JSONL file.
 
@@ -377,8 +601,9 @@ def _load_json_or_jsonl(file_path):
     Returns:
         list[dict]: List of data examples.
     """
+    file_path = str(file_path)
     with open(file_path) as f:
-        if file_path.endswith(".jsonl"):
+        if file_path.endswith((".jsonl", ".ndjson")):
             return [json.loads(line) for line in f if line.strip()]
         else:
             data = json.load(f)
