@@ -16,7 +16,9 @@
 import importlib
 import inspect
 import logging
+import warnings
 from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
 
@@ -26,186 +28,170 @@ from nemo_automodel._transformers.registry.model_package_spec import ModelPackag
 
 logger = logging.getLogger(__name__)
 
+_ModelArchMappingInput = Mapping[str, ModelPackageSpec] | Iterable[ModelPackageSpec] | None
 
-class _LazyArchMapping:
-    """Lazy-loading mapping from architecture name to model class.
 
-    Inspired by HuggingFace transformers' ``_LazyAutoMapping``.  Entries from the
-    static ``ModelPackageSpec`` mapping are imported on first access and cached.  Additional entries
-    can be added at runtime via ``register``.
-    """
+def _normalize_model_arch_mapping(auto_map: _ModelArchMappingInput = None) -> OrderedDict[str, ModelPackageSpec]:
+    """Normalize legacy dict mappings or tuple-based specs into an architecture lookup."""
+    mapping: OrderedDict[str, ModelPackageSpec] = OrderedDict()
+    if isinstance(auto_map, Mapping):
+        spec_items = ((architecture, spec.with_architecture(architecture)) for architecture, spec in auto_map.items())
+    else:
+        spec_items = []
+        for spec in auto_map or ():
+            if spec.class_name is None and not spec.architectures:
+                continue
+            if not spec.architectures:
+                raise ValueError(f"Model architecture spec for {spec.package!r} must declare at least one architecture")
+            spec_items.extend((architecture, spec) for architecture in spec.architectures)
 
-    def __init__(self, auto_map: OrderedDict[str, ModelPackageSpec] | dict[str, ModelPackageSpec] | None = None):
-        self._specs: dict[str, ModelPackageSpec] = OrderedDict()
-        self._tags: dict[str, set] = {}
-        for key, spec in (auto_map or {}).items():
-            if spec.class_name is None:
-                raise ValueError(f"Model architecture entry {key!r} must include a class name")
-            spec = spec.with_architecture(key)
-            self._specs[key] = spec
-            if spec.tags:
-                self._tags[key] = set(spec.tags)
-        self._loaded: dict[str, type[nn.Module]] = {}
-        self._extra: dict[str, type[nn.Module]] = {}
-        self._extra_specs: dict[str, ModelPackageSpec] = {}
-        self._modules: dict[str, object] = {}
-
-    def _load(self, key: str) -> type[nn.Module]:
-        if key in self._loaded:
-            return self._loaded[key]
-        spec = self._specs[key]
-        module_path = spec.module_path
-        class_name = spec.class_name
-        if module_path not in self._modules:
-            self._modules[module_path] = importlib.import_module(module_path)
-        cls = getattr(self._modules[module_path], class_name)
-        self._loaded[key] = cls
-        return cls
-
-    def __contains__(self, key: str) -> bool:
-        if key in self._extra or key in self._loaded:
-            return True
-        if key not in self._specs:
-            return False
-        try:
-            self._load(key)
-            return True
-        except Exception:
-            logger.debug("Model %s unavailable (import failed), removing from registry specs", key)
-            self._specs.pop(key, None)
-            self._tags.pop(key, None)
-            return False
-
-    def __getitem__(self, key: str) -> type[nn.Module]:
-        if key in self._extra:
-            return self._extra[key]
-        if key in self._specs:
-            return self._load(key)
-        raise KeyError(key)
-
-    def __setitem__(self, key: str, value: type[nn.Module]) -> None:
-        self._extra[key] = value
-        self._extra_specs[key] = ModelPackageSpec.from_module_path(value.__module__, value.__name__).with_architecture(
-            key
-        )
-
-    def register(self, key: str, value: type[nn.Module], exist_ok: bool = False) -> None:
-        """Register a model class under the given architecture name."""
-        if not exist_ok and key in self._extra:
-            raise ValueError(f"Duplicated model implementation for {key}")
-        self._extra[key] = value
-        self._extra_specs[key] = ModelPackageSpec.from_module_path(value.__module__, value.__name__).with_architecture(
-            key
-        )
-
-    def has_tag(self, key: str, tag: str) -> bool:
-        """Return ``True`` if *key* was registered with *tag*."""
-        return tag in self._tags.get(key, set())
-
-    def keys_with_tag(self, tag: str) -> set:
-        """Return all architecture names that have *tag*."""
-        return {k for k, tags in self._tags.items() if tag in tags}
-
-    def keys(self):
-        return set(self._specs.keys()) | set(self._extra.keys())
-
-    def get_spec(self, key: str) -> ModelPackageSpec | None:
-        """Return package metadata for *key* without importing the model class."""
-        if key in self._extra_specs:
-            return self._extra_specs[key]
-        return self._specs.get(key)
-
-    def specs(self) -> tuple[ModelPackageSpec, ...]:
-        """Return metadata for all statically and dynamically registered model classes."""
-        return (*self._specs.values(), *self._extra_specs.values())
-
-    def __len__(self) -> int:
-        return len(self.keys())
-
-    def __repr__(self) -> str:
-        return f"_LazyArchMapping(specs={len(self._specs)}, extra={len(self._extra)}, loaded={len(self._loaded)})"
+    for architecture, spec in spec_items:
+        if spec.class_name is None:
+            raise ValueError(f"Model architecture entry {architecture!r} must include a class name")
+        if architecture in mapping:
+            raise ValueError(f"Duplicated model architecture entry for {architecture!r}")
+        mapping[architecture] = spec
+    return mapping
 
 
 @dataclass
-class _ModelRegistry:
-    model_arch_mapping: OrderedDict[str, ModelPackageSpec] | dict[str, ModelPackageSpec] | None = None
-    model_arch_name_to_cls: _LazyArchMapping = field(default=None)
-    package_specs: tuple[ModelPackageSpec, ...] = ()
-    _retrieval_archs: set = field(default_factory=set)
+class _BaseModelRegistry:
+    model_specs: _ModelArchMappingInput = None
+    model_arch_name_to_cls: "_BaseModelRegistry" = field(init=False, repr=False, compare=False)
+    _model_specs: tuple[ModelPackageSpec, ...] = field(init=False)
+    _loaded_model_classes: dict[str, type[nn.Module]] = field(default_factory=dict)
+    _extra_model_classes: dict[str, type[nn.Module]] = field(default_factory=dict)
+    _discarded_architectures: set[str] = field(default_factory=set)
+    _manual_architecture_tags: dict[str, set[str]] = field(default_factory=dict)
     _architecture_to_specs: dict[str, tuple[ModelPackageSpec, ...]] = field(default_factory=dict)
     _model_type_to_specs: dict[str, tuple[ModelPackageSpec, ...]] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.model_arch_name_to_cls is None:
-            self.model_arch_name_to_cls = _LazyArchMapping(self.model_arch_mapping or {})
-        self._retrieval_archs = self.model_arch_name_to_cls.keys_with_tag("retrieval")
+        if isinstance(self.model_specs, Mapping):
+            raw_specs: Iterable[ModelPackageSpec] = _normalize_model_arch_mapping(self.model_specs).values()
+        else:
+            raw_specs = tuple(self.model_specs or ())
+            _normalize_model_arch_mapping(raw_specs)
+        self._model_specs = tuple(dict.fromkeys(raw_specs))
         self._rebuild_spec_indexes()
-
-    def _iter_specs(self) -> tuple[ModelPackageSpec, ...]:
-        return (*self.model_arch_name_to_cls.specs(), *self.package_specs)
+        self.model_arch_name_to_cls = self
 
     def _rebuild_spec_indexes(self) -> None:
         architecture_to_specs: dict[str, list[ModelPackageSpec]] = {}
         model_type_to_specs: dict[str, list[ModelPackageSpec]] = {}
-        for spec in self._iter_specs():
+        dynamic_specs = tuple(
+            ModelPackageSpec.from_model_class(model_cls, architectures=(architecture,))
+            for architecture, model_cls in self._extra_model_classes.items()
+        )
+        for spec in (*dynamic_specs, *self._model_specs):
             for architecture in spec.architectures:
+                if architecture in self._discarded_architectures and architecture not in self._extra_model_classes:
+                    continue
                 architecture_to_specs.setdefault(architecture, []).append(spec)
             for model_type in spec.model_types:
                 model_type_to_specs.setdefault(model_type, []).append(spec)
         self._architecture_to_specs = {
             architecture: tuple(specs) for architecture, specs in architecture_to_specs.items()
         }
-        self._model_type_to_specs = {
-            model_type: tuple(self._dedupe_specs(specs)) for model_type, specs in model_type_to_specs.items()
-        }
+        self._model_type_to_specs = {model_type: tuple(specs) for model_type, specs in model_type_to_specs.items()}
 
-    @staticmethod
-    def _dedupe_specs(specs: list[ModelPackageSpec] | tuple[ModelPackageSpec, ...]) -> tuple[ModelPackageSpec, ...]:
-        seen: set[str] = set()
-        deduped: list[ModelPackageSpec] = []
-        for spec in specs:
-            if spec.package in seen:
-                continue
-            seen.add(spec.package)
-            deduped.append(spec)
-        return tuple(deduped)
+    def _discard_architecture(self, architecture: str) -> None:
+        self._discarded_architectures.add(architecture)
+        self._architecture_to_specs.pop(architecture, None)
+        self._extra_model_classes.pop(architecture, None)
+        self._loaded_model_classes.pop(architecture, None)
+        self._manual_architecture_tags.pop(architecture, None)
 
-    @staticmethod
-    def _import_optional_module(spec: ModelPackageSpec, module_name: str) -> ModuleType | None:
-        if module_name not in spec.optional_modules:
-            return None
-        module_path = spec.optional_module_path(module_name)
+    def _load_model_class(self, architecture: str) -> type[nn.Module]:
+        if architecture in self._loaded_model_classes:
+            return self._loaded_model_classes[architecture]
+        spec = self.get_model_package_spec(architecture)
+        if spec is None or spec.class_name is None:
+            raise KeyError(architecture)
+        model_cls = getattr(importlib.import_module(spec.module_path), spec.class_name)
+        self._loaded_model_classes[architecture] = model_cls
+        return model_cls
+
+    def __contains__(self, architecture: str) -> bool:
+        if architecture in self._extra_model_classes or architecture in self._loaded_model_classes:
+            return True
+        if self.get_model_package_spec(architecture) is None:
+            return False
         try:
-            return importlib.import_module(module_path)
-        except ImportError:
-            logger.debug("Optional model module is unavailable: %s", module_path)
-            return None
+            self._load_model_class(architecture)
+            return True
+        except Exception:
+            logger.debug("Model %s unavailable (import failed), removing from registry specs", architecture)
+            self._discard_architecture(architecture)
+            return False
+
+    def __getitem__(self, architecture: str) -> type[nn.Module]:
+        if architecture in self._extra_model_classes:
+            return self._extra_model_classes[architecture]
+        return self._load_model_class(architecture)
+
+    def __setitem__(self, architecture: str, model_cls: type[nn.Module]) -> None:
+        self._discarded_architectures.discard(architecture)
+        self._extra_model_classes[architecture] = model_cls
+        self._loaded_model_classes.pop(architecture, None)
+        self._rebuild_spec_indexes()
+
+    def keys(self):
+        return set(self._architecture_to_specs) | set(self._extra_model_classes)
+
+    def __len__(self) -> int:
+        return len(self.keys())
+
+    def __repr__(self) -> str:
+        return (
+            f"_BaseModelRegistry(specs={len(self._architecture_to_specs)}, "
+            f"extra={len(self._extra_model_classes)}, loaded={len(self._loaded_model_classes)})"
+        )
+
+    def _architecture_has_tag(self, architecture: str, tag: str) -> bool:
+        if tag in self._manual_architecture_tags.get(architecture, set()):
+            return True
+        return any(tag in spec.tags for spec in self.get_model_package_specs_for_architecture(architecture))
 
     @property
     def supported_models(self):
-        return self.model_arch_name_to_cls.keys()
+        return self.keys()
 
     def get_model_cls_from_model_arch(self, model_arch: str) -> type[nn.Module]:
-        return self.model_arch_name_to_cls[model_arch]
+        return self[model_arch]
 
     def has_custom_model(self, arch_name: str) -> bool:
         """Return ``True`` if *arch_name* has a custom (non-HF) implementation."""
-        return arch_name in self.model_arch_name_to_cls
+        return arch_name in self
 
     def has_retrieval_model(self, arch_name: str) -> bool:
         """Return ``True`` if *arch_name* is a registered retrieval/encoder architecture."""
-        return arch_name in self._retrieval_archs
+        warnings.warn(
+            "has_retrieval_model() is deprecated; use RetrievalModelRegistry.get_model_package_spec() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if self._architecture_has_tag(arch_name, "retrieval"):
+            return True
+        from nemo_automodel._transformers.registry import RetrievalModelRegistry
+
+        return RetrievalModelRegistry.get_model_package_spec(arch_name) is not None
 
     def register_retrieval(self, arch_name: str) -> None:
         """Mark *arch_name* as a retrieval/encoder architecture."""
-        self._retrieval_archs.add(arch_name)
+        warnings.warn(
+            "register_retrieval() is deprecated; register retrieval classes with RetrievalModelRegistry.register().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._manual_architecture_tags.setdefault(arch_name, set()).add("retrieval")
 
     def get_model_package_spec(self, architecture: str) -> ModelPackageSpec | None:
         """Return package metadata for an architecture without importing ``model.py``."""
         specs = self.get_model_package_specs_for_architecture(architecture)
         if specs:
             return specs[0]
-        return self.model_arch_name_to_cls.get_spec(architecture)
+        return None
 
     def get_model_package_specs_for_architecture(self, architecture: str) -> tuple[ModelPackageSpec, ...]:
         """Return all package metadata entries that declare *architecture*."""
@@ -214,71 +200,6 @@ class _ModelRegistry:
     def get_model_package_specs_for_model_type(self, model_type: str) -> tuple[ModelPackageSpec, ...]:
         """Return package metadata entries that declare *model_type*."""
         return self._model_type_to_specs.get(model_type, ())
-
-    def get_optional_module_for_architecture(self, architecture: str, module_name: str) -> ModuleType | None:
-        """Import ``<model package>.<module_name>`` for an architecture if declared."""
-        modules = self.iter_optional_modules_for_architectures((architecture,), module_name)
-        return modules[0] if modules else None
-
-    def iter_optional_modules_for_architectures(
-        self, architectures: tuple[str, ...] | list[str], module_name: str
-    ) -> tuple[ModuleType, ...]:
-        """Import convention modules for the requested architectures only."""
-        modules: list[ModuleType] = []
-        seen_paths: set[str] = set()
-        for architecture in architectures:
-            for spec in self.get_model_package_specs_for_architecture(architecture):
-                if module_name not in spec.optional_modules:
-                    continue
-                module_path = spec.optional_module_path(module_name)
-                if module_path in seen_paths:
-                    continue
-                module = self._import_optional_module(spec, module_name)
-                if module is not None:
-                    seen_paths.add(module_path)
-                    modules.append(module)
-        return tuple(modules)
-
-    def iter_optional_modules_for_model_type(self, model_type: str, module_name: str) -> tuple[ModuleType, ...]:
-        """Import convention modules for packages that declare *model_type*."""
-        modules: list[ModuleType] = []
-        for spec in self.get_model_package_specs_for_model_type(model_type):
-            module = self._import_optional_module(spec, module_name)
-            if module is not None:
-                modules.append(module)
-        return tuple(modules)
-
-    def iter_optional_modules(
-        self,
-        module_name: str,
-        *,
-        global_patches: bool | None = None,
-        pre_config_patches: bool | None = None,
-        post_shard_patches: bool | None = None,
-        tokenizer_registrations: bool | None = None,
-    ) -> tuple[ModuleType, ...]:
-        """Import declared convention modules matching the provided metadata filters."""
-        modules: list[ModuleType] = []
-        seen_paths: set[str] = set()
-        for spec in self._iter_specs():
-            if module_name not in spec.optional_modules:
-                continue
-            if global_patches is not None and spec.global_patches is not global_patches:
-                continue
-            if pre_config_patches is not None and spec.pre_config_patches is not pre_config_patches:
-                continue
-            if post_shard_patches is not None and spec.post_shard_patches is not post_shard_patches:
-                continue
-            if tokenizer_registrations is not None and spec.tokenizer_registrations is not tokenizer_registrations:
-                continue
-            module_path = spec.optional_module_path(module_name)
-            if module_path in seen_paths:
-                continue
-            module = self._import_optional_module(spec, module_name)
-            if module is not None:
-                seen_paths.add(module_path)
-                modules.append(module)
-        return tuple(modules)
 
     @staticmethod
     def _iter_config_classes(module: ModuleType):
@@ -344,9 +265,9 @@ class _ModelRegistry:
         to opt out for specific HF configs (e.g. a Mistral3 VLM with a dense
         Ministral3 text backbone instead of the expected Mistral4 MoE+MLA).
         """
-        if architecture not in self.model_arch_name_to_cls:
+        if architecture not in self:
             return None
-        model_cls = self.model_arch_name_to_cls[architecture]
+        model_cls = self[architecture]
         if hasattr(model_cls, "supports_config") and not model_cls.supports_config(config):
             logger.info(
                 "Custom model %s does not support config %s, falling back to HF",
@@ -358,5 +279,6 @@ class _ModelRegistry:
 
     def register(self, arch_name: str, model_cls: type[nn.Module], exist_ok: bool = False) -> None:
         """Register a custom model class for a given architecture name."""
-        self.model_arch_name_to_cls.register(arch_name, model_cls, exist_ok=exist_ok)
-        self._rebuild_spec_indexes()
+        if not exist_ok and arch_name in self._extra_model_classes:
+            raise ValueError(f"Duplicated model implementation for {arch_name}")
+        self[arch_name] = model_cls

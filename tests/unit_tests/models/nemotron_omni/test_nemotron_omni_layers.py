@@ -16,7 +16,7 @@
 
 These tests exercise the small, dependency-free building blocks of the
 NemotronOmni wrapper (activation, norm, projectors, config) plus the
-architecture registration that lets ``MODEL_ARCH_MAPPING`` resolve the v3 dump.
+architecture registration that lets ``MODEL_PACKAGE_SPECS`` resolve the v3 dump.
 The heavy ``NemotronOmniForConditionalGeneration`` end-to-end forward path
 requires a full HF v3 checkpoint and is covered by the functional/integration
 suites — not here.
@@ -164,18 +164,20 @@ def test_nemotron_omni_config_overrides_propagate():
 
 
 def test_registry_entry_present():
-    """``MODEL_ARCH_MAPPING`` should resolve the v3 architecture name to our wrapper."""
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    """``MODEL_PACKAGE_SPECS`` should resolve the v3 architecture name to our wrapper."""
+    from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
+    from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
 
-    mapping = dict(MODEL_ARCH_MAPPING)
+    mapping = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)
     assert "NemotronH_Nano_Omni_Reasoning_V3" in mapping
-    module_path, class_name, *_ = mapping["NemotronH_Nano_Omni_Reasoning_V3"]
-    assert module_path == "nemo_automodel.components.models.nemotron_omni.model"
-    assert class_name == "NemotronOmniForConditionalGeneration"
+    spec = mapping["NemotronH_Nano_Omni_Reasoning_V3"]
+    assert spec.module_path == "nemo_automodel.components.models.nemotron_omni.model"
+    assert spec.class_name == "NemotronOmniForConditionalGeneration"
 
 
 def test_registry_v2_entry_removed():
     """V2 dispatch was deleted along with V2 dump support — keep it gone."""
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
+    from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
 
-    assert "NemotronH_Nano_VL_V2" not in dict(MODEL_ARCH_MAPPING)
+    assert "NemotronH_Nano_VL_V2" not in _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)

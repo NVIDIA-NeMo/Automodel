@@ -14,17 +14,16 @@
 
 """Public exports for the model registry package."""
 
-from nemo_automodel._transformers.registry.base import _LazyArchMapping
-from nemo_automodel._transformers.registry.base import _ModelRegistry as _BaseModelRegistry
+from nemo_automodel._transformers.registry.base import _BaseModelRegistry
 from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
 
 _MODEL_REGISTRY_EXPORTS = {
-    "MODEL_ARCH_MAPPING",
-    "_CUSTOM_CONFIG_SPECS",
     "MODEL_PACKAGE_SPECS",
+    "RETRIEVAL_MODEL_PACKAGE_SPECS",
     "ModelRegistry",
-    "_ModelRegistry",
-    "get_registry",
+    "RetrievalModelRegistry",
+    "make_registry",
+    "make_retrieval_registry",
 }
 
 
@@ -38,13 +37,12 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "MODEL_ARCH_MAPPING",
-    "_CUSTOM_CONFIG_SPECS",
     "MODEL_PACKAGE_SPECS",
+    "RETRIEVAL_MODEL_PACKAGE_SPECS",
     "ModelRegistry",
+    "RetrievalModelRegistry",
     "ModelPackageSpec",
     "_BaseModelRegistry",
-    "_LazyArchMapping",
-    "_ModelRegistry",
-    "get_registry",
+    "make_registry",
+    "make_retrieval_registry",
 ]

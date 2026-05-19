@@ -17,7 +17,27 @@ from dataclasses import dataclass, field, replace
 
 @dataclass(frozen=True)
 class ModelPackageSpec:
-    """Registry metadata for a model package and its optional convention modules."""
+    """Registry entry for a model package.
+
+    Args:
+        package: Python package that owns the model implementation, usually
+            ``nemo_automodel.components.models.<model_name>``.
+        class_name: Model class to lazy-load from ``module_path`` for architectures
+            declared by this spec. Config-only specs leave this unset.
+        model_module: Module inside ``package`` that contains ``class_name``. Defaults
+            to ``model``, producing ``<package>.model``.
+        config_module: Module inside ``package`` that contains a custom HF config
+            class. Used only for model types that need on-demand AutoConfig registration.
+        config_class_name: Explicit config class name to register from
+            ``config_module_path``. If unset, the registry can discover a local
+            ``PretrainedConfig`` subclass by ``model_type``.
+        tags: Registry metadata flags for the model class. For example,
+            ``retrieval`` marks bidirectional encoder architectures.
+        architectures: HF ``config.architectures`` names that should resolve to this
+            model class. These are expanded into the architecture-to-spec lookup.
+        model_types: HF ``config.model_type`` names associated with this package,
+            primarily for resolving and registering custom config classes.
+    """
 
     package: str
     class_name: str | None = None
@@ -27,17 +47,11 @@ class ModelPackageSpec:
     tags: frozenset[str] = field(default_factory=frozenset)
     architectures: tuple[str, ...] = ()
     model_types: tuple[str, ...] = ()
-    optional_modules: frozenset[str] = field(default_factory=frozenset)
-    global_patches: bool = False
-    pre_config_patches: bool = False
-    post_shard_patches: bool = False
-    tokenizer_registrations: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tags", frozenset(self.tags))
         object.__setattr__(self, "architectures", tuple(self.architectures))
         object.__setattr__(self, "model_types", tuple(self.model_types))
-        object.__setattr__(self, "optional_modules", frozenset(self.optional_modules))
 
     @classmethod
     def from_module_path(
@@ -48,13 +62,8 @@ class ModelPackageSpec:
         config_module: str | None = None,
         config_class_name: str | None = None,
         tags: set[str] | frozenset[str] | tuple[str, ...] = (),
-        architectures: tuple[str, ...] = (),
+        architectures: list[str] | tuple[str, ...] = (),
         model_types: tuple[str, ...] = (),
-        optional_modules: set[str] | frozenset[str] | tuple[str, ...] = (),
-        global_patches: bool = False,
-        pre_config_patches: bool = False,
-        post_shard_patches: bool = False,
-        tokenizer_registrations: bool = False,
     ) -> "ModelPackageSpec":
         """Create a spec from a fully qualified model module path."""
         package, sep, model_module = module_path.rpartition(".")
@@ -70,11 +79,28 @@ class ModelPackageSpec:
             tags=frozenset(tags),
             architectures=architectures,
             model_types=model_types,
-            optional_modules=frozenset(optional_modules),
-            global_patches=global_patches,
-            pre_config_patches=pre_config_patches,
-            post_shard_patches=post_shard_patches,
-            tokenizer_registrations=tokenizer_registrations,
+        )
+
+    @classmethod
+    def from_model_class(
+        cls,
+        model_cls: type,
+        *,
+        config_module: str | None = None,
+        config_class_name: str | None = None,
+        tags: set[str] | frozenset[str] | tuple[str, ...] = (),
+        architectures: list[str] | tuple[str, ...] = (),
+        model_types: tuple[str, ...] = (),
+    ) -> "ModelPackageSpec":
+        """Create a spec from a model class object."""
+        return cls.from_module_path(
+            model_cls.__module__,
+            model_cls.__name__,
+            config_module=config_module,
+            config_class_name=config_class_name,
+            tags=tags,
+            architectures=architectures,
+            model_types=model_types,
         )
 
     @property
@@ -83,12 +109,6 @@ class ModelPackageSpec:
         if not self.package:
             return self.model_module
         return f"{self.package}.{self.model_module}"
-
-    def optional_module_path(self, module_name: str) -> str:
-        """Return the import path for a convention module such as ``patches``."""
-        if not self.package:
-            return f"{self.model_module}.{module_name}"
-        return f"{self.package}.{module_name}"
 
     @property
     def config_module_path(self) -> str | None:
