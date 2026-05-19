@@ -30,7 +30,7 @@
 | GPT-NeoX 20B | [`EleutherAI/gpt-neox-20b`](https://huggingface.co/EleutherAI/gpt-neox-20b) |
 | Pythia 12B | [`EleutherAI/pythia-12b`](https://huggingface.co/EleutherAI/pythia-12b) |
 | OpenAssistant SFT Pythia 12B | [`OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5`](https://huggingface.co/OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5) |
-| Dolly v2 12B | [`databricks/dolly-v2-12b`](https://huggingface.co/databricks/dolly-v2-12b) |
+| Dolly v2 12B | [`databrickslabs/dolly`](https://github.com/databrickslabs/dolly) |
 | StableLM tuned alpha 7B | [`stabilityai/stablelm-tuned-alpha-7b`](https://huggingface.co/stabilityai/stablelm-tuned-alpha-7b) |
 
 

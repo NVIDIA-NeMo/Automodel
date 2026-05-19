@@ -235,6 +235,18 @@ class TestFromHF:
 
         assert not any("scale_inv" in k for k in out)
 
+    def test_keeps_top_level_lm_head_key_with_model_prefixed_checkpoint(self, adapter):
+        lm_head = torch.randn(8, 8)
+        hf_state = {
+            "model.language_model.layers.0.self_attn.q_proj.weight": torch.randn(8, 8),
+            "lm_head.weight": lm_head,
+        }
+
+        out = adapter.from_hf(hf_state)
+
+        assert out["lm_head.weight"] is lm_head
+        assert "model.lm_head.weight" not in out
+
 
 class TestConvertSingleTensorToHf:
     def test_expert_tensor_passthrough(self, adapter):

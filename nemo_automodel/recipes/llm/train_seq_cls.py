@@ -460,6 +460,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
 
 def main(config_path: str | None = None):
+    """Run the sequence-classification fine-tuning recipe."""
     if config_path is None:
         config_path = (
             pathlib.Path(__file__).parent.resolve()
