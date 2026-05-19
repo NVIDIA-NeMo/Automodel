@@ -1,0 +1,97 @@
+---
+title: "DeepSeek V4 Flash"
+description: ""
+position: 6
+---
+## Introduction
+
+[deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is the latest fine-grained Mixture-of-Experts language model from DeepSeek. It uses a 43-layer all-MoE backbone (no dense MLP layers) with 256 routed experts plus one shared expert per block and top-6 routing. The architecture introduces a hybrid per-layer attention zoo — Sliding-Window Attention (SWA), Compressed Sparse Attention (CSA, Compressor + Indexer), and Hierarchical Compressed Attention (HCA, Compressor only) — selectable per layer through `compress_ratios`. The first `num_hash_layers` blocks use a hash-clustering gate (`DeepseekV4HashGate`) for token-to-expert routing, and every block maintains `hc_mult=4` Hyper-Connection streams mixed via a learned col-norm-first Sinkhorn router.
+
+This guide walks you through fine-tuning DeepSeek V4 Flash on HellaSwag using NVIDIA NeMo Automodel. You will learn how to configure the recipe, launch training, and inspect the results.
+
+To set up your environment to run NeMo Automodel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+
+## Data
+
+### HellaSwag
+
+We use [HellaSwag](https://huggingface.co/datasets/Rowan/hellaswag), a commonsense natural-language-inference dataset consisting of context + four candidate continuations. The version used here is the standard `rowan/hellaswag` HuggingFace split, formatted for next-token-prediction fine-tuning.
+
+- **Train / validation splits** taken directly from the HuggingFace dataset.
+- **Tokenizer**: shared with the base model (`AutoTokenizer.from_pretrained` on the DeepSeek V4 Flash checkpoint).
+- **Padding**: `pad_seq_len_divisible=64` via the default collater.
+
+For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/hellaswag.py).
+
+## Architecture Notes
+
+DeepSeek V4 Flash differs from V3 / V3.2 in several load-bearing ways. The state-dict adapter and pipeline-parallel forward in NeMo Automodel handle each of these transparently:
+
+- **Attention**: GQA with a single KV head broadcast to all 64 attention heads, Q-LoRA (`q_lora_rank=1024`), and grouped O-LoRA (`o_lora_rank=1024`, `o_groups=8`) — not MLA. Per-head non-learnable rsqrt on Q after `wq_b` matches the inference reference.
+- **Hybrid attention via `compress_ratios`**:
+  - `compress_ratio=0` → pure SWA with a learned per-head attention sink.
+  - `compress_ratio=4` → CSA: Compressor (overlap mode, pools `2 * ratio` raw tokens per compressed token) plus Indexer (selects top-k compressed positions per query). An explicit additive `[B, 1, S, P_total]` mask enforces per-query causal correctness.
+  - `compress_ratio=128` → HCA: Compressor only (non-overlap pooling), deterministic `p < (q + 1) // ratio` causal mask.
+- **Dual RoPE bases**: `theta=10000` for `compress_ratio==0` layers; `theta=160000` (with YaRN scaling) for `compress_ratio>0` layers, applied to both the main attention Q/KV and the Compressor sub-module on those layers. RoPE is encoded as INTERLEAVED pairs (`view_as_complex` style) to match the released checkpoint.
+- **Hash-routing first layers**: the first `num_hash_layers` (default 3) blocks use a `DeepseekV4HashGate` with a `tid2eid` lookup table. `input_ids` is threaded through the model and the V4-aware pipeline forward; under pipeline parallelism, hash layers live on stage 0 where `input_ids` is available.
+- **Hyper-Connections (HC)**: every block maintains `hc_mult=4` streams of the hidden state. The mixer follows the released `hc_split_sinkhorn` formulas: `pre = sigmoid + eps`, `post = 2 * sigmoid` (no `+eps`), `comb = softmax(dim=-1) + eps` followed by a col-norm-first Sinkhorn (`iters - 1` alternating row/col passes), producing a doubly-stochastic mixing matrix per block.
+- **MoE routing**: `sqrtsoftplus` scoring with `noaux_tc` topk method and clamped SwiGLU on routed experts (`swiglu_limit=10.0`).
+- **Optional MTP layers** via `num_nextn_predict_layers`.
+
+### Checkpoint format
+
+The released DSV4-Flash safetensors mix several quantization formats. The state-dict adapter handles all of them transparently:
+
+- **Routed experts**: FP4 `e2m1fn` packed two values per int8 byte, with per-row 32-col FP8 `e8m0fnu` scales — unpacked on load, re-emitted in matching packed placeholders on `to_hf` so DCP shape/dtype validation lines up with the on-disk layout.
+- **Shared experts + non-expert weights**: standard FP8 `e4m3fn` 128×128 block scales.
+- **Hash layers' gate has no bias on disk**: the adapter reads `num_hash_layers` from the checkpoint's `config.json` and drops the corresponding bias keys before DCP load.
+- **Indexer / Compressor key flattening**: on disk the Indexer sits as a sibling of the Compressor with its own nested compressor (`indexer.compressor.{ape,norm,wgate,wkv}` + `indexer.{wq_b,weights_proj}`); the adapter renames these to land at the flat `compressor.indexer.*` layout.
+
+A new in-tree `HuggingFaceStorageReader` recognizes `F8_E8M0` and `F8_E5M2` dtypes (the upstream reader silently dropped them), restoring DCP metadata on every rank for these checkpoints.
+
+## Launch Training
+
+A ready-to-use recipe ships at [`examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml). The yaml header documents how to scale `num_hidden_layers` and `ep_size` for the full 43-layer multi-node run.
+
+NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+
+### Standalone Slurm Script
+
+Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide. Then submit the job:
+
+```bash
+export TRANSFORMERS_OFFLINE=1
+export HF_HOME=your/path/to/hf_cache
+export HF_DATASETS_OFFLINE=1
+export WANDB_API_KEY=your_wandb_key
+
+srun --output=output.out \
+     --error=output.err \
+     --container-image /your/path/to/automodel.image.sqsh --no-container-mount-home bash -c "
+  CUDA_DEVICE_MAX_CONNECTIONS=1 automodel \
+  examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml \
+  --nproc-per-node=8 \
+  --model.config.pretrained_model_name_or_path=/your/local/dsv4-flash \
+  --model.config.name_or_path=/your/local/dsv4-flash "
+```
+
+**Before you start**:
+- Hugging Face applies rate limits on downloads. We recommend cloning the model repository to your local filesystem beforehand.
+- Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
+- To enable Weights & Biases logging, set your `WANDB_API_KEY` and configure the `wandb` section in the YAML file.
+- For the full 43-layer schedule, increase `ep_size` (and add `pp_size`) per the cluster you are running on; see the yaml header for guidance.
+
+## Layer-Parity Validation
+
+The bringup was validated against the official DeepSeek inference reference (`dsv4flash/inference/model.py`) by per-tensor dump bisection. On the 4-layer parity harness (`compress_ratios=[0, 0, 4, 128]`, `num_hash_layers=2`, PP=1, EP=8):
+
+- **Final-logits cosine similarity: 0.998 vs reference, top-1 token matches.**
+- Every block cosine similarity ≥ 0.987.
+
+## Training Results
+
+The training loss curve below is from a 43-layer full-finetune run on HellaSwag with the full attention zoo (SWA + CSA + HCA) live.
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek V4 Flash Training Loss Curve" width="600" />
+</p>
