@@ -21,7 +21,7 @@ weight download), then asserts every resolved architecture is mentioned in at
 least one ``docs/model-coverage/*.md`` file.
 
 This complements ``test_doc_coverage.py`` which only covers archs registered
-in ``MODEL_ARCH_MAPPING``. Many recipes fine-tune HF-native archs (e.g.,
+in ``MODEL_PACKAGE_SPECS``. Many recipes fine-tune HF-native archs (e.g.,
 ``Olmo2ForCausalLM``) that never get added to the registry, and still need
 documentation.
 

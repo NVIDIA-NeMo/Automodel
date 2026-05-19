@@ -317,10 +317,10 @@ def test_registry_registration():
 
     arch_name = "LLaVAOneVision1_5_ForConditionalGeneration"
 
-    assert arch_name in ModelRegistry.model_arch_name_to_cls, f"{arch_name} not found in MODEL_ARCH_MAPPING"
+    assert arch_name in ModelRegistry.model_arch_name_to_cls, f"{arch_name} not found in MODEL_PACKAGE_SPECS"
 
     model_cls = ModelRegistry.model_arch_name_to_cls[arch_name]
-    logger.info("  ✓ Model registered in MODEL_ARCH_MAPPING")
+    logger.info("  ✓ Model registered in MODEL_PACKAGE_SPECS")
     logger.info(f"    - Architecture name: {arch_name}")
     logger.info(f"    - Model class: {model_cls.__name__}")
     logger.info(f"    - Module: {model_cls.__module__}")

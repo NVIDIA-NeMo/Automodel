@@ -25,7 +25,7 @@ from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassificati
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
-from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.registry import RetrievalModelRegistry
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
@@ -57,11 +57,11 @@ def _get_supported_backbone_class(model_type: str, task: str) -> type[nn.Module]
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
 
-    if arch_name not in ModelRegistry.model_arch_name_to_cls:
-        raise ValueError(f"Model class '{arch_name}' not found in ModelRegistry.")
+    if not RetrievalModelRegistry.has_custom_model(arch_name):
+        raise ValueError(f"Model class '{arch_name}' not found in RetrievalModelRegistry.")
 
     logger.info(f"Using {arch_name} from registry")
-    return ModelRegistry.model_arch_name_to_cls[arch_name]
+    return RetrievalModelRegistry.get_model_cls_from_model_arch(arch_name)
 
 
 def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn.Module:
@@ -179,7 +179,7 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
     Sets ``config.architectures`` unconditionally.  For custom retrieval
-    architectures registered in :class:`ModelRegistry`, also writes
+    architectures registered in :class:`RetrievalModelRegistry`, also writes
     ``config.auto_map`` so that the saved checkpoint can be reloaded via
     HuggingFace Auto classes.  Standard HF models already have their own
     auto-resolution and do not need ``auto_map`` entries.
@@ -193,7 +193,7 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
 
     # Only set auto_map for custom retrieval architectures.
     # Standard HF models don't need auto_map pointing to a local model.py.
-    if ModelRegistry.has_retrieval_model(encoder_class_name):
+    if RetrievalModelRegistry.get_model_package_spec(encoder_class_name) is not None:
         config_class_name = config.__class__.__name__
         config_module = config.__class__.__module__.rsplit(".", 1)[-1]
         model_module = model.__class__.__module__.rsplit(".", 1)[-1]
@@ -226,8 +226,8 @@ def build_encoder_backbone(
 
     Without ``extract_submodel``, model types listed in
     :data:`SUPPORTED_BACKBONES` resolve to custom bidirectional classes from
-    :class:`ModelRegistry`; all other model types fall back to HuggingFace Auto
-    classes.
+    :class:`RetrievalModelRegistry`; all other model types fall back to
+    HuggingFace Auto classes.
 
     Args:
         model_name_or_path: Path or HuggingFace Hub identifier.
@@ -247,7 +247,7 @@ def build_encoder_backbone(
 
     Raises:
         ValueError: If the task is unsupported for a known model type, or the
-            architecture class is missing from :class:`ModelRegistry`.
+            architecture class is missing from :class:`RetrievalModelRegistry`.
     """
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
@@ -320,7 +320,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     model.model.save_pretrained(save_directory)
 
 
-# HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
+# HuggingFace model_type -> task -> bidirectional architecture class name in RetrievalModelRegistry
 _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
@@ -340,7 +340,7 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
-    if ModelRegistry.has_retrieval_model(model.__class__.__name__):
+    if RetrievalModelRegistry.get_model_package_spec(model.__class__.__name__) is not None:
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")

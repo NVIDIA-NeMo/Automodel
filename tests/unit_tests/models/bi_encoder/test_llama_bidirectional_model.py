@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 
-from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.registry import RetrievalModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
     CrossEncoderModel,
@@ -139,7 +139,6 @@ def test_bidirectional_attention_is_symmetric():
     )
 
 
-
 # --- Fakes for classification and encoder tests ---
 class FakeOutputs:
     def __init__(self, last_hidden_state=None, hidden_states=None):
@@ -234,9 +233,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             )
 
     lm = NoTTIDLm(hidden=8)
-    model = BiEncoderModel(
-        model=lm, pooling="avg", l2_normalize=True
-    )
+    model = BiEncoderModel(model=lm, pooling="avg", l2_normalize=True)
     # encode removes token_type_ids and normalizes
     q = {
         "input_ids": torch.ones(2, 3, dtype=torch.long),
@@ -278,9 +275,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = BiEncoderModel(
-        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
-    )
+    model_no_last = BiEncoderModel(model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True)
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
     )
@@ -294,9 +289,13 @@ def test_encoder_build_and_save(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    # Patch the retrieval registry to return our fake model
+    RetrievalModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(
+        RetrievalModelRegistry,
+        "model_arch_name_to_cls",
+        RetrievalModelRegistry.model_arch_name_to_cls,
+    )
 
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
@@ -380,9 +379,13 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    # Patch the retrieval registry to return our fake model
+    RetrievalModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(
+        RetrievalModelRegistry,
+        "model_arch_name_to_cls",
+        RetrievalModelRegistry.model_arch_name_to_cls,
+    )
 
     # Create a model directory whose path has no 'llama' substring
     model_dir = tmp_path / "scratch" / "job" / "model"
@@ -415,9 +418,13 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls(hidden=16)
 
-    # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    # Patch the retrieval registry to return our fake model
+    RetrievalModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(
+        RetrievalModelRegistry,
+        "model_arch_name_to_cls",
+        RetrievalModelRegistry.model_arch_name_to_cls,
+    )
 
     # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
     import nemo_automodel._transformers.retrieval as encoder_module
@@ -535,10 +542,14 @@ def test_init_encoder_common_name_or_path_for_generic():
 
     # Use a class name that is NOT a retrieval arch
     FakeModel.__name__ = "Qwen3Model"
-    FakeModel = type("Qwen3Model", (nn.Module,), {
-        "__init__": FakeModel.__init__,
-        "config": property(lambda self: self._config),
-    })
+    FakeModel = type(
+        "Qwen3Model",
+        (nn.Module,),
+        {
+            "__init__": FakeModel.__init__,
+            "config": property(lambda self: self._config),
+        },
+    )
     fake = object.__new__(FakeModel)
     nn.Module.__init__(fake)
     fake._config = FakeCfg()

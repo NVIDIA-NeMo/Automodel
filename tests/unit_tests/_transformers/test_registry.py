@@ -13,16 +13,23 @@
 # limitations under the License.
 
 import types
+from unittest.mock import patch
 
 import pytest
 
+from nemo_automodel._transformers.registry.base import _BaseModelRegistry
 
-def _new_registry_instance(registry_module):
+
+def _new_registry_instance(_registry_module=None):
     """Create a fresh registry with an empty auto_map for testing."""
-    from nemo_automodel._transformers.registry import _LazyArchMapping
+    return _BaseModelRegistry(model_specs=())
 
-    mapping = _LazyArchMapping(auto_map={})
-    return registry_module._ModelRegistry(model_arch_name_to_cls=mapping)
+
+def _model_arch_lookup(model_arch_mapping):
+    """Return the architecture-keyed lookup derived from registry package specs."""
+    from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+
+    return _normalize_model_arch_mapping(model_arch_mapping)
 
 
 def test_register_single_class():
@@ -104,38 +111,141 @@ def test_supported_models_and_getter():
     assert inst.get_model_cls_from_model_arch("A") is A
 
 
-def test_get_registry_is_cached():
-    from nemo_automodel._transformers import registry as reg
+def test_make_registry_is_cached():
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS, make_registry
 
-    reg.get_registry.cache_clear()
-    r1 = reg.get_registry()
-    r2 = reg.get_registry()
+    make_registry.cache_clear()
+    r1 = make_registry(MODEL_PACKAGE_SPECS)
+    r2 = make_registry(MODEL_PACKAGE_SPECS)
     assert r1 is r2
 
 
-def test_lazy_arch_mapping_auto_map():
+def test_make_registry_caches_by_model_specs():
+    from nemo_automodel._transformers.registry.model_registry import RETRIEVAL_MODEL_PACKAGE_SPECS, make_registry
+
+    make_registry.cache_clear()
+    r1 = make_registry(RETRIEVAL_MODEL_PACKAGE_SPECS)
+    r2 = make_registry(RETRIEVAL_MODEL_PACKAGE_SPECS)
+    assert r1 is r2
+
+
+def test_registry_reexports_public_singletons():
+    """The registry package root exposes only the runtime registry singletons."""
+    from nemo_automodel._transformers import registry as reg
+    from nemo_automodel._transformers.registry.model_registry import (
+        ModelRegistry,
+        RetrievalModelRegistry,
+    )
+
+    assert reg.ModelRegistry is ModelRegistry
+    assert reg.RetrievalModelRegistry is RetrievalModelRegistry
+
+
+def test_registry_mapping_loads_model_class_on_demand():
     """Static auto_map entries are lazily loaded on first access."""
-    from nemo_automodel._transformers.registry import _LazyArchMapping
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
 
     class FakeClass:
         pass
 
     fake_module = types.SimpleNamespace(FakeClass=FakeClass)
-    mapping = _LazyArchMapping({"FakeArch": ("fake.module", "FakeClass")})
+    spec = ModelPackageSpec(package="fake", model_module="module", class_name="FakeClass", architectures=("FakeArch",))
+    inst = _BaseModelRegistry(model_specs=(spec,))
 
-    mapping._modules["fake.module"] = fake_module
-
-    assert "FakeArch" in mapping
-    assert mapping["FakeArch"] is FakeClass
-    assert "FakeArch" in mapping._loaded
+    with patch("nemo_automodel._transformers.registry.base.importlib.import_module", return_value=fake_module):
+        assert "FakeArch" in inst.model_arch_name_to_cls
+    assert inst.model_arch_name_to_cls["FakeArch"] is FakeClass
+    assert "FakeArch" in inst._loaded_model_classes
 
     with pytest.raises(KeyError):
-        mapping["NonExistent"]
+        inst.model_arch_name_to_cls["NonExistent"]
 
 
-def test_lazy_arch_mapping_extra_overrides_auto_map():
+def test_registry_accepts_model_package_spec_entries():
+    """Static auto_map entries may be declared as ModelPackageSpec metadata."""
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    class FakeClass:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeClass=FakeClass)
+    spec = ModelPackageSpec(
+        package="fake.package",
+        model_module="model",
+        class_name="FakeClass",
+        architectures=["FakeArch"],
+        model_types=("fake",),
+    )
+    inst = _BaseModelRegistry(model_specs={"FakeArch": spec})
+
+    with patch("nemo_automodel._transformers.registry.base.importlib.import_module", return_value=fake_module):
+        assert inst.model_arch_name_to_cls["FakeArch"] is FakeClass
+    assert inst.model_arch_name_to_cls.keys() == {"FakeArch"}
+
+
+def test_model_package_spec_from_model_class():
+    """ModelPackageSpec can be derived directly from a model class object."""
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    class FakeClass:
+        pass
+
+    FakeClass.__module__ = "fake.package.model"
+
+    spec = ModelPackageSpec.from_model_class(FakeClass, architectures=["FakeArch"])
+
+    assert spec.module_path == "fake.package.model"
+    assert spec.class_name == "FakeClass"
+    assert spec.architectures == ("FakeArch",)
+
+
+def test_registry_derives_keys_from_spec_architectures():
+    """Tuple-based auto_map entries derive lookup keys from spec.architectures."""
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    spec = ModelPackageSpec(
+        package="fake.package",
+        class_name="FakeClass",
+        architectures=("FakeArch", "FakeAlias"),
+    )
+    inst = _BaseModelRegistry(model_specs=(spec,))
+
+    assert inst.model_arch_name_to_cls.keys() == {"FakeArch", "FakeAlias"}
+
+
+def test_base_registry_owns_architecture_metadata():
+    """Package metadata indexes live on the registry, not on the lazy class loader."""
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    spec = ModelPackageSpec(
+        package="fake.package",
+        class_name="FakeClass",
+        architectures=("FakeArch", "FakeAlias"),
+        model_types=("fake",),
+    )
+    inst = _BaseModelRegistry(model_specs=(spec,))
+
+    assert inst.get_model_package_spec("FakeArch") is spec
+    assert inst.get_model_package_spec("FakeAlias") is spec
+    assert inst.get_model_package_specs_for_model_type("fake") == (spec,)
+
+
+def test_registry_rejects_duplicate_architectures():
+    """Duplicate architecture names across package specs fail during registry construction."""
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    specs = (
+        ModelPackageSpec(package="fake.package_a", class_name="FakeClassA", architectures=("FakeArch",)),
+        ModelPackageSpec(package="fake.package_b", class_name="FakeClassB", architectures=("FakeArch",)),
+    )
+
+    with pytest.raises(ValueError, match="Duplicated model architecture entry for 'FakeArch'"):
+        _BaseModelRegistry(model_specs=specs)
+
+
+def test_registry_dynamic_entry_overrides_static_entry():
     """Dynamically registered entries take precedence over static entries."""
-    from nemo_automodel._transformers.registry import _LazyArchMapping
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
 
     class StaticClass:
         pass
@@ -144,32 +254,178 @@ def test_lazy_arch_mapping_extra_overrides_auto_map():
         pass
 
     fake_module = types.SimpleNamespace(StaticClass=StaticClass)
-    mapping = _LazyArchMapping({"MyArch": ("fake.module", "StaticClass")})
-    mapping._modules["fake.module"] = fake_module
+    spec = ModelPackageSpec(package="fake", model_module="module", class_name="StaticClass", architectures=("MyArch",))
+    inst = _BaseModelRegistry(model_specs=(spec,))
 
-    assert mapping["MyArch"] is StaticClass
+    with patch("nemo_automodel._transformers.registry.base.importlib.import_module", return_value=fake_module):
+        assert inst.model_arch_name_to_cls["MyArch"] is StaticClass
 
-    mapping["MyArch"] = DynamicClass
-    assert mapping["MyArch"] is DynamicClass
+    inst.model_arch_name_to_cls["MyArch"] = DynamicClass
+    assert inst.model_arch_name_to_cls["MyArch"] is DynamicClass
+    assert inst.get_model_package_spec("MyArch").class_name == "DynamicClass"
 
 
-def test_lazy_arch_mapping_unavailable_model():
+def test_registry_unavailable_model():
     """Auto_map entries whose imports fail are removed and excluded from containment."""
-    from nemo_automodel._transformers.registry import _LazyArchMapping
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
 
-    mapping = _LazyArchMapping({"BadArch": ("nonexistent.module.path", "BadClass")})
+    spec = ModelPackageSpec(
+        package="nonexistent.module",
+        model_module="path",
+        class_name="BadClass",
+        architectures=("BadArch",),
+    )
+    inst = _BaseModelRegistry(model_specs=(spec,))
 
-    assert "BadArch" not in mapping
-    assert "BadArch" not in mapping._auto_map
+    assert "BadArch" not in inst.model_arch_name_to_cls
+    assert "BadArch" not in inst.model_arch_name_to_cls.keys()
+
+
+def test_registry_discards_failed_import_from_metadata_index():
+    """Failed model imports remove the architecture from the registry-owned metadata index."""
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    spec = ModelPackageSpec(
+        package="nonexistent.module",
+        model_module="path",
+        class_name="BadClass",
+        architectures=("BadArch",),
+    )
+    inst = _BaseModelRegistry(model_specs=(spec,))
+
+    assert "BadArch" not in inst.model_arch_name_to_cls
+    assert inst.get_model_package_spec("BadArch") is None
+    assert "BadArch" not in inst.supported_models
+
+    class GoodClass:
+        pass
+
+    inst.register("GoodArch", GoodClass)
+    assert "BadArch" not in inst.model_arch_name_to_cls.keys()
+
+
+def test_direct_lazy_registration_updates_registry_metadata():
+    """Direct mapping assignment still informs the registry about dynamic model metadata."""
+    from nemo_automodel._transformers import registry as reg
+
+    inst = _new_registry_instance(reg)
+
+    class DirectClass:
+        pass
+
+    DirectClass.__module__ = "fake.direct.model"
+    inst.model_arch_name_to_cls["DirectArch"] = DirectClass
+
+    spec = inst.get_model_package_spec("DirectArch")
+    assert spec.module_path == "fake.direct.model"
+    assert spec.class_name == "DirectClass"
+    assert inst.model_arch_name_to_cls["DirectArch"] is DirectClass
 
 
 def test_default_registry_has_static_entries():
-    """The default registry is populated from MODEL_ARCH_MAPPING."""
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, _ModelRegistry
+    """The default registry is populated from MODEL_PACKAGE_SPECS."""
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS, make_registry
 
-    inst = _ModelRegistry()
-    for arch_name in MODEL_ARCH_MAPPING:
-        assert arch_name in inst.model_arch_name_to_cls.keys()
+    inst = make_registry(MODEL_PACKAGE_SPECS)
+    for spec in MODEL_PACKAGE_SPECS:
+        for arch_name in spec.architectures:
+            assert arch_name in inst.model_arch_name_to_cls.keys()
+
+
+def test_retrieval_registry_has_separate_static_entries():
+    """Retrieval architectures live in the retrieval registry, not the default registry."""
+    from nemo_automodel._transformers.registry.model_registry import (
+        MODEL_PACKAGE_SPECS,
+        RETRIEVAL_MODEL_PACKAGE_SPECS,
+    )
+
+    retrieval_arch = "LlamaBidirectionalModel"
+    default_registry = _BaseModelRegistry(model_specs=MODEL_PACKAGE_SPECS)
+    retrieval_registry = _BaseModelRegistry(model_specs=RETRIEVAL_MODEL_PACKAGE_SPECS)
+
+    assert retrieval_arch not in _model_arch_lookup(MODEL_PACKAGE_SPECS)
+    assert retrieval_arch in _model_arch_lookup(RETRIEVAL_MODEL_PACKAGE_SPECS)
+    assert retrieval_arch not in default_registry.model_arch_name_to_cls.keys()
+    assert retrieval_arch in retrieval_registry.model_arch_name_to_cls.keys()
+
+
+def test_registry_discovers_config_class_from_config_module():
+    """Config classes are imported from declared convention modules on demand."""
+    from transformers import PretrainedConfig
+
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    class FakeConfig(PretrainedConfig):
+        model_type = "fake_model"
+
+    FakeConfig.__module__ = "fake.package.config"
+    fake_module = types.SimpleNamespace(__name__="fake.package.config", FakeConfig=FakeConfig)
+    spec = ModelPackageSpec(package="fake.package", model_types=("fake_model",), config_module="config")
+    inst = _BaseModelRegistry(model_specs=(spec,))
+
+    with (
+        patch("transformers.AutoConfig.register") as mock_register,
+        patch("nemo_automodel._transformers.registry.base.importlib.import_module", return_value=fake_module),
+    ):
+        assert inst.ensure_config_registered("fake_model") is True
+
+    mock_register.assert_called_once_with("fake_model", FakeConfig)
+
+
+def test_registry_registers_explicit_config_alias():
+    """Explicit config metadata supports aliases whose key differs from class.model_type."""
+    from transformers import PretrainedConfig
+
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    class FakeConfig(PretrainedConfig):
+        model_type = "canonical_model"
+
+    fake_module = types.SimpleNamespace(__name__="fake.package.model", FakeConfig=FakeConfig)
+    spec = ModelPackageSpec(
+        package="fake.package",
+        model_types=("canonical_model", "alias_model"),
+        config_module="model",
+        config_class_name="FakeConfig",
+    )
+    inst = _BaseModelRegistry(model_specs=(spec,))
+
+    with (
+        patch("transformers.AutoConfig.register") as mock_register,
+        patch("nemo_automodel._transformers.registry.base.importlib.import_module", return_value=fake_module),
+    ):
+        assert inst.ensure_config_registered("alias_model") is True
+
+    mock_register.assert_called_once_with("alias_model", FakeConfig)
+
+
+def test_registry_registers_config_alias_when_auto_config_rejects_mismatch():
+    """HF validates ``config.model_type``; aliases fall back to CONFIG_MAPPING directly."""
+    from transformers import PretrainedConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
+
+    class FakeConfig(PretrainedConfig):
+        model_type = "canonical_model"
+
+    fake_module = types.SimpleNamespace(__name__="fake.package.model", FakeConfig=FakeConfig)
+    spec = ModelPackageSpec(
+        package="fake.package",
+        model_types=("alias_model_with_mismatch",),
+        config_module="model",
+        config_class_name="FakeConfig",
+    )
+    inst = _BaseModelRegistry(model_specs=(spec,))
+
+    with (
+        patch("transformers.AutoConfig.register", side_effect=ValueError("model_type mismatch")),
+        patch.object(CONFIG_MAPPING, "register") as mock_mapping_register,
+        patch("nemo_automodel._transformers.registry.base.importlib.import_module", return_value=fake_module),
+    ):
+        assert inst.ensure_config_registered("alias_model_with_mismatch") is True
+
+    mock_mapping_register.assert_called_once_with("alias_model_with_mismatch", FakeConfig)
 
 
 def test_resolve_custom_model_cls_found():
@@ -242,87 +498,85 @@ def test_resolve_custom_model_cls_passes_config_to_supports():
     assert inst.resolve_custom_model_cls("ConfigAwareModel", bad) is None
 
 
-def test_custom_config_registrations_in_config_mapping():
-    """Models in _CUSTOM_CONFIG_REGISTRATIONS must be registered in CONFIG_MAPPING after import.
+def test_config_metadata_is_metadata_only_until_requested():
+    """Config metadata should not require eager registration at registry import time."""
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-    This ensures that AutoConfig.from_pretrained can resolve custom model types
-    (e.g. kimi_k25, kimi_vl) from local checkpoints without trust_remote_code=True.
-    """
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
-
-    missing = []
-    for model_type in _CUSTOM_CONFIG_REGISTRATIONS:
-        if model_type not in CONFIG_MAPPING:
-            missing.append(model_type)
-
-    assert not missing, (
-        f"Model type(s) {missing} are in _CUSTOM_CONFIG_REGISTRATIONS but not in "
-        f"CONFIG_MAPPING. The _register_custom_configs() call at module level may "
-        f"have failed for these entries."
-    )
+    for spec in MODEL_PACKAGE_SPECS:
+        if spec.config_module_path is None:
+            continue
+        assert spec.config_module_path
+        assert spec.config_class_name
 
 
-def test_kimi_k25_arch_alias_in_model_arch_mapping():
+def test_kimi_k25_arch_alias_in_model_package_specs():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-    assert "KimiK25ForConditionalGeneration" in MODEL_ARCH_MAPPING, (
-        "KimiK25ForConditionalGeneration missing from MODEL_ARCH_MAPPING. "
+    mapping = _model_arch_lookup(MODEL_PACKAGE_SPECS)
+    assert "KimiK25ForConditionalGeneration" in mapping, (
+        "KimiK25ForConditionalGeneration missing from MODEL_PACKAGE_SPECS. "
         "Kimi-K2.5 checkpoints use this architecture name and need it mapped "
         "to KimiK25VLForConditionalGeneration."
     )
-    module_path, cls_name = MODEL_ARCH_MAPPING["KimiK25ForConditionalGeneration"]
-    assert cls_name == "KimiK25VLForConditionalGeneration"
+    spec = mapping["KimiK25ForConditionalGeneration"]
+    assert spec.class_name == "KimiK25VLForConditionalGeneration"
 
 
-def test_deepseek_v4_registered_in_arch_mapping():
-    """DeepseekV4ForCausalLM must be registered in MODEL_ARCH_MAPPING."""
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+def test_deepseek_v4_registered_in_model_package_specs():
+    """DeepseekV4ForCausalLM must be registered in MODEL_PACKAGE_SPECS."""
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-    assert "DeepseekV4ForCausalLM" in MODEL_ARCH_MAPPING, (
-        "DeepseekV4ForCausalLM missing from MODEL_ARCH_MAPPING. "
+    mapping = _model_arch_lookup(MODEL_PACKAGE_SPECS)
+    assert "DeepseekV4ForCausalLM" in mapping, (
+        "DeepseekV4ForCausalLM missing from MODEL_PACKAGE_SPECS. "
         "DSV4 checkpoints declare this architecture and need it routed to the "
         "in-tree model implementation."
     )
-    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"]
-    assert module_path == "nemo_automodel.components.models.deepseek_v4.model"
-    assert cls_name == "DeepseekV4ForCausalLM"
+    spec = mapping["DeepseekV4ForCausalLM"]
+    assert spec.module_path == "nemo_automodel.components.models.deepseek_v4.model"
+    assert spec.class_name == "DeepseekV4ForCausalLM"
 
 
-def test_deepseek_v4_in_custom_config_registrations():
-    """deepseek_v4 model_type must be registered in _CUSTOM_CONFIG_REGISTRATIONS."""
-    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+def test_deepseek_v4_in_model_package_specs():
+    """deepseek_v4 model_type must be declared in MODEL_PACKAGE_SPECS."""
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-    assert "deepseek_v4" in _CUSTOM_CONFIG_REGISTRATIONS, (
-        "deepseek_v4 must be in _CUSTOM_CONFIG_REGISTRATIONS so AutoConfig.from_pretrained "
-        "can resolve DSV4 configs without trust_remote_code=True."
+    specs_by_model_type = {model_type: spec for spec in MODEL_PACKAGE_SPECS for model_type in spec.model_types}
+    assert "deepseek_v4" in specs_by_model_type, (
+        "deepseek_v4 must be in MODEL_PACKAGE_SPECS so ModelRegistry can register "
+        "DSV4 configs on demand before AutoConfig.from_pretrained runs."
     )
-    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS["deepseek_v4"]
-    assert module_path == "nemo_automodel.components.models.deepseek_v4.config"
-    assert cls_name == "DeepseekV4Config"
+    spec = specs_by_model_type["deepseek_v4"]
+    assert spec.config_module_path == "nemo_automodel.components.models.deepseek_v4.config"
+    assert spec.config_class_name == "DeepseekV4Config"
 
 
 def test_all_model_folders_registered_in_auto_map():
-    """Every model folder with a model.py must have at least one entry in MODEL_ARCH_MAPPING.
+    """Every model folder with a model.py must have at least one registry package-spec entry.
 
     This catches the case where a developer adds a new model directory under
     ``nemo_automodel/components/models/`` but forgets to add it to the static
-    ``MODEL_ARCH_MAPPING`` in ``registry.py``.
+    registry package specs in ``registry.py``.
     """
     import pathlib
 
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    from nemo_automodel._transformers.registry.model_registry import (
+        MODEL_PACKAGE_SPECS,
+        RETRIEVAL_MODEL_PACKAGE_SPECS,
+    )
 
     models_root = pathlib.Path(__file__).resolve().parents[3] / "nemo_automodel" / "components" / "models"
 
-    # Collect the set of module paths referenced by the auto_map
-    registered_module_paths = {v[0] for v in MODEL_ARCH_MAPPING.values()}
+    # Collect the set of module paths referenced by the registries.
+    registered_module_paths = {spec.module_path for spec in (*MODEL_PACKAGE_SPECS, *RETRIEVAL_MODEL_PACKAGE_SPECS)}
 
     missing = []
+    documentation_only_model_dirs = {"blueprint"}
     for model_dir in sorted(models_root.iterdir()):
         if not model_dir.is_dir() or model_dir.name.startswith(("_", ".")):
+            continue
+        if model_dir.name in documentation_only_model_dirs:
             continue
         model_file = model_dir / "model.py"
         if not model_file.exists():
@@ -333,6 +587,6 @@ def test_all_model_folders_registered_in_auto_map():
 
     assert not missing, (
         f"Model folder(s) {missing} contain a model.py but are not registered "
-        f"in MODEL_ARCH_MAPPING (registry.py). Add an entry for each architecture "
+        f"in the registry package specs (registry.py). Add an entry for each architecture "
         f"exported by these modules."
     )

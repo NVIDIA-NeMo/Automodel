@@ -14,45 +14,50 @@
 
 """Verify HYV3 model + config are registered in nemo_automodel._transformers.registry."""
 
-import pytest
-
 
 class TestArchMapping:
     def test_hyv3_arch_registered(self):
-        from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+        from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-        assert "HYV3ForCausalLM" in MODEL_ARCH_MAPPING
+        assert "HYV3ForCausalLM" in _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)
 
     def test_hyv3_arch_points_at_correct_module(self):
-        from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+        from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-        entry = MODEL_ARCH_MAPPING["HYV3ForCausalLM"]
-        assert entry[0] == "nemo_automodel.components.models.hy_v3.model"
-        assert entry[1] == "HYV3ForCausalLM"
+        entry = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)["HYV3ForCausalLM"]
+        assert entry.module_path == "nemo_automodel.components.models.hy_v3.model"
+        assert entry.class_name == "HYV3ForCausalLM"
 
     def test_hyv3_arch_resolves_to_class(self):
         """Walk the mapping path -- importable + the named class exists."""
         import importlib
 
-        from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+        from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-        mod_path, cls_name, *_ = MODEL_ARCH_MAPPING["HYV3ForCausalLM"]
+        spec = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)["HYV3ForCausalLM"]
+        mod_path = spec.module_path
+        cls_name = spec.class_name
         mod = importlib.import_module(mod_path)
         assert hasattr(mod, cls_name)
 
 
 class TestCustomConfigRegistration:
     def test_hy_v3_config_registered(self):
-        from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-        assert "hy_v3" in _CUSTOM_CONFIG_REGISTRATIONS
+        assert any("hy_v3" in spec.model_types for spec in MODEL_PACKAGE_SPECS)
 
     def test_hy_v3_config_resolves_to_class(self):
         import importlib
 
-        from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
-        mod_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS["hy_v3"]
+        spec = next(spec for spec in MODEL_PACKAGE_SPECS if "hy_v3" in spec.model_types)
+        mod_path = spec.config_module_path
+        cls_name = spec.config_class_name
         mod = importlib.import_module(mod_path)
         cls = getattr(mod, cls_name)
         assert cls.__name__ == "HYV3Config"

@@ -552,6 +552,23 @@ class TestLayerTypesFix:
 class TestGetHfConfigLayerTypesRetry:
     """get_hf_config should retry via the layer_types fix helper when AutoConfig raises."""
 
+    @patch("nemo_automodel._transformers.model_init.ModelRegistry.ensure_config_registered")
+    @patch("nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict")
+    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
+    def test_registers_custom_config_before_auto_config(
+        self, mock_from_pretrained, _mock_trust, mock_get_dict, mock_register
+    ):
+        mock_get_dict.return_value = ({"model_type": "fake_model"}, {})
+        built_config = MagicMock()
+        mock_from_pretrained.return_value = built_config
+
+        result = get_hf_config("fake/model", "sdpa")
+
+        assert result is built_config
+        mock_register.assert_called_once_with("fake_model")
+        mock_from_pretrained.assert_called_once()
+
     @patch("nemo_automodel._transformers.model_init._load_config_with_layer_types_fix")
     @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=True)
     @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")

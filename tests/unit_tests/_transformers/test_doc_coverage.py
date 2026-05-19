@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Guard against the gemma4-style regression where a new model architecture
-lands in ``MODEL_ARCH_MAPPING`` without any corresponding page under
+lands in ``MODEL_PACKAGE_SPECS`` without any corresponding page under
 ``docs/model-coverage/``.
 """
 
@@ -88,14 +88,14 @@ def _repo_root() -> pathlib.Path:
 
 
 def test_every_registered_arch_has_model_coverage_doc():
-    """Every architecture in ``MODEL_ARCH_MAPPING`` must be mentioned in at
+    """Every architecture in ``MODEL_PACKAGE_SPECS`` must be mentioned in at
     least one ``docs/model-coverage/*.md`` file, either by its own name or by
     a mapped alias in ``_DOC_ARCH_ALIASES``.
 
     This guards against the regression where a new arch (e.g. gemma4) is
     registered but never gets a corresponding model card in the docs.
     """
-    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
     docs_dir = _repo_root() / "docs" / "model-coverage"
     assert docs_dir.is_dir(), f"docs/model-coverage/ not found at {docs_dir}"
@@ -104,10 +104,11 @@ def test_every_registered_arch_has_model_coverage_doc():
     assert md_contents, "No .md files found under docs/model-coverage/"
 
     missing = []
-    for arch_name in MODEL_ARCH_MAPPING:
-        needle = _DOC_ARCH_ALIASES.get(arch_name, arch_name)
-        if not any(needle in content for content in md_contents):
-            missing.append((arch_name, needle))
+    for spec in MODEL_PACKAGE_SPECS:
+        for arch_name in spec.architectures:
+            needle = _DOC_ARCH_ALIASES.get(arch_name, arch_name)
+            if not any(needle in content for content in md_contents):
+                missing.append((arch_name, needle))
 
     if missing:
         details = "\n".join(f"  - {arch} (looked for {repr(needle)})" for arch, needle in missing)
