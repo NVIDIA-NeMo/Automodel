@@ -12,20 +12,23 @@ The legacy Sphinx tree under `../docs/` remains in place for reference until the
 | Fern dashboard | https://dashboard.buildwithfern.com (NVIDIA org) |
 | Skill for agents | [`../skills/fern-docs/SKILL.md`](../skills/fern-docs/SKILL.md) |
 | CI workflows | [`../.github/workflows/fern-docs-*.yml`](../.github/workflows/) |
-| Make targets | [`../Makefile`](../Makefile) |
+| Make targets | [`./Makefile`](./Makefile) |
 
 ## Quickstart
 
 First time on this machine:
 
 ```bash
+# All Make targets live in fern/Makefile — run them from this directory
+# (`cd fern && make <target>`) or from anywhere with `make -C fern <target>`.
+
 # 1. Install the Fern CLI globally (one-time)
 npm install -g fern-api
 # or use it ad-hoc via:  npx -y fern-api@latest <subcommand>
 
 # 2. Provision your Fern account + CLI auth (one-time per machine).
 #    Walks you through the dashboard sign-in step before running `fern login`.
-make docs-login
+cd fern && make docs-login
 
 # 3. Build the API library reference and start the local dev server
 make docs           # http://localhost:3002
@@ -79,7 +82,7 @@ fern/versions/v0.4/pages/get-started/installation.mdx      docs.nvidia.com/nemo/
 
 ## Local development
 
-From the repo root:
+From this directory (`cd fern` first, or use `make -C fern <target>` from anywhere):
 
 ```bash
 make docs           # `fern docs md generate` + `fern docs dev` → http://localhost:3002

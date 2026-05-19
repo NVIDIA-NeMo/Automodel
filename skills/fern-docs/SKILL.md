@@ -285,7 +285,7 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | `fern/components/` | `BadgeLinks.tsx`, `Tag.tsx`, `CustomFooter.tsx` |
 | `fern/main.css` | Theme overrides — NVIDIA green, badge spacing |
 | `fern/README.md` | Human-facing orientation |
-| `Makefile` | `make docs / docs-check / docs-preview / docs-publish` |
+| `fern/Makefile` | `make docs / docs-check / docs-preview / docs-publish` (run from `fern/` or via `make -C fern`) |
 | `.github/workflows/fern-docs-*.yml` | CI: check, preview build, preview comment |
 | `.github/workflows/publish-fern-docs.yml` | CI: publish to docs.nvidia.com/nemo/automodel |
 | `docs/` | **Legacy** Sphinx source — read-only reference for fidelity checks |

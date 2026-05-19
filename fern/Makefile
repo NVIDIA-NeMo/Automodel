@@ -1,14 +1,18 @@
-# NeMo AutoModel — top-level convenience targets.
-# Docs-related targets live here so contributors don't have to remember the
-# exact `cd fern && fern …` invocations. CI workflows under
-# `.github/workflows/fern-docs-*.yml` are the source of truth for the published
-# pipeline; these targets just mirror the local-developer entry points.
+# NeMo AutoModel — Fern docs convenience targets.
+# Runs from this directory (fern/). Invoke as:
+#
+#     cd fern && make docs
+#     # or from anywhere in the repo:
+#     make -C fern docs
+#
+# CI workflows under `.github/workflows/fern-docs-*.yml` are the source of
+# truth for the published pipeline; these targets just mirror the
+# local-developer entry points.
 #
 # First time on this machine? Run `make docs-login` before `make docs`.
 # Without dashboard provisioning, `fern docs md generate` fails with
 # `HTTP 403: User does not belong to organization`.
 
-FERN_DIR := fern
 PUBLISH_WORKFLOW := Publish Fern Docs
 
 .DEFAULT_GOAL := help
@@ -17,15 +21,18 @@ PUBLISH_WORKFLOW := Publish Fern Docs
 
 help:
 	@echo ""
-	@echo "NeMo AutoModel top-level Make targets"
-	@echo "====================================="
+	@echo "NeMo AutoModel — Fern docs Make targets"
+	@echo "========================================"
+	@echo ""
+	@echo "Run from this directory ('cd fern && make <target>')"
+	@echo "or from anywhere in the repo ('make -C fern <target>')."
 	@echo ""
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"
 	@echo "  make docs-check             Run 'fern check' (config + MDX validation)"
 	@echo "  make docs-preview           Build a shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)"
 	@echo "  make docs-publish           Trigger the 'Publish Fern Docs' workflow on origin/main"
-	@echo "  make docs-generate-library  Regenerate the autodoc library reference under fern/product-docs/"
+	@echo "  make docs-generate-library  Regenerate the autodoc library reference under product-docs/"
 	@echo ""
 	@echo "First time? Run 'make docs-login' before 'make docs' or your"
 	@echo "autodoc step will fail with HTTP 403."
@@ -75,22 +82,22 @@ docs-login:
 	@echo ""
 	fern login
 
-# Local-only preview. `fern docs md generate` populates fern/product-docs/ from
-# the nemo_automodel package source (declared under `libraries:` in fern/docs.yml);
+# Local-only preview. `fern docs md generate` populates ./product-docs/ from
+# the nemo_automodel package source (declared under `libraries:` in docs.yml);
 # `fern docs dev` then serves the site on localhost:3002. Re-run `make docs` only
-# when the library source changes — for prose-only iteration, `cd fern && fern docs dev`
+# when the library source changes — for prose-only iteration, `fern docs dev`
 # alone is enough after the first generate.
 docs: docs-generate-library
-	cd $(FERN_DIR) && fern docs dev
+	fern docs dev
 
 docs-check:
-	cd $(FERN_DIR) && fern check
+	fern check
 
 # Wraps the autodoc generate step. If it fails (the most common cause is
 # the HTTP 403 from missing dashboard provisioning), print the recovery
 # pointer so contributors aren't left guessing.
 docs-generate-library:
-	@cd $(FERN_DIR) && fern docs md generate || { \
+	@fern docs md generate || { \
 		status=$$?; \
 		echo ""; \
 		echo "✗ 'fern docs md generate' failed (exit $$status)."; \
@@ -110,7 +117,7 @@ docs-generate-library:
 # work-in-progress link before merge. Requires DOCS_FERN_TOKEN in the environment
 # (org secret of the same name is wired into CI).
 docs-preview:
-	cd $(FERN_DIR) && fern generate --docs --preview
+	fern generate --docs --preview
 
 # Trigger the Publish Fern Docs workflow on origin/main via workflow_dispatch.
 # Alternative: tag a release with `git tag docs/v0.4.0 && git push origin docs/v0.4.0`
