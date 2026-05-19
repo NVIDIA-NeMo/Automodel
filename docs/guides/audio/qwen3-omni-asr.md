@@ -1,27 +1,27 @@
 # Fine-Tune Qwen3-Omni for ASR
 
 End-to-end ASR fine-tuning of `Qwen/Qwen3-Omni-30B-A3B-Instruct` on a
-HuggingFace audio dataset, using the NeMo AutoModel VLM training stack. The
+Hugging Face audio dataset, using the NeMo AutoModel VLM training stack. The
 running example is the public
 [`edinburghcstr/ami`](https://huggingface.co/datasets/edinburghcstr/ami)
 meeting corpus (English IHM), but the same recipe works for any HF dataset
 that exposes `{audio, text}` columns (AMI, LibriSpeech, GigaSpeech,
 WenetSpeech, CommonVoice, …).
 
-The path has two stages:
+The workflow has two stages:
 
 1. **Train** the thinker sub-model with the `FinetuneRecipeForVLM` recipe.
-2. **Convert** the NEMO-saved thinker checkpoint into a HuggingFace-compatible
+2. **Convert** the NeMo-saved thinker checkpoint into a Hugging Face-compatible
    Qwen3-Omni export so `transformers.AutoModel*` and vLLM can load it.
 
 ---
 
-## 1. Data
+## Data Preparation
 
-### Built-in builder: `make_hf_audio_asr_dataset`
+### Built-In Builder: `make_hf_audio_asr_dataset`
 
 `nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`
-returns a HuggingFace `Dataset` whose `__getitem__` lazily produces a single
+returns a Hugging Face `Dataset` whose `__getitem__` lazily produces a single
 `{"conversation": [...]}` dict suitable for `qwen3_omni_asr_collate_fn`. Key
 design points:
 
@@ -60,7 +60,7 @@ dataset = make_hf_audio_asr_dataset(
 #   ]
 ```
 
-### Built-in collate: `qwen3_omni_asr_collate_fn`
+### Built-In Collate: `qwen3_omni_asr_collate_fn`
 
 `nemo_automodel.components.datasets.vlm.collate_fns.qwen3_omni_asr_collate_fn`
 batches the lazy samples into model inputs without depending on
@@ -77,12 +77,12 @@ batches the lazy samples into model inputs without depending on
 * Reuses `build_labels_from_template` (marker-based; `Qwen3OmniMoeProcessor`
   is in `_IMSTART_TEMPLATE_PROCESSORS`) and emits pre-shifted labels.
 
-The collate is selected via the YAML's `dataloader.collate_fn._target_`; it
+The collate is selected through the YAML's `dataloader.collate_fn._target_`; it
 is intentionally **not** registered in the global `COLLATE_FNS` map so the
 existing `Qwen3OmniMoeProcessor → qwen3_omni_collate_fn` mapping keeps
 serving non-ASR VLM users that *do* have `qwen_omni_utils` installed.
 
-### Using a different HF audio dataset
+### Use a Different HF Audio Dataset
 
 To target your own dataset, set `dataset.path_or_dataset` and override the
 defaults below only when the dataset diverges:
@@ -92,7 +92,7 @@ defaults below only when the dataset diverges:
 | `edinburghcstr/ami`                     | `edinburghcstr/ami`                    | `ihm` or `sdm`               | `text` (default)  |
 | `openslr/librispeech_asr`               | `openslr/librispeech_asr`              | optional config              | `text` (default)  |
 | `speechcolab/gigaspeech`                | `speechcolab/gigaspeech`               | optional config              | `text` (default)  |
-| `mozilla-foundation/common_voice_*`     | `mozilla-foundation/common_voice_18_0` | language code (e.g. `en`)    | **`sentence`**    |
+| `mozilla-foundation/common_voice_*`     | `mozilla-foundation/common_voice_18_0` | language code (e.g., `en`)    | **`sentence`**    |
 
 YAML override snippet for CommonVoice (note `text_column: sentence`):
 
@@ -111,9 +111,9 @@ default `audio_column="audio"` rarely needs an override.
 
 ---
 
-## 2. Train
+## Train
 
-### Example config
+### Example Config
 
 `examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml` is a ready-to-run full
 fine-tune for the 30B-A3B Omni model on a single 8-GPU node, targeting the
@@ -130,14 +130,14 @@ public AMI IHM corpus. Defaults:
 | `dataset`          | `make_hf_audio_asr_dataset(path_or_dataset="edinburghcstr/ami", name="ihm")`           |
 
 `peft:` is intentionally omitted — both the language model and the audio
-tower are trainable, vision tower stays frozen. With `ep_size=8` the MoE
+tower are trainable; the vision tower stays frozen. With `ep_size=8`, the MoE
 experts are sharded across all 8 GPUs.
 
-Measured on 8x H100 80GB: ~1.4 step/s steady-state, ~36–40 GB peak / GPU.
+Measured on 8x H100 80 GB: ~1.4 step/s steady-state, ~36–40 GB peak/GPU.
 One epoch over the ~69k post-1.0s-filter AMI IHM train clips finishes in
-~22 min (vs ~2 h at `local_batch_size=1`). Peak memory on this MoE is
-dominated by FSDP / expert all-gather (~36 GB), not by activations, so batch
-can be pushed this high without OOM.
+~22 min (compared to ~2 h at `local_batch_size=1`). Peak memory on this MoE is
+dominated by FSDP/expert all-gather (~36 GB), not by activations, so the batch
+size can be pushed this high without OOM.
 
 
 ### Launch
@@ -149,12 +149,12 @@ torchrun --nproc_per_node=8 --nnodes=1 -m nemo_automodel.cli.app \
     examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml
 ```
 
-Any per-field CLI override (e.g. `--dataset.split 'train[:5000]'`) is
+Any per-field CLI override (e.g., `--dataset.split 'train[:5000]'`) is
 forwarded to the YAML. Optional WandB logging streams online as long as
 `WANDB_API_KEY` is set in the environment; set `WANDB_MODE=offline` for a
 dry run.
 
-### What gets saved
+### What Gets Saved
 
 Every `ckpt_every_steps` steps the recipe writes a consolidated checkpoint:
 
@@ -176,11 +176,11 @@ epoch_E_step_S/
     └── chat_template.jinja, tokenizer*.json, processor_config.json
 ```
 
-The `consolidated/` directory is the artefact you continue with for
-inference. It already holds the trained weights and the right tokenizer +
-processor — but its `config.json` describes the *thinker sub-model only*
+The `consolidated/` directory is the artifact to use for inference. It already
+holds the trained weights and the right tokenizer + processor — but its
+`config.json` describes the *thinker sub-model only*
 (`model_type=qwen3_omni_moe_thinker`), which neither `transformers.AutoConfig`
-nor vLLM recognises as a top-level architecture. See section 3 for the
+nor vLLM recognizes as a top-level architecture. See the Convert section for the
 conversion step.
 
 ### Resume
@@ -192,7 +192,7 @@ below for restart — only for *external* inference tooling.
 
 ---
 
-## 3. Convert: thinker → HF-compatible Omni
+## Convert: Thinker → HF-Compatible Omni
 
 NeMo maps `Qwen3OmniMoeForConditionalGeneration` to a custom *thinker-only*
 class (the parent Omni model in HF has `thinker / code2wav / talker`
@@ -213,14 +213,14 @@ ValueError: The checkpoint you are trying to load has model type
 full Qwen3-Omni export by:
 
 1. Renaming + copying the trained `thinker.*` shards into the output dir.
-2. Copying the un-trained `code2wav.*` and `talker.*` shards verbatim from
+2. Copying the untrained `code2wav.*` and `talker.*` shards verbatim from
    the cached HF base model (these were never modified during ASR training).
-3. Writing a merged `model.safetensors.index.json` over all three buckets.
+3. Writing a merged `model.safetensors.index.json` across all three buckets.
 4. Replacing the bogus `config.json` with the base model's
    (`model_type=qwen3_omni_moe`,
    `architectures=["Qwen3OmniMoeForConditionalGeneration"]`).
 5. Copying the rest of the HF metadata (tokenizer, processor, generation
-   config, chat template) from base; the recipe-saved `chat_template.jinja`
+   config, chat template) from the base; the recipe-saved `chat_template.jinja`
    wins if present.
 
 Memory footprint stays at roughly one shard (~5 GB) at a time — no full-model
@@ -238,14 +238,14 @@ snapshot — only the `thinker.*` weights differ.
 
 ---
 
-## 4. Results: AMI IHM
+## Results: AMI IHM
 
 End-of-epoch evaluation on the AMI IHM `test` split, comparing the
 zero-shot base Qwen3-Omni against the same model after one epoch of full
 fine-tuning with the recipe above (audio tower trainable). WER drops by
 roughly half:
 
-![AMI IHM WER: base vs fine-tuned Qwen3-Omni](./qwen_omni_asr.png)
+![AMI IHM WER: base vs. fine-tuned Qwen3-Omni](./qwen_omni_asr.png)
 
 | Stage           | Model                                                 | WER (AMI IHM test) |
 |-----------------|-------------------------------------------------------|--------------------|
