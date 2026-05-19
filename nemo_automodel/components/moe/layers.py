@@ -219,7 +219,8 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax', 'sigmoid', 'softmax_with_bias', or 'sqrtsoftplus').
+        score_func (str): Scoring function ('softmax', 'sigmoid', 'sigmoid_with_bias',
+            'softmax_with_bias', or 'sqrtsoftplus').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -363,6 +364,26 @@ class Gate(nn.Module):
                 scores = scores + self.e_score_correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.score_func == "sigmoid_with_bias":
+            scores = scores.sigmoid()
+            original_scores = scores
+            scores_for_choice = scores
+
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores_for_choice + self.e_score_correction_bias
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+                group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
+                group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
+                scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
+                    ~score_mask.bool(), float("-inf")
+                )
+
+            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
