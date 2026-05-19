@@ -674,6 +674,23 @@ class MiMoV2FlashForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             hidden = hidden[:, logits_to_keep, :]
         return self.lm_head(hidden)
 
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Keep the SWA rotary embedding on every PP stage."""
+        text_model = text_model or self.model
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+        if getattr(text_model, "swa_rotary_emb", None) is not None:
+            fqn = f"{layers_prefix}swa_rotary_emb"
+            for modules in stage_modules:
+                if fqn not in modules:
+                    modules.append(fqn)
+        return stage_modules
+
     @torch.no_grad()
     def initialize_weights(
         self,

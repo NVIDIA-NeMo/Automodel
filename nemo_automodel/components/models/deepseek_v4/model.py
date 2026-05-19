@@ -42,6 +42,7 @@ Compress-ratio sliding-window attention is not yet implemented.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -68,6 +69,23 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class DeepseekV4CausalLMOutput:
+    """Output of DeepseekV4ForCausalLM.forward.
+
+    Attributes:
+        logits: ``[B, S, vocab_size]`` next-token prediction logits.
+        mtp_per_depth_h: Per-depth MTP hidden states (training mode only).
+            List of length ``num_nextn_predict_layers``, each ``[B, S, hidden]``.
+            ``None`` when MTP is disabled or in eval mode.
+        mtp_loss_scaling_factor: Coefficient for the MTP auxiliary loss.
+    """
+
+    logits: torch.Tensor
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float = 0.1
 
 
 class DeepseekV4Block(nn.Module):
@@ -367,8 +385,9 @@ class DeepseekV4Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        return_hc_hidden: bool = False,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # PP-aware forward (same pattern as DeepseekV3Model.forward).
         # Stage 0 of pipeline parallelism owns ``embed_tokens`` and receives
         # raw token ids; subsequent stages have ``embed_tokens=None`` and
@@ -443,6 +462,8 @@ class DeepseekV4Model(nn.Module):
                 **attn_kwargs,
             )
 
+        mtp_hc_hidden = h if return_hc_hidden else None
+
         # Reduce hc_mult copies -> [B,S,dim] via the learned HC head, then
         # apply the shared RMSNorm.  Both modules live ONLY on the last PP
         # stage (intermediate stages keep h at 4D so the next stage can
@@ -451,6 +472,10 @@ class DeepseekV4Model(nn.Module):
             h = self.hc_head(h)
         if getattr(self, "norm", None) is not None:
             h = self.norm(h)
+        if return_hc_hidden:
+            if mtp_hc_hidden is None:
+                raise ValueError("return_hc_hidden requested before HC stream was available")
+            return h, mtp_hc_hidden
         return h
 
     def update_moe_gate_bias(self) -> None:
@@ -529,6 +554,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.config = config
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
+        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = DeepseekV4Model(
             config,
             backend=self.backend,
@@ -550,6 +576,26 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 dtype=get_dtype(config.torch_dtype, torch.bfloat16),
             )
 
+        # MTP construction (import inside __init__ to avoid circular imports).
+        from nemo_automodel.components.models.deepseek_v4.mtp import (  # noqa: PLC0415
+            build_deepseek_v4_mtp,
+            build_mtp_config_from_hf,
+        )
+
+        self.mtp_config = build_mtp_config_from_hf(config, loss_scaling_factor=mtp_loss_scaling_factor)
+        if self.mtp_config.enabled:
+            self.mtp = build_deepseek_v4_mtp(
+                config=config,
+                mtp_config=self.mtp_config,
+                backend=self.backend,
+                moe_config=self.model.moe_config,
+                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+                rotary_emb=self.model.rotary_emb,
+                rotary_emb_compress=self.model.rotary_emb_compress,
+            )
+        else:
+            self.mtp = None
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -562,34 +608,184 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Keep DSV4 non-layer PP dependencies with the stages that need them."""
+
+        text_model = text_model or self.model
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+
+        def append_once(modules: list[str], fqn: str) -> None:
+            if fqn not in modules:
+                modules.append(fqn)
+
+        if getattr(text_model, "rotary_emb_compress", None) is not None:
+            for modules in stage_modules:
+                append_once(modules, f"{layers_prefix}rotary_emb_compress")
+        if getattr(text_model, "hc_head", None) is not None:
+            append_once(stage_modules[-1], f"{layers_prefix}hc_head")
+        if self.mtp is not None:
+            append_once(stage_modules[-1], "mtp")
+
+        return stage_modules
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return PP input/output meta tensors for DSV4's HC and MTP contract."""
+
+        hidden_shape = (microbatch_size, seq_len, self.config.hidden_size)
+        hc_hidden_shape = (microbatch_size, seq_len, self.config.hc_mult, self.config.hidden_size)
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+
+        def meta(shape: tuple[int, ...]) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=dtype)
+
+        def append_mtp_metas(primary: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            mtp_metas = (meta(hidden_shape) for _ in range(mtp_depth))
+            return (primary, *mtp_metas)
+
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
+
+        if self.lm_head is not None:
+            output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
+        elif getattr(self.model, "norm", None) is not None:
+            output_meta = meta(hidden_shape)
+        else:
+            output_meta = meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape)
+
+        return inputs_meta, append_mtp_metas(output_meta)
+
+    def _is_pipeline_parallel_stage(self) -> bool:
+        if self.lm_head is None:
+            return True
+        if getattr(self.model, "embed_tokens", None) is None:
+            return True
+        try:
+            return len(self.model.layers) != int(self.config.num_hidden_layers)
+        except TypeError:
+            return False
+
+    def _build_mtp_embed_inputs_for_pp(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if getattr(self.model, "embed_tokens", None) is None:
+            raise ValueError("First PP stage must own embed_tokens to build MTP embeddings")
+        if input_ids.dtype not in (torch.int32, torch.int64, torch.long):
+            raise ValueError("First PP stage must receive token ids to build MTP embeddings")
+
+        from nemo_automodel.components.models.common.mtp import roll_tensor  # noqa: PLC0415
+
+        cur_input_ids = input_ids
+        embeds = []
+        for _ in range(self.mtp_config.num_layers):
+            cur_input_ids = roll_tensor(cur_input_ids, shifts=-1, dim=-1)
+            embeds.append(self.model.embed_tokens(cur_input_ids))
+        return tuple(embeds)
+
     def forward(
         self,
         input_ids: torch.Tensor,
-        *,
+        *mtp_embed_inputs: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
+        is_pp_stage = self._is_pipeline_parallel_stage()
+        pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
+
+        thd_mode = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if thd_mode:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
             attention_mask = None
 
-        logits = self.model(
+        use_mtp = self.mtp is not None and self.training
+        model_out = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
+            return_hc_hidden=use_mtp,
             **attn_kwargs,
         )
+        if use_mtp:
+            hidden_states, mtp_hc_hidden = model_out
+        else:
+            hidden_states = model_out
+            mtp_hc_hidden = None
         if self.lm_head:
-            hidden_dtype = logits.dtype
-            logits = self.lm_head(logits.float()).to(hidden_dtype)
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+            hidden_dtype = hidden_states.dtype
+            logits = self.lm_head(hidden_states.float()).to(hidden_dtype)
+        else:
+            logits = hidden_states
+        if thd_mode:
             logits = logits.unsqueeze(0)
-        return logits
+
+        if pp_mtp_enabled and self.lm_head is None:
+            if not mtp_embed_inputs:
+                mtp_embed_inputs = self._build_mtp_embed_inputs_for_pp(input_ids)
+            return (logits, *mtp_embed_inputs)
+
+        mtp_per_depth_h = None
+        if use_mtp:
+            if is_pp_stage and not mtp_embed_inputs:
+                raise ValueError("Final PP stage requires propagated MTP embeddings")
+            # MTP consumes the pre-final-head HC stream [B, S, hc_mult, hidden]
+            # and returns collapsed per-depth [B, S, hidden] tensors for CE.
+            seq_len = hidden_states.shape[1]
+            batch_size = hidden_states.shape[0]
+            if position_ids is None:
+                position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
+            sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
+            mtp_attn_mask = build_causal_padding_mask(
+                attention_mask,
+                seq_len=seq_len,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+                batch_size=batch_size,
+                sliding_window=sliding_window,
+            )
+            mtp_kwargs = {
+                "hidden_states": mtp_hc_hidden,
+                "position_ids": position_ids,
+                "attention_mask": mtp_attn_mask,
+                "padding_mask": padding_mask,
+            }
+            if mtp_embed_inputs:
+                mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
+            else:
+                mtp_kwargs["input_ids"] = input_ids
+                mtp_kwargs["embed_fn"] = self.model.embed_tokens
+            mtp_per_depth_h = self.mtp(**mtp_kwargs)
+        elif pp_mtp_enabled and self.lm_head is not None:
+            mtp_per_depth_h = [hidden_states.new_empty(hidden_states.shape) for _ in range(self.mtp_config.num_layers)]
+
+        if is_pp_stage:
+            if pp_mtp_enabled:
+                if self.training and self.mtp is None:
+                    raise ValueError("Final PP stage has MTP enabled but does not own the MTP module")
+                return (logits, *mtp_per_depth_h)
+            return logits
+
+        return DeepseekV4CausalLMOutput(
+            logits=logits,
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+        )
 
     def update_moe_gate_bias(self) -> None:
         self.model.update_moe_gate_bias()
@@ -611,6 +807,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
+        if self.mtp is not None:
+            for sublayer in self.mtp.layers:
+                sublayer.init_weights(buffer_device=buffer_device)
         # After FSDP2 wrapping, parameter dtypes must already be correct from
         # construction-time metadata. A blanket ``model.to(bf16)`` would
         # downcast fp32 DTensors before checkpoint load can fill them.
