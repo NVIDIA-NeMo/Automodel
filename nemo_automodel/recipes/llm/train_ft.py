@@ -80,6 +80,8 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
@@ -809,118 +811,6 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-            }
-        )
-    else:
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
-
-
-def calculate_mtp_loss(
-    loss_fn,
-    *,
-    mtp_per_depth_h: list[torch.Tensor],
-    labels: torch.Tensor,
-    model: nn.Module,
-    scaling_factor: float = 0.1,
-    num_label_tokens: Optional[int] = None,
-    ignore_index: int = -100,
-) -> torch.Tensor:
-    """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
-
-    Each depth's CE is dispatched through :func:`calculate_loss` with the
-    same loss class as the main path, so MTP inherits FusedLinearCrossEntropy
-    / MaskedCrossEntropy memory and numerical characteristics.
-
-    Args:
-        loss_fn: Configured per-token loss class (same instance the main
-            path uses).
-        mtp_per_depth_h: Per-depth hidden states from the model's MTP head,
-            one ``[B, S, H]`` tensor per depth.
-        labels: Original (unshifted) labels.
-        model: The wrapped model; used to fetch the shared LM head when the
-            loss class needs materialized logits (non-FusedLinearCE path).
-        scaling_factor: Coefficient applied to the summed per-depth CE.
-        num_label_tokens: Total non-ignore label tokens (forwarded to the
-            base loss for sum-reduction normalization).
-        ignore_index: Label value masked out of the CE loss for the trailing
-            ``k+1`` rolled positions at depth ``k``.
-
-    Returns:
-        Scalar MTP loss with autograd graph.
-    """
-    from nemo_automodel.components.models.common.mtp import roll_tensor
-
-    D = len(mtp_per_depth_h)
-    cur_labels = labels
-    total = mtp_per_depth_h[0].new_zeros(())
-    for k, h_k in enumerate(mtp_per_depth_h):
-        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
-        masked = cur_labels.clone()
-        n_invalid = min(k + 1, masked.shape[-1])
-        masked[..., -n_invalid:] = ignore_index
-
-        if isinstance(loss_fn, FusedLinearCrossEntropy):
-            depth_loss = calculate_loss(
-                loss_fn,
-                hidden_states=h_k,
-                labels=masked,
-                model=model,
-                num_label_tokens=num_label_tokens,
-            )
-        else:
-            depth_loss = calculate_loss(
-                loss_fn,
-                logits=model.get_output_embeddings()(h_k),
-                labels=masked,
-                model=model,
-                num_label_tokens=num_label_tokens,
-            )
-        total = total + depth_loss
-
-    return total * (scaling_factor / D)
-
-
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
     """Build validation dataloaders from validation dataset config entries."""
 
@@ -1146,6 +1036,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
+
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
@@ -1292,6 +1185,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
         else:
             wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
