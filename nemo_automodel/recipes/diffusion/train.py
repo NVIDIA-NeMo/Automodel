@@ -27,6 +27,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -35,6 +36,80 @@ from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
+from nemo_automodel.shared.utils import dtype_from_str
+
+
+def _resolve_optimizer_dtype_strings(optimizer_cfg: Any) -> None:
+    """Resolve dtype strings in optimizer config objects in place."""
+    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
+        val = getattr(optimizer_cfg, attr, None)
+        if isinstance(val, str):
+            setattr(optimizer_cfg, attr, dtype_from_str(val))
+
+
+def _resolve_model_dtypes(cfg: Any) -> tuple[torch.dtype, torch.dtype]:
+    """Resolve model storage and compute dtypes from the recipe config."""
+    return (
+        dtype_from_str(cfg.get("model.torch_dtype", None), default=torch.bfloat16),
+        dtype_from_str(cfg.get("model.compute_dtype", None), default=torch.bfloat16),
+    )
+
+
+def _validate_precision_configuration(
+    dtype: torch.dtype,
+    compute_dtype: torch.dtype,
+    *,
+    ddp_cfg: Optional[Dict[str, Any]],
+    peft_cfg: Any,
+) -> None:
+    """Reject split storage/compute dtypes on paths without FSDP param casting."""
+    if dtype == compute_dtype:
+        return
+
+    unsupported_modes = []
+    if ddp_cfg is not None:
+        unsupported_modes.append("DDP")
+    if peft_cfg is not None:
+        unsupported_modes.append("PEFT/LoRA")
+    if not unsupported_modes:
+        return
+
+    modes = " and ".join(unsupported_modes)
+    raise ValueError(
+        f"model.torch_dtype ({dtype}) and model.compute_dtype ({compute_dtype}) must match for {modes}. "
+        "Split storage/compute dtypes require FSDP full-parameter training, where FSDP can cast gathered "
+        "parameters to the compute dtype."
+    )
+
+
+def _build_optimizer(
+    trainable_params: list[torch.nn.Parameter],
+    optimizer_cfg: Any,
+    learning_rate: float,
+) -> torch.optim.Optimizer:
+    """Build optimizer from config, falling back to AdamW for legacy dict configs."""
+    optimizer_cfg = optimizer_cfg or {}
+    if isinstance(optimizer_cfg, dict) and "_target_" in optimizer_cfg:
+        optimizer_cfg = ConfigNode(optimizer_cfg)
+
+    if hasattr(optimizer_cfg, "instantiate") and hasattr(optimizer_cfg, "_target_"):
+        _resolve_optimizer_dtype_strings(optimizer_cfg)
+        optimizer = optimizer_cfg.instantiate(params=trainable_params, lr=learning_rate)
+        logging.info("[INFO] Optimizer: %s, lr=%s", optimizer.__class__.__name__, learning_rate)
+        return optimizer
+
+    optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
+    weight_decay = optimizer_dict.get("weight_decay", 0.01)
+    betas = optimizer_dict.get("betas", (0.9, 0.999))
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay, betas=betas)
+
+    logging.info(
+        "[INFO] Optimizer: AdamW, lr=%s, weight_decay=%s, betas=%s",
+        learning_rate,
+        weight_decay,
+        betas,
+    )
+    return optimizer
 
 
 def build_model_and_optimizer(
@@ -44,6 +119,7 @@ def build_model_and_optimizer(
     learning_rate: float,
     device: torch.device,
     dtype: torch.dtype,
+    compute_dtype: Optional[torch.dtype] = None,
     cpu_offload: bool = False,
     fsdp_cfg: Optional[Dict[str, Any]] = None,
     ddp_cfg: Optional[Dict[str, Any]] = None,
@@ -60,7 +136,8 @@ def build_model_and_optimizer(
         finetune_mode: Whether to load for finetuning (True) or pretraining (False).
         learning_rate: Learning rate for optimizer.
         device: Target device.
-        dtype: Model dtype.
+        dtype: Model parameter storage dtype.
+        compute_dtype: Forward/FSDP compute dtype. Defaults to dtype when unset.
         cpu_offload: Whether to enable CPU offload (FSDP only).
         fsdp_cfg: FSDP configuration dict. Mutually exclusive with ddp_cfg.
         ddp_cfg: DDP configuration dict. Mutually exclusive with fsdp_cfg.
@@ -95,13 +172,16 @@ def build_model_and_optimizer(
         logging.info("[WARN] torch.distributed not initialized; proceeding in single-process mode")
 
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if compute_dtype is None:
+        compute_dtype = dtype
 
     lora_enabled = peft_cfg is not None
+    _validate_precision_configuration(dtype, compute_dtype, ddp_cfg=ddp_cfg, peft_cfg=peft_cfg)
+
     # param_dtype=None when LoRA: FSDP2 does not cast any parameter.
-    # bf16 base weights stay bf16 (loaded dtype).
-    # bf16 LoRA weights stay bf16 (set via peft_cfg.lora_dtype in pipeline).
-    # param_dtype=dtype when full fine-tune: FSDP2 casts everything to dtype (bf16).
-    param_dtype = None if lora_enabled else dtype
+    # In full training, FSDP2 casts gathered params to compute_dtype while
+    # the model can still be initialized in a different storage dtype.
+    param_dtype = None if lora_enabled else compute_dtype
 
     # Build manager args based on which config is provided
     if ddp_cfg is not None:
@@ -146,7 +226,7 @@ def build_model_and_optimizer(
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
                 reduce_dtype=torch.float32,
-                output_dtype=dtype,
+                output_dtype=compute_dtype,
             ),
         }
 
@@ -213,13 +293,7 @@ def build_model_and_optimizer(
         if not trainable_params:
             raise RuntimeError("No trainable parameters found in transformer module!")
 
-    optimizer_cfg = optimizer_cfg or {}
-    weight_decay = optimizer_cfg.get("weight_decay", 0.01)
-    betas = optimizer_cfg.get("betas", (0.9, 0.999))
-    # TODO: Support other optimizers
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay, betas=betas)
-
-    logging.info("[INFO] Optimizer config: lr=%s, weight_decay=%s, betas=%s", learning_rate, weight_decay, betas)
+    optimizer = _build_optimizer(trainable_params, optimizer_cfg, learning_rate)
 
     trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
     frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
@@ -354,7 +428,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.attention_backend = self.cfg.get("model.attention_backend")
         self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
         self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
-        self.bf16 = torch.bfloat16
+        self.model_dtype, self.compute_dtype = _resolve_model_dtypes(self.cfg)
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -374,6 +448,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
         logging.info(f"[INFO] Learning rate: {self.learning_rate}")
+        logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
 
         # Get distributed training configs (mutually exclusive)
         fsdp_cfg = self.cfg.get("fsdp", None)
@@ -454,7 +529,8 @@ class TrainDiffusionRecipe(BaseRecipe):
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
             learning_rate=self.learning_rate,
             device=self.device,
-            dtype=self.bf16,
+            dtype=self.model_dtype,
+            compute_dtype=self.compute_dtype,
             cpu_offload=self.cpu_offload,
             fsdp_cfg=fsdp_cfg,
             ddp_cfg=ddp_cfg,
@@ -635,7 +711,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                             model=self.model,
                             batch=micro_batch,
                             device=self.device,
-                            dtype=self.bf16,
+                            dtype=self.compute_dtype,
                             global_step=global_step,
                         )
                     except Exception as exc:
@@ -684,19 +760,33 @@ class TrainDiffusionRecipe(BaseRecipe):
                         "epoch": epoch,
                         "global_step": global_step,
                     }
+                    if torch.cuda.is_available():
+                        memory_allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+                        memory_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+                        max_memory_allocated = torch.cuda.max_memory_allocated(self.device) / 1024**3
+                        max_memory_reserved = torch.cuda.max_memory_reserved(self.device) / 1024**3
+                        log_dict.update(
+                            {
+                                "mem_allocated_gib": memory_allocated,
+                                "mem_reserved_gib": memory_reserved,
+                                "max_mem_allocated_gib": max_memory_allocated,
+                                "max_mem_reserved_gib": max_memory_reserved,
+                            }
+                        )
                     if wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
 
                     # Update tqdm if present
                     if hasattr(self.step_scheduler.dataloader, "set_postfix"):
-                        self.step_scheduler.dataloader.set_postfix(
-                            {
-                                "loss": f"{group_loss_mean:.4f}",
-                                "avg": f"{(avg_loss):.4f}",
-                                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                                "gn": f"{grad_norm:.2f}",
-                            }
-                        )
+                        postfix = {
+                            "loss": f"{group_loss_mean:.4f}",
+                            "avg": f"{(avg_loss):.4f}",
+                            "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                            "gn": f"{grad_norm:.2f}",
+                        }
+                        if "mem_allocated_gib" in log_dict:
+                            postfix["mem"] = f"{log_dict['mem_allocated_gib']:.2f}GiB"
+                        self.step_scheduler.dataloader.set_postfix(postfix)
 
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
