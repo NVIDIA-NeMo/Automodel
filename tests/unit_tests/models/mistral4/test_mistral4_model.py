@@ -929,8 +929,10 @@ class TestRegistry:
         from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
 
         mapping = dict(MODEL_ARCH_MAPPING)
-        assert mapping["Mistral4ForCausalLM"][0] == "nemo_automodel.components.models.mistral4.model"
-        assert mapping["Mistral3ForConditionalGeneration"][0] == "nemo_automodel.components.models.mistral4.model"
+        assert mapping["Mistral4ForCausalLM"].module_path == "nemo_automodel.components.models.mistral4.model"
+        assert (
+            mapping["Mistral3ForConditionalGeneration"].module_path == "nemo_automodel.components.models.mistral4.model"
+        )
 
 
 # ---------------------------------------------------------------------------

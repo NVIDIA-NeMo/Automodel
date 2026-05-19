@@ -40,13 +40,21 @@ from transformers.modeling_utils import PreTrainedModel
 if not hasattr(PretrainedConfig, "pad_token_id"):
     PretrainedConfig.pad_token_id = None
 
-from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
+from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.models.protocols import LayerTypesConfigPatchModule, PreConfigPatchModule
 
-apply_qwen3_omni_config_patch()
+
+def _apply_registered_pre_config_patches() -> None:
+    """Apply model package patches required before ``AutoConfig`` instantiation."""
+    for patch_module in ModelRegistry.iter_optional_modules("patches", pre_config_patches=True):
+        if isinstance(patch_module, PreConfigPatchModule):
+            patch_module.apply_pre_config_patches()
+
+
+_apply_registered_pre_config_patches()
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
-from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
@@ -178,30 +186,6 @@ def _propagate_torch_dtype_to_subconfigs(hf_config, torch_dtype: torch.dtype) ->
     _recurse(hf_config)
 
 
-def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
-    """
-    Check if a HuggingFace config is compatible with our custom model implementation.
-
-    Some architectures (e.g., NemotronHForCausalLM) are shared between different model versions
-    (v2 vs v3) but our custom implementation only supports specific versions. This function
-    validates that the config has the required attributes for the custom implementation.
-
-    Args:
-        arch_name: The architecture name (e.g., "NemotronHForCausalLM")
-        config: The HuggingFace config object
-
-    Returns:
-        True if the config is compatible with our custom implementation, False otherwise
-    """
-    # NemotronHForCausalLM: Our custom implementation is for v3 (MoE model)
-    # v3 requires n_routed_experts, v2 does not have this attribute
-    if arch_name == "NemotronHForCausalLM":
-        return hasattr(config, "n_routed_experts") and config.n_routed_experts is not None
-
-    # All other architectures are assumed compatible
-    return True
-
-
 def _resolve_custom_model_cls_for_config(config):
     """Resolve the custom model class for *config*, if the config is compatible."""
     architectures = get_architectures(config)
@@ -212,12 +196,23 @@ def _resolve_custom_model_cls_for_config(config):
     if not ModelRegistry.has_custom_model(arch_name):
         return None
 
-    # Some architecture names are shared across multiple upstream variants.
-    # Screen them here before asking the registry for the custom implementation.
-    if not _is_config_compatible_with_custom_model(arch_name, config):
-        return None
-
     return ModelRegistry.resolve_custom_model_cls(arch_name, config)
+
+
+def _ensure_config_registered_from_config_dict(pretrained_model_name_or_path, **kwargs) -> None:
+    """Register a matching local config class before delegating to ``AutoConfig``."""
+    config_lookup_kwargs = kwargs.copy()
+    config_lookup_kwargs["_from_auto"] = True
+    config_lookup_kwargs["name_or_path"] = pretrained_model_name_or_path
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_lookup_kwargs)
+    except Exception:
+        logger.debug("Could not inspect config metadata for %s", pretrained_model_name_or_path, exc_info=True)
+        return
+
+    model_type = config_dict.get("model_type")
+    if isinstance(model_type, str):
+        ModelRegistry.ensure_config_registered(model_type)
 
 
 def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
@@ -233,6 +228,11 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
         # with incomplete dicts, losing all other fields. These nested overrides are
         # instead handled by _consume_config_overrides which deep-merges them.
         nested_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if isinstance(kwargs[k], dict)}  # noqa: F841
+        _ensure_config_registered_from_config_dict(
+            pretrained_model_name_or_path,
+            **kwargs,
+            attn_implementation=attn_implementation,
+        )
         try:
             hf_config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
@@ -271,40 +271,20 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
 
 
 def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implementation, trust_remote_code, **kwargs):
-    """Load an HF config after truncating ``layer_types`` to ``num_hidden_layers``.
+    """Compatibility wrapper for the Step-3.5 config layer-types fix."""
+    patch_modules = ModelRegistry.iter_optional_modules_for_model_type("step3p5", "patches")
+    if not patch_modules:
+        raise ValueError("Step-3.5 config compatibility patch module is not registered")
+    patch_module = patch_modules[0]
+    if not isinstance(patch_module, LayerTypesConfigPatchModule):
+        raise ValueError("Step-3.5 config compatibility patch module does not implement the layer-types hook")
 
-    Works around buggy upstream configs whose ``layer_types`` list is longer than
-    ``num_hidden_layers`` (e.g. stepfun-ai/Step-3.5-Flash).
-    """
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
-    n = config_dict.get("num_hidden_layers")
-    lt = config_dict.get("layer_types")
-    if isinstance(n, int) and isinstance(lt, list) and len(lt) > n:
-        logger.warning(
-            "Truncating layer_types (len=%d) to num_hidden_layers=%d for %s",
-            len(lt),
-            n,
-            pretrained_model_name_or_path,
-        )
-        config_dict["layer_types"] = lt[:n]
-
-    config_cls = None
-    auto_map = config_dict.get("auto_map") or {}
-    if trust_remote_code and "AutoConfig" in auto_map:
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-        config_cls = get_class_from_dynamic_module(auto_map["AutoConfig"], pretrained_model_name_or_path)
-    if config_cls is None:
-        model_type = config_dict.get("model_type")
-        config_cls = CONFIG_MAPPING.get(model_type)
-    if config_cls is None:
-        raise ValueError(
-            f"Could not resolve config class for {pretrained_model_name_or_path} "
-            f"(model_type={config_dict.get('model_type')!r})"
-        )
-    return config_cls.from_dict(config_dict, attn_implementation=attn_implementation)
+    return patch_module.load_config_with_layer_types_fix(
+        pretrained_model_name_or_path,
+        attn_implementation,
+        trust_remote_code,
+        **kwargs,
+    )
 
 
 def get_is_hf_model(config, force_hf):

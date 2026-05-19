@@ -122,9 +122,9 @@ def _resolve_architectures(model_id: str) -> list[str] | None:
 
     Returns ``None`` on failure (network, gated repo, missing cache, etc.).
     ``trust_remote_code`` is intentionally ``False`` to keep the test hermetic;
-    custom NeMo configs are registered at import time via
-    ``_register_custom_configs`` so HF-hosted configs matching our registered
-    ``model_type`` values still resolve without remote code.
+    custom NeMo configs are registered on demand before recipe load paths call
+    ``AutoConfig`` so HF-hosted configs matching our registered ``model_type``
+    values still resolve without remote code.
     """
     try:
         from transformers import AutoConfig

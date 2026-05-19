@@ -230,6 +230,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     main_input_name: str = "input_ids"
 
     @classmethod
+    def supports_config(cls, config: Any) -> bool:
+        """Return True when the HF config matches the Nemotron V3 MoE implementation."""
+        return hasattr(config, "n_routed_experts") and config.n_routed_experts is not None
+
+    @classmethod
     def from_config(
         cls,
         config,

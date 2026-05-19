@@ -108,11 +108,15 @@ TokenizerRegistry = _TokenizerRegistry()
 
 def _register_default_tokenizers():
     """Register default custom tokenizer implementations."""
-    # Register for Mistral model types (resolved lazily to keep import time low)
-    mistral_common = "nemo_automodel._transformers.tokenization.tokenization_mistral_common:MistralCommonBackend"
-    TokenizerRegistry.register("mistral", mistral_common)
-    TokenizerRegistry.register("pixtral", mistral_common)
-    TokenizerRegistry.register("mistral3", mistral_common)
+    from nemo_automodel._transformers.registry import ModelRegistry
+
+    for module in ModelRegistry.iter_optional_modules("tokenization", tokenizer_registrations=True):
+        get_registrations = getattr(module, "get_tokenizer_registrations", None)
+        if get_registrations is None:
+            logger.debug("Tokenizer registration module has no get_tokenizer_registrations(): %s", module.__name__)
+            continue
+        for model_type, tokenizer_impl in get_registrations().items():
+            TokenizerRegistry.register(model_type, tokenizer_impl)
 
 
 # Register defaults on module load

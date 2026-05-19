@@ -21,9 +21,9 @@ from nemo_automodel._transformers.utils import (
     _patch_bytes_to_unicode,
     _patch_special_tokens_pattern,
     apply_cache_compatibility_patches,
-    apply_qwen3_omni_config_patch,
     sliding_window_overwrite,
 )
+from nemo_automodel.components.models.qwen3_omni_moe.patches import apply_qwen3_omni_config_patch
 
 
 class TestSlidingWindowOverwrite:

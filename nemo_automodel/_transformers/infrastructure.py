@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 
 from nemo_automodel._transformers.utils import _should_load_before_shard
-from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
@@ -109,9 +108,22 @@ def _apply_peft_and_lower_precision(
 def _apply_runtime_compatibility_fixes(model):
     """Apply targeted runtime workarounds after sharding/load completes."""
     model_parts = model.parts if hasattr(model, "parts") else [model]
-    if should_fix_rotary_embeddings(model_parts):
-        fix_rotary_embeddings(model_parts)
+    _apply_registered_post_shard_patches(model_parts)
     return model
+
+
+def _apply_registered_post_shard_patches(model_parts: list[object]) -> None:
+    """Apply model package patches that run after sharding/load."""
+    from nemo_automodel._transformers.registry import ModelRegistry
+    from nemo_automodel.components.models.protocols import PostShardPatchModule, PostShardPatchPredicate
+
+    for patch_module in ModelRegistry.iter_optional_modules("patches", post_shard_patches=True):
+        if not isinstance(patch_module, PostShardPatchModule):
+            continue
+        if not isinstance(patch_module, PostShardPatchPredicate) or patch_module.should_apply_post_shard_patches(
+            model_parts
+        ):
+            patch_module.apply_post_shard_patches(model_parts)
 
 
 #  Sharding helpers

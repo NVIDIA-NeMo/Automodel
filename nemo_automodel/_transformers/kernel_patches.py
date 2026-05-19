@@ -42,16 +42,20 @@ DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
 
-_MODEL_RUNTIME_PATCHES = {
-    "Qwen3_5ForCausalLM": (
-        "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
-        "apply_model_runtime_patches",
-    ),
-    "Qwen3_5ForConditionalGeneration": (
-        "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
-        "apply_model_runtime_patches",
-    ),
-}
+
+@functools.lru_cache(maxsize=64)
+def _load_model_runtime_patch_specs(model_arch_keys: tuple[str, ...]):
+    """Load runtime patch declarations for the requested architecture keys."""
+    from nemo_automodel._transformers.registry import ModelRegistry
+    from nemo_automodel.components.models.protocols import RuntimePatchSpecModule
+
+    specs = {}
+    for module in ModelRegistry.iter_optional_modules_for_architectures(model_arch_keys, "patches"):
+        if not isinstance(module, RuntimePatchSpecModule):
+            logger.debug("Runtime patch declaration module has no get_runtime_patch_specs(): %s", module.__name__)
+            continue
+        specs.update(module.get_runtime_patch_specs())
+    return specs
 
 
 def _assert_same_signature(original, patched):
@@ -160,8 +164,10 @@ def _model_runtime_patch_keys(model):
 def apply_model_runtime_patches(model, mesh):
     """Apply registered architecture-specific runtime patches to a model."""
     seen_hooks = set()
-    for key in _model_runtime_patch_keys(model):
-        hook_spec = _MODEL_RUNTIME_PATCHES.get(key)
+    model_arch_keys = tuple(_model_runtime_patch_keys(model))
+    runtime_patch_specs = _load_model_runtime_patch_specs(model_arch_keys)
+    for key in model_arch_keys:
+        hook_spec = runtime_patch_specs.get(key)
         if hook_spec is None or hook_spec in seen_hooks:
             continue
         seen_hooks.add(hook_spec)

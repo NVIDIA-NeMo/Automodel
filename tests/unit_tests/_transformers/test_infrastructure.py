@@ -221,8 +221,9 @@ class TestApplyModelInfrastructurePostShardInit:
 
     def test_skips_model_to_device_when_checkpoint_loaded_with_dtensor(self, monkeypatch):
         """DTensor-sharded post-shard checkpoint loads should skip model.to(device)."""
-        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
         import torch.distributed.tensor as dist_tensor
+
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
         class FakeDTensor:
             pass
@@ -380,14 +381,22 @@ class TestApplyModelInfrastructurePostShardInit:
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
         model = _DummyModel()
+        should_apply = MagicMock(return_value=True)
+        apply_post_shard_patches = MagicMock()
+        patch_module = SimpleNamespace(
+            should_apply_post_shard_patches=should_apply,
+            apply_post_shard_patches=apply_post_shard_patches,
+        )
 
         with (
             patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
             patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
             patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
             patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
-            patch(f"{_INFRA_MODULE}.should_fix_rotary_embeddings", return_value=True) as mock_should_fix,
-            patch(f"{_INFRA_MODULE}.fix_rotary_embeddings") as mock_fix_rotary,
+            patch(
+                "nemo_automodel._transformers.registry.ModelRegistry.iter_optional_modules",
+                return_value=(patch_module,),
+            ) as mock_iter_patch_modules,
             patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         ):
             mock_ckpt = MockCheckpointer.return_value
@@ -402,22 +411,31 @@ class TestApplyModelInfrastructurePostShardInit:
                 pretrained_model_name_or_path="",
             )
 
-            mock_should_fix.assert_called_once_with([model])
-            mock_fix_rotary.assert_called_once_with([model])
+            mock_iter_patch_modules.assert_called_once_with("patches", post_shard_patches=True)
+            should_apply.assert_called_once_with([model])
+            apply_post_shard_patches.assert_called_once_with([model])
 
     def test_skips_rotary_fix_when_not_needed(self):
         """Shared infrastructure should leave non-Nemotron models untouched."""
         from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
         model = _DummyModel()
+        should_apply = MagicMock(return_value=False)
+        apply_post_shard_patches = MagicMock()
+        patch_module = SimpleNamespace(
+            should_apply_post_shard_patches=should_apply,
+            apply_post_shard_patches=apply_post_shard_patches,
+        )
 
         with (
             patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
             patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
             patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
             patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
-            patch(f"{_INFRA_MODULE}.should_fix_rotary_embeddings", return_value=False) as mock_should_fix,
-            patch(f"{_INFRA_MODULE}.fix_rotary_embeddings") as mock_fix_rotary,
+            patch(
+                "nemo_automodel._transformers.registry.ModelRegistry.iter_optional_modules",
+                return_value=(patch_module,),
+            ) as mock_iter_patch_modules,
             patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         ):
             mock_ckpt = MockCheckpointer.return_value
@@ -432,8 +450,9 @@ class TestApplyModelInfrastructurePostShardInit:
                 pretrained_model_name_or_path="",
             )
 
-            mock_should_fix.assert_called_once_with([model])
-            mock_fix_rotary.assert_not_called()
+            mock_iter_patch_modules.assert_called_once_with("patches", post_shard_patches=True)
+            should_apply.assert_called_once_with([model])
+            apply_post_shard_patches.assert_not_called()
 
 
 # =============================================================================

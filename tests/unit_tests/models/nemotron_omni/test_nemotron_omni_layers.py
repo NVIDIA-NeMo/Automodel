@@ -169,9 +169,9 @@ def test_registry_entry_present():
 
     mapping = dict(MODEL_ARCH_MAPPING)
     assert "NemotronH_Nano_Omni_Reasoning_V3" in mapping
-    module_path, class_name, *_ = mapping["NemotronH_Nano_Omni_Reasoning_V3"]
-    assert module_path == "nemo_automodel.components.models.nemotron_omni.model"
-    assert class_name == "NemotronOmniForConditionalGeneration"
+    spec = mapping["NemotronH_Nano_Omni_Reasoning_V3"]
+    assert spec.module_path == "nemo_automodel.components.models.nemotron_omni.model"
+    assert spec.class_name == "NemotronOmniForConditionalGeneration"
 
 
 def test_registry_v2_entry_removed():

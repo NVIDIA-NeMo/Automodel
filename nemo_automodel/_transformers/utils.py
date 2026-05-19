@@ -80,14 +80,6 @@ def sliding_window_overwrite(model_name: str) -> dict[str, Any]:
     return overwrite_dict
 
 
-def apply_qwen3_omni_config_patch():
-    """Fix Qwen3OmniMoeTalkerCodePredictorConfig accessing use_sliding_window."""
-    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
-
-    if not hasattr(Qwen3OmniMoeTalkerCodePredictorConfig, "use_sliding_window"):
-        Qwen3OmniMoeTalkerCodePredictorConfig.use_sliding_window = False
-
-
 def _patch_bytes_to_unicode():
     """Re-export bytes_to_unicode on transformers.models.gpt2.tokenization_gpt2.
 
@@ -242,62 +234,17 @@ def apply_cache_compatibility_patches():
         mu.PreTrainedModel.post_init = _patched_post_init
         mu.PreTrainedModel.post_init._nemo_tied_keys_patched = True  # type: ignore[attr-defined]
 
-    _patch_phi4mm_processor()
+    from nemo_automodel._transformers.registry import ModelRegistry
+    from nemo_automodel.components.models.protocols import GlobalPatchModule
+
+    for patch_module in ModelRegistry.iter_optional_modules("patches", global_patches=True):
+        if isinstance(patch_module, GlobalPatchModule):
+            patch_module.apply_global_patches()
     _patch_peft_prepare_inputs()
 
     from nemo_automodel._transformers.kernel_patches import _patch_legacy_flash_attn_flag
 
     _patch_legacy_flash_attn_flag()
-
-
-def _patch_phi4mm_processor():
-    """Patch AutoProcessor.from_pretrained to fall back to the remote
-    Phi4MMProcessor when the native Phi4MultimodalProcessor fails
-    (hub processor_config.json points to native class but the tokenizer
-    lacks image_token/audio_token attributes the native processor expects).
-    """
-    import transformers.processing_utils as pu
-
-    if getattr(pu.ProcessorMixin.__dict__.get("from_pretrained"), "_nemo_phi4mm_patched", False):
-        return
-    _orig = pu.ProcessorMixin.from_pretrained.__func__
-
-    @classmethod  # type: ignore[misc]
-    def _patched(cls, pretrained_model_name_or_path, *args, **kwargs):
-        try:
-            return _orig(cls, pretrained_model_name_or_path, *args, **kwargs)
-        except AttributeError as e:
-            if "image_token" not in str(e) and "audio_token" not in str(e):
-                raise
-            import json
-
-            from huggingface_hub import hf_hub_download
-            from transformers import AutoTokenizer
-            from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-            kwargs.pop("trust_remote_code", None)
-            repo = pretrained_model_name_or_path
-
-            ProcessorCls = get_class_from_dynamic_module("processing_phi4mm.Phi4MMProcessor", repo)
-            ImageProcCls = get_class_from_dynamic_module("processing_phi4mm.Phi4MMImageProcessor", repo)
-            AudioProcCls = get_class_from_dynamic_module("processing_phi4mm.Phi4MMAudioFeatureExtractor", repo)
-
-            pp_path = hf_hub_download(repo, "preprocessor_config.json")
-            with open(pp_path) as f:
-                pp_cfg = json.load(f)
-
-            return ProcessorCls(
-                ImageProcCls(dynamic_hd=pp_cfg.get("dynamic_hd", 36)),
-                AudioProcCls(
-                    audio_compression_rate=pp_cfg.get("audio_compression_rate", 8),
-                    audio_downsample_rate=pp_cfg.get("audio_downsample_rate", 1),
-                    audio_feat_stride=pp_cfg.get("audio_feat_stride", 1),
-                ),
-                AutoTokenizer.from_pretrained(repo, trust_remote_code=True),
-            )
-
-    _patched._nemo_phi4mm_patched = True  # type: ignore[attr-defined]
-    pu.ProcessorMixin.from_pretrained = _patched
 
 
 def _patch_peft_prepare_inputs():
@@ -324,72 +271,4 @@ def _patch_peft_prepare_inputs():
         _patched._nemo_peft_patched = True  # type: ignore[attr-defined]
         pm.PeftModelForCausalLM.__init__ = _patched
     except ImportError:
-        pass
-
-    # ---------------------------------------------------------------------
-    # DTensor/TP compatibility patches
-    # ---------------------------------------------------------------------
-    # HF Qwen3 slices `hidden_states[:, slice(0, None), :]` when logits_to_keep=0.
-    # Under DTensor this can dispatch to `aten.alias`, which lacks a sharding strategy
-    # on some torch nightly builds used in CI.
-    #
-    # Patch: skip the no-op slice and call lm_head(hidden_states) directly.
-    try:  # pragma: no cover
-        import functools
-
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-
-        if not getattr(Qwen3ForCausalLM.forward, "__nemo_dtensor_logits_to_keep_patched__", False):
-            from transformers.modeling_outputs import CausalLMOutputWithPast  # noqa: WPS433
-
-            _orig_forward = Qwen3ForCausalLM.forward
-
-            @functools.wraps(_orig_forward)
-            def _patched_forward(
-                self,
-                input_ids=None,
-                attention_mask=None,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=None,
-                labels=None,
-                use_cache=None,
-                cache_position=None,
-                logits_to_keep=0,
-                **kwargs,
-            ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    inputs_embeds=inputs_embeds,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    **kwargs,
-                )
-
-                hidden_states = outputs.last_hidden_state
-                if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-                    logits = self.lm_head(hidden_states)
-                else:
-                    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-                    logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-                loss = None
-                if labels is not None:
-                    loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-                return CausalLMOutputWithPast(
-                    loss=loss,
-                    logits=logits,
-                    past_key_values=outputs.past_key_values,
-                    hidden_states=outputs.hidden_states,
-                    attentions=outputs.attentions,
-                )
-
-            _patched_forward.__nemo_dtensor_logits_to_keep_patched__ = True  # type: ignore[attr-defined]
-            Qwen3ForCausalLM.forward = _patched_forward  # type: ignore[method-assign]
-    except Exception:
-        # Best-effort patch; ignore if transformers/qwen3 is unavailable.
         pass

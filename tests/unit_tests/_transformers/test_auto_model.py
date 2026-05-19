@@ -202,11 +202,22 @@ class TestModelRuntimePatches:
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+        patch_specs = {
+            "Qwen3_5ForCausalLM": (
+                "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+                "apply_model_runtime_patches",
+            )
+        }
 
-        with patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            return_value=fake_module,
-        ) as mock_import:
+        with (
+            patch(
+                "nemo_automodel._transformers.kernel_patches._load_model_runtime_patch_specs", return_value=patch_specs
+            ),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                return_value=fake_module,
+            ) as mock_import,
+        ):
             assert apply_model_runtime_patches(model, mesh) is model
 
         mock_import.assert_called_once_with("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn")
@@ -224,10 +235,23 @@ class TestModelRuntimePatches:
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+        hook_spec = (
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+            "apply_model_runtime_patches",
+        )
+        patch_specs = {
+            "Qwen3_5ForCausalLM": hook_spec,
+            "Qwen3_5ForConditionalGeneration": hook_spec,
+        }
 
-        with patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            return_value=fake_module,
+        with (
+            patch(
+                "nemo_automodel._transformers.kernel_patches._load_model_runtime_patch_specs", return_value=patch_specs
+            ),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                return_value=fake_module,
+            ),
         ):
             assert apply_model_runtime_patches(model, mesh) is model
 
@@ -239,7 +263,10 @@ class TestModelRuntimePatches:
         model = self._DummyModel(["LlamaForCausalLM"])
         mesh = types.SimpleNamespace(cp_size=1)
 
-        with patch("nemo_automodel._transformers.kernel_patches.importlib.import_module") as mock_import:
+        with (
+            patch("nemo_automodel._transformers.kernel_patches._load_model_runtime_patch_specs", return_value={}),
+            patch("nemo_automodel._transformers.kernel_patches.importlib.import_module") as mock_import,
+        ):
             assert apply_model_runtime_patches(model, mesh) is model
 
         mock_import.assert_not_called()
@@ -249,12 +276,60 @@ class TestModelRuntimePatches:
 
         model = self._DummyModel(["Qwen3_5ForCausalLM"])
         mesh = types.SimpleNamespace(cp_size=1)
+        patch_specs = {
+            "Qwen3_5ForCausalLM": (
+                "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+                "apply_model_runtime_patches",
+            )
+        }
 
-        with patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            side_effect=ImportError,
+        with (
+            patch(
+                "nemo_automodel._transformers.kernel_patches._load_model_runtime_patch_specs", return_value=patch_specs
+            ),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                side_effect=ImportError,
+            ),
         ):
             assert apply_model_runtime_patches(model, mesh) is model
+
+    def test_runtime_patch_specs_load_from_model_registry(self):
+        from nemo_automodel._transformers import kernel_patches
+
+        fake_patches = types.SimpleNamespace(
+            __name__="fake.patches",
+            get_runtime_patch_specs=lambda: {
+                "FakeArch": ("fake.runtime", "apply_model_runtime_patches"),
+            },
+        )
+
+        kernel_patches._load_model_runtime_patch_specs.cache_clear()
+        try:
+            with patch(
+                "nemo_automodel._transformers.registry.ModelRegistry.iter_optional_modules_for_architectures",
+                return_value=(fake_patches,),
+            ) as mock_iter_patch_modules:
+                specs = kernel_patches._load_model_runtime_patch_specs(("FakeArch",))
+        finally:
+            kernel_patches._load_model_runtime_patch_specs.cache_clear()
+
+        mock_iter_patch_modules.assert_called_once_with(("FakeArch",), "patches")
+        assert specs == {"FakeArch": ("fake.runtime", "apply_model_runtime_patches")}
+
+    def test_qwen35_declares_runtime_patch_specs(self):
+        from nemo_automodel.components.models.qwen3_5_moe.patches import get_runtime_patch_specs
+
+        specs = get_runtime_patch_specs()
+
+        assert specs["Qwen3_5ForCausalLM"] == (
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+            "apply_model_runtime_patches",
+        )
+        assert specs["Qwen3_5ForConditionalGeneration"] == (
+            "nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn",
+            "apply_model_runtime_patches",
+        )
 
 
 class TestPatchLegacyFlashAttnFlag:
@@ -1001,7 +1076,10 @@ class TestModelMappingKeyErrorFallback:
 
         with (
             patch("nemo_automodel._transformers.model_init.ModelRegistry.has_custom_model", return_value=True),
-            patch("nemo_automodel._transformers.model_init.ModelRegistry.resolve_custom_model_cls") as mock_resolve,
+            patch(
+                "nemo_automodel._transformers.model_init.ModelRegistry.resolve_custom_model_cls",
+                return_value=None,
+            ) as mock_resolve,
             patch("nemo_automodel._transformers.model_init._get_mixin_wrapped_class") as mock_wrap,
         ):
             mock_wrap.return_value = type("WrappedModel", (HFCheckpointingMixin, FakeModel), {})
@@ -1015,7 +1093,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        mock_resolve.assert_not_called()
+        mock_resolve.assert_called_once_with("NemotronHForCausalLM", fake_config)
         mock_wrap.assert_called_once_with(FakeModel)
 
     def test_fallback_path_unknown_config_falls_back_to_type_model(self):
@@ -1240,10 +1318,15 @@ class TestBuildModelRetryDepth:
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)),
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
-            patch("nemo_automodel._transformers.auto_model.apply_model_runtime_patches", side_effect=fake_runtime_patches),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_runtime_patches", side_effect=fake_runtime_patches
+            ),
             patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
             patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
-            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", side_effect=fake_apply_infrastructure),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+                side_effect=fake_apply_infrastructure,
+            ),
             patch("torch.cuda.current_device", return_value=0),
         ):
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)

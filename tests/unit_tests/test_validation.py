@@ -475,50 +475,48 @@ class TestValidateForMesh:
 
 
 # ---------------------------------------------------------------------------
-# _is_config_compatible_with_custom_model + get_is_hf_model
+# model supports_config + get_is_hf_model
 # ---------------------------------------------------------------------------
 
 
 class TestGetIsHfModel:
-    """Verify that get_is_hf_model uses config compatibility checks."""
+    """Verify that get_is_hf_model uses registry compatibility checks."""
+
+    def test_nemotron_h_supports_only_v3_moe_configs(self):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        assert NemotronHForCausalLM.supports_config(SimpleNamespace(n_routed_experts=8)) is True
+        assert NemotronHForCausalLM.supports_config(SimpleNamespace()) is False
 
     def test_nemotron_h_v3_uses_custom(self):
-        from unittest.mock import MagicMock
-
         from nemo_automodel._transformers.model_init import get_is_hf_model
 
         config = SimpleNamespace(
             architectures=["NemotronHForCausalLM"],
             n_routed_experts=8,
         )
-        reg_mapping = MagicMock()
-        reg_mapping.__contains__ = lambda self, k: k == "NemotronHForCausalLM"
-        with patch("nemo_automodel._transformers.model_init.ModelRegistry") as mock_reg:
-            mock_reg.model_arch_name_to_cls = reg_mapping
+        with (
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.has_custom_model", return_value=True),
+            patch(
+                "nemo_automodel._transformers.model_init.ModelRegistry.resolve_custom_model_cls", return_value=object
+            ),
+        ):
             assert get_is_hf_model(config, force_hf=False) is False
 
     def test_nemotron_h_v2_falls_through_to_hf(self):
-        from unittest.mock import MagicMock
-
         from nemo_automodel._transformers.model_init import get_is_hf_model
 
         config = SimpleNamespace(
             architectures=["NemotronHForCausalLM"],
         )
-        reg_mapping = MagicMock()
-        reg_mapping.__contains__ = lambda self, k: k == "NemotronHForCausalLM"
-        with patch("nemo_automodel._transformers.model_init.ModelRegistry") as mock_reg:
-            mock_reg.model_arch_name_to_cls = reg_mapping
+        with (
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.has_custom_model", return_value=True),
+            patch("nemo_automodel._transformers.model_init.ModelRegistry.resolve_custom_model_cls", return_value=None),
+        ):
             assert get_is_hf_model(config, force_hf=False) is True
 
     def test_force_hf_always_returns_true(self):
-        from unittest.mock import MagicMock
-
         from nemo_automodel._transformers.model_init import get_is_hf_model
 
         config = SimpleNamespace(architectures=["LlamaForCausalLM"])
-        reg_mapping = MagicMock()
-        reg_mapping.__contains__ = lambda self, k: True
-        with patch("nemo_automodel._transformers.model_init.ModelRegistry") as mock_reg:
-            mock_reg.model_arch_name_to_cls = reg_mapping
-            assert get_is_hf_model(config, force_hf=True) is True
+        assert get_is_hf_model(config, force_hf=True) is True
