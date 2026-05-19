@@ -90,6 +90,61 @@ def test_llama_eagle3_draft_forward_shape():
     assert logits.shape == (batch_size, seq_len, config.draft_vocab_size)
 
 
+def test_build_eagle3_token_mapping_rejects_non_positive_draft_vocab_size():
+    """``draft_vocab_size`` must be a positive int or ``None``.
+
+    Without validation, ``draft_vocab_size=0`` returns an empty selection
+    and ``draft_vocab_size=-1`` slices the special-token list (which has
+    nothing to do with the requested vocab size). Both are silent
+    miscompilations -- raise instead.
+    """
+
+    class DummyLoader:
+        def __iter__(self):
+            yield {
+                "input_ids": torch.tensor([[5, 9, 9, 3]], dtype=torch.long),
+                "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.long),
+            }
+
+    for bad in (0, -1, -16):
+        with pytest.raises(ValueError, match="draft_vocab_size"):
+            build_eagle3_token_mapping(
+                DummyLoader(),
+                target_vocab_size=16,
+                draft_vocab_size=bad,
+                special_token_ids=[0, 1],
+            )
+
+    # Non-int (e.g. a float coming from YAML) is also rejected.
+    with pytest.raises(ValueError, match="draft_vocab_size"):
+        build_eagle3_token_mapping(
+            DummyLoader(),
+            target_vocab_size=16,
+            draft_vocab_size=4.0,  # type: ignore[arg-type]
+            special_token_ids=[0, 1],
+        )
+
+
+def test_build_eagle3_token_mapping_rejects_non_positive_target_vocab_size():
+    """``target_vocab_size`` must be a positive int; it sizes the count tensor."""
+
+    class DummyLoader:
+        def __iter__(self):
+            yield {
+                "input_ids": torch.tensor([[5, 9, 9, 3]], dtype=torch.long),
+                "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.long),
+            }
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="target_vocab_size"):
+            build_eagle3_token_mapping(
+                DummyLoader(),
+                target_vocab_size=bad,
+                draft_vocab_size=4,
+                special_token_ids=[0, 1],
+            )
+
+
 def test_build_eagle3_token_mapping_keeps_requested_vocab_size():
     class DummyLoader:
         def __iter__(self):
@@ -125,6 +180,50 @@ def _build_tiny_draft_model() -> LlamaEagle3DraftModel:
     config.draft_vocab_size = 16
     config.target_hidden_size = 32
     return LlamaEagle3DraftModel(config).to(torch.float32)
+
+
+def test_eagle3_trainer_rejects_non_positive_ttt_steps():
+    """Misconfigured ``ttt_steps`` must raise at construction.
+
+    The forward pass divides by ``sum(0.8**i for i in range(ttt_steps))``,
+    which is zero when ``ttt_steps <= 0`` and would silently produce a
+    NaN loss. Catching it in ``__init__`` keeps the failure local to the
+    recipe setup step.
+    """
+    import pytest
+
+    draft = _build_tiny_draft_model()
+    config = draft.config
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+
+    for bad in (0, -1, -7):
+        with pytest.raises(ValueError, match="ttt_steps"):
+            Eagle3TrainerModule(
+                draft,
+                selected_token_ids=selected_token_ids,
+                selected_token_mask=selected_token_mask,
+                ttt_steps=bad,
+            )
+
+    # Non-int (e.g. a float coming from YAML) is also rejected.
+    with pytest.raises(ValueError, match="ttt_steps"):
+        Eagle3TrainerModule(
+            draft,
+            selected_token_ids=selected_token_ids,
+            selected_token_mask=selected_token_mask,
+            ttt_steps=1.0,  # type: ignore[arg-type]
+        )
+
+    # ``ttt_steps=1`` is the minimum valid configuration and must work.
+    trainer = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=1,
+    )
+    assert trainer.ttt_steps == 1
 
 
 def test_eagle3_trainer_runs_multi_step_ttt():
