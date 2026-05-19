@@ -57,7 +57,7 @@ class MegatronFSDPManager:
         from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
         config = MegatronFSDPConfig(zero_dp_strategy=3, overlap_grad_reduce=True)
-        # device_mesh created externally via create_device_mesh()
+        # device_mesh created externally via create_mesh_context()
         manager = MegatronFSDPManager(config, device_mesh=device_mesh)
         model, optimizer = manager.parallelize(model, optimizer)
     """

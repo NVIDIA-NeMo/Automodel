@@ -29,7 +29,7 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
 config = FSDP2Config(activation_checkpointing=True)
-# device_mesh is created elsewhere (e.g. by the recipe via setup_distributed)
+# device_mesh is created elsewhere (e.g. by the recipe via create_mesh_context_from_config)
 manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
 model = manager.parallelize(model)
 ```

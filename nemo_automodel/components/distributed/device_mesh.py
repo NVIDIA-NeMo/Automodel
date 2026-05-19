@@ -12,26 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device mesh creation utilities for distributed training.
+"""Mesh context and device mesh creation utilities for distributed training.
 
-This module provides a central function to create device meshes based on the
-distributed config type (FSDP2, MegatronFSDP, or DDP).
-
-Usage:
-    from nemo_automodel.components.distributed.config import FSDP2Config
-    from nemo_automodel.components.distributed.device_mesh import create_device_mesh
-
-    config = FSDP2Config(sequence_parallel=True)
-    device_mesh, moe_mesh = create_device_mesh(
-        config,
-        tp_size=2,
-        pp_size=1,
-        dp_replicate_size=2,
-        world_size=8,
-    )
+This module is the canonical entry point for building the ``MeshContext`` used
+by recipe setup and distributed managers. Raw device mesh construction remains
+private to keep the public API aligned with its return type. Mesh access helpers
+such as ``get_flat_mesh`` live in :mod:`nemo_automodel.components.distributed.mesh_utils`.
 """
 
-from typing import Optional, Tuple, Union
+import dataclasses
+from typing import Any
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -40,52 +30,182 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
 )
-from nemo_automodel.components.distributed.mesh_utils import _unflatten_compat
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
+from nemo_automodel.components.distributed.mesh import (
+    STRATEGY_ALIASES,
+    STRATEGY_MAP,
+    MeshAxisName,
+    MeshContext,
+    normalize_strategy_name,
+)
+from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
+from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
 
-def create_device_mesh(
-    distributed_config: Union[FSDP2Config, MegatronFSDPConfig, DDPConfig],
+def create_mesh_context(
+    strategy: str | FSDP2Config | MegatronFSDPConfig | DDPConfig = "fsdp2",
     *,
-    dp_size: Optional[int] = None,
-    dp_replicate_size: Optional[int] = None,
+    distributed_config: FSDP2Config | MegatronFSDPConfig | DDPConfig | None = None,
+    dp_size: int | None = None,
+    dp_replicate_size: int | None = None,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    cp_size: int = 1,
+    ep_size: int = 1,
+    world_size: int | None = None,
+    pipeline_config: PipelineConfig | dict | None = None,
+    moe_config: MoEParallelizerConfig | dict | None = None,
+    activation_checkpointing: bool | None = None,
+    **strategy_kwargs: Any,
+) -> MeshContext:
+    """Create a :class:`MeshContext` from a strategy name or config object.
+
+    Args:
+        strategy: Strategy name (``"fsdp2"``, ``"megatron_fsdp"``, ``"mfsdp"``,
+            or ``"ddp"``) or an already-instantiated strategy config.
+        distributed_config: Backward-compatible keyword alias for passing an
+            already-instantiated strategy config.
+        dp_size: Data parallel size. If None, inferred from world_size and other
+            parallelism sizes.
+        dp_replicate_size: FSDP2-only. Size of the replication group for HSDP.
+        tp_size: Tensor parallel size.
+        pp_size: Pipeline parallel size.
+        cp_size: Context parallel size.
+        ep_size: Expert parallel size.
+        world_size: Total number of processes. If None, inferred from the
+            distributed environment.
+        pipeline_config: Optional pipeline config object or kwargs dict. A default
+            ``PipelineConfig`` is created when ``pp_size > 1`` and no config is
+            supplied.
+        moe_config: Optional MoE parallelizer config object or kwargs dict. A
+            default ``MoEParallelizerConfig`` is created when ``ep_size > 1`` and
+            no config is supplied.
+        activation_checkpointing: Whether activation checkpointing is enabled.
+            For non-EP FSDP/DDP/Megatron configs this is also routed onto the
+            strategy config, matching recipe setup behavior.
+        **strategy_kwargs: Strategy-specific config fields used when *strategy*
+            is a string.
+
+    Returns:
+        A fully initialized ``MeshContext``.
+
+    Raises:
+        ValueError: If an unknown strategy name or strategy option is provided.
+        ValueError: If dp_replicate_size is provided with non-FSDP2 config.
+        ValueError: If world_size is not divisible by requested parallelism sizes.
+    """
+    if world_size is None:
+        world_size = get_world_size_safe()
+    if distributed_config is not None:
+        if strategy != "fsdp2":
+            raise ValueError("Pass either strategy or distributed_config, not both")
+        strategy = distributed_config
+
+    strategy_config = _resolve_strategy_config(
+        strategy,
+        ep_size=ep_size,
+        activation_checkpointing=activation_checkpointing,
+        strategy_kwargs=strategy_kwargs,
+    )
+    if activation_checkpointing is None:
+        activation_checkpointing = bool(getattr(strategy_config, "activation_checkpointing", False))
+    elif (ep_size or 1) <= 1 and hasattr(strategy_config, "activation_checkpointing"):
+        setattr(strategy_config, "activation_checkpointing", activation_checkpointing)
+
+    device_mesh, moe_mesh = _create_device_meshes(
+        strategy_config,
+        dp_size=dp_size,
+        dp_replicate_size=dp_replicate_size,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        ep_size=ep_size,
+        world_size=world_size,
+    )
+
+    return MeshContext(
+        strategy_config=strategy_config,
+        pipeline_config=_resolve_pipeline_config(pipeline_config, pp_size),
+        moe_config=_resolve_moe_config(moe_config, ep_size),
+        activation_checkpointing=activation_checkpointing,
+        device_mesh=device_mesh,
+        moe_mesh=moe_mesh,
+    )
+
+
+def _resolve_strategy_config(
+    strategy: str | FSDP2Config | MegatronFSDPConfig | DDPConfig,
+    *,
+    ep_size: int,
+    activation_checkpointing: bool | None,
+    strategy_kwargs: dict[str, Any],
+) -> FSDP2Config | MegatronFSDPConfig | DDPConfig:
+    """Resolve a strategy name or config object into a strategy config."""
+    if isinstance(strategy, (FSDP2Config, MegatronFSDPConfig, DDPConfig)):
+        if strategy_kwargs:
+            raise ValueError("Strategy-specific keyword arguments require strategy to be a string")
+        return strategy
+
+    if not isinstance(strategy, str):
+        raise ValueError(f"Unknown distributed strategy type: {type(strategy)}")
+
+    strategy_name = normalize_strategy_name(strategy)
+    if strategy_name not in STRATEGY_MAP:
+        valid = sorted(set(STRATEGY_MAP) | set(STRATEGY_ALIASES))
+        raise ValueError(f"Unknown strategy: {strategy}. Valid strategies: {valid}")
+
+    strategy_cls = STRATEGY_MAP[strategy_name]
+    strategy_kwargs = strategy_kwargs.copy()
+    if activation_checkpointing is not None and (ep_size or 1) <= 1:
+        strategy_kwargs["activation_checkpointing"] = activation_checkpointing
+    _validate_strategy_kwargs(strategy_name, strategy_cls, strategy_kwargs)
+    return strategy_cls(**strategy_kwargs)
+
+
+def _validate_strategy_kwargs(strategy_name: str, strategy_cls: type, strategy_kwargs: dict[str, Any]) -> None:
+    """Check that strategy kwargs are accepted by the strategy dataclass."""
+    valid_fields = {field.name for field in dataclasses.fields(strategy_cls)}
+    unknown = set(strategy_kwargs) - valid_fields
+    if unknown:
+        raise ValueError(f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}")
+
+
+def _resolve_pipeline_config(pipeline_config: PipelineConfig | dict | None, pp_size: int) -> PipelineConfig | None:
+    """Resolve pipeline config inputs using recipe-compatible defaults."""
+    if (pp_size or 1) <= 1:
+        return None
+    if pipeline_config is None:
+        return PipelineConfig()
+    if isinstance(pipeline_config, PipelineConfig):
+        return pipeline_config
+    return PipelineConfig(**pipeline_config)
+
+
+def _resolve_moe_config(moe_config: MoEParallelizerConfig | dict | None, ep_size: int) -> MoEParallelizerConfig | None:
+    """Resolve MoE config inputs using recipe-compatible defaults."""
+    if (ep_size or 1) <= 1:
+        return None
+    if moe_config is None:
+        return MoEParallelizerConfig()
+    if isinstance(moe_config, MoEParallelizerConfig):
+        return moe_config
+    return MoEParallelizerConfig(**moe_config)
+
+
+def _create_device_meshes(
+    distributed_config: FSDP2Config | MegatronFSDPConfig | DDPConfig,
+    *,
+    dp_size: int | None = None,
+    dp_replicate_size: int | None = None,
     tp_size: int = 1,
     pp_size: int = 1,
     cp_size: int = 1,
     ep_size: int = 1,
     world_size: int,
-) -> Tuple[Optional[DeviceMesh], Optional[DeviceMesh]]:
-    """Create device mesh based on distributed config type.
-
-    Routes to the appropriate mesh creation logic based on config type.
-
-    Args:
-        distributed_config: The distributed config (FSDP2Config, MegatronFSDPConfig,
-            or DDPConfig).
-        dp_size: Data parallel size. If None, inferred from world_size and other
-            parallelism sizes.
-        dp_replicate_size: FSDP2-only. Size of the replication group for HSDP
-            (Hybrid Sharded Data Parallel). If None or <= 0, defaults to 1.
-            Must be a divisor of dp_size.
-        tp_size: Tensor parallel size.
-        pp_size: Pipeline parallel size.
-        cp_size: Context parallel size.
-        ep_size: Expert parallel size (for MoE models).
-        world_size: Total number of processes.
-
-    Returns:
-        tuple: (device_mesh, moe_mesh)
-            - For FSDP2Config: Full device mesh + optional moe_mesh (if ep_size > 1)
-            - For MegatronFSDPConfig: Device mesh + None
-            - For DDPConfig: (None, None) - DDP doesn't use device mesh
-
-    Raises:
-        ValueError: If dp_replicate_size is provided with non-FSDP2 config.
-        ValueError: If world_size is not divisible by parallelism sizes.
-    """
-    # Validate FSDP2-only params
-    if dp_replicate_size is not None and dp_replicate_size > 1:
-        if not isinstance(distributed_config, FSDP2Config):
-            raise ValueError("dp_replicate_size is only supported with FSDP2Config")
+) -> tuple[DeviceMesh | None, DeviceMesh | None]:
+    """Create raw device meshes based on distributed config type."""
+    if dp_replicate_size is not None and dp_replicate_size > 1 and not isinstance(distributed_config, FSDP2Config):
+        raise ValueError("dp_replicate_size is only supported with FSDP2Config")
 
     if isinstance(distributed_config, FSDP2Config):
         return _create_fsdp2_device_mesh(
@@ -99,6 +219,10 @@ def create_device_mesh(
             backend=distributed_config.backend,
         )
     elif isinstance(distributed_config, MegatronFSDPConfig):
+        if (pp_size or 1) > 1:
+            raise ValueError("megatron_fsdp does not support pipeline parallelism")
+        if (ep_size or 1) > 1:
+            raise ValueError("megatron_fsdp does not support expert parallelism")
         mesh = _create_megatron_fsdp_device_mesh(
             dp_size=dp_size,
             tp_size=tp_size,
@@ -108,46 +232,30 @@ def create_device_mesh(
         )
         return mesh, None
     elif isinstance(distributed_config, DDPConfig):
-        return None, None  # DDP doesn't use device mesh
+        if (tp_size or 1) > 1:
+            raise ValueError("ddp does not support tensor parallelism")
+        if (pp_size or 1) > 1:
+            raise ValueError("ddp does not support pipeline parallelism")
+        if (cp_size or 1) > 1:
+            raise ValueError("ddp does not support context parallelism")
+        if (ep_size or 1) > 1:
+            raise ValueError("ddp does not support expert parallelism")
+        return None, None
     else:
         raise ValueError(f"Unknown distributed config type: {type(distributed_config)}")
 
 
 def _create_fsdp2_device_mesh(
-    dp_size: Optional[int],
-    dp_replicate_size: Optional[int],
+    dp_size: int | None,
+    dp_replicate_size: int | None,
     tp_size: int,
     pp_size: int,
     cp_size: int,
     ep_size: int,
     world_size: int,
     backend: str,
-) -> Tuple[DeviceMesh, Optional[DeviceMesh]]:
-    """
-    Create device mesh for FSDP2.
-
-    Mesh shape: (pp_size, dp_replicate_size, dp_shard_size, cp_size, tp_size)
-    Mesh names: ("pp", "dp_replicate", "dp_shard", "cp", "tp")
-
-    Also creates flattened submeshes:
-        - "dp": dp_replicate + dp_shard
-        - "dp_shard_cp": dp_shard + cp
-        - "dp_cp": dp_replicate + dp_shard + cp
-
-    Args:
-        dp_size: Data parallel size. If None, inferred from world_size.
-        dp_replicate_size: Size of the replication group for HSDP.
-        tp_size: Tensor parallel size.
-        pp_size: Pipeline parallel size.
-        cp_size: Context parallel size.
-        ep_size: Expert parallel size (for MoE models).
-        world_size: Total number of processes.
-        backend: Distributed backend ('nccl' or 'gloo').
-
-    Returns:
-        tuple: (device_mesh, moe_mesh)
-    """
-    # Normalize sizes
+) -> tuple[DeviceMesh, DeviceMesh | None]:
+    """Create the FSDP2 root mesh and optional MoE mesh."""
     if tp_size is None or tp_size <= 0:
         tp_size = 1
     if cp_size is None or cp_size <= 0:
@@ -157,7 +265,6 @@ def _create_fsdp2_device_mesh(
     if ep_size is None or ep_size <= 0:
         ep_size = 1
 
-    # Infer dp_size if not provided
     if dp_size is None or dp_size <= 0:
         total_parallel_ranks = tp_size * cp_size * pp_size
         if world_size % total_parallel_ranks != 0:
@@ -170,25 +277,25 @@ def _create_fsdp2_device_mesh(
     if dp_replicate_size is None or dp_replicate_size <= 0:
         dp_replicate_size = 1
 
-    # HSDP usecase: dp_size = dp_replicate_size * dp_shard_size
     assert dp_size % dp_replicate_size == 0, "dp_size must be a multiple of dp_replicate_size"
     assert dp_replicate_size < dp_size or dp_replicate_size == 1, (
-        "dp_replicate_size must be less than dp_size since ddp usecase is not supported by FSDP2"
+        f"dp_replicate_size={dp_replicate_size} must be less than dp_size={dp_size} "
+        "since DDP usecase is not supported by FSDP2"
     )
 
-    # Expert parallelism: EP spans all non-pp dims (dp, cp, tp)
     non_pp_size = dp_size * cp_size * tp_size
     assert non_pp_size % ep_size == 0, f"{non_pp_size=} must be a multiple of {ep_size=}"
-    if ep_size < non_pp_size:
-        ep_shard_size = non_pp_size // ep_size
-    else:
-        ep_shard_size = 1
-
+    ep_shard_size = non_pp_size // ep_size if ep_size < non_pp_size else 1
     dp_shard_size = dp_size // dp_replicate_size
 
-    # Build main device mesh
     mesh_shape = (pp_size, dp_replicate_size, dp_shard_size, cp_size, tp_size)
-    mesh_names = ("pp", "dp_replicate", "dp_shard", "cp", "tp")
+    mesh_names = (
+        MeshAxisName.PP,
+        MeshAxisName.DP_REPLICATE,
+        MeshAxisName.DP_SHARD,
+        MeshAxisName.CP,
+        MeshAxisName.TP,
+    )
     for shape, name in zip(mesh_shape, mesh_names):
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"
@@ -199,72 +306,44 @@ def _create_fsdp2_device_mesh(
         mesh_dim_names=mesh_names,
     )
 
-    # Create flattened submeshes
-    # Based on https://github.com/pytorch/torchtitan/blob/d282cf2ce9ca8049b4b8423c1d7578c80426576f/torchtitan/distributed/parallel_dims.py#L191
-    dp_mesh_dim_names = []  # Mesh for data loading (no communication on this mesh)
-    dp_shard_cp_mesh_dim_names = []  # Mesh for param sharding
-    dp_cp_mesh_dim_names = []  # Mesh for loss all-reduce
+    dp_mesh_dim_names = [MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD]
+    dp_shard_cp_mesh_dim_names = [MeshAxisName.DP_SHARD, MeshAxisName.CP]
+    dp_cp_mesh_dim_names = [MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP]
 
-    # for dp_replicate:
-    dp_mesh_dim_names.append("dp_replicate")
-    dp_cp_mesh_dim_names.append("dp_replicate")
-    # for dp_shard:
-    dp_mesh_dim_names.append("dp_shard")
-    dp_shard_cp_mesh_dim_names.append("dp_shard")
-    dp_cp_mesh_dim_names.append("dp_shard")
-    # for cp:
-    dp_shard_cp_mesh_dim_names.append("cp")
-    dp_cp_mesh_dim_names.append("cp")
+    _dp_flat = device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP)
+    _dp_shard_cp_flat = device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_SHARD_CP)
+    _dp_cp_flat = device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+    if not hasattr(device_mesh, "_flatten_mapping"):
+        device_mesh._flatten_mapping = {}
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP, _dp_flat)
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_SHARD_CP, _dp_shard_cp_flat)
+    device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
-    # Flatten submeshes
-    device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-    device_mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
-    device_mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
-
-    # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
     moe_mesh = None
     if ep_size > 1:
-        non_pp_mesh = device_mesh[("dp_replicate", "dp_shard", "cp", "tp")]._flatten()
+        non_pp_dims = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
+        non_pp_mesh = device_mesh[non_pp_dims]._flatten()
         moe_mesh = _unflatten_compat(
             non_pp_mesh,
             0,
             (ep_shard_size, ep_size),
-            ("ep_shard", "ep"),
+            (MeshAxisName.EP_SHARD, MeshAxisName.EP),
         )
 
     return device_mesh, moe_mesh
 
 
 def _create_megatron_fsdp_device_mesh(
-    dp_size: Optional[int],
+    dp_size: int | None,
     tp_size: int,
     cp_size: int,
     world_size: int,
     backend: str,
 ) -> DeviceMesh:
-    """
-    Create device mesh for MegatronFSDP.
-
-    Mesh shape: (dp_size, cp_size, tp_size)
-    Mesh names: ("dp", "cp", "tp")
-
-    Also creates flattened submesh "dp_cp" if cp_size > 1.
-
-    Args:
-        dp_size: Data parallel size. If None, inferred from world_size.
-        tp_size: Tensor parallel size.
-        cp_size: Context parallel size.
-        world_size: Total number of processes.
-        backend: Distributed backend ('nccl' or 'gloo').
-
-    Returns:
-        DeviceMesh: The device mesh for MegatronFSDP.
-    """
-    # Normalize sizes
+    """Create the Megatron FSDP mesh."""
     tp_size = tp_size or 1
     cp_size = cp_size or 1
 
-    # Infer dp_size if not provided
     if dp_size is None or dp_size <= 0:
         total_parallel_ranks = tp_size * cp_size
         if world_size % total_parallel_ranks != 0:
@@ -275,20 +354,40 @@ def _create_megatron_fsdp_device_mesh(
         dp_size = world_size // total_parallel_ranks
 
     mesh_shape = (dp_size, cp_size, tp_size)
-    mesh_names = ("dp", "cp", "tp")
+    mesh_names = (MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP)
     for shape, name in zip(mesh_shape, mesh_names):
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"
 
-    # Build mesh [dp, cp, tp]
     device_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
         mesh_shape=mesh_shape,
         mesh_dim_names=mesh_names,
     )
 
-    # Flatten dp+cp if cp > 1
     if cp_size > 1:
-        device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
+        _dp_cp_flat = device_mesh[(MeshAxisName.DP, MeshAxisName.CP)]._flatten(mesh_dim_name=MeshAxisName.DP_CP)
+        if not hasattr(device_mesh, "_flatten_mapping"):
+            device_mesh._flatten_mapping = {}
+        device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
     return device_mesh
+
+
+def _unflatten_compat(flat_mesh: DeviceMesh, dim: int, sizes: tuple, names: tuple) -> DeviceMesh:
+    """Compatibility shim for DeviceMesh._unflatten(), added in PyTorch 2.10."""
+    if hasattr(flat_mesh, "_unflatten"):
+        return flat_mesh._unflatten(dim, sizes, names)
+    new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
+    from torch.distributed.device_mesh import DeviceMesh as _DeviceMesh
+
+    return _DeviceMesh(flat_mesh.device_type, new_mesh_tensor, mesh_dim_names=names)
+
+
+__all__ = [
+    "create_mesh_context",
+    "_create_device_meshes",
+    "_create_fsdp2_device_mesh",
+    "_create_megatron_fsdp_device_mesh",
+    "_unflatten_compat",
+]

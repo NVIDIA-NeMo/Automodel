@@ -162,7 +162,7 @@ def test_build_model_passes_freeze_config():
             return {"freeze_language_model": False, "freeze_vision_tower": True}
 
     with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
+        build_model(
             cfg_model=cfg_model,
             cfg_freeze=FreezeConfig(),
             cfg_peft=None,
@@ -793,8 +793,6 @@ class DummyModelConfigWithAdapter:
 def test_vlm_build_model_with_adapter():
     """Test that model with state_dict_adapter is properly instantiated in VLM."""
 
-    cfg_opt = DummyOptConfig(lr=0.01)
-
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
@@ -980,7 +978,7 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
             seed=42,
             device_mesh=mock_device_mesh,
         )
-        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
+        build_optimizer(model, cfg_opt, None, mock_device_mesh)
 
     assert cfg_opt.foreach is False
 
@@ -2467,7 +2465,7 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.setup_distributed",
+        "nemo_automodel.recipes.vlm.finetune.create_mesh_context_from_config",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=None,
             pipeline_config=None,
@@ -2609,7 +2607,10 @@ class TestChunkVlmMedia:
         n_images_per_sample = torch.tensor([3, 1])
 
         pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=2,
+            n_microbatches=2,
             n_images_per_sample=n_images_per_sample,
         )
         assert len(pv_chunks) == 2
@@ -2625,7 +2626,10 @@ class TestChunkVlmMedia:
         pixel_values = torch.randn(int(patch_counts.sum()), 64)
 
         pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 2
@@ -2663,7 +2667,10 @@ class TestChunkVlmMedia:
 
         with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
             chunk_vlm_media(
-                pixel_values, image_grid, batch_size=2, n_microbatches=2,
+                pixel_values,
+                image_grid,
+                batch_size=2,
+                n_microbatches=2,
             )
 
     def test_n_videos_per_sample_packed(self):

@@ -14,14 +14,14 @@
 
 """Tests for the **component-layer** mesh module (MeshContext, validation, STRATEGY_MAP).
 
-Dict-parsing tests live in ``tests/unit_tests/recipes/test_dist_setup.py``.
+Dict-parsing tests live in ``tests/unit_tests/recipes/test_dist_utils.py``.
 """
+
+from unittest.mock import Mock
 
 import pytest
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
-from unittest.mock import Mock
-
 from nemo_automodel.components.distributed.mesh import (
     STRATEGY_MAP,
     MeshAxisName,
@@ -31,7 +31,6 @@ from nemo_automodel.components.distributed.mesh import (
 )
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
 
 # ---------------------------------------------------------------------------
 # MeshContext – defaults (no mesh attached)
@@ -116,8 +115,16 @@ class TestMeshAxisNameEnum:
     def test_all_expected_members(self):
         names = {m.value for m in MeshAxisName}
         assert names == {
-            "pp", "dp", "dp_replicate", "dp_shard", "dp_shard_cp",
-            "dp_cp", "cp", "tp", "ep", "ep_shard",
+            "pp",
+            "dp",
+            "dp_replicate",
+            "dp_shard",
+            "dp_shard_cp",
+            "dp_cp",
+            "cp",
+            "tp",
+            "ep",
+            "ep_shard",
         }
 
 

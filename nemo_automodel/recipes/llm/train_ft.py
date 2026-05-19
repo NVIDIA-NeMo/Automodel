@@ -99,7 +99,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 from nemo_automodel.shared.utils import dtype_from_str
@@ -994,12 +994,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Enable NVTX patching only when explicitly requested in config
         self.enable_nvtx = bool(self.cfg.get("nvtx", False))
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        self.mesh_context = create_mesh_context_from_config(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.mesh_context.strategy_config
+        self.device_mesh = self.mesh_context.device_mesh
+        self.moe_mesh = self.mesh_context.moe_mesh
+        self.pp_enabled = self.mesh_context.pp_enabled
+        self.pipeline_config = self.mesh_context.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -1030,13 +1030,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
+            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
             )
 
             # THD override logic
             if (
-                self.dist_setup.cp_size > 1
+                self.mesh_context.cp_size > 1
                 and _uses_te_dot_product_attention(self.cfg.model)
                 and _uses_thd_collater(self.cfg.dataloader)
             ):
@@ -1095,8 +1095,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
-        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
-            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+        if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
         model = build_model(
@@ -1112,8 +1112,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
             cfg_qat=self.cfg.get("qat", None),
-            cfg_moe=self.dist_setup.moe_config,
-            activation_checkpointing=self.dist_setup.activation_checkpointing,
+            cfg_moe=self.mesh_context.moe_config,
+            activation_checkpointing=self.mesh_context.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
@@ -1144,11 +1144,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
-        if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
+        if self.mesh_context.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
             if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing:
                 raise ValueError(
-                    f"Context parallelism (cp_size={self.dist_setup.cp_size}) with packed sequences "
+                    f"Context parallelism (cp_size={self.mesh_context.cp_size}) with packed sequences "
                     f"is not supported for {type(_m).__name__}.\n"
                     f"Either disable sequence packing:\n"
                     f"  packed_sequence:\n"

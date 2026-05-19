@@ -32,7 +32,7 @@ Decision tree:
 ## YAML Config Structure
 
 The `distributed` section in the recipe YAML maps directly to
-`parse_distributed_section()` in `recipes/_dist_setup.py`:
+`parse_distributed_section()` in `recipes/_dist_utils.py`:
 
 ```yaml
 distributed:
@@ -69,11 +69,12 @@ dp_size = world_size / (tp_size * pp_size * cp_size)
 ## Infrastructure Flow
 
 ```
-YAML distributed section
-    -> parse_distributed_section()          [recipes/_dist_setup.py]
-    -> setup_distributed()                  [recipes/_dist_setup.py]
-        -> create_device_mesh()             [components/distributed/device_mesh.py]
-        -> MeshContext(...)                  [components/distributed/mesh.py]
+initialize_distributed()                       [components/distributed/init_utils.py]
+    -> initializes torch.distributed process group and returns DistInfo
+YAML distributed section + DistInfo.world_size
+    -> parse_distributed_section()          [recipes/_dist_utils.py]
+    -> create_mesh_context_from_config()                  [recipes/_dist_utils.py]
+        -> create_mesh_context()            [components/distributed/device_mesh.py]
     -> instantiate_infrastructure()         [_transformers/infrastructure.py]
         -> _instantiate_distributed()       -> FSDP2Manager / MegatronFSDPManager / DDPManager
         -> _instantiate_pipeline()          -> AutoPipeline (if pp_size > 1)
@@ -372,25 +373,17 @@ scaling dimension:
 When not using YAML recipes, configure distributed training via Python:
 
 ```python
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.device_mesh import create_device_mesh
-from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed import FSDP2Config, create_mesh_context, initialize_distributed
 from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
 
-# 1. Create strategy config
+dist_env = initialize_distributed("nccl")
 config = FSDP2Config(sequence_parallel=True, activation_checkpointing=True)
 
-# 2. Create device mesh
-device_mesh, moe_mesh = create_device_mesh(
-    config, tp_size=2, pp_size=1, cp_size=1, ep_size=1, world_size=8,
+mesh = create_mesh_context(
+    config, tp_size=2, pp_size=1, cp_size=1, ep_size=1, world_size=dist_env.world_size,
 )
 
-# 3. Build MeshContext
-mesh = MeshContext.from_meshes(
-    device_mesh, moe_mesh, strategy_config=config, activation_checkpointing=True,
-)
-
-# 4. Instantiate infrastructure
+# 3. Instantiate infrastructure
 model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
     distributed_config=config, mesh=mesh,
 )
@@ -428,13 +421,13 @@ components/distributed/mesh.py
     MeshAxisName -- PP, DP, DP_REPLICATE, DP_SHARD, DP_SHARD_CP, DP_CP, CP, TP, EP, EP_SHARD
 ```
 
-Device mesh creation:
+Mesh context and raw mesh creation:
 
 ```
 components/distributed/device_mesh.py
-    create_device_mesh()          -- routes to FSDP2/MegatronFSDP/DDP mesh creation
+    create_mesh_context()         -- builds MeshContext from strategy + parallelism
+    _create_device_meshes()       -- routes to FSDP2/MegatronFSDP/DDP raw mesh creation
     _create_fsdp2_device_mesh()   -- shape (pp, dp_replicate, dp_shard, cp, tp) + flattened submeshes
-    _create_moe_mesh()            -- shape (pp, ep_shard, ep)
 ```
 
 Distributed managers:
@@ -477,9 +470,9 @@ _transformers/infrastructure.py
 YAML parsing:
 
 ```
-recipes/_dist_setup.py
+recipes/_dist_utils.py
     parse_distributed_section()  -- YAML dict -> typed configs + sizes
-    setup_distributed()          -- full entry-point: parse + create meshes + MeshContext
+    create_mesh_context_from_config()          -- recipe adapter: parse + create MeshContext; does not init process group
 ```
 
 MoE config:

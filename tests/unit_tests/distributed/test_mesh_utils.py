@@ -26,6 +26,27 @@ from nemo_automodel.components.distributed.mesh_utils import (
     get_submesh,
 )
 
+
+def test_mesh_utils_reexports_device_mesh_creation_helpers():
+    """Legacy mesh_utils imports should use the canonical device_mesh implementation."""
+    from nemo_automodel.components.distributed import device_mesh, mesh_utils
+
+    assert mesh_utils.create_mesh_context is device_mesh.create_mesh_context
+    assert mesh_utils._create_device_meshes is device_mesh._create_device_meshes
+    assert mesh_utils._create_fsdp2_device_mesh is device_mesh._create_fsdp2_device_mesh
+    assert mesh_utils._create_megatron_fsdp_device_mesh is device_mesh._create_megatron_fsdp_device_mesh
+
+
+def test_distributed_package_exports_user_entrypoints():
+    """Users can import the two programmatic distributed entry points from one namespace."""
+    from nemo_automodel.components import distributed
+    from nemo_automodel.components.distributed.device_mesh import create_mesh_context
+    from nemo_automodel.components.distributed.init_utils import initialize_distributed
+
+    assert distributed.create_mesh_context is create_mesh_context
+    assert distributed.initialize_distributed is initialize_distributed
+
+
 # ---------------------------------------------------------------------------
 # get_flat_mesh
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     _get_model_name,
@@ -60,12 +60,12 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        self.mesh_context = create_mesh_context_from_config(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.mesh_context.strategy_config
+        self.device_mesh = self.mesh_context.device_mesh
+        self.moe_mesh = self.mesh_context.moe_mesh
+        self.pp_enabled = self.mesh_context.pp_enabled
+        self.pipeline_config = self.mesh_context.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()

@@ -34,7 +34,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     build_checkpoint_config,
@@ -153,12 +153,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
         apply_te_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        self.mesh_context = create_mesh_context_from_config(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.mesh_context.strategy_config
+        self.device_mesh = self.mesh_context.device_mesh
+        self.moe_mesh = self.mesh_context.moe_mesh
+        self.pp_enabled = self.mesh_context.pp_enabled
+        self.pipeline_config = self.mesh_context.pipeline_config
 
         if self.pp_enabled:
             raise NotImplementedError("Encoder does not support pipeline parallelism")

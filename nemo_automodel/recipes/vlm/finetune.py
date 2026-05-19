@@ -77,7 +77,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -673,12 +673,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        self.mesh_context = create_mesh_context_from_config(self.cfg, world_size=self.dist_env.world_size)
+        self.distributed_config = self.mesh_context.strategy_config
+        self.device_mesh = self.mesh_context.device_mesh
+        self.moe_mesh = self.mesh_context.moe_mesh
+        self.pp_enabled = self.mesh_context.pp_enabled
+        self.pipeline_config = self.mesh_context.pipeline_config
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -697,8 +697,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
+            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
             )
 
             assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
@@ -742,8 +742,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
-        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
-            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+        if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
         model = build_model(
@@ -757,8 +757,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
-            cfg_moe=self.dist_setup.moe_config,
-            activation_checkpointing=self.dist_setup.activation_checkpointing,
+            cfg_moe=self.mesh_context.moe_config,
+            activation_checkpointing=self.mesh_context.activation_checkpointing,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

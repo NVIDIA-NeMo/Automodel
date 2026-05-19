@@ -13,6 +13,16 @@
 # limitations under the License.
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.device_mesh import create_mesh_context
+from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
-__all__ = ["FSDP2Config", "MegatronFSDPConfig", "DDPConfig", "PipelineConfig"]
+__all__ = [
+    "DDPConfig",
+    "DistInfo",
+    "FSDP2Config",
+    "MegatronFSDPConfig",
+    "PipelineConfig",
+    "create_mesh_context",
+    "initialize_distributed",
+]

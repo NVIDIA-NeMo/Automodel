@@ -73,7 +73,7 @@ class FSDP2Manager:
         from nemo_automodel.components.distributed.config import FSDP2Config
 
         config = FSDP2Config(sequence_parallel=True, activation_checkpointing=True)
-        # device_mesh created externally via create_device_mesh()
+        # device_mesh created externally via create_mesh_context()
         manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
         model = manager.parallelize(model)
     """

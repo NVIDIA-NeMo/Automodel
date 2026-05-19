@@ -258,7 +258,7 @@ def test_peft_without_pipeline_parallelism(caplog):
                                     cfg_peft=cfg_peft,
                                     seed=42,
                                 )
-                                optimizer = build_optimizer(model, cfg_opt, None, None)
+                                build_optimizer(model, cfg_opt, None, None)
 
                             # Verify that apply_lora was called
                             assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -454,9 +454,9 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
         lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
     )
-    # Stub setup_distributed to avoid requiring torch.distributed init
+    # Stub create_mesh_context_from_config to avoid requiring torch.distributed init
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.llm.train_ft.create_mesh_context_from_config",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=None,
             pipeline_config=None,
@@ -1192,7 +1192,7 @@ def test_build_model_with_quantized_model_config():
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, None)
+                    build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated with quantization config
     assert model is not None
@@ -1216,7 +1216,7 @@ def test_build_model_without_quant_config():
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, None)
+                    build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated without quantization config
     assert model is not None
@@ -1252,7 +1252,7 @@ def test_build_optimizer_disables_foreach_with_tp():
                         seed=42,
                         device_mesh=mock_mesh,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, mock_mesh)
+                    build_optimizer(model, cfg_opt, None, mock_mesh)
 
     # Verify foreach was disabled
     assert cfg_opt.foreach is False
@@ -1812,9 +1812,9 @@ def _minimal_cfg_with_rope_fusion(cp_size: int, rope_fusion: bool):
 def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
     """Variant of _patch_setup_minimals that lets us control cp_size."""
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
-    # Override setup_distributed to expose the desired cp_size
+    # Override create_mesh_context_from_config to expose the desired cp_size
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.setup_distributed",
+        "nemo_automodel.recipes.llm.train_ft.create_mesh_context_from_config",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=None,
             pipeline_config=None,

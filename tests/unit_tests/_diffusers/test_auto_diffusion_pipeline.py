@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -223,61 +224,78 @@ def test_pipeline_spec_validate_for_from_config_passes_with_cls():
 def test_create_parallel_manager_fsdp2_default():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_context = SimpleNamespace(strategy_config=mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.create_mesh_context", return_value=mock_context) as MockCreateMeshContext,
     ):
         MockFSDP2.return_value = Mock()
         manager = _create_parallel_manager({"world_size": 1})
 
-    MockConfig.assert_called_once()
-    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+    MockCreateMeshContext.assert_called_once()
+    assert MockCreateMeshContext.call_args.args == ("fsdp2",)
+    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     assert manager is MockFSDP2.return_value
 
 
 def test_create_parallel_manager_ddp():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
+    mock_context = SimpleNamespace(strategy_config=mock_config)
     with (
         patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
-        patch(f"{MODULE_PATH}.DDPConfig") as MockConfig,
+        patch(f"{MODULE_PATH}.create_mesh_context", return_value=mock_context) as MockCreateMeshContext,
     ):
         MockDDP.return_value = Mock()
         manager = _create_parallel_manager({"_manager_type": "ddp", "some_arg": "value"})
 
-    MockConfig.assert_called_once_with(activation_checkpointing=False, backend="nccl")
-    MockDDP.assert_called_once_with(MockConfig.return_value)
+    MockCreateMeshContext.assert_called_once_with(
+        "ddp",
+        dp_size=None,
+        dp_replicate_size=None,
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        ep_size=1,
+        world_size=None,
+        activation_checkpointing=False,
+        backend="nccl",
+    )
+    MockDDP.assert_called_once_with(mock_config)
     assert manager is MockDDP.return_value
 
 
 def test_create_parallel_manager_explicit_fsdp2():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_context = SimpleNamespace(strategy_config=mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.create_mesh_context", return_value=mock_context),
     ):
         MockFSDP2.return_value = Mock()
         _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
 
-    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
 
 
 def test_create_parallel_manager_fsdp2_passes_perf_options():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_context = SimpleNamespace(strategy_config=mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.create_mesh_context", return_value=mock_context) as MockCreateMeshContext,
     ):
         MockFSDP2.return_value = Mock()
         _create_parallel_manager(
@@ -296,7 +314,7 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
             }
         )
 
-    config_kwargs = MockConfig.call_args.kwargs
+    config_kwargs = MockCreateMeshContext.call_args.kwargs
     assert config_kwargs["sequence_parallel"] is True
     assert config_kwargs["tp_plan"] == {"layer": "colwise"}
     assert config_kwargs["patch_is_packed_sequence"] is True
@@ -664,7 +682,7 @@ def test_from_config_full_pipeline_mode():
 def test_import_diffusers_class_success():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _import_diffusers_class
 
-    with patch("diffusers.SomeClass", create=True, new="sentinel"):
+    with patch.dict("sys.modules", {"diffusers": SimpleNamespace(SomeClass="sentinel")}):
         result = _import_diffusers_class("SomeClass")
     assert result == "sentinel"
 
@@ -672,7 +690,10 @@ def test_import_diffusers_class_success():
 def test_import_diffusers_class_missing_raises():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _import_diffusers_class
 
-    with pytest.raises(ImportError, match="not found in diffusers"):
+    with (
+        patch.dict("sys.modules", {"diffusers": SimpleNamespace()}),
+        pytest.raises(ImportError, match="not found in diffusers"),
+    ):
         _import_diffusers_class("NonExistentClassName12345")
 
 

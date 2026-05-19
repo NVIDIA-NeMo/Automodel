@@ -24,7 +24,7 @@ dp / hsdp).
 
 All inputs and outputs are typed Python objects (dataclasses, enums, etc.).
 YAML / dict parsing belongs in the recipe layer — see
-``nemo_automodel.recipes._dist_setup``.
+``nemo_automodel.recipes._dist_utils``.
 """
 
 from dataclasses import dataclass, field
@@ -50,6 +50,17 @@ STRATEGY_MAP: Dict[str, type] = {
     "megatron_fsdp": MegatronFSDPConfig,
     "ddp": DDPConfig,
 }
+
+#: Maps accepted strategy aliases to canonical ``STRATEGY_MAP`` keys.
+STRATEGY_ALIASES: Dict[str, str] = {
+    "mfsdp": "megatron_fsdp",
+}
+
+
+def normalize_strategy_name(strategy: str) -> str:
+    """Normalize public strategy aliases to ``STRATEGY_MAP`` keys."""
+    strategy_name = strategy.lower().replace("-", "_")
+    return STRATEGY_ALIASES.get(strategy_name, strategy_name)
 
 
 class MeshAxisName(str, Enum):
@@ -91,7 +102,7 @@ class MeshContext:
     Lifecycle
     ---------
     1. Recipes parse YAML to obtain sizes and strategy configs.
-    2. Sizes are passed to ``create_device_mesh`` to build ``DeviceMesh``
+    2. Sizes are passed to ``create_mesh_context`` to build ``DeviceMesh``
        objects.
     3. ``MeshContext`` is created with those meshes; dimension names are
        validated automatically in ``__post_init__``.
