@@ -42,6 +42,7 @@ Memory footprint: zero materialisation of weights — the tool only reads the
 safetensors shard index and either copies shards file-by-file (for base
 ``code2wav.*``/``talker.*``) or symlinks the thinker shards as-is.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -108,6 +109,19 @@ def _write_shard(out_path: Path, tensors: Dict[str, torch.Tensor]) -> None:
 
 
 def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
+    """Materialize an HF-compatible Qwen3-Omni export under ``out_dir``.
+
+    Copies the trained ``thinker.*`` safetensors shards from ``ckpt_dir``,
+    fills in the untrained ``code2wav.*`` / ``talker.*`` shards from the base
+    HF snapshot at ``base_dir``, and writes a merged
+    ``model.safetensors.index.json`` plus the base ``config.json`` and
+    tokenizer/processor metadata.
+
+    Args:
+        ckpt_dir: NEMO consolidated checkpoint directory (thinker-only).
+        base_dir: Base ``Qwen/Qwen3-Omni-30B-A3B-Instruct`` HF snapshot.
+        out_dir: Destination directory for the wrapped HF export.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 1. Collect ckpt thinker shards ----
@@ -120,9 +134,7 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
     ckpt_prefixes = _classify_keys(ckpt_all_keys)
     logger.info("ckpt key counts: %s", {k: len(v) for k, v in ckpt_prefixes.items()})
     if set(ckpt_prefixes.keys()) != {"thinker"}:
-        raise ValueError(
-            f"expected ckpt to contain only 'thinker.*' keys; got prefixes {sorted(ckpt_prefixes.keys())}"
-        )
+        raise ValueError(f"expected ckpt to contain only 'thinker.*' keys; got prefixes {sorted(ckpt_prefixes.keys())}")
 
     # ---- 2. Collect base shards keyed by prefix bucket ----
     base_weight_map = _read_index(base_dir)
@@ -181,8 +193,9 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
         _write_shard(out_dir / out_name, tensors)
         for k in keys:
             new_index[k] = out_name
-        logger.info("wrote thinker shard %s (%d keys, %.2f GB)", out_name,
-                    len(keys), (out_dir / out_name).stat().st_size / 1e9)
+        logger.info(
+            "wrote thinker shard %s (%d keys, %.2f GB)", out_name, len(keys), (out_dir / out_name).stat().st_size / 1e9
+        )
 
     # 3c. Copy code2wav + talker shards from base; filter to only those keys
     # (some base shards mix prefixes).
@@ -196,9 +209,14 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
             _write_shard(out_dir / out_name, tensors)
             for k in keys:
                 new_index[k] = out_name
-            logger.info("wrote %s shard %s (from base %s, %d keys, %.2f GB)",
-                        src_kind, out_name, shard_name, len(keys),
-                        (out_dir / out_name).stat().st_size / 1e9)
+            logger.info(
+                "wrote %s shard %s (from base %s, %d keys, %.2f GB)",
+                src_kind,
+                out_name,
+                shard_name,
+                len(keys),
+                (out_dir / out_name).stat().st_size / 1e9,
+            )
 
     # ---- 4. Write the merged safetensors index ----
     index_path = out_dir / "model.safetensors.index.json"
@@ -228,6 +246,7 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the thinker-to-Omni wrapper script."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt-dir", required=True, help="NEMO PEFT/full-FT consolidated directory")
     p.add_argument("--base-dir", required=True, help="Base Qwen3-Omni HF snapshot directory")
@@ -236,6 +255,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI entry point: resolve paths and invoke :func:`wrap`."""
     args = parse_args()
     wrap(Path(args.ckpt_dir).resolve(), Path(args.base_dir).resolve(), Path(args.out_dir).resolve())
     logger.info("done")

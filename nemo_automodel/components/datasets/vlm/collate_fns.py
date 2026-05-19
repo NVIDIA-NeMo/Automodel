@@ -16,6 +16,7 @@ import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import MagicMock
 
+import numpy as np
 import torch
 from PIL import Image as PILImage
 
@@ -718,7 +719,7 @@ def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) ->
     return audios
 
 
-def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> "np.ndarray":  # type: ignore[name-defined]
+def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> np.ndarray:
     """Coerce an audio payload to a 1-D ``float32`` ``np.ndarray`` or raise.
 
     The single rule:
@@ -738,26 +739,24 @@ def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> "np.n
     Raises:
         ValueError: When the payload is not a numeric array or is not 1-D.
     """
-    import numpy as _np
-
     if hasattr(payload, "detach") and hasattr(payload, "cpu") and hasattr(payload, "numpy"):
         # torch.Tensor or similar; move to CPU before NumPy view.
         payload = payload.detach().cpu().numpy()
 
-    if not isinstance(payload, _np.ndarray):
+    if not isinstance(payload, np.ndarray):
         raise ValueError(
             f"sample[{sample_index}] audio payload must be an np.ndarray or torch.Tensor; "
             f"got type={type(payload).__name__}"
         )
 
-    if not _np.issubdtype(payload.dtype, _np.number):
+    if not np.issubdtype(payload.dtype, np.number):
         raise ValueError(
             f"sample[{sample_index}] audio payload must have a numeric dtype; "
             f"got shape={payload.shape} dtype={payload.dtype}"
         )
 
-    if payload.dtype != _np.float32:
-        payload = payload.astype(_np.float32, copy=False)
+    if payload.dtype != np.float32:
+        payload = payload.astype(np.float32, copy=False)
 
     if payload.ndim != 1:
         raise ValueError(
@@ -828,14 +827,10 @@ def qwen3_omni_asr_collate_fn(
     for idx, conv in enumerate(conversations):
         if not _conversation_ends_with_assistant_text(conv):
             raise ValueError(
-                f"example[{idx}].conversation must end with an assistant turn "
-                f"containing non-empty text; got: {conv!r}"
+                f"example[{idx}].conversation must end with an assistant turn containing non-empty text; got: {conv!r}"
             )
 
-    texts = [
-        processor.apply_chat_template(conv, add_generation_prompt=False, tokenize=False)
-        for conv in conversations
-    ]
+    texts = [processor.apply_chat_template(conv, add_generation_prompt=False, tokenize=False) for conv in conversations]
 
     all_audios: List[Any] = []
     for idx, conv in enumerate(conversations):
