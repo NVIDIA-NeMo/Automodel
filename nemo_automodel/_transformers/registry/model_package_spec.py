@@ -60,9 +60,14 @@ class ModelPackageSpec:
         model_types: tuple[str, ...] = (),
     ) -> "ModelPackageSpec":
         """Create a spec from a model class object."""
-        return cls.from_module_path(
-            model_cls.__module__,
-            model_cls.__name__,
+        package, sep, model_module = model_cls.__module__.rpartition(".")
+        if not sep:
+            package = ""
+            model_module = model_cls.__module__
+        return cls(
+            package=package,
+            class_name=model_cls.__name__,
+            model_module=model_module,
             config_module=config_module,
             config_class_name=config_class_name,
             architectures=architectures,

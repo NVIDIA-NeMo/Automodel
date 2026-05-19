@@ -95,7 +95,7 @@ def test_every_registered_arch_has_model_coverage_doc():
     This guards against the regression where a new arch (e.g. gemma4) is
     registered but never gets a corresponding model card in the docs.
     """
-    from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
     docs_dir = _repo_root() / "docs" / "model-coverage"
     assert docs_dir.is_dir(), f"docs/model-coverage/ not found at {docs_dir}"

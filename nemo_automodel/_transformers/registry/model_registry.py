@@ -222,18 +222,10 @@ RETRIEVAL_MODEL_PACKAGE_SPECS: tuple[ModelPackageSpec, ...] = (
 
 
 @lru_cache
-def make_registry(model_specs: tuple[ModelPackageSpec, ...] = MODEL_PACKAGE_SPECS) -> _BaseModelRegistry:
-    """Return the process-wide model registry singleton."""
+def make_registry(model_specs: tuple[ModelPackageSpec, ...]) -> _BaseModelRegistry:
+    """Return a process-wide model registry singleton for package specs."""
     return _BaseModelRegistry(model_specs=model_specs)
 
 
-@lru_cache
-def make_retrieval_registry(
-    model_specs: tuple[ModelPackageSpec, ...] = RETRIEVAL_MODEL_PACKAGE_SPECS,
-) -> _BaseModelRegistry:
-    """Return the process-wide retrieval model registry singleton."""
-    return _BaseModelRegistry(model_specs=model_specs)
-
-
-ModelRegistry = make_registry()
-RetrievalModelRegistry = make_retrieval_registry()
+ModelRegistry = make_registry(MODEL_PACKAGE_SPECS)
+RetrievalModelRegistry = make_registry(RETRIEVAL_MODEL_PACKAGE_SPECS)

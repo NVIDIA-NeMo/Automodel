@@ -165,8 +165,8 @@ def test_nemotron_omni_config_overrides_propagate():
 
 def test_registry_entry_present():
     """``MODEL_PACKAGE_SPECS`` should resolve the v3 architecture name to our wrapper."""
-    from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
     from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
     mapping = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)
     assert "NemotronH_Nano_Omni_Reasoning_V3" in mapping
@@ -177,7 +177,7 @@ def test_registry_entry_present():
 
 def test_registry_v2_entry_removed():
     """V2 dispatch was deleted along with V2 dump support — keep it gone."""
-    from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
     from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+    from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
     assert "NemotronH_Nano_VL_V2" not in _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)

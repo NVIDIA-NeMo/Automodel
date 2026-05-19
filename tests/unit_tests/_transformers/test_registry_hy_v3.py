@@ -17,14 +17,14 @@
 
 class TestArchMapping:
     def test_hyv3_arch_registered(self):
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
         from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         assert "HYV3ForCausalLM" in _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)
 
     def test_hyv3_arch_points_at_correct_module(self):
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
         from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         entry = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)["HYV3ForCausalLM"]
         assert entry.module_path == "nemo_automodel.components.models.hy_v3.model"
@@ -34,8 +34,8 @@ class TestArchMapping:
         """Walk the mapping path -- importable + the named class exists."""
         import importlib
 
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
         from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         spec = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)["HYV3ForCausalLM"]
         mod_path = spec.module_path
@@ -46,14 +46,14 @@ class TestArchMapping:
 
 class TestCustomConfigRegistration:
     def test_hy_v3_config_registered(self):
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         assert any("hy_v3" in spec.model_types for spec in MODEL_PACKAGE_SPECS)
 
     def test_hy_v3_config_resolves_to_class(self):
         import importlib
 
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         spec = next(spec for spec in MODEL_PACKAGE_SPECS if "hy_v3" in spec.model_types)
         mod_path = spec.config_module_path

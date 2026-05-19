@@ -920,16 +920,16 @@ class TestMistral3ModelVision:
 
 class TestRegistry:
     def test_mistral4_in_registry(self):
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
         from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         mapping = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)
         assert "Mistral4ForCausalLM" in mapping
         assert "Mistral3ForConditionalGeneration" in mapping
 
     def test_registry_module_path(self):
-        from nemo_automodel._transformers.registry import MODEL_PACKAGE_SPECS
         from nemo_automodel._transformers.registry.base import _normalize_model_arch_mapping
+        from nemo_automodel._transformers.registry.model_registry import MODEL_PACKAGE_SPECS
 
         mapping = _normalize_model_arch_mapping(MODEL_PACKAGE_SPECS)
         assert mapping["Mistral4ForCausalLM"].module_path == "nemo_automodel.components.models.mistral4.model"

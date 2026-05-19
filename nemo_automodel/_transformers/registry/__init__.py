@@ -14,16 +14,9 @@
 
 """Public exports for the model registry package."""
 
-from nemo_automodel._transformers.registry.base import _BaseModelRegistry
-from nemo_automodel._transformers.registry.model_package_spec import ModelPackageSpec
-
 _MODEL_REGISTRY_EXPORTS = {
-    "MODEL_PACKAGE_SPECS",
-    "RETRIEVAL_MODEL_PACKAGE_SPECS",
     "ModelRegistry",
     "RetrievalModelRegistry",
-    "make_registry",
-    "make_retrieval_registry",
 }
 
 
@@ -37,12 +30,6 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "MODEL_PACKAGE_SPECS",
-    "RETRIEVAL_MODEL_PACKAGE_SPECS",
     "ModelRegistry",
     "RetrievalModelRegistry",
-    "ModelPackageSpec",
-    "_BaseModelRegistry",
-    "make_registry",
-    "make_retrieval_registry",
 ]
