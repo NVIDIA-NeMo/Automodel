@@ -122,7 +122,7 @@ See the [full benchmark results](performance-summary.md) for configuration detai
 
 ## Advanced Topics
 
-Parallelism, precision, checkpointing strategies and experiment tracking.
+Parallelism, precision, checkpointing strategies, and experiment tracking.
 
 ::::{grid} 1 2 2 3
 :gutter: 1 1 1 2
@@ -213,6 +213,7 @@ Installation <guides/installation.md>
 Configuration <guides/configuration.md>
 🤗 HF Compatibility <guides/huggingface-api-compatibility.md>
 Repo Structure <repository-structure.md>
+Release Notes <release-notes.md>
 ::::
 
 ::::{toctree}
@@ -233,7 +234,7 @@ performance-summary.md
 Overview <model-coverage/overview.md>
 Release Log <model-coverage/latest-models.md>
 Large Language Models <model-coverage/llm/index.md>
-Vison Language Models <model-coverage/vlm/index.md>
+Vision Language Models <model-coverage/vlm/index.md>
 Omni <model-coverage/omni/index.md>
 Diffusion <model-coverage/diffusion/index.md>
 ::::
@@ -255,6 +256,7 @@ Gemma 3 / 3n <guides/omni/gemma3-3n.md>
 Gemma 4 <guides/vlm/gemma4.md>
 Qwen3.5-VL <guides/vlm/qwen3-5.md>
 Nemotron-Omni <guides/vlm/nemotron-omni.md>
+Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 dLLM Fine-Tuning <guides/dllm/finetune.md>
 QAT <guides/quantization-aware-training.md>
@@ -279,7 +281,7 @@ Diffusion Dataset <guides/diffusion/dataset.md>
 Overview <launcher/overview.md>
 Local Workstation <launcher/local-workstation.md>
 SLURM Cluster <launcher/slurm.md>
-NeMo-Run <launcher/nemo-run.md>
+NeMo Run <launcher/nemo-run.md>
 SkyPilot <launcher/skypilot.md>
 SkyPilot k8s <launcher/skypilot-kubernetes.md>
 ::::
@@ -293,4 +295,5 @@ Pipeline Parallelism <guides/pipelining.md>
 guides/fp8-training.md
 guides/mlflow-logging.md
 API Reference <apidocs/index.rst>
+Breaking Changes <breaking-changes.md>
 ::::

@@ -159,10 +159,11 @@ def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
             sd[k[len(prefix) :]] = sd.pop(k)
 
 
-def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] = []) -> None:
+def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] | None = None) -> None:
     """
     Prepend `prefix` once to every key in-place (inverse of `_drop_outer_prefix`).
     """
+    skip_keys = [] if skip_keys is None else skip_keys
     for k in list(sd.keys()):
         if not k.startswith(prefix) and k not in skip_keys:
             sd[prefix + k] = sd.pop(k)
@@ -285,9 +286,10 @@ class ModelState:
         if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
-        if self.is_peft and not _has_quantized_params(self.model[0]):
+        if self.is_peft:
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
-            # correctly with the HF PEFT API.
+            # correctly with the HF PEFT API. Quantized PEFT bypasses DCP above, but the collected
+            # trainable tensors still need the same on-disk key normalization.
             _add_outer_prefix(model_state_dict, "base_model.model.")
             # DoRA: rename lora_magnitude to match HF PEFT's expected key format
             _rename_dora_keys_to_hf(model_state_dict)

@@ -177,6 +177,8 @@ def _process_one_dataset(ds_name, file_path, output_path, columns, tags, pool, c
 
 
 def main():
+    """Precompute text token counts for datasets listed in a meta file."""
+
     mp.set_start_method("fork", force=True)  # COW shared memory
 
     parser = argparse.ArgumentParser(description="Pre-compute text token counts for meta dataset")

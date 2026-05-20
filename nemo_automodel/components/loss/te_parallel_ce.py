@@ -111,6 +111,8 @@ parallel_cross_entropy = CrossEntropyFunction.apply
 
 
 class TEParallelCrossEntropy:
+    """TransformerEngine tensor-parallel cross-entropy loss wrapper."""
+
     def __init__(
         self,
         ignore_index: int = -100,

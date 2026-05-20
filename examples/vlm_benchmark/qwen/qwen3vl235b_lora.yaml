@@ -16,7 +16,7 @@
 # Benchmarking config for Qwen3-VL-235B-A22B LoRA (text backbone only)
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/qwen3vl235b_lora.yaml --nproc-per-node 8
+#   automodel examples/vlm_benchmark/qwen/qwen3vl235b_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction

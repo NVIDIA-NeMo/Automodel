@@ -77,6 +77,18 @@ class TestShiftSample:
         assert "pixel_values" in shifted
         assert shifted["pixel_values"].shape == sample["pixel_values"].shape
 
+    def test_shift_mm_token_type_ids_1d(self):
+        sample = _make_vlm_sample(5)
+        sample["mm_token_type_ids"] = torch.tensor([0, 1, 1, 0, 0])
+        shifted = _shift_sample(sample)
+        assert shifted["mm_token_type_ids"].tolist() == [0, 1, 1, 0]
+
+    def test_shift_mm_token_type_ids_2d(self):
+        sample = _make_vlm_sample(5)
+        sample["mm_token_type_ids"] = torch.tensor([[0, 1, 1, 0, 0]])
+        shifted = _shift_sample(sample)
+        assert shifted["mm_token_type_ids"].tolist() == [0, 1, 1, 0]
+
 
 class TestBuildPackedVlmSample:
     def test_basic(self):
@@ -120,6 +132,22 @@ class TestBuildPackedVlmSample:
         assert result["image_grid_thw"].shape[0] == 3
         assert result["n_images"] == 3
         assert result["n_videos"] == 0
+
+    def test_mm_token_type_ids_propagated(self):
+        samples = [
+            {
+                "input_ids": torch.tensor([1, 2, 3]),
+                "labels": torch.tensor([10, 20, 30]),
+                "mm_token_type_ids": torch.tensor([0, 1, 0]),
+            },
+            {
+                "input_ids": torch.tensor([4, 5]),
+                "labels": torch.tensor([40, 50]),
+                "mm_token_type_ids": torch.tensor([1, 1]),
+            },
+        ]
+        result = _build_packed_vlm_sample(samples, pack_size=8, padding_idx=0)
+        assert result["mm_token_type_ids"].tolist() == [0, 1, 0, 1, 1]
 
 
 class TestNeatPackDatasetVlm:

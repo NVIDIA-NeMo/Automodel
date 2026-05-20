@@ -36,6 +36,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
         ),
         (
+            "BailingMoeV2ForCausalLM",
+            ("nemo_automodel.components.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
+        ),
+        (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
@@ -46,6 +50,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "DeepseekV4ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+        ),
+        (
+            "Ernie4_5_MoeForCausalLM",
+            ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
         (
             "Glm4MoeForCausalLM",
@@ -100,6 +108,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
         ),
         (
+            "MiMoV2FlashForCausalLM",
+            ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
+        ),
+        (
             "Ministral3ForCausalLM",
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
         ),
@@ -118,6 +130,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Mistral3ForConditionalGeneration",
             ("nemo_automodel.components.models.mistral4.model", "Mistral3ForConditionalGeneration"),
+        ),
+        (
+            "Mistral3FP8VLMForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.mistral3_vlm.model",
+                "Mistral3FP8VLMForConditionalGeneration",
+            ),
         ),
         (
             "NemotronHForCausalLM",
@@ -185,11 +204,13 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
+    "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
 }
 

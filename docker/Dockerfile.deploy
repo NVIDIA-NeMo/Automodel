@@ -21,7 +21,8 @@ RUN pip install --no-build-isolation --no-binary=mamba-ssm,causal-conv1d \
     mamba-ssm causal-conv1d
 
 # Test dependencies
-RUN pip install peft pytest pyyaml
+RUN --mount=type=bind,source=tests/ci_tests/requirements_deploy.txt,target=/tmp/requirements_deploy.txt \
+    pip install -r /tmp/requirements_deploy.txt
 
 COPY . /opt/Automodel
 WORKDIR /opt/Automodel

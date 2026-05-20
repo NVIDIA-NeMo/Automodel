@@ -120,7 +120,6 @@ ci:
   nodes: 2
   time: "00:45:00"
   vllm_deploy: true
-  known_issue_id: AM-155
   checkpoint_robustness:
     hf_kl_threshold: 5e-3
     resume_loss_threshold: 5e-2

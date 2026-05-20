@@ -78,6 +78,31 @@ def _supports_seq_lens(model: nn.Module) -> bool:
     return False
 
 
+# Umbrella of multimodal kwarg names used by VLM forwards across families.
+# Mirrors the discovery pattern of ``fake_image._VISION_TOKEN_ID_ATTRS``: every
+# consumer iterates this list and uses whichever keys the live batch contains,
+# so callers don't need a per-model branch. New VLM family -> append its keys.
+VLM_INPUT_KEYS: tuple[str, ...] = (
+    "input_ids",
+    # Image
+    "pixel_values",
+    "image_flags",
+    "imgs_sizes",
+    "image_position_ids",
+    "mm_token_type_ids",
+    "image_grid_hws",
+    "image_grid_thw",
+    "image_sizes",
+    # Video
+    "pixel_values_videos",
+    # Audio / sound
+    "sound_features",
+    "sound_attention_mask",
+    "audio_input_values",
+    "audio_attention_mask",
+)
+
+
 def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     """Drop kwargs that ``model.forward`` does not accept.
 
@@ -98,6 +123,30 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     if dropped:
         logger.debug("Dropping unsupported forward kwargs for %s: %s", type(model).__name__, dropped)
     return filtered
+
+
+def get_lm_head_module(model: nn.Module) -> nn.Module | None:
+    """Return the model's LM head module, if one can be found."""
+    if hasattr(model, "get_output_embeddings"):
+        lm_head = model.get_output_embeddings()
+        if lm_head is not None:
+            return lm_head
+    for name, module in model.named_modules():
+        if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
+            return module
+    return None
+
+
+def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
+    """Return the model's LM-head weight, materializing DTensor weights when needed."""
+    lm_head = get_lm_head_module(model)
+    if lm_head is not None:
+        weight = lm_head.weight
+        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if "lm_head" in name and name.endswith(".weight"):
+            return param.full_tensor() if hasattr(param, "full_tensor") else param
+    raise ValueError("lm_head.weight not found in model")
 
 
 def _get_logical_numel(param) -> int:
@@ -336,6 +385,22 @@ def freeze_unused_kv_sharing_params(model):
         )
 
 
+def freeze_deepseek_v4_indexer_params(model):
+    """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if ".self_attn.compressor.indexer." in name:
+            param.requires_grad_(False)
+            frozen_count += 1
+
+    if frozen_count > 0:
+        logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
+
+
 def cast_mixed_dtype_params_to_bf16(model):
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():
@@ -361,8 +426,13 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     3. Converts max_seqlen from tensor to scalar if needed
 
     Args:
-        input_ids (torch.Tensor): Input token IDs with shape [1, total_tokens] or
-            [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+        input_ids (torch.Tensor or None): Input token IDs with shape [1, total_tokens]
+            or [1, total_tokens, hidden_dim]. The first dimension will be squeezed.
+            ``None`` is permitted when the caller is feeding the model via
+            ``inputs_embeds`` instead — embeddings are squeezed inside the model
+            forward (the ``squeezed_for_thd`` branch in ``NemotronHModel.forward``
+            and analogous code paths), so this helper has nothing to squeeze and
+            simply returns ``None`` for the ``input_ids`` slot.
         position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
             The first dimension will be squeezed.
         padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
@@ -410,7 +480,8 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         This function modifies attn_kwargs in-place. If you need to preserve the original
         dictionary, pass a copy.
     """
-    input_ids = input_ids.squeeze(0)
+    if input_ids is not None:
+        input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)
     if isinstance(padding_mask, torch.Tensor):
         padding_mask = padding_mask.squeeze(0)

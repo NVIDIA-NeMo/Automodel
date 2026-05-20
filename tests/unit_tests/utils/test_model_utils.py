@@ -453,3 +453,93 @@ class TestFilterForwardKwargs:
         filtered = model_utils.filter_forward_kwargs(model, batch)
 
         assert filtered == batch
+
+
+class TestSqueezeInputForThd:
+    """``squeeze_input_for_thd`` strips the placeholder batch dim (``[1, T, ...] -> [T, ...]``)
+    before THD attention/Mamba kernels see the inputs. The contract has to handle
+    ``input_ids=None`` because callers feeding the model via ``inputs_embeds`` only
+    (multimodal LMs, speech-language models) leave ``input_ids`` unset; the embeddings
+    are squeezed inside the model forward instead.
+    """
+
+    def _attn_kwargs(self, *, padded: bool = False, with_max_seqlen: bool = True):
+        """Build the kwargs dict in the canonical [1, num_seqs+1] layout, padded
+        with the ``-1000`` sentinel that ``squeeze_input_for_thd`` filters out."""
+        kwargs: dict = {
+            "cu_seqlens": torch.tensor([[0, 3, 5, -1000]], dtype=torch.int32),
+        }
+        if padded:
+            kwargs["cu_seqlens_padded"] = torch.tensor([[0, 4, 6, -1000]], dtype=torch.int32)
+        if with_max_seqlen:
+            kwargs["max_seqlen"] = torch.tensor([3])
+        return kwargs
+
+    def test_squeezes_input_ids_when_provided(self):
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        padding_mask = torch.tensor([[False, False, False, False, False]])
+        kwargs = self._attn_kwargs()
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(input_ids, position_ids, padding_mask, kwargs)
+
+        assert ids.shape == (5,)
+        assert pos.shape == (5,)
+        assert mask.shape == (5,)
+        # Sentinel filtered out and dtype/shape preserved.
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["cu_seqlens"].dtype == torch.int32
+        # max_seqlen tensor → Python int.
+        assert kw["max_seqlen"] == 3
+        assert isinstance(kw["max_seqlen"], int)
+
+    def test_accepts_input_ids_none_for_inputs_embeds_callers(self):
+        """The bug: prior code did ``input_ids.squeeze(0)`` unconditionally and
+        crashed when the caller used ``inputs_embeds`` only. The fix returns
+        ``None`` for the ``input_ids`` slot and squeezes everything else."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        padding_mask = torch.tensor([[False, False, False, False, False]])
+        kwargs = self._attn_kwargs()
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, padding_mask, kwargs)
+
+        assert ids is None
+        assert pos.shape == (5,)
+        assert mask.shape == (5,)
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["max_seqlen"] == 3
+
+    def test_padding_mask_none_is_passed_through(self):
+        """Existing behavior: ``padding_mask`` may be ``None`` (unmasked path).
+        The new ``input_ids=None`` branch must compose with this."""
+        position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+
+        ids, pos, mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert ids is None
+        assert mask is None
+        assert pos.shape == (5,)
+
+    def test_3d_inputs_embeds_via_input_ids_slot_still_works(self):
+        """Belt-and-braces: the docstring claims ``input_ids`` may carry a 3D
+        ``[1, T, H]`` embedding tensor. Squeezing dim 0 of that yields ``[T, H]``."""
+        embeds = torch.randn(1, 5, 16)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+
+        ids, pos, _mask, _kw = model_utils.squeeze_input_for_thd(embeds, position_ids, None, kwargs)
+
+        assert ids.shape == (5, 16)
+        assert pos.shape == (5,)
+
+    def test_cu_seqlens_padded_filtered_alongside_cu_seqlens(self):
+        """Both ``cu_seqlens`` and ``cu_seqlens_padded`` (CP path) get the
+        sentinel filter — the bug fix must not regress this."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        kwargs = self._attn_kwargs(padded=True, with_max_seqlen=False)
+
+        _ids, _pos, _mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert kw["cu_seqlens"].tolist() == [0, 3, 5]
+        assert kw["cu_seqlens_padded"].tolist() == [0, 4, 6]
