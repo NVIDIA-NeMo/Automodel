@@ -27,7 +27,8 @@ content_type: index
 # NeMo AutoModel Documentation
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
-**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md)
+
+**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md) | [🌐 Omni](guides/omni/gemma3-3n.md) | [🌊 dLLM](guides/dllm/finetune.md)
 
 ::::{grid} 2 2 2 2
 :gutter: 1 1 1 2
@@ -84,7 +85,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 ## Recipes & Guides
 
-Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
+Find the right guide for your task — fine-tuning, pretraining, distillation, diffusion, and more.
 
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
