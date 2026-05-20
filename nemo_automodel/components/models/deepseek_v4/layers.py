@@ -56,6 +56,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -617,10 +618,32 @@ class DeepseekV4Compressor(nn.Module):
         self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
+        self._hca_param_sync_group = None
 
     @property
     def ape(self) -> torch.Tensor:
         return self.ape_param()
+
+    def _set_hca_param_sync_group(self, process_group) -> None:
+        self._hca_param_sync_group = process_group
+
+    def _compute_fsdp_group_has_complete_hca_window(
+        self,
+        local_has_complete_hca_window: bool,
+        device: torch.device,
+    ) -> bool:
+        process_group = self._hca_param_sync_group
+        if process_group is None or not dist.is_available() or not dist.is_initialized():
+            return local_has_complete_hca_window
+        if dist.get_world_size(group=process_group) == 1:
+            return local_has_complete_hca_window
+
+        # A single int max-reduce tells short ranks whether any peer in the same
+        # HCA parameter sync group has a complete HCA window. It is a small
+        # synchronization point, but it avoids using a broader or world group.
+        flag = torch.tensor(int(local_has_complete_hca_window), device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=process_group)
+        return bool(flag.item())
 
     def forward(
         self,
@@ -631,6 +654,7 @@ class DeepseekV4Compressor(nn.Module):
         cache: DeepseekV4TrainCache,
         layer_idx: int,
         start_pos: int,
+        enable_hca_fsdp_graph_alignment: bool = False,
     ) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
@@ -640,6 +664,30 @@ class DeepseekV4Compressor(nn.Module):
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
+        local_has_complete_hca_window = ready_kv.shape[1] > 0
+        fsdp_group_has_complete_hca_window = (
+            self._compute_fsdp_group_has_complete_hca_window(local_has_complete_hca_window, kv.device)
+            if enable_hca_fsdp_graph_alignment
+            else local_has_complete_hca_window
+        )
+        needs_masked_synthetic_hca_window = (
+            enable_hca_fsdp_graph_alignment
+            and self.indexer is None
+            and fsdp_group_has_complete_hca_window
+            and not local_has_complete_hca_window
+            and 0 < kv.shape[1] < self.compress_ratio
+        )
+        if needs_masked_synthetic_hca_window:
+            # A mixed short/long HCA parameter sync group needs every rank to
+            # create the same compressor autograd edges. All-short groups keep
+            # the original no-HCA path so optimizer semantics stay at
+            # grad=None. Zero-length local HCA inputs are outside this narrow
+            # training fix.
+            pad_len = self.compress_ratio - kv.shape[1]
+            pad_shape = (batch, pad_len, kv.shape[-1])
+            ready_kv = torch.cat([kv, kv.new_zeros(pad_shape)], dim=1)
+            ready_gate = torch.cat([gate, gate.new_zeros(pad_shape)], dim=1)
+            pool_base = max(0, start_pos)
         new_pooled = self.kv_norm(
             _pool_windows(
                 ready_kv,
@@ -910,6 +958,14 @@ class DeepseekV4Attention(nn.Module):
                 cache=cache,
                 layer_idx=self.layer_idx,
                 start_pos=start_pos,
+                # Only DeepSeek-V4 HCA (ratio 128) needs this FSDP graph alignment.
+                # Ratio 4 uses the Indexer/SCA path and is outside this fix.
+                # Direct attention calls without an explicit mask keep the
+                # original behavior since synthetic windows must be maskable.
+                # The normal DeepSeek-V4 model path builds this mask upstream.
+                enable_hca_fsdp_graph_alignment=(
+                    self.training and attention_mask is not None and self.compress_ratio == 128
+                ),
             )
             n_pooled = pooled.shape[2]
             full_kv = torch.cat([full_kv, pooled], dim=2)

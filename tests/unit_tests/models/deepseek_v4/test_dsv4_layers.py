@@ -22,8 +22,11 @@ Full-model behaviour is covered by ``test_dsv4_model_smoke.py``.
 
 import pytest
 import torch
+import torch.nn as nn
 
+from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
+    DeepseekV4Attention,
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
     DeepseekV4RotaryEmbedding,
@@ -32,6 +35,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _yarn_correction_dim,
     _yarn_correction_range,
     _yarn_linear_ramp,
+    build_causal_padding_mask,
 )
 
 
@@ -45,6 +49,266 @@ class TestDeepseekV4AttentionMask:
         expected_compressed_mask = torch.tensor([[[[0.0, min_val, 0.0, min_val, min_val]]]])
         compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled=5).unsqueeze(1)
         torch.testing.assert_close(compressed_mask, expected_compressed_mask)
+
+    def test_short_hca_training_window_stays_disabled_without_group_hca(self):
+        """All-short groups should keep the original no-HCA path and grad=None semantics."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention_ref = DeepseekV4Attention(cfg, layer_idx=0)
+        attention_ref.load_state_dict(attention.state_dict())
+
+        attention_ref.eval()
+        with torch.no_grad():
+            expected, expected_weights = attention_ref(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+            )
+
+        attention.train()
+        actual, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert expected_weights.shape[-1] == seq_len
+        assert actual_weights.shape[-1] == seq_len
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+        actual.square().sum().backward()
+
+        compressor = attention.compressor
+        assert compressor is not None
+        params = list(compressor.named_parameters())
+        before = {name: param.detach().clone() for name, param in params}
+        for name, param in params:
+            assert param.grad is None, name
+
+        optimizer = torch.optim.AdamW([param for _, param in params], lr=1e-3, weight_decay=0.1)
+        optimizer.step()
+        for name, param in params:
+            torch.testing.assert_close(param, before[name], atol=0.0, rtol=0.0)
+
+    def test_short_hca_training_window_is_fully_masked_when_group_has_hca(self, monkeypatch):
+        """Mixed short/long groups should mask the synthetic HCA position completely."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention_ref = DeepseekV4Attention(cfg, layer_idx=0)
+        attention_ref.load_state_dict(attention.state_dict())
+
+        attention_ref.eval()
+        with torch.no_grad():
+            expected, expected_weights = attention_ref(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+            )
+
+        attention.train()
+        compressor = attention.compressor
+        assert compressor is not None
+        monkeypatch.setattr(
+            compressor,
+            "_compute_fsdp_group_has_complete_hca_window",
+            lambda local_has_complete_hca_window, device: True,
+        )
+        actual, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert expected_weights.shape[-1] == seq_len
+        assert actual_weights.shape[-1] == seq_len + 1
+        torch.testing.assert_close(
+            actual_weights[..., -1], torch.zeros_like(actual_weights[..., -1]), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+    def test_short_hca_training_window_keeps_compressor_in_backward(self, monkeypatch):
+        """Mixed-group short HCA ranks should produce zero-valued compressor gradients."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        compressor = attention.compressor
+        assert compressor is not None
+        monkeypatch.setattr(
+            compressor,
+            "_compute_fsdp_group_has_complete_hca_window",
+            lambda local_has_complete_hca_window, device: True,
+        )
+
+        output, _ = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+        output.square().sum().backward()
+
+        for name, param in compressor.named_parameters():
+            assert param.grad is not None, name
+            assert torch.isfinite(param.grad).all(), name
+            torch.testing.assert_close(param.grad, torch.zeros_like(param.grad), atol=0.0, rtol=0.0)
+
+    def test_short_hca_training_window_stays_disabled_without_attention_mask(self, monkeypatch):
+        """Synthetic HCA alignment requires a mask so the extra position can be hidden."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, _ = self._hca_inputs(
+            cfg, seq_len
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        compressor = attention.compressor
+        assert compressor is not None
+        monkeypatch.setattr(
+            compressor,
+            "_compute_fsdp_group_has_complete_hca_window",
+            lambda local_has_complete_hca_window, device: True,
+        )
+
+        _, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=None,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert actual_weights.shape[-1] == seq_len
+
+    @pytest.mark.parametrize(
+        ("seq_len", "group_has_hca", "expected_attention_width"),
+        (
+            (127, False, 127),
+            (127, True, 128),
+            (128, False, 129),
+            (129, False, 130),
+        ),
+    )
+    def test_hca_window_boundary_paths(self, monkeypatch, seq_len, group_has_hca, expected_attention_width):
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        if group_has_hca:
+            compressor = attention.compressor
+            assert compressor is not None
+            monkeypatch.setattr(
+                compressor,
+                "_compute_fsdp_group_has_complete_hca_window",
+                lambda local_has_complete_hca_window, device: True,
+            )
+
+        _, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert actual_weights.shape[-1] == expected_attention_width
+
+    @staticmethod
+    def _tiny_hca_config() -> DeepseekV4Config:
+        return DeepseekV4Config(
+            vocab_size=32,
+            hidden_size=16,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=1,
+            n_routed_experts=2,
+            n_shared_experts=0,
+            num_experts_per_tok=1,
+            max_position_embeddings=256,
+            compress_ratios=[128],
+            sliding_window=128,
+            attention_dropout=0.0,
+            num_hash_layers=0,
+            hc_mult=1,
+            num_nextn_predict_layers=0,
+            rms_norm_eps=1e-6,
+            torch_dtype="float32",
+        )
+
+    @staticmethod
+    def _hca_inputs(
+        cfg: DeepseekV4Config,
+        seq_len: int,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        nn.Module,
+        torch.Tensor,
+    ]:
+        hidden_states = torch.randn(1, seq_len, cfg.hidden_size)
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+        partial_rotary_factor = float(cfg.qk_rope_head_dim) / float(cfg.head_dim)
+        rotary = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        rotary_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.compress_rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        position_embeddings = rotary(hidden_states, position_ids)
+        position_embeddings_compress = rotary_compress(hidden_states, position_ids)
+        attention_mask = build_causal_padding_mask(
+            None,
+            seq_len=seq_len,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            batch_size=hidden_states.shape[0],
+            sliding_window=cfg.sliding_window,
+        )
+        return hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask
 
 
 class TestDeepseekV4GroupedLinear:
