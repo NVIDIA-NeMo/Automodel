@@ -613,6 +613,41 @@ def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
     assert ex["doc_image"] == ["", "", ""]
 
 
+def test_make_retrieval_dataset_inline_parquet_end_to_end(tmp_path):
+    """End-to-end: make_retrieval_dataset should accept inline Parquet input."""
+    records = [
+        {
+            "question_id": "q0",
+            "question": "Explain transformers",
+            "corpus_id": rdi.INLINE_CORPUS_ID,
+            "pos_doc": [{"id": "p0", "text": "Transformers are attention models.", "image": "", "nr_ocr": ""}],
+            "neg_doc": [
+                {"id": "n0", "text": "RNNs process sequences recurrently.", "image": "", "nr_ocr": ""},
+                {"id": "n1", "text": "CNNs use convolutions.", "image": "", "nr_ocr": ""},
+            ],
+        }
+    ]
+    parquet_path = tmp_path / "inline.parquet"
+    Dataset.from_list(records).to_parquet(str(parquet_path))
+
+    ds = rdi.make_retrieval_dataset(
+        data_dir_list=str(parquet_path),
+        data_type="train",
+        n_passages=3,
+        do_shuffle=False,
+        cache_dir=str(tmp_path / "hf_cache"),
+    )
+
+    ex = ds[0]
+    assert ex["question"] == "Explain transformers"
+    assert ex["doc_text"] == [
+        "Transformers are attention models.",
+        "RNNs process sequences recurrently.",
+        "CNNs use convolutions.",
+    ]
+    assert ex["doc_image"] == ["", "", ""]
+
+
 def test__load_json_or_jsonl_json_and_jsonl_error_paths(tmp_path):
     # JSON (list)
     f_json = tmp_path / "data.json"

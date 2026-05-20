@@ -15,11 +15,39 @@
 import json
 import logging
 import os
+from glob import glob
+from pathlib import Path
 from typing import Any, Dict, List, Union
 
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 
 INLINE_CORPUS_ID = "__inline__"
+
+
+def _is_hf_dataset_dir(path: str) -> bool:
+    """Return whether *path* looks like a dataset saved by ``Dataset.save_to_disk``."""
+    path_obj = Path(path)
+    return path_obj.is_dir() and (path_obj / "dataset_info.json").is_file() and (path_obj / "state.json").is_file()
+
+
+def _expand_parquet_files(path: str) -> list[str]:
+    """Return Parquet files represented by a file, directory, or glob path."""
+    path_obj = Path(path)
+    if path_obj.is_file() and path_obj.suffix == ".parquet":
+        return [str(path_obj)]
+    if path_obj.is_dir():
+        return sorted(str(p) for p in path_obj.glob("*.parquet"))
+    if any(token in path for token in ("*", "?", "[")):
+        return sorted(p for p in glob(path) if p.endswith(".parquet"))
+    return []
+
+
+def _load_inline_parquet(path: str, cache_dir: str | None = None) -> Dataset:
+    """Load inline retrieval records from Parquet shards."""
+    parquet_files = _expand_parquet_files(path)
+    if not parquet_files:
+        raise ValueError(f"No Parquet files found for inline retrieval dataset path: {path}")
+    return load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=cache_dir)
 
 
 def _load_json_or_jsonl(path: str) -> Union[dict, list]:
@@ -102,9 +130,9 @@ def _resolve_doc_to_example(doc: Any) -> dict:
     return example
 
 
-def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
+def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True, cache_dir: str | None = None):
     """
-    Load retrieval datasets from JSON/JSONL files.
+    Load retrieval datasets from JSON/JSONL, Parquet, or saved HuggingFace datasets.
 
     Copied from nemo-retriever-research/src/data/datasets.py
 
@@ -115,6 +143,18 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
         data_dir_list = [data_dir_list]
     datasets = []
     for data_dir in data_dir_list:
+        if _is_hf_dataset_dir(data_dir):
+            loaded_dataset = load_from_disk(data_dir)
+            if isinstance(loaded_dataset, dict):
+                loaded_dataset = loaded_dataset["train"]
+            datasets.append(loaded_dataset)
+            continue
+
+        parquet_files = _expand_parquet_files(data_dir)
+        if parquet_files:
+            datasets.append(_load_inline_parquet(data_dir, cache_dir=cache_dir))
+            continue
+
         train_data = _load_json_or_jsonl(data_dir)
 
         # Corpus-id based format is intentionally not supported in this "inline" loader.
@@ -362,6 +402,7 @@ def make_retrieval_dataset(
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
+    cache_dir: str | None = None,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -379,6 +420,7 @@ def make_retrieval_dataset(
         do_shuffle: Whether to shuffle the dataset
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
+        cache_dir: Optional HuggingFace datasets cache directory for Parquet loading
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -398,7 +440,7 @@ def make_retrieval_dataset(
     logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
 
     # Load datasets from JSON files
-    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
+    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, cache_dir=cache_dir)
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
