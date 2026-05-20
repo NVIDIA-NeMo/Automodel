@@ -76,6 +76,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 | Date | Modality | Model |
 |------|----------|-------|
+| 2026-05-18 | Audio | Qwen3-Omni ASR ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml)) |
 | 2026-04-07 | LLM | [GLM-5.1](https://github.com/NVIDIA-NeMo/Automodel/discussions/1719) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)) |
 | 2026-04-02 | VLM | Gemma 4 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml)) |
 | 2026-03-16 | VLM | [Mistral Small 4](https://github.com/NVIDIA-NeMo/Automodel/discussions/1558) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml)) |
@@ -96,6 +97,7 @@ Find the right guide for your task -- fine-tuning, pretraining, distillation, di
 | **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](guides/dllm/finetune.md)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3-5.md)                |
+| **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](guides/audio/qwen3-omni-asr.md) |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.md)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](guides/llm/dsv4-flash.md)   |
@@ -257,6 +259,7 @@ Gemma 4 <guides/vlm/gemma4.md>
 Qwen3.5-VL <guides/vlm/qwen3-5.md>
 Nemotron-Omni <guides/vlm/nemotron-omni.md>
 Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
+Qwen3-Omni ASR <guides/audio/qwen3-omni-asr.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 dLLM Fine-Tuning <guides/dllm/finetune.md>
 QAT <guides/quantization-aware-training.md>
