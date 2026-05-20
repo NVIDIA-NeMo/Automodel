@@ -55,9 +55,14 @@ def initialize_attn_module_and_func(
             **kwargs,
         )
 
-        def attn_func(*args, **call_kwargs):
+        def attn_func(q, k, v, **call_kwargs):
             merged = {**defaults, **call_kwargs}
-            return F.scaled_dot_product_attention(*args, **merged)
+            if merged.get("enable_gqa", False) and merged.get("attn_mask", None) is not None:
+                groups = q.shape[-3] // k.shape[-3]
+                k = k.repeat_interleave(groups, dim=-3)
+                v = v.repeat_interleave(groups, dim=-3)
+                merged["enable_gqa"] = False
+            return F.scaled_dot_product_attention(q, k, v, **merged)
 
         return None, attn_func
     elif attn_impl == "flex":
@@ -150,7 +155,36 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-        attn_kwargs["is_causal"] = True
+        window_size = kwargs.get("window_size", (-1, 0))
+        left_window, right_window = window_size if isinstance(window_size, tuple) else (window_size, 0)
+        has_local_window = (left_window is not None and left_window >= 0) or (
+            right_window is not None and right_window > 0
+        )
+        has_padding_mask = attention_mask is not None and not bool(attention_mask.to(dtype=torch.bool).all().item())
+
+        if has_local_window or has_padding_mask:
+            q_len = q.shape[-2]
+            kv_len = k.shape[-2]
+            kv_offset = max(kv_len - q_len, 0)
+            q_pos = torch.arange(q_len, device=q.device) + kv_offset
+            kv_pos = torch.arange(kv_len, device=q.device)
+            causal_mask = kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+
+            if left_window is not None and left_window >= 0:
+                causal_mask = causal_mask & (kv_pos.unsqueeze(0) > q_pos.unsqueeze(1) - left_window)
+            if right_window is not None and right_window > 0:
+                causal_mask = causal_mask & (kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1) + right_window)
+
+            if has_padding_mask:
+                key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+                if key_mask.shape[-1] != kv_len:
+                    key_mask = key_mask[..., -kv_len:]
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0) & key_mask[:, None, None, :]
+
+            attn_kwargs["attn_mask"] = causal_mask
+            attn_kwargs["is_causal"] = False
+        else:
+            attn_kwargs["is_causal"] = True
 
     return q, k, v, attn_kwargs
 
