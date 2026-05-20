@@ -483,13 +483,24 @@ def format_prompt_completion(
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
-    # Tokenize full text
-    tokenized = tokenizer(
-        full_text,
-        padding=padding,
-        truncation=truncation,
-        max_length=seq_length,
-    )
+    # transformers 5.5.0 still honored `padding_side: "right"` baked into the
+    # tokenizer's saved tokenizer_config.json, but 5.8.1 ignores that field and
+    # uses the LlamaTokenizer class default ("left"). Hardcode "right" here so
+    # pad positions land at the end (the label-masking / attention-mask logic
+    # below assumes right padding).
+    _saved_padding_side = getattr(tokenizer, "padding_side", None)
+    if _saved_padding_side is not None:
+        tokenizer.padding_side = "right"
+    try:
+        tokenized = tokenizer(
+            full_text,
+            padding=padding,
+            truncation=truncation,
+            max_length=seq_length,
+        )
+    finally:
+        if _saved_padding_side is not None:
+            tokenizer.padding_side = _saved_padding_side
     input_ids = tokenized["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
