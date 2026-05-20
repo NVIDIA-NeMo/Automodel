@@ -1,5 +1,5 @@
 ---
-name: automodel researcher
+name: automodel research
 ---
 
 # Automodel Researcher
