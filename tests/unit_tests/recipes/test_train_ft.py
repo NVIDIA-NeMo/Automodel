@@ -32,6 +32,7 @@ from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.recipes.llm.train_ft import (
+    PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
     build_model,
@@ -72,6 +73,38 @@ class DummyIterableDataset(IterableDataset):  # noqa: D401
 def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kwargs via attribute
     dl_factory_capture.captured = kwargs
     return "dl"
+
+
+def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(3, 5, bias=False)
+            self.mtp_config = SimpleNamespace(loss_scaling_factor=0.2)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    torch.manual_seed(123)
+    model = DummyModel()
+    model.train()
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+    wrapper = PipelineCausalLMLoss(loss_fn, model)
+
+    logits = torch.randn(1, 4, 5)
+    mtp_h = torch.randn(1, 4, 3)
+    labels = torch.tensor([[1, 2, 3, 4]])
+
+    got = wrapper((logits, mtp_h), labels)
+    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    expected = loss_fn(logits=logits, labels=labels) + 0.2 * loss_fn(
+        logits=model.lm_head(mtp_h),
+        labels=shifted_labels,
+    )
+
+    torch.testing.assert_close(got, expected)
 
 
 def test_build_validation_dataloader_pp_enabled(caplog):
@@ -659,6 +692,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             self.epochs = [0]
             self.is_val_step = False
             self.is_ckpt_step = False
+            self.sigterm_flag = False
 
         def set_epoch(self, epoch):
             self.epoch = epoch

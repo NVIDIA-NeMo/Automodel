@@ -186,6 +186,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     model,
                     sequence_parallel,
                     tp_shard_plan,
+                    tp_size=tp_mesh.size(),
                 ).items()
             }
 
@@ -1416,6 +1417,7 @@ def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
     tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+    tp_size: int = 1,
 ) -> Dict[str, ParallelStyle]:
     """
     Select the tensor-parallel plan for the given model.
@@ -1423,7 +1425,27 @@ def _get_parallel_plan(
     Priority order:
     1) If ``tp_shard_plan`` is provided as a dict or import path, use it.
     2) If the model type exists in ``PARALLELIZE_FUNCTIONS``, use its optimised plan; on failure, fall back to HF plan.
-    3) Otherwise, use the default base plan.
+    3) Otherwise, prefer the model's HF-native ``_tp_plan`` (via ``get_hf_tp_shard_plan``).
+    4) Otherwise, fall back to the default base plan.
+
+    When ``tp_size > 1`` and the model falls through to path 4 *and* the
+    model class was loaded from a custom-code source (HF's
+    ``trust_remote_code=True`` path, where the dynamic class lives under
+    ``transformers_modules.*``), this raises ``ValueError`` instead of
+    returning the default base plan. On recent PyTorch the default plan's
+    placements do not populate ``shard_order`` and trip an internal assert in
+    ``torch.distributed.tensor._redistribute`` on the first weight
+    redistribute, which surfaces to the user as an opaque PyTorch internal
+    error. Custom-code architectures are the only known-broken case (see
+    https://github.com/NVIDIA-NeMo/Automodel/issues/2243); known HF
+    architectures that happen to fall through (e.g. Mixtral) are left on the
+    default plan with a warning, since they have been working in practice.
+
+    When the model *did* define a ``_tp_plan`` but ``get_hf_tp_shard_plan``
+    raised while translating it (e.g. styles nemo does not recognize), the
+    translator's error message is folded into the ``ValueError`` as a
+    diagnostic so the user can tell whether to add a ``_tp_plan`` from
+    scratch or fix the styles in the one they already have.
     """
     model_parallel_plan = None
     model_cls = type(model)
@@ -1485,15 +1507,52 @@ def _get_parallel_plan(
         # live under model.language_model.layers.* and would be missed by the
         # hardcoded llama-style wildcards below.
         hf_plan = None
+        hf_plan_error: Exception | None = None
         try:
             hf_plan = get_hf_tp_shard_plan(model)
         except Exception as e:
+            hf_plan_error = e
             logger.info(f"HF tp plan not available ({e}). Falling back to default base plan.")
 
         if hf_plan:
             model_parallel_plan = hf_plan
             logger.info(f"Using HF-native tp plan for {model_cls.__name__}.")
         else:
+            # HF places dynamic classes loaded via ``trust_remote_code=True`` under the
+            # ``transformers_modules.*`` namespace. Those are the only archs known to
+            # actually crash inside ``_redistribute`` with the default base plan, so we
+            # only fail-fast for them. See https://github.com/NVIDIA-NeMo/Automodel/issues/2243.
+            is_remote_code = (model_cls.__module__ or "").startswith("transformers_modules.")
+            if tp_size > 1 and is_remote_code:
+                # If the model author *did* define `_tp_plan` but it was unusable
+                # (e.g. styles nemo does not recognize), surface that diagnostic so the
+                # user knows whether to (a) add a missing `_tp_plan` from scratch or
+                # (b) fix the styles in the one they already have.
+                diag = f" Note: {hf_plan_error}." if hf_plan_error is not None else ""
+                raise ValueError(
+                    f"No tensor-parallel plan is registered for the custom-code architecture "
+                    f"'{model_cls.__name__}' (loaded via trust_remote_code=True), and no usable "
+                    f"HuggingFace `_tp_plan` was found.{diag} The default base plan cannot be used "
+                    f"at tp_size={tp_size}: it produces DTensor placements without `shard_order` "
+                    "metadata, which trips an internal assert in "
+                    "`torch.distributed.tensor._redistribute` on the first weight redistribute. "
+                    "Register a working plan in one of the following ways:\n"
+                    f"  1. Add an entry for '{model_cls.__name__}' to "
+                    "`nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS`.\n"
+                    "  2. Define a `_tp_plan` on the model class with styles nemo recognizes "
+                    "(e.g. `colwise`, `rowwise`, `colwise_rep`, `rowwise_rep`).\n"
+                    "  3. Pass `tp_shard_plan` (dict or import path) when constructing the parallelizer.\n"
+                    "Alternatively, run with tp_size=1."
+                )
+            if tp_size > 1:
+                logger.warning(
+                    "No usable tensor-parallel plan is registered for '%s'. Falling back to the "
+                    "default base plan at tp_size=%d. If you hit an internal assert in "
+                    "`torch.distributed.tensor._redistribute` on `shard_order is not None`, "
+                    "register a plan via `PARALLELIZE_FUNCTIONS`, `_tp_plan`, or `tp_shard_plan`.",
+                    model_cls.__name__,
+                    tp_size,
+                )
             base_model_tp_plan = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),

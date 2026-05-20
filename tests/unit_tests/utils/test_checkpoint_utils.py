@@ -41,6 +41,25 @@ def test_is_tied_word_embeddings_prefers_text_config_value():
     assert checkpoint_utils.is_tied_word_embeddings(model) is False
 
 
+def test_is_tied_word_embeddings_respects_qwen3_vl_moe_exclusion():
+    class DummyTextConfig:
+        tie_word_embeddings = True
+
+    class DummyConfig:
+        tie_word_embeddings = False
+
+        def get_text_config(self):
+            return DummyTextConfig()
+
+    class Qwen3VLMoeForConditionalGeneration(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = DummyConfig()
+
+    model = Qwen3VLMoeForConditionalGeneration()
+    assert checkpoint_utils.is_tied_word_embeddings(model) is False
+
+
 def test_is_tied_word_embeddings_falls_back_to_top_level_when_no_text_config():
     class DummyModel(nn.Module):
         def __init__(self) -> None:

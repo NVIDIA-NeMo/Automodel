@@ -29,14 +29,12 @@ full recipe — exercising the code shape that gets shipped:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
-
 
 # -----------------------------------------------------------------------------
 # Helpers reproducing the recipe's CP-prepare block (train + val flavors).
