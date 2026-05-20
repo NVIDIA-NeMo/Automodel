@@ -87,6 +87,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -316,7 +317,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -324,6 +325,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
     # optimizers like TE FusedAdam that accept dtype kwargs.
@@ -362,6 +364,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
             tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="llm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -1024,7 +1034,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")

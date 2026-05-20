@@ -33,6 +33,7 @@ from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipelin
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -93,6 +94,7 @@ def _build_optimizer(
     trainable_params: list[torch.nn.Parameter],
     optimizer_cfg: Any,
     learning_rate: float,
+    is_peft: bool = False,
 ) -> torch.optim.Optimizer:
     """Build optimizer from config, falling back to AdamW for legacy dict configs."""
     optimizer_cfg = optimizer_cfg or {}
@@ -103,6 +105,14 @@ def _build_optimizer(
         _resolve_optimizer_dtype_strings(optimizer_cfg)
         optimizer = optimizer_cfg.instantiate(params=trainable_params, lr=learning_rate)
         logging.info("[INFO] Optimizer: %s, lr=%s", optimizer.__class__.__name__, learning_rate)
+        warn_if_torch_adam_with_bf16_params(
+            optimizer=optimizer,
+            optimizer_cfg=optimizer_cfg,
+            parameters=trainable_params,
+            is_peft=is_peft,
+            context="diffusion",
+            logger=logging.getLogger(__name__),
+        )
         return optimizer
 
     optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
@@ -124,6 +134,14 @@ def _build_optimizer(
     optimizer = torch.optim.AdamW(trainable_params, **adamw_kwargs)
 
     logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=optimizer_cfg,
+        parameters=trainable_params,
+        is_peft=is_peft,
+        context="diffusion",
+        logger=logging.getLogger(__name__),
+    )
     return optimizer
 
 
@@ -358,7 +376,7 @@ def build_model_and_optimizer(
         if not trainable_params:
             raise RuntimeError("No trainable parameters found in transformer module!")
 
-    optimizer = _build_optimizer(trainable_params, optimizer_cfg, learning_rate)
+    optimizer = _build_optimizer(trainable_params, optimizer_cfg, learning_rate, is_peft=lora_enabled)
 
     trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
     frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)

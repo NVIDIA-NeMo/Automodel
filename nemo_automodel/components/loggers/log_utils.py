@@ -179,7 +179,7 @@ def _ensure_root_handler_with_formatter(formatter: logging.Formatter) -> None:
 
 def setup_logging(
     logging_level: int = logging.INFO,
-    filter_warning: bool = True,
+    filter_warning: bool = False,
     modules_to_filter: Optional[list[str]] = None,
     set_level_for_all_loggers: bool = False,
 ) -> None:
@@ -187,8 +187,8 @@ def setup_logging(
     Set up logging level and filters for the application.
 
     Configures the logging level based on arguments, environment variables,
-    or defaults. Optionally adds filters to suppress warnings or messages
-    from specific modules.
+    or defaults. Optionally adds filters to suppress WARNING records or
+    messages from specific modules.
 
     Logging Level Precedence:
     1. Env var `LOGGING_LEVEL`

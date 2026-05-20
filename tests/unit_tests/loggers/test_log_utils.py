@@ -109,7 +109,8 @@ def test_setup_logging_full(monkeypatch, caplog):
     End-to-end test of setup_logging:
 
     * env var overrides function arg
-    * WARNING messages are filtered
+    * WARNING messages are allowed by default
+    * WARNING messages are filtered when explicitly requested
     * module prefix suppression works
     * RankFilter still lets rank 0 log
     """
@@ -142,17 +143,31 @@ def test_setup_logging_full(monkeypatch, caplog):
     monkeypatch.setenv("RANK", "0")  # keep logging on
 
     try:
-        # Configure logging
+        # Configure logging with the default warning behavior.
         caplog.set_level(logging.DEBUG)
+        mod.setup_logging(
+            logging_level=logging.INFO,  # should be overridden by env
+            set_level_for_all_loggers=True,
+        )
+
+        log_ok = logging.getLogger("public.module")
+
+        with caplog.at_level(logging.DEBUG):
+            log_ok.warning("visible-default-warning")
+
+        messages = {rec.message for rec in caplog.records}
+
+        assert "visible-default-warning" in messages
+
+        caplog.clear()
+
+        # Configure logging with explicit warning filtering.
         mod.setup_logging(
             logging_level=logging.INFO,  # should be overridden by env
             filter_warning=True,
             modules_to_filter=["secret"],
             set_level_for_all_loggers=True,
         )
-
-        # Logger for allowed module
-        log_ok = logging.getLogger("public.module")
 
         # Emit records
         with caplog.at_level(logging.DEBUG):
@@ -162,6 +177,7 @@ def test_setup_logging_full(monkeypatch, caplog):
         messages = {rec.message for rec in caplog.records}
 
         assert "visible-debug" in messages
+        assert "hidden-warning" not in messages
 
         # Confirm root level got set from env override
         assert logging.getLogger().level == logging.DEBUG
