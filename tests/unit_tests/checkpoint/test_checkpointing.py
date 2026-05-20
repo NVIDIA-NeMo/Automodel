@@ -627,19 +627,19 @@ class TestInitializeModelWeights:
             if hasattr(module, "_is_hf_initialized"):
                 assert module._is_hf_initialized is False
 
-    def test_calls_initialize_weights(self):
-        """model.initialize_weights() should be called when available."""
+    def test_calls_init_weights(self):
+        """model.init_weights() should be called when available."""
         model = self._make_meta_model()
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_called_once()
+        model.init_weights.assert_called_once()
 
-    def test_warns_when_no_initialize_weights_method(self):
-        """Should log a warning when model lacks initialize_weights."""
+    def test_warns_when_no_init_weights_method(self):
+        """Should log a warning when model lacks init_weights."""
         model = self._make_meta_model()
-        assert not hasattr(model, "initialize_weights")
+        assert not hasattr(model, "init_weights")
 
         with patch("nemo_automodel.components.checkpoint.checkpointing.logging") as mock_logging:
             Checkpointer.initialize_model_weights(model, torch.device("cpu"))
@@ -650,22 +650,22 @@ class TestInitializeModelWeights:
         model = self._make_meta_model()
         model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
         model._is_hf_initialized = True
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_not_called()
+        model.init_weights.assert_not_called()
         assert model._is_hf_initialized is True
 
     def test_does_not_skip_for_nemotron_v3_moe(self):
         """NemotronHForCausalLM v3 (with n_routed_experts) should NOT be skipped."""
         model = self._make_meta_model()
         model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"], n_routed_experts=8)
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_called_once()
+        model.init_weights.assert_called_once()
 
     @pytest.mark.parametrize(
         "architecture",
@@ -677,11 +677,11 @@ class TestInitializeModelWeights:
         model = self._make_meta_model()
         model.config = SimpleNamespace(architectures=[architecture])
         model._is_hf_initialized = True
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_not_called()
+        model.init_weights.assert_not_called()
         assert model._is_hf_initialized is True
 
     def test_handles_missing_config_gracefully(self):
@@ -689,16 +689,16 @@ class TestInitializeModelWeights:
         with torch.device("meta"):
             model = torch.nn.Linear(4, 4)
         model.config = SimpleNamespace()
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_called_once()
+        model.init_weights.assert_called_once()
 
     def test_peft_init_method_calls_init_peft_adapters(self):
         """When peft_init_method is provided, _init_peft_adapters should be called."""
         model = self._make_meta_model()
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         with patch("nemo_automodel.components.checkpoint.checkpointing._init_peft_adapters") as mock_init_peft:
             Checkpointer.initialize_model_weights(model, torch.device("cpu"), peft_init_method="xavier")
@@ -708,7 +708,7 @@ class TestInitializeModelWeights:
     def test_peft_init_method_none_skips_init_peft_adapters(self):
         """When peft_init_method is None (default), _init_peft_adapters should NOT be called."""
         model = self._make_meta_model()
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         with patch("nemo_automodel.components.checkpoint.checkpointing._init_peft_adapters") as mock_init_peft:
             Checkpointer.initialize_model_weights(model, torch.device("cpu"))
@@ -1010,7 +1010,7 @@ class TestGetStorageReaderInitStep:
 
 class TestSkipInitWeightsOnLoadGate:
     """The Checkpointer.initialize_model_weights gate that lets a model opt
-    out of HF's initialize_weights() via a class attribute.
+    out of HF's init_weights() via a class attribute.
 
     Without this gate, Mistral3FP8VLMForConditionalGeneration's PP load
     deadlocks on stage-divergent DTensor collectives inside HF's init.
@@ -1027,11 +1027,11 @@ class TestSkipInitWeightsOnLoadGate:
         """A model with _skip_init_weights_on_load=True takes the skip branch."""
         model = self._make_meta_model()
         model._skip_init_weights_on_load = True
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_not_called()
+        model.init_weights.assert_not_called()
         # And the _is_hf_initialized flag is left alone (not reset to False).
         assert model._is_hf_initialized is True
 
@@ -1039,21 +1039,21 @@ class TestSkipInitWeightsOnLoadGate:
         """attr=False (or attr-missing default) does NOT take the skip branch."""
         model = self._make_meta_model()
         model._skip_init_weights_on_load = False
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_called_once()
+        model.init_weights.assert_called_once()
 
     def test_does_not_skip_when_attr_missing(self):
-        """No attr at all → default behavior (initialize_weights runs)."""
+        """No attr at all → default behavior (init_weights runs)."""
         model = self._make_meta_model()
         assert not hasattr(model, "_skip_init_weights_on_load")
-        model.initialize_weights = MagicMock()
+        model.init_weights = MagicMock()
 
         Checkpointer.initialize_model_weights(model, torch.device("cpu"))
 
-        model.initialize_weights.assert_called_once()
+        model.init_weights.assert_called_once()
 
 
 class TestConsolidatedIndexUnderPPWithoutSourceIndex:
