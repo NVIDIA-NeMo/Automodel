@@ -197,6 +197,25 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _init_weights(self, module):
+        # transformers v5 PreTrainedModel._init_weights for nn.Linear is
+        # `init.normal_(module.weight.float(), ...)`: when `module.weight` is
+        # bfloat16, `.float()` returns a *new* fp32 tensor and the init writes
+        # into that copy, leaving the original weight whatever uninitialized
+        # garbage `to_empty()` left behind. For `score` (the only missing key
+        # when loading a backbone-only checkpoint into the seq-cls head), this
+        # produced NaNs and broke L2_Retrieval / cross-encoder training. Bypass
+        # the buggy base by initializing `score` in-place here, then defer to
+        # super() for everything else.
+        if module is self.score:
+            std = getattr(self.config, "initializer_range", 0.02) or 0.02
+            with torch.no_grad():
+                module.weight.normal_(mean=0.0, std=std)
+                if module.bias is not None:
+                    module.bias.zero_()
+            return
+        super()._init_weights(module)
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
