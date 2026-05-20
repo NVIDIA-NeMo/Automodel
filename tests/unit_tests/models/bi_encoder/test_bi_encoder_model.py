@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
+import torch
 
 import nemo_automodel._transformers.auto_model as am
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, colbert_scores_and_labels
 
 
 class DummyModel:
@@ -25,6 +29,19 @@ class DummyModel:
 
 class DummyMesh:
     pass
+
+
+class _ToyColbertBiEncoder(torch.nn.Module):
+    do_distributed_inbatch_negative = False
+    l2_normalize = False
+    pooling = "colbert"
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, batch):
+        return batch["input_ids"].float() * self.scale
 
 
 def _apply_common_mocks(monkeypatch):
@@ -180,3 +197,70 @@ def test_cross_encoder_retries_without_liger(monkeypatch):
 
 def test_cross_encoder_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, CrossEncoderModel, am.NeMoAutoModelCrossEncoder)
+
+
+def test_colbert_scores_and_labels_masks_padding_before_maxsim():
+    query = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            [[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        ]
+    )
+    query_attention_mask = torch.tensor([[1, 1], [1, 0]])
+    key = torch.tensor(
+        [
+            [[-0.4, -0.4, 0.0, 0.0], [-0.6, -0.6, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            [[0.8, 0.0, 0.0, 0.0], [0.0, 0.7, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            [[0.2, 0.0, 0.0, 0.0], [0.0, 0.1, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            [[0.0, -0.2, 0.0, 0.0], [0.0, -0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            [[0.0, 0.6, 0.0, 0.0], [0.1, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            [[0.0, -0.9, 0.0, 0.0], [0.0, -0.4, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        ]
+    )
+    key_attention_mask = torch.tensor([[1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0]])
+
+    scores, labels = colbert_scores_and_labels(
+        query,
+        key,
+        current_train_n_passages=3,
+        query_attention_mask=query_attention_mask,
+        key_attention_mask=key_attention_mask,
+    )
+
+    assert torch.allclose(scores, torch.tensor([[-0.8, 1.5, 0.3], [-0.2, 0.6, -0.4]]))
+    assert torch.equal(labels, torch.tensor([0, 0]))
+
+
+def test_forward_backward_step_supports_local_colbert_pooling():
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [_ToyColbertBiEncoder()]
+    recipe.temperature = 1.0
+    recipe.train_n_passages = 2
+
+    batch = {
+        "q_input_ids": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[1.0, 1.0], [0.0, 0.0]],
+            ]
+        ),
+        "q_attention_mask": torch.tensor([[1, 1], [1, 0]]),
+        "d_input_ids": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+                [[1.0, 0.0], [0.0, 0.0]],
+                [[0.0, 1.0], [1.0, 1.0]],
+            ]
+        ),
+        "d_attention_mask": torch.tensor([[1, 1], [1, 0], [1, 0], [1, 1]]),
+    }
+    loss_buffer = []
+
+    recipe._forward_backward_step(0, batch, loss_buffer=loss_buffer, num_batches=1, is_train=True)
+
+    assert len(loss_buffer) == 1
+    assert torch.isfinite(loss_buffer[0])
+    assert recipe.model_parts[0].scale.grad is not None

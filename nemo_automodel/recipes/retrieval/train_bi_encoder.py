@@ -72,6 +72,32 @@ def contrastive_scores_and_labels(
     return qk, labels
 
 
+def colbert_scores_and_labels(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    current_train_n_passages: int,
+    query_attention_mask: torch.Tensor,
+    key_attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local ColBERT MaxSim scores and labels without in-batch negatives."""
+    assert key.shape[0] == query.shape[0] * current_train_n_passages, "{} != {} * {}".format(
+        key.shape[0], query.shape[0], current_train_n_passages
+    )
+    assert query_attention_mask.shape == query.shape[:2], "{} != {}".format(query_attention_mask.shape, query.shape[:2])
+    assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
+
+    key = key.reshape(query.shape[0], current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(query.shape[0], current_train_n_passages, key.shape[2])
+
+    token_scores = torch.einsum("bqd,bnpd->bnqp", query, key)
+    token_scores.masked_fill_(~key_attention_mask[:, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
+    maxsim = token_scores.max(dim=3).values
+    maxsim.masked_fill_(~query_attention_mask[:, None, :].bool(), 0.0)
+    scores = maxsim.sum(dim=2)
+    labels = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
+    return scores, labels
+
+
 def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     """Unpack query and passage inputs from batch dictionary.
 
@@ -377,7 +403,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         local_batch_size=local_bs,
                     )
             else:
-                scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                if getattr(model, "pooling", None) == "colbert":
+                    scores, labels = colbert_scores_and_labels(
+                        q_reps,
+                        p_reps,
+                        n_passages,
+                        query["attention_mask"],
+                        passage["attention_mask"],
+                    )
+                else:
+                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
                 if model.l2_normalize:
                     scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
@@ -465,7 +500,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     q_reps = model(query)
                     p_reps = model(passage)
 
-                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
+                    if getattr(model, "pooling", None) == "colbert":
+                        scores, labels = colbert_scores_and_labels(
+                            q_reps,
+                            p_reps,
+                            self.val_n_passages,
+                            query["attention_mask"],
+                            passage["attention_mask"],
+                        )
+                    else:
+                        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
                     if model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)
