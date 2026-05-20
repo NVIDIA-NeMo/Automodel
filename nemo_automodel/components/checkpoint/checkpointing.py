@@ -240,6 +240,7 @@ class Checkpointer:
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
         self._optim_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
+        self._sync_process_group = None
         if self.config.is_async:
             self._model_ctx.stager = DefaultStager()
             self._optim_ctx.stager = DefaultStager()
@@ -789,6 +790,9 @@ class Checkpointer:
             self._model_ctx.stager.close()
         if self._optim_ctx.stager is not None:
             self._optim_ctx.stager.close()
+        if self._sync_process_group is not None and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group(self._sync_process_group)
+            self._sync_process_group = None
 
     def _do_load(
         self,
@@ -860,8 +864,28 @@ class Checkpointer:
             )
             ctx.staging_active = True
         else:
-            dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
+            dcp.save(
+                state_dict,
+                checkpoint_id=path,
+                storage_writer=storage_writer,
+                planner=planner,
+                process_group=self._get_sync_process_group(),
+            )
         return ret
+
+    def _get_sync_process_group(self) -> Any | None:
+        """
+        Return a CPU-backed process group for synchronous DCP coordination.
+
+        DCP uses object collectives while planning saves. If those collectives
+        run on the default NCCL group, NCCL may need extra CUDA memory at the
+        checkpoint boundary when training has already filled the device.
+        """
+        if not torch.distributed.is_initialized():
+            return None
+        if self._sync_process_group is None:
+            self._sync_process_group = torch.distributed.new_group(backend="gloo")
+        return self._sync_process_group
 
     def _should_write_consolidated_safetensors(self) -> bool:
         """
