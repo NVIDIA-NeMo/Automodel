@@ -34,7 +34,6 @@ Usage:
 
 import sys
 
-import pytest
 import torch
 
 PROMPTS = [
