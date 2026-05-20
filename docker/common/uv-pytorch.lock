@@ -3338,6 +3338,7 @@ all = [
     { name = "qwen-omni-utils" },
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "sentencepiece" },
+    { name = "soundfile" },
     { name = "timm" },
     { name = "torchcodec", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
@@ -3408,6 +3409,7 @@ vlm = [
     { name = "pillow" },
     { name = "qwen-omni-utils" },
     { name = "qwen-vl-utils", extra = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "soundfile" },
     { name = "timm" },
     { name = "torchcodec", marker = "sys_platform == 'never'" },
 ]
@@ -3496,6 +3498,7 @@ requires-dist = [
     { name = "qwen-omni-utils", marker = "extra == 'vlm'" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "sentencepiece", marker = "extra == 'extra'" },
+    { name = "soundfile", marker = "extra == 'vlm'" },
     { name = "tiktoken" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
