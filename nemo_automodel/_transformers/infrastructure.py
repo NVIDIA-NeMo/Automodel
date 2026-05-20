@@ -60,6 +60,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
+    freeze_deepseek_v4_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
     print_trainable_parameters,
@@ -492,6 +493,7 @@ def apply_model_infrastructure(
     # Freeze dead K/V parameters in KV-shared layers (e.g. Gemma4 E2B/E4B)
     # so the optimizer never tracks them and checkpoint save/resume stay consistent.
     freeze_unused_kv_sharing_params(model)
+    freeze_deepseek_v4_indexer_params(model)
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
@@ -597,7 +599,6 @@ def apply_model_infrastructure(
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
-            attach_linear_attn_position_hooks,
         )
 
         is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
@@ -606,7 +607,6 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         for mp in model_parts:
             attach_context_parallel_hooks(mp)
-            attach_linear_attn_position_hooks(mp)
             if is_compile_enabled:
                 attach_cp_sdpa_hooks(mp, cp_mesh)
 

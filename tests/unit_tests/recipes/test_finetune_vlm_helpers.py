@@ -430,6 +430,53 @@ def _patch_pp_optim_step_dependencies(monkeypatch):
         "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
         lambda model_parts, pp_enabled: None,
     )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: None,
+    )
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_clears_first_microbatch_after_first_batch(monkeypatch):
+    recipe, _ = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=2)
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100, 2, -100]]),
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        },
+        {
+            "labels": torch.tensor([[-100, 3, -100, 4]]),
+            "input_ids": torch.tensor([[5, 6, 7, 8]]),
+        },
+    ]
+    events = []
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: events.append("prepare"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: events.append("final"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: events.append("after_first"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
+    )
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        events.append(f"forward_{idx}")
+        loss_buffer.append(torch.tensor(1.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+
+    recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert events == ["prepare", "forward_0", "after_first", "final", "forward_1"]
 
 
 @pytest.mark.cuda(False)

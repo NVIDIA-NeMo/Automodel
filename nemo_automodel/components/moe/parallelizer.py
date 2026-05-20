@@ -57,6 +57,29 @@ def _get_cp_stream() -> torch.cuda.Stream:
     return _CP_STREAM
 
 
+def _iter_transformer_and_mtp_blocks(model: nn.Module):
+    inner = model.model if hasattr(model, "model") and model.model is not None else model
+    text_model = get_text_module(inner)
+
+    layers = getattr(text_model, "layers", None)
+    if layers is not None:
+        for layer_id, block in layers.named_children():
+            yield layers, layer_id, block
+
+    mtp = getattr(model, "mtp", None)
+    mtp_layers = getattr(mtp, "layers", None)
+    if mtp_layers is not None:
+        for layer_id, block in mtp_layers.named_children():
+            yield mtp_layers, layer_id, block
+
+
+def _get_moe_module(block: nn.Module) -> MoE | None:
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return module
+
+
 class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
@@ -117,8 +140,8 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
     _model = get_text_module(_model)
 
     for block in _iter_moe_blocks(model, _model):
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
-        if not isinstance(moe_module, MoE):
+        moe_module = _get_moe_module(block)
+        if moe_module is None:
             continue
         # GroupedExpertsTEGroupedLinear uses TE's GroupedLinear which creates
         # local experts directly. It doesn't support DTensor wrapping, so we
@@ -186,12 +209,7 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
-    if hasattr(model, "model") and model.model is not None:
-        _model = model.model
-    else:
-        _model = model
-    _model = get_text_module(_model)
-    for layer_id, block in _model.layers.named_children():
+    for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
@@ -199,7 +217,7 @@ def apply_ac(
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
-        _model.layers.register_module(layer_id, block)
+        parent_layers.register_module(layer_id, block)
 
 
 def apply_fsdp(
@@ -245,11 +263,11 @@ def apply_fsdp(
         _model = model.model
     else:
         _model = model
-    # handle VLM
+    # Prefer nested text modules when present (VLM models)
     _model = get_text_module(_model)
 
     for block in _iter_moe_blocks(model, _model):
-        moe_module = block.moe if hasattr(block, "moe") else block.mlp
+        moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
             # shards than experts (dim=0).

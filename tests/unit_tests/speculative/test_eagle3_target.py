@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -42,19 +43,46 @@ def test_default_aux_layer_ids_returns_three_unique_for_normal_models():
     assert len(set(ids)) == len(ids)
 
 
-def test_default_aux_layer_ids_deduplicates_on_shallow_models():
-    """Models with fewer than ~7 layers must not collide on the default recipe.
+def test_default_aux_layer_ids_raises_on_shallow_models():
+    """Shallow targets must raise instead of silently returning fewer than 3 ids.
 
     With ``num_layers=5`` the raw recipe yields ``[1, 1, 1]``; with
-    ``num_layers=6`` it yields ``[1, 2, 2]``. Both must be deduplicated
-    (order-preserving) so ``generate_batch`` does not register multiple
-    hooks on the same module and fail the post-forward length check.
+    ``num_layers=6`` it yields ``[1, 2, 2]``. The draft model's ``fc``
+    is sized for exactly ``num_aux_hidden_states`` (default 3) layers,
+    so silently collapsing the list would only defer the crash to a
+    confusing shape mismatch inside the draft. Raise here instead.
     """
-    target_5 = HFEagle3TargetModel(_build_tiny_target(num_hidden_layers=5))
-    assert target_5.aux_layer_ids == [1]
+    with pytest.raises(ValueError, match="too shallow"):
+        HFEagle3TargetModel(_build_tiny_target(num_hidden_layers=5))
+    with pytest.raises(ValueError, match="too shallow"):
+        HFEagle3TargetModel(_build_tiny_target(num_hidden_layers=6))
 
-    target_6 = HFEagle3TargetModel(_build_tiny_target(num_hidden_layers=6))
-    assert target_6.aux_layer_ids == [1, 2]
+
+def test_shallow_model_with_explicit_aux_layer_ids_is_allowed():
+    """Explicit ``aux_layer_ids`` bypasses the default-recipe check.
+
+    Users with shallow targets can still drive the trainer by passing
+    3 in-bounds ids that match the draft's ``num_aux_hidden_states``.
+    """
+    target = HFEagle3TargetModel(
+        _build_tiny_target(num_hidden_layers=5),
+        aux_layer_ids=[0, 2, 4],
+    )
+    assert target.aux_layer_ids == [0, 2, 4]
+
+
+def test_explicit_aux_layer_ids_raises_when_count_does_not_match_recipe():
+    model = _build_tiny_target(num_hidden_layers=8)
+    with pytest.raises(ValueError, match="exactly 3 aux_layer_ids"):
+        HFEagle3TargetModel(model, aux_layer_ids=[1, 3])
+    with pytest.raises(ValueError, match="exactly 3 aux_layer_ids"):
+        HFEagle3TargetModel(model, aux_layer_ids=[0, 2, 4, 6])
+
+
+def test_explicit_aux_layer_ids_raises_when_not_distinct():
+    model = _build_tiny_target(num_hidden_layers=8)
+    with pytest.raises(ValueError, match="must be distinct"):
+        HFEagle3TargetModel(model, aux_layer_ids=[1, 3, 3])
 
 
 def test_generate_batch_aux_hidden_states_shape_and_layer_capture():
@@ -119,14 +147,5 @@ def test_generate_batch_shifts_logits_input_ids_and_loss_mask():
 
 def test_generate_batch_raises_for_out_of_bounds_aux_layer_id():
     model = _build_tiny_target(num_hidden_layers=4)
-    target = HFEagle3TargetModel(model, aux_layer_ids=[1, 2, 99])
-
-    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids)
-    loss_mask = torch.ones_like(input_ids)
-    try:
-        target.generate_batch(input_ids=input_ids, attention_mask=attention_mask, loss_mask=loss_mask)
-    except ValueError as exc:
-        assert "out of bounds" in str(exc)
-    else:
-        raise AssertionError("expected ValueError for out-of-bounds aux layer id")
+    with pytest.raises(ValueError, match="out of bounds"):
+        HFEagle3TargetModel(model, aux_layer_ids=[1, 2, 99])
