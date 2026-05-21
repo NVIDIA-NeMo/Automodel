@@ -22,6 +22,8 @@ difficulty: beginner
 content_type: index
 ---
 
+import { Octicon } from "@/components/Octicon";
+
 (automodel-home)=
 
 # NeMo AutoModel Documentation
@@ -30,25 +32,25 @@ PyTorch-native training that scales from 1 GPU to thousands with a single config
 **Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.mdx) | [🚀 Performance](performance-summary.mdx) | [📐 Scalability](about/key-features.mdx) | [🎯 SFT & PEFT](guides/llm/finetune.mdx) | [🎨 Diffusion](guides/diffusion/finetune.mdx) | [👁️ VLM](guides/vlm/gemma4.mdx)
 
 ::::{grid}
-:::{grid-item-card} About
+:::{grid-item-card} <Octicon name="book" /> About
 :link: about/index
 :link-type: doc
 Overview of NeMo AutoModel and its capabilities.
 :::
 
-:::{grid-item-card} Key Features
+:::{grid-item-card} <Octicon name="zap" /> Key Features
 :link: about/key-features
 :link-type: doc
 Supported workflows, parallelism, recipes, and benchmarks.
 :::
 
-:::{grid-item-card} 🤗 HF Integration
+:::{grid-item-card} <Octicon name="hubot" /> 🤗 HF Integration
 :link: guides/huggingface-api-compatibility
 :link-type: doc
 A `transformers`-compatible library with accelerated model implementations.
 :::
 
-:::{grid-item-card} Model Coverage
+:::{grid-item-card} <Octicon name="checklist" /> Model Coverage
 :link: model-coverage/overview
 :link-type: doc
 Built on `transformers` for day-0 model support and OOTB compatibility.
@@ -125,7 +127,7 @@ See the [full benchmark results](performance-summary.mdx) for configuration deta
 Parallelism, precision, checkpointing strategies, and experiment tracking.
 
 ::::{grid}
-:::{grid-item-card} Pipeline Parallelism
+:::{grid-item-card} <Octicon name="git-merge" /> Pipeline Parallelism
 :link: guides/pipelining
 :link-type: doc
 Torch-native pipelining composable with FSDP2 and DTensor.
@@ -133,7 +135,7 @@ Torch-native pipelining composable with FSDP2 and DTensor.
 3d-parallelism
 :::
 
-:::{grid-item-card} FP8 Training
+:::{grid-item-card} <Octicon name="zap" /> FP8 Training
 :link: guides/fp8-training
 :link-type: doc
 Mixed-precision FP8 training with torchao.
@@ -141,7 +143,7 @@ Mixed-precision FP8 training with torchao.
 FP8 mixed-precision
 :::
 
-:::{grid-item-card} Checkpointing
+:::{grid-item-card} <Octicon name="database" /> Checkpointing
 :link: guides/checkpointing
 :link-type: doc
 Distributed checkpoints with SafeTensors output.
@@ -149,7 +151,7 @@ Distributed checkpoints with SafeTensors output.
 DCP safetensors
 :::
 
-:::{grid-item-card} Gradient Checkpointing
+:::{grid-item-card} <Octicon name="shield-check" /> Gradient Checkpointing
 :link: guides/gradient-checkpointing
 :link-type: doc
 Trade compute for memory with activation checkpointing.
@@ -157,7 +159,7 @@ Trade compute for memory with activation checkpointing.
 memory-efficiency
 :::
 
-:::{grid-item-card} Quantization-Aware Training
+:::{grid-item-card} <Octicon name="meter" /> Quantization-Aware Training
 :link: guides/quantization-aware-training
 :link-type: doc
 Train with quantization for deployment-ready models.
@@ -165,7 +167,7 @@ Train with quantization for deployment-ready models.
 QAT
 :::
 
-:::{grid-item-card} Experiment Tracking
+:::{grid-item-card} <Octicon name="graph" /> Experiment Tracking
 :link: guides/mlflow-logging
 :link-type: doc
 Track experiments and metrics with MLflow and Wandb.
@@ -178,19 +180,19 @@ MLflow Wandb
 ## For Developers
 
 ::::{grid}
-:::{grid-item-card} Repo Internals
+:::{grid-item-card} <Octicon name="file-directory" /> Repo Internals
 :link: repository-structure
 :link-type: doc
 Components, recipes, and CLI architecture.
 :::
 
-:::{grid-item-card} API Reference
+:::{grid-item-card} <Octicon name="code" /> API Reference
 :link: apidocs/index
 :link-type: doc
 Auto-generated Python API documentation.
 :::
 
-:::{grid-item-card} Use as a Library
+:::{grid-item-card} <Octicon name="plug" /> Use as a Library
 :link: about/index
 :link-type: doc
 Drop-in accelerated backend for TRL, lm-eval-harness, OpenRLHF, or any code that loads Hugging Face models.

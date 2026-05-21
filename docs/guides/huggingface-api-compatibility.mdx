@@ -1,3 +1,5 @@
+import { ApiComparison } from "@/components/ApiComparison";
+
 # 🤗 Transformers API Compatibility
 
 NeMo AutoModel is built to work with the 🤗 Hugging Face ecosystem.
@@ -70,10 +72,10 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ### Load a Model and Tokenizer (Transformers v4)
 
-**Hugging Face (`transformers`)**
-
-```python
-import torch
+<ApiComparison
+  leftTitle="Hugging Face (transformers)"
+  rightTitle="NeMo AutoModel (nemo_automodel)"
+  leftCode={`import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 model_id = "gpt2"
@@ -83,12 +85,8 @@ model = AutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
 )
-```
-
-**NeMo AutoModel (`nemo_automodel`)**
-
-```python
-import torch
+`}
+  rightCode={`import torch
 from nemo_automodel import NeMoAutoModelForCausalLM, NeMoAutoTokenizer
 
 model_id = "gpt2"
@@ -98,14 +96,17 @@ model = NeMoAutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
 )
-```
+`}
+/>
 
 ### Text Generation
 
 This snippet assumes you already have a `model` and `tokenizer` (see the loading snippet above).
 
-```python
-import torch
+<ApiComparison
+  leftTitle="Hugging Face (transformers)"
+  rightTitle="NeMo AutoModel (nemo_automodel)"
+  leftCode={`import torch
 
 prompt = "Write a haiku about GPU kernels."
 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -114,28 +115,35 @@ with torch.inference_mode():
     out = model.generate(**inputs, max_new_tokens=64)
 
 print(tokenizer.decode(out[0], skip_special_tokens=True))
-```
+`}
+  rightCode={`import torch
 
+prompt = "Write a haiku about GPU kernels."
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.inference_mode():
+    out = model.generate(**inputs, max_new_tokens=64)
+
+print(tokenizer.decode(out[0], skip_special_tokens=True))
+`}
+/>
 
 ### Tokenizers (Transformers vs NeMo AutoModel)
 
 NeMo AutoModel provides `NeMoAutoTokenizer` as a Transformers-like auto-tokenizer with a small registry for specialized backends (and a safe fallback when no specialization is needed).
 
-**Hugging Face (`transformers`)**
-
-```python
-from transformers import AutoTokenizer
+<ApiComparison
+  leftTitle="Hugging Face (transformers)"
+  rightTitle="NeMo AutoModel (nemo_automodel)"
+  leftCode={`from transformers import AutoTokenizer
 
 tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-```
-
-**NeMo AutoModel (`nemo_automodel`)**
-
-```python
-from nemo_automodel import NeMoAutoTokenizer
+`}
+  rightCode={`from nemo_automodel import NeMoAutoTokenizer
 
 tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-```
+`}
+/>
 
 ## Checkpoints: Save in NeMo AutoModel, Load Everywhere
 
