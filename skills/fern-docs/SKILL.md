@@ -30,11 +30,12 @@ docs/                                ← nightly MDX (top level)
 ├── about/, guides/, model-coverage/, launcher/, api-reference/
 ├── *.png / *.jpg                    ← page-scoped images
 └── fern/                            ← infra only
-    ├── fern.config.json             # Org slug + Fern CLI pin (4.62.4+)
-    ├── docs.yml                     # Site config: instances, versions, redirects, libraries, theme
-    ├── main.css                     # NVIDIA-green theme overrides
-    ├── assets/                      # Logos and shared SVGs (NVIDIA_dark/light/symbol)
-    ├── components/                  # BadgeLinks.tsx, Tag.tsx, CustomFooter.tsx
+    ├── fern.config.json             # Org slug + Fern CLI pin (5.29.0+)
+    ├── docs.yml                     # Site config + global-theme: nvidia (inherits
+    │                                #   logos / footer / theme CSS / fonts / OneTrust JS
+    │                                #   from NVIDIA/fern-components)
+    ├── components/                  # BadgeLinks.tsx, Tag.tsx
+    │                                #   (repo-specific; NVIDIA footer ships in global theme)
     ├── versions/
     │   ├── nightly.yml              # Nav for nightly — paths → ../../<rel>.mdx (up into docs/)
     │   ├── v0.4.yml                 # Nav for frozen 0.4.0 — paths → ./v0.4/pages/
@@ -167,7 +168,7 @@ import { BadgeLinks } from "@/components/BadgeLinks";
 
 `<Tag variant="...">` accepts: `primary`, `secondary`, `success`, `warning`, `danger`, `info`, `light`, `dark` (1:1 with sphinx-design `{bdg-*}` variants).
 
-Images live in `docs/fern/assets/` (shared across all pages) or alongside the MDX file (page-scoped). Reference page-scoped images with relative paths (`./image.png`), not absolute (`/image.png`) — Fern's path resolver doesn't normalize root-relative image paths the same way as link targets.
+Page-scoped images live alongside the MDX file (e.g. `docs/guides/audio/qwen_omni_asr.png`). Reference them with relative paths (`./image.png`), not absolute (`/image.png`) — Fern's path resolver doesn't normalize root-relative image paths the same way as link targets. The NVIDIA logos and favicon come from the `nvidia` global theme; do not add them locally.
 
 ## Frontmatter
 
@@ -285,8 +286,7 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | `docs/fern/versions/{latest,v0.4}.yml` | Frozen GA nav (mount `./v0.4/pages/...`) |
 | `docs/` (top-level *.mdx) | Nightly MDX content (~140 pages + page-scoped images) |
 | `docs/fern/versions/v0.4/pages/` | Frozen 0.4.0 snapshot (back-ports only) |
-| `docs/fern/components/` | `BadgeLinks.tsx`, `Tag.tsx`, `CustomFooter.tsx` |
-| `docs/fern/main.css` | Theme overrides — NVIDIA green, badge spacing |
+| `docs/fern/components/` | `BadgeLinks.tsx`, `Tag.tsx` (repo-specific; NVIDIA footer ships via `global-theme: nvidia`) |
 | `docs/fern/README.md` | Human-facing orientation |
 | `docs/fern/Makefile` | `make docs / docs-check / docs-preview / docs-publish` (run from `docs/fern/` or via `make -C docs/fern`) |
 | `.github/workflows/fern-docs-*.yml` | CI: check, preview build, preview comment |

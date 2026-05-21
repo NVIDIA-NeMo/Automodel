@@ -1,8 +1,10 @@
 # NeMo AutoModel — Fern Docs
 
-This directory holds the Fern build infrastructure (config, theme, components, frozen version snapshots) for the NeMo AutoModel documentation site at **[docs.nvidia.com/nemo/automodel](https://docs.nvidia.com/nemo/automodel)**.
+This directory holds the Fern build infrastructure (config, repo-specific components, frozen version snapshots) for the NeMo AutoModel documentation site at **[docs.nvidia.com/nemo/automodel](https://docs.nvidia.com/nemo/automodel)**.
 
 **The MDX content lives one level up, in `docs/` itself** — every nightly page is a top-level sibling of this `docs/fern/` directory (e.g. `docs/index.mdx`, `docs/guides/llm/finetune.mdx`). Fern reads those files via relative `path: ../../<...>.mdx` entries in `docs/fern/versions/nightly.yml`.
+
+NVIDIA branding (logos, favicon, footer, fonts, NVIDIA-green CSS, OneTrust JS) comes from the central control repo at **[NVIDIA/fern-components](https://github.com/NVIDIA/fern-components)** via `global-theme: nvidia` in `docs.yml` — no logos or theme CSS are vendored locally.
 
 ## Quick links
 
@@ -60,11 +62,10 @@ docs/                            ← nightly MDX lives here (sibling of fern/)
 ├── about/, guides/, model-coverage/, launcher/, api-reference/
 ├── *.png / *.jpg                ← page-scoped images
 └── fern/                        ← THIS DIRECTORY
-    ├── fern.config.json         # Fern CLI pin (4.62.4+) and org slug
-    ├── docs.yml                 # Site config: instances, versions, redirects, libraries, theme
-    ├── main.css                 # NVIDIA-green theme overrides
-    ├── assets/                  # Logos and shared SVGs
-    ├── components/              # BadgeLinks.tsx, Tag.tsx, CustomFooter.tsx
+    ├── fern.config.json         # Fern CLI pin (5.29.0+) and org slug
+    ├── docs.yml                 # Site config: instances, versions, redirects, libraries, global-theme: nvidia
+    ├── components/              # BadgeLinks.tsx, Tag.tsx (repo-specific only;
+    │                            #   NVIDIA-branded footer/logo/CSS ship via global-theme)
     ├── versions/
     │   ├── nightly.yml          # Nav for nightly — paths point at ../../<path>.mdx (up into docs/)
     │   ├── v0.4.yml             # Nav for the frozen 0.4.0 GA snapshot — paths at ./v0.4/pages/
@@ -126,7 +127,8 @@ Use the bundled custom components in `components/`:
 |---|---|---|
 | `<BadgeLinks ... />` | Header badge rows on landing pages (PyPI, license, GitHub, …) | `import { BadgeLinks } from "@/components/BadgeLinks";` |
 | `<Tag variant="...">label</Tag>` | Card chips ("start here", "5 min", etc.) | `import { Tag } from "@/components/Tag";` |
-| `<CustomFooter />` | Wired in `docs.yml` `footer:`; **required** for NVIDIA legal/privacy compliance | (auto) |
+
+The shared NVIDIA `<CustomFooter />` (privacy / Do Not Sell / etc.) ships from the `nvidia` global theme — wired automatically, **not** authored in this repo.
 
 Standard Fern components are also available — `<Note>`, `<Tip>`, `<Info>`, `<Warning>`, `<Cards>` / `<Card>`, etc. Don't use GitHub `> [!NOTE]` syntax — it does not render in MDX.
 
@@ -202,7 +204,7 @@ PR titles follow Conventional Commits (e.g. `docs(fern): add gemma4 fine-tuning 
 | `[ERR_PNPM_IGNORED_BUILDS]` on first `fern docs dev` | pnpm 10+ blocks esbuild's postinstall — `pnpm config set onlyBuiltDependencies '["esbuild"]' --location global`, then `rm -rf ~/.fern/app-preview` and retry |
 | Broken-link warning for version-agnostic path | `fern docs broken-links` false-positives on links without a version slug; the URLMap-based `validate_fern_internal_links.py` is authoritative |
 | `JSX expressions must have one parent element` | Wrap multi-element JSX in `<>...</>` or a `<div>` |
-| Card badges have no spacing | Use `<Tag>` (NeMo AutoModel landing pattern), not raw HTML; spacing is in `main.css` |
+| Card badges have no spacing | Use `<Tag>` (NeMo AutoModel landing pattern), not raw HTML; spacing comes from the `nvidia` global theme's CSS |
 | Old Sphinx URL breaks | Add a `redirects:` entry in `docs.yml` |
 | `<basepath>/<version>/index.html` 404s but deep paths work | `:path*` does not match the empty-path case ([NVIDIA-NeMo/Curator#1938](https://github.com/NVIDIA-NeMo/Curator/pull/1938)). Each version-root `index.html` needs its own explicit redirect rule — slot before the `:path*/index.html` catch-all |
 
