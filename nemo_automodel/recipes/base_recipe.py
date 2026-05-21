@@ -398,14 +398,27 @@ class BaseRecipe:
             # Defer best symlink update similarly, capturing the metric used for comparison
             if best_val_metric is not None:
                 setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            self._log_final_consolidation_instruction(path, is_rank_0)
         else:
             # Sync: update immediately
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric))
+                self._log_final_consolidation_instruction(path, is_rank_0)
             if is_dist_initialized:
                 torch.distributed.barrier()
+
+    def _log_final_consolidation_instruction(self, checkpoint_path: str, is_rank_0: bool) -> None:
+        """Log how to export the final checkpoint when an offline helper script exists."""
+        if not is_rank_0 or not getattr(getattr(self, "step_scheduler", None), "is_last_step", False):
+            return
+        consolidate_script = self.checkpointer.get_offline_consolidation_script_path(checkpoint_path)
+        if os.path.exists(consolidate_script):
+            logger.info(
+                "To export the final checkpoint to consolidated HuggingFace safetensors, run: bash %s",
+                consolidate_script,
+            )
 
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """

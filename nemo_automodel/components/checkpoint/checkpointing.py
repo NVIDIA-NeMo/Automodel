@@ -63,6 +63,9 @@ if TYPE_CHECKING:
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
+_CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
+
+
 def _is_geq_torch_2_9() -> bool:
     """
     Check if the current torch version is greater than or equal to 2.9.0.
@@ -119,6 +122,41 @@ def _get_checkpoint_metadata_keys(
     reader = storage_reader if storage_reader is not None else FileSystemReader(path)
     metadata = reader.read_metadata()
     return set(metadata.state_dict_metadata.keys())
+
+
+def _get_rank_safe() -> int:
+    """Return the current distributed rank, defaulting to 0 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def _get_world_size_safe() -> int:
+    """Return the current distributed world size, defaulting to 1 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _is_rank_0() -> bool:
+    """Return True on the main rank."""
+    return _get_rank_safe() == 0
+
+
+def _estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """Estimate logical bytes in a state dict without materializing tensors."""
+    total = 0
+    try:
+        for tensor in state_dict.values():
+            total += int(tensor.numel()) * int(tensor.element_size())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return total
+
+
+def _format_bytes(num_bytes: int) -> str:
+    """Format bytes as a human-readable GiB value."""
+    return f"{num_bytes / 1024**3:.1f} GiB"
 
 
 if _is_geq_torch_2_9():
@@ -251,6 +289,7 @@ class Checkpointer:
             self._addons.append(ConsolidatedHFAddon())
         if self.config.is_peft:
             self._addons.append(PeftAddon())
+        self._warn_if_inline_consolidation_in_distributed_job()
 
     @torch.no_grad()
     def save_model(
@@ -306,6 +345,7 @@ class Checkpointer:
         )
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+        self._warn_if_large_inline_consolidation(state_dict, fqn_to_file_index_mapping)
 
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
         for addon in self._addons:
@@ -320,6 +360,7 @@ class Checkpointer:
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
             )
+        self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
             consolidated_dir, fqn_to_file_index_mapping, model_dir, consolidate_on_all_ranks
@@ -862,6 +903,90 @@ class Checkpointer:
         else:
             dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
         return ret
+
+    def _warn_if_inline_consolidation_in_distributed_job(self) -> None:
+        """Educate distributed users about the cost of inline HF consolidation."""
+        if not self._should_write_consolidated_safetensors() or not _is_rank_0():
+            return
+        world_size = _get_world_size_safe()
+        if world_size <= 1:
+            return
+        logging.warning(
+            "checkpoint.save_consolidated=True exports HuggingFace safetensors during every checkpoint save "
+            "inside this distributed training job (world_size=%d). This is convenient for small/debug runs, "
+            "but for non-trivial distributed jobs consider checkpoint.save_consolidated=false and run the "
+            "generated consolidate.sh script after training.",
+            world_size,
+        )
+
+    def _warn_if_large_inline_consolidation(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        fqn_to_index_mapping: Optional[dict[str, int]],
+    ) -> None:
+        """Warn when inline consolidated export is large enough to waste GPU allocation time."""
+        if not self._should_write_consolidated_safetensors() or not _is_rank_0():
+            return
+        estimated_bytes = _estimate_state_dict_bytes(state_dict)
+        if estimated_bytes is None or estimated_bytes < _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES:
+            return
+        world_size = _get_world_size_safe()
+        output_file_count = len(set(fqn_to_index_mapping.values())) if fqn_to_index_mapping else 1
+        logging.warning(
+            "checkpoint.save_consolidated=True is exporting approximately %s of HF safetensors inside the "
+            "training job. This can leave GPU ranks idle during filesystem writes. The current mapping has "
+            "%d output file(s) across world_size=%d. For large checkpoints, consider "
+            "checkpoint.save_consolidated=false and run consolidate.sh offline after training.",
+            _format_bytes(estimated_bytes),
+            output_file_count,
+            world_size,
+        )
+
+    def get_offline_consolidation_script_path(self, weights_path: str) -> str:
+        """Return the offline consolidation helper script path for a checkpoint root."""
+        return os.path.join(weights_path, "model", "consolidate.sh")
+
+    def _maybe_write_offline_consolidation_script(self, model_dir: str) -> None:
+        """Write a conservative helper script for offline HF safetensors consolidation."""
+        if not self._should_write_hf_metadata() or self._should_write_consolidated_safetensors() or not _is_rank_0():
+            return
+
+        script_path = os.path.join(model_dir, "consolidate.sh")
+        output_dir = os.path.join(model_dir, "consolidated")
+        repo_root = Path(__file__).resolve().parents[3]
+        tool_path = repo_root / "tools" / "offline_hf_consolidation.py"
+        contents = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+# Offline HF safetensors consolidation helper.
+# Defaults are conservative for login nodes and small CPU machines. On a CPU
+# compute node, increase parallelism, for example:
+#   NPROC_PER_NODE=16 NUM_THREADS=4 bash "$0"
+NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
+NUM_THREADS="${{NUM_THREADS:-1}}"
+PYTHON="${{PYTHON:-python3}}"
+TORCHRUN="${{TORCHRUN:-torchrun}}"
+CONSOLIDATION_TOOL="${{CONSOLIDATION_TOOL:-{tool_path}}}"
+
+if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
+  "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" "${{CONSOLIDATION_TOOL}}" \\
+    --backend gloo \\
+    --num-threads "${{NUM_THREADS}}" \\
+    --model-name "{self.config.model_repo_id}" \\
+    --input-dir "{model_dir}" \\
+    --output-dir "{output_dir}"
+else
+  "${{PYTHON}}" "${{CONSOLIDATION_TOOL}}" \\
+    --backend gloo \\
+    --num-threads "${{NUM_THREADS}}" \\
+    --model-name "{self.config.model_repo_id}" \\
+    --input-dir "{model_dir}" \\
+    --output-dir "{output_dir}"
+fi
+"""
+        with open(script_path, "w") as f:
+            f.write(contents)
+        os.chmod(script_path, 0o755)
 
     def _should_write_consolidated_safetensors(self) -> bool:
         """

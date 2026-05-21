@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import logging
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from nemo_automodel.components.checkpoint._backports.hf_storage import _DIFFUSERS_INDEX_FN
+from nemo_automodel.components.checkpoint._backports.hf_storage import (
+    _DIFFUSERS_INDEX_FN,
+    _extract_file_index_with_status,
+    get_fqn_to_file_index_mapping,
+)
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
@@ -46,6 +51,146 @@ def _count_by_shard(mapping: dict[str, int]) -> dict[int, int]:
     for shard_index in mapping.values():
         counts[shard_index] = counts.get(shard_index, 0) + 1
     return counts
+
+
+def test_extract_file_index_with_status_supports_hf_and_qwen35_patterns():
+    assert _extract_file_index_with_status("model-00001-of-00008.safetensors") == (1, True)
+    assert _extract_file_index_with_status("model.safetensors-00002-of-00008.safetensors") == (2, True)
+    assert _extract_file_index_with_status("shard-00000-model-00003-of-00008.safetensors") == (3, True)
+    assert _extract_file_index_with_status("model.safetensors") == (1, True)
+
+
+def test_extract_file_index_with_status_rejects_invalid_encoded_index():
+    assert _extract_file_index_with_status("model-00012-of-00008.safetensors") == (1, False)
+    assert _extract_file_index_with_status("model-00000-of-00008.safetensors") == (1, False)
+    assert _extract_file_index_with_status("weights-a.safetensors") == (1, False)
+
+
+def test_get_fqn_to_file_index_mapping_uses_index_json_for_qwen35_names(tmp_path):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model.safetensors-00001-of-00003.safetensors",
+            "model.layers.1.weight": "model.safetensors-00002-of-00003.safetensors",
+            "lm_head.weight": "model.safetensors-00003-of-00003.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+        "lm_head.weight": 3,
+    }
+
+
+def test_get_fqn_to_file_index_mapping_warns_when_multiple_files_fallback_to_one(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "weights-a.safetensors",
+            "model.layers.1.weight": "weights-b.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "parsing failed or produced unexpected indices" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_warns_when_only_some_files_parse(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model-00001-of-00002.safetensors",
+            "model.layers.1.weight": "weights-b.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "weights-b.safetensors" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_reserves_single_file_index_for_fallback_assignment(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model.safetensors",
+            "model.layers.1.weight": "weights-b.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "parsing failed or produced unexpected indices" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_reassigns_invalid_encoded_index(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model-00001-of-00008.safetensors",
+            "model.layers.1.weight": "model-00012-of-00008.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "parsing failed or produced unexpected indices" in caplog.text
+    assert "model-00012-of-00008.safetensors" in caplog.text
+
+
+def test_get_fqn_to_file_index_mapping_remaps_when_parsed_indices_are_not_dense(tmp_path, caplog):
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "model.layers.0.weight": "model-00001-of-00012.safetensors",
+            "model.layers.1.weight": "model-00012-of-00012.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    caplog.set_level(logging.WARNING)
+    mapping = get_fqn_to_file_index_mapping(str(tmp_path))
+
+    assert mapping == {
+        "model.layers.0.weight": 1,
+        "model.layers.1.weight": 2,
+    }
+    assert "Expected parsed indices to be 1..2; falling back to sorted filename order" in caplog.text
 
 
 def test_equally_divide_layers_num_shards_gt_num_layers():
@@ -868,6 +1013,80 @@ class TestCheckpointerSaveModelDiffusersRename:
 
         assert (consolidated_dir / "model.safetensors.index.json").exists()
         assert not (consolidated_dir / _DIFFUSERS_INDEX_FN).exists()
+
+
+class TestOfflineConsolidationScriptAndWarnings:
+    """Focused tests for offline consolidation helper generation and warnings."""
+
+    def _make_checkpointer(self, tmp_path, save_consolidated=False):
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=save_consolidated,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    def test_writes_conservative_consolidate_script(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        script_path = model_dir / "consolidate.sh"
+        script = script_path.read_text()
+        assert script_path.exists()
+        assert os.access(script_path, os.X_OK)
+        assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
+        assert 'NUM_THREADS="${NUM_THREADS:-1}"' in script
+        assert 'PYTHON="${PYTHON:-python3}"' in script
+        assert 'NPROC_PER_NODE=16 NUM_THREADS=4 bash "$0"' in script
+        assert "--backend gloo \\" in script
+        assert '--model-name "test/model" \\' in script
+        assert f'--input-dir "{model_dir}" \\' in script
+        assert f'--output-dir "{model_dir / "consolidated"}"' in script
+
+    def test_does_not_write_script_when_inline_consolidation_is_enabled(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        assert not (model_dir / "consolidate.sh").exists()
+
+    def test_setup_warns_for_distributed_inline_consolidation(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        caplog.set_level(logging.WARNING)
+
+        self._make_checkpointer(tmp_path, save_consolidated=True)
+
+        assert "exports HuggingFace safetensors during every checkpoint save" in caplog.text
+        assert "world_size=8" in caplog.text
+
+    def test_save_time_warns_for_large_inline_consolidation(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("WORLD_SIZE", "256")
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+        caplog.clear()
+        caplog.set_level(logging.WARNING)
+
+        class FakeLargeTensor:
+            def numel(self):
+                return 50 * 1024**3 // 2
+
+            def element_size(self):
+                return 2
+
+        checkpointer._warn_if_large_inline_consolidation({"w": FakeLargeTensor()}, {"w": 1})
+
+        assert "approximately 50.0 GiB" in caplog.text
+        assert "1 output file(s) across world_size=256" in caplog.text
+        assert "run consolidate.sh offline" in caplog.text
 
 
 # =============================================================================
