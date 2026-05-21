@@ -1,19 +1,15 @@
----
-title: "InternVL"
-description: ""
----
+# InternVL
+
 [InternVL](https://github.com/OpenGVLab/InternVL) is a vision language model from Shanghai AI Laboratory (OpenGVLab), combining a large vision encoder with an InternLM language backbone for strong multimodal performance.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `InternVLForConditionalGeneration` |
 | **Parameters** | 4B – 8B |
 | **HF Org** | [OpenGVLab](https://huggingface.co/OpenGVLab) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -34,11 +30,12 @@ description: ""
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [internvl_3_5_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/internvl/internvl_3_5_4b.yaml) | MedPix-VQA | SFT — InternVL3.5 4B on MedPix |
+| {download}`internvl_3_5_4b.yaml <../../../../examples/vlm_finetune/internvl/internvl_3_5_4b.yaml>` | MedPix-VQA | SFT — InternVL3.5 4B on MedPix |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -57,7 +54,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/vlm_finetune/internvl/internvl_3_5_4b.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -78,13 +75,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/internvl/internvl_3_5_4b.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [Installation Guide](../../../guides/installation.mdx) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Hugging Face Model Cards
 

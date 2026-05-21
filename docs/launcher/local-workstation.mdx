@@ -1,12 +1,9 @@
----
-title: "Run on Your Local Workstation"
-description: ""
-position: 2
----
-Use this guide for local, single-node workflows on a workstation or an interactive Slurm allocation. For setup details, refer to our [Installation Guide](/get-started/installation).
-For batch multi-node jobs, see the [Run on a Cluster](/job-launchers/slurm-cluster) or [SkyPilot](/job-launchers/skypilot) guides.
+# Run on Your Local Workstation
 
-NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](/get-started/repo-structure) guide.
+Use this guide for local, single-node workflows on a workstation or an interactive Slurm allocation. For setup details, refer to our [Installation Guide](../guides/installation.mdx).
+For batch multi-node jobs, see the [Slurm](./slurm.mdx) or [SkyPilot](./skypilot.mdx) guides.
+
+NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.mdx) guide.
 
 ## Quick Start: Choose Your Job Launch Option
 
@@ -27,7 +24,7 @@ NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipe
 
 ## Run with AutoModel CLI (Single Node)
 
-The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](/job-launchers/slurm-cluster)).
+The AutoModel CLI is the preferred method for most users. It offers a unified interface to launch training scaling from a local workstation (this guide) to large clusters (see our [cluster guide](./slurm.mdx)).
 
 ### Basic Usage
 
@@ -67,7 +64,7 @@ automodel --nproc-per-node 2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 If you don't specify `--nproc-per-node`, it will use all available GPUs on your system.
 
-Looking for Slurm or cloud training? See [Run on a Cluster](/job-launchers/slurm-cluster) or [SkyPilot](/job-launchers/skypilot).
+Looking for Slurm or cloud training? See [Slurm](./slurm.mdx) or [SkyPilot](./skypilot.mdx).
 
 ## Run with uv (Development Mode)
 
@@ -113,7 +110,7 @@ python nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/
 torchrun --nproc-per-node=2 nemo_automodel/recipes/llm/train_ft.py -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-This approach requires that you have already installed NeMo AutoModel and its dependencies in your Python environment (see the [installation guide](/get-started/installation) for details).
+This approach requires that you have already installed NeMo AutoModel and its dependencies in your Python environment (see the [installation guide](../guides/installation.mdx) for details).
 
 ## Customize Configuration Settings
 
@@ -150,4 +147,4 @@ For example, if you want to fine-tune `Qwen/Qwen3-0.6B` instead of `meta-llama/L
 - You're working in environments where uv is not available
 - You're integrating with existing PyTorch workflows
 
-All approaches use the same configuration files and provide the same training capabilities on a single node. For multi-node training, see [Run on a Cluster](/job-launchers/slurm-cluster).
+All approaches use the same configuration files and provide the same training capabilities on a single node. For multi-node training, see [Run on a Cluster](./slurm.mdx).

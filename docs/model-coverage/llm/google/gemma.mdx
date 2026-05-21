@@ -1,19 +1,15 @@
----
-title: "Gemma"
-description: ""
----
+# Gemma
+
 [Google's Gemma](https://ai.google.dev/gemma) is a family of open-weight language models built on the same research and technology as Gemini. Gemma models are available in multiple sizes and versions, with improvements in each generation including local sliding window attention (Gemma 2) and interleaved global/local attention (Gemma 3).
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `GemmaForCausalLM` / `Gemma2ForCausalLM` / `Gemma3ForCausalLM` |
 | **Parameters** | 1B – 27B |
 | **HF Org** | [google](https://huggingface.co/google) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -43,14 +39,15 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [gemma_2_9b_it_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml) | SFT — Gemma 2 9B IT on SQuAD |
-| [gemma_2_9b_it_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml) | LoRA — Gemma 2 9B IT on SQuAD |
-| [gemma_3_270m_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_3_270m_squad.yaml) | SFT — Gemma 3 270M on SQuAD |
-| [gemma_3_270m_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml) | LoRA — Gemma 3 270M on SQuAD |
+| {download}`gemma_2_9b_it_squad.yaml <../../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml>` | SFT — Gemma 2 9B IT on SQuAD |
+| {download}`gemma_2_9b_it_squad_peft.yaml <../../../../examples/llm_finetune/gemma/gemma_2_9b_it_squad_peft.yaml>` | LoRA — Gemma 2 9B IT on SQuAD |
+| {download}`gemma_3_270m_squad.yaml <../../../../examples/llm_finetune/gemma/gemma_3_270m_squad.yaml>` | SFT — Gemma 3 270M on SQuAD |
+| {download}`gemma_3_270m_squad_peft.yaml <../../../../examples/llm_finetune/gemma/gemma_3_270m_squad_peft.yaml>` | LoRA — Gemma 3 270M on SQuAD |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -69,7 +66,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -90,13 +87,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/gemma/gemma_2_9b_it_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) for full SFT and LoRA instructions.
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx) for full SFT and LoRA instructions.
 
 ## Hugging Face Model Cards
 

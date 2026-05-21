@@ -1,19 +1,15 @@
----
-title: "Bamba"
-description: ""
----
+# Bamba
+
 [Bamba](https://huggingface.co/ibm-ai-platform/Bamba-9B) is a hybrid SSM-attention language model from IBM, combining Mamba-2 selective state space layers with standard transformer attention for efficient long-context processing.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `BambaForCausalLM` |
 | **Parameters** | 9B |
 | **HF Org** | [ibm-ai-platform](https://huggingface.co/ibm-ai-platform) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -29,11 +25,12 @@ description: ""
 |---|---|
 | Bamba 9B | [`ibm-ai-platform/Bamba-9B`](https://huggingface.co/ibm-ai-platform/Bamba-9B) |
 
+
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -55,7 +52,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -77,13 +74,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

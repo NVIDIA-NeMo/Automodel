@@ -1,19 +1,15 @@
----
-title: "Seed (ByteDance)"
-description: ""
----
+# Seed (ByteDance)
+
 [Seed-Coder](https://huggingface.co/ByteDance-Seed/Seed-Coder-8B-Instruct) and [Seed-OSS](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) are open-weight models from ByteDance. Both use the `Qwen2ForCausalLM` architecture under the hood.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `Qwen2ForCausalLM` |
 | **Parameters** | 8B – 36B |
 | **HF Org** | [ByteDance-Seed](https://huggingface.co/ByteDance-Seed) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -35,14 +31,15 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [seed_coder_8b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml) | SFT — Seed-Coder 8B on SQuAD |
-| [seed_coder_8b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml) | LoRA — Seed-Coder 8B on SQuAD |
-| [seed_oss_36B_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml) | SFT — Seed-OSS 36B on HellaSwag |
-| [seed_oss_36B_hellaswag_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml) | LoRA — Seed-OSS 36B on HellaSwag |
+| {download}`seed_coder_8b_instruct_squad.yaml <../../../../examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml>` | SFT — Seed-Coder 8B on SQuAD |
+| {download}`seed_coder_8b_instruct_squad_peft.yaml <../../../../examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml>` | LoRA — Seed-Coder 8B on SQuAD |
+| {download}`seed_oss_36B_hellaswag.yaml <../../../../examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml>` | SFT — Seed-OSS 36B on HellaSwag |
+| {download}`seed_oss_36B_hellaswag_peft.yaml <../../../../examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml>` | LoRA — Seed-OSS 36B on HellaSwag |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -61,7 +58,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -82,13 +79,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

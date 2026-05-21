@@ -1,19 +1,15 @@
----
-title: "Moonlight"
-description: ""
----
+# Moonlight
+
 [Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts language model from Moonshot AI trained using Muon optimizer. It uses the `DeepseekV3ForCausalLM` architecture with 16B total parameters and 3B activated per token.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `DeepseekV3ForCausalLM` |
 | **Parameters** | 16B total / 3B active |
 | **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -33,12 +29,13 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [moonlight_16b_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | SFT — Moonlight 16B with Transformer Engine |
-| [moonlight_16b_te_packed_sequence.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | SFT — Moonlight 16B with packed sequences |
+| {download}`moonlight_16b_te.yaml <../../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml>` | SFT — Moonlight 16B with Transformer Engine |
+| {download}`moonlight_16b_te_packed_sequence.yaml <../../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml>` | SFT — Moonlight 16B with packed sequences |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -57,7 +54,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/moonlight/moonlight_16b_te.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -78,13 +75,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/moonlight/moonlight_16b_te.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

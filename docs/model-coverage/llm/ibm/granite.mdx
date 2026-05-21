@@ -1,19 +1,15 @@
----
-title: "Granite"
-description: ""
----
+# Granite
+
 [IBM Granite](https://www.ibm.com/granite) is IBM's family of enterprise-focused language models. Granite 3.x models are trained on a mix of code and language data and are optimized for enterprise tasks including summarization, classification, and RAG. PowerLM (IBM Research) also uses this architecture.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `GraniteForCausalLM` |
 | **Parameters** | 2B – 8B |
 | **HF Org** | [ibm-granite](https://huggingface.co/ibm-granite) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -38,12 +34,13 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [granite_3_3_2b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml) | SFT — Granite 3.3 2B Instruct on SQuAD |
-| [granite_3_3_2b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/granite/granite_3_3_2b_instruct_squad_peft.yaml) | LoRA — Granite 3.3 2B Instruct on SQuAD |
+| {download}`granite_3_3_2b_instruct_squad.yaml <../../../../examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml>` | SFT — Granite 3.3 2B Instruct on SQuAD |
+| {download}`granite_3_3_2b_instruct_squad_peft.yaml <../../../../examples/llm_finetune/granite/granite_3_3_2b_instruct_squad_peft.yaml>` | LoRA — Granite 3.3 2B Instruct on SQuAD |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -62,7 +59,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -83,13 +80,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/granite/granite_3_3_2b_instruct_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

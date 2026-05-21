@@ -1,8 +1,5 @@
----
-title: "Large Language Models (LLMs)"
-description: ""
-position: 3
----
+# Large Language Models (LLMs)
+
 ## Introduction
 Large Language Models (LLMs) power a variety of tasks such as dialogue systems, text classification, summarization, and more.
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
@@ -14,70 +11,70 @@ To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
-For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](/get-started/installation).
+For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](../../guides/installation.mdx).
 
 ## Supported Models
 
-NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. See [LLM datasets](/datasets/text-dataset) and [dataset overview](/datasets/overview).
+NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. See [LLM datasets](../../guides/llm/dataset.mdx) and [dataset overview](../../guides/dataset-overview.mdx).
 
 | Owner | Model Family | Architectures |
 |---|---|---|
-| Meta | [Llama](/model-coverage/large-language-models/llama) | `LlamaForCausalLM` |
-| Google | [Gemma](/model-coverage/large-language-models/gemma) | `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen2](/model-coverage/large-language-models/qwen2) | `Qwen2ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen2 MoE](/model-coverage/large-language-models/qwen2-moe) | `Qwen2MoeForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3](/model-coverage/large-language-models/qwen3) | `Qwen3ForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3 MoE](/model-coverage/large-language-models/qwen3-moe) | `Qwen3MoeForCausalLM` |
-| Qwen / Alibaba Cloud | [Qwen3-Next](/model-coverage/large-language-models/qwen3-next) | `Qwen3NextForCausalLM` |
-| Baidu | [ERNIE 4.5](/model-coverage/large-language-models/ernie-4-5) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
-| DeepSeek | [DeepSeek](/model-coverage/large-language-models/deepseek) | `DeepseekForCausalLM` |
-| DeepSeek | [DeepSeek-V3](/model-coverage/large-language-models/deepseek-v3) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
-| DeepSeek | [DeepSeek V4 Flash](/model-coverage/large-language-models/deepseek-v4-flash) | `DeepseekV4ForCausalLM` |
-| Mistral AI | [Mistral](/model-coverage/large-language-models/mistral) | `MistralForCausalLM` |
-| Mistral AI | [Mixtral](/model-coverage/large-language-models/mixtral) | `MixtralForCausalLM` |
-| Mistral AI | [Ministral3 / Devstral](/model-coverage/large-language-models/ministral3-devstral) | `Mistral3ForConditionalGeneration` |
-| Microsoft | [Phi](/model-coverage/large-language-models/phi) | `PhiForCausalLM` |
-| Microsoft | [Phi-3 / Phi-4](/model-coverage/large-language-models/phi-3-phi-4) | `Phi3ForCausalLM` |
-| Microsoft | [Phi-3-Small](/model-coverage/large-language-models/phi-3-small) | `Phi3SmallForCausalLM` |
-| NVIDIA | [Nemotron / Minitron](/model-coverage/large-language-models/nemotron-minitron) | `NemotronForCausalLM` |
-| NVIDIA | [Nemotron-H](/model-coverage/large-language-models/nemotron-h) | `NemotronHForCausalLM` |
-| NVIDIA | [Nemotron-Flash](/model-coverage/large-language-models/nemotron-flash) | `NemotronFlashForCausalLM` |
-| NVIDIA | [Nemotron-Super](/model-coverage/large-language-models/nemotron-super-llama-3-3-nemotron-super-49b) | `DeciLMForCausalLM` |
-| ZAI / Zhipu AI | [ChatGLM](/model-coverage/large-language-models/chatglm) | `ChatGLMModel` |
-| ZAI / Zhipu AI | [GLM-4](/model-coverage/large-language-models/glm-4) | `GlmForCausalLM`, `Glm4ForCausalLM` |
-| ZAI / Zhipu AI | [GLM-4 MoE](/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
-| ZAI / Zhipu AI | [GLM-5 / GLM-5.1](/model-coverage/large-language-models/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
-| IBM | [Granite](/model-coverage/large-language-models/granite) | `GraniteForCausalLM` |
-| IBM | [Granite MoE](/model-coverage/large-language-models/granite-moe) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
-| IBM | [Bamba](/model-coverage/large-language-models/bamba) | `BambaForCausalLM` |
-| Allen AI | [OLMo](/model-coverage/large-language-models/olmo) | `OLMoForCausalLM` |
-| Allen AI | [OLMo2](/model-coverage/large-language-models/olmo2) | `OLMo2ForCausalLM` |
-| Allen AI | [OLMoE](/model-coverage/large-language-models/olmoe) | `OLMoEForCausalLM` |
-| OpenAI | [GPT-OSS](/model-coverage/large-language-models/gpt-oss) | `GptOssForCausalLM` |
-| OpenAI | [GPT-2](/model-coverage/large-language-models/gpt-2) | `GPT2LMHeadModel` |
-| EleutherAI | [GPT-J](/model-coverage/large-language-models/gpt-j) | `GPTJForCausalLM` |
-| EleutherAI | [GPT-NeoX / Pythia](/model-coverage/large-language-models/gpt-neox-pythia) | `GPTNeoXForCausalLM` |
-| BigCode | [StarCoder](/model-coverage/large-language-models/starcoder) | `GPTBigCodeForCausalLM` |
-| BigCode | [StarCoder2](/model-coverage/large-language-models/starcoder2) | `Starcoder2ForCausalLM` |
-| BAAI | [Aquila / Aquila2](/model-coverage/large-language-models/aquila-aquila2) | `AquilaForCausalLM` |
-| Baichuan Inc | [Baichuan / Baichuan2](/model-coverage/large-language-models/baichuan-baichuan2) | `BaiChuanForCausalLM` |
-| Cohere | [Command-R](/model-coverage/large-language-models/command-r) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
-| TII | [Falcon](/model-coverage/large-language-models/falcon) | `FalconForCausalLM` |
-| LG AI Research | [EXAONE](/model-coverage/large-language-models/exaone) | `ExaoneForCausalLM` |
-| InternLM | [InternLM](/model-coverage/large-language-models/internlm) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
-| Inception AI | [Jais](/model-coverage/large-language-models/jais) | `JAISLMHeadModel` |
-| MiniMax | [MiniMax-M2](/model-coverage/large-language-models/minimax-m2) | `MiniMaxM2ForCausalLM` |
-| OpenBMB | [MiniCPM](/model-coverage/large-language-models/minicpm) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM` |
-| Moonshot AI | [Moonlight](/model-coverage/large-language-models/moonlight) | `DeepseekV3ForCausalLM` |
-| ByteDance Seed | [Seed (ByteDance)](/model-coverage/large-language-models/seed-bytedance) | `Qwen2ForCausalLM` |
-| Upstage | [Solar Pro](/model-coverage/large-language-models/solar-pro) | `SolarForCausalLM` |
-| OrionStar | [Orion](/model-coverage/large-language-models/orion) | `OrionForCausalLM` |
-| Stability AI | [StableLM](/model-coverage/large-language-models/stablelm) | `StableLmForCausalLM` |
-| Stepfun AI | [Step-3.5](/model-coverage/large-language-models/step-3-5) | `Step3p5ForCausalLM` |
-| Parasail AI | [GritLM](/model-coverage/large-language-models/gritlm) | `GritLM` |
-| Tencent | [Hy3-preview](/model-coverage/large-language-models/hy3-preview) | `HYV3ForCausalLM` |
-| Xiaomi MiMo | [MiMo-V2-Flash](/model-coverage/large-language-models/mimo-v2-flash) | `MiMoV2FlashForCausalLM` |
-| inclusionAI | [Ling 2.0](/model-coverage/large-language-models/ling-2-0) | `BailingMoeV2ForCausalLM` |
+| Meta | [Llama](meta/llama.mdx) | `LlamaForCausalLM` |
+| Google | [Gemma](google/gemma.mdx) | `GemmaForCausalLM`, `Gemma2ForCausalLM`, `Gemma3ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2](qwen/qwen2.mdx) | `Qwen2ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen2 MoE](qwen/qwen2-moe.mdx) | `Qwen2MoeForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3](qwen/qwen3.mdx) | `Qwen3ForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3 MoE](qwen/qwen3-moe.mdx) | `Qwen3MoeForCausalLM` |
+| Qwen / Alibaba Cloud | [Qwen3-Next](qwen/qwen3-next.mdx) | `Qwen3NextForCausalLM` |
+| Baidu | [ERNIE 4.5](baidu/ernie4-5.mdx) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
+| DeepSeek | [DeepSeek](deepseek-ai/deepseek.mdx) | `DeepseekForCausalLM` |
+| DeepSeek | [DeepSeek-V3](deepseek-ai/deepseek-v3.mdx) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
+| DeepSeek | [DeepSeek V4 Flash](deepseek-ai/dsv4-flash.mdx) | `DeepseekV4ForCausalLM` |
+| Mistral AI | [Mistral](mistralai/mistral.mdx) | `MistralForCausalLM` |
+| Mistral AI | [Mixtral](mistralai/mixtral.mdx) | `MixtralForCausalLM` |
+| Mistral AI | [Ministral3 / Devstral](mistralai/ministral3.mdx) | `Mistral3ForConditionalGeneration` |
+| Microsoft | [Phi](microsoft/phi.mdx) | `PhiForCausalLM` |
+| Microsoft | [Phi-3 / Phi-4](microsoft/phi3.mdx) | `Phi3ForCausalLM` |
+| Microsoft | [Phi-3-Small](microsoft/phi3-small.mdx) | `Phi3SmallForCausalLM` |
+| NVIDIA | [Nemotron](nvidia/nemotron.mdx) | `NemotronForCausalLM` |
+| NVIDIA | [Nemotron-H](nvidia/nemotron-h.mdx) | `NemotronHForCausalLM` |
+| NVIDIA | [Nemotron-Flash](nvidia/nemotron-flash.mdx) | `NemotronFlashForCausalLM` |
+| NVIDIA | [Nemotron-Super](nvidia/nemotron-super.mdx) | `DeciLMForCausalLM` |
+| ZAI / Zhipu AI | [ChatGLM](thudm/chatglm.mdx) | `ChatGLMModel` |
+| ZAI / Zhipu AI | [GLM-4](thudm/glm4.mdx) | `GlmForCausalLM`, `Glm4ForCausalLM` |
+| ZAI / Zhipu AI | [GLM-4 MoE](thudm/glm4-moe.mdx) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
+| ZAI / Zhipu AI | [GLM-5 / GLM-5.1](thudm/glm5-moe-dsa.mdx) | `GlmMoeDsaForCausalLM` |
+| IBM | [Granite](ibm/granite.mdx) | `GraniteForCausalLM` |
+| IBM | [Granite MoE](ibm/granite-moe.mdx) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
+| IBM | [Bamba](ibm/bamba.mdx) | `BambaForCausalLM` |
+| Allen AI | [OLMo](allenai/olmo.mdx) | `OLMoForCausalLM` |
+| Allen AI | [OLMo2](allenai/olmo2.mdx) | `OLMo2ForCausalLM` |
+| Allen AI | [OLMoE](allenai/olmoe.mdx) | `OLMoEForCausalLM` |
+| OpenAI | [GPT-OSS](openai/gpt-oss.mdx) | `GptOssForCausalLM` |
+| OpenAI | [GPT-2](openai/gpt2.mdx) | `GPT2LMHeadModel` |
+| EleutherAI | [GPT-J](eleutherai/gpt-j.mdx) | `GPTJForCausalLM` |
+| EleutherAI | [GPT-NeoX / Pythia](eleutherai/gpt-neox.mdx) | `GPTNeoXForCausalLM` |
+| BigCode | [StarCoder](bigcode/starcoder.mdx) | `GPTBigCodeForCausalLM` |
+| BigCode | [StarCoder2](bigcode/starcoder2.mdx) | `Starcoder2ForCausalLM` |
+| BAAI | [Aquila](baai/aquila.mdx) | `AquilaForCausalLM` |
+| Baichuan Inc | [Baichuan](baichuan-inc/baichuan.mdx) | `BaiChuanForCausalLM` |
+| Cohere | [Command-R](cohere/command-r.mdx) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
+| TII | [Falcon](tiiuae/falcon.mdx) | `FalconForCausalLM` |
+| LG AI Research | [EXAONE](lgai-exaone/exaone.mdx) | `ExaoneForCausalLM` |
+| InternLM | [InternLM](internlm/internlm.mdx) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
+| Inception AI | [Jais](inceptionai/jais.mdx) | `JAISLMHeadModel` |
+| MiniMax | [MiniMax-M2](minimax/minimax-m2.mdx) | `MiniMaxM2ForCausalLM` |
+| OpenBMB | [MiniCPM](openbmb/minicpm.mdx) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM` |
+| Moonshot AI | [Moonlight](moonshotai/moonlight.mdx) | `DeepseekV3ForCausalLM` |
+| ByteDance Seed | [Seed](bytedance-seed/seed.mdx) | `Qwen2ForCausalLM` |
+| Upstage | [Solar](upstage/solar.mdx) | `SolarForCausalLM` |
+| OrionStar | [Orion](orionstar/orion.mdx) | `OrionForCausalLM` |
+| Stability AI | [StableLM](stabilityai/stablelm.mdx) | `StableLmForCausalLM` |
+| Stepfun AI | [Step-3.5](stepfun-ai/step-3-5.mdx) | `Step3p5ForCausalLM` |
+| Parasail AI | [GritLM](parasail-ai/gritlm.mdx) | `GritLM` |
+| Tencent | [Hy3-preview](tencent/hy3.mdx) | `HYV3ForCausalLM` |
+| Xiaomi MiMo | [MiMo-V2-Flash](xiaomimimo/mimo-v2-flash.mdx) | `MiMoV2FlashForCausalLM` |
+| inclusionAI | [Ling 2.0](inclusionai/ling-2.mdx) | `BailingMoeV2ForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
@@ -86,9 +83,69 @@ The models listed above can be fine-tuned using NeMo AutoModel. We support two p
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically &lt;1%) using techniques like Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
 
-See the [Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) to learn how to apply both methods to your data.
+See the [Fine-Tuning Guide](../../guides/llm/finetune.mdx) to learn how to apply both methods to your data.
 
-<Tip>
-In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](/datasets/text-dataset) and [dataset overview](/datasets/overview).
+:::{tip}
+In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](../../guides/llm/dataset.mdx) and [dataset overview](../../guides/dataset-overview.mdx).
+:::
 
-</Tip>
+```{toctree}
+:hidden:
+
+meta/llama
+google/gemma
+qwen/qwen2
+qwen/qwen2-moe
+qwen/qwen3
+qwen/qwen3-moe
+qwen/qwen3-next
+baidu/ernie4-5
+deepseek-ai/deepseek
+deepseek-ai/deepseek-v3
+deepseek-ai/dsv4-flash
+mistralai/mistral
+mistralai/mixtral
+mistralai/ministral3
+microsoft/phi
+microsoft/phi3
+microsoft/phi3-small
+nvidia/nemotron
+nvidia/nemotron-h
+nvidia/nemotron-flash
+nvidia/nemotron-super
+thudm/chatglm
+thudm/glm4
+thudm/glm4-moe
+thudm/glm5-moe-dsa
+ibm/granite
+ibm/granite-moe
+ibm/bamba
+allenai/olmo
+allenai/olmo2
+allenai/olmoe
+openai/gpt-oss
+openai/gpt2
+eleutherai/gpt-j
+eleutherai/gpt-neox
+bigcode/starcoder
+bigcode/starcoder2
+baai/aquila
+baichuan-inc/baichuan
+cohere/command-r
+tiiuae/falcon
+lgai-exaone/exaone
+internlm/internlm
+inceptionai/jais
+minimax/minimax-m2
+openbmb/minicpm
+moonshotai/moonlight
+bytedance-seed/seed
+upstage/solar
+orionstar/orion
+stabilityai/stablelm
+stepfun-ai/step-3-5
+parasail-ai/gritlm
+tencent/hy3
+xiaomimimo/mimo-v2-flash
+inclusionai/ling-2
+```

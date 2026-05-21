@@ -1,8 +1,5 @@
----
-title: "Fine-Tune Gemma 3 and Gemma 3n"
-description: ""
-position: 11
----
+# Fine-Tune Gemma 3 and Gemma 3n
+
 This document explains how to fine-tune Gemma 3 and Gemma 3n using NeMo AutoModel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
 
 To set up your environment to run NeMo AutoModel, follow the [Installation Guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
@@ -134,7 +131,7 @@ NeMo AutoModel uses a flexible configuration system that combines YAML configura
 
 The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma 3 and Gemma 3n.
 
-<Note>
+:::{note}
 These VLM recipes require the optional `vlm` dependency set. If you see `ImportError: qwen_vl_utils is not installed`, install VLM dependencies first:
 
 ```bash
@@ -142,8 +139,7 @@ uv sync --frozen --extra vlm
 ```
 
 (If you're using pip: `pip3 install "nemo-automodel[vlm]"`.)
-
-</Note>
+:::
 
 #### Run Gemma 3 Fine-Tuning
 
@@ -229,11 +225,16 @@ peft:
 
 The training loss should look similar to the example below:
 
-![Training Loss Curve](./medpix_peft.jpg)
+```{image} medpix_peft.jpg
+:alt: Training Loss Curve
+:class: bg-primary
+:width: 400px
+:align: center
+```
 
 ### Checkpointing
 
-We support training state checkpointing in either [Safetensors](https://huggingface.co/docs/safetensors/en) or [PyTorch DCP](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) format.
+We support training state checkpointing in either [Safetensors](https://huggingface.co/docs/safetensors/en/index) or [PyTorch DCP](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) format.
 
 ```yaml
 checkpoint:
@@ -267,7 +268,7 @@ After fine-tuning your Gemma 3 or Gemma 3n model, you can use it for inference o
 
 ### Generation Script
 
-The inference functionality is provided through [`examples/vlm_generate/generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_generate/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
+The inference functionality is provided through [`examples/vlm_generate/generate.py`](../../../examples/vlm_generate/generate.py), which supports loading fine-tuned checkpoints and performing image-text generation.
 
 #### Basic Usage
 
@@ -306,7 +307,12 @@ uv run examples/vlm_generate/generate.py \
 
 Given the following image:
 
-![Sample image from the MedPix dataset](./medpix.jpg)
+```{image} medpix.jpg
+:alt: Sample image from the MedPix dataset
+:class: bg-primary
+:width: 200px
+:align: center
+```
 
 And the prompt:
 

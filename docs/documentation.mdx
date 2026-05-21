@@ -1,66 +1,42 @@
----
-title: "Documentation Development"
-description: ""
----
+# Documentation Development
 
-## Source Layout
+- [Documentation Development](#documentation-development)
+  - [Build the Documentation](#build-the-documentation)
+  - [Live Building](#live-building)
+  - [Documentation Version](#documentation-version)
 
-Documentation authors edit MDX pages and page-scoped images under `docs/`.
-The repository does not track a root-level `fern/` project.
 
-Fern-specific site configuration lives under `.github/fern-template/`, and
-local/CI commands generate a disposable Fern project under `.fern-build/fern`
-or `$RUNNER_TEMP`.
+## Build the Documentation
 
-## Local Validation
+The following sections describe how to set up and build the NeMo Automodel documentation.
 
-Install the Fern CLI once:
+Switch to the documentation source folder and generate HTML output.
 
 ```sh
-npm install -g fern-api@4.62.4
+cd docs/
+uv run sphinx-build . _build/html
 ```
 
-Then validate the generated Fern project from the repository root:
+* The resulting HTML files are generated in a `_build/html` folder that is created under the project `docs/` folder.
+* The generated python API docs are placed in `apidocs` under the `docs/` folder.
+
+## Live Building
+
+When writing documentation, it can be helpful to serve the documentation and have it update live while you edit.
+
+To do so, run:
 
 ```sh
-make -f .github/fern-template/Makefile docs-check
+cd docs/
+uv run sphinx-autobuild . _build/html --port 12345 --host 0.0.0.0
 ```
 
-## Local Preview
+Open a web browser and go to `http://0.0.0.0:12345` to view the output.
 
-Build the disposable Fern project and start a local Fern preview:
+## Documentation Version
 
-```sh
-scripts/serve_docs.sh
-```
+The three files below control the version switcher. Before you attempt to publish a new version of the documentation, update these files to match the latest version numbers.
 
-The generated site is served by Fern, usually at `http://localhost:3002`.
-This default path does not require Fern login; it uses a local placeholder for
-the generated Python API reference.
-
-Pass Fern dev-server arguments after `--`:
-
-```sh
-scripts/serve_docs.sh -- --port 3003
-```
-
-To generate the full Python API reference locally, opt in to Fern's library
-generation step:
-
-```sh
-scripts/serve_docs.sh --generate-api
-```
-
-If library-reference generation fails with an organization permission error,
-provision your Fern dashboard account and log in:
-
-```sh
-make -f .github/fern-template/Makefile docs-login
-```
-
-## Publishing
-
-The published site has one maintained version: `latest`.
-
-Legacy `/nightly`, `/v0.4`, and older Sphinx version URLs redirect to the
-nearest `/latest` path. Their content trees are not tracked in this repository.
+* docs/versions1.json
+* docs/project.json
+* docs/conf.py

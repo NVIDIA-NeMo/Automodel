@@ -1,11 +1,9 @@
----
-title: "Run on a Cluster"
-description: ""
-position: 3
----
-In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](/job-launchers/local-workstation). For setup details, refer to our [Installation Guide](/get-started/installation).
+# Run on a Cluster
 
-NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](/get-started/repo-structure) guide.
+In this guide, you will learn how to submit distributed training jobs on Slurm clusters (single- or multi-node). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.mdx). For setup details, refer to our [Installation Guide](../guides/installation.mdx).
+
+NeMo AutoModel uses recipes to run end-to-end workflows. If you're new to recipes, see the [Repository Structure](../repository-structure.mdx) guide.
+
 
 ## Quickstart
 
@@ -64,6 +62,7 @@ The reference `slurm.sub` script:
 All cluster-specific configuration (SBATCH directives, container runtime,
 mounts, NCCL tuning, secrets) lives in your sbatch script where you can see
 and edit it directly.
+
 
 ### Examples
 
@@ -161,6 +160,7 @@ srun apptainer exec --nv /shared/images/automodel.sif \
             -m nemo_automodel.cli.app ${CONFIG}"
 ```
 
+
 ### Launch with Modified Code
 
 If the script is executed from within a Git repository accessible to Slurm
@@ -189,4 +189,4 @@ You can customize training by following the steps in this section.
 
 3. **Create custom configs**: Copy and modify existing configurations from the `examples/` directory.
 
-For single-node workflows, see our [Run on Your Local Workstation](/job-launchers/local-workstation) guide.
+For single-node workflows, see our [Run on Your Local Workstation](./local-workstation.mdx) guide.

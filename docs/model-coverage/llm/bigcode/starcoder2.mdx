@@ -1,19 +1,15 @@
----
-title: "StarCoder2"
-description: ""
----
+# StarCoder2
+
 [StarCoder2](https://huggingface.co/blog/starcoder2) is BigCode's second-generation code language model, available in 3B, 7B, and 15B sizes, trained on 600+ programming languages from The Stack v2.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Code Generation |
 | **Architecture** | `Starcoder2ForCausalLM` |
 | **Parameters** | 3B – 15B |
 | **HF Org** | [bigcode](https://huggingface.co/bigcode) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -37,12 +33,13 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [starcoder_2_7b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml) | SFT — StarCoder2 7B on SQuAD |
-| [starcoder_2_7b_hellaswag_fp8.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/starcoder/starcoder_2_7b_hellaswag_fp8.yaml) | SFT — StarCoder2 7B on HellaSwag with FP8 |
+| {download}`starcoder_2_7b_squad.yaml <../../../../examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml>` | SFT — StarCoder2 7B on SQuAD |
+| {download}`starcoder_2_7b_hellaswag_fp8.yaml <../../../../examples/llm_finetune/starcoder/starcoder_2_7b_hellaswag_fp8.yaml>` | SFT — StarCoder2 7B on HellaSwag with FP8 |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -61,7 +58,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -82,13 +79,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/starcoder/starcoder_2_7b_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

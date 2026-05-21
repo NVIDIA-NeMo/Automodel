@@ -1,8 +1,3 @@
----
-title: "Recipes and End-to-End Examples"
-description: ""
-position: 1
----
 ## Recipes and End-to-End Examples
 
 NeMo Automodel is organized around two key concepts: recipes and components.
@@ -14,7 +9,7 @@ Components are modular, plug-and-play building blocks referenced using the `_tar
 This page maps the ready-to-run recipes found in the `examples/` directory to their intended use cases, representative model families, and the most relevant how-to guides.
 
 - Examples root: [examples/ (GitHub)](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples)
-- Getting started: [Install NeMo AutoModel](/get-started/installation)
+- Getting started: [Installation](installation.mdx)
 
 ## Large Language Models (LLM)
 This section provides practical recipes and configurations for working with large language models across three core workflows: fine-tuning, pretraining, and knowledge distillation.
@@ -25,7 +20,7 @@ End-to-end fine-tuning recipes for many open models. Each subfolder contains YAM
 
 - Folder: [examples/llm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune)
 - Representative families: Llama 3.1/3.2/3.3, Gemma 2/3, Falcon 3, Mistral/Mixtral, Nemotron, Granite, Starcoder, Qwen, Baichuan, GLM, OLMo, Phi, GPT-OSS, Moonlight
-- How-to guide: [LLM finetuning](/recipes-e2e-examples/sft-peft)
+- How-to guide: [LLM finetuning](llm/finetune.mdx)
 
 ### Pretraining
 
@@ -34,8 +29,8 @@ Starter configurations and scripts for pretraining with datasets from different 
 - Folder: [examples/llm_pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain)
 - Example models: GPT-2 baseline, NanoGPT, DeepSeek-V3, Moonlight 16B TE (Slurm)
 - How-to guides:
-  - [LLM pretraining](/recipes-e2e-examples/pretraining)
-  - [Pretraining with NanoGPT](/recipes-e2e-examples/nanogpt-pretraining)
+  - [LLM pretraining](llm/pretraining.mdx)
+  - [Pretraining with NanoGPT](llm/nanogpt-pretraining.mdx)
 
 ### Knowledge Distillation (KD)
 
@@ -43,7 +38,7 @@ Recipes for distilling knowledge from a large teacher model into a smaller, more
 
 - Folder: [examples/llm_kd](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_kd)
 - Example model: Llama 3.2 1B
-- How-to guide: [Knowledge distillation](/recipes-e2e-examples/knowledge-distillation)
+- How-to guide: [Knowledge distillation](llm/knowledge-distillation.mdx)
 
 ### Benchmark Configurations
 
@@ -51,6 +46,7 @@ Curated configurations for benchmarking different training stacks and settings (
 
 - Folder: [examples/llm_benchmark](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark)
 - Representative configurations: DeepSeek-V3, GPT-OSS (20B/120B), Kimi K2, Moonlight 16B, Qwen3 MoE 30B
+
 
 ## Vision Language Models (VLM)
 This section provides practical recipes and configurations for working with vision language models, covering fine-tuning and generation workflows for multimodal tasks.
@@ -61,7 +57,7 @@ Fine-tuning recipes for VLMs.
 
 - Folder: [examples/vlm_finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune)
 - Representative family: Gemma 3 (various configurations)
-- How-to guide: [Gemma 3n: Efficient multimodal fine-tuning](/recipes-e2e-examples/gemma-3-3n)
+- How-to guide: [Gemma 3n: Efficient multimodal fine-tuning](omni/gemma3-3n.mdx)
 
 ### Generation
 
@@ -79,7 +75,7 @@ End-to-end ASR fine-tuning of `Qwen3-Omni-30B-A3B-Instruct` on any HuggingFace a
 
 - Folder: [examples/audio_finetune/qwen3_omni_asr](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/audio_finetune/qwen3_omni_asr)
 - Representative model: Qwen3-Omni-30B-A3B-Instruct
-- How-to guide: [Fine-tune Qwen3-Omni for ASR](/recipes-e2e-examples/qwen3-omni-asr)
+- How-to guide: [Fine-tune Qwen3-Omni for ASR](audio/qwen3-omni-asr.mdx)
 
 ## Diffusion Models (Text-to-Image & Text-to-Video)
 
@@ -93,7 +89,7 @@ Fine-tuning recipes for adapting pretrained diffusion models to your data.
 
 - Folder: [examples/diffusion/finetune](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/finetune)
 - Representative models: FLUX.1-dev (T2I, 12B), Wan 2.1 T2V 1.3B, HunyuanVideo 1.5
-- How-to guide: [Diffusion fine-tuning](/recipes-e2e-examples/diffusion-fine-tuning)
+- How-to guide: [Diffusion fine-tuning](diffusion/finetune.mdx)
 
 ### Pretraining
 
@@ -101,7 +97,7 @@ Pretraining recipes for training diffusion models from scratch on large-scale da
 
 - Folder: [examples/diffusion/pretrain](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/pretrain)
 - Representative models: Wan 2.1 T2V 1.3B, FLUX.1-dev
-- How-to guide: [Diffusion fine-tuning (pretraining section)](/recipes-e2e-examples/diffusion-fine-tuning#configure-your-training-recipe)
+- How-to guide: [Diffusion fine-tuning (pretraining section)](diffusion/finetune.mdx#configure-your-training-recipe)
 
 ### Generation
 
@@ -109,14 +105,14 @@ Generation scripts and configs for running inference with pretrained or fine-tun
 
 - Folder: [examples/diffusion/generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/diffusion/generate)
 - Representative models: Wan 2.1 1.3B, FLUX.1-dev, HunyuanVideo
-- How-to guide: [Diffusion generation](/recipes-e2e-examples/diffusion-fine-tuning#generation--inference)
+- How-to guide: [Diffusion generation](diffusion/finetune.mdx#generation--inference)
 
 ### Dataset Preparation
 
 Preprocessing pipeline to create `.meta` files containing VAE latents and text embeddings.
 
-- How-to guide: [Diffusion dataset preparation](/datasets/diffusion-dataset)
+- How-to guide: [Diffusion dataset preparation](diffusion/dataset.mdx)
 
 ---
 
-If you are new to the project, begin with the [Install NeMo AutoModel](/get-started/installation) guide. Then, select a recipe category above and follow its linked how-to guide(s). The provided YAML configurations can serve as templates—customize them by adapting model names, datasets, and precision settings to match your specific needs.
+If you are new to the project, begin with the [Installation](installation.mdx) guide. Then, select a recipe category above and follow its linked how-to guide(s). The provided YAML configurations can serve as templates—customize them by adapting model names, datasets, and precision settings to match your specific needs.

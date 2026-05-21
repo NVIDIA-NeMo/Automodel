@@ -230,7 +230,7 @@ navigation:
             path: ./latest/pages/model-coverage/embedding/index.mdx
             slug: overview
           - page: "Llama (Bidirectional)"
-            path: ./latest/pages/model-coverage/embedding/meta/llama-bidirectional.mdx
+            path: ./latest/pages/model-coverage/embedding/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
           - page: "Ministral3 (Bidirectional)"
             path: ./latest/pages/model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
@@ -242,7 +242,7 @@ navigation:
             path: ./latest/pages/model-coverage/reranker/index.mdx
             slug: overview
           - page: "Llama (Bidirectional)"
-            path: ./latest/pages/model-coverage/reranker/meta/llama-bidirectional.mdx
+            path: ./latest/pages/model-coverage/reranker/nvidia/llama-bidirectional.mdx
             slug: llama-bidirectional
   - section: "Recipes & E2E Examples"
     slug: recipes-e2e-examples

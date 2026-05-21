@@ -1,19 +1,15 @@
----
-title: "Ministral3 VL"
-description: ""
----
+# Ministral3 VL
+
 [Ministral3](https://mistral.ai/news/ministraux/) is Mistral AI's efficient small model series. The vision-capable variants support image-text inputs for multimodal tasks.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `Mistral3ForConditionalGeneration` |
 | **Parameters** | 3B – 14B |
 | **HF Org** | [mistralai](https://huggingface.co/mistralai) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -37,13 +33,14 @@ description: ""
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [ministral3_3b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml) | MedPix-VQA | SFT — Ministral3 3B on MedPix |
-| [ministral3_8b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml) | MedPix-VQA | SFT — Ministral3 8B on MedPix |
-| [ministral3_14b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml) | MedPix-VQA | SFT — Ministral3 14B on MedPix |
+| {download}`ministral3_3b_medpix.yaml <../../../../examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 3B on MedPix |
+| {download}`ministral3_8b_medpix.yaml <../../../../examples/vlm_finetune/mistral/ministral3_8b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 8B on MedPix |
+| {download}`ministral3_14b_medpix.yaml <../../../../examples/vlm_finetune/mistral/ministral3_14b_medpix.yaml>` | MedPix-VQA | SFT — Ministral3 14B on MedPix |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -62,7 +59,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -83,13 +80,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [Installation Guide](../../../guides/installation.mdx) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Hugging Face Model Cards
 

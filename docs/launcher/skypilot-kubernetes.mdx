@@ -1,8 +1,5 @@
----
-title: "SkyPilot k8s"
-description: ""
-position: 6
----
+# SkyPilot + Kubernetes Tutorial
+
 This tutorial shows how to run NeMo AutoModel on a Kubernetes cluster through SkyPilot.
 
 You will:
@@ -78,7 +75,7 @@ If you do not see any GPUs here, stop and fix the Kubernetes or SkyPilot setup f
 
 The easiest starting point is a one-GPU fine-tune using the existing Llama 3.2 1B SQuAD example.
 
-This repository now includes a Kubernetes-flavored SkyPilot config at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml).
+This repository now includes a Kubernetes-flavored SkyPilot config at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml`](../../examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml).
 
 Launch it from the repo root:
 
@@ -141,7 +138,7 @@ torchrun --nproc_per_node=1 ~/sky_workdir/nemo_automodel/recipes/llm/train_ft.py
 
 Once the single-node job works, scaling out is just a small YAML change.
 
-Use the two-node example at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml):
+Use the two-node example at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml`](../../examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml):
 
 ```bash
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml
@@ -231,7 +228,7 @@ Start with the single-node example first. If that works, check that:
 
 If you want to adapt this tutorial for your own model, the quickest path is:
 
-1. Copy [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml).
+1. Copy [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml`](../../examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml).
 2. Change the `model` and dataset sections.
 3. Keep the `skypilot:` block small until the first run succeeds.
 

@@ -1,19 +1,15 @@
----
-title: "OLMo2"
-description: ""
----
+# OLMo2
+
 [OLMo2](https://allenai.org/olmo) is Allen AI's second-generation open language model with improved architecture and training, including RMSNorm and rotary position embeddings.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `OLMo2ForCausalLM` |
 | **Parameters** | 1B – 13B |
 | **HF Org** | [allenai](https://huggingface.co/allenai) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -36,12 +32,13 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [olmo_2_0425_1b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml) | SFT — OLMo2 0425 1B Instruct on SQuAD |
-| [olmo_2_0425_1b_instruct_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad_peft.yaml) | LoRA — OLMo2 0425 1B Instruct on SQuAD |
+| {download}`olmo_2_0425_1b_instruct_squad.yaml <../../../../examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml>` | SFT — OLMo2 0425 1B Instruct on SQuAD |
+| {download}`olmo_2_0425_1b_instruct_squad_peft.yaml <../../../../examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad_peft.yaml>` | LoRA — OLMo2 0425 1B Instruct on SQuAD |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -60,7 +57,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -81,13 +78,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/olmo/olmo_2_0425_1b_instruct_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

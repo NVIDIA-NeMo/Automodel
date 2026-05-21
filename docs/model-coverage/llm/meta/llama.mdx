@@ -1,19 +1,15 @@
----
-title: "Llama"
-description: ""
----
+# Llama
+
 [Meta's Llama](https://www.llama.com/) is a family of open-weight autoregressive language models built on the transformer decoder architecture. Key design choices include pre-normalization with RMSNorm, SwiGLU activations, and Rotary Positional Embeddings (RoPE). Llama 3+ models add Grouped Query Attention (GQA) for memory-efficient inference at larger scales.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `LlamaForCausalLM` |
 | **Parameters** | 1B – 405B |
 | **HF Org** | [meta-llama](https://huggingface.co/meta-llama) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -46,12 +42,13 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [llama3_2_1b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) | SFT — Llama 3.2 1B on SQuAD |
-| [llama_3_3_70b_instruct_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml) | SFT — Llama 3.3 70B Instruct on SQuAD |
+| {download}`llama3_2_1b_squad.yaml <../../../../examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml>` | SFT — Llama 3.2 1B on SQuAD |
+| {download}`llama_3_3_70b_instruct_squad.yaml <../../../../examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml>` | SFT — Llama 3.3 70B Instruct on SQuAD |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -70,7 +67,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -91,13 +88,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) for full SFT and LoRA instructions.
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx) for full SFT and LoRA instructions.
 
 ## Hugging Face Model Cards
 

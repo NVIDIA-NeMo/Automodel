@@ -1,8 +1,5 @@
----
-title: "Fine-Tuning Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide"
-description: ""
-position: 12
----
+# Fine-Tuning Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide
+
 **A step-by-step guide for fine-tuning Gemma 4 31B to extract structured receipt data
 from scanned images using [NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel).**
 
@@ -177,6 +174,7 @@ def compute_ned(pred: str, target: str) -> float:
             prev = tmp
     return dp[n] / max(m, n)
 
+
 def run_gemma4_inference(model, processor, pil_image, prompt="Describe this image.",
                          max_new_tokens=1024):
     """Run Gemma 4 inference on a single image."""
@@ -203,6 +201,7 @@ def run_gemma4_inference(model, processor, pil_image, prompt="Describe this imag
     generated_text = processor.decode(outputs[0], skip_special_tokens=True)
     prompt_length = len(processor.decode(inputs["input_ids"][0], skip_special_tokens=True))
     return generated_text[prompt_length:].strip()
+
 
 def evaluate_receipts(model, processor, test_dataset, n_samples=20):
     """Evaluate model on receipt test set, return avg NED and per-sample results."""

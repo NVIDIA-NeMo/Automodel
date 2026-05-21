@@ -1,19 +1,15 @@
----
-title: "Mistral-Small-4"
-description: ""
----
+# Mistral-Small-4
+
 [Mistral-Small-4-119B](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) is Mistral AI's multimodal MoE model supporting both text and image inputs at scale.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `MistralForConditionalGeneration` |
 | **Parameters** | 119B (MoE) |
 | **HF Org** | [mistralai](https://huggingface.co/mistralai) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -33,11 +29,12 @@ description: ""
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [mistral4_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml) | MedPix-VQA | SFT — Mistral-Small-4 on MedPix |
+| {download}`mistral4_medpix.yaml <../../../../examples/vlm_finetune/mistral4/mistral4_medpix.yaml>` | MedPix-VQA | SFT — Mistral-Small-4 on MedPix |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -50,10 +47,9 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-<Note>
-This recipe was validated on **4 nodes × 8 GPUs (32 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
+:::{note}
+This recipe was validated on **4 nodes × 8 GPUs (32 H100s)**. See the [Launcher Guide](../../../launcher/slurm.mdx) for multi-node setup.
+:::
 
 **3. Run the recipe** from inside the repo:
 
@@ -61,7 +57,7 @@ This recipe was validated on **4 nodes × 8 GPUs (32 H100s)**. See the [Launcher
 automodel --nproc-per-node=8 examples/vlm_finetune/mistral4/mistral4_medpix.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -82,13 +78,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/mistral4/mistral4_medpix.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [Installation Guide](../../../guides/installation.mdx) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Hugging Face Model Cards
 

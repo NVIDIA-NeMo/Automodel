@@ -234,6 +234,14 @@ _HF_ORG_TO_DOC_SLUG = {
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
 
+# Specific model IDs that are documented on product/fine-tuning cards rather
+# than under the base checkpoint publisher. The Llama bidirectional retrieval
+# pages live under nvidia/ because they document NVIDIA retrieval models built
+# from Meta Llama checkpoints.
+_HF_MODEL_ID_ALLOWED_DOC_SLUGS = {
+    "meta-llama/Llama-3.1-8B": {"nvidia"},
+}
+
 # HF orgs that are personal mirrors / temp upload accounts and should not be
 # expected to have a dedicated doc subdirectory.
 _IGNORED_HF_ORGS = {
@@ -296,7 +304,8 @@ def test_recipe_model_ids_live_under_publishing_org_dir():
         # cross-references on sibling pages (e.g., Moonlight on deepseek-v3.mdx
         # for shared-arch context) are fine as long as a properly-placed
         # primary card exists.
-        if any(md.parent.name == expected_slug for md in mentioning):
+        allowed_slugs = {expected_slug, *_HF_MODEL_ID_ALLOWED_DOC_SLUGS.get(mid, set())}
+        if any(md.parent.name in allowed_slugs for md in mentioning):
             continue
 
         wrong_paths = ", ".join(str(p.relative_to(docs_dir)) for p in mentioning)

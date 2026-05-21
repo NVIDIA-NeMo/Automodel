@@ -1,21 +1,17 @@
----
-title: "Ministral3 / Devstral"
-description: ""
----
+# Ministral3 / Devstral
+
 [Ministral](https://mistral.ai/news/ministraux/) is Mistral AI's efficient small model series optimized for on-device and edge use cases. [Devstral](https://mistral.ai/news/devstral/) is a code-focused model built on the same architecture, designed for software engineering agents.
 
 Both use the `Mistral3ForConditionalGeneration` architecture.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `Mistral3ForConditionalGeneration` |
 | **Parameters** | 3B – 24B |
 | **HF Org** | [mistralai](https://huggingface.co/mistralai) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -42,7 +38,7 @@ Both use the `Mistral3ForConditionalGeneration` architecture.
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -61,7 +57,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -82,13 +78,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/devstral/devstral2_small_2512_squad.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Hugging Face Model Cards
 

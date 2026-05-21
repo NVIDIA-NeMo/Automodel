@@ -1,19 +1,15 @@
----
-title: "DeepSeek V4 Flash"
-description: ""
----
+# DeepSeek V4 Flash
+
 [DeepSeek V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is DeepSeek's latest fine-grained Mixture-of-Experts language model. It uses a 43-layer all-MoE backbone with 256 routed experts plus one shared expert per block, top-6 routing, and a hybrid per-layer attention zoo (SWA / CSA / HCA) selectable through `compress_ratios`. The first `num_hash_layers` blocks use a hash-clustering gate, and every block maintains `hc_mult=4` Hyper-Connection streams mixed via a learned col-norm-first Sinkhorn router.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `DeepseekV4ForCausalLM` |
 | **Parameters** | fine-grained MoE, 256 routed + 1 shared expert |
 | **HF Org** | [deepseek-ai](https://huggingface.co/deepseek-ai) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -35,9 +31,10 @@ description: ""
 |---|---|
 | [`deepseek_v4_flash_hellaswag.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml) | SFT — DeepSeek V4 Flash on HellaSwag with pipeline parallelism |
 
+
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -50,10 +47,9 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-<Note>
-The full 43-layer schedule requires a multi-node run; see the recipe yaml header for `ep_size` / `pp_size` guidance. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
+:::{note}
+The full 43-layer schedule requires a multi-node run; see the recipe yaml header for `ep_size` / `pp_size` guidance. See the [Launcher Guide](../../../launcher/slurm.mdx) for multi-node setup.
+:::
 
 **3. Run the recipe** from inside the repo:
 
@@ -61,7 +57,7 @@ The full 43-layer schedule requires a multi-node run; see the recipe yaml header
 automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -82,13 +78,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [Fine-Tune DeepSeek V4 Flash](/recipes-e2e-examples/deepseek-v4-flash) guide and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+See the [Fine-Tune DeepSeek V4 Flash](../../../guides/llm/dsv4-flash.mdx) guide and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.mdx).
 
 ## Hugging Face Model Cards
 

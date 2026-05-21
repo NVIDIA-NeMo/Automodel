@@ -1,22 +1,18 @@
----
-title: "Nemotron-3-Nano-Omni"
-description: ""
----
+# Nemotron-3-Nano-Omni
+
 [Nemotron-3-Nano-Omni-30B-A3B-Reasoning](https://huggingface.co/nvidia) is NVIDIA's
 omnimodal reasoning model. It pairs a NemotronH (hybrid Mamba-2 + Attention) MoE
 language backbone with a RADIO v2.5-H vision encoder and a Parakeet (FastConformer)
 sound encoder, supporting interleaved text, image, and audio inputs.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Omnimodal (Text·Image·Audio) |
 | **Architecture** | `NemotronH_Nano_Omni_Reasoning_V3` |
 | **Parameters** | 30B total / 3B active |
 | **HF Org** | [nvidia](https://huggingface.co/nvidia) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -30,12 +26,12 @@ sound encoder, supporting interleaved text, image, and audio inputs.
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [nemotron_omni_cord_v2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml) | CORD-v2 | Full SFT — receipt parsing |
-| [nemotron_omni_cord_v2_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml) | CORD-v2 | LoRA PEFT — receipt parsing |
+| {download}`nemotron_omni_cord_v2.yaml <../../../../examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml>` | CORD-v2 | Full SFT — receipt parsing |
+| {download}`nemotron_omni_cord_v2_peft.yaml <../../../../examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2_peft.yaml>` | CORD-v2 | LoRA PEFT — receipt parsing |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([NeMo AutoModel](/get-started/installation)):
+**1. Install** ([NeMo AutoModel](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -56,4 +52,4 @@ automodel examples/vlm_finetune/nemotron_omni/nemotron_omni_cord_v2.yaml --nproc
 
 For a full walkthrough — dataset preparation, SFT vs. LoRA configs, and
 post-training inference — see the
-[Nemotron-Omni guide](/recipes-e2e-examples/nemotron-omni).
+[Nemotron-Omni guide](../../../guides/vlm/nemotron-omni.mdx).

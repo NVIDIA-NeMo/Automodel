@@ -1,19 +1,15 @@
----
-title: "Gemma 4"
-description: ""
----
+# Gemma 4
+
 [Gemma 4](https://ai.google.dev/gemma) is Google's next-generation multimodal Gemma family, supporting image-text inputs with a Mixture-of-Experts (MoE) language backbone at larger scales. NeMo AutoModel replaces the HF-native dense matmul over experts with the NeMo `GroupedExperts` backend, enabling Expert Parallelism (EP) via the standard MoE parallelizer.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `Gemma4ForConditionalGeneration` |
 | **Parameters** | 2B – 31B (dense) · 26B-A4B (MoE) |
 | **HF Org** | [google](https://huggingface.co/google) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -39,21 +35,22 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [gemma4_2b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b.yaml) | SFT — Gemma 4 E2B on MedPix |
-| [gemma4_2b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_2b_peft.yaml) | LoRA — Gemma 4 E2B on MedPix |
-| [gemma4_4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml) | SFT — Gemma 4 E4B on MedPix |
-| [gemma4_4b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b_peft.yaml) | LoRA — Gemma 4 E4B on MedPix |
-| [gemma4_31b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b.yaml) | SFT — Gemma 4 31B on MedPix |
-| [gemma4_31b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_peft.yaml) | LoRA — Gemma 4 31B on MedPix |
-| [gemma4_31b_tp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml) | SFT — Gemma 4 31B with TP=4 |
-| [gemma4_31b_tp4_pp2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml) | SFT — Gemma 4 31B with TP=4, PP=2 |
-| [gemma4_31b_tp4_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml) | SFT — Gemma 4 31B with TP=4, PP=4 (multi-node) |
-| [gemma4_26b_a4b_moe.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml) | SFT — Gemma 4 26B-A4B MoE on MedPix |
-| [gemma4_26b_a4b_moe_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_peft.yaml) | LoRA — Gemma 4 26B-A4B MoE on MedPix |
+| {download}`gemma4_2b.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_2b.yaml>` | SFT — Gemma 4 E2B on MedPix |
+| {download}`gemma4_2b_peft.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_2b_peft.yaml>` | LoRA — Gemma 4 E2B on MedPix |
+| {download}`gemma4_4b.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_4b.yaml>` | SFT — Gemma 4 E4B on MedPix |
+| {download}`gemma4_4b_peft.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_4b_peft.yaml>` | LoRA — Gemma 4 E4B on MedPix |
+| {download}`gemma4_31b.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_31b.yaml>` | SFT — Gemma 4 31B on MedPix |
+| {download}`gemma4_31b_peft.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_31b_peft.yaml>` | LoRA — Gemma 4 31B on MedPix |
+| {download}`gemma4_31b_tp4.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_31b_tp4.yaml>` | SFT — Gemma 4 31B with TP=4 |
+| {download}`gemma4_31b_tp4_pp2.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp2.yaml>` | SFT — Gemma 4 31B with TP=4, PP=2 |
+| {download}`gemma4_31b_tp4_pp4.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml>` | SFT — Gemma 4 31B with TP=4, PP=4 (multi-node) |
+| {download}`gemma4_26b_a4b_moe.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml>` | SFT — Gemma 4 26B-A4B MoE on MedPix |
+| {download}`gemma4_26b_a4b_moe_peft.yaml <../../../../examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_peft.yaml>` | LoRA — Gemma 4 26B-A4B MoE on MedPix |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -72,7 +69,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/vlm_finetune/gemma4/gemma4_4b.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -93,13 +90,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/gemma4/gemma4_4b.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [Installation Guide](../../../guides/installation.mdx) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.mdx).
 
 ## Hugging Face Model Cards
 

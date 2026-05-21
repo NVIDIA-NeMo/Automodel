@@ -1,8 +1,16 @@
 ---
-title: "Key Features and Concepts"
 description: "Key features and core concepts of NeMo AutoModel for scalable LLM and VLM training with Hugging Face integration"
-position: 2
+categories: ["concepts-architecture"]
+tags: ["features", "benchmarks", "parallelism", "peft", "distributed", "recipes", "components"]
+personas: ["machine-learning-engineer", "researcher", "devops"]
+difficulty: "beginner"
+content_type: "concept"
 ---
+
+(about-key-features)=
+
+# Key Features and Concepts
+
 NeMo AutoModel provides GPU-accelerated, `transformers`-compatible training for LLMs and VLMs. It combines Hugging Face's model ecosystem with NVIDIA's optimized training stack, delivering high throughput without sacrificing ease of use.
 
 ## Why NeMo AutoModel?
@@ -21,7 +29,7 @@ NeMo AutoModel provides GPU-accelerated, `transformers`-compatible training for 
 | GPT-OSS 20B | 8 | 279 | 13,058 | TE + DeepEP + FlexAttn |
 | Qwen3 MoE 30B | 8 | 212 | 11,842 | TE + DeepEP |
 
-See the [full benchmark results](/performance/performance-summary) for configuration details and more models.
+See the [full benchmark results](../performance-summary.mdx) for configuration details and more models.
 
 ---
 
@@ -29,32 +37,44 @@ See the [full benchmark results](/performance/performance-summary) for configura
 
 NeMo AutoModel supports a range of training tasks across LLM and VLM modalities.
 
-<Cards>
-<Card title="Supervised Fine-Tuning (SFT)" href="/recipes-e2e-examples/sft-peft">
+::::{grid}
+:::{grid-item-card} Supervised Fine-Tuning (SFT)
+:link: ../guides/llm/finetune
+:link-type: doc
 Full-parameter fine-tuning for task-specific adaptation.
-</Card>
+:::
 
-<Card title="PEFT (LoRA / QLoRA)" href="/recipes-e2e-examples/sft-peft">
+:::{grid-item-card} PEFT (LoRA / QLoRA)
+:link: ../guides/llm/finetune
+:link-type: doc
 Memory-efficient fine-tuning by updating only low-rank adapter weights.
-</Card>
+:::
 
-<Card title="Pre-Training" href="/recipes-e2e-examples/pretraining">
+:::{grid-item-card} Pre-Training
+:link: ../guides/llm/pretraining
+:link-type: doc
 Train models from scratch on large-scale datasets.
-</Card>
+:::
 
-<Card title="Knowledge Distillation" href="/recipes-e2e-examples/knowledge-distillation">
+:::{grid-item-card} Knowledge Distillation
+:link: ../guides/llm/knowledge-distillation
+:link-type: doc
 Transfer knowledge from a large teacher to a smaller student model.
-</Card>
+:::
 
-<Card title="Tool Calling" href="/recipes-e2e-examples/function-calling">
+:::{grid-item-card} Tool Calling
+:link: ../guides/llm/toolcalling
+:link-type: doc
 Fine-tune models for structured function calling with tool schemas.
-</Card>
+:::
 
-<Card title="Quantization-Aware Training" href="/recipes-e2e-examples/qat">
+:::{grid-item-card} Quantization-Aware Training
+:link: ../guides/quantization-aware-training
+:link-type: doc
 Train with quantization for deployment-ready models.
-</Card>
+:::
 
-</Cards>
+::::
 
 ---
 
@@ -62,24 +82,24 @@ Train with quantization for deployment-ready models.
 
 NeMo AutoModel leverages PyTorch-native parallelism strategies to scale training from a single GPU to multi-node clusters.
 
-<Cards>
-<Card title="FSDP2">
+::::{grid}
+:::{grid-item-card} FSDP2
 Fully Sharded Data Parallelism with DTensor for memory-efficient distributed training. Supports Hybrid Sharding (HSDP) for multi-node.
-</Card>
+:::
 
-<Card title="Pipeline Parallelism">
+:::{grid-item-card} Pipeline Parallelism
 Torch-native pipelining composable with FSDP2 and DTensor for 3D parallelism.
-</Card>
+:::
 
-<Card title="FP8 Mixed Precision">
+:::{grid-item-card} FP8 Mixed Precision
 FP8 training via torchao for reduced memory and higher throughput on supported models.
-</Card>
+:::
 
-<Card title="Multi-Node with SLURM">
-Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](/job-launchers/slurm-cluster).
-</Card>
+:::{grid-item-card} Multi-Node with SLURM
+Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](../launcher/slurm.mdx).
+:::
 
-</Cards>
+::::
 
 ---
 
@@ -145,7 +165,7 @@ automodel config.yaml
 sbatch my_cluster.sub  # copy slurm.sub, edit CONFIG & SBATCH directives, then submit
 ```
 
-See the [Run on Your Local Workstation](/job-launchers/local-workstation) and [Cluster](/job-launchers/slurm-cluster) guides.
+See the [Local Workstation](../launcher/local-workstation.mdx) and [Cluster](../launcher/slurm.mdx) guides.
 
 ---
 
@@ -157,8 +177,8 @@ NeMo AutoModel writes Distributed Checkpoints (DCP) with SafeTensors shards. Che
 - **Reshard** when loading onto a different mesh or topology.
 - **Resume** training from any checkpoint without manual intervention.
 
-See the [Checkpointing guide](/development/checkpointing) for details.
+See the [Checkpointing guide](../guides/checkpointing.mdx) for details.
 
 ## Experiment Tracking
 
-NeMo AutoModel integrates with MLflow and Weights & Biases for experiment tracking, metric logging, and artifact management. See the [Experiment Tracking guide](/development/mlflow-logging).
+NeMo AutoModel integrates with MLflow and Weights & Biases for experiment tracking, metric logging, and artifact management. See the [Experiment Tracking guide](../guides/mlflow-logging.mdx).

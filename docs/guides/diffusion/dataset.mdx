@@ -1,8 +1,7 @@
----
-title: "Diffusion Dataset Preparation"
-description: ""
-position: 7
----
+(diffusion-dataset)=
+
+# Diffusion Dataset Preparation
+
 ## Introduction
 
 Diffusion model training in NeMo AutoModel requires pre-encoded `.meta` files rather than raw images or videos. During preprocessing, a VAE encodes visual data into latent representations and a text encoder produces text embeddings. These are saved as `.meta` files so that training operates entirely in latent space, avoiding the need to load heavy encoder models during training.
@@ -30,7 +29,7 @@ If no caption is found for a sample, the filename (with underscores replaced by 
 
 ## Preprocessing
 
-NeMo AutoModel includes a unified preprocessing tool at [`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py) that encodes raw images and videos into cache files compatible with the multiresolution dataloader. It uses model-specific processors from `tools/diffusion/processors/` to handle VAE encoding, text embedding, and cache data formatting for each supported model.
+NeMo AutoModel includes a unified preprocessing tool at [`tools/diffusion/preprocessing_multiprocess.py`](../../../tools/diffusion/preprocessing_multiprocess.py) that encodes raw images and videos into cache files compatible with the multiresolution dataloader. It uses model-specific processors from `tools/diffusion/processors/` to handle VAE encoding, text embedding, and cache data formatting for each supported model.
 
 The tool automatically distributes work across all available GPUs using multiprocessing, with one worker per GPU.
 
@@ -203,7 +202,6 @@ data:
     drop_last: false
 ```
 
-<Tip>
+:::{tip}
 Supported image resolutions for FLUX include `[256, 256]`, `[512, 512]`, and `[1024, 1024]`. While a 1:1 aspect ratio is currently used as a proxy for the closest image size, the implementation is designed to support multiple aspect ratios.
-
-</Tip>
+:::

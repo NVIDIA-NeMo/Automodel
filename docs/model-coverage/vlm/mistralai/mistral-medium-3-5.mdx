@@ -1,7 +1,5 @@
----
-title: "Mistral Medium 3.5"
-description: ""
----
+# Mistral Medium 3.5
+
 [Mistral Medium 3.5](https://huggingface.co/mistralai) is Mistral AI's
 flagship **128B dense** model that merges instruction-following, reasoning,
 and coding into a single checkpoint with a configurable reasoning mode.
@@ -11,8 +9,7 @@ It unifies the lineage of *Mistral Medium 3.1*, *Magistral Medium*, and
 H100 nodes — a notable footprint advantage over comparably-capable
 Mixture-of-Experts (MoE) systems.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
@@ -22,8 +19,7 @@ Mixture-of-Experts (MoE) systems.
 | **Languages** | 40+ (English, French, Spanish, German, Russian, Chinese, Japanese, Italian, Portuguese, Arabic, Hindi, Korean, plus Indic / Nordic / Eastern European tail) |
 | **License** | Modified MIT (open-weights, ≤ $20M annual revenue threshold) |
 | **HF Org** | [mistralai](https://huggingface.co/mistralai) |
-
-</Info>
+:::
 
 ## Architecture
 
@@ -93,11 +89,12 @@ training to fit on H100-80GB.
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| [mistral3p5_128b_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml) | MedPix-VQA | SFT — Mistral Medium 3.5 128B on MedPix, 8 nodes × 8 GPUs (TP=8 PP=8) |
+| {download}`mistral3p5_128b_medpix.yaml <../../../../examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml>` | MedPix-VQA | SFT — Mistral Medium 3.5 128B on MedPix, 8 nodes × 8 GPUs (TP=8 PP=8) |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -110,23 +107,22 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-<Note>
+:::{note}
 This recipe was validated on **8 nodes × 8 GPUs (64 H100s)** with
-TP=8 PP=8 DP=1. See the [Launcher Guide](/job-launchers/slurm-cluster)
+TP=8 PP=8 DP=1. See the [Launcher Guide](../../../launcher/slurm.mdx)
 for multi-node setup. Inference / single-node fine-tune fits in
 **1 × H200** or **2 × H100** nodes thanks to the dense + FP8 layout.
-
-</Note>
+:::
 
 **3. Run the recipe** via Slurm (see the
-[fine-tuning guide](/recipes-e2e-examples/mistral-medium-3-5) for a
+[fine-tuning guide](../../../guides/vlm/mistral-medium-3-5.mdx) for a
 complete launch script):
 
 ```bash
 sbatch your_slurm_script.sub
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -147,14 +143,14 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and the
-[Mistral Medium 3.5 Fine-Tuning Guide](/recipes-e2e-examples/mistral-medium-3-5).
+See the [Installation Guide](../../../guides/installation.mdx) and the
+[Mistral Medium 3.5 Fine-Tuning Guide](../../../guides/vlm/mistral-medium-3-5.mdx).
 
 ## Fine-Tuning
 
-See the [Mistral Medium 3.5 Fine-Tuning Guide](/recipes-e2e-examples/mistral-medium-3-5).
+See the [Mistral Medium 3.5 Fine-Tuning Guide](../../../guides/vlm/mistral-medium-3-5.mdx).
 
 ## Hugging Face Model Cards
 

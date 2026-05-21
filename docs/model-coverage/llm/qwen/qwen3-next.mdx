@@ -1,19 +1,15 @@
----
-title: "Qwen3-Next"
-description: ""
----
+# Qwen3-Next
+
 Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team designed for high-throughput inference with large total parameter counts and efficient per-token activation.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `Qwen3NextForCausalLM` |
 | **Parameters** | 80B total / 3B active |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-
-</Info>
+:::
 
 ## Available Models
 
@@ -33,11 +29,12 @@ Qwen3-Next is an advanced MoE language model from Alibaba Cloud's Qwen team desi
 
 | Recipe | Description |
 |---|---|
-| [qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml) | SFT — Qwen3-Next with TE + DeepEP |
+| {download}`qwen3_next_te_deepep.yaml <../../../../examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml>` | SFT — Qwen3-Next with TE + DeepEP |
+
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -50,10 +47,9 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-<Note>
-This recipe was validated on **4 nodes × 8 GPUs (32 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
+:::{note}
+This recipe was validated on **4 nodes × 8 GPUs (32 H100s)**. See the [Launcher Guide](../../../launcher/slurm.mdx) for multi-node setup.
+:::
 
 **3. Run the recipe** from inside the repo:
 
@@ -61,7 +57,7 @@ This recipe was validated on **4 nodes × 8 GPUs (32 H100s)**. See the [Launcher
 automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -82,13 +78,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+See the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.mdx).
 
 ## Hugging Face Model Cards
 

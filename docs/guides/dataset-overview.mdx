@@ -1,11 +1,8 @@
----
-title: "Dataset Overview: LLM, VLM, and Retrieval Datasets"
-description: ""
-position: 1
----
+# Dataset Overview: LLM, VLM, and Retrieval Datasets
+
 This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](/datasets/text-dataset), [VLM datasets](/datasets/multi-modal-dataset), and [Retrieval dataset](/datasets/retrieval-dataset) for deeper, task-specific guides.
+- See also: [LLM datasets](llm/dataset.mdx), [VLM datasets](vlm/dataset.mdx), and [Retrieval dataset](llm/retrieval-dataset.mdx) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
@@ -28,11 +25,10 @@ dataset:
 ### SQuAD-Style Question Answering (QA) (Instruction SFT)
 - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
 - Use case: instruction/QA tuning with either prompt-and-answer formatting or chat-template formatting
-<Note>
+:::{note}
 - If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
 - Optional `seq_length` can be used for padding/truncation.
-
-</Note>
+:::
 - Example YAML:
 ```yaml
 dataset:
@@ -64,7 +60,7 @@ dataset:
   answer_only_loss_mask: true
   start_of_turn_token: "<|assistant|>"
 ```
-See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/columnmapped-dataset), for more information.
+See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.mdx), for more information.
 
 - **ChatDataset (multi-turn conversations and tool calling)**
   - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
@@ -80,7 +76,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
     - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
     - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
     - `chat_template`: optional override for tokenizer's chat template
-    - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
+    - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files (warnings log skip counts); default ``false`` fails fast on a bad line
   - Notes:
     - Requires a tokenizer with chat template support
     - Supports both single-turn and multi-turn tool calling
@@ -102,8 +98,8 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
   - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
   - `chat_template`: optional override for tokenizer's chat template
   - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
-  - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
-<Note>
+  - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files (warnings log skip counts); default ``false`` fails fast on a bad line
+:::{note}
 - Requires a tokenizer with chat template support
 - Supports both single-turn and multi-turn tool calling
 - Assistant messages may also include `reasoning_content` for structured reasoning traces
@@ -114,8 +110,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
 - For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
 - Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss
 - Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load
-
-</Note>
+:::
 - Example YAML:
 ```yaml
 dataset:
@@ -239,8 +234,8 @@ dataset:
   ]
 }
 ```
-See the [Function Calling guide](/recipes-e2e-examples/function-calling) for an end-to-end example with FunctionGemma.
-For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
+See the [Function Calling guide](llm/toolcalling.mdx) for an end-to-end example with FunctionGemma.
+For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](../../examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
 
 ### Retrieval (Embedding Fine-Tuning)
 - Factory: `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
@@ -261,16 +256,15 @@ collate_fn:
   q_max_len: 512
   p_max_len: 512
 ```
-See the detailed guide, [Retrieval dataset](/datasets/retrieval-dataset), for more information.
+See the detailed guide, [Retrieval dataset](llm/retrieval-dataset.mdx), for more information.
 
 ### NanoGPT Binary Shards (Pretraining)
 - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
 - Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
-<Note>
+:::{note}
 - Streams contiguous `seq_len` slices, supports optional BOS alignment and `.bos.idx` sidecar files
 - Related tool: `tools/nanogpt_data_processor.py`
-
-</Note>
+:::
 
 ### Megatron (Pretraining; Interoperable With Pre-Tokenized Megatron Data)
 - Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
@@ -290,7 +284,7 @@ dataset:
   split: "0.99, 0.01, 0.00"  # train, validation, test
   splits_to_build: "train"
 ```
-See the detailed [pretraining guide](/recipes-e2e-examples/pretraining), which uses MegatronPretraining data.
+See the detailed [pretraining guide](llm/pretraining.mdx), which uses MegatronPretraining data.
 
 ## Streaming Datasets
 
@@ -459,6 +453,7 @@ Built-in dataset makers (return lists of `conversation` dicts):
 - **MedPix-VQA (Medical Pixel Question Answering)**: `nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset`
 - **CommonVoice 17 (CV17) (audio)**: `nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset`
 
+
 Each example follows the conversation schema expected by `apply_chat_template`, e.g.:
 ```python
 {
@@ -505,7 +500,7 @@ dataloader:
 ```
 If you want answer-only loss masking, provide a model-appropriate `start_of_response_token` to the collate function.
 
-See [Gemma-3n](/recipes-e2e-examples/gemma-3-3n) and [VLM dataset](/datasets/multi-modal-dataset) for end-to-end examples.
+See [Gemma-3n](omni/gemma3-3n.mdx) and [VLM dataset](vlm/dataset.mdx) for end-to-end examples.
 
 ---
 
@@ -537,7 +532,7 @@ data:
     num_workers: 0
 ```
 
-See the [Diffusion Dataset Preparation](/datasets/diffusion-dataset) guide for full preprocessing instructions and configuration details.
+See the [Diffusion Dataset Preparation](diffusion/dataset.mdx) guide for full preprocessing instructions and configuration details.
 
 ---
 

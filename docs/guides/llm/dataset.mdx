@@ -1,8 +1,5 @@
----
-title: "Integrate Your Own Text Dataset"
-description: ""
-position: 2
----
+# Integrate Your Own Text Dataset
+
 This guide shows you how to integrate your own dataset into NeMo Automodel for training. You'll learn about two main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)) and **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)). We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
 
 ## Quick Start Summary
@@ -49,6 +46,7 @@ NeMo Automodel provides the `SFTSingleTurnPreprocessor` class to handle completi
 4. **Creates loss mask**: `-100` for context, target IDs for target.
 5. **Pads** sequences to equal length.
 
+
 #### Create Your Own Completion Dataset
 
 To adapt your dataset into this format, define a class like this:
@@ -77,6 +75,7 @@ class MyCompletionDataset:
     def __len__(self):
         return len(self.dataset)
 ```
+
 
 ### Instruction Datasets
 
@@ -149,6 +148,7 @@ dataset:
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
 
+
 ## Packed Sequence Support in NeMo AutoModel
 NeMo AutoModel supports **packed sequences**, a technique to optimize training with variable-length sequences (e.g., text) by minimizing padding.
 
@@ -163,6 +163,7 @@ Instead of padding each sequence to a fixed length (wasting computation on `[PAD
 - Enables larger effective batch sizes leading to better GPU utilization.
 - Especially useful for language modeling and text datasets.
 
+
 ### Enable Packed Sequences in NeMo Automodel
 
 To enable packed sequences, add these keys to your recipe's YAML config:
@@ -176,6 +177,7 @@ packed_sequence:
 The `packed_sequence` has two options:
 - **packed_sequence_size**: Defines the total token length of each packed sequence, higher values require higher GPU memory usage.
 - **split_across_pack**: If two will split a sequence across different packed sequences.
+
 
 ## Troubleshooting Tips
 

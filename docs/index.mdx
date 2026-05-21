@@ -1,30 +1,60 @@
 ---
-title: "NeMo AutoModel Documentation"
+
 description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support"
+
+categories:
+
+- documentation
+- home
+tags:
+- training
+- fine-tuning
+- distributed
+- gpu-accelerated
+- spmd
+- dtensor
+personas:
+- Machine Learning Engineers
+- Data Scientists
+- Researchers
+- DevOps Professionals
+difficulty: beginner
+content_type: index
 ---
-import { Tag } from "@/components/Tag";
 
-PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
-**Quick links:** [🤗 HF Compatible](/get-started/hf-compatibility) | [🚀 Performance](/performance/performance-summary) | [📐 Scalability](/get-started/key-features) | [🎯 SFT & PEFT](/recipes-e2e-examples/sft-peft) | [🎨 Diffusion](/recipes-e2e-examples/diffusion-fine-tuning) | [👁️ VLM](/recipes-e2e-examples/gemma-4)
+(automodel-home)=
 
-<Cards>
-<Card title="About" href="/get-started/about">
+# NeMo AutoModel Documentation
+
+PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
+**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.mdx) | [🚀 Performance](performance-summary.mdx) | [📐 Scalability](about/key-features.mdx) | [🎯 SFT & PEFT](guides/llm/finetune.mdx) | [🎨 Diffusion](guides/diffusion/finetune.mdx) | [👁️ VLM](guides/vlm/gemma4.mdx)
+
+::::{grid}
+:::{grid-item-card} About
+:link: about/index
+:link-type: doc
 Overview of NeMo AutoModel and its capabilities.
-</Card>
+:::
 
-<Card title="Key Features" href="/get-started/key-features">
+:::{grid-item-card} Key Features
+:link: about/key-features
+:link-type: doc
 Supported workflows, parallelism, recipes, and benchmarks.
-</Card>
+:::
 
-<Card title="🤗 HF Integration" href="/get-started/hf-compatibility">
+:::{grid-item-card} 🤗 HF Integration
+:link: guides/huggingface-api-compatibility
+:link-type: doc
 A `transformers`-compatible library with accelerated model implementations.
-</Card>
+:::
 
-<Card title="Model Coverage" href="/model-coverage/overview">
+:::{grid-item-card} Model Coverage
+:link: model-coverage/overview
+:link-type: doc
 Built on `transformers` for day-0 model support and OOTB compatibility.
-</Card>
+:::
 
-</Cards>
+::::
 
 ## Get Started
 
@@ -34,13 +64,13 @@ uv pip install nemo-automodel
 automodel --nproc-per-node=2 llama3_2_1b_squad.yaml
 ```
 
-See the [installation guide](/get-started/installation) for Docker, source builds, and multi-node setup.
-See the [configuration guide](/get-started/configuration) for YAML recipes and CLI overrides.
-Launch on a [local workstation](/job-launchers/local-workstation) or [SLURM cluster](/job-launchers/slurm-cluster).
+See the [installation guide](guides/installation.mdx) for Docker, source builds, and multi-node setup.
+See the [configuration guide](guides/configuration.mdx) for YAML recipes and CLI overrides.
+Launch on a [local workstation](launcher/local-workstation.mdx) or [SLURM cluster](launcher/slurm.mdx).
 
 ## Latest Model Support
 
-New models are added regularly. Pick a model below to start fine-tuning, or see the [full release log](/model-coverage/release-log).
+New models are added regularly. Pick a model below to start fine-tuning, or see the [full release log](model-coverage/latest-models.mdx).
 
 | Date | Modality | Model |
 |------|----------|-------|
@@ -53,32 +83,33 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 ## Recipes & Guides
 
-Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
+Find the right guide for your task: fine-tuning, pretraining, distillation, diffusion, and more.
 
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
-| **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](/recipes-e2e-examples/sft-peft)               |
-| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates &lt;1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](/recipes-e2e-examples/sft-peft)        |
-| **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](/recipes-e2e-examples/function-calling)             |
-| **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](/recipes-e2e-examples/gemma-3-3n)                 |
-| **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](/recipes-e2e-examples/gemma-4)                 |
-| **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](/recipes-e2e-examples/dllm-fine-tuning)                 |
-| **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](/recipes-e2e-examples/diffusion-fine-tuning)       |
-| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](/recipes-e2e-examples/qwen3-5-vl)                |
-| **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](/recipes-e2e-examples/qwen3-omni-asr) |
-| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Tag variant="info">Coming Soon</Tag>                                   |
-| **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](/recipes-e2e-examples/large-moe-fine-tuning)         |
-| **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](/recipes-e2e-examples/deepseek-v4-flash)   |
-| **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](/recipes-e2e-examples/hy3-preview)                |
-| **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](/recipes-e2e-examples/sequence-classification) |
-| **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](/recipes-e2e-examples/qat)       |
-| **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](/recipes-e2e-examples/knowledge-distillation)   |
-| **Pretrain an LLM**         | You are building a base model from scratch on your own corpus                       | Large unlabeled text corpus (e.g., FineWeb-Edu)   | LLM       | [Start pretraining](/recipes-e2e-examples/pretraining)            |
-| **Pretrain (NanoGPT)**      | You want quick pretraining experiments on a single node                             | FineWeb / text corpus                             | LLM       | [Try NanoGPT](/recipes-e2e-examples/nanogpt-pretraining)          |
+| **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](guides/llm/finetune.mdx)               |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates &lt;1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.mdx)     |
+| **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.mdx)             |
+| **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.mdx)                 |
+| **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.mdx)                 |
+| **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](guides/dllm/finetune.mdx)                 |
+| **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.mdx)       |
+| **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3-5.mdx)                |
+| **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](guides/audio/qwen3-omni-asr.mdx) |
+| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | Coming Soon                                   |
+| **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.mdx)         |
+| **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](guides/llm/dsv4-flash.mdx)   |
+| **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](guides/llm/hy3.mdx)                |
+| **Sequence classification** | You need to classify text into categories (sentiment, topic, NLI)                   | Text + labels (e.g., GLUE MRPC)                   | LLM       | [Train classifier](guides/llm/sequence-classification.mdx) |
+| **QAT fine-tune**           | You want a quantized model that keeps accuracy for efficient deployment             | Text dataset                                      | LLM       | [Enable QAT](guides/quantization-aware-training.mdx)       |
+| **Knowledge distillation**  | You want a smaller, faster model that retains most of the teacher's quality         | Instruction dataset + teacher model               | LLM       | [Distill a model](guides/llm/knowledge-distillation.mdx)   |
+| **Pretrain an LLM**         | You are building a base model from scratch on your own corpus                       | Large unlabeled text corpus (e.g., FineWeb-Edu)   | LLM       | [Start pretraining](guides/llm/pretraining.mdx)            |
+| **Pretrain (NanoGPT)**      | You want quick pretraining experiments on a single node                             | FineWeb / text corpus                             | LLM       | [Try NanoGPT](guides/llm/nanogpt-pretraining.mdx)          |
 
 ## Performance
 
 Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face models.
+
 
 | Model            | GPUs | TFLOPs/sec/GPU | Tokens/sec/GPU | Optimizations          |
 | ---------------- | ---- | -------------- | -------------- | ---------------------- |
@@ -86,58 +117,168 @@ Training throughput on NVIDIA GPUs with optimized kernels for Hugging Face model
 | GPT-OSS 20B      | 8    | 279            | 13,058         | TE + DeepEP + FlexAttn |
 | Qwen3 MoE 30B    | 8    | 277            | 12,040         | TE + DeepEP            |
 
-See the [full benchmark results](/performance/performance-summary) for configuration details and more models.
+
+See the [full benchmark results](performance-summary.mdx) for configuration details and more models.
 
 ## Advanced Topics
 
 Parallelism, precision, checkpointing strategies, and experiment tracking.
 
-<Cards>
-<Card title="Pipeline Parallelism" href="/development/pipeline-parallelism">
+::::{grid}
+:::{grid-item-card} Pipeline Parallelism
+:link: guides/pipelining
+:link-type: doc
 Torch-native pipelining composable with FSDP2 and DTensor.
-<Tag variant="secondary">3d-parallelism</Tag>
-</Card>
++++
+3d-parallelism
+:::
 
-<Card title="FP8 Training" href="/development/fp8-training">
+:::{grid-item-card} FP8 Training
+:link: guides/fp8-training
+:link-type: doc
 Mixed-precision FP8 training with torchao.
-<Tag variant="secondary">FP8</Tag> <Tag variant="secondary">mixed-precision</Tag>
-</Card>
++++
+FP8 mixed-precision
+:::
 
-<Card title="Checkpointing" href="/development/checkpointing">
+:::{grid-item-card} Checkpointing
+:link: guides/checkpointing
+:link-type: doc
 Distributed checkpoints with SafeTensors output.
-<Tag variant="secondary">DCP</Tag> <Tag variant="secondary">safetensors</Tag>
-</Card>
++++
+DCP safetensors
+:::
 
-<Card title="Gradient Checkpointing" href="/development/gradient-checkpointing">
+:::{grid-item-card} Gradient Checkpointing
+:link: guides/gradient-checkpointing
+:link-type: doc
 Trade compute for memory with activation checkpointing.
-<Tag variant="secondary">memory-efficiency</Tag>
-</Card>
++++
+memory-efficiency
+:::
 
-<Card title="Quantization-Aware Training" href="/recipes-e2e-examples/qat">
+:::{grid-item-card} Quantization-Aware Training
+:link: guides/quantization-aware-training
+:link-type: doc
 Train with quantization for deployment-ready models.
-<Tag variant="secondary">QAT</Tag>
-</Card>
++++
+QAT
+:::
 
-<Card title="Experiment Tracking" href="/development/mlflow-logging">
+:::{grid-item-card} Experiment Tracking
+:link: guides/mlflow-logging
+:link-type: doc
 Track experiments and metrics with MLflow and Wandb.
-<Tag variant="secondary">MLflow</Tag> <Tag variant="secondary">Wandb</Tag>
-</Card>
++++
+MLflow Wandb
+:::
 
-</Cards>
+::::
 
 ## For Developers
 
-<Cards>
-<Card title="Repo Internals" href="/get-started/repo-structure">
+::::{grid}
+:::{grid-item-card} Repo Internals
+:link: repository-structure
+:link-type: doc
 Components, recipes, and CLI architecture.
-</Card>
+:::
 
-<Card title="API Reference" href="/development/api-reference/overview">
+:::{grid-item-card} API Reference
+:link: apidocs/index
+:link-type: doc
 Auto-generated Python API documentation.
-</Card>
+:::
 
-<Card title="Use as a Library" href="/get-started/about">
+:::{grid-item-card} Use as a Library
+:link: about/index
+:link-type: doc
 Drop-in accelerated backend for TRL, lm-eval-harness, OpenRLHF, or any code that loads Hugging Face models.
-</Card>
+:::
 
-</Cards>
+::::
+
+---
+
+## Documentation Index
+
+### Get Started
+
+- [About](about/index.mdx)
+- [Key Features](about/key-features.mdx)
+- [Installation](guides/installation.mdx)
+- [Configuration](guides/configuration.mdx)
+- [HF Compatibility](guides/huggingface-api-compatibility.mdx)
+- [Repo Structure](repository-structure.mdx)
+- [Release Notes](release-notes.mdx)
+
+### Announcements
+
+- [Announcements](announcements.mdx)
+
+### Performance
+
+- [Performance Summary](performance-summary.mdx)
+
+### Model Coverage
+
+- [Overview](model-coverage/overview.mdx)
+- [Release Log](model-coverage/latest-models.mdx)
+- [Large Language Models](model-coverage/llm/index.mdx)
+- [Vision Language Models](model-coverage/vlm/index.mdx)
+- [Omni](model-coverage/omni/index.mdx)
+- [Diffusion](model-coverage/diffusion/index.mdx)
+- [Embedding Models](model-coverage/embedding/index.mdx)
+- [Reranking Models](model-coverage/reranker/index.mdx)
+
+### Recipes & E2E Examples
+
+- [Overview](guides/overview.mdx)
+- [SFT & PEFT](guides/llm/finetune.mdx)
+- [Function Calling](guides/llm/toolcalling.mdx)
+- [Knowledge Distillation](guides/llm/knowledge-distillation.mdx)
+- [Large MoE Fine-Tuning](guides/llm/large-moe-finetune.mdx)
+- [DeepSeek V4 Flash](guides/llm/dsv4-flash.mdx)
+- [Hy3-preview](guides/llm/hy3.mdx)
+- [Pretraining](guides/llm/pretraining.mdx)
+- [NanoGPT Pretraining](guides/llm/nanogpt-pretraining.mdx)
+- [Sequence Classification](guides/llm/sequence-classification.mdx)
+- [Gemma 3 / 3n](guides/omni/gemma3-3n.mdx)
+- [Gemma 4](guides/vlm/gemma4.mdx)
+- [Qwen3.5-VL](guides/vlm/qwen3-5.mdx)
+- [Nemotron-Omni](guides/vlm/nemotron-omni.mdx)
+- [Mistral Medium 3.5 VL](guides/vlm/mistral-medium-3-5.mdx)
+- [Qwen3-Omni ASR](guides/audio/qwen3-omni-asr.mdx)
+- [Diffusion Fine-Tuning](guides/diffusion/finetune.mdx)
+- [dLLM Fine-Tuning](guides/dllm/finetune.mdx)
+- [QAT](guides/quantization-aware-training.mdx)
+- [Databricks](guides/llm/databricks.mdx)
+
+### Datasets
+
+- [Overview](guides/dataset-overview.mdx)
+- [Text Dataset](guides/llm/dataset.mdx)
+- [Retrieval Dataset](guides/llm/retrieval-dataset.mdx)
+- [ColumnMapped Dataset](guides/llm/column-mapped-text-instruction-dataset.mdx)
+- [ColumnMapped Iterable](guides/llm/column-mapped-text-instruction-iterable-dataset.mdx)
+- [Multi-Modal Dataset](guides/vlm/dataset.mdx)
+- [Diffusion Dataset](guides/diffusion/dataset.mdx)
+
+### Job Launchers
+
+- [Overview](launcher/overview.mdx)
+- [Local Workstation](launcher/local-workstation.mdx)
+- [SLURM Cluster](launcher/slurm.mdx)
+- [NeMo Run](launcher/nemo-run.mdx)
+- [SkyPilot](launcher/skypilot.mdx)
+- [SkyPilot k8s](launcher/skypilot-kubernetes.mdx)
+
+### Development
+
+- [Checkpointing](guides/checkpointing.mdx)
+- [Gradient Checkpointing](guides/gradient-checkpointing.mdx)
+- [Pipeline Parallelism](guides/pipelining.mdx)
+- [FP8 Training](guides/fp8-training.mdx)
+- [MLflow Logging](guides/mlflow-logging.mdx)
+- [API Reference](api-reference/index.mdx)
+- [Breaking Changes](breaking-changes.mdx)

@@ -1,19 +1,15 @@
----
-title: "GLM-5 / GLM-5.1 (MoE + DSA)"
-description: ""
----
+# GLM-5 / GLM-5.1 (MoE + DSA)
+
 [GLM-5](https://huggingface.co/zai-org/GLM-5) and [GLM-5.1](https://huggingface.co/zai-org/GLM-5.1) are Zhipu AI's latest open-source large Mixture-of-Experts models featuring a DeepSeek-style MLA (Multi-head Latent Attention) + DSA (Dynamic Sparse Attention) architecture. GLM-5.1 shares the `glm_moe_dsa` architecture with GLM-5, with updated weights.
 
-<Info>
-
+:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `GlmMoeDsaForCausalLM` |
 | **Parameters** | 256 routed experts, 8 active per token |
 | **HF Org** | [zai-org](https://huggingface.co/zai-org) |
-
-</Info>
+:::
 
 ## Key Features
 
@@ -38,8 +34,8 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [glm_5_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) | SFT — GLM-5 with EP=64, PP=4 on 32 nodes |
-| [glm_5.1_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml) | SFT — GLM-5.1 with EP=64, PP=4 on 32 nodes |
+| {download}`glm_5_hellaswag_pp.yaml <../../../../examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml>` | SFT — GLM-5 with EP=64, PP=4 on 32 nodes |
+| {download}`glm_5.1_hellaswag_pp.yaml <../../../../examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml>` | SFT — GLM-5.1 with EP=64, PP=4 on 32 nodes |
 
 ## Parallel Setup
 
@@ -69,7 +65,7 @@ distributed:
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
+**1. Install** ([full instructions](../../../guides/installation.mdx)):
 
 ```bash
 pip install nemo-automodel
@@ -82,10 +78,9 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-<Note>
-This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
-
-</Note>
+:::{note}
+This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launcher Guide](../../../launcher/slurm.mdx) for multi-node setup.
+:::
 
 **3. Run the recipe** from inside the repo:
 
@@ -93,7 +88,7 @@ This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launch
 automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml
 ```
 
-<Accordion title="Run with Docker">
+:::{dropdown} Run with Docker
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -114,13 +109,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml
 ```
-</Accordion>
+:::
 
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+See the [Installation Guide](../../../guides/installation.mdx) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.mdx) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.mdx).
 
 ## Hugging Face Model Cards
 

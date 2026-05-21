@@ -1,8 +1,6 @@
----
-title: "Diffusion Language Model (dLLM) Fine-Tuning and Generation"
-description: ""
-position: 17
----
+
+# Diffusion Language Model (dLLM) Fine-Tuning and Generation with NeMo AutoModel
+
 ## Introduction
 
 Diffusion language models (dLLMs) generate text by iteratively denoising masked tokens, rather than generating one token at a time left-to-right like autoregressive (AR) models. Starting from a sequence of `[MASK]` tokens, the model progressively unmasks the most confident positions over multiple denoising steps until the full response is revealed.
@@ -35,7 +33,7 @@ NeMo AutoModel currently supports the following dLLM model family:
 
 | Model Family | dLLM Mode | Loss | Inference | Example Config |
 |---|---|---|---|---|
-| LLaDA | `mdlm` | MDLM cross-entropy | Block-by-block, full-forward (no KV cache) | [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) |
+| LLaDA | `mdlm` | MDLM cross-entropy | Block-by-block, full-forward (no KV cache) | [llada_sft.yaml](../../../examples/dllm_sft/llada_sft.yaml) |
 
 ## Install NeMo AutoModel
 
@@ -50,13 +48,13 @@ docker pull nvcr.io/nvidia/nemo-automodel:26.02.00
 docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-For the full set of installation methods, see the [installation guide](/get-started/installation).
+For the full set of installation methods, see the [installation guide](../installation.mdx).
 
 ## Configure Your Training Recipe
 
 dLLM fine-tuning is driven by:
 
-1. A **recipe script** ([`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/dllm/train_ft.py)) — orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
+1. A **recipe script** ([`train_ft.py`](../../../nemo_automodel/recipes/dllm/train_ft.py)) — orchestrates the training loop with dLLM-specific corruption, loss, and batch handling.
 2. A **YAML configuration file** — specifies the model, data, optimizer, dLLM-specific settings, and distributed training strategy.
 
 The recipe uses a **strategy pattern** to handle differences between model families. The `dllm.mode` field in the YAML selects the strategy:
@@ -67,7 +65,7 @@ The recipe uses a **strategy pattern** to handle differences between model famil
 
 ### LLaDA Configuration
 
-See [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) for the full working config. The key dLLM-specific sections are:
+See [llada_sft.yaml](../../../examples/dllm_sft/llada_sft.yaml) for the full working config. The key dLLM-specific sections are:
 
 ```yaml
 model:
@@ -103,7 +101,7 @@ torchrun --nproc-per-node=8 \
 
 ## Generation / Inference
 
-The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat, raw, and infilling modes for LLaDA checkpoints.
+The generation script ([`generate.py`](../../../examples/dllm_generate/generate.py)) supports chat, raw, and infilling modes for LLaDA checkpoints.
 
 ### LLaDA Generation
 
