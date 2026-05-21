@@ -806,11 +806,11 @@ def consolidate_safetensors_files_on_every_rank(
     # Distribute indices across ranks
     indices_for_this_rank = []
     for idx in unique_indices:
-        # Simple distribution: index % world_size == rank
-        if idx % world_size == rank:
+        # Output shard indices are 1-based. Assign shard 1 to rank 0.
+        if (idx - 1) % world_size == rank:
             indices_for_this_rank.append(idx)
 
-    logger.info(
+    logger.debug(
         "Rank %d: Assigned %d output files out of %d total files",
         rank,
         len(indices_for_this_rank),
@@ -842,7 +842,7 @@ def consolidate_safetensors_files_on_every_rank(
     if rank == 0:
         _write_overall_metadata_file_from_shards(input_dir, output_dir, fqn_to_index_mapping)
 
-    logger.info(
+    logger.debug(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",
         rank,
         len(indices_for_this_rank),
@@ -851,8 +851,8 @@ def consolidate_safetensors_files_on_every_rank(
 
     # Wait for all ranks to complete
     if dist.is_available() and dist.is_initialized():
-        logger.info("Rank %d: Waiting for all ranks to complete...", rank)
+        logger.debug("Rank %d: Waiting for all ranks to complete...", rank)
         dist.barrier()
-        logger.info("Rank %d: All ranks have completed.", rank)
+        logger.debug("Rank %d: All ranks have completed.", rank)
         if rank == 0:
-            logger.info("Total time taken: %.2f secs.", time.time() - start_time)
+            logger.debug("Total time taken: %.2f secs.", time.time() - start_time)

@@ -64,6 +64,9 @@ if TYPE_CHECKING:
 
 
 _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
+_DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
+
+logger = logging.getLogger(__name__)
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -148,10 +151,15 @@ def _estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | Non
     total = 0
     try:
         for tensor in state_dict.values():
-            total += int(tensor.numel()) * int(tensor.element_size())
+            total += _estimate_tensor_bytes(tensor)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
     return total
+
+
+def _estimate_tensor_bytes(tensor: torch.Tensor) -> int:
+    """Estimate logical bytes in a tensor without materializing it."""
+    return int(tensor.numel()) * int(tensor.element_size())
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -223,13 +231,13 @@ class CheckpointingConfig:
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
         if self.save_consolidated or False:
             if not self.v4_compatible:
-                logging.warning(
+                logger.warning(
                     "save_consolidated=True but v4_compatible=False; "
                     "checkpoint assets may be not compatible with transformers v4; "
                     "[experimental] set --checkpoint.v4_compatible=True to enable"
                 )
             else:
-                logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
+                logger.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
 
         # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
         if self.is_async and not _is_geq_torch_2_9():
@@ -289,7 +297,7 @@ class Checkpointer:
             self._addons.append(ConsolidatedHFAddon())
         if self.config.is_peft:
             self._addons.append(PeftAddon())
-        self._warn_if_inline_consolidation_in_distributed_job()
+        self._warn_if_inline_consolidation_enabled()
 
     @torch.no_grad()
     def save_model(
@@ -382,6 +390,8 @@ class Checkpointer:
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
+            if _is_rank_0():
+                logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
 
     @torch.no_grad()
     def save_optimizer(
@@ -904,19 +914,14 @@ class Checkpointer:
             dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
         return ret
 
-    def _warn_if_inline_consolidation_in_distributed_job(self) -> None:
-        """Educate distributed users about the cost of inline HF consolidation."""
+    def _warn_if_inline_consolidation_enabled(self) -> None:
+        """Educate users about the cost of inline HF consolidation."""
         if not self._should_write_consolidated_safetensors() or not _is_rank_0():
             return
-        world_size = _get_world_size_safe()
-        if world_size <= 1:
-            return
-        logging.warning(
+        logger.warning(
             "checkpoint.save_consolidated=True exports HuggingFace safetensors during every checkpoint save "
-            "inside this distributed training job (world_size=%d). This is convenient for small/debug runs, "
-            "but for non-trivial distributed jobs consider checkpoint.save_consolidated=false and run the "
-            "generated consolidate.sh script after training.",
-            world_size,
+            "and can leave GPUs idle during consolidation and filesystem writes. Recommended: "
+            "checkpoint.save_consolidated=false; after training run bash <checkpoint>/model/consolidate.sh",
         )
 
     def _warn_if_large_inline_consolidation(
@@ -932,11 +937,12 @@ class Checkpointer:
             return
         world_size = _get_world_size_safe()
         output_file_count = len(set(fqn_to_index_mapping.values())) if fqn_to_index_mapping else 1
-        logging.warning(
+        logger.warning(
             "checkpoint.save_consolidated=True is exporting approximately %s of HF safetensors inside the "
             "training job. This can leave GPU ranks idle during filesystem writes. The current mapping has "
             "%d output file(s) across world_size=%d. For large checkpoints, consider "
-            "checkpoint.save_consolidated=false and run consolidate.sh offline after training.",
+            "checkpoint.save_consolidated=false and run the generated consolidation script after training: "
+            "bash <checkpoint>/model/consolidate.sh",
             _format_bytes(estimated_bytes),
             output_file_count,
             world_size,
@@ -953,40 +959,44 @@ class Checkpointer:
 
         script_path = os.path.join(model_dir, "consolidate.sh")
         output_dir = os.path.join(model_dir, "consolidated")
-        repo_root = Path(__file__).resolve().parents[3]
-        tool_path = repo_root / "tools" / "offline_hf_consolidation.py"
+        diffusers_arg = " \\\n    --diffusers-compatible" if self.config.diffusers_compatible else ""
         contents = f"""#!/usr/bin/env bash
 set -euo pipefail
 
 # Offline HF safetensors consolidation helper.
 # Defaults are conservative for login nodes and small CPU machines. On a CPU
 # compute node, increase parallelism, for example:
-#   NPROC_PER_NODE=16 NUM_THREADS=4 bash "$0"
+#   NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"
 NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
-NUM_THREADS="${{NUM_THREADS:-1}}"
+NUM_THREADS="${{NUM_THREADS:-5}}"
 PYTHON="${{PYTHON:-python3}}"
 TORCHRUN="${{TORCHRUN:-torchrun}}"
-CONSOLIDATION_TOOL="${{CONSOLIDATION_TOOL:-{tool_path}}}"
+PYTHON_MODULE="${{PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}}"
 
 if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
-  "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" "${{CONSOLIDATION_TOOL}}" \\
+  "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" -m "${{PYTHON_MODULE}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
-    --output-dir "{output_dir}"
+    --output-dir "{output_dir}"{diffusers_arg}
 else
-  "${{PYTHON}}" "${{CONSOLIDATION_TOOL}}" \\
+  "${{PYTHON}}" -m "${{PYTHON_MODULE}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
-    --output-dir "{output_dir}"
+    --output-dir "{output_dir}"{diffusers_arg}
 fi
 """
         with open(script_path, "w") as f:
             f.write(contents)
         os.chmod(script_path, 0o755)
+        logger.info(
+            "Wrote offline HF safetensors consolidation helper script to %s. "
+            "Run it after training to export HF weights.",
+            script_path,
+        )
 
     def _should_write_consolidated_safetensors(self) -> bool:
         """
@@ -1058,10 +1068,21 @@ fi
             pre_shard_hf_state_dict_keys = (
                 getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
             )
-            if pre_shard_hf_state_dict_keys:
-                fqn_to_file_index_mapping = {k: 1 for k in pre_shard_hf_state_dict_keys}
-            else:
-                fqn_to_file_index_mapping = {k: 1 for k in state_dict.keys()}
+            fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
+            fqn_to_file_index_mapping = _divide_keys_by_size(
+                fallback_keys,
+                state_dict,
+                _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+            )
+            num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
+            if _is_rank_0():
+                logger.info(
+                    "No original HF safetensors shard index found for %s; using size-based fallback with "
+                    "target shard size %s and %d output shard(s).",
+                    self.config.model_repo_id,
+                    _format_bytes(_DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES),
+                    num_shards,
+                )
 
         # Add any missing keys from the model_state_dict
         # These will go to the same file as the last file (or file 1 for single-file models)
@@ -1723,6 +1744,32 @@ def _equally_divide_layers(num_shards: int, keys: list[str]) -> dict[str, int]:
         for key in keys[start:end]:
             fqn_to_index_mapping[key] = shard_index
         start = end
+    return fqn_to_index_mapping
+
+
+def _divide_keys_by_size(
+    keys: list[str],
+    state_dict: dict[str, torch.Tensor],
+    target_shard_bytes: int,
+) -> dict[str, int]:
+    """Assign keys to deterministic size-based shards."""
+    if target_shard_bytes <= 0:
+        raise ValueError(f"target_shard_bytes must be > 0, got {target_shard_bytes}")
+
+    fqn_to_index_mapping: dict[str, int] = {}
+    current_shard = 1
+    current_shard_bytes = 0
+
+    for key in keys:
+        tensor = state_dict.get(key)
+        tensor_bytes = _estimate_tensor_bytes(tensor) if tensor is not None else 0
+        if current_shard_bytes > 0 and current_shard_bytes + tensor_bytes > target_shard_bytes:
+            current_shard += 1
+            current_shard_bytes = 0
+
+        fqn_to_index_mapping[key] = current_shard
+        current_shard_bytes += tensor_bytes
+
     return fqn_to_index_mapping
 
 

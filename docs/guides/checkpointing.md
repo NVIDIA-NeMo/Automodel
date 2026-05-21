@@ -26,10 +26,10 @@ Changing between output formats can be done seamlessly through the recipe's `yam
 checkpoint:
     ...
     model_save_format: safetensors # Format for saving (torch_save or safetensors)
-    save_consolidated: true # Change to false if you want to save sharded checkpoints.
+    save_consolidated: false # Set to true if you want inline consolidated checkpoints.
     ...
 ```
-> **Note:** For optimal compatibility with the Hugging Face ecosystem, including downstream tools such as vLLM and SGLang, we recommend using the checkpoint configuration provided above.
+> **Note:** For Hugging Face serving compatibility, run the generated consolidation helper after training or set `save_consolidated: true` to export consolidated checkpoints inline.
 
 ::: {note}
 The optimizer states are _always_ saved in DCP (`.distcp` extension) format.

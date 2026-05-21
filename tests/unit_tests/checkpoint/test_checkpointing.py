@@ -29,6 +29,7 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
+    _divide_keys_by_size,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
@@ -190,7 +191,7 @@ def test_get_fqn_to_file_index_mapping_remaps_when_parsed_indices_are_not_dense(
         "model.layers.0.weight": 1,
         "model.layers.1.weight": 2,
     }
-    assert "Expected parsed indices to be 1..2; falling back to sorted filename order" in caplog.text
+    assert "Expected indices to be 1..2; falling back to sorted filename order for output indices" in caplog.text
 
 
 def test_equally_divide_layers_num_shards_gt_num_layers():
@@ -226,6 +227,93 @@ def test_equally_divide_layers_num_shards_one():
 
     assert len(mapping) == len(keys)
     assert set(mapping.values()) == {1}
+
+
+def test_divide_keys_by_size_keeps_small_state_dict_in_one_shard():
+    state_dict = {
+        "a.weight": torch.empty(2, dtype=torch.float32),
+        "b.weight": torch.empty(3, dtype=torch.float32),
+    }
+
+    mapping = _divide_keys_by_size(list(state_dict), state_dict, target_shard_bytes=32)
+
+    assert mapping == {
+        "a.weight": 1,
+        "b.weight": 1,
+    }
+
+
+def test_divide_keys_by_size_splits_without_empty_shards():
+    state_dict = {
+        "a.weight": torch.empty(6, dtype=torch.uint8),
+        "b.weight": torch.empty(6, dtype=torch.uint8),
+        "c.weight": torch.empty(1, dtype=torch.uint8),
+    }
+
+    mapping = _divide_keys_by_size(list(state_dict), state_dict, target_shard_bytes=10)
+
+    assert mapping == {
+        "a.weight": 1,
+        "b.weight": 2,
+        "c.weight": 2,
+    }
+
+
+def test_divide_keys_by_size_places_oversized_tensor_alone():
+    state_dict = {
+        "huge.weight": torch.empty(12, dtype=torch.uint8),
+        "small.weight": torch.empty(1, dtype=torch.uint8),
+    }
+
+    mapping = _divide_keys_by_size(list(state_dict), state_dict, target_shard_bytes=10)
+
+    assert mapping == {
+        "huge.weight": 1,
+        "small.weight": 2,
+    }
+
+
+def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path, caplog):
+    class FakeTensor:
+        def __init__(self, bytes_: int):
+            self.bytes = bytes_
+
+        def numel(self):
+            return self.bytes
+
+        def element_size(self):
+            return 1
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="config-only/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    state_dict = {
+        "a.weight": FakeTensor(4 * 1024**3),
+        "b.weight": FakeTensor(4 * 1024**3),
+        "c.weight": FakeTensor(1),
+    }
+    model_state = SimpleNamespace(model=[SimpleNamespace()])
+    caplog.set_level(logging.INFO)
+
+    with patch("nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path", return_value=None):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+    assert mapping == {
+        "a.weight": 1,
+        "b.weight": 2,
+        "c.weight": 2,
+    }
+    assert "No original HF safetensors shard index found for config-only/model" in caplog.text
+    assert "2 output shard(s)" in caplog.text
 
 
 def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
@@ -1018,7 +1106,7 @@ class TestCheckpointerSaveModelDiffusersRename:
 class TestOfflineConsolidationScriptAndWarnings:
     """Focused tests for offline consolidation helper generation and warnings."""
 
-    def _make_checkpointer(self, tmp_path, save_consolidated=False):
+    def _make_checkpointer(self, tmp_path, save_consolidated=False, diffusers_compatible=False):
         config = CheckpointingConfig(
             enabled=True,
             checkpoint_dir=str(tmp_path),
@@ -1026,15 +1114,17 @@ class TestOfflineConsolidationScriptAndWarnings:
             model_cache_dir=str(tmp_path / "cache"),
             model_repo_id="test/model",
             save_consolidated=save_consolidated,
+            diffusers_compatible=diffusers_compatible,
             is_peft=False,
         )
         with patch("torch.distributed.is_initialized", return_value=False):
             return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
 
-    def test_writes_conservative_consolidate_script(self, tmp_path):
+    def test_writes_conservative_consolidate_script(self, tmp_path, caplog):
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
         model_dir = tmp_path / "epoch_0_step_1" / "model"
         model_dir.mkdir(parents=True)
+        caplog.set_level(logging.INFO)
 
         checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
 
@@ -1043,13 +1133,32 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert script_path.exists()
         assert os.access(script_path, os.X_OK)
         assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
-        assert 'NUM_THREADS="${NUM_THREADS:-1}"' in script
+        assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
         assert 'PYTHON="${PYTHON:-python3}"' in script
-        assert 'NPROC_PER_NODE=16 NUM_THREADS=4 bash "$0"' in script
+        assert 'PYTHON_MODULE="${PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}"' in script
+        assert "CONSOLIDATION_TOOL" not in script
+        assert 'NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"' in script
+        assert '-m "${PYTHON_MODULE}" \\' in script
         assert "--backend gloo \\" in script
         assert '--model-name "test/model" \\' in script
         assert f'--input-dir "{model_dir}" \\' in script
         assert f'--output-dir "{model_dir / "consolidated"}"' in script
+        assert "--diffusers-compatible" not in script
+        assert (
+            f"Wrote offline HF safetensors consolidation helper script to {script_path}. "
+            "Run it after training to export HF weights."
+        ) in caplog.text
+
+    def test_writes_diffusers_compatible_consolidate_script(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False, diffusers_compatible=True)
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        script = (model_dir / "consolidate.sh").read_text()
+        assert f'--output-dir "{model_dir / "consolidated"}" \\' in script
+        assert "--diffusers-compatible" in script
 
     def test_does_not_write_script_when_inline_consolidation_is_enabled(self, tmp_path):
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
@@ -1060,14 +1169,17 @@ class TestOfflineConsolidationScriptAndWarnings:
 
         assert not (model_dir / "consolidate.sh").exists()
 
-    def test_setup_warns_for_distributed_inline_consolidation(self, tmp_path, monkeypatch, caplog):
-        monkeypatch.setenv("WORLD_SIZE", "8")
+    def test_setup_warns_for_inline_consolidation(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("WORLD_SIZE", "1")
         caplog.set_level(logging.WARNING)
 
         self._make_checkpointer(tmp_path, save_consolidated=True)
 
         assert "exports HuggingFace safetensors during every checkpoint save" in caplog.text
-        assert "world_size=8" in caplog.text
+        assert "world_size" not in caplog.text
+        assert "can leave GPUs idle during consolidation and filesystem writes" in caplog.text
+        assert "Recommended: checkpoint.save_consolidated=false" in caplog.text
+        assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
 
     def test_save_time_warns_for_large_inline_consolidation(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setenv("WORLD_SIZE", "256")
@@ -1086,7 +1198,99 @@ class TestOfflineConsolidationScriptAndWarnings:
 
         assert "approximately 50.0 GiB" in caplog.text
         assert "1 output file(s) across world_size=256" in caplog.text
-        assert "run consolidate.sh offline" in caplog.text
+        assert "generated consolidation script after training" in caplog.text
+        assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
+
+
+class TestOfflineHFConsolidationTool:
+    """Focused tests for the packaged offline consolidation module."""
+
+    def test_main_renames_index_when_diffusers_compatible(self, tmp_path, monkeypatch, caplog):
+        from nemo_automodel.tools import offline_hf_consolidation as tool
+
+        input_dir = tmp_path / "model"
+        metadata_dir = input_dir / ".hf_metadata"
+        output_dir = input_dir / "consolidated"
+        metadata_dir.mkdir(parents=True)
+        with open(metadata_dir / "fqn_to_file_index_mapping.json", "w") as f:
+            json.dump({"w": 1}, f)
+        metadata_file = metadata_dir / "config.json"
+        metadata_file.write_text("{}")
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "offline_hf_consolidation",
+                "--backend",
+                "gloo",
+                "--model-name",
+                "test/model",
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--diffusers-compatible",
+            ],
+        )
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch.object(tool, "initialize_distributed"),
+            patch.object(tool, "get_world_size_safe", return_value=1),
+            patch.object(tool, "get_rank_safe", return_value=0),
+            patch.object(tool, "consolidate_safetensors_files_on_every_rank") as mock_consolidate,
+            patch.object(tool, "_maybe_rename_index_for_diffusers") as mock_rename,
+        ):
+            tool.main()
+
+        mock_consolidate.assert_called_once_with(
+            str(input_dir),
+            str(output_dir),
+            {"w": 1},
+            num_threads=5,
+        )
+        mock_rename.assert_called_once_with(str(output_dir))
+        assert metadata_dir.exists()
+        assert metadata_file.exists()
+        assert (output_dir / "config.json").exists()
+        assert f"Consolidating sharded HF safetensors from {input_dir} to {output_dir}." in caplog.text
+        assert f"Successfully exported consolidated HF safetensors to {output_dir}." in caplog.text
+
+    def test_main_skips_when_output_exists_and_metadata_was_consumed(self, tmp_path, monkeypatch, caplog):
+        from nemo_automodel.tools import offline_hf_consolidation as tool
+
+        input_dir = tmp_path / "model"
+        output_dir = input_dir / "consolidated"
+        input_dir.mkdir(parents=True)
+        output_dir.mkdir()
+        (output_dir / "model-00001-of-00001.safetensors").write_bytes(b"")
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "offline_hf_consolidation",
+                "--backend",
+                "gloo",
+                "--model-name",
+                "test/model",
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+            ],
+        )
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch.object(tool, "initialize_distributed"),
+            patch.object(tool, "get_world_size_safe", return_value=1),
+            patch.object(tool, "get_rank_safe", return_value=0),
+            patch.object(tool, "consolidate_safetensors_files_on_every_rank") as mock_consolidate,
+        ):
+            tool.main()
+
+        mock_consolidate.assert_not_called()
+        assert f"Consolidated HF safetensors already exist at {output_dir}" in caplog.text
 
 
 # =============================================================================
@@ -1325,7 +1529,7 @@ class TestConsolidatedIndexUnderPPWithoutSourceIndex:
     def test_global_pre_shard_keys_yield_consistent_mapping_across_pp_ranks(self, tmp_path):
         """Disjoint per-rank PP state dicts but the same global pre-shard key set →
         every rank produces the identical mapping covering every FQN, so
-        consolidate_safetensors_files_on_every_rank's idx%world_size partitioning
+        consolidate_safetensors_files_on_every_rank's output-shard partitioning
         cannot drop any keys.
         """
         checkpointer = self._make_checkpointer(tmp_path)

@@ -1219,7 +1219,7 @@ class TestBuildCheckpointConfig:
         assert config.model_save_format.value == "safetensors"
         assert config.model_repo_id == "org/model"
         assert config.model_cache_dir == "/tmp/cache"
-        assert config.save_consolidated is True
+        assert config.save_consolidated is False
         assert config.is_peft is False
 
     def test_build_checkpoint_config_with_custom_config(self):
@@ -1269,7 +1269,7 @@ class TestBuildCheckpointConfig:
         # checkpoint_dir is preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
         # other user-provided torch_save options are discarded (defaults restored)
-        assert config.save_consolidated is True
+        assert config.save_consolidated is False
         assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
