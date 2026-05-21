@@ -48,7 +48,6 @@ def test_set_dotted_preserves_siblings():
 
 
 def test_set_dotted_replaces_non_dict_intermediate():
-    """If an intermediate key is not a dict, _set_dotted overwrites it with one."""
     d = {"a": "scalar"}
     config_resolver._set_dotted(d, "a.b", 1)
     assert d == {"a": {"b": 1}}

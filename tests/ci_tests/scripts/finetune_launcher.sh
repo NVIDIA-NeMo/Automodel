@@ -12,22 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Automodel CI finetune launcher.
+# Finetune launcher. Config resolution happens in config_resolver.py.
 #
-# Sourced by the nemo-ci sbatch wrappers under /opt/Automodel/tests/ci_tests/scripts/.
-# All per-phase config resolution (step_scheduler, wandb, checkpoint flags,
-# env-driven overrides, dynamic paths) happens up-front in config_resolver.py
-# and produces a single resolved YAML; this launcher only handles command
-# execution + timing + customizer dataset paths + the FINETUNE_ARGS escape hatch.
-#
-# Env contract -- required:
-#   CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
-#   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID,
-#   HAS_ROBUSTNESS
-# Env contract -- optional (with defaults):
-#   EXEC_CMD (torchrun|python|uv_python), RDZV_TIMEOUT (600), MAX_STEPS,
-#   LOCAL_BATCH_SIZE, CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH,
-#   WANDB_AUTOMODEL_API_KEY (convergence only), TIME
+# Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
+#   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, HAS_ROBUSTNESS
+# Env optional: EXEC_CMD, RDZV_TIMEOUT, MAX_STEPS, LOCAL_BATCH_SIZE,
+#   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME
 
 cd /opt/Automodel
 
@@ -35,13 +25,13 @@ CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.p
 TEST_DIR="$PIPELINE_DIR/$TEST_NAME"
 mkdir -p "$TEST_DIR"
 
-# --- Resolve finetune config (recipe + ci.<phase> + env + computed) ---
+# --- Resolve finetune config ---
 RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
   --base "/opt/Automodel/${CONFIG_PATH}" \
   --phase "${TEST_LEVEL}" \
   --output "$TEST_DIR/finetune_config.yaml")
 
-# WANDB_API_KEY is a runtime secret env (not a config key)
+# WANDB_API_KEY is a runtime secret, not a config key.
 if [ "$TEST_LEVEL" = "convergence" ]; then
   export WANDB_API_KEY="${WANDB_AUTOMODEL_API_KEY}"
 fi

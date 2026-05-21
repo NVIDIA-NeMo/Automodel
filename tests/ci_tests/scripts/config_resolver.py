@@ -14,13 +14,7 @@
 
 """Resolve a CI test config from a recipe + config_templates/ci_config.yaml.
 
-Resolution stack (last wins):
-    1. Recipe top-level
-    2. ci_config.yaml -> phases[<phase>]
-    3. ci_config.yaml -> conditional[...] (recipe-name-pattern, phase-filtered)
-    4. recipe.ci.<phase>
-    5. ci_config.yaml -> env[...]         (env-driven, phase-filtered)
-    6. ci_config.yaml -> computed[...]    (per-run dynamic, phase-filtered)
+See ci_config.yaml for the layered resolution stack and override schema.
 
 CLI:
     --base       Recipe YAML
@@ -100,7 +94,7 @@ def _format_or_passthrough(value: Any, substitutions: dict[str, Any], context: s
 
 
 def _resolve_computed_layer(computed_entries: list, phase: str) -> dict[str, Any]:
-    """Return per-run dynamic overrides (paths, dates) with env + `date` interpolated into each format string."""
+    """Return per-run dynamic overrides with env + `date` interpolated into each format string."""
     substitutions: dict[str, Any] = {"date": datetime.now(), **os.environ}
     out: dict[str, Any] = {}
     for entry in computed_entries or []:
@@ -114,7 +108,7 @@ def _resolve_computed_layer(computed_entries: list, phase: str) -> dict[str, Any
 
 
 def _resolve_conditional_layer(conditional_entries: list, phase: str, recipe_stem: str) -> dict[str, Any]:
-    """Return overrides for entries whose `phases` and recipe-name predicates both match the current run."""
+    """Return overrides for entries whose phase and recipe-name predicates both match."""
     substitutions: dict[str, Any] = {"date": datetime.now(), **os.environ}
     out: dict[str, Any] = {}
     for entry in conditional_entries or []:
@@ -145,7 +139,7 @@ def _print_layer(label: str, payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    """Parse args, build each layer, merge them onto the recipe in stack order, and write or dry-print the result."""
+    """Build each layer, merge onto the recipe, then write or dry-print the result."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base", type=Path, required=True, help="Base recipe YAML")
     parser.add_argument("--phase", required=True, help="Phase key under ci_config.yaml.phases")
