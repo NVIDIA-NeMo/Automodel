@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from huggingface_hub.constants import HF_HUB_CACHE
-from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
@@ -210,6 +210,10 @@ def build_model_and_optimizer(
                 reduce_dtype=torch.float32,
                 output_dtype=dtype,
             ),
+            # CPU offload: when enabled, sharded params + optimizer state live on
+            # host RAM and are paged to GPU per-block during forward/backward.
+            # Saves ~21 GB per H100 for a 14B AdamW finetune; adds H2D traffic.
+            "offload_policy": CPUOffloadPolicy(pin_memory=True) if cpu_offload else None,
         }
 
     parallel_scheme = {"transformer": manager_args}
