@@ -32,6 +32,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import mlflow
 import torch
 import torch.nn as nn
 import wandb
@@ -71,10 +72,16 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
-from nemo_automodel.components.loggers.mlflow_utils import build_mlflow
+from nemo_automodel.components.loggers.mlflow_utils import (
+    configure_mlflow,
+    end_mlflow_active_run_as_killed,
+    to_float_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
@@ -804,54 +811,9 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
-def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
-    """Calculate the loss.
-
-    Args:
-        loss_fn: Loss function.
-        **kwargs: Keyword arguments for the loss function.
-
-    Returns:
-        The loss.
-    """
-    loss_fn_kwargs = {"num_label_tokens": kwargs.pop("num_label_tokens", None)}
-    if isinstance(loss_fn, FusedLinearCrossEntropy):
-        model = kwargs.pop("model")
-        labels = kwargs.pop("labels")
-
-        # find the lm_head in the model
-        lm_head = None
-        if hasattr(model, "get_output_embeddings"):
-            lm_head = model.get_output_embeddings().weight
-        else:
-            for n, p in model.named_parameters(remove_duplicate=False):
-                if "lm_head" in n and n.endswith(".weight"):
-                    lm_head = p
-                    break
-        if lm_head is None:
-            raise ValueError("lm_head.weight not found in model")
-
-        # unshard the possibly sharded lm_head
-        lm_head = lm_head.full_tensor() if hasattr(lm_head, "full_tensor") else lm_head
-        loss_fn_kwargs.update(
-            {
-                "hidden_states": kwargs.pop("hidden_states"),
-                "labels": labels,
-                "lm_weight": lm_head,
-            }
-        )
-    else:
-        loss_fn_kwargs.update(
-            {
-                "logits": kwargs.pop("logits"),
-                "labels": kwargs.pop("labels"),
-            }
-        )
-
-    return loss_fn(**loss_fn_kwargs)
-
-
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
+    """Build validation dataloaders from validation dataset config entries."""
+
     def _prepare_val_ds_name(val_ds_name):
         val_ds_name = val_ds_name.replace("validation_dataset", "")
         if len(val_ds_name) > 1 and val_ds_name[0] in ("_", "-", "."):
@@ -939,11 +901,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
-        self.mlflow_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            self.mlflow_logger = build_mlflow(self.cfg)
-            self.mlflow_logger.log_params(self.cfg.to_dict())
-            logging.info("MLflow experiment tracking enabled")
+            if configure_mlflow(self.cfg) is not None:
+                logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None
         if self.dist_env.is_main and hasattr(self.cfg, "comet"):
@@ -1075,6 +1035,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
@@ -1223,6 +1186,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         else:
             wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
 
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
+
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
@@ -1322,6 +1299,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             v.close()
 
         self.checkpointer.close()
+
+        # Mark the MLflow run KILLED if training exited via SIGTERM.
+        if self.step_scheduler.sigterm_flag:
+            end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1426,6 +1407,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                if mtp_per_depth_h is not None:
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=out.mtp_loss_scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                    )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1672,8 +1663,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
 
-        if self.mlflow_logger is not None:
-            self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
         if self.comet_logger is not None:
             self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
@@ -1716,8 +1707,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
-            if self.mlflow_logger is not None:
-                self.mlflow_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
                 self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
@@ -1728,6 +1719,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
+            if mlflow.active_run() is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
                 )
 
         # JSONL training log (always log for detailed local records)

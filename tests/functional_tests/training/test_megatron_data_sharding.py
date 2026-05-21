@@ -18,8 +18,8 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_dataloader
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
@@ -64,7 +64,7 @@ def test_megatron_data_sharding():
     batch_to_test = {k: v.to(dist.get_rank()) for k, v in batch_to_test.items()}
 
     # ensure that labels are inputs left shifted by 1
-    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), f"Labels are not inputs left shifted by 1"
+    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), "Labels are not inputs left shifted by 1"
 
     dist.barrier()
     del dataset
@@ -72,8 +72,8 @@ def test_megatron_data_sharding():
     for key in ("input_ids", "labels"):
         gathered_tensors = gather_helper(batch_to_test[key])
         if tp_world_size > 1:
-            assert torch.all(gathered_tensors[0] == gathered_tensors[1]), f"Expected the same tensors for TP > 1"
+            assert torch.all(gathered_tensors[0] == gathered_tensors[1]), "Expected the same tensors for TP > 1"
         else:
-            assert torch.any(gathered_tensors[0] != gathered_tensors[1]), f"Expected different tensors for DP > 1"
+            assert torch.any(gathered_tensors[0] != gathered_tensors[1]), "Expected different tensors for DP > 1"
 
     dist.barrier()

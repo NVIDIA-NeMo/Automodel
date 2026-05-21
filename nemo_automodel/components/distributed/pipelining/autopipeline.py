@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineInfo:
+    """Runtime state produced by pipeline-parallel setup."""
+
     enabled: bool
     schedule: Optional[_PipelineSchedule]
     has_first_stage: bool

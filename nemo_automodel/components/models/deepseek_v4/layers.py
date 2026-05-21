@@ -56,6 +56,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -116,19 +117,20 @@ def _apply_partial_rope_interleaved(
     """
     rd = rope_head_dim
     half = rd // 2
+    input_dtype = x.dtype
     nope, rope = x[..., :-rd], x[..., -rd:]
     # Pair-reshape last dim: [..., rd] -> [..., rd/2, 2]
-    rope_pairs = rope.unflatten(-1, (-1, 2))
+    rope_pairs = rope.float().unflatten(-1, (-1, 2))
     a, b = rope_pairs[..., 0], rope_pairs[..., 1]  # [..., rd/2]
-    c = cos[..., :half]
-    s = sin[..., :half]
+    c = cos[..., :half].float()
+    s = sin[..., :half].float()
     # Broadcast c/s up to ``a``'s rank by inserting a head dim before S.
     while c.ndim < a.ndim:
         c = c.unsqueeze(1)
         s = s.unsqueeze(1)
     new_a = a * c - b * s
     new_b = a * s + b * c
-    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2)
+    new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2).to(input_dtype)
     return torch.cat([nope, new_rope], dim=-1)
 
 
@@ -504,6 +506,17 @@ def _build_indexer_topk_compressed_mask(
     )  # [B, S, P]
 
 
+class DeepseekV4FP32Parameter(nn.Module):
+    """Callable holder for fp32 tensors that need their own FSDP unit."""
+
+    def __init__(self, value: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(value.to(torch.float32))
+
+    def forward(self) -> torch.Tensor:
+        return self.weight
+
+
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -523,12 +536,16 @@ class DeepseekV4Indexer(nn.Module):
         self.index_topk = config.index_topk
         self.softmax_scale = self.head_dim**-0.5
         proj_dim = 2 * self.head_dim  # overlap mode
-        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.ape = nn.Parameter(torch.zeros(self.compress_ratio, proj_dim))
+        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.ape_param = DeepseekV4FP32Parameter(torch.zeros(self.compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
+
+    @property
+    def ape(self) -> torch.Tensor:
+        return self.ape_param()
 
     def forward(
         self,
@@ -540,9 +557,11 @@ class DeepseekV4Indexer(nn.Module):
         layer_idx: int,
         start_pos: int,
     ) -> torch.LongTensor:
+        input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
-        kv = self.wkv(hidden_states)
-        gate = self.wgate(hidden_states)
+        hidden_states_fp32 = hidden_states.float()
+        kv = self.wkv(hidden_states_fp32)
+        gate = self.wgate(hidden_states_fp32)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
         )
@@ -554,7 +573,7 @@ class DeepseekV4Indexer(nn.Module):
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
-            )
+            ).to(input_dtype)
         )
         if new_pooled.shape[1] > 0:
             positions = _rope_pool_positions(
@@ -594,11 +613,37 @@ class DeepseekV4Compressor(nn.Module):
         self.overlap = compress_ratio == 4
         coff = 2 if self.overlap else 1
         proj_dim = coff * head_dim
-        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False)
-        self.ape = nn.Parameter(torch.zeros(compress_ratio, proj_dim))
+        self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.wgate = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
+        self.ape_param = DeepseekV4FP32Parameter(torch.zeros(compress_ratio, proj_dim, dtype=torch.float32))
         self.kv_norm = initialize_rms_norm_module("torch_fp32", head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
+        self._hca_param_sync_group = None
+
+    @property
+    def ape(self) -> torch.Tensor:
+        return self.ape_param()
+
+    def _set_hca_param_sync_group(self, process_group) -> None:
+        self._hca_param_sync_group = process_group
+
+    def _compute_fsdp_group_has_complete_hca_window(
+        self,
+        local_has_complete_hca_window: bool,
+        device: torch.device,
+    ) -> bool:
+        process_group = self._hca_param_sync_group
+        if process_group is None or not dist.is_available() or not dist.is_initialized():
+            return local_has_complete_hca_window
+        if dist.get_world_size(group=process_group) == 1:
+            return local_has_complete_hca_window
+
+        # A single int max-reduce tells short ranks whether any peer in the same
+        # HCA parameter sync group has a complete HCA window. It is a small
+        # synchronization point, but it avoids using a broader or world group.
+        flag = torch.tensor(int(local_has_complete_hca_window), device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=process_group)
+        return bool(flag.item())
 
     def forward(
         self,
@@ -609,13 +654,40 @@ class DeepseekV4Compressor(nn.Module):
         cache: DeepseekV4TrainCache,
         layer_idx: int,
         start_pos: int,
+        enable_hca_fsdp_graph_alignment: bool = False,
     ) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
-        kv = self.wkv(hidden_states)
-        gate = self.wgate(hidden_states)
+        hidden_states_fp32 = hidden_states.float()
+        kv = self.wkv(hidden_states_fp32)
+        gate = self.wgate(hidden_states_fp32)
         ready_kv, ready_gate, pool_base = cache.accumulate_windows(
             kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
         )
+        local_has_complete_hca_window = ready_kv.shape[1] > 0
+        fsdp_group_has_complete_hca_window = (
+            self._compute_fsdp_group_has_complete_hca_window(local_has_complete_hca_window, kv.device)
+            if enable_hca_fsdp_graph_alignment
+            else local_has_complete_hca_window
+        )
+        needs_masked_synthetic_hca_window = (
+            enable_hca_fsdp_graph_alignment
+            and self.indexer is None
+            and fsdp_group_has_complete_hca_window
+            and not local_has_complete_hca_window
+            and 0 < kv.shape[1] < self.compress_ratio
+        )
+        if needs_masked_synthetic_hca_window:
+            # A mixed short/long HCA parameter sync group needs every rank to
+            # create the same compressor autograd edges. All-short groups keep
+            # the original no-HCA path so optimizer semantics stay at
+            # grad=None. Zero-length local HCA inputs are outside this narrow
+            # training fix.
+            pad_len = self.compress_ratio - kv.shape[1]
+            pad_shape = (batch, pad_len, kv.shape[-1])
+            ready_kv = torch.cat([kv, kv.new_zeros(pad_shape)], dim=1)
+            ready_gate = torch.cat([gate, gate.new_zeros(pad_shape)], dim=1)
+            pool_base = max(0, start_pos)
         new_pooled = self.kv_norm(
             _pool_windows(
                 ready_kv,
@@ -624,7 +696,7 @@ class DeepseekV4Compressor(nn.Module):
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
-            )
+            ).to(input_dtype)
         )
         positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
         cos, sin = rotary(new_pooled, positions)
@@ -704,9 +776,9 @@ class DeepseekV4HyperConnection(nn.Module):
         self.hc_eps = hc_eps
         self.norm_eps = rms_norm_eps
         mix = (2 + self.hc_mult) * self.hc_mult
-        self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size))
-        self.base = nn.Parameter(torch.empty(mix))
-        self.scale = nn.Parameter(torch.empty(3))
+        self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size, dtype=torch.float32))
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
@@ -744,6 +816,9 @@ class DeepseekV4HyperConnection(nn.Module):
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
         return pre, post, comb
 
+    def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.compute_weights(hidden_streams)
+
 
 class DeepseekV4HyperHead(nn.Module):
     """Final HC-stream collapse before the shared RMSNorm + ``lm_head``.
@@ -759,9 +834,9 @@ class DeepseekV4HyperHead(nn.Module):
         self.hc_mult = hc_mult
         self.norm_eps = rms_norm_eps
         self.eps = hc_eps
-        self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * hidden_size))
-        self.hc_base = nn.Parameter(torch.empty(self.hc_mult))
-        self.hc_scale = nn.Parameter(torch.empty(1))
+        self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * hidden_size, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.flatten(2).float()
@@ -821,11 +896,15 @@ class DeepseekV4Attention(nn.Module):
             config.o_groups,
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
-        self.sinks = nn.Parameter(torch.zeros(self.num_heads))
+        self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
 
         self.compressor = (
             DeepseekV4Compressor(config, self.compress_ratio, self.head_dim) if self.compress_ratio else None
         )
+
+    @property
+    def sinks(self) -> torch.Tensor:
+        return self.sinks_param()
 
     def forward(
         self,
@@ -879,6 +958,14 @@ class DeepseekV4Attention(nn.Module):
                 cache=cache,
                 layer_idx=self.layer_idx,
                 start_pos=start_pos,
+                # Only DeepSeek-V4 HCA (ratio 128) needs this FSDP graph alignment.
+                # Ratio 4 uses the Indexer/SCA path and is outside this fix.
+                # Direct attention calls without an explicit mask keep the
+                # original behavior since synthetic windows must be maskable.
+                # The normal DeepSeek-V4 model path builds this mask upstream.
+                enable_hca_fsdp_graph_alignment=(
+                    self.training and attention_mask is not None and self.compress_ratio == 128
+                ),
             )
             n_pooled = pooled.shape[2]
             full_kv = torch.cat([full_kv, pooled], dim=2)
@@ -945,11 +1032,11 @@ class DeepseekV4Attention(nn.Module):
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
         for norm in (self.q_norm, self.kv_norm):
             norm.reset_parameters()
-        nn.init.zeros_(self.sinks)
+        nn.init.zeros_(self.sinks_param.weight)
         if self.compressor is not None:
             for mod in self.compressor.modules():
                 if isinstance(mod, nn.Linear):
                     nn.init.trunc_normal_(mod.weight, mean=0.0, std=init_std)
-            nn.init.zeros_(self.compressor.ape)
+            nn.init.zeros_(self.compressor.ape_param.weight)
             if self.compressor.indexer is not None:
-                nn.init.zeros_(self.compressor.indexer.ape)
+                nn.init.zeros_(self.compressor.indexer.ape_param.weight)

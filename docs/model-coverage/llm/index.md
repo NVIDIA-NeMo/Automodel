@@ -26,6 +26,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Qwen / Alibaba Cloud | [Qwen3](qwen/qwen3.md) | `Qwen3ForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen3 MoE](qwen/qwen3-moe.md) | `Qwen3MoeForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen3-Next](qwen/qwen3-next.md) | `Qwen3NextForCausalLM` |
+| Baidu | [ERNIE 4.5](baidu/ernie4-5.md) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
 | DeepSeek | [DeepSeek](deepseek-ai/deepseek.md) | `DeepseekForCausalLM` |
 | DeepSeek | [DeepSeek-V3](deepseek-ai/deepseek-v3.md) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
 | DeepSeek | [DeepSeek V4 Flash](deepseek-ai/dsv4-flash.md) | `DeepseekV4ForCausalLM` |
@@ -39,10 +40,10 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | NVIDIA | [Nemotron-H](nvidia/nemotron-h.md) | `NemotronHForCausalLM` |
 | NVIDIA | [Nemotron-Flash](nvidia/nemotron-flash.md) | `NemotronFlashForCausalLM` |
 | NVIDIA | [Nemotron-Super](nvidia/nemotron-super.md) | `DeciLMForCausalLM` |
-| THUDM / Zhipu AI | [ChatGLM](thudm/chatglm.md) | `ChatGLMModel` |
-| THUDM / Zhipu AI | [GLM-4](thudm/glm4.md) | `GlmForCausalLM`, `Glm4ForCausalLM` |
-| THUDM / ZAI | [GLM-4 MoE](thudm/glm4-moe.md) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
-| THUDM / ZAI | [GLM-5 / GLM-5.1](thudm/glm5-moe-dsa.md) | `GlmMoeDsaForCausalLM` |
+| ZAI / Zhipu AI | [ChatGLM](thudm/chatglm.md) | `ChatGLMModel` |
+| ZAI / Zhipu AI | [GLM-4](thudm/glm4.md) | `GlmForCausalLM`, `Glm4ForCausalLM` |
+| ZAI / Zhipu AI | [GLM-4 MoE](thudm/glm4-moe.md) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
+| ZAI / Zhipu AI | [GLM-5 / GLM-5.1](thudm/glm5-moe-dsa.md) | `GlmMoeDsaForCausalLM` |
 | IBM | [Granite](ibm/granite.md) | `GraniteForCausalLM` |
 | IBM | [Granite MoE](ibm/granite-moe.md) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
 | IBM | [Bamba](ibm/bamba.md) | `BambaForCausalLM` |
@@ -72,6 +73,8 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Stepfun AI | [Step-3.5](stepfun-ai/step-3-5.md) | `Step3p5ForCausalLM` |
 | Parasail AI | [GritLM](parasail-ai/gritlm.md) | `GritLM` |
 | Tencent | [Hy3-preview](tencent/hy3.md) | `HYV3ForCausalLM` |
+| Xiaomi MiMo | [MiMo-V2-Flash](xiaomimimo/mimo-v2-flash.md) | `MiMoV2FlashForCausalLM` |
+| inclusionAI | [Ling 2.0](inclusionai/ling-2.md) | `BailingMoeV2ForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
 
@@ -96,6 +99,7 @@ qwen/qwen2-moe
 qwen/qwen3
 qwen/qwen3-moe
 qwen/qwen3-next
+baidu/ernie4-5
 deepseek-ai/deepseek
 deepseek-ai/deepseek-v3
 deepseek-ai/dsv4-flash
@@ -142,4 +146,6 @@ stabilityai/stablelm
 stepfun-ai/step-3-5
 parasail-ai/gritlm
 tencent/hy3
+xiaomimimo/mimo-v2-flash
+inclusionai/ling-2
 ```
