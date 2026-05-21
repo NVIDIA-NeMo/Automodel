@@ -269,6 +269,14 @@ class BaseRecipe:
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
 
+        # Free GPU caches before DCP's gather-and-write. DCP allocates NCCL
+        # workspace and materializes DTensor shards on GPU; with CPU-offloaded
+        # FSDP2 the residual training-time fragments can leave just enough
+        # headroom to break the gather (cuda failure 2 / "out of memory").
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
         # If a previous async checkpoint just finished, update the "latest" symlink now
         prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
         is_dist_initialized = torch.distributed.is_initialized()
