@@ -29,7 +29,6 @@ on:
       - main
     paths:
       - 'docs/**'
-      - 'fern/**'
     tags:
       - 'docs/v*'
   workflow_dispatch: {}
@@ -59,5 +58,5 @@ jobs:
       - name: Publish Docs
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
-        working-directory: ./fern
+        working-directory: ./docs/fern
         run: fern generate --docs
