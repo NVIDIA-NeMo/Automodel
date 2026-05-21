@@ -28,6 +28,13 @@ python scripts/yauhen/prepare_retrieval_inline_parquet.py \
   --num-negatives 4 \
   --records-per-shard 50000
 
+python scripts/yauhen/prepare_retrieval_inline_parquet.py \
+  --input-json /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/multilingual_wiki_ccnews_5hn_withMoreDS_more_reddit_s2orc_allLang_11M_qwen3_8B_0_95_perc_posdocs_only.json \
+  --output-dir /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/multilingual_wiki_ccnews_5hn_withMoreDS_more_reddit_s2orc_allLang_11M_qwen3_8B_0_95_perc_posdocs_only_inline_nneg4 \
+  --corpus-index-path /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/corpus/multilingual_wiki_ccnews_5hn_withMoreDS_more_reddit_s2orc_allLang_11M_qwen3_8B_0_95_perc_posdocs_only_docs.sqlite \
+  --num-negatives 4 \
+  --records-per-shard 50000
+
 
 python scripts/yauhen/prepare_retrieval_inline_parquet.py \
   --input-json /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/nq.json \

@@ -58,7 +58,8 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
     model_type: bi_encoder
     data_dir_list:
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/nq_inline_nneg4
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/multilingual_wiki_ccnews_5hn_withMoreDS_more_reddit_s2orc_allLang_12M_inline_nneg4
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/multilingual_wiki_ccnews_5hn_withMoreDS_more_reddit_s2orc_allLang_11M_qwen3_8B_0_95_perc_posdocs_only_inline_nneg4
     cache_dir: /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hf_cache/ministral3_3b_inline_multi_ds
     data_type: train
     n_passages: 5
