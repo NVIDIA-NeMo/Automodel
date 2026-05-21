@@ -47,11 +47,13 @@ yaml.preserve_quotes = True
 
 
 def _load(path: Path) -> dict:
+    """Load a YAML file and return its top-level mapping (empty dict if file is empty)."""
     with path.open("r", encoding="utf-8") as f:
         return yaml.load(f) or {}
 
 
 def _set_dotted(d: dict, dotted_key: str, value: Any) -> None:
+    """Write `value` at the dotted-key path in `d`, creating intermediate dicts as needed."""
     keys = dotted_key.split(".")
     cursor = d
     for k in keys[:-1]:
@@ -75,6 +77,7 @@ def _coerce(value: str) -> Any:
 
 
 def _resolve_env_layer(env_section: dict, phase: str) -> dict[str, Any]:
+    """Return env-driven overrides whose env var is set and whose `phases` filter matches."""
     out: dict[str, Any] = {}
     for env_var, spec in (env_section or {}).items():
         target = spec["target"]
@@ -97,6 +100,7 @@ def _format_or_passthrough(value: Any, substitutions: dict[str, Any], context: s
 
 
 def _resolve_computed_layer(computed_entries: list, phase: str) -> dict[str, Any]:
+    """Return per-run dynamic overrides (paths, dates) with env + `date` interpolated into each format string."""
     substitutions: dict[str, Any] = {"date": datetime.now(), **os.environ}
     out: dict[str, Any] = {}
     for entry in computed_entries or []:
@@ -110,6 +114,7 @@ def _resolve_computed_layer(computed_entries: list, phase: str) -> dict[str, Any
 
 
 def _resolve_conditional_layer(conditional_entries: list, phase: str, recipe_stem: str) -> dict[str, Any]:
+    """Return overrides for entries whose `phases` and recipe-name predicates both match the current run."""
     substitutions: dict[str, Any] = {"date": datetime.now(), **os.environ}
     out: dict[str, Any] = {}
     for entry in conditional_entries or []:
@@ -130,6 +135,7 @@ def _resolve_conditional_layer(conditional_entries: list, phase: str, recipe_ste
 
 
 def _print_layer(label: str, payload: dict[str, Any]) -> None:
+    """Render one layer of the resolution stack for --dry-run output."""
     if not payload:
         print(f"  [{label}] (empty)")
         return
@@ -139,6 +145,7 @@ def _print_layer(label: str, payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    """Parse args, build each layer, merge them onto the recipe in stack order, and write or dry-print the result."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base", type=Path, required=True, help="Base recipe YAML")
     parser.add_argument("--phase", required=True, help="Phase key under ci_config.yaml.phases")
