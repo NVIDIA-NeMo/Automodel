@@ -360,20 +360,24 @@ class TestRecipeInternals:
         recipe = self._build_recipe(tmp_path)
         assert recipe._module() is recipe.trainer_module
 
-    def test_save_checkpoint_creates_files(self, tmp_path):
+    def test_save_extra_state_round_trip(self, tmp_path):
+        """``_save_extra_state`` persists ``global_step`` and ``epoch``; the
+        matching ``_load_extra_state`` restores them. Full ``save_checkpoint``
+        (model + optimizer via DCP) is covered separately by the dedicated
+        checkpoint-resume test file."""
         recipe = self._build_recipe(tmp_path)
-        recipe._save_checkpoint("test_ckpt")
-        ckpt_dir = tmp_path / "test_ckpt"
-        assert (ckpt_dir / "draft_model.pt").exists()
-        assert (ckpt_dir / "eagle1_meta.pt").exists()
-        meta = torch.load(ckpt_dir / "eagle1_meta.pt", weights_only=True)
-        assert meta["global_step"] == 5
+        recipe.runtime.global_step = 11
+        save_dir = tmp_path / "extra"
+        save_dir.mkdir()
+        recipe._save_extra_state(str(save_dir), epoch=2)
+        assert (save_dir / "eagle_meta.pt").exists()
 
-    def test_save_checkpoint_skipped_when_not_main(self, tmp_path):
-        recipe = self._build_recipe(tmp_path)
-        recipe.dist_env.is_main = False
-        recipe._save_checkpoint("skipped")
-        assert not (tmp_path / "skipped").exists()
+        fresh = self._build_recipe(tmp_path)
+        fresh._resume_epoch = 0
+        fresh.runtime.global_step = 0
+        fresh._load_extra_state(str(save_dir))
+        assert fresh.runtime.global_step == 11
+        assert fresh._resume_epoch == 2
 
     def test_run_eval_returns_none_without_val_loader(self, tmp_path):
         recipe = self._build_recipe(tmp_path)
@@ -431,7 +435,9 @@ class TestRecipeInternals:
         recipe.log_every_steps = 1
         recipe.run_train_validation_loop()
         assert recipe.runtime.global_step >= 1
-        assert (tmp_path / "epoch_1").exists()
+        # End-of-epoch save is a no-op here because the test fixture skips
+        # ``setup()`` and never builds a checkpointer; the dedicated
+        # ``test_eagle_checkpoint_resume`` file exercises the save/load path.
 
     def test_run_train_loop_with_grad_accumulation(self, tmp_path):
         recipe = self._build_recipe(tmp_path)
