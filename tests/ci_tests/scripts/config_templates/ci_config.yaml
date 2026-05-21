@@ -1,0 +1,101 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# CI test configuration consumed by config_resolver.py.
+#
+# Resolution stack (last wins):
+#   1. Recipe top-level (the base config the user wrote)
+#   2. phases[<phase>]               shared defaults for this phase
+#   3. conditional[...]              recipe-name-pattern overrides (filtered by `phases`)
+#   4. recipe.ci.<phase>             per-recipe overrides
+#   5. env[...]                      env-driven overrides (filtered by `phases`)
+#   6. computed[...]                 dynamic per-run values (filtered by `phases`)
+#
+# All override targets are flat dotted keys pointing into the recipe's top-level
+# config (e.g. step_scheduler.max_steps).
+
+phases:
+  nightly: &nightly_defaults
+    step_scheduler.max_steps: 50
+    step_scheduler.ckpt_every_steps: 50
+    step_scheduler.val_every_steps: 50
+
+  release: *nightly_defaults
+
+  convergence:
+    step_scheduler.max_steps: 200
+    step_scheduler.ckpt_every_steps: 200
+    step_scheduler.val_every_steps: 200
+    wandb.entity: Nemo-automodel
+    wandb.dir: /tmp/wandb/
+
+  performance: {}
+
+  robustness:
+    step_scheduler.max_steps: 5
+    step_scheduler.ckpt_every_steps: 5
+    step_scheduler.val_every_steps: 5
+    step_scheduler.global_batch_size: 32
+    step_scheduler.local_batch_size: 2
+    checkpoint.enabled: true
+    checkpoint.model_save_format: safetensors
+    checkpoint.save_consolidated: true
+
+# Recipe-name-pattern overrides. Each entry applies if --phase is in `phases`
+# (omit = all phases) AND the recipe stem (filename without .yaml) satisfies the
+# predicate(s):
+#   when_recipe_contains_all: [s1, s2, ...]   stem must contain every substring
+#   when_recipe_contains_any: [s1, s2, ...]   stem must contain at least one
+# Both predicates may be combined; both default to "match" when omitted.
+# `apply` is a flat dotted-key dict; string values support {var} substitution
+# from env vars + built-in `date` (same as computed:).
+conditional:
+  # Customizer recipes use sample datasets shipped under NEMO_CI_PATH.
+  # All customizer_* recipes default to prompt_completion paths; the chat-flavored
+  # subset overrides to chat paths (applied after, last-wins).
+  - when_recipe_contains_all: [customizer_]
+    apply:
+      dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/prompt_completion/train.jsonl"
+      validation_dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/prompt_completion/validation.jsonl"
+
+  - when_recipe_contains_all: [customizer_, chat]
+    apply:
+      dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/chat/train.jsonl"
+      validation_dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/chat/validation.jsonl"
+
+  # Robustness phase: peft/lora recipes disable triton (incompat with the
+  # checkpoint-robustness pytest harness).
+  - when_recipe_contains_any: [peft, lora]
+    phases: [robustness]
+    apply:
+      peft.use_triton: false
+
+# Env var -> { target: dotted.config.key, phases: [...] }
+# Applied iff the env var is set AND --phase is in `phases`.
+# Values are coerced to int -> float -> str.
+env:
+  MAX_STEPS:
+    target: step_scheduler.max_steps
+    phases: [nightly, release, convergence, performance]
+  LOCAL_BATCH_SIZE:
+    target: step_scheduler.local_batch_size
+    phases: [nightly, release, convergence, performance]
+
+# Computed dynamic overrides. `format` is a Python str.format() template.
+# Substitution sources: every env var, plus built-in `date` (supports {date:%Y%m%d}).
+# `phases` restricts which --phase values trigger the entry.
+computed:
+  - target: checkpoint.checkpoint_dir
+    format: "{PIPELINE_DIR}/{TEST_NAME}/checkpoint"
+    phases: [nightly, release, convergence, performance]
+
+  - target: checkpoint.checkpoint_dir
+    format: "{PIPELINE_DIR}/{TEST_NAME}/robustness_checkpoint"
+    phases: [robustness]
+
+  - target: wandb.name
+    format: "{TEST_NAME}"
+    phases: [convergence]
+
+  - target: wandb.project
+    format: "automodel-nemo-ci-convergence-test-{date:%Y%m%d}"
+    phases: [convergence]
