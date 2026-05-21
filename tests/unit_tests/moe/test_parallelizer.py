@@ -1492,7 +1492,11 @@ def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
         return "CTX"
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]))
+    monkeypatch.setattr(
+        P,
+        "ptd_checkpoint_wrapper",
+        MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]),
+    )
 
     class TextConfig:
         hidden_size = 256
@@ -2108,9 +2112,13 @@ class _FakeSelfAttn:
 
 
 class _FakeBlockWithAttn:
-    def __init__(self, attn_module, moe=None):
+    def __init__(self, attn_module, moe=None, layer_type=None, attention_type=None):
         self.self_attn = _FakeSelfAttn(attn_module)
         self.mlp = moe if moe is not None else object()
+        if layer_type is not None:
+            self.layer_type = layer_type
+        if attention_type is not None:
+            self.attention_type = attention_type
 
 
 def test_apply_cp_skips_non_te_attention(monkeypatch):
@@ -2178,6 +2186,31 @@ def test_apply_cp_configures_te_attention(monkeypatch):
     P.apply_cp(model, cp_mesh)
 
     te_attn.set_context_parallel_group.assert_called_once()
+
+
+def test_apply_cp_uses_attention_type_and_all_gather_for_sliding_attention(monkeypatch):
+    """Blocks that name attention style with ``attention_type`` should still
+    receive TE context-parallel setup."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class DotProductAttention:
+        def __init__(self):
+            self.set_context_parallel_group = MagicMock()
+
+    _setup_te_and_dist_stubs(monkeypatch, DotProductAttention)
+
+    te_attn = DotProductAttention()
+    block = _FakeBlockWithAttn(te_attn, attention_type="sliding_attention")
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+
+    P.apply_cp(model, cp_mesh, cp_comm_type="p2p")
+
+    te_attn.set_context_parallel_group.assert_called_once()
+    _, kwargs = te_attn.set_context_parallel_group.call_args
+    assert kwargs["cp_comm_type"] == "all_gather"
 
 
 def test_apply_cp_mixed_te_and_non_te(monkeypatch):

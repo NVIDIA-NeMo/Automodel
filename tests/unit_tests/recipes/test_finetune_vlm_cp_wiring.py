@@ -35,23 +35,29 @@ import pytest
 import torch
 
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 # -----------------------------------------------------------------------------
 # Helpers reproducing the recipe's CP-prepare block (train + val flavors).
 # -----------------------------------------------------------------------------
 
 
-def _train_cp_prepare(_model, batch):
+def _train_cp_prepare(_model, batch, *, pp_enabled=False, has_first_stage=True):
     """Replicates the train-side CP prepare block in
     ``recipes/vlm/finetune.py::_forward_backward_step`` (lines 960-967)."""
     if not hasattr(_model, "prepare_model_inputs_for_cp"):
         return batch
-    mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-    with torch.no_grad():
-        prepared = _model(_pre_embed_only=True, **mm_kwargs)
-    for k in VLM_INPUT_KEYS:
-        batch.pop(k, None)
-    batch.update(prepared)
+    if not pp_enabled or has_first_stage:
+        mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+        with torch.no_grad():
+            prepared = _model(_pre_embed_only=True, **mm_kwargs)
+        for k in VLM_INPUT_KEYS:
+            batch.pop(k, None)
+        batch.update(prepared)
+    else:
+        for k in VLM_INPUT_KEYS:
+            if k != "input_ids":
+                batch.pop(k, None)
     return batch
 
 
@@ -173,9 +179,7 @@ def test_train_cp_prepare_uses_torch_no_grad():
             return {"inputs_embeds": torch.zeros(1, 4, 8)}
 
         def __call__(self, **kw):
-            assert not torch.is_grad_enabled(), (
-                "prepare step must run under torch.no_grad()"
-            )
+            assert not torch.is_grad_enabled(), "prepare step must run under torch.no_grad()"
             return {"inputs_embeds": torch.zeros(1, 4, 8)}
 
     model = _GradSensitive()
@@ -184,6 +188,98 @@ def test_train_cp_prepare_uses_torch_no_grad():
         "labels": torch.tensor([[1, 2, 3, 4]]),
     }
     _train_cp_prepare(model, batch)
+
+
+def test_train_cp_prepare_pp_first_stage_preembeds_inputs():
+    """When CP and PP are both enabled, only the first stage should materialize
+    multimodal inputs before sequence sharding."""
+    inputs_embeds = torch.randn(1, 4, 8)
+    model = _SpyVLM(prepared={"inputs_embeds": inputs_embeds})
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "pixel_values": torch.zeros(1, 3, 4, 4),
+        "patch_pixel_values": torch.zeros(1, 2, 3, 4, 4),
+        "num_patches": torch.tensor([2]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+    }
+
+    out_batch = _train_cp_prepare(model, batch, pp_enabled=True, has_first_stage=True)
+
+    assert len(model.calls) == 1
+    assert model.calls[0]["_pre_embed_only"] is True
+    assert "patch_pixel_values" in model.calls[0]
+    assert "num_patches" in model.calls[0]
+    assert "inputs_embeds" in out_batch
+    assert "input_ids" not in out_batch
+    assert "pixel_values" not in out_batch
+
+
+def test_train_cp_prepare_pp_later_stage_drops_media_without_preembedding():
+    """Later PP stages should not run the media encoder, but should remove
+    unneeded media tensors before CP batch processing."""
+    model = _SpyVLM()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "pixel_values": torch.zeros(1, 3, 4, 4),
+        "patch_pixel_values": torch.zeros(1, 2, 3, 4, 4),
+        "num_patches": torch.tensor([2]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+    }
+
+    out_batch = _train_cp_prepare(model, batch, pp_enabled=True, has_first_stage=False)
+
+    assert model.calls == []
+    assert "input_ids" in out_batch
+    assert "inputs_embeds" not in out_batch
+    assert "pixel_values" not in out_batch
+    assert "patch_pixel_values" not in out_batch
+    assert "num_patches" not in out_batch
+    assert "labels" in out_batch
+
+
+def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
+    first_stage = SimpleNamespace(is_first=True, inputs_meta=("old-first",))
+    later_stage = SimpleNamespace(is_first=False, inputs_meta=("old-later",))
+    recipe = SimpleNamespace(
+        pp_enabled=pp_enabled,
+        pp=SimpleNamespace(
+            pp_microbatch_size=pp_microbatch_size,
+            info=SimpleNamespace(has_first_stage=has_first_stage, stages=[first_stage, later_stage]),
+        ),
+    )
+    return recipe, first_stage, later_stage
+
+
+def test_maybe_set_pp_first_stage_embed_input_meta_sets_first_stage_meta():
+    recipe, first_stage, later_stage = _make_recipe_with_pp_stages(pp_microbatch_size=3)
+    model_input = torch.empty(5, 11, 13, dtype=torch.bfloat16)
+
+    FinetuneRecipeForVLM._maybe_set_pp_first_stage_embed_input_meta(recipe, model_input)
+
+    assert later_stage.inputs_meta == ("old-later",)
+    assert len(first_stage.inputs_meta) == 1
+    meta = first_stage.inputs_meta[0]
+    assert tuple(meta.shape) == (3, 11, 13)
+    assert meta.dtype == torch.bfloat16
+    assert meta.device.type == "meta"
+
+
+@pytest.mark.parametrize(
+    ("recipe_kwargs", "model_input"),
+    [
+        ({"pp_enabled": False}, torch.empty(5, 11, 13)),
+        ({"has_first_stage": False}, torch.empty(5, 11, 13)),
+        ({}, torch.empty(5, 11, 13, dtype=torch.int64)),
+        ({}, torch.empty(5, 11)),
+    ],
+)
+def test_maybe_set_pp_first_stage_embed_input_meta_guard_conditions(recipe_kwargs, model_input):
+    recipe, first_stage, later_stage = _make_recipe_with_pp_stages(**recipe_kwargs)
+
+    FinetuneRecipeForVLM._maybe_set_pp_first_stage_embed_input_meta(recipe, model_input)
+
+    assert first_stage.inputs_meta == ("old-first",)
+    assert later_stage.inputs_meta == ("old-later",)
 
 
 # -----------------------------------------------------------------------------
@@ -217,9 +313,7 @@ def test_val_pos_ids_uses_dist_env_device_not_model_device():
         # Intentionally has NO ``.device`` attribute (mirrors real FSDP wrapper).
         def __getattr__(self, name):
             if name == "device":
-                raise AttributeError(
-                    "'FSDPWrapped' object has no attribute 'device'"
-                )
+                raise AttributeError("'FSDPWrapped' object has no attribute 'device'")
             raise AttributeError(name)
 
     model = _FSDPWrapped()
