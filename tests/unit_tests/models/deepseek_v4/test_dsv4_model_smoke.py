@@ -118,6 +118,96 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_dsv4_hca_param_sync_group_uses_only_1d_mesh(self):
+        named_hca_group = object()
+        unnamed_hca_group = object()
+        shape_only_hca_group = object()
+
+        class NamedOneDimMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return named_hca_group
+
+        class UnnamedOneDimMesh:
+            mesh_dim_names = None
+            ndim = 1
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return unnamed_hca_group
+
+        class UnnamedTwoDimMesh:
+            mesh_dim_names = None
+            ndim = 2
+
+        class ShapeOnlyOneDimMesh:
+            shape = (2,)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return shape_only_hca_group
+
+        class TwoDimMesh:
+            mesh_dim_names = ("dp", "tp")
+
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(None) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedOneDimMesh()) is unnamed_hca_group
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedTwoDimMesh()) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(ShapeOnlyOneDimMesh()) is shape_only_hca_group
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
+
+    def test_dsv4_fsdp_attaches_hca_group_before_all_fp32_fast_path(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
+        model = _make_model(cfg)
+        block = model.model.layers["0"]
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        hca_group = object()
+
+        class FakeMesh:
+            ndim = 1
+            mesh_dim_names = None
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return hca_group
+
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=FakeMesh(),
+            mp_policy=input_policy,
+            offload_policy=object(),
+        )
+
+        assert block.self_attn.compressor._hca_param_sync_group is hca_group
+        assert len(calls) == 1
+        assert calls[0][0] is block
+        assert calls[0][1]["mp_policy"].param_dtype == torch.float32
+        assert calls[0][1]["mp_policy"].reduce_dtype == torch.float32
+
     def test_dsv4_fsdp_wraps_fp32_islands_without_ignored_trainable_tensors(self, monkeypatch):
         cfg = _tiny_config(
             num_hidden_layers=1,
@@ -152,6 +242,17 @@ class TestDeepseekV4ModelSmoke:
 
         monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
 
+        hca_group = object()
+
+        class FakeMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return hca_group
+
         input_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -161,12 +262,13 @@ class TestDeepseekV4ModelSmoke:
 
         dsv4_fsdp.fully_shard_deepseek_v4(
             block,
-            mesh=object(),
+            mesh=FakeMesh(),
             mp_policy=input_policy,
             offload_policy=object(),
             ignored_params=ignored_expert_params,
         )
 
+        assert block.self_attn.compressor._hca_param_sync_group is hca_group
         calls_by_name = {name: kwargs for name, kwargs in calls}
         expected_fp32_modules = {
             "attn_hc",
