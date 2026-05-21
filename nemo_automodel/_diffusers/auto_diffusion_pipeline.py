@@ -188,6 +188,50 @@ def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype:
         module.to(device=device)
 
 
+def _select_active_transformer(pipe, active_transformer: str) -> None:
+    """Keep only the chosen transformer on a two-transformer pipeline.
+
+    Two-stage diffusion pipelines (Wan2.2 T2V-A14B) register both
+    ``transformer`` (high-noise) and ``transformer_2`` (low-noise). Finetuning
+    only needs one at a time. This helper swaps the chosen one into
+    ``pipe.transformer`` and nulls the other so subsequent device placement,
+    LoRA injection, and FSDP2 wrapping only touch the active model.
+
+    Args:
+        pipe: A diffusers pipeline that may expose ``transformer_2``.
+        active_transformer: Either ``"transformer"`` or ``"transformer_2"``.
+
+    Raises:
+        ValueError: If ``active_transformer`` is unrecognized.
+        AttributeError: If ``active_transformer="transformer_2"`` but the pipeline
+            has no ``transformer_2`` attribute (model is not a two-stage variant).
+    """
+    if active_transformer not in ("transformer", "transformer_2"):
+        raise ValueError(f"active_transformer must be 'transformer' or 'transformer_2', got {active_transformer!r}")
+
+    has_t2 = getattr(pipe, "transformer_2", None) is not None
+    if active_transformer == "transformer_2":
+        if not has_t2:
+            raise AttributeError(
+                "active_transformer='transformer_2' requested but the loaded pipeline "
+                "has no transformer_2 attribute. This option is for two-stage models like "
+                "Wan2.2-T2V-A14B."
+            )
+        # Move transformer_2 into the transformer slot and free the old one.
+        old_transformer = pipe.transformer
+        pipe.transformer = pipe.transformer_2
+        pipe.transformer_2 = None
+        del old_transformer
+        logger.info("[INFO] Selected transformer_2 as active transformer (low-noise stage)")
+    else:
+        if has_t2:
+            pipe.transformer_2 = None
+            logger.info("[INFO] Selected transformer as active transformer (high-noise stage); freed transformer_2")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = None) -> int:
     """
     Ensure that all parameters in the given module are trainable.
@@ -373,6 +417,7 @@ class NeMoAutoDiffusionPipeline:
         components_to_load: Optional[Iterable[str]] = None,
         peft_cfg=None,
         model_type=None,
+        active_transformer: Optional[str] = None,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -396,6 +441,12 @@ class NeMoAutoDiffusionPipeline:
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
             model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+            active_transformer: For two-transformer pipelines (e.g. Wan2.2 with
+                ``transformer`` + ``transformer_2``), selects which one becomes
+                ``pipe.transformer`` for training. Accepts ``"transformer"`` (default,
+                high-noise stage in Wan2.2) or ``"transformer_2"`` (low-noise stage).
+                The unused transformer is replaced with ``None`` and freed before
+                device placement so only one transformer occupies GPU memory.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -418,6 +469,13 @@ class NeMoAutoDiffusionPipeline:
         )
 
         logger.info("[INFO] Loaded pipeline type: %s", type(pipe).__name__)
+
+        # Two-transformer pipelines (Wan2.2): keep only the selected transformer
+        # on the pipeline so device placement / sharding only touches one model.
+        # We do this before any device move so the dropped transformer never
+        # occupies GPU memory.
+        if active_transformer is not None:
+            _select_active_transformer(pipe, active_transformer)
 
         # Decide device
         dev = _choose_device(device)

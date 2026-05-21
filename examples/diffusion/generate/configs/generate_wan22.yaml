@@ -1,0 +1,44 @@
+model:
+  pretrained_model_name_or_path: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  # Two-transformer loading. Either, both, or neither may be set:
+  #   - both unset  → use the hub-pretrained weights for both stages
+  #   - one set     → swap that stage's weights, leave the other stage at hub baseline
+  #   - both set    → swap both stages' weights
+  # Each path should be a training checkpoint dir produced by
+  # examples/diffusion/finetune/wan2_2_t2v_flow.yaml with the matching model.stage.
+  checkpoint_high_noise: null   # set to: PATH_TO_CKPT/wan22_high/checkpoint-1000
+  checkpoint_low_noise: null    # set to: PATH_TO_CKPT/wan22_low/checkpoint-1000
+
+inference:
+  num_inference_steps: 50
+  # High-noise stage guidance (used for timesteps >= boundary_ratio * num_train_timesteps).
+  guidance_scale: 5.0
+  height: 480
+  width: 832
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "A cat sitting on a windowsill watching the rain"
+  pipeline_kwargs:
+    num_frames: 81
+    negative_prompt: ""
+    # Low-noise stage guidance (used for timesteps < boundary_ratio * num_train_timesteps).
+    # Wan2.2 A14B uses asymmetric guidance: a stronger scale on the high-noise stage
+    # and a milder one on the low-noise stage. Tune per-prompt as needed.
+    guidance_scale_2: 5.0
+
+output:
+  output_dir: "./inference_outputs"
+  fps: 16
+
+distributed: null
+
+vae:
+  enable_slicing: true
+  enable_tiling: true
+  # WanPipeline cpu_offload_seq cycles text_encoder->transformer->transformer_2->vae,
+  # so enabling cpu offload keeps only one transformer on GPU at a time. Strongly
+  # recommended for A14B (two 14B transformers won't co-reside on a single GPU).
+  enable_cpu_offload: true
+
+seed: 42
