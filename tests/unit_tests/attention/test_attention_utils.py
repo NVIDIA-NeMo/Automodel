@@ -332,6 +332,24 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert torch.equal(attn_kwargs["attn_mask"], expected_mask)
         assert attn_kwargs["is_causal"] is False
 
+    def test_sdpa_preprocessing_with_explicit_attention_bias(self):
+        """Test SDPA preserves a prebuilt additive attention mask."""
+        q = torch.randn(2, 4, 3, 8)
+        k = torch.randn(2, 4, 3, 8)
+        v = torch.randn(2, 4, 3, 8)
+        attention_mask = torch.zeros(2, 1, 4, 4)
+        attention_mask = attention_mask.masked_fill(torch.triu(torch.ones(4, 4), diagonal=1).bool(), float("-inf"))
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask=attention_mask, attn_impl="sdpa"
+        )
+
+        assert q_out.shape == (2, 3, 4, 8)
+        assert k_out.shape == (2, 3, 4, 8)
+        assert v_out.shape == (2, 3, 4, 8)
+        assert torch.equal(attn_kwargs["attn_mask"], attention_mask)
+        assert attn_kwargs["is_causal"] is False
+
     def test_sdpa_preprocessing_with_sliding_window(self):
         """Test SDPA builds a local causal mask when window_size is provided."""
         q = torch.randn(1, 5, 1, 8)

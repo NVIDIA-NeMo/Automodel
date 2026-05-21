@@ -182,9 +182,14 @@ def preprocess_args_and_kwargs_for_attn(
             right_window is not None and right_window > 0
         )
         key_mask = None
+        explicit_mask = None
         if attention_mask is not None:
-            key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
-            has_padding_mask = not bool(key_mask.all().item())
+            if attention_mask.dim() <= 2:
+                key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+                has_padding_mask = not bool(key_mask.all().item())
+            else:
+                explicit_mask = attention_mask.to(device=q.device)
+                has_padding_mask = False
         else:
             has_padding_mask = False
 
@@ -208,6 +213,9 @@ def preprocess_args_and_kwargs_for_attn(
                 causal_mask = causal_mask.unsqueeze(0).unsqueeze(0) & key_mask[:, None, None, :]
 
             attn_kwargs["attn_mask"] = causal_mask
+            attn_kwargs["is_causal"] = False
+        elif explicit_mask is not None:
+            attn_kwargs["attn_mask"] = explicit_mask
             attn_kwargs["is_causal"] = False
         else:
             attn_kwargs["is_causal"] = True
