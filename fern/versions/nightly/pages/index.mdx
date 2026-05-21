@@ -4,7 +4,7 @@ description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source traini
 ---
 import { Tag } from "@/components/Tag";
 
-PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
+PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
 **Quick links:** [🤗 HF Compatible](/get-started/hf-compatibility) | [🚀 Performance](/performance/performance-summary) | [📐 Scalability](/get-started/key-features) | [🎯 SFT & PEFT](/recipes-e2e-examples/sft-peft) | [🎨 Diffusion](/recipes-e2e-examples/diffusion-fine-tuning) | [👁️ VLM](/recipes-e2e-examples/gemma-4)
 
 <Cards>
@@ -44,6 +44,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 | Date | Modality | Model |
 |------|----------|-------|
+| 2026-05-18 | Audio | Qwen3-Omni ASR ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml)) |
 | 2026-04-07 | LLM | [GLM-5.1](https://github.com/NVIDIA-NeMo/Automodel/discussions/1719) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)) |
 | 2026-04-02 | VLM | Gemma 4 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml)) |
 | 2026-03-16 | VLM | [Mistral Small 4](https://github.com/NVIDIA-NeMo/Automodel/discussions/1558) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml)) |
@@ -52,7 +53,7 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 ## Recipes & Guides
 
-Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
+Find the right guide for your task: fine-tuning, pretraining, distillation, diffusion, and more.
 
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
@@ -64,6 +65,7 @@ Find the right guide for your task -- fine-tuning, pretraining, distillation, di
 | **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](/recipes-e2e-examples/dllm-fine-tuning)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](/recipes-e2e-examples/diffusion-fine-tuning)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](/recipes-e2e-examples/qwen3-5-vl)                |
+| **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](/recipes-e2e-examples/qwen3-omni-asr) |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Tag variant="info">Coming Soon</Tag>                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](/recipes-e2e-examples/large-moe-fine-tuning)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](/recipes-e2e-examples/deepseek-v4-flash)   |

@@ -220,6 +220,27 @@ navigation:
             path: ./nightly/pages/model-coverage/diffusion/hunyuanvideo-community/hunyuanvideo.mdx
           - page: "Qwen-Image"
             path: ./nightly/pages/model-coverage/diffusion/qwen/qwen-image.mdx
+      - section: "Embedding Models"
+        slug: embedding-models
+        contents:
+          - page: "Overview"
+            path: ./nightly/pages/model-coverage/embedding/index.mdx
+            slug: overview
+          - page: "Llama (Bidirectional)"
+            path: ./nightly/pages/model-coverage/embedding/nvidia/llama-bidirectional.mdx
+            slug: llama-bidirectional
+          - page: "Ministral3 (Bidirectional)"
+            path: ./nightly/pages/model-coverage/embedding/mistralai/ministral3-bidirectional.mdx
+            slug: ministral3-bidirectional
+      - section: "Reranking Models"
+        slug: reranking-models
+        contents:
+          - page: "Overview"
+            path: ./nightly/pages/model-coverage/reranker/index.mdx
+            slug: overview
+          - page: "Llama (Bidirectional)"
+            path: ./nightly/pages/model-coverage/reranker/nvidia/llama-bidirectional.mdx
+            slug: llama-bidirectional
   - section: "Recipes & E2E Examples"
     contents:
       - page: "Recipes and End-to-End Examples"
@@ -267,6 +288,9 @@ navigation:
       - page: "Mistral Medium 3.5 VL"
         path: ./nightly/pages/guides/vlm/mistral-medium-3-5.mdx
         slug: mistral-medium-3-5
+      - page: "Fine-Tune Qwen3-Omni for ASR"
+        path: ./nightly/pages/guides/audio/qwen3-omni-asr.mdx
+        slug: qwen3-omni-asr
       - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
         path: ./nightly/pages/guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
