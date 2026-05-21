@@ -1,9 +1,9 @@
 # NeMo AutoModel — Fern docs convenience targets.
-# Runs from this directory (fern/). Invoke as:
+# Runs from this directory (docs/fern/). Invoke as:
 #
-#     cd fern && make docs
+#     cd docs/fern && make docs
 #     # or from anywhere in the repo:
-#     make -C fern docs
+#     make -C docs/fern docs
 #
 # CI workflows under `.github/workflows/fern-docs-*.yml` are the source of
 # truth for the published pipeline; these targets just mirror the
@@ -24,8 +24,8 @@ help:
 	@echo "NeMo AutoModel — Fern docs Make targets"
 	@echo "========================================"
 	@echo ""
-	@echo "Run from this directory ('cd fern && make <target>')"
-	@echo "or from anywhere in the repo ('make -C fern <target>')."
+	@echo "Run from this directory ('cd docs/fern && make <target>')"
+	@echo "or from anywhere in the repo ('make -C docs/fern <target>')."
 	@echo ""
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"

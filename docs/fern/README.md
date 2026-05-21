@@ -1,8 +1,8 @@
 # NeMo AutoModel — Fern Docs
 
-This directory holds the Fern MDX source for the NeMo AutoModel documentation site at **[docs.nvidia.com/nemo/automodel](https://docs.nvidia.com/nemo/automodel)**.
+This directory holds the Fern build infrastructure (config, theme, components, frozen version snapshots) for the NeMo AutoModel documentation site at **[docs.nvidia.com/nemo/automodel](https://docs.nvidia.com/nemo/automodel)**.
 
-The legacy Sphinx tree under `../docs/` remains in place for reference until the Fern site is fully validated; new pages and edits should land here.
+**The MDX content lives one level up, in `docs/` itself** — every nightly page is a top-level sibling of this `docs/fern/` directory (e.g. `docs/index.mdx`, `docs/guides/llm/finetune.mdx`). Fern reads those files via relative `path: ../../<...>.mdx` entries in `docs/fern/versions/nightly.yml`.
 
 ## Quick links
 
@@ -10,8 +10,8 @@ The legacy Sphinx tree under `../docs/` remains in place for reference until the
 |---|---|
 | Published site | https://docs.nvidia.com/nemo/automodel |
 | Fern dashboard | https://dashboard.buildwithfern.com (NVIDIA org) |
-| Skill for agents | [`../skills/fern-docs/SKILL.md`](../skills/fern-docs/SKILL.md) |
-| CI workflows | [`../.github/workflows/fern-docs-*.yml`](../.github/workflows/) |
+| Skill for agents | [`../../skills/fern-docs/SKILL.md`](../../skills/fern-docs/SKILL.md) |
+| CI workflows | [`../../.github/workflows/fern-docs-*.yml`](../../.github/workflows/) |
 | Make targets | [`./Makefile`](./Makefile) |
 
 ## Quickstart
@@ -19,8 +19,8 @@ The legacy Sphinx tree under `../docs/` remains in place for reference until the
 First time on this machine:
 
 ```bash
-# All Make targets live in fern/Makefile — run them from this directory
-# (`cd fern && make <target>`) or from anywhere with `make -C fern <target>`.
+# All Make targets live in docs/fern/Makefile — run them from this directory
+# (`cd docs/fern && make <target>`) or from anywhere with `make -C docs/fern <target>`.
 
 # 1. Install the Fern CLI globally (one-time)
 npm install -g fern-api
@@ -28,7 +28,7 @@ npm install -g fern-api
 
 # 2. Provision your Fern account + CLI auth (one-time per machine).
 #    Walks you through the dashboard sign-in step before running `fern login`.
-cd fern && make docs-login
+cd docs/fern && make docs-login
 
 # 3. Build the API library reference and start the local dev server
 make docs           # http://localhost:3002
@@ -55,34 +55,37 @@ make docs-check
 ## Layout
 
 ```
-fern/
-├── fern.config.json          # Fern CLI pin (4.62.4+) and org slug
-├── docs.yml                  # Site config: instances, versions, redirects, libraries, theme
-├── main.css                  # NVIDIA-green theme overrides
-├── assets/                   # Logos and shared SVGs
-├── components/               # BadgeLinks.tsx, Tag.tsx, CustomFooter.tsx
-├── versions/
-│   ├── nightly.yml           # Nav for the bleeding-edge tree — paths point at ./nightly/pages/
-│   ├── nightly/pages/        # Bleeding-edge MDX content (edited on every PR)
-│   ├── v0.4.yml              # Nav for the frozen 0.4.0 GA snapshot — paths point at ./v0.4/pages/
-│   ├── v0.4/pages/           # Frozen 0.4.0 content (back-ports only)
-│   └── latest.yml            # GA alias — paths point at ./v0.4/pages/; bumps to ./v0.5/pages/ at next GA cut
-└── product-docs/             # GENERATED Python API reference (gitignored — `make docs` regenerates)
+docs/                            ← nightly MDX lives here (sibling of fern/)
+├── index.mdx, breaking-changes.mdx, release-notes.mdx, ...
+├── about/, guides/, model-coverage/, launcher/, api-reference/
+├── *.png / *.jpg                ← page-scoped images
+└── fern/                        ← THIS DIRECTORY
+    ├── fern.config.json         # Fern CLI pin (4.62.4+) and org slug
+    ├── docs.yml                 # Site config: instances, versions, redirects, libraries, theme
+    ├── main.css                 # NVIDIA-green theme overrides
+    ├── assets/                  # Logos and shared SVGs
+    ├── components/              # BadgeLinks.tsx, Tag.tsx, CustomFooter.tsx
+    ├── versions/
+    │   ├── nightly.yml          # Nav for nightly — paths point at ../../<path>.mdx (up into docs/)
+    │   ├── v0.4.yml             # Nav for the frozen 0.4.0 GA snapshot — paths at ./v0.4/pages/
+    │   ├── v0.4/pages/          # Frozen 0.4.0 content (back-ports only; never edited from nightly)
+    │   └── latest.yml           # GA alias — paths at ./v0.4/pages/ today; repointed at next GA cut
+    └── product-docs/            # GENERATED Python API reference (gitignored — `make docs` regenerates)
 ```
 
 ```
 File path                                                  Published URL
 ─────────────────────────────────────────────────────────  ─────────────────────────────────────────────────
-fern/versions/nightly/pages/get-started/installation.mdx   docs.nvidia.com/nemo/automodel/nightly/get-started/installation
-fern/versions/v0.4/pages/get-started/installation.mdx      docs.nvidia.com/nemo/automodel/v0.4/get-started/installation
+docs/get-started/installation.mdx                          docs.nvidia.com/nemo/automodel/nightly/get-started/installation
+docs/fern/versions/v0.4/pages/get-started/installation.mdx docs.nvidia.com/nemo/automodel/v0.4/get-started/installation
                                                            docs.nvidia.com/nemo/automodel/latest/get-started/installation  (latest mounts v0.4 content)
 ```
 
-`nightly/pages/` and `v0.4/pages/` are **separate, independent content trees**. `nightly/` is the bleeding-edge tree edited on every PR; `v0.4/` is the frozen 0.4.0 release snapshot, only changed via deliberate back-port. `latest.yml` mounts `./v0.4/pages/` so `/latest/...` URLs serve the current GA — at the next GA cut, `latest.yml` repoints at the new train. Today the two trees are byte-for-byte identical (we just shipped 0.4.0); they'll diverge as nightly accumulates post-release edits.
+The **`docs/` top-level tree IS the nightly tree** — every PR lands there. The **`docs/fern/versions/v0.4/pages/` tree is a frozen 0.4.0 release snapshot**, only changed via deliberate back-port. `latest.yml` mounts `./v0.4/pages/` so `/latest/...` URLs serve the current GA — at the next GA cut, `latest.yml` repoints at the new train. Today the two trees are byte-for-byte identical (we just shipped 0.4.0); they'll diverge as nightly accumulates post-release edits.
 
 ## Local development
 
-From this directory (`cd fern` first, or use `make -C fern <target>` from anywhere):
+From this directory (`cd docs/fern` first, or use `make -C docs/fern <target>` from anywhere):
 
 ```bash
 make docs           # `fern docs md generate` + `fern docs dev` → http://localhost:3002
@@ -93,7 +96,7 @@ make docs-publish   # trigger the `Publish Fern Docs` workflow on origin/main
 
 For first-time-on-this-machine setup, see the [Quickstart](#quickstart) above — `make docs-login` walks through dashboard provisioning + `fern login` together.
 
-`fern docs md generate` (run by `make docs`) populates `fern/product-docs/` from the `nemo_automodel` package source declared in the `libraries:` block of `docs.yml`. Without it, a cold `fern docs dev` will fail with `Folder not found: ./product-docs/...`. Re-run only when the upstream Python source changes — for prose-only iteration, `cd fern && fern docs dev` alone is enough.
+`fern docs md generate` (run by `make docs`) populates `docs/fern/product-docs/` from the `nemo_automodel` package source declared in the `libraries:` block of `docs.yml`. Without it, a cold `fern docs dev` will fail with `Folder not found: ./product-docs/...`. Re-run only when the upstream Python source changes — for prose-only iteration, `cd docs/fern && fern docs dev` alone is enough.
 
 ## Sidebar fidelity rule
 
@@ -156,28 +159,28 @@ Repository source paths like `examples/llm_finetune/foo.yaml` or `nemo_automodel
 | `Latest` | `latest` | `stable` | `./versions/latest.yml` |
 | `0.4.0 · 26.04` | `v0.4` | `stable` | `./versions/v0.4.yml` |
 
-**`nightly` is the bleeding-edge tree** — every PR lands here, and (once wired up) the daily build publishes from here. **`v0.4` is the frozen 0.4.0 GA snapshot** with its own copy of every page; it only changes via deliberate back-ports from nightly. `latest.yml` mounts the current GA's content (today: `./v0.4/pages/...`).
+**`nightly` reads the MDX directly from `docs/`** (via `path: ../../<...>.mdx` in `nightly.yml`) — every PR lands there, and (once wired up) the daily build publishes from that tree. **`v0.4` is the frozen 0.4.0 GA snapshot** with its own copy of every page under `docs/fern/versions/v0.4/pages/`; it only changes via deliberate back-ports from nightly. `latest.yml` mounts the current GA's content (today: `./v0.4/pages/...`).
 
 When the next GA cuts (e.g. `v0.5`):
 
-1. `cp -r versions/nightly versions/v0.5` — fresh frozen snapshot of nightly at release time
-2. `cp versions/nightly.yml versions/v0.5.yml`, then sed `./nightly/` → `./v0.5/` in the new file
+1. `cp -r ../* versions/v0.5/pages/` (excluding `docs/fern/`) — fresh frozen snapshot of nightly at release time
+2. `cp versions/nightly.yml versions/v0.5.yml`, then sed `../../` → `./v0.5/pages/` in the new file
 3. Repoint `versions/latest.yml` at the new GA: `cp versions/v0.5.yml versions/latest.yml`
 4. Add the new frozen-pin entry to `docs.yml` `versions:` (`display-name: "0.5.0"`, `slug: v0.5`, `availability: stable`); keep `v0.4` per support policy
-5. `versions/nightly/pages/` keeps moving forward as the bleeding-edge tree; `versions/v0.4/pages/` and `versions/v0.5/pages/` are now both frozen
+5. `docs/` keeps moving forward as the nightly tree; `versions/v0.4/pages/` and `versions/v0.5/pages/` are both frozen
 
 ## CI and publishing
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
 | `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | `fern check` on PRs |
-| `fern-docs-preview-build.yml` | `pull_request` | Untrusted half: collect `fern/` artifact (no secrets) |
+| `fern-docs-preview-build.yml` | `pull_request` | Untrusted half: collect `docs/fern/` artifact (no secrets) |
 | `fern-docs-preview-comment.yml` | `workflow_run` after build | Trusted half: build preview with `DOCS_FERN_TOKEN`, post 🌿 comment |
-| `publish-fern-docs.yml` | push to `main` (`fern/**`), `docs/v*` tag, or manual | Publish to docs.nvidia.com/nemo/automodel |
+| `publish-fern-docs.yml` | push to `main` (`docs/**`), `docs/v*` tag, or manual | Publish to docs.nvidia.com/nemo/automodel |
 
 Required org secret: **`DOCS_FERN_TOKEN`** (already wired for the existing `build-docs.yml`).
 
-PRs that touch `fern/**` get an automatic preview URL posted as a 🌿 comment.
+PRs that touch `docs/**` get an automatic preview URL posted as a 🌿 comment.
 
 ## Commits
 
@@ -187,13 +190,13 @@ DCO sign-off is required:
 git commit -s -m "docs: <add|update|remove> <page-title>"
 ```
 
-PR titles follow Conventional Commits (e.g. `docs(fern): add gemma4 fine-tuning guide`) — see [`AGENTS.md`](../AGENTS.md) for the full convention.
+PR titles follow Conventional Commits (e.g. `docs(fern): add gemma4 fine-tuning guide`) — see [`AGENTS.md`](../../AGENTS.md) for the full convention.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `fern check` YAML error | 2-space indent; `- page:` inside `contents:`; `path:` is relative to the version YAML |
+| `fern check` YAML error | 2-space indent; `- page:` inside `contents:`; `path:` is relative to the version YAML (so nightly paths reach back up via `../../`) |
 | Page 404 in preview | `slug:` collision in the same section, or missing `slug:` override (default slugifies the long display title) |
 | `Folder not found: ./product-docs/...` in `fern docs dev` | Run `make docs` once; library generation populates `product-docs/` |
 | `[ERR_PNPM_IGNORED_BUILDS]` on first `fern docs dev` | pnpm 10+ blocks esbuild's postinstall — `pnpm config set onlyBuiltDependencies '["esbuild"]' --location global`, then `rm -rf ~/.fern/app-preview` and retry |

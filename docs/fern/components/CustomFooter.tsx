@@ -6,7 +6,7 @@
 /**
  * Custom footer for NVIDIA docs (Fern native header/footer).
  * Markup and class names match the original custom-app footer 1:1 so that
- * fern/main.css (footer + Built with Fern styles) applies correctly:
+ * docs/fern/main.css (footer + Built with Fern styles) applies correctly:
  * dark mode logo, responsive layout, and Built with Fern tooltip.
  */
 export default function CustomFooter() {

@@ -10,7 +10,7 @@
  * their visual cues after migration. Used by `convert_myst_to_fern.py` when
  * converting `{bdg-primary}\`text\`` to `<Tag variant="primary">text</Tag>`.
  *
- * Copy to your repo's `fern/components/` together with `BadgeLinks.tsx`.
+ * Copy to your repo's `docs/fern/components/` together with `BadgeLinks.tsx`.
  */
 export type TagVariant =
   | "primary"
