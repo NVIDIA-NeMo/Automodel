@@ -70,7 +70,6 @@ from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import Deep
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
-from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -747,11 +746,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
 
         thd_mode = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
-        if thd_mode:
-            input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
-                input_ids, position_ids, padding_mask, attn_kwargs
-            )
-            attention_mask = None
 
         use_mtp = self.mtp is not None and self.training
         model_out = self.model(

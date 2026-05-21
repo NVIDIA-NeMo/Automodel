@@ -28,6 +28,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
@@ -513,10 +514,32 @@ class TestDeepseekV4ModelSmoke:
         torch.nn.Module.__init__(model)
         model.model = _HiddenStage()
         model.lm_head = None
+        model.mtp = None
+        model.mtp_config = MTPConfig()
 
         out = model(torch.ones(1, 8, dtype=torch.long), qkv_format="thd")
 
         assert out.shape == (1, 8, 4, 16)
+
+    def test_thd_first_stage_keeps_batch_axis(self):
+        """DSV4 packed sequence uses seq_lens masks while preserving [1, T] inputs."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+
+        input_ids = torch.ones(1, 8, dtype=torch.long)
+        position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
+        seq_lens = torch.tensor([[8]], dtype=torch.long)
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                seq_lens=seq_lens,
+                seq_lens_padded=seq_lens,
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
 
     @_REQUIRES_CUDA
     def test_forward_shape(self):
