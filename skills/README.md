@@ -26,4 +26,4 @@ To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 | `cicd` | Commit/PR workflow, CI trigger mechanism, failure investigation |
 | `build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
 | `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
-| `fern-docs` | Maintain the Fern docs site under `fern/` — pages, slugs, redirects, version aliases, library reference |
+| `fern-docs` | Maintain the Fern docs site with authored MDX under `docs/` and generated Fern infrastructure under `.github/fern-template/` |

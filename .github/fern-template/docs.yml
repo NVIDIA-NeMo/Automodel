@@ -1,0 +1,150 @@
+instances:
+- url: https://nemo-automodel.docs.buildwithfern.com/nemo/automodel
+  custom-domain: docs.nvidia.com/nemo/automodel
+title: NVIDIA NeMo AutoModel
+footer: ./components/CustomFooter.tsx
+layout:
+  searchbar-placement: header
+  page-width: 1376px
+  sidebar-width: 248px
+  content-width: 812px
+  tabs-placement: header
+  hide-feedback: true
+colors:
+  accentPrimary:
+    dark: '#76B900'
+    light: '#76B900'
+  background:
+    light: '#FFFFFF'
+    dark: '#000000'
+theme:
+  page-actions: toolbar
+  footer-nav: minimal
+logo:
+  dark: ./assets/NVIDIA_dark.svg
+  light: ./assets/NVIDIA_light.svg
+  height: 20
+  href: /
+  right-text: NeMo AutoModel
+favicon: ./assets/NVIDIA_symbol.svg
+js:
+- url: https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js
+  strategy: beforeInteractive
+css:
+- ./main.css
+navbar-links:
+- type: github
+  value: https://github.com/NVIDIA-NeMo/Automodel
+libraries:
+  nemo-automodel:
+    input:
+      git: https://github.com/NVIDIA-NeMo/Automodel
+      subpath: nemo_automodel
+    output:
+      path: ./product-docs/nemo-automodel/Full-Library-Reference
+    lang: python
+
+experimental:
+  mdx-components:
+  - ./components
+  basepath-aware: true
+
+versions:
+  - display-name: Latest
+    slug: latest
+    path: ./versions/latest.yml
+    availability: stable
+
+redirects:
+  # Keep legacy Sphinx and pre-refactor Fern URLs resolving to the single
+  # maintained /latest tree. Specific version rules must stay before the
+  # generic /:path*/index.html and /:path*.html catch-alls.
+  - source: "/nemo/automodel/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/latest/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/latest/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/latest/recipes-e-2-e-examples"
+    destination: "/nemo/automodel/latest/recipes-e2e-examples/overview"
+  - source: "/nemo/automodel/latest/recipes-e-2-e-examples/:path*"
+    destination: "/nemo/automodel/latest/recipes-e2e-examples/:path*"
+  - source: "/nemo/automodel/v0.4/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/v0.4/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/nightly/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/nightly/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.4/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.4/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.3.0/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.3.0/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.2.0/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.2.0/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.1.0/index.html"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.1.0/index"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/v0.4/:path*/index.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/nightly/:path*/index.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.4/:path*/index.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.3.0/:path*/index.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.2.0/:path*/index.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.1.0/:path*/index.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/v0.4"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/v0.4/:path*"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/nightly"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/nightly/:path*"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.4"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.4/:path*"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.3.0"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.3.0/:path*"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.2.0"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.2.0/:path*"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.1.0"
+    destination: "/nemo/automodel/latest"
+  - source: "/nemo/automodel/0.1.0/:path*"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/:path*/index.html"
+    destination: "/nemo/automodel/:path*"
+  # Sphinx page URLs (foo.html); must follow all :path*/index.html rules above.
+  - source: "/nemo/automodel/v0.4/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/nightly/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.4/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.3.0/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.2.0/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/0.1.0/:path*.html"
+    destination: "/nemo/automodel/latest/:path*"
+  - source: "/nemo/automodel/:path*.html"
+    destination: "/nemo/automodel/:path*"

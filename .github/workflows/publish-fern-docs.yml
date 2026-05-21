@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Publishes the Fern documentation site when a docs tag is pushed or manually triggered.
+# Publishes the Fern documentation site when docs change, a docs tag is pushed,
+# or the workflow is manually triggered. The root repo does not track a fern/
+# directory; the workflow prepares a temporary Fern project before publishing.
 #
 # To publish:  git tag docs/v1.2.0 && git push origin docs/v1.2.0
 # Or use the "Run workflow" button in the Actions tab.
@@ -29,7 +31,9 @@ on:
       - main
     paths:
       - 'docs/**'
-      - 'fern/**'
+      - '.github/fern-template/**'
+      - '.github/scripts/prepare-fern-docs.sh'
+      - '.github/workflows/publish-fern-docs.yml'
     tags:
       - 'docs/v*'
   workflow_dispatch: {}
@@ -54,10 +58,13 @@ jobs:
           node-version: '20'
 
       - name: Install Fern CLI
-        run: npm install -g fern-api
+        run: npm install -g fern-api.62.4
+
+      - name: Prepare Fern project
+        run: bash .github/scripts/prepare-fern-docs.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/fern-docs/fern"
 
       - name: Publish Docs
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
-        working-directory: ./fern
+        working-directory: ${{ runner.temp }}/fern-docs/fern
         run: fern generate --docs

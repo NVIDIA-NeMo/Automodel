@@ -1,0 +1,66 @@
+---
+title: "Documentation Development"
+description: ""
+---
+
+## Source Layout
+
+Documentation authors edit MDX pages and page-scoped images under `docs/`.
+The repository does not track a root-level `fern/` project.
+
+Fern-specific site configuration lives under `.github/fern-template/`, and
+local/CI commands generate a disposable Fern project under `.fern-build/fern`
+or `$RUNNER_TEMP`.
+
+## Local Validation
+
+Install the Fern CLI once:
+
+```sh
+npm install -g fern-api@4.62.4
+```
+
+Then validate the generated Fern project from the repository root:
+
+```sh
+make -f .github/fern-template/Makefile docs-check
+```
+
+## Local Preview
+
+Build the disposable Fern project and start a local Fern preview:
+
+```sh
+scripts/serve_docs.sh
+```
+
+The generated site is served by Fern, usually at `http://localhost:3002`.
+This default path does not require Fern login; it uses a local placeholder for
+the generated Python API reference.
+
+Pass Fern dev-server arguments after `--`:
+
+```sh
+scripts/serve_docs.sh -- --port 3003
+```
+
+To generate the full Python API reference locally, opt in to Fern's library
+generation step:
+
+```sh
+scripts/serve_docs.sh --generate-api
+```
+
+If library-reference generation fails with an organization permission error,
+provision your Fern dashboard account and log in:
+
+```sh
+make -f .github/fern-template/Makefile docs-login
+```
+
+## Publishing
+
+The published site has one maintained version: `latest`.
+
+Legacy `/nightly`, `/v0.4`, and older Sphinx version URLs redirect to the
+nearest `/latest` path. Their content trees are not tracked in this repository.

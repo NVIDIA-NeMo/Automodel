@@ -41,11 +41,6 @@ on:
         required: false
         default: true
         type: boolean
-      publish-docs:
-        description: Publish docs
-        required: false
-        default: true
-        type: boolean
       version-bump-branch:
         description: Branch for version bump
         required: true
@@ -96,8 +91,7 @@ jobs:
       no-build-isolation: true
       app-id: ${{ vars.BOT_ID }}
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
-      publish-docs: ${{ inputs.publish-docs || true }}
-      docs-target-path: nemo/automodel
+      publish-docs: false
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
       restrict-to-admins: true
     secrets: inherit  # pragma: allowlist secret

@@ -15,9 +15,9 @@
 
 # Workflow 1 of 2 for Fern doc previews.
 #
-# Collects the fern/ sources and PR metadata from the (possibly untrusted) PR
-# branch and uploads them as an artifact. No secrets are used here, so this is
-# safe to run on fork PRs via the regular pull_request trigger.
+# Collects docs sources, Fern template files, and PR metadata from the
+# (possibly untrusted) PR branch and uploads them as an artifact. No secrets are
+# used here, so this is safe to run on fork PRs via pull_request.
 #
 # The companion workflow (fern-docs-preview-comment.yml) picks up the artifact,
 # builds the preview with DOCS_FERN_TOKEN, and posts the PR comment.
@@ -27,7 +27,9 @@ name: "Preview Fern Docs: Build"
 on:
   pull_request:
     paths:
-      - 'fern/**'
+      - 'docs/**'
+      - '.github/fern-template/**'
+      - '.github/scripts/prepare-fern-docs.sh'
       - '.github/workflows/fern-docs-preview-build.yml'
 
 permissions:
@@ -51,13 +53,17 @@ jobs:
           mkdir -p preview-metadata
           echo "$PR_NUMBER" > preview-metadata/pr_number
           echo "$HEAD_REF" > preview-metadata/head_ref
-          git diff --name-only "origin/${BASE_REF}...HEAD" -- '*.mdx' > preview-metadata/changed_mdx_files 2>/dev/null || true
+          git diff --name-only "origin/${BASE_REF}...HEAD" -- 'docs/**/*.mdx' 'docs/*.mdx' \
+            | sed 's|^docs/|versions/latest/pages/|' > preview-metadata/changed_mdx_files 2>/dev/null || true
 
-      - name: Upload fern sources and metadata
+      - name: Upload docs sources and metadata
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fern-preview
           path: |
-            fern/
+            docs/
+            .github/fern-template/
+            .github/scripts/prepare-fern-docs.sh
             preview-metadata/
+          include-hidden-files: true
           retention-days: 1

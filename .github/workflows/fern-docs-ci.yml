@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Validates Fern docs configuration on pull requests.
+# Validates Fern docs configuration on pull requests. The repo tracks authored
+# docs under docs/ and Fern configuration under .github/fern-template/; this
+# workflow materializes a disposable Fern project before running the CLI.
 
 name: Fern docs (check)
 
@@ -25,7 +27,9 @@ on:
     branches:
       - "pull-request/[0-9]+"
     paths:
-      - 'fern/**'
+      - 'docs/**'
+      - '.github/fern-template/**'
+      - '.github/scripts/prepare-fern-docs.sh'
       - '.github/workflows/fern-docs-ci.yml'
 
 permissions:
@@ -44,8 +48,11 @@ jobs:
           node-version: '20'
 
       - name: Install Fern CLI
-        run: npm install -g fern-api
+        run: npm install -g fern-api.62.4
+
+      - name: Prepare Fern project
+        run: bash .github/scripts/prepare-fern-docs.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/fern-docs/fern"
 
       - name: Validate Fern configuration
-        working-directory: ./fern
+        working-directory: ${{ runner.temp }}/fern-docs/fern
         run: fern check

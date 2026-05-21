@@ -162,7 +162,7 @@ After installing the git hooks, `git commit` will automatically run incremental 
 
 ## Adding Documentation
 
-If your contribution involves documentation changes, please refer to the [Documentation Development](docs/documentation.md) guide for detailed instructions on building and serving the documentation.
+If your contribution involves documentation changes, please refer to the [Documentation Development](docs/documentation.mdx) guide for detailed instructions on building and serving the documentation.
 
 ## Signing Your Work
 
