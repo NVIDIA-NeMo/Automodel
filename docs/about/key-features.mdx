@@ -7,6 +7,8 @@ difficulty: "beginner"
 content_type: "concept"
 ---
 
+import { Octicon } from "@/components/Octicon";
+
 (about-key-features)=
 
 # Key Features and Concepts
@@ -38,37 +40,37 @@ See the [full benchmark results](../performance-summary.mdx) for configuration d
 NeMo AutoModel supports a range of training tasks across LLM and VLM modalities.
 
 ::::{grid}
-:::{grid-item-card} Supervised Fine-Tuning (SFT)
+:::{grid-item-card} <Octicon name="mortar-board" /> Supervised Fine-Tuning (SFT)
 :link: ../guides/llm/finetune
 :link-type: doc
 Full-parameter fine-tuning for task-specific adaptation.
 :::
 
-:::{grid-item-card} PEFT (LoRA / QLoRA)
+:::{grid-item-card} <Octicon name="cpu" /> PEFT (LoRA / QLoRA)
 :link: ../guides/llm/finetune
 :link-type: doc
 Memory-efficient fine-tuning by updating only low-rank adapter weights.
 :::
 
-:::{grid-item-card} Pre-Training
+:::{grid-item-card} <Octicon name="iterations" /> Pre-Training
 :link: ../guides/llm/pretraining
 :link-type: doc
 Train models from scratch on large-scale datasets.
 :::
 
-:::{grid-item-card} Knowledge Distillation
+:::{grid-item-card} <Octicon name="dependabot" /> Knowledge Distillation
 :link: ../guides/llm/knowledge-distillation
 :link-type: doc
 Transfer knowledge from a large teacher to a smaller student model.
 :::
 
-:::{grid-item-card} Tool Calling
+:::{grid-item-card} <Octicon name="tools" /> Tool Calling
 :link: ../guides/llm/toolcalling
 :link-type: doc
 Fine-tune models for structured function calling with tool schemas.
 :::
 
-:::{grid-item-card} Quantization-Aware Training
+:::{grid-item-card} <Octicon name="meter" /> Quantization-Aware Training
 :link: ../guides/quantization-aware-training
 :link-type: doc
 Train with quantization for deployment-ready models.
@@ -83,19 +85,19 @@ Train with quantization for deployment-ready models.
 NeMo AutoModel leverages PyTorch-native parallelism strategies to scale training from a single GPU to multi-node clusters.
 
 ::::{grid}
-:::{grid-item-card} FSDP2
+:::{grid-item-card} <Octicon name="git-merge" /> FSDP2
 Fully Sharded Data Parallelism with DTensor for memory-efficient distributed training. Supports Hybrid Sharding (HSDP) for multi-node.
 :::
 
-:::{grid-item-card} Pipeline Parallelism
+:::{grid-item-card} <Octicon name="git-merge" /> Pipeline Parallelism
 Torch-native pipelining composable with FSDP2 and DTensor for 3D parallelism.
 :::
 
-:::{grid-item-card} FP8 Mixed Precision
+:::{grid-item-card} <Octicon name="zap" /> FP8 Mixed Precision
 FP8 training via torchao for reduced memory and higher throughput on supported models.
 :::
 
-:::{grid-item-card} Multi-Node with SLURM
+:::{grid-item-card} <Octicon name="server" /> Multi-Node with SLURM
 Add a `slurm:` section to any YAML config and launch with the `automodel` CLI. See the [Cluster guide](../launcher/slurm.mdx).
 :::
 
