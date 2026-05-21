@@ -1,15 +1,19 @@
-# Phi
+---
+title: "Phi"
+description: ""
+---
+[Microsoft's Phi](https://azure.microsoft.com/en-us/products/phi) are compact, high-capability language models designed to punch above their weight class. Phi-1.5 and Phi-2 use a standard transformer decoder architecture (`PhiForCausalLM`). For Phi-3 and Phi-4 see [Phi-3 / Phi-4](/model-coverage/large-language-models/phi-3-phi-4).
 
-[Microsoft's Phi](https://azure.microsoft.com/en-us/products/phi) are compact, high-capability language models designed to punch above their weight class. Phi-1.5 and Phi-2 use a standard transformer decoder architecture (`PhiForCausalLM`). For Phi-3 and Phi-4 see [Phi-3 / Phi-4](phi3.md).
+<Info>
 
-:::{card}
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `PhiForCausalLM` |
 | **Parameters** | 1.3B – 2.7B |
 | **HF Org** | [microsoft](https://huggingface.co/microsoft) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -31,13 +35,12 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`phi_2_squad.yaml <../../../../examples/llm_finetune/phi/phi_2_squad.yaml>` | SFT — Phi-2 on SQuAD |
-| {download}`phi_2_squad_peft.yaml <../../../../examples/llm_finetune/phi/phi_2_squad_peft.yaml>` | LoRA — Phi-2 on SQuAD |
-
+| [phi_2_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_2_squad.yaml) | SFT — Phi-2 on SQuAD |
+| [phi_2_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_2_squad_peft.yaml) | LoRA — Phi-2 on SQuAD |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -56,7 +59,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_2_squad.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -77,13 +80,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_2_squad.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

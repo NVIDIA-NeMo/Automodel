@@ -1,15 +1,19 @@
-# Phi-3 / Phi-4
-
+---
+title: "Phi-3 / Phi-4"
+description: ""
+---
 [Phi-3](https://azure.microsoft.com/en-us/products/phi) and [Phi-4](https://azure.microsoft.com/en-us/products/phi) are Microsoft's high-capability small language models using a shared transformer decoder architecture (`Phi3ForCausalLM`). Phi-4-mini and Phi-4 achieve strong benchmark results at relatively small parameter counts.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `Phi3ForCausalLM` |
 | **Parameters** | 3.8B – 14B |
 | **HF Org** | [microsoft](https://huggingface.co/microsoft) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -38,15 +42,14 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`phi_4_squad.yaml <../../../../examples/llm_finetune/phi/phi_4_squad.yaml>` | SFT — Phi-4 on SQuAD |
-| {download}`phi_4_squad_peft.yaml <../../../../examples/llm_finetune/phi/phi_4_squad_peft.yaml>` | LoRA — Phi-4 on SQuAD |
-| {download}`phi_3_mini_it_squad.yaml <../../../../examples/llm_finetune/phi/phi_3_mini_it_squad.yaml>` | SFT — Phi-3-mini Instruct on SQuAD |
-| {download}`phi_3_mini_it_squad_peft.yaml <../../../../examples/llm_finetune/phi/phi_3_mini_it_squad_peft.yaml>` | LoRA — Phi-3-mini Instruct on SQuAD |
-
+| [phi_4_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_squad.yaml) | SFT — Phi-4 on SQuAD |
+| [phi_4_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_4_squad_peft.yaml) | LoRA — Phi-4 on SQuAD |
+| [phi_3_mini_it_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_3_mini_it_squad.yaml) | SFT — Phi-3-mini Instruct on SQuAD |
+| [phi_3_mini_it_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/phi/phi_3_mini_it_squad_peft.yaml) | LoRA — Phi-3-mini Instruct on SQuAD |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -65,7 +68,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_4_squad.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -86,13 +89,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/phi/phi_4_squad.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

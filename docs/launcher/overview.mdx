@@ -1,15 +1,18 @@
-# Job Launchers
-
+---
+title: "Job Launchers"
+description: ""
+position: 1
+---
 NeMo AutoModel provides several ways to launch training. The right choice depends on your hardware and environment.
 
 ## Which Launcher Should I Use?
 
 | Launcher | Best for | GPUs | Guide |
 |---|---|---|---|
-| **Local Workstation** | Getting started, debugging, single-node training | 1-8 on one machine | [Local Workstation](./local-workstation.md) |
-| **NeMo-Run** | Managed execution on Slurm, Kubernetes, Docker, local | 1+ | [NeMo-Run](./nemo-run.md) |
-| **SkyPilot** | Cloud training or Kubernetes clusters | Any | [SkyPilot](./skypilot.md) |
-| **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Slurm](./slurm.md) |
+| **Local Workstation** | Getting started, debugging, single-node training | 1-8 on one machine | [Run on Your Local Workstation](/job-launchers/local-workstation) |
+| **NeMo-Run** | Managed execution on Slurm, Kubernetes, Docker, local | 1+ | [NeMo-Run](/job-launchers/nemo-run) |
+| **SkyPilot** | Cloud training or Kubernetes clusters | Any | [SkyPilot](/job-launchers/skypilot) |
+| **Slurm** | Multi-node batch jobs on HPC clusters | 8+ across nodes | [Run on a Cluster](/job-launchers/slurm-cluster) |
 
 ### I Have 1–2 GPUs on My Workstation
 
@@ -19,7 +22,7 @@ Use the **interactive** launcher. No scheduler or cluster software is needed:
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
 ```
 
-See the [Local Workstation](./local-workstation.md) guide.
+See the [Run on Your Local Workstation](/job-launchers/local-workstation) guide.
 
 ### I Have Access to a Slurm Cluster
 
@@ -29,7 +32,7 @@ Add a `slurm:` section to your YAML config and submit with the same `automodel` 
 automodel config_with_slurm.yaml
 ```
 
-See the [Slurm](./slurm.md) guide.
+See the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
 ### I Want Managed Job Submission (Slurm, Kubernetes, Docker)
 
@@ -39,7 +42,7 @@ Add a `nemo_run:` section to your YAML config. NeMo-Run loads a pre-configured e
 automodel config_with_nemo_run.yaml
 ```
 
-See the [NeMo-Run](./nemo-run.md) guide.
+See the [NeMo-Run](/job-launchers/nemo-run) guide.
 
 ### I Want to Train on the Cloud
 
@@ -49,7 +52,7 @@ Add a `skypilot:` section to your YAML config. SkyPilot provisions VMs on any ma
 automodel config_with_skypilot.yaml
 ```
 
-See the [SkyPilot](./skypilot.md) guide.
+See the [SkyPilot](/job-launchers/skypilot) guide.
 
 ### I Want to Train on Kubernetes with SkyPilot
 
@@ -59,7 +62,7 @@ Use the same `skypilot:` launcher, but set `cloud: kubernetes`. This is a good f
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml
 ```
 
-See the [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md).
+See the [SkyPilot + Kubernetes tutorial](/job-launchers/skypilot-k8s).
 
 ## All Launchers Use the Same Config
 

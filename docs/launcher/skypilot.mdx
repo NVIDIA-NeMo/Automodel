@@ -1,6 +1,9 @@
-# Run with SkyPilot
-
-In this guide, you will learn how to launch NeMo AutoModel training jobs with [SkyPilot](https://docs.skypilot.co/en/stable/docs/). SkyPilot can target public clouds such as AWS, GCP, Azure, and Lambda, and it can also submit jobs to Kubernetes clusters. For a beginner-friendly Kubernetes walkthrough, see [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md). For on-premises cluster usage without SkyPilot, see [Run on a Cluster (Slurm)](./slurm.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
+---
+title: "Run on Any Cloud with SkyPilot"
+description: ""
+position: 5
+---
+In this guide, you will learn how to launch NeMo AutoModel training jobs with [SkyPilot](https://docs.skypilot.co/en/stable/docs/). SkyPilot can target public clouds such as AWS, GCP, Azure, and Lambda, and it can also submit jobs to Kubernetes clusters. For a beginner-friendly Kubernetes walkthrough, see [SkyPilot + Kubernetes tutorial](/job-launchers/skypilot-k8s). For on-premises cluster usage without SkyPilot, see [Run on a Cluster (Slurm)](/job-launchers/slurm-cluster). For single-node workstation usage, see [Run on Your Local Workstation](/job-launchers/local-workstation).
 
 SkyPilot is an open-source framework that abstracts cloud infrastructure so you can train on whichever cloud is cheapest or most available at launch time — including automatic spot-instance handling for significant cost savings.
 
@@ -45,7 +48,7 @@ The CLI detects the `skypilot:` key, strips it from the training config, uploads
 
 ## Configuration Reference
 
-Below is an annotated example for fine-tuning Llama-3.2-1B on SQuAD on a GCP spot T4. A ready-to-run copy lives at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml`](../../examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml).
+Below is an annotated example for fine-tuning Llama-3.2-1B on SQuAD on a GCP spot T4. A ready-to-run copy lives at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml).
 
 ```yaml
 # ── SkyPilot launcher section ─────────────────────────────────────────────
@@ -178,7 +181,7 @@ automodel config_with_skypilot.yaml \
 
 ## Kubernetes Users
 
-If you want to run on a Kubernetes cluster, use `cloud: kubernetes` and follow the dedicated [SkyPilot + Kubernetes tutorial](./skypilot-kubernetes.md). That guide includes:
+If you want to run on a Kubernetes cluster, use `cloud: kubernetes` and follow the dedicated [SkyPilot + Kubernetes tutorial](/job-launchers/skypilot-k8s). That guide includes:
 
 - a copy-paste single-node config
 - a two-node example

@@ -1,15 +1,19 @@
-# GPT-OSS
-
+---
+title: "GPT-OSS"
+description: ""
+---
 [GPT-OSS](https://huggingface.co/openai/gpt-oss-20b) is OpenAI's open-weight model family featuring QuickGELU activations and activation clamping for training stability.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `GptOssForCausalLM` |
 | **Parameters** | 20B – 120B |
 | **HF Org** | [openai](https://huggingface.co/openai) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -31,13 +35,12 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`gpt_oss_20b.yaml <../../../../examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml>` | SFT — GPT-OSS 20B |
-| {download}`gpt_oss_120b.yaml <../../../../examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml>` | SFT — GPT-OSS 120B |
-
+| [gpt_oss_20b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml) | SFT — GPT-OSS 20B |
+| [gpt_oss_120b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gpt_oss/gpt_oss_120b.yaml) | SFT — GPT-OSS 120B |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -56,7 +59,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -77,13 +80,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/gpt_oss/gpt_oss_20b.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

@@ -1,17 +1,21 @@
-# DeepSeek-V3
-
+---
+title: "DeepSeek-V3"
+description: ""
+---
 [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) is a large-scale Mixture-of-Experts model with 671B total parameters and 37B activated per token. It features Multi-head Latent Attention (MLA), innovative load balancing, and Multi-Token Prediction (MTP). DeepSeek-V3.2 is an updated release with further improvements.
 
 [Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) by Moonshot AI also uses this architecture with 16B total / 3B activated parameters.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `DeepseekV3ForCausalLM` / `DeepseekV32ForCausalLM` |
 | **Parameters** | 671B total / 37B active |
 | **HF Org** | [deepseek-ai](https://huggingface.co/deepseek-ai) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -37,14 +41,13 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`deepseek_v32_hellaswag_pp.yaml <../../../../examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml>` | SFT — DeepSeek-V3.2 on HellaSwag with pipeline parallelism |
-| {download}`moonlight_16b_te.yaml <../../../../examples/llm_finetune/moonlight/moonlight_16b_te.yaml>` | SFT — Moonlight 16B with Transformer Engine |
-| {download}`moonlight_16b_te_packed_sequence.yaml <../../../../examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml>` | SFT — Moonlight 16B with packed sequences |
-
+| [deepseek_v32_hellaswag_pp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml) | SFT — DeepSeek-V3.2 on HellaSwag with pipeline parallelism |
+| [moonlight_16b_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | SFT — Moonlight 16B with Transformer Engine |
+| [moonlight_16b_te_packed_sequence.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | SFT — Moonlight 16B with packed sequences |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -57,9 +60,10 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 ```
 
-:::{note}
-This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launcher Guide](../../../launcher/slurm.md) for multi-node setup.
-:::
+<Note>
+This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launcher Guide](/job-launchers/slurm-cluster) for multi-node setup.
+
+</Note>
 
 **3. Run the recipe** from inside the repo:
 
@@ -67,7 +71,7 @@ This recipe was validated on **32 nodes × 8 GPUs (256 H100s)**. See the [Launch
 automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -88,13 +92,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
 
 ## Hugging Face Model Cards
 

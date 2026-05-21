@@ -1,15 +1,19 @@
-# Qwen3
-
+---
+title: "Qwen3"
+description: ""
+---
 [Qwen3](https://qwenlm.github.io/blog/qwen3/) is Alibaba Cloud's third-generation dense language model series, featuring improved reasoning, instruction following, and multilingual capabilities over Qwen2.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `Qwen3ForCausalLM` |
 | **Parameters** | 0.6B – 32B |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -31,13 +35,12 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen3_0p6b_hellaswag.yaml <../../../../examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml>` | SFT — Qwen3 0.6B on HellaSwag |
-| {download}`qwen3_8b_squad_spark.yaml <../../../../examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml>` | SFT — Qwen3 8B on SQuAD (Spark) |
-
+| [qwen3_0p6b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml) | SFT — Qwen3 0.6B on HellaSwag |
+| [qwen3_8b_squad_spark.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_8b_squad_spark.yaml) | SFT — Qwen3 8B on SQuAD (Spark) |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -56,7 +59,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -77,13 +80,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) for full SFT and LoRA instructions.
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) for full SFT and LoRA instructions.
 
 ## Hugging Face Model Cards
 

@@ -1,15 +1,19 @@
-# Nemotron-H
-
+---
+title: "Nemotron-H"
+description: ""
+---
 [NVIDIA Nemotron-H](https://developer.nvidia.com/blog/nemotron-h-reasoning-enabling-throughput-gains-with-no-compromises/) is a hybrid Mamba-2 / transformer architecture that interleaves selective state space layers with standard attention layers for improved efficiency on long sequences.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `NemotronHForCausalLM` |
 | **Parameters** | 9B – 30B |
 | **HF Org** | [nvidia](https://huggingface.co/nvidia) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -33,15 +37,14 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`nemotron_nano_9b_squad.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml>` | SFT — Nemotron-Nano 9B on SQuAD |
-| {download}`nemotron_nano_9b_squad_peft.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_9b_squad_peft.yaml>` | LoRA — Nemotron-Nano 9B on SQuAD |
-| {download}`nemotron_nano_v3_hellaswag.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml>` | SFT — Nemotron-3-Nano 30B on HellaSwag |
-| {download}`nemotron_nano_v3_hellaswag_peft.yaml <../../../../examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml>` | LoRA — Nemotron-3-Nano 30B on HellaSwag |
-
+| [nemotron_nano_9b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml) | SFT — Nemotron-Nano 9B on SQuAD |
+| [nemotron_nano_9b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_9b_squad_peft.yaml) | LoRA — Nemotron-Nano 9B on SQuAD |
+| [nemotron_nano_v3_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag.yaml) | SFT — Nemotron-3-Nano 30B on HellaSwag |
+| [nemotron_nano_v3_hellaswag_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_v3_hellaswag_peft.yaml) | LoRA — Nemotron-3-Nano 30B on HellaSwag |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -60,7 +63,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -81,13 +84,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/nemotron/nemotron_nano_9b_squad.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

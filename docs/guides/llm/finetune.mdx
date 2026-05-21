@@ -1,5 +1,8 @@
-# Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT)
-
+---
+title: "Supervised Fine-Tuning (SFT) and Parameter-Efficient Fine-Tuning (PEFT) with NeMo AutoModel"
+description: ""
+position: 2
+---
 ## Introduction
 
 Pretrained language models are general-purpose: they know a lot about language but nothing about your particular domain, terminology, or task. Fine-tuning bridges that gap — you fine-tune the model on your own examples so it produces answers that are accurate and relevant for your use case, without the cost of training a model from scratch. The result is a model optimized for your data that you can evaluate, publish, and deploy. This guide walks you through that process end-to-end with NeMo AutoModel — from installation through training, evaluation, and deployment — using [Meta LLaMA 3.2 1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the [SQuAD v1.1](https://huggingface.co/datasets/rajpurkar/squad) dataset as a running example.
@@ -44,21 +47,20 @@ docker pull nvcr.io/nvidia/nemo-automodel:26.02.00
 docker run --gpus all -it --rm --shm-size=8g -v $(pwd)/checkpoints:/tmp/checkpoints/ nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-:::{important}
-Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
-:::
+<Info>
+Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Saving Checkpoints When Using Docker](/development/checkpointing#saving-checkpoints-when-using-docker).
 
-For the full set of installation methods, see the [installation guide](../installation.md).
+</Info>
+
+For the full set of installation methods, see the [installation guide](/get-started/installation).
 
 ## Configure Your Training Recipe
-
 
 Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) config file with three required sections — **model**, **dataset**, and **step_scheduler** — plus an optional **peft** section. The sections below walk through each one. For the complete copy-pastable file, see [Full Config YAML](#full-config-yaml).
 
 Under the hood, both SFT and PEFT are executed by a **recipe**: a self-contained Python class that wires together model loading, dataset preparation, training, checkpointing, and logging. The fine-tuning recipe is [`TrainFinetuneRecipeForNextTokenPrediction`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). The config file tells the recipe *what* to build; the recipe decides *how* to build it.
 
-:::{dropdown} How the Config System Works
-
+<Accordion title="How the Config System Works">
 NeMo AutoModel configs use a convention borrowed from [Hydra](https://hydra.cc/): the special **`_target_`** key tells the framework *which* Python class or function to call, and **every other key** in the same YAML block is passed as a keyword argument to that call. For example:
 
 ```yaml
@@ -78,9 +80,10 @@ optimizer = Adam(lr=1.0e-5, weight_decay=0)
 
 The `_target_` value is a **dotted Python import path**: the same string you would use in an `import` statement. The framework resolves it at runtime by importing the module and looking up the attribute. This means you can point `_target_` at any class constructor or factory function, and the remaining keys become its arguments.
 
-:::{tip}
+<Tip>
 To discover which parameters a section accepts, look up the Python signature of its `_target_`. For instance, `torch.optim.Adam` accepts `lr`, `betas`, `eps`, and `weight_decay` — those are the keys you can set in the YAML.
-:::
+
+</Tip>
 
 **From YAML to running code.** Here is the path a config takes through the framework:
 
@@ -133,7 +136,7 @@ recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPredi
 The short name form is a convenience — the CLI scans all recipe modules under `nemo_automodel.recipes` and matches the bare class name. If you invoke the recipe script directly with `torchrun` instead of the `automodel` CLI, the `recipe` key is not required because the script itself *is* the recipe.
 
 **Not every section uses `_target_`.** Some sections like `step_scheduler`, `distributed`, and `checkpoint` are plain key-value groups consumed directly by the recipe — they control training schedule, parallelism strategy, and checkpoint behavior without instantiating a Python object.
-:::
+</Accordion>
 
 ### Model
 
@@ -148,20 +151,20 @@ model:
 | `_target_` | Points to [`NeMoAutoModelForCausalLM.from_pretrained`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/auto_model.py) — a factory method that downloads (or loads from cache) a pretrained Hugging Face model and wraps it with NeMo distributed-training support. |
 | `pretrained_model_name_or_path` | A keyword argument to `from_pretrained`. Any argument that [`from_pretrained`](https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained) accepts can be added here (e.g. `cache_dir`, `torch_dtype`). |
 
-This guide uses **Meta Llama 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](../../model-coverage/llm/index.md).
+This guide uses **Meta Llama 3.2 1B** as a running example. Replace `pretrained_model_name_or_path` with any supported [Hugging Face model ID](/model-coverage/large-language-models/overview).
 
-:::{dropdown} About Llama 3.2 1B
+<Accordion title="About Llama 3.2 1B">
 Llama is a family of decoder-only transformer models developed by Meta. The 1B variant is a compact model suitable for research and edge deployment, featuring RoPE positional embeddings, grouped-query attention (GQA), and SwiGLU activations.
-:::
+</Accordion>
 
-:::{dropdown} Accessing gated models
+<Accordion title="Accessing gated models">
 Some Hugging Face models are **gated**. If the model page shows a "Request access" button:
 
 1. Log in with your Hugging Face account and accept the license.
 2. Ensure the token you use (from `huggingface-cli login` or `HF_TOKEN`) belongs to the approved account.
 
 Pulling a gated model without an authorized token triggers a 403 error.
-:::
+</Accordion>
 
 ### Dataset
 
@@ -179,12 +182,12 @@ validation_dataset:
 
 | Key | Role |
 |-----|------|
-| `_target_` | Points to [`make_squad_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) — a factory function that downloads the SQuAD dataset, tokenizes it, and returns a `torch.utils.data.Dataset`. To use a different dataset, change `_target_` to a different factory function (see [Integrate Your Own Text Dataset](dataset.md)). |
+| `_target_` | Points to [`make_squad_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) — a factory function that downloads the SQuAD dataset, tokenizes it, and returns a `torch.utils.data.Dataset`. To use a different dataset, change `_target_` to a different factory function (see [Integrate Your Own Text Dataset](/datasets/text-dataset)). |
 | `dataset_name`, `split` | Keyword arguments passed to `make_squad_dataset`. Each dataset factory defines its own parameters — check the function signature to see what's available. |
 
-This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments — see [Integrate Your Own Text Dataset](dataset.md) and [Dataset Overview](../dataset-overview.md).
+This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments — see [Integrate Your Own Text Dataset](/datasets/text-dataset) and [Dataset Overview: LLM, VLM, and Retrieval Datasets](/datasets/overview).
 
-:::{dropdown} About SQuAD v1.1
+<Accordion title="About SQuAD v1.1">
 The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and a span answer. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
 
 Example:
@@ -195,7 +198,7 @@ Example:
     "answers": { "text": ["Saint Bernadette Soubirous"], "answer_start": [515] }
 }
 ```
-:::
+</Accordion>
 
 ### PEFT (Optional)
 
@@ -256,7 +259,7 @@ All other settings (distributed strategy, optimizer, checkpointing, logging) use
 
 ### Full Config YAML
 
-:::{dropdown} finetune_config.yaml (click to expand)
+<Accordion title="finetune_config.yaml (click to expand)">
 Save as `finetune_config.yaml`. This config runs PEFT (LoRA). To run SFT instead, remove the `peft:` section. For production-ready examples, see the hosted configs: [Llama 3.2 1B SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) and [Llama 3.2 1B PEFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad_peft.yaml).
 
 ```yaml
@@ -283,7 +286,7 @@ validation_dataset:
 step_scheduler:
   num_epochs: 1
 ```
-:::
+</Accordion>
 
 ## Fine-Tune the Model
 
@@ -328,7 +331,7 @@ Each log line reports the current loss, gradient norm, peak GPU memory, and toke
 
 Checkpoints are saved in native Hugging Face format, so no conversion is required — they work directly with Transformers, PEFT, vLLM, lm-eval-harness, and other tools in the Hugging Face ecosystem. SFT and PEFT produce different checkpoint layouts. **SFT checkpoints** contain the full model weights at `model/consolidated/` — a single, self-contained Hugging Face model directory created by gathering distributed shards into one location — and can be loaded directly. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs) — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
 
-:::{dropdown} Checkpoint directory structure
+<Accordion title="Checkpoint directory structure">
 **SFT checkpoint:**
 ```bash
 $ tree checkpoints/epoch_0_step_10/
@@ -373,7 +376,7 @@ checkpoints/epoch_0_step_10/
 
 2 directories, 8 files
 ```
-:::
+</Accordion>
 
 ## Run Inference
 
@@ -471,13 +474,15 @@ lm_eval --model hf \
   --batch_size auto
 ```
 
-:::{tip}
+<Tip>
 The SFT example uses the `vllm` backend for faster evaluation (requires `pip install vllm`; see [Deploy with vLLM](#deploy-with-vllm) for setup details). The PEFT example uses the `hf` backend with lm-eval's built-in PEFT support to load the adapter on top of the base model.
-:::
 
-:::{tip}
+</Tip>
+
+<Tip>
 Run lm-eval-harness on the base model *before* fine-tuning to establish a baseline, then compare against the fine-tuned checkpoint.
-:::
+
+</Tip>
 
 ## Publish to the Hugging Face Hub
 
@@ -543,9 +548,10 @@ model = PeftModel.from_pretrained(model, "your-username/llama3.2_1b-lora-squad")
 
 [vLLM](https://github.com/vllm-project/vllm) is an efficient inference engine for production deployment of LLMs.
 
-:::{note}
+<Note>
 Make sure vLLM is installed (`pip install vllm`, or use an environment that includes it).
-:::
+
+</Note>
 
 ### SFT Checkpoint with vLLM
 
@@ -565,12 +571,13 @@ print(f"Generated text: {outputs[0].outputs[0].text}")
 
 PEFT adapter serving uses the `vLLMHFExporter` class, which is provided by the `nemo` package — a separate dependency from `nemo-automodel`.
 
-:::{important}
+<Info>
 Install both packages before proceeding:
 ```bash
 pip install nemo vllm
 ```
-:::
+
+</Info>
 
 ```python
 from nemo.export.vllm_hf_exporter import vLLMHFExporter
@@ -609,8 +616,7 @@ All other config sections remain the same for both modes.
 
 ### Full Configuration
 
-:::{dropdown} Full Config
-:open:
+<Accordion title="Full Config">
 ```yaml
 # Recipe
 # Selects which recipe class runs the training loop.
@@ -769,7 +775,7 @@ optimizer:
 #   name: <your_wandb_exp_name>      # display name for this run
 #   save_dir: <your_wandb_save_dir>  # local directory for W&B artifacts
 ```
-:::
+</Accordion>
 
 ### Config Field Reference
 
@@ -868,9 +874,10 @@ distributed:
 | `pp_microbatch_size` | Number of samples per micro-batch fed into the pipeline. Must satisfy: `local_batch_size ÷ pp_microbatch_size ≥ pp_size`. |
 | `layers_per_stage` | How many transformer layers each pipeline stage contains. If omitted, the framework splits layers evenly across `pp_size` stages. |
 
-:::{note}
+<Note>
 PP requires the model to define a `_pp_plan` that tells the framework how to split layers into stages. All built-in models include this plan; custom models must add one.
-:::
+
+</Note>
 
 #### Context Parallelism
 
@@ -884,9 +891,10 @@ distributed:
   cp_size: 2
 ```
 
-:::{important}
+<Info>
 When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences — the framework will raise an error with instructions if this applies.
-:::
+
+</Info>
 
 #### Expert Parallelism (MoE models)
 
@@ -928,7 +936,7 @@ When choosing a combination, keep these rules in mind:
 
 ## Next Steps
 
-- [Integrate Your Own Text Dataset](dataset.md) — swap the SQuAD example for your own data.
-- [Recipes and End-to-End Examples](../overview.md) — browse the full set of recipes available in NeMo AutoModel. See also the [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune) directory for ready-to-run configs.
-- [Dataset Overview](../dataset-overview.md) — see all supported dataset types across LLM, VLM, and retrieval tasks.
-- [Knowledge Distillation](knowledge-distillation.md) — distill a fine-tuned model into a smaller one.
+- [Integrate Your Own Text Dataset](/datasets/text-dataset) — swap the SQuAD example for your own data.
+- [Recipes and End-to-End Examples](/recipes-e2e-examples/overview) — browse the full set of recipes available in NeMo AutoModel. See also the [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune) directory for ready-to-run configs.
+- [Dataset Overview: LLM, VLM, and Retrieval Datasets](/datasets/overview) — see all supported dataset types across LLM, VLM, and retrieval tasks.
+- [Knowledge Distillation](/recipes-e2e-examples/knowledge-distillation) — distill a fine-tuned model into a smaller one.

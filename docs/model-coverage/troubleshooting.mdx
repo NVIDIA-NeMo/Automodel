@@ -1,7 +1,7 @@
-:orphan:
-
-# Troubleshooting Unsupported Models
-
+---
+title: "Troubleshooting Unsupported Models"
+description: ""
+---
 Sometimes a model listed on the Hugging Face Hub may not work with NeMo AutoModel.
 If you encounter any such model, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with the model ID and any stack trace you see.
 
@@ -18,6 +18,6 @@ These cases typically stem from upstream packaging or dependency constraints. Yo
 
 ## Steps to Try
 
-1. **Upgrade NeMo AutoModel** to a release that supports the required `transformers` version. See [Installation](../guides/installation.md).
-2. **Enable remote code** — if the model uses custom code, set `trust_remote_code: true` in your `model:` config. See [Hugging Face API Compatibility](../guides/huggingface-api-compatibility.md).
+1. **Upgrade NeMo AutoModel** to a release that supports the required `transformers` version. See [Install NeMo AutoModel](/get-started/installation).
+2. **Enable remote code** — if the model uses custom code, set `trust_remote_code: true` in your `model:` config. See [Hugging Face API Compatibility](/get-started/hf-compatibility).
 3. **Open a GitHub issue** with the model ID and error so we can prioritize support or add a registry-backed implementation.

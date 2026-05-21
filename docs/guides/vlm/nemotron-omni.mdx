@@ -1,5 +1,8 @@
-# Fine-Tuning NemotronOmni on CORD-v2 Receipts — End-to-End Guide
-
+---
+title: "Nemotron-Omni"
+description: ""
+position: 14
+---
 **A step-by-step guide for fine-tuning NemotronOmni (33B MoE) to extract structured
 receipt data from scanned images using [NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel).
 Covers both full SFT and LoRA PEFT.**
@@ -63,9 +66,10 @@ git clone -b nemotron-omni ssh://git@gitlab-master.nvidia.com:12051/huiyingl/aut
 cd automodel-omni
 ```
 
-:::{note}
+<Note>
 NemotronOmni requires `mamba_ssm`, `causal_conv1d`, and `decord` packages, which are included in the NeMo AutoModel container.
-:::
+
+</Note>
 
 ---
 

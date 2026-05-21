@@ -1,8 +1,11 @@
-# ERNIE 4.5
-
+---
+title: "ERNIE 4.5"
+description: ""
+---
 [ERNIE 4.5](https://huggingface.co/baidu) is Baidu's dense and Mixture-of-Experts language model family with long-context text checkpoints on Hugging Face.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
@@ -10,7 +13,8 @@
 | **Parameters** | 0.36B dense; 21B total / 3B active MoE |
 | **Context Length** | 131,072 tokens |
 | **HF Org** | [baidu](https://huggingface.co/baidu) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -33,12 +37,12 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`ernie4_5_0p3b_hellaswag.yaml <../../../../examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml>` | SFT -- ERNIE 4.5 0.3B on HellaSwag with the Hugging Face implementation |
-| {download}`ernie4_5_21b_a3b_hellaswag.yaml <../../../../examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml>` | SFT -- ERNIE 4.5 21B A3B on HellaSwag with TE attention and DeepEP |
+| [ernie4_5_0p3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml) | SFT — ERNIE 4.5 0.3B on HellaSwag with the Hugging Face implementation |
+| [ernie4_5_21b_a3b_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml) | SFT — ERNIE 4.5 21B A3B on HellaSwag with TE attention and DeepEP |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -63,7 +67,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellas
 automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -84,9 +88,9 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
 ```
-:::
+</Accordion>
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
 
 ## Hugging Face Model Cards
 

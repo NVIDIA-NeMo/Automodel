@@ -1,19 +1,24 @@
-# Nemotron-Flash
-
+---
+title: "Nemotron-Flash"
+description: ""
+---
 [NVIDIA Nemotron-Flash](https://huggingface.co/nvidia/Nemotron-Flash-1B) is a compact, fast language model designed for low-latency inference workloads.
 
-:::{note}
+<Note>
 This model requires `trust_remote_code: true` in your recipe YAML.
-:::
 
-:::{card}
+</Note>
+
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `NemotronFlashForCausalLM` |
 | **Parameters** | 1B |
 | **HF Org** | [nvidia](https://huggingface.co/nvidia) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -33,13 +38,12 @@ This model requires `trust_remote_code: true` in your recipe YAML.
 
 | Recipe | Description |
 |---|---|
-| {download}`nemotron_flash_1b_squad.yaml <../../../../examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml>` | SFT — Nemotron-Flash 1B on SQuAD |
-| {download}`nemotron_flash_1b_squad_peft.yaml <../../../../examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml>` | LoRA — Nemotron-Flash 1B on SQuAD |
-
+| [nemotron_flash_1b_squad.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml) | SFT — Nemotron-Flash 1B on SQuAD |
+| [nemotron_flash_1b_squad_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml) | LoRA — Nemotron-Flash 1B on SQuAD |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -58,7 +62,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -79,13 +83,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

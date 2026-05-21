@@ -1,5 +1,8 @@
-# Use the ColumnMappedTextInstructionDataset
-
+---
+title: "Use the ColumnMappedTextInstructionDataset"
+description: ""
+position: 4
+---
 This guide explains how to use `ColumnMappedTextInstructionDataset` to quickly and flexibly load instruction-answer datasets for LLM fine-tuning, with minimal code changes and support for common tokenization strategies.
 
 The `ColumnMappedTextInstructionDataset` is a lightweight, plug-and-play helper that lets you train on instruction-answer style corpora without writing custom Python for every new schema. You simply specify which columns map to logical fields like `context`, `question`, and `answer`, and the loader handles the rest automatically. This enables:
@@ -15,7 +18,7 @@ It supports two data sources out-of-the-box:
 1. **Local JSON/JSONL files** - pass a single file path or a list of paths on disk. Newline-delimited JSON works great.
 2. **Hugging Face Hub** - point to any dataset repo (`org/dataset`) that contains the required columns.
 
-For **streaming** (including **Delta Lake / Databricks**), use [`ColumnMappedTextInstructionIterableDataset`](column-mapped-text-instruction-iterable-dataset.md). The iterable variant always streams by design to avoid accidentally materializing entire datasets to disk/memory.
+For **streaming** (including **Delta Lake / Databricks**), use [`ColumnMappedTextInstructionIterableDataset`](/datasets/columnmapped-iterable). The iterable variant always streams by design to avoid accidentally materializing entire datasets to disk/memory.
 
 ---
 ## Quickstart
@@ -92,7 +95,6 @@ dataset:
   answer_only_loss_mask: false
 ```
 
-
 ### Remote Dataset Example
 
 In the following section, we demonstrate how to load the instruction-tuning corpus
@@ -157,13 +159,15 @@ dataset:
 
 ### Streaming / Delta Lake / Databricks
 
-:::{note}
-`ColumnMappedTextInstructionDataset` does not support streaming or Delta Lake / Databricks sources. For those, use [`ColumnMappedTextInstructionIterableDataset`](column-mapped-text-instruction-iterable-dataset.md).
-:::
+<Note>
+`ColumnMappedTextInstructionDataset` does not support streaming or Delta Lake / Databricks sources. For those, use [`ColumnMappedTextInstructionIterableDataset`](/datasets/columnmapped-iterable).
 
-:::{note}
-Delta Lake / Databricks (including `delta_sql_query` and authentication) is supported only by `ColumnMappedTextInstructionIterableDataset`. See [`column-mapped-text-instruction-iterable-dataset.md`](column-mapped-text-instruction-iterable-dataset.md) for details.
-:::
+</Note>
+
+<Note>
+Delta Lake / Databricks (including `delta_sql_query` and authentication) is supported only by `ColumnMappedTextInstructionIterableDataset`. See [`column-mapped-text-instruction-iterable-dataset.md`](/datasets/columnmapped-iterable) for details.
+
+</Note>
 
 ### Advanced Options
 | Arg                     | Default | Description |
@@ -225,14 +229,15 @@ sbatch my_cluster.sub
 ```
 
 All cluster-specific settings (nodes, GPUs, partition, container, mounts, secrets)
-live in your sbatch script. See the [cluster guide](../../launcher/slurm.md) for
+live in your sbatch script. See the [cluster guide](/job-launchers/slurm-cluster) for
 full examples (Pyxis, bare-metal, Apptainer).
 
 ### Multi-Node Slurm Configuration
 
-:::{note}
+<Note>
 **Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set `HF_DATASETS_CACHE` to a shared directory in your sbatch script (e.g., `export HF_DATASETS_CACHE=/shared/hf_cache`) to ensure all nodes can access the cached datasets.
-:::
+
+</Note>
 
 When using multiple nodes with Hugging Face datasets:
 
@@ -241,7 +246,6 @@ When using multiple nodes with Hugging Face datasets:
 3. **Mounts**: Add shared directories as container mounts in your sbatch script
 
 Configure all of this in your sbatch script (`my_cluster.sub`), not in the YAML.
-
 
 ---
 ### That's It!

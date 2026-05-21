@@ -1,5 +1,8 @@
-# FP8 Training
-
+---
+title: "FP8 Training in NeMo AutoModel"
+description: ""
+position: 4
+---
 NeMo AutoModel supports FP8 quantization using [TorchAO](https://github.com/pytorch/ao) and `torch.compile` to accelerate training on compatible hardware.
 
 FP8 (8-bit floating point) quantization can provide substantial speedups for models where the majority of GEMMs are sufficiently large. The speedup from using FP8 tensor cores must outweigh the overhead of dynamic quantization.
@@ -65,12 +68,10 @@ fp8:
 - Good performance, moderate accuracy
 - Recommended for most use cases
 
-
 #### Rowwise Scaling
 - Scale per row for better accuracy
 - Slower than tensorwise
 - Better numerical stability
-
 
 For more on scaling strategies, refer to the [TorchAO FP8 documentation](https://github.com/pytorch/ao/tree/main/torchao/float8).
 
@@ -93,12 +94,7 @@ FP8 quantization provides measurable performance improvements while maintaining 
 - **Convergence**: FP8 training achieves loss parity with BF16 training.
 - **Memory**: FP8 training achieves on par memory usage with BF16 baseline.
 
-```{image} fp8_convergence.jpg
-:alt: FP8 Convergence Comparison
-:class: bg-primary
-:width: 600px
-:align: center
-```
+![FP8 Convergence Comparison](./fp8_convergence.jpg)
 
 *Figure: Loss curves comparing FP8 tensorwise scaling + torch.compile vs. BF16 + torch.compile training on 8xH100 with 8k sequence length, demonstrating virtually identical convergence behavior with 1.24x speedup*
 
@@ -123,7 +119,6 @@ For example, to train Llama 3.1 8B with FP8:
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
 ```
 
-
 ## Performance Considerations
 
 FP8 requires specific conditions to be effective:
@@ -140,10 +135,8 @@ FP8 works best when the majority of GEMM operations are sufficiently large such 
 - You have modern (H100+) hardware optimized for FP8 acceleration
 - Moderate numerical precision is acceptable and slight approximations won't affect outcomes
 
-
-
 ## References
 
 - [TorchAO FP8 Documentation](https://github.com/pytorch/ao/tree/main/torchao/float8)
 - [FP8 Performance Benchmarks](https://github.com/pytorch/ao/tree/main/torchao/float8#performance)
-- [NVIDIA FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html) 
+- [NVIDIA FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html)

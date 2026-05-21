@@ -1,10 +1,13 @@
-# LLM Pre-Training
-
+---
+title: "LLM Pre-Training with NeMo AutoModel"
+description: ""
+position: 9
+---
 This guide covers **FineWeb** data preparation, **defining** a [NanoGPT‑style](https://github.com/KellerJordan/modded-nanogpt) model, and **launching and monitoring** a NeMo AutoModel pre‑training run.
 
 ## Set Up Your Environment
 
-In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](../installation.md)).
+In this guide, we will use an interactive environment to install NeMo AutoModel from Git. You can also install NeMo AutoModel from PyPI or use our bi-monthly Docker container (see the [Installation Guide](/get-started/installation)).
 
 ```bash
 # clone / install AutoModel (editable for local hacks)
@@ -14,39 +17,42 @@ cd Automodel/
 pip install -e ".[all]"    # installs NeMo AutoModel + optional extras
 ```
 
-:::{note}
+<Note>
 For this guide, we will use a single machine equipped with 8xH100 NVIDIA GPUs.
-:::
 
-:::{tip}
-To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model using `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](../../launcher/local-workstation.md).
-:::
+</Note>
+
+<Tip>
+To run this guide on a single GPU, use the single-GPU command in the **Launch Training** section below and scale down the YAML (for example, reduce `step_scheduler.global_batch_size` / `local_batch_size`, and shrink the model using `model.n_layer` / `model.n_embd` / `model.n_head`). For more launch patterns, see [Run on Your Local Workstation](/job-launchers/local-workstation).
+
+</Tip>
 
 ## Preprocess the FineWeb Dataset
 
-:::{warning}
+<Warning>
 **File Size Limitation**: The `nanogpt_data_processor.py` script has a **4GB file size limit** (~2^32 bytes) due to 32-bit position tracking in the BOS index. This translates to:
-- **~2 billion tokens** when using uint16 (vocabularies < 65,536 tokens, e.g., GPT-2)
+- **~2 billion tokens** when using uint16 (vocabularies &lt; 65,536 tokens, e.g., GPT-2)
 - **~1 billion tokens** when using uint32 (larger vocabularies)
 
 Always use the `--max-tokens` flag to stay within these limits (e.g., `--max-tokens 2B` or `--max-tokens 1.5B`).
 
-For larger datasets, please see [pretraining.md](pretraining.md) which supports sharded preprocessing without these constraints.
-:::
+For larger datasets, please see [pretraining.md](/recipes-e2e-examples/pretraining) which supports sharded preprocessing without these constraints.
+
+</Warning>
 
 ### Quick Introduction to the FineWeb Dataset
 The [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset consists of more than 18.5T tokens of cleaned and deduplicated English web data from [CommonCrawl](https://commoncrawl.org/). For this guide, we use the **`sample-10BT` subset** (10 billion tokens), from which we extract a smaller sample (e.g., 500M tokens) that fits within the preprocessing tool's limits.
 
 Briefly, FineWeb is built by extracting main text from CommonCrawl WARC HTML, keeping English pages using fastText language scoring, applying multiple quality filters (e.g., Gopher repetition/quality checks, C4-style rules, and custom heuristics for list-like or repeated/poorly formatted lines), and then MinHash-deduplicating each crawl independently (5-gram shingling with 14×8 hash functions). Basic PII normalization is applied (e.g., anonymizing emails and public IPs). The result is released per-crawl (and convenient sampled subsets), ready for high-throughput streaming.
 
-:::{tip}
-To train on more than 2B tokens from FineWeb, see [pretraining.md](pretraining.md) which uses Megatron Core's sharded dataset format without file size constraints.
-:::
+<Tip>
+To train on more than 2B tokens from FineWeb, see [pretraining.md](/recipes-e2e-examples/pretraining) which uses Megatron Core's sharded dataset format without file size constraints.
+
+</Tip>
 
 ### Preprocessing and Tokenization
 
 For the purposes of this guide, we provide a data preprocessing tool at [`nanogpt_data_processor.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/nanogpt_data_processor.py) that streams datasets from the Hugging Face Hub, tokenizes using Hugging Face's `transformers.AutoTokenizer` (default: GPT-2), and writes the output in **memory-mapped binary shards** to files. During training, we use the [`NanogptDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/nanogpt_dataset.py) class that can stream efficiently at training time.
-
 
 ```bash
 # Step into repo root
@@ -354,11 +360,12 @@ model:
     vocab_size: 50258
 ```
 
-:::{note}
+<Note>
 - The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
 - Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
-:::
+
+</Note>
 
 ## Inspect and Adjust the YAML Configuration
 
@@ -421,9 +428,10 @@ automodel examples/llm_pretrain/nanogpt_pretrain.yaml
 # multi-GPU (8 GPUs)
 automodel --nproc-per-node 8 examples/llm_pretrain/nanogpt_pretrain.yaml
 ```
-:::{tip}
+<Tip>
 Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.
-:::
+
+</Tip>
 
 The `TrainFinetuneRecipeForNextTokenPrediction` class handles:
 * Distributed (FSDP2 / TP / CP) wrapping if requested in the YAML.
@@ -450,6 +458,6 @@ wandb:
 
 1. **Scaling up**: Swap the GPT-2 config for `LlamaForCausalLM`, `Qwen2`, or any Hugging Face-compatible causal model; increase `n_layer`, `n_embd`, etc.
 2. **Mixed precision** - FSDP2 + `bfloat16` (`dtype: bfloat16` in distributed config) for memory savings.
-3. **Sequence packing** - set `packed_sequence.packed_sequence_size` > 0 to pack variable-length contexts and boost utilization.
+3. **Sequence packing** - set `packed_sequence.packed_sequence_size` &gt;0 to pack variable-length contexts and boost utilization.
 4. **Custom datasets** - implement your own `IterableDataset` or convert existing corpora to the `.bin` format using `tools/nanogpt_data_processor.py` as a template.
 5. **BOS alignment** - set `align_to_bos: true` in the dataset config to ensure sequences start with BOS tokens (requires `bos_token` parameter).

@@ -1,15 +1,19 @@
-# Qwen2 MoE
-
+---
+title: "Qwen2 MoE"
+description: ""
+---
 [Qwen1.5-MoE](https://qwenlm.github.io/) is a Mixture-of-Experts variant from Alibaba Cloud that activates only a fraction of parameters per token, enabling efficient training and inference at scale.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `Qwen2MoeForCausalLM` |
 | **Parameters** | 14.3B total / 2.7B active |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -30,12 +34,11 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen1_5_moe_a2_7b_qlora.yaml <../../../../examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml>` | QLoRA — Qwen1.5 MoE A2.7B |
-
+| [qwen1_5_moe_a2_7b_qlora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml) | QLoRA — Qwen1.5 MoE A2.7B |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -54,7 +57,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -75,13 +78,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
 
 ## Hugging Face Model Cards
 

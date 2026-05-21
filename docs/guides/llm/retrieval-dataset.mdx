@@ -1,5 +1,8 @@
-# Retrieval Dataset (Embedding Fine-tuning)
-
+---
+title: "Retrieval Dataset (Embedding Fine-tuning)"
+description: ""
+position: 3
+---
 NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
 
 This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and `examples/retrieval/cross_encoder/`) together with the `BiEncoderCollator`.
@@ -50,10 +53,11 @@ Minimal example:
 { "class": "TextQADataset", "corpus_id": "wiki_corpus" }
 ```
 
-:::{note}
+<Note>
 - `pos_doc` and `neg_doc` can be lists of `{"id": ...}` dicts or raw IDs (they are normalized internally).
 - If you set `use_dataset_instruction: true`, optional fields like `query_instruction` and `passage_instruction` in `merlin_metadata.json` are surfaced to the collator.
-:::
+
+</Note>
 
 ### Inline-Text JSONL (No Corpus Required)
 
@@ -66,7 +70,7 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 {"query":"What is Python?","pos_doc":["A programming language."],"neg_doc":"A snake."}
 ```
 
-:::{note}
+<Note>
 - `query` is accepted (`question` is also accepted as an alias).
 - `pos_doc` and `neg_doc` can be either:
   - strings (interpreted as document text), or
@@ -74,7 +78,8 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
   - dicts with at least `text` (optionally `image`, `nr_ocr`) for multimodal use cases.
 - If `corpus_id` is not provided, it defaults to `__inline__`.
 - `use_dataset_instruction: true` has no effect for pure inline records (instructions come from corpus metadata).
-:::
+
+</Note>
 
 ## YAML Usage (Dataset + Collator)
 

@@ -1,15 +1,19 @@
-# StarCoder
-
+---
+title: "StarCoder"
+description: ""
+---
 [StarCoder](https://huggingface.co/blog/starcoder) is BigCode's code language model trained on the Stack dataset. It uses Multi-Query Attention and Fill-in-the-Middle (FIM) objectives. WizardCoder also uses this architecture.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Code Generation |
 | **Architecture** | `GPTBigCodeForCausalLM` |
 | **Parameters** | 1B – 15.5B |
 | **HF Org** | [bigcode](https://huggingface.co/bigcode) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -29,12 +33,11 @@
 | SantaCoder | [`bigcode/gpt_bigcode-santacoder`](https://huggingface.co/bigcode/gpt_bigcode-santacoder) |
 | WizardCoder 15B | [`WizardLM/WizardCoder-15B-V1.0`](https://huggingface.co/WizardLM/WizardCoder-15B-V1.0) |
 
-
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -56,7 +59,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -78,13 +81,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

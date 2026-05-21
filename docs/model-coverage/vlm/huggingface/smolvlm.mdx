@@ -1,15 +1,19 @@
-# SmolVLM
-
+---
+title: "SmolVLM"
+description: ""
+---
 [SmolVLM](https://huggingface.co/blog/smolvlm) is HuggingFace's compact vision language model designed for on-device and memory-constrained deployment, featuring an efficient image token compression strategy.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `SmolVLMForConditionalGeneration` |
 | **Parameters** | 256M – 2B |
 | **HF Org** | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -27,12 +31,11 @@
 | SmolVLM Instruct | [`HuggingFaceTB/SmolVLM-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-Instruct) |
 | SmolVLM 256M Instruct | [`HuggingFaceTB/SmolVLM-256M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct) |
 
-
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -54,7 +57,7 @@ automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.y
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -76,13 +79,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Hugging Face Model Cards
 

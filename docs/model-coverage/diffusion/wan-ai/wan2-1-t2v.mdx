@@ -1,15 +1,19 @@
-# Wan 2.1 T2V
-
+---
+title: "Wan 2.1 T2V"
+description: ""
+---
 [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) is a text-to-video diffusion model from Wan AI, trained with flow matching on a large-scale video dataset. It generates high-quality short video clips from text prompts.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text-to-Video |
 | **Architecture** | DiT (Flow Matching) |
 | **Parameters** | 1.3B |
 | **HF Org** | [Wan-AI](https://huggingface.co/Wan-AI) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -29,13 +33,12 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`wan2_1_t2v_flow.yaml <../../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml>` | Fine-tune — Wan 2.1 T2V with flow matching |
-| {download}`wan2_1_t2v_flow.yaml <../../../../examples/diffusion/pretrain/wan2_1_t2v_flow.yaml>` | Pretrain — Wan 2.1 T2V with flow matching |
-
+| [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) | Fine-tune — Wan 2.1 T2V with flow matching |
+| [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/wan2_1_t2v_flow.yaml) | Pretrain — Wan 2.1 T2V with flow matching |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -56,7 +59,7 @@ torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -79,13 +82,13 @@ torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
   -c examples/diffusion/finetune/wan2_1_t2v_flow.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [Diffusion Fine-Tuning Guide](../../../guides/diffusion/finetune.md).
+See the [Installation Guide](/get-started/installation) and [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
 
 ## Training
 
-See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/finetune.md) and [Dataset Preparation](../../../guides/diffusion/dataset.md).
+See the [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning) and [Dataset Preparation](/datasets/diffusion-dataset).
 
 ## Hugging Face Model Cards
 

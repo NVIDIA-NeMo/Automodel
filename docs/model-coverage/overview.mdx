@@ -1,21 +1,24 @@
-# Model Coverage Overview
-
+---
+title: "Model Coverage Overview"
+description: ""
+position: 1
+---
 NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that can be instantiated through `transformers` can also be used using NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
 
 ## Supported Hugging Face Auto Classes
 
 | Auto Class | Task | Status | Details |
 |------------|------|--------|---------|
-| `AutoModelForCausalLM` | Text Generation (LLM) | Supported | See [LLM model list](llm/index.md). |
-| `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](vlm/index.md). |
+| `AutoModelForCausalLM` | Text Generation (LLM) | Supported | See [LLM model list](/model-coverage/large-language-models/overview). |
+| `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](/model-coverage/vision-language-models/overview). |
 | `AutoModelForSequenceClassification` | Sequence Classification | WIP | Early support; interfaces may change. |
-| Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](diffusion/index.md). |
-| `NeMoAutoModelBiEncoder` | Embedding Models | Supported | See [Embedding model list](embedding/index.md). |
-| `NeMoAutoModelCrossEncoder` | Reranking Models | Supported | See [Reranking model list](reranker/index.md). |
+| Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](/model-coverage/diffusion/overview). |
+| `NeMoAutoModelBiEncoder` | Embedding Models | Supported | See [Embedding model list](/model-coverage/embedding-models/overview). |
+| `NeMoAutoModelCrossEncoder` | Reranking Models | Supported | See [Reranking model list](/model-coverage/reranking-models/overview). |
 
 ## Release Log
 
-The table below tracks when model support and key features were added across NeMo AutoModel releases. For the full list of tested architectures and example configs, see the [LLM](llm/index.md) and [VLM](vlm/index.md) pages.
+The table below tracks when model support and key features were added across NeMo AutoModel releases. For the full list of tested architectures and example configs, see the [LLM](/model-coverage/large-language-models/overview) and [VLM](/model-coverage/vision-language-models/overview) pages.
 
 | Release | Date | New Models | Key Features |
 |---------|------|------------|--------------|
@@ -23,7 +26,6 @@ The table below tracks when model support and key features were added across NeM
 | **0.2.0** | Dec 2025 | GPT-OSS 20B/120B, Qwen3, Qwen3-MoE, GLM-4/4-MoE, Qwen2.5-VL, Qwen3-VL | Single- and multi-turn tool calling, streaming dataset, QAT for SFT, sequence classification, async DCP checkpointing, MLflow, CP + sequence packing for MoE |
 | **0.1.0** | Oct 2025 | DeepSeek V3/V3.2, 40+ LLM architectures, Gemma 3 VLM | Pretraining, knowledge distillation, FP8 (torchao), pipeline parallelism, HSDP, auto pipelining, ColumnMapped dataset |
 | **0.1.0a0** | Sep 2025 | Initial LLM and VLM support (Llama, Mistral, Qwen2, Gemma, Phi, and more) | MegatronFSDP, packed sequences, Triton LoRA kernels |
-
 
 ## Day-0 Support
 
@@ -41,4 +43,4 @@ NeMo AutoModel includes a custom model registry that allows teams to:
 
 ## Having Issues?
 
-If a model from the Hub doesn't work as expected, see the [Troubleshooting Guide](troubleshooting.md) for common issues and solutions.
+If a model from the Hub doesn't work as expected, see the [Troubleshooting Unsupported Models](/model-coverage/overview) guide for common issues and solutions.

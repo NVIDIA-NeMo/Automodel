@@ -1,15 +1,19 @@
-# Solar Pro
-
+---
+title: "Solar Pro"
+description: ""
+---
 [Solar Pro](https://huggingface.co/upstage/solar-pro-preview-instruct) is an enterprise language model from Upstage, built on a depth up-scaling technique applied to Llama-based architectures.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `SolarForCausalLM` |
 | **Parameters** | 22B |
 | **HF Org** | [upstage](https://huggingface.co/upstage) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -25,12 +29,11 @@
 |---|---|
 | Solar Pro Preview Instruct | [`upstage/solar-pro-preview-instruct`](https://huggingface.co/upstage/solar-pro-preview-instruct) |
 
-
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -52,7 +55,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -74,13 +77,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

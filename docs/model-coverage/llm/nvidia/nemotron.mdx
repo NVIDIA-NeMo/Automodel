@@ -1,15 +1,19 @@
-# Nemotron / Minitron
-
+---
+title: "Nemotron / Minitron"
+description: ""
+---
 [NVIDIA Nemotron](https://www.nvidia.com/en-us/ai-data-science/foundation-models/) and [Minitron](https://developer.nvidia.com/blog/how-to-prune-and-distill-llama-3-1-8b-to-an-nvidia-llama-3-1-minitron-4b-model/) are NVIDIA's family of language models. Minitron models are produced by pruning and distilling larger Llama/Nemotron models into compact, high-performance checkpoints.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation |
 | **Architecture** | `NemotronForCausalLM` |
 | **Parameters** | 8B |
 | **HF Org** | [nvidia](https://huggingface.co/nvidia) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -25,12 +29,11 @@
 |---|---|
 | Minitron 8B Base | [`nvidia/Minitron-8B-Base`](https://huggingface.co/nvidia/Minitron-8B-Base) |
 
-
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -52,7 +55,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -74,13 +77,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

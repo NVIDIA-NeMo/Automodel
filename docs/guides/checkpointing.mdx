@@ -1,5 +1,8 @@
-# Checkpointing
-
+---
+title: "Checkpointing in NeMo Automodel"
+description: ""
+position: 1
+---
 ## Introduction
 
 During machine-learning experiments, the model-training routine regularly saves checkpoints. A checkpoint is a complete snapshot of a run that includes model weights, optimizer states, and other metadata required to resume training exactly where it left off. Writing these snapshots at regular intervals lets you recover quickly from crashes or pauses without losing progress.
@@ -20,7 +23,6 @@ SFT  | LLM                  | ✅          | ✅                   | ✅        
 SFT  | VLM                  | ✅          | ✅                   | ✅                      |
 PEFT | LLM / VLM            | 🚧          | 🚧                   | ✅                      | 
 
-
 Changing between output formats can be done seamlessly through the recipe's `yaml` configuration file:
 ```yaml
 checkpoint:
@@ -31,9 +33,10 @@ checkpoint:
 ```
 > **Note:** For optimal compatibility with the Hugging Face ecosystem, including downstream tools such as vLLM and SGLang, we recommend using the checkpoint configuration provided above.
 
-::: {note}
+<Note>
 The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
-:::
+
+</Note>
 
 ## Checkpoint Symbolic Links
 
@@ -64,10 +67,11 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
     --checkpoint.save_consolidated True
 ```
 
-::: {note}
+<Note>
 In the above command we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example, adjust as necessary to your case.
 More config examples can be found in our [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
-:::
+
+</Note>
 
 If you're running on a single GPU, you can run:
 ```bash
@@ -128,7 +132,6 @@ print(pipe("The key to life is"))
 ```
 
 Although this example uses the Hugging Face Transformers API, the `consolidated/` checkpoint is compatible with any Hugging Face-compatible tool, such as vLLM, SGLang, and others.
-
 
 ## PEFT
 When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
@@ -243,7 +246,7 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 ## Saving Checkpoints When Using Docker
 
-When training inside a Docker container (see [Installation Guide](installation.md)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
+When training inside a Docker container (see [Installation Guide](/get-started/installation)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
 
 ```bash
 docker run --gpus all -it --rm \
@@ -265,9 +268,10 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
 
 When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.
 
-::: {tip}
-Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts. See the [Installation Guide](installation.md) for a complete `docker run` example with all recommended mounts.
-:::
+<Tip>
+Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts. See the [Installation Guide](/get-started/installation) for a complete `docker run` example with all recommended mounts.
+
+</Tip>
 
 ## Asynchronous Checkpointing
 

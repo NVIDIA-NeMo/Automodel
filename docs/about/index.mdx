@@ -1,16 +1,8 @@
 ---
+title: "About NeMo AutoModel"
 description: "Overview of NeMo AutoModel, a PyTorch DTensor-native SPMD library with optimized model implementations and a Hugging Face-compatible API for training, fine-tuning, and as an accelerated backend for other frameworks"
-categories: ["getting-started"]
-tags: ["overview", "spmd", "dtensor", "distributed", "getting-started"]
-personas: ["machine-learning-engineer", "researcher", "devops"]
-difficulty: "beginner"
-content_type: "concept"
+position: 1
 ---
-
-(about-overview)=
-
-# About NeMo AutoModel
-
 NeMo AutoModel is a PyTorch DTensor-native SPMD (Single Program, Multiple Data) open-source library under [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo). It provides **optimized model implementations** with a **Hugging Face-compatible API**, so any model on the Hub works out of the box with no checkpoint conversion. On top of that, it ships ready-made **recipes** for training and fine-tuning LLMs and VLMs at scale.
 
 Because AutoModel exposes the same Autoclass interface as `transformers`, it can also be used as a **drop-in accelerated backend for other libraries** -- reinforcement learning frameworks, evaluation harnesses, or any codebase that loads Hugging Face models.
@@ -55,7 +47,7 @@ NeMo AutoModel builds on top of `transformers` rather than replacing it:
 - Checkpoints stay in the native Hugging Face format -- no conversion step before or after training.
 - New models released on the Hub get day-0 support because AutoModel tracks the latest `transformers` version.
 
-See the [Hugging Face API Compatibility](../guides/huggingface-api-compatibility.md) guide and [Model Coverage](../model-coverage/overview.md) for details.
+See the [Hugging Face API Compatibility](/get-started/hf-compatibility) guide and [Model Coverage](/model-coverage/overview) for details.
 
 ## Optimized Model Implementations
 
@@ -83,19 +75,13 @@ The returned model is a standard `nn.Module` with the same forward signature as 
 
 ## What's Next
 
-::::{grid} 1 2 2 2
-:gutter: 1 1 1 2
-
-:::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` Key Features and Concepts
-:link: about-key-features
-:link-type: ref
+<Cards>
+<Card title="Key Features and Concepts" href="/get-started/key-features">
 Explore the main features, supported workflows, and core concepts.
-:::
+</Card>
 
-:::{grid-item-card} {octicon}`rocket;1.5em;sd-mr-1` Quickstart
-:link: ../index
-:link-type: doc
+<Card title="Quickstart" href="/get-started/installation">
 Jump to the quickstart table to find the right guide for your task.
-:::
+</Card>
 
-::::
+</Cards>

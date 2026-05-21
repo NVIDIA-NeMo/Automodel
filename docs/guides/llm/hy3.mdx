@@ -1,5 +1,8 @@
-# Fine-Tune Hy3-preview (HunyuanLarge)
-
+---
+title: "Hy3-preview"
+description: ""
+position: 7
+---
 ## Introduction
 
 [tencent/Hy3-preview](https://huggingface.co/tencent/Hy3-preview) is a 295B Mixture-of-Experts language model from Tencent. It features 80 transformer layers (layer 0 dense, layers 1–79 MoE), 192 routed experts plus one shared expert per MoE block with top-8 sigmoid routing, Grouped Query Attention (64 Q / 8 KV heads, `head_dim=128`), per-head QK RMSNorm applied before RoPE, and an `expert_bias` buffer (surfaced as `e_score_correction_bias` in the Automodel gate) for expert-load correction during inference. The model supports a 256K context window via long-context RoPE (`rope_theta=11158840`).

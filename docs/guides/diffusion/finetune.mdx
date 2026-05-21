@@ -1,7 +1,8 @@
-(diffusion-finetune)=
-
-# Diffusion Model Fine-Tuning
-
+---
+title: "Diffusion Model Fine-Tuning with NeMo AutoModel"
+description: ""
+position: 16
+---
 ## Introduction
 
 Diffusion models generate images and videos by learning to reverse a noise process — starting from random noise and iteratively refining it into coherent visual output guided by a text prompt. Pretrained diffusion models (like [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) for images or [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) for video) produce impressive general-purpose results, but they know nothing about your particular visual domain, style, or subject matter. Fine-tuning bridges that gap — you adapt the model on your own data so it produces outputs that match your requirements, without the cost of training from scratch.
@@ -34,9 +35,9 @@ For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific
 
 | Model | HF Model ID | Task | Parameters | Example Config |
 |-------|-------------|------|------------|----------------|
-| Wan 2.1 T2V 1.3B | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video | 1.3B | [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
-| FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Text-to-Image | 12B | [flux_t2i_flow.yaml](../../../examples/diffusion/finetune/flux_t2i_flow.yaml) |
-| HunyuanVideo 1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video | — | [hunyuan_t2v_flow.yaml](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
+| Wan 2.1 T2V 1.3B | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video | 1.3B | [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml) |
+| FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | Text-to-Image | 12B | [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml) |
+| HunyuanVideo 1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video | — | [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml) |
 
 All models use FSDP2 for distributed training and flow matching for loss computation.
 
@@ -53,11 +54,12 @@ docker pull nvcr.io/nvidia/nemo-automodel:26.02.00
 docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-:::{important}
-**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](../installation.md#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
-:::
+<Info>
+**Docker users:** Checkpoints are lost when the container exits unless you bind-mount the checkpoint directory to the host. See [Install with NeMo Docker Container](/get-started/installation#install-with-nemo-docker-container) and [Saving Checkpoints When Using Docker](/development/checkpointing#saving-checkpoints-when-using-docker).
 
-For the full set of installation methods, see the [installation guide](../installation.md).
+</Info>
+
+For the full set of installation methods, see the [installation guide](/get-started/installation).
 
 ## Prepare Your Dataset
 
@@ -100,7 +102,7 @@ python -m tools.diffusion.preprocessing_multiprocess video \
     --caption_format meta_json
 ```
 
-For the full set of arguments and input format details, see the [Diffusion Dataset Preparation](dataset.md) guide.
+For the full set of arguments and input format details, see the [Diffusion Dataset Preparation](/datasets/diffusion-dataset) guide.
 
 ## Configure Your Training Recipe
 
@@ -110,7 +112,7 @@ Fine-tuning is driven by two components:
 2. A YAML configuration file — a text file in YAML format that specifies all settings the recipe uses: which model to fine-tune, where the data lives, optimizer hyperparameters, parallelism strategy, etc.
   You customize training by editing this file rather than modifying code, allowing you to scale from 1 to 100s of GPUs seamlessly.
 
-Below is the annotated [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml), with each section explained:
+Below is the annotated [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml), with each section explained:
 
 ```yaml
 seed: 42
@@ -212,7 +214,6 @@ checkpoint:
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
 | `wandb` | Optional | Configure to enable Weights & Biases logging. |
 
-(fine-tune-the-model)=
 ## Fine-Tune the Model
 
 Launch fine-tuning with `torchrun`:
@@ -225,7 +226,6 @@ torchrun --nproc-per-node=8 \
 
 Adjust `--nproc-per-node` to match the number of GPUs on your node, and ensure `fsdp.dp_size` in the YAML matches.
 
-(multi-node-training)=
 ## Multi-Node Training
 
 When a single node doesn't provide enough GPUs or memory for your workload, you can scale training across multiple nodes. NeMo AutoModel handles multi-node distributed training through `torchrun` rendezvous and FSDP2 — the same recipe script works on one node or many.
@@ -245,7 +245,7 @@ fsdp:
   dp_size: 16             # Total GPUs: 2 nodes × 8 GPUs
 ```
 
-A complete multi-node config is provided at [wan2_1_t2v_flow_multinode.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml).
+A complete multi-node config is provided at [wan2_1_t2v_flow_multinode.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml).
 
 ### Launch with torchrun
 
@@ -266,7 +266,6 @@ torchrun \
   -c examples/diffusion/finetune/wan2_1_t2v_flow_multinode.yaml
 ```
 
-(model-specific-notes)=
 ## Model-Specific Notes
 
 Use the table below to pick the right model for your use case:
@@ -281,7 +280,7 @@ Use the table below to pick the right model for your use case:
 
 - **Adapter type**: `simple`
 - **Dataloader**: `build_video_multiresolution_dataloader` with `model_type: wan`
-- **Config**: [wan2_1_t2v_flow.yaml](../../../examples/diffusion/finetune/wan2_1_t2v_flow.yaml)
+- **Config**: [wan2_1_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/wan2_1_t2v_flow.yaml)
 
 ### FLUX.1-dev (Text-to-Image)
 
@@ -305,7 +304,7 @@ Use the table below to pick the right model for your use case:
         use_guidance_embeds: true
     ```
   - Uses `logit_normal` timestep sampling instead of `uniform`
-- **Config**: [flux_t2i_flow.yaml](../../../examples/diffusion/finetune/flux_t2i_flow.yaml)
+- **Config**: [flux_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux_t2i_flow.yaml)
 
 ### HunyuanVideo 1.5
 
@@ -322,7 +321,7 @@ Use the table below to pick the right model for your use case:
         default_image_embed_shape: [729, 1152]
     ```
   - Uses `logit_normal` timestep sampling
-- **Config**: [hunyuan_t2v_flow.yaml](../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml)
+- **Config**: [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml)
 
 ## Generation / Inference
 
@@ -374,13 +373,14 @@ python examples/diffusion/generate/generate.py \
 
 | Config | Model | Output | GPUs |
 |--------|-------|--------|------|
-| [`generate_wan.yaml`](../../../examples/diffusion/generate/configs/generate_wan.yaml) | Wan 2.1 1.3B | Video | 1 |
-| [`generate_flux.yaml`](../../../examples/diffusion/generate/configs/generate_flux.yaml) | FLUX.1-dev | Image | 1 |
-| [`generate_hunyuan.yaml`](../../../examples/diffusion/generate/configs/generate_hunyuan.yaml) | HunyuanVideo | Video | 1 |
+| [`generate_wan.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_wan.yaml) | Wan 2.1 1.3B | Video | 1 |
+| [`generate_flux.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux.yaml) | FLUX.1-dev | Image | 1 |
+| [`generate_hunyuan.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_hunyuan.yaml) | HunyuanVideo | Video | 1 |
 
-:::{note}
+<Note>
 You can use `--model.checkpoint ./checkpoints/LATEST` to automatically load the most recent checkpoint.
-:::
+
+</Note>
 
 ## Hardware Requirements
 

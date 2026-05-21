@@ -1,15 +1,19 @@
-# Kimi-VL
-
+---
+title: "Kimi-VL"
+description: ""
+---
 [Kimi-VL](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct) and Kimi-K25-VL are vision language models from Moonshot AI. Kimi-VL-A3B uses a MoE language backbone (3B active parameters) with a vision encoder, supporting image understanding and multimodal reasoning.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `KimiVLForConditionalGeneration` |
 | **Parameters** | ~3B active (MoE) |
 | **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -30,13 +34,12 @@
 
 | Recipe | Dataset | Description |
 |---|---|---|
-| {download}`kimi2vl_cordv2.yaml <../../../../examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml>` | cord-v2 | SFT — Kimi-VL on CORD-v2 |
-| {download}`kimi25vl_medpix.yaml <../../../../examples/vlm_finetune/kimi/kimi25vl_medpix.yaml>` | MedPix-VQA | SFT — Kimi-K25-VL on MedPix |
-
+| [kimi2vl_cordv2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml) | cord-v2 | SFT — Kimi-VL on CORD-v2 |
+| [kimi25vl_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/kimi25vl_medpix.yaml) | MedPix-VQA | SFT — Kimi-K25-VL on MedPix |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -55,7 +58,7 @@ cd Automodel
 automodel --nproc-per-node=8 examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -76,13 +79,13 @@ cd /opt/Automodel
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Hugging Face Model Cards
 

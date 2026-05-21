@@ -1,15 +1,19 @@
-# HunyuanVideo 1.5
-
+---
+title: "HunyuanVideo 1.5"
+description: ""
+---
 [HunyuanVideo 1.5](https://huggingface.co/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v) is a 13B parameter text-to-video diffusion model from the Hunyuan community, supporting 720p resolution video generation with flow matching training.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text-to-Video |
 | **Architecture** | DiT (Flow Matching) |
 | **Parameters** | 13B |
 | **HF Org** | [hunyuanvideo-community](https://huggingface.co/hunyuanvideo-community) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -29,12 +33,11 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`hunyuan_t2v_flow.yaml <../../../../examples/diffusion/finetune/hunyuan_t2v_flow.yaml>` | Fine-tune — HunyuanVideo 1.5 with flow matching |
-
+| [hunyuan_t2v_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/hunyuan_t2v_flow.yaml) | Fine-tune — HunyuanVideo 1.5 with flow matching |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -55,7 +58,7 @@ torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/hunyuan_t2v_flow.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -78,13 +81,13 @@ torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
   -c examples/diffusion/finetune/hunyuan_t2v_flow.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [Diffusion Fine-Tuning Guide](../../../guides/diffusion/finetune.md).
+See the [Installation Guide](/get-started/installation) and [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
 
 ## Training
 
-See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/finetune.md) and [Dataset Preparation](../../../guides/diffusion/dataset.md).
+See the [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning) and [Dataset Preparation](/datasets/diffusion-dataset).
 
 ## Hugging Face Model Cards
 

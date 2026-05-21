@@ -1,15 +1,19 @@
-# OLMoE
-
+---
+title: "OLMoE"
+description: ""
+---
 [OLMoE](https://allenai.org/olmo) is Allen AI's open Mixture-of-Experts language model. It activates 1B parameters per token from a 7B total parameter pool.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text Generation (MoE) |
 | **Architecture** | `OLMoEForCausalLM` |
 | **Parameters** | 7B total / 1B active |
 | **HF Org** | [allenai](https://huggingface.co/allenai) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -27,12 +31,11 @@
 | OLMoE 1B 7B | [`allenai/OLMoE-1B-7B-0924`](https://huggingface.co/allenai/OLMoE-1B-7B-0924) |
 | OLMoE 1B 7B Instruct | [`allenai/OLMoE-1B-7B-0924-Instruct`](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct) |
 
-
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -54,7 +57,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -76,13 +79,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Fine-Tuning
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
 
 ## Hugging Face Model Cards
 

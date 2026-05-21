@@ -1,17 +1,18 @@
-# Ministral3 (Bidirectional) for Embedding
+---
+title: "Ministral3 (Bidirectional) for Embedding"
+description: ""
+---
 
 NeMo AutoModel provides a bidirectional variant of [Mistral AI's Ministral3](https://mistral.ai/news/ministraux/) for embedding and dense retrieval tasks. Unlike the standard causal (left-to-right) Ministral3 used for text generation, this variant uses **bidirectional attention**, so each token can attend to both past and future tokens in the sequence, producing richer representations for semantic similarity and dense retrieval.
 
 The bidirectional encoder can be loaded directly from text-only checkpoints (e.g. `mistralai/Ministral-3B-Instruct`) and also automatically extracts the language model from Ministral3 VLM checkpoints (e.g. `mistralai/Ministral-3-3B-Base-2512` or `mistralai/Ministral-3-3B-Instruct-2512`).
 
-:::{card}
 | | |
 |---|---|
 | **Tasks** | Embedding, Dense Retrieval |
 | **Architecture** | `Ministral3BidirectionalModel` |
 | **Parameters** | 3B |
 | **HF Org** | [mistralai](https://huggingface.co/mistralai) |
-:::
 
 ## Available Models
 
@@ -48,7 +49,7 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 
 ## Try with NeMo AutoModel
 
-**1. Install NeMo AutoModel**. Refer to the ([Installation Guide](../../../guides/installation.md)) for information:
+**1. Install NeMo AutoModel**. Refer to the ([Installation Guide](/get-started/installation)) for information:
 
 ```bash
 uv pip install nemo-automodel
@@ -68,13 +69,13 @@ torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config e
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml
 ```
 
-See the [Installation Guide](../../../guides/installation.md).
+See the [Installation Guide](/get-started/installation).
 
-<!-- TODO: uncomment when finetune guide is published.
+{/* TODO: uncomment when finetune guide is published.
 ## Fine-Tuning
 
-See the [Embedding and Reranking Fine-Tuning Guide](../../../guides/retrieval/finetune.md) for bi-encoder training instructions, including LoRA and PEFT configuration.
--->
+See the [Embedding and Reranking Fine-Tuning Guide](/recipes-e2e-examples/retrieval-finetune) for bi-encoder training instructions, including LoRA and PEFT configuration.
+*/}
 
 ## Hugging Face Model Cards
 

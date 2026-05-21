@@ -1,5 +1,8 @@
-# Fine-Tune DeepSeek V4 Flash
-
+---
+title: "DeepSeek V4 Flash"
+description: ""
+position: 6
+---
 ## Introduction
 
 [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) is the latest fine-grained Mixture-of-Experts language model from DeepSeek. It uses a 43-layer all-MoE backbone (no dense MLP layers) with 256 routed experts plus one shared expert per block and top-6 routing. The architecture introduces a hybrid per-layer attention zoo — Sliding-Window Attention (SWA), Compressed Sparse Attention (CSA, Compressor + Indexer), and Hierarchical Compressed Attention (HCA, Compressor only) — selectable per layer through `compress_ratios`. The first `num_hash_layers` blocks use a hash-clustering gate (`DeepseekV4HashGate`) for token-to-expert routing, and every block maintains `hc_mult=4` Hyper-Connection streams mixed via a learned col-norm-first Sinkhorn router.
@@ -90,5 +93,5 @@ The bringup was validated against the official DeepSeek inference reference (`ds
 The training loss curve below is from a 43-layer full-finetune run on HellaSwag with the full attention zoo (SWA + CSA + HCA) live.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek V4 Flash Training Loss Curve" width="600">
+  <img src="https://github.com/user-attachments/assets/b5ed8837-40cb-41c6-8b90-2789e5e872cc" alt="DeepSeek V4 Flash Training Loss Curve" width="600" />
 </p>

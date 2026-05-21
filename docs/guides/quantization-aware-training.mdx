@@ -1,5 +1,8 @@
-# Quantization-Aware Training (QAT)
-
+---
+title: "Quantization-Aware Training (QAT) in NeMo Automodel"
+description: ""
+position: 18
+---
 NeMo Automodel supports Quantization-Aware Training (QAT) for Supervised Fine-Tuning (SFT) using [TorchAO](https://github.com/pytorch/ao). QAT simulates quantization effects during the training process, allowing models to adapt to lower precision representations while learning. This approach produces quantized models that maintain significantly higher accuracy compared to applying quantization after training is complete.
 
 ## What is Quantization-Aware Training?
@@ -182,7 +185,7 @@ After converting to actual quantization:
 
 - **Speed**: 2-4x faster inference depending on hardware and model size
 - **Memory**: ~4x reduction in model size
-- **Accuracy**: Minimal degradation compared to full-precision models (typically <1% difference)
+- **Accuracy**: Minimal degradation compared to full-precision models (typically &lt;1% difference)
 
 ### When to Use QAT
 
@@ -257,8 +260,8 @@ This allows the model to learn basic patterns before introducing quantization co
 |---------------------|----------------------|----------------|
 | Full Precision (BF16) | Baseline | Baseline |
 | Post-Training Quantization | 1-3% | 4x |
-| QAT (8da4w) | <1% | 4x |
-| QAT (4w) | <1.5% | 4x (weights only) |
+| QAT (8da4w) | &lt;1% | 4x |
+| QAT (4w) | &lt;1.5% | 4x (weights only) |
 
 ### Optimization Strategies
 

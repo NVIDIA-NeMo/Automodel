@@ -1,5 +1,8 @@
-# MLflow Logging
-
+---
+title: "MLflow Logging in NeMo AutoModel"
+description: ""
+position: 5
+---
 ## Introduction
 
 MLflow is an open-source platform for managing the machine learning lifecycle, including experiment tracking, model versioning, and deployment. NeMo AutoModel integrates with MLflow to log training metrics, parameters, and artifacts during model training.
@@ -89,9 +92,10 @@ NeMo AutoModel automatically logs the following information to MLflow:
 - Model checkpoints (if configured)
 - Training configuration files
 
-:::{note}
+<Note>
 Only rank 0 in distributed training logs to MLflow to avoid duplicate entries and reduce overhead.
-:::
+
+</Note>
 
 ## Usage Example
 

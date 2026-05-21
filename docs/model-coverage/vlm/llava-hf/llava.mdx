@@ -1,15 +1,19 @@
-# LLaVA
-
+---
+title: "LLaVA"
+description: ""
+---
 [LLaVA](https://llava-vl.github.io/) (Large Language and Vision Assistant) is a pioneering open-source multimodal model connecting a vision encoder to a language model via a projection layer. Multiple versions and variants are supported via the `llava-hf` organization on Hugging Face.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text |
 | **Architecture** | `LlavaForConditionalGeneration` / `LlavaNextForConditionalGeneration` |
 | **Parameters** | 7B – 34B |
 | **HF Org** | [llava-hf](https://huggingface.co/llava-hf) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -36,12 +40,11 @@
 | LLaVA-NeXT-Video 7B | [`llava-hf/LLaVA-NeXT-Video-7B-hf`](https://huggingface.co/llava-hf/LLaVA-NeXT-Video-7B-hf) |
 | LLaVA-OneVision 7B | [`llava-hf/llava-onevision-qwen2-7b-ov-hf`](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf) |
 
-
 ## Try with NeMo AutoModel
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -63,7 +66,7 @@ automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.y
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -85,13 +88,13 @@ cd /opt/Automodel
 automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Fine-Tuning
 
-See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
+See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
 ## Hugging Face Model Cards
 

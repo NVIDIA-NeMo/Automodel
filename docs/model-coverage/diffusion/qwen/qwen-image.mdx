@@ -1,14 +1,18 @@
-# Qwen-Image
-
+---
+title: "Qwen-Image"
+description: ""
+---
 [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's text-to-image diffusion transformer. NeMo AutoModel supports Qwen-Image training via its flow-matching pipeline with a dedicated `qwen_image` adapter, enabling FSDP2 parallelization, multiresolution bucketed dataloading and LoRA-style fine-tuning.
 
-:::{card}
+<Info>
+
 | | |
 |---|---|
 | **Task** | Text-to-Image |
 | **Architecture** | DiT (Flow Matching) |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
-:::
+
+</Info>
 
 ## Available Models
 
@@ -28,13 +32,12 @@
 
 | Recipe | Description |
 |---|---|
-| {download}`qwen_image_t2i_flow.yaml <../../../../examples/diffusion/finetune/qwen_image_t2i_flow.yaml>` | Fine-tune — Qwen-Image with flow matching |
-| {download}`qwen_image_t2i_flow.yaml <../../../../examples/diffusion/pretrain/qwen_image_t2i_flow.yaml>` | Pretrain — Qwen-Image with flow matching |
-
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune — Qwen-Image with flow matching |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain — Qwen-Image with flow matching |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](../../../guides/installation.md)):
+**1. Install** ([full instructions](/get-started/installation)):
 
 ```bash
 pip install nemo-automodel
@@ -55,7 +58,7 @@ torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
 ```
 
-:::{dropdown} Run with Docker
+<Accordion title="Run with Docker">
 **1. Pull the container** and mount a checkpoint directory:
 
 ```bash
@@ -78,13 +81,13 @@ torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
   -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
 ```
-:::
+</Accordion>
 
-See the [Installation Guide](../../../guides/installation.md) and [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/finetune.md).
+See the [Installation Guide](/get-started/installation) and [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
 
 ## Fine-Tuning
 
-See the [Diffusion Training and Fine-Tuning Guide](../../../guides/diffusion/finetune.md).
+See the [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
 
 ## Hugging Face Model Cards
 
