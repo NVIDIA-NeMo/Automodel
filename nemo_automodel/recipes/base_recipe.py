@@ -415,6 +415,13 @@ class BaseRecipe:
             if is_dist_initialized:
                 torch.distributed.barrier()
 
+        # Release NCCL workspace and DCP gather scratch back to the allocator.
+        # Without this, the next training step's backward sees a fragmented
+        # heap (~74 GB still resident on tight 14B FSDP2 runs) and OOMs.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
         Create or update a symlink named `link_name` under the checkpoint root

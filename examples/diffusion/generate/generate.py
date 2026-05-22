@@ -275,6 +275,16 @@ def _load_checkpoint_into_attr(pipe, attr_name, checkpoint, torch_dtype):
         new_module = _load_sharded_fsdp_checkpoint(target, str(sharded_dir), torch_dtype)
         new_module.to("cuda", dtype=torch_dtype)
         setattr(pipe, attr_name, new_module)
+    elif sharded_dir.is_dir() and any(
+        name.startswith("shard-") and name.endswith(".safetensors") for name in os.listdir(sharded_dir)
+    ):
+        # NeMo-AutoModel sharded HF safetensors: one ``shard-XXXXX-*.safetensors``
+        # per FSDP rank from a run that set ``save_consolidated: false``. Use the
+        # DCP HuggingFaceStorageReader to materialize the full state dict.
+        logger.info("Loading sharded HF safetensors checkpoint from %s into %s", sharded_dir, attr_name)
+        new_module = _load_sharded_hf_safetensors_checkpoint(target, str(sharded_dir), torch_dtype)
+        new_module.to("cuda", dtype=torch_dtype)
+        setattr(pipe, attr_name, new_module)
     else:
         logger.warning(
             "No recognized checkpoint format found in %s, leaving %s at base weights",
@@ -357,6 +367,50 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bf
 
         # Unwrap back to the original module for inference
         return fsdp_transformer.module
+    finally:
+        if init_dist:
+            dist.destroy_process_group()
+
+
+def _load_sharded_hf_safetensors_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
+    """Load NeMo-AutoModel sharded HF safetensors checkpoint into a transformer.
+
+    Handles directories containing ``shard-XXXXX-model-XXXXX-of-XXXXX.safetensors``
+    files produced by training runs with ``save_consolidated: false``. Uses DCP's
+    ``HuggingFaceStorageReader`` to gather all shards into the target state dict.
+
+    Args:
+        transformer: The transformer nn.Module to load weights into.
+        sharded_dir: Path to the directory containing shard-*.safetensors files.
+        torch_dtype: The dtype to cast the transformer to before loading.
+
+    Returns:
+        The transformer module with the merged state dict loaded.
+    """
+    from torch.distributed.checkpoint import load as dist_load
+
+    # Prefer the upstream HF storage reader; fall back to NeMo's backport if
+    # the torch version is too old to ship it.
+    try:
+        from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
+    except ImportError:
+        from nemo_automodel.components.checkpoint._backports.hf_storage import (
+            _HuggingFaceStorageReader as HuggingFaceStorageReader,
+        )
+
+    init_dist = False
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        init_dist = True
+
+    try:
+        transformer.to(device="cuda", dtype=torch_dtype)
+        state_dict = transformer.state_dict()
+        dist_load(state_dict=state_dict, storage_reader=HuggingFaceStorageReader(path=sharded_dir))
+        transformer.load_state_dict(state_dict, strict=True)
+        return transformer
     finally:
         if init_dist:
             dist.destroy_process_group()
