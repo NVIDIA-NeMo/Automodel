@@ -1,10 +1,23 @@
 ---
 name: retrieval-models
+version: "1.0.0"
+author: NeMo AutoModel maintainers
 description: Work on NeMo AutoModel retrieval encoder support, including bi-encoder embedding and cross-encoder scoring backbones, wrapper and registry wiring, retrieval recipes, and focused validation.
 when_to_use: Adding, modifying, or debugging retrieval model support; working with NeMoAutoModelBiEncoder, NeMoAutoModelCrossEncoder, bidirectional causal-decoder backbones, retrieval recipe configs, retrieval dataset/collator shape issues, or encoder save/reload metadata.
+tags:
+  - nemo-automodel
+  - retrieval
+  - bi-encoder
+  - cross-encoder
+tools:
+  - shell
+  - read
+  - edit
 ---
 
 # Retrieval Models
+
+## Purpose
 
 Use this skill when a task touches retrieval model behavior, not ordinary LLM
 generation. Retrieval support has three layers that are easy to mix up:
@@ -16,6 +29,13 @@ generation. Retrieval support has three layers that are easy to mix up:
    `SUPPORTED_BACKBONES`.
 3. Concrete backbone classes under `nemo_automodel/components/models/`, such as
    `llama_bidirectional` and `ministral_bidirectional`.
+
+## Prerequisites
+
+- Work from a NeMo AutoModel checkout and read `AGENTS.md` before editing.
+- Use `uv` for validation commands; do not introduce `pip install` steps.
+- Use the repo's Python, pytest, and ruff configuration rather than ad hoc
+  formatter or test settings.
 
 ## References
 
@@ -192,6 +212,26 @@ recipe shape errors, and retrieval checkpoint save/reload metadata.
 Do not use this skill for unrelated RAG application code, generic causal LM
 generation, VLM chunk retrieval, or hard-negative mining unless the task also
 touches the model wrapper, dataset/collator contract, or retrieval recipe.
+
+## Limitations
+
+- This skill covers NeMo AutoModel retrieval model internals. It is not a guide
+  for generic RAG application wiring, vector databases, or embedding service
+  deployment.
+- It gives CPU-first validation commands. Broaden to GPU, distributed, or full
+  recipe tests only when the changed surface needs that coverage.
+- It assumes the existing HuggingFace fallback path is preferred unless a custom
+  retrieval backbone is explicitly required.
+
+## Troubleshooting
+
+- If saved checkpoints reload without retrieval metadata, check the registry
+  `{"retrieval"}` tag and `configure_encoder_metadata` path first.
+- If cross-encoder logits cannot be reshaped, verify flattened dataset rows are
+  divisible by the configured `train_n_passages` or `val_n_passages`.
+- If a causal decoder appears bidirectional only in config, inspect the forward
+  mask and each attention layer's `is_causal` flag.
+- Read `PITFALLS.md` for deeper failure patterns before widening the change.
 
 ## Evaluation Scenarios
 
