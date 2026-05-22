@@ -16,7 +16,7 @@
 # Workflow 2 of 2 for Fern doc previews.
 #
 # Triggered by workflow_run after "Preview Fern Docs: Build" completes.
-# Downloads the fern/ artifact, builds a preview with DOCS_FERN_TOKEN, and
+# Downloads the docs/fern/ artifact, builds a preview with DOCS_FERN_TOKEN, and
 # posts a stable :herb: comment on the PR. This workflow never checks out the
 # PR branch directly, keeping secrets isolated from untrusted code.
 #
@@ -65,7 +65,7 @@ jobs:
         env:
           FERN_TOKEN: ${{ secrets.DOCS_FERN_TOKEN }}
           HEAD_REF: ${{ steps.metadata.outputs.head_ref }}
-        working-directory: ./fern
+        working-directory: ./docs/fern
         run: |
           OUTPUT=$(fern generate --docs --preview --id "$HEAD_REF" 2>&1)
           echo "$OUTPUT"

@@ -15,7 +15,7 @@
 
 # Workflow 1 of 2 for Fern doc previews.
 #
-# Collects the fern/ sources and PR metadata from the (possibly untrusted) PR
+# Collects the docs/fern/ sources and PR metadata from the (possibly untrusted) PR
 # branch and uploads them as an artifact. No secrets are used here, so this is
 # safe to run on fork PRs via the regular pull_request trigger.
 #
@@ -27,7 +27,7 @@ name: "Preview Fern Docs: Build"
 on:
   pull_request:
     paths:
-      - 'fern/**'
+      - 'docs/fern/**'
       - '.github/workflows/fern-docs-preview-build.yml'
 
 permissions:
@@ -58,6 +58,6 @@ jobs:
         with:
           name: fern-preview
           path: |
-            fern/
+            docs/fern/
             preview-metadata/
           retention-days: 1

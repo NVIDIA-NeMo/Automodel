@@ -25,7 +25,7 @@ on:
     branches:
       - "pull-request/[0-9]+"
     paths:
-      - 'fern/**'
+      - 'docs/fern/**'
       - '.github/workflows/fern-docs-ci.yml'
 
 permissions:
@@ -47,5 +47,5 @@ jobs:
         run: npm install -g fern-api
 
       - name: Validate Fern configuration
-        working-directory: ./fern
+        working-directory: ./docs/fern
         run: fern check
