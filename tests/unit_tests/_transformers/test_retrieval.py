@@ -243,6 +243,54 @@ def test_load_encoder_config_merges_v5_retrieval_metadata(tmp_path):
     assert config.nemo_retrieval == {"task": "embedding", "pooling": "last", "l2_normalize": False}
 
 
+def test_load_encoder_config_merges_hub_v5_retrieval_metadata(monkeypatch, tmp_path):
+    """Hub exports can recover AutoModel metadata from config.v5.json sidecars."""
+    from nemo_automodel._transformers import retrieval
+
+    v5_config_path = tmp_path / "config.v5.json"
+    v5_config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "nemo_retrieval": {"task": "embedding", "pooling": "cls", "l2_normalize": True},
+            }
+        )
+    )
+    captured = {}
+
+    class FakeConfig:
+        model_type = "bert"
+
+    def fake_config_from_pretrained(model_name_or_path, **kwargs):
+        captured["config"] = {"model_name_or_path": model_name_or_path, "kwargs": kwargs}
+        return FakeConfig()
+
+    def fake_hf_hub_download(repo_id, filename, **kwargs):
+        captured["hub"] = {"repo_id": repo_id, "filename": filename, "kwargs": kwargs}
+        return str(v5_config_path)
+
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", fake_config_from_pretrained)
+    monkeypatch.setattr(retrieval, "hf_hub_download", fake_hf_hub_download)
+
+    config = retrieval._load_encoder_config(
+        "nvidia/example-retriever",
+        trust_remote_code=True,
+        revision="main",
+        token="token",
+        torch_dtype="auto",
+    )
+
+    assert captured["config"]["kwargs"]["trust_remote_code"] is True
+    assert captured["config"]["kwargs"]["revision"] == "main"
+    assert "torch_dtype" not in captured["config"]["kwargs"]
+    assert captured["hub"] == {
+        "repo_id": "nvidia/example-retriever",
+        "filename": "config.v5.json",
+        "kwargs": {"revision": "main", "token": "token"},
+    }
+    assert config.nemo_retrieval == {"task": "embedding", "pooling": "cls", "l2_normalize": True}
+
+
 def test_nemo_auto_biencoder_defaults_do_not_override_saved_metadata(monkeypatch):
     """The public AutoModel entry point should defer pooling/l2 defaults to the saved config."""
     from nemo_automodel._transformers import auto_model

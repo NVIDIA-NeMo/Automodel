@@ -15,6 +15,7 @@
 """Unit tests for MineHardNegativesRecipe — attn_implementation support."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -22,7 +23,12 @@ import pytest
 import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
+from nemo_automodel.recipes.retrieval.mine_hard_negatives import (
+    DOCUMENT_EMBEDDINGS_FNAME,
+    MINING_DEFAULTS,
+    QUERY_EMBEDDINGS_FNAME,
+    MineHardNegativesRecipe,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,6 +53,30 @@ def _make_recipe(mining_overrides=None):
     recipe = MineHardNegativesRecipe(cfg)
     # Simulate what setup() does before calling _extract_mining_params:
     recipe.mining_cfg = cfg.get("mining")
+    return recipe
+
+
+def _make_cache_ready_recipe(tmp_path):
+    """Create a recipe with enough state for embedding cache validation."""
+    recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": True})
+    recipe.cache_embeddings_dir = str(tmp_path)
+    recipe.load_embeddings_from_cache = True
+    recipe.model_name_or_path = "/fake/model"
+    recipe.tokenizer_name_or_path = "/fake/tokenizer"
+    recipe.train_qa_file_path = "/fake/input.json"
+    recipe.corpus_path = "/fake/corpus"
+    recipe.query_prefix = "query: "
+    recipe.passage_prefix = "passage: "
+    recipe.query_max_length = 16
+    recipe.passage_max_length = 32
+    recipe.add_bos_token = None
+    recipe.add_eos_token = False
+    recipe.attn_implementation = None
+    recipe.questions = ["what is nvlink?"]
+    recipe.question_ids = ["q0"]
+    recipe.idx_to_doc = {0: "d0"}
+    recipe.dist_env = SimpleNamespace(world_size=1, rank=0, is_main=True, device=torch.device("cpu"))
+    recipe.model = SimpleNamespace(pooling="avg", l2_normalize=True)
     return recipe
 
 
@@ -237,6 +267,78 @@ def test_load_cached_chunk_ignored_when_cache_loading_disabled(tmp_path):
     assert recipe._load_cached_chunk(cache_path) is None
 
 
+def test_full_embeddings_cache_requires_matching_metadata(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    query_embeddings = np.ones((1, 2), dtype=np.float32)
+    document_embeddings = np.ones((1, 2), dtype=np.float32)
+
+    recipe._save_embeddings_to_cache(query_embeddings, document_embeddings)
+
+    assert recipe._has_full_embeddings_cache()
+    cached_query_embeddings, cached_document_embeddings = recipe._load_embeddings_from_cache()
+    np.testing.assert_array_equal(cached_query_embeddings, query_embeddings)
+    np.testing.assert_array_equal(cached_document_embeddings, document_embeddings)
+
+    recipe.query_prefix = "different query: "
+    assert not recipe._has_full_embeddings_cache()
+    assert recipe._load_embeddings_from_cache() == (None, None)
+
+
+def test_full_embeddings_cache_rejects_shape_mismatch(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    query_embeddings = np.ones((1, 2), dtype=np.float32)
+    document_embeddings = np.ones((1, 2), dtype=np.float32)
+    recipe._save_embeddings_to_cache(query_embeddings, document_embeddings)
+    np.savez(tmp_path / QUERY_EMBEDDINGS_FNAME, np.ones((2, 2), dtype=np.float32))
+
+    assert not recipe._has_full_embeddings_cache()
+    assert recipe._load_embeddings_from_cache() == (None, None)
+
+
+def test_encode_queries_sharded_handles_empty_rank_shard(tmp_path):
+    recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": False})
+    recipe.cache_embeddings_dir = str(tmp_path)
+    recipe.load_embeddings_from_cache = False
+    recipe.query_embedding_batch_size = 2
+    recipe.query_max_length = 16
+    recipe.query_prefix = "query: "
+    recipe.questions = ["what is nvlink?"]
+    recipe.dist_env = SimpleNamespace(world_size=2, rank=0, is_main=True, device=torch.device("cpu"))
+    recipe._encode_texts = lambda **_: np.ones((1, 2), dtype=np.float32)
+
+    def write_empty_peer_shard():
+        shard_dir = tmp_path / "query_shards"
+        np.savez(shard_dir / "queries_rank0001.npz", np.empty((0, 0), dtype=np.float32))
+
+    recipe._synchronize_ranks = write_empty_peer_shard
+
+    query_embeddings = recipe._encode_queries_sharded()
+
+    assert query_embeddings.shape == (1, 2)
+
+
+def test_encode_chunk_distributed_handles_empty_rank_shard(tmp_path):
+    recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": False})
+    recipe.cache_embeddings_dir = str(tmp_path)
+    recipe.load_embeddings_from_cache = False
+    recipe.document_embedding_batch_size = 2
+    recipe.passage_max_length = 16
+    recipe.passage_prefix = "passage: "
+    recipe.dist_env = SimpleNamespace(world_size=2, rank=0, is_main=True, device=torch.device("cpu"))
+    recipe._encode_texts = lambda **_: np.ones((1, 2), dtype=np.float32)
+    cache_path = tmp_path / "chunk_0000.npz"
+
+    def write_empty_peer_shard():
+        np.savez(tmp_path / "chunk_0000_rank0001.npz", np.empty((0, 0), dtype=np.float32))
+
+    recipe._synchronize_ranks = write_empty_peer_shard
+
+    document_embeddings = recipe._encode_chunk_distributed(["NVLink is fast."], cache_path)
+
+    assert document_embeddings.shape == (1, 2)
+    assert (tmp_path / DOCUMENT_EMBEDDINGS_FNAME).exists() is False
+
+
 def test_mine_hard_negatives_drops_margin_filtered_candidates():
     recipe = _make_recipe()
     recipe.dist_env = MagicMock(device=torch.device("cpu"))
@@ -263,3 +365,43 @@ def test_mine_hard_negatives_drops_margin_filtered_candidates():
     assert neg_indices == [[2]]
     assert neg_scores[0][0] == pytest.approx(0.2)
     assert pos_scores[0][0] == pytest.approx(1.0)
+
+
+def test_mine_hard_negatives_drops_raw_non_finite_scores():
+    recipe = _make_recipe()
+    recipe.dist_env = MagicMock(device=torch.device("cpu"))
+    query_embeddings = np.array([[1.0, 0.0]], dtype=np.float32)
+    document_embeddings = np.array(
+        [
+            [1.0, 0.0],
+            [np.nan, 0.0],
+            [0.2, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    neg_indices, neg_scores, pos_scores = recipe._mine_hard_negatives(
+        query_embeddings=query_embeddings,
+        document_embeddings=document_embeddings,
+        pos_doc_indices=[[0]],
+        batch_size=1,
+        num_negs=2,
+    )
+
+    assert neg_indices == [[2]]
+    assert neg_scores[0][0] == pytest.approx(0.2)
+    assert pos_scores[0][0] == pytest.approx(1.0)
+
+
+def test_mine_hard_negatives_rejects_token_level_embeddings():
+    recipe = _make_recipe()
+    recipe.dist_env = MagicMock(device=torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="2D single-vector embeddings"):
+        recipe._mine_hard_negatives(
+            query_embeddings=np.ones((1, 2, 3), dtype=np.float32),
+            document_embeddings=np.ones((1, 2, 3), dtype=np.float32),
+            pos_doc_indices=[[0]],
+            batch_size=1,
+            num_negs=1,
+        )

@@ -33,9 +33,12 @@ def main() -> int:
     parser.add_argument(
         "--pooling",
         type=str,
-        choices=("avg", "weighted_avg", "cls", "last", "colbert"),
+        choices=("avg", "weighted_avg", "cls", "last"),
         default=None,
-        help="Pooling strategy to persist. Omit to keep saved metadata or the AutoModel default.",
+        help=(
+            "Single-vector pooling strategy to persist. Omit to keep saved metadata or the AutoModel default. "
+            "ColBERT/token-level pooling is not supported by the hard-negative miner."
+        ),
     )
     l2_group = parser.add_mutually_exclusive_group()
     l2_group.add_argument(

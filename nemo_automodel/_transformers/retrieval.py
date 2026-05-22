@@ -23,6 +23,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
@@ -35,6 +36,16 @@ logger = logging.get_logger(__name__)
 _RETRIEVAL_METADATA_KEY = "nemo_retrieval"
 _BI_ENCODER_DEFAULT_POOLING = "avg"
 _BI_ENCODER_DEFAULT_L2_NORMALIZE = True
+_HF_HUB_DOWNLOAD_CONFIG_KWARGS = {
+    "cache_dir",
+    "force_download",
+    "local_files_only",
+    "repo_type",
+    "revision",
+    "subfolder",
+    "token",
+}
+_AUTO_CONFIG_LOAD_KWARGS = _HF_HUB_DOWNLOAD_CONFIG_KWARGS - {"repo_type"}
 
 
 def _get_retrieval_metadata(config) -> dict:
@@ -43,20 +54,54 @@ def _get_retrieval_metadata(config) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
-def _load_encoder_config(model_name_or_path: str, trust_remote_code: bool = False):
-    """Load an encoder config and merge AutoModel v5 metadata when present."""
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
-    model_path = Path(model_name_or_path)
-    v5_config_path = model_path / "config.v5.json"
-    if not v5_config_path.exists():
-        return config
-
+def _load_v5_retrieval_metadata(config, v5_config_path: str | Path):
+    """Merge retrieval wrapper metadata from an AutoModel v5 config file."""
     with open(v5_config_path, "r") as f:
         v5_config = json.load(f)
 
     metadata = v5_config.get(_RETRIEVAL_METADATA_KEY)
     if isinstance(metadata, dict):
         setattr(config, _RETRIEVAL_METADATA_KEY, metadata)
+
+
+def _get_hf_hub_download_kwargs(hf_kwargs: dict) -> dict:
+    """Return kwargs that ``hf_hub_download`` accepts for config sidecars."""
+    return {key: value for key, value in hf_kwargs.items() if key in _HF_HUB_DOWNLOAD_CONFIG_KWARGS}
+
+
+def _get_auto_config_load_kwargs(hf_kwargs: dict) -> dict:
+    """Return kwargs that ``AutoConfig.from_pretrained`` should receive."""
+    return {key: value for key, value in hf_kwargs.items() if key in _AUTO_CONFIG_LOAD_KWARGS}
+
+
+def _load_encoder_config(model_name_or_path: str, trust_remote_code: bool = False, **hf_kwargs):
+    """Load an encoder config and merge AutoModel v5 metadata when present."""
+    model_id = str(model_name_or_path)
+    config = AutoConfig.from_pretrained(
+        model_id,
+        trust_remote_code=trust_remote_code,
+        **_get_auto_config_load_kwargs(hf_kwargs),
+    )
+    model_path = Path(model_id)
+    v5_config_path = model_path / "config.v5.json"
+    if v5_config_path.exists():
+        _load_v5_retrieval_metadata(config, v5_config_path)
+        return config
+
+    # Local directory exports write config.v5.json beside config.json. Hub exports need
+    # an explicit sidecar download because AutoConfig only loads config.json.
+    if os.path.isdir(model_id) or "/" not in model_id:
+        return config
+    try:
+        hub_v5_config_path = hf_hub_download(
+            repo_id=model_id,
+            filename="config.v5.json",
+            **_get_hf_hub_download_kwargs(hf_kwargs),
+        )
+    except Exception:
+        return config
+
+    _load_v5_retrieval_metadata(config, hub_v5_config_path)
     return config
 
 
@@ -330,7 +375,7 @@ def build_encoder_backbone(
     """
     config = loaded_config
     if config is None:
-        config = _load_encoder_config(model_name_or_path, trust_remote_code=trust_remote_code)
+        config = _load_encoder_config(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -472,7 +517,7 @@ class BiEncoderModel(nn.Module):
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        config = _load_encoder_config(model_name_or_path, trust_remote_code=trust_remote_code)
+        config = _load_encoder_config(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
         pooling, l2_normalize = _resolve_bi_encoder_options(config, pooling, l2_normalize)
         backbone = build_encoder_backbone(
             model_name_or_path,

@@ -309,7 +309,9 @@ dataloader:
 
 Important knobs:
 
-- `pooling`: controls how token hidden states become one embedding. Common choices are `avg`, `cls`, and `last`.
+- `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
+  `last`, and `weighted_avg`. The hard-negative miner supports only single-vector pooling modes; do not mine with
+  `colbert` pooling, which returns token-level embeddings.
 - `l2_normalize`: normalizes embeddings before scoring. When enabled, the recipe divides scores by `temperature`.
 - `q_max_len` and `p_max_len`: set separate truncation lengths for queries and passages.
 - `query_prefix` and `passage_prefix`: add task-specific text before tokenization. Keep these aligned between training,
@@ -571,6 +573,12 @@ Hard-negative mining expects the corpus ID-based retrieval JSON format described
 JSONL shortcut. The input must reference one corpus so the miner can build a passage embedding cache, retrieve
 candidates, and write mined negatives back to each query.
 
+The quickstart configs use `hf://` sources for the first train/eval path. The miner currently reads a local
+corpus-backed retrieval JSON file instead of `hf://` URIs directly. For a train -> mine -> retrain loop, first
+materialize or preprocess your selected HF subset into the corpus ID JSON schema from
+[Retrieval Dataset](retrieval-dataset.md), then set `--mining.train_qa_file_path` to that local JSON file. The mining
+commands below assume that local corpus-backed input.
+
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
 - `hard_negatives_to_mine`: target number of negatives to add per query. The miner can return fewer when the corpus has
@@ -593,8 +601,10 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
   rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
-  length, and world-size combination. Set `load_embeddings_from_cache: true` only when you intentionally want to reuse
-  every cached query shard, corpus chunk, and consolidated embedding file from the same model/input/prefix/length run.
+  length, and world-size combination. The miner validates a cache fingerprint before reuse, but fresh run-specific
+  paths are still easier to reason about. Set `load_embeddings_from_cache: true` only when you intentionally want to
+  reuse every cached query shard, corpus chunk, and consolidated embedding file from the same
+  model/input/prefix/length/world-size run.
 
 `pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
 `--mining.pooling` or `--mining.l2_normalize`; the miner rejects unknown mining keys. Mine from a saved bi-encoder export
@@ -609,6 +619,10 @@ uv run python examples/retrieval/data_utils/export_biencoder_with_metadata.py \
   --no-l2-normalize
 ```
 
+Hard-negative mining parallelizes embedding generation across ranks, but the final exact scoring step still runs on
+rank `0` and materializes the full document embedding matrix there. For very large corpora, use a smaller mining slice
+or a custom ANN/blockwise mining workflow instead of expecting this helper to scale to web-scale indexing.
+
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
 negative mining excludes document IDs listed in each input row's `pos_doc`, but it cannot read an external qrels file or
 know every semantically relevant duplicate. Put all known positive IDs for the query in the mining input, deduplicate the
@@ -620,8 +634,12 @@ Run the audit utility before reusing mined output:
 
 ```bash
 uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
-  /path/to/mined.json
+  /path/to/mined.json \
+  --allow-findings
 ```
+
+`--allow-findings` keeps this first inspection command from failing the shell when it finds issues. Omit it in CI or
+quality gates when findings should fail the job.
 
 If the report only contains issues that you want to drop automatically, write a cleaned copy:
 

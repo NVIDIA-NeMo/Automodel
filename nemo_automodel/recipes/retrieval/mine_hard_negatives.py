@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from pathlib import Path
@@ -38,6 +40,8 @@ EMPTY_QUESTION = "##### keep empty questions #####"
 # Cache file names
 QUERY_EMBEDDINGS_FNAME = "query_embeddings.npz"
 DOCUMENT_EMBEDDINGS_FNAME = "passage_embeddings.npz"
+EMBEDDINGS_CACHE_METADATA_FNAME = "embedding_cache_metadata.json"
+EMBEDDINGS_CACHE_METADATA_VERSION = 1
 CORPUS_CHUNKS_DIR = "corpus_chunks"
 QUERY_SHARDS_DIR = "query_shards"
 
@@ -209,6 +213,7 @@ class MineHardNegativesRecipe:
         # Embeddings (populated by _generate_embeddings)
         self.query_embeddings = None
         self.document_embeddings = None
+        self._reuse_partial_embedding_cache = False
 
         # Mining results (populated by _mine_hard_negatives)
         self.mined_neg_indices = None  # List[List[int]] - mined negative indices per query
@@ -252,6 +257,12 @@ class MineHardNegativesRecipe:
         )
         self.model = self.model.to(self.dist_env.device)
         self.model.eval()
+        if getattr(self.model, "pooling", None) == "colbert":
+            raise ValueError(
+                "Hard negative mining supports single-vector bi-encoder pooling modes only "
+                "('avg', 'weighted_avg', 'cls', or 'last'). ColBERT pooling returns token-level "
+                "embeddings and is not supported by this miner."
+            )
 
         # Load and configure tokenizer
         self._configure_tokenizer()
@@ -594,7 +605,7 @@ class MineHardNegativesRecipe:
         shard_path = shard_dir / f"queries_rank{r:04d}.npz"
 
         # Compute or load this rank's shard
-        if self.load_embeddings_from_cache and shard_path.exists():
+        if self._should_load_partial_cache(shard_path):
             local_embeds = _load_npz_array(shard_path)
         else:
             local_texts = self.questions[local_start:local_end]
@@ -639,7 +650,7 @@ class MineHardNegativesRecipe:
         Returns:
             Cached embeddings array, or None if cache doesn't exist.
         """
-        if not self.load_embeddings_from_cache or cache_path is None or not cache_path.exists():
+        if not self._should_load_partial_cache(cache_path):
             return None
 
         # In distributed runs, only rank0 needs the assembled chunk
@@ -676,7 +687,7 @@ class MineHardNegativesRecipe:
         rank_cache_path = cache_path.parent / f"{cache_path.stem}_rank{r:04d}{cache_path.suffix}"
 
         # Compute or load this rank's slice
-        if self.load_embeddings_from_cache and rank_cache_path.exists():
+        if self._should_load_partial_cache(rank_cache_path):
             local_embeds = _load_npz_array(rank_cache_path)
         else:
             local_texts = texts[local_start:local_end]
@@ -819,6 +830,143 @@ class MineHardNegativesRecipe:
             return np.concatenate(all_embeddings, axis=0) if all_embeddings else np.empty((0, 0), dtype=np.float32)
         return np.empty((0, 0), dtype=np.float32)
 
+    def _hash_cache_values(self, values: Optional[List[Any]]) -> str:
+        """Build a stable digest for ordered cache identity values."""
+        hasher = hashlib.sha256()
+        for value in values or []:
+            hasher.update(str(value).encode("utf-8"))
+            hasher.update(b"\0")
+        return hasher.hexdigest()
+
+    def _get_ordered_doc_ids(self) -> List[Any]:
+        """Return document IDs in embedding row order."""
+        if isinstance(self.idx_to_doc, dict):
+            return [self.idx_to_doc[idx] for idx in sorted(self.idx_to_doc)]
+        return list(self.idx_to_doc or [])
+
+    def _get_model_pooling(self):
+        """Return pooling metadata from the live model or cached model metadata."""
+        if hasattr(self, "_model_pooling"):
+            return self._model_pooling
+        if self.model is None:
+            return None
+        return getattr(self.model, "pooling", None)
+
+    def _get_model_l2_normalize(self):
+        """Return l2 metadata from the live model or cached model metadata."""
+        if hasattr(self, "_model_l2_normalize"):
+            return self._model_l2_normalize
+        if self.model is None:
+            return None
+        return getattr(self.model, "l2_normalize", None)
+
+    def _build_cache_fingerprint(self) -> Dict[str, Any]:
+        """Build the cache identity used to decide whether embeddings are reusable."""
+        return {
+            "model_name_or_path": str(self.model_name_or_path),
+            "tokenizer_name_or_path": str(self.tokenizer_name_or_path),
+            "train_qa_file_path": str(self.train_qa_file_path),
+            "corpus_path": str(self.corpus_path),
+            "query_prefix": self.query_prefix,
+            "passage_prefix": self.passage_prefix,
+            "query_max_length": self.query_max_length,
+            "passage_max_length": self.passage_max_length,
+            "add_bos_token": self.add_bos_token,
+            "add_eos_token": self.add_eos_token,
+            "attn_implementation": self.attn_implementation,
+            "pooling": self._get_model_pooling(),
+            "l2_normalize": self._get_model_l2_normalize(),
+            "world_size": getattr(self.dist_env, "world_size", 1),
+            "num_questions": len(self.questions or []),
+            "num_documents": len(self.idx_to_doc or {}),
+            "question_ids_hash": self._hash_cache_values(self.question_ids),
+            "questions_hash": self._hash_cache_values(self.questions),
+            "document_ids_hash": self._hash_cache_values(self._get_ordered_doc_ids()),
+        }
+
+    def _cache_metadata_path(self) -> Optional[Path]:
+        """Return the path to the embedding cache metadata file."""
+        if not self.cache_embeddings_dir:
+            return None
+        return Path(self.cache_embeddings_dir) / EMBEDDINGS_CACHE_METADATA_FNAME
+
+    def _load_cache_metadata(self) -> Optional[Dict[str, Any]]:
+        """Load embedding cache metadata if it exists and is valid JSON."""
+        metadata_path = self._cache_metadata_path()
+        if metadata_path is None or not metadata_path.exists():
+            return None
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning("Ignoring invalid embedding cache metadata at %s", metadata_path)
+            return None
+        return metadata if isinstance(metadata, dict) else None
+
+    def _cache_metadata_matches(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        query_shape: Optional[Tuple[int, ...]] = None,
+        document_shape: Optional[Tuple[int, ...]] = None,
+    ) -> bool:
+        """Check whether cache metadata matches the current mining run."""
+        if metadata is None:
+            logger.info("Embedding cache metadata is missing; recomputing embeddings.")
+            return False
+        if metadata.get("version") != EMBEDDINGS_CACHE_METADATA_VERSION:
+            logger.info("Embedding cache metadata version changed; recomputing embeddings.")
+            return False
+        if metadata.get("fingerprint") != self._build_cache_fingerprint():
+            logger.info("Embedding cache fingerprint does not match this mining run; recomputing embeddings.")
+            return False
+
+        expected_query_shape = metadata.get("query_shape")
+        expected_document_shape = metadata.get("document_shape")
+        if (
+            not isinstance(expected_query_shape, list)
+            or not expected_query_shape
+            or not isinstance(expected_document_shape, list)
+            or not expected_document_shape
+        ):
+            logger.info("Embedding cache metadata is missing shape information; recomputing embeddings.")
+            return False
+        if expected_query_shape[0] != len(self.questions or []):
+            logger.info("Query cache metadata shape does not match the current input; recomputing embeddings.")
+            return False
+        if expected_document_shape[0] != len(self.idx_to_doc or {}):
+            logger.info("Document cache metadata shape does not match the current corpus; recomputing embeddings.")
+            return False
+        if query_shape is not None and expected_query_shape != list(query_shape):
+            logger.info("Cached query embedding file shape differs from metadata; recomputing embeddings.")
+            return False
+        if document_shape is not None and expected_document_shape != list(document_shape):
+            logger.info("Cached document embedding file shape differs from metadata; recomputing embeddings.")
+            return False
+        return True
+
+    def _write_cache_metadata(self, query_embeddings: np.ndarray, document_embeddings: np.ndarray) -> None:
+        """Write embedding cache metadata after consolidated embeddings are saved."""
+        metadata_path = self._cache_metadata_path()
+        if metadata_path is None:
+            return
+        metadata = {
+            "version": EMBEDDINGS_CACHE_METADATA_VERSION,
+            "fingerprint": self._build_cache_fingerprint(),
+            "query_shape": list(query_embeddings.shape),
+            "document_shape": list(document_embeddings.shape),
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
+
+    def _should_load_partial_cache(self, cache_path: Optional[Path]) -> bool:
+        """Return whether query shard or corpus chunk caches may be reused."""
+        return (
+            self.load_embeddings_from_cache
+            and self._reuse_partial_embedding_cache
+            and cache_path is not None
+            and cache_path.exists()
+        )
+
     def _load_embeddings_from_cache(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Load query and document embeddings from cache.
 
@@ -837,19 +985,28 @@ class MineHardNegativesRecipe:
 
         query_embeddings = _load_npz_array(query_path)
         doc_embeddings = _load_npz_array(doc_path)
+        metadata = self._load_cache_metadata()
+        if not self._cache_metadata_matches(metadata, query_embeddings.shape, doc_embeddings.shape):
+            return None, None
 
         return query_embeddings, doc_embeddings
 
     def _has_full_embeddings_cache(self) -> bool:
-        """Check if the consolidated (rank0) embedding cache exists.
-
-        This is intentionally a lightweight existence check (no file reads), used to avoid
-        redundant IO on non-main ranks in distributed runs.
-        """
+        """Check if the consolidated (rank0) embedding cache matches this run."""
         if not self.cache_embeddings_dir:
             return False
         cache_dir = Path(self.cache_embeddings_dir)
-        return (cache_dir / QUERY_EMBEDDINGS_FNAME).exists() and (cache_dir / DOCUMENT_EMBEDDINGS_FNAME).exists()
+        query_path = cache_dir / QUERY_EMBEDDINGS_FNAME
+        doc_path = cache_dir / DOCUMENT_EMBEDDINGS_FNAME
+        if not query_path.exists() or not doc_path.exists():
+            return False
+        try:
+            query_shape = _load_npz_array(query_path).shape
+            doc_shape = _load_npz_array(doc_path).shape
+        except Exception:
+            logger.warning("Ignoring unreadable embedding cache under %s", cache_dir)
+            return False
+        return self._cache_metadata_matches(self._load_cache_metadata(), query_shape, doc_shape)
 
     def _save_embeddings_to_cache(
         self,
@@ -870,6 +1027,7 @@ class MineHardNegativesRecipe:
 
         np.savez(cache_dir / QUERY_EMBEDDINGS_FNAME, query_embeddings)
         np.savez(cache_dir / DOCUMENT_EMBEDDINGS_FNAME, document_embeddings)
+        self._write_cache_metadata(query_embeddings, document_embeddings)
 
         logger.info(f"Saved embeddings to cache: {cache_dir}")
 
@@ -886,6 +1044,7 @@ class MineHardNegativesRecipe:
         # In distributed runs, only rank0 needs the consolidated embeddings for mining.
         # To avoid redundant IO, rank0 checks for cache presence and broadcasts a cache_hit flag;
         # only rank0 reads the cache files.
+        self._reuse_partial_embedding_cache = self.load_embeddings_from_cache
         if self.load_embeddings_from_cache and self.cache_embeddings_dir:
             cache_hit = False
             if self.dist_env.world_size > 1 and torch.distributed.is_initialized():
@@ -903,7 +1062,8 @@ class MineHardNegativesRecipe:
                 if self.dist_env.is_main:
                     logger.info("Loading embeddings from cache (rank0 only)...")
                     query_embeddings, document_embeddings = self._load_embeddings_from_cache()
-                    assert query_embeddings is not None and document_embeddings is not None
+                    if query_embeddings is None or document_embeddings is None:
+                        raise RuntimeError("Embedding cache was marked reusable but failed validation during load.")
                     logger.info(
                         f"Loaded embeddings from cache: queries={query_embeddings.shape}, "
                         f"documents={document_embeddings.shape}"
@@ -914,6 +1074,7 @@ class MineHardNegativesRecipe:
 
             if self.dist_env.is_main:
                 logger.info("Cache not found or incomplete, generating embeddings...")
+            self._reuse_partial_embedding_cache = False
 
         # Generate query embeddings (shard across ranks if distributed)
         query_embeddings = None
@@ -1013,6 +1174,12 @@ class MineHardNegativesRecipe:
                 - neg_scores: Similarity scores for each hard negative
                 - pos_scores: Similarity scores for each positive document
         """
+        if query_embeddings.ndim != 2 or document_embeddings.ndim != 2:
+            raise ValueError(
+                "Hard negative mining supports 2D single-vector embeddings only. "
+                "Token-level embeddings such as ColBERT pooling are not supported by this miner."
+            )
+
         # Convert document embeddings to tensor once (encoder embeddings are 2D)
         device = self.dist_env.device
         doc_embeddings_tensor = torch.tensor(document_embeddings, device=device)
@@ -1035,6 +1202,7 @@ class MineHardNegativesRecipe:
             # Compute similarity scores: [batch_size, num_docs]
             batch_query_tensor = torch.tensor(batch_query_embs, device=device)
             batch_scores = batch_query_tensor @ doc_embeddings_tensor.T
+            batch_scores[~torch.isfinite(batch_scores)] = float("-inf")
 
             # Extract positive scores and mask positives
             min_pos_scores = []  # Minimum positive score per query (for margin filtering)
