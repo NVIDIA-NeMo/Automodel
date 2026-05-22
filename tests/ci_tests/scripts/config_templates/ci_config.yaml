@@ -1,0 +1,126 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Consumed by config_resolver.py.
+#
+# Resolution stack (last wins):
+#   1. Recipe top-level
+#   2. phases[<phase>]       defaults per phase
+#   3. conditional[...]      recipe-name-pattern overrides
+#   4. recipe.ci.<phase>     per-recipe overrides
+#   5. env[...]              env-driven overrides
+#   6. computed[...]         per-run dynamic values
+#
+# Override targets are flat dotted keys into the recipe's top-level config.
+# `fixture_keys` (see bottom) lists keys to skip when applying recipe.ci.<phase>.
+
+phases:
+  nightly: &nightly_defaults
+    step_scheduler.max_steps: 50
+    step_scheduler.ckpt_every_steps: 50
+    step_scheduler.val_every_steps: 50
+
+  release: *nightly_defaults
+
+  convergence:
+    step_scheduler.max_steps: 200
+    step_scheduler.ckpt_every_steps: 200
+    step_scheduler.val_every_steps: 200
+    wandb.entity: Nemo-automodel
+    wandb.dir: /tmp/wandb/
+
+  performance: {}
+
+  # Phase key matches the recipe's ci.checkpoint_robustness section so per-recipe
+  # overrides resolve naturally.
+  checkpoint_robustness:
+    step_scheduler.max_steps: 5
+    step_scheduler.ckpt_every_steps: 5
+    step_scheduler.val_every_steps: 5
+    step_scheduler.global_batch_size: 32
+    step_scheduler.local_batch_size: 2
+    checkpoint.enabled: true
+    checkpoint.model_save_format: safetensors
+    checkpoint.save_consolidated: true
+
+# Recipe-name-pattern overrides. Predicate keys:
+#   when_recipe_contains_all   stem must contain every listed substring
+#   when_recipe_contains_any   stem must contain at least one
+# `phases` is optional (default = all). `apply` values support {var} substitution.
+conditional:
+  # customizer_* recipes use sample datasets under NEMO_CI_PATH;
+  # the chat-flavored subset overrides to chat paths (last-wins).
+  - when_recipe_contains_all: [customizer_]
+    apply:
+      dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/prompt_completion/train.jsonl"
+      validation_dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/prompt_completion/validation.jsonl"
+
+  - when_recipe_contains_all: [customizer_, chat]
+    apply:
+      dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/chat/train.jsonl"
+      validation_dataset.path_or_dataset_id: "{NEMO_CI_PATH}/datasets/customizer/sample-datasets/chat/validation.jsonl"
+
+  # peft/lora recipes disable triton in the robustness pytest harness.
+  - when_recipe_contains_any: [peft, lora]
+    phases: [checkpoint_robustness]
+    apply:
+      peft.use_triton: false
+
+# Env var -> { target, phases }. Applied iff env is set and phase matches.
+# Values coerced to int -> float -> str.
+env:
+  MAX_STEPS:
+    target: step_scheduler.max_steps
+    phases: [nightly, release, convergence, performance]
+  LOCAL_BATCH_SIZE:
+    target: step_scheduler.local_batch_size
+    phases: [nightly, release, convergence, performance]
+
+# Computed dynamic overrides. `format` is str.format() over env vars + built-in `date`.
+computed:
+  - target: checkpoint.checkpoint_dir
+    format: "{PIPELINE_DIR}/{TEST_NAME}/checkpoint"
+    phases: [nightly, release, convergence, performance]
+
+  - target: checkpoint.checkpoint_dir
+    format: "{PIPELINE_DIR}/{TEST_NAME}/robustness_checkpoint"
+    phases: [checkpoint_robustness]
+
+  - target: wandb.name
+    format: "{TEST_NAME}"
+    phases: [convergence]
+
+  - target: wandb.project
+    format: "automodel-convergence-test-{date:%Y%m%d}"
+    phases: [convergence]
+
+# Keys in recipe.ci.<phase> that are read by phase-specific consumers (pytest
+# fixtures, etc.) -- NOT config overrides. The resolver leaves them in the
+# resolved YAML's ci.<phase> block but does not apply them to the top-level.
+fixture_keys:
+  checkpoint_robustness:
+    - check_fused_qkv_keys
+    - check_phantom_keys
+    - check_resume
+    - cross_tp_kl_threshold
+    - cross_tp_size
+    - experts_implementation
+    - hf_device_map_auto
+    - hf_kl_threshold
+    - kl_threshold
+    - no_check_resume
+    - resume_loss_threshold
+    - skip_hf_reload
+    - tokenizer_name
+    - trust_remote_code
