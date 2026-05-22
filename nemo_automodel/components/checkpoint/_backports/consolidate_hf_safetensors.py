@@ -35,16 +35,78 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
     DATA_OFFSETS_KEY,
     DEFAULT_EXTRA_METADATA_KEY,
     DTYPE_KEY,
+    DTYPE_MAP,
     SAVED_OFFSETS_KEY,
     SHAPE_KEY,
     SUFFIX,
     _gen_file_name,
     _get_dcp_custom_metadata,
+    _get_dtype,
     _get_safetensors_file_metadata,
     _metadata_fn,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_DTYPE_CAST_ALIASES: dict[str, torch.dtype] = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "half": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "fp64": torch.float64,
+    "float64": torch.float64,
+    "double": torch.float64,
+}
+
+_DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {dtype: key for key, dtype in DTYPE_MAP.items()}
+
+
+def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
+    """Resolve an optional dtype cast name into a torch dtype."""
+    if dtype_name is None:
+        return None
+
+    normalized = dtype_name.lower().removeprefix("torch.").replace("_", "").replace("-", "")
+    if normalized in ("", "none"):
+        return None
+
+    if normalized not in _DTYPE_CAST_ALIASES:
+        supported = ", ".join(sorted(_DTYPE_CAST_ALIASES))
+        raise ValueError(f"Unsupported target dtype: {dtype_name}. Supported values: {supported}")
+    return _DTYPE_CAST_ALIASES[normalized]
+
+
+def _get_known_dtype(dtype_str: str) -> torch.dtype:
+    """Return the torch dtype for a safetensors dtype string."""
+    if dtype_str in DTYPE_MAP:
+        return DTYPE_MAP[dtype_str]
+    return _get_dtype(dtype_str)
+
+
+def _get_dtype_size(dtype: torch.dtype) -> int:
+    """Return the serialized element size for a torch dtype."""
+    try:
+        return torch.finfo(dtype).bits // 8
+    except TypeError:
+        return torch.empty((), dtype=dtype).element_size()
+
+
+def _get_safetensors_dtype_str(dtype: torch.dtype) -> str:
+    """Return the safetensors dtype string for a supported torch dtype."""
+    try:
+        return _DTYPE_TO_SAFETENSORS_DTYPE[dtype]
+    except KeyError as e:
+        raise ValueError(f"Unsupported target dtype for safetensors consolidation: {dtype}") from e
+
+
+def _should_cast_dtype(source_dtype: torch.dtype, target_dtype: torch.dtype | None) -> bool:
+    """Return True when a tensor should be cast to the requested output dtype."""
+    if target_dtype is None or source_dtype == target_dtype:
+        return False
+    return torch.empty((), dtype=source_dtype).is_floating_point()
 
 
 @dataclass
@@ -57,12 +119,16 @@ class _FqnData:
         shape_in_file: Shape of the tensor in the output file
         dtype_size: Size of the tensor's data type in bytes
         dtype_str: String representation of the tensor's data type
+        source_dtype_size: Size of the source tensor's data type in bytes
+        source_dtype_str: String representation of the source tensor's data type
     """
 
     offset_in_file: int = 0
     shape_in_file: list[int] = field(default_factory=list)
     dtype_size: int = 0
     dtype_str: str = ""
+    source_dtype_size: int = 0
+    source_dtype_str: str = ""
 
 
 @dataclass
@@ -96,6 +162,7 @@ class _InputFileData:
 def _parse_input_metadata(
     input_files_data: dict[str, _InputFileData],
     output_files_data: dict[str, _OutputFileData],
+    target_dtype: torch.dtype | None = None,
 ) -> None:
     """
     Parse metadata from input safetensors files to determine the full tensor shapes and types.
@@ -110,8 +177,6 @@ def _parse_input_metadata(
     Raises:
         ValueError: If no DCP custom metadata is found in a safetensors file
     """
-
-    from safetensors.torch import _getdtype  # type: ignore[import]
 
     # Dictionary to track the full size of each tensor across all shards
     fqn_to_size_mapping: dict[str, tuple[list[int], str]] = {}
@@ -149,15 +214,17 @@ def _parse_input_metadata(
         for output_data in output_files_data.values():
             # Add this tensor to the output file if it's already assigned there
             if fqn in output_data.fqn_data:
-                dtype = _getdtype(dtype_str)
-                try:
-                    dtype_size = torch.finfo(dtype).bits // 8  # Convert bits to bytes
-                except TypeError:
-                    dtype_size = torch.tensor([], dtype=dtype).element_size()
+                source_dtype = _get_known_dtype(dtype_str)
+                output_dtype = target_dtype if _should_cast_dtype(source_dtype, target_dtype) else source_dtype
+                output_dtype_str = (
+                    _get_safetensors_dtype_str(output_dtype) if output_dtype != source_dtype else dtype_str
+                )
                 output_data.fqn_data[fqn] = _FqnData(
                     shape_in_file=tensor_size,
-                    dtype_size=dtype_size,
-                    dtype_str=dtype_str,
+                    dtype_size=_get_dtype_size(output_dtype),
+                    dtype_str=output_dtype_str,
+                    source_dtype_size=_get_dtype_size(source_dtype),
+                    source_dtype_str=dtype_str,
                 )
 
 
@@ -271,7 +338,7 @@ def _process_output_file(
         # Process each tensor in sequential output order
         for tensor_fqn, tensor_fqn_data in sorted_tensors:
             full_tensor_mv = memoryview(
-                bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.dtype_size)
+                bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.source_dtype_size)
             )
 
             # Process each input safetensors file
@@ -302,13 +369,39 @@ def _process_output_file(
                 _write_sub_tensor_to_file_optimized(
                     full_tensor_mv,
                     data_to_write,
-                    tensor_fqn_data.dtype_size,  # Size of each element in bytes
+                    tensor_fqn_data.source_dtype_size,  # Size of each source element in bytes
                     tensor_fqn_data.shape_in_file,  # Full tensor shape
                     offsets_of_tensor_being_read,  # Where this shard belongs in the full tensor
                     metadata[SHAPE_KEY],  # Shape of this shard
                 )
 
-            output_stream.write(full_tensor_mv)
+            if tensor_fqn_data.source_dtype_str == tensor_fqn_data.dtype_str:
+                output_stream.write(full_tensor_mv)
+            else:
+                output_stream.write(
+                    _cast_tensor_bytes(
+                        full_tensor_mv,
+                        tensor_fqn_data.shape_in_file,
+                        tensor_fqn_data.source_dtype_str,
+                        tensor_fqn_data.dtype_str,
+                    )
+                )
+
+
+def _cast_tensor_bytes(
+    tensor_bytes: memoryview,
+    tensor_shape: list[int],
+    source_dtype_str: str,
+    target_dtype_str: str,
+) -> bytes:
+    """Cast a contiguous tensor byte buffer from its source dtype to the target dtype."""
+    source_dtype = _get_known_dtype(source_dtype_str)
+    target_dtype = _get_known_dtype(target_dtype_str)
+    tensor = torch.frombuffer(tensor_bytes, dtype=source_dtype)
+    if tensor_shape:
+        tensor = tensor.reshape(tensor_shape)
+    cast_tensor = tensor.to(dtype=target_dtype).contiguous()
+    return cast_tensor.view(torch.uint8).numpy().tobytes()
 
 
 def _write_data(
@@ -335,24 +428,25 @@ def _write_data(
     else:
         # Parallel processing with ThreadPoolExecutor
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_threads, len(output_files_data))) as executor:
-            futures = []
+            futures = {}
             for output_file, output_data in output_files_data.items():
-                futures.append(
+                futures[
                     executor.submit(
                         _process_output_file,
                         output_file,
                         output_data,
                         input_files_data,
                     )
-                )
+                ] = output_file
 
             # Wait for all futures to complete
             for future in concurrent.futures.as_completed(futures):
                 # Handle any exceptions that might have occurred
+                output_file = futures[future]
                 try:
                     future.result()
-                except Exception as e:
-                    print(f"Error processing output file: {e}")
+                except Exception:
+                    logger.exception("Error processing output file %s.", os.path.basename(output_file))
                     raise
 
 
@@ -536,6 +630,7 @@ def _write_overall_metadata_file_from_shards(
     input_dir: str,
     output_dir: str,
     fqn_to_index_mapping: dict[str, int],
+    target_dtype: torch.dtype | None = None,
 ) -> None:
     """
     Write the overall metadata file by reading metadata from input shard files.
@@ -550,8 +645,6 @@ def _write_overall_metadata_file_from_shards(
         output_dir: Directory where the metadata file will be written
         fqn_to_index_mapping: Mapping from tensor names to output file indices
     """
-    from safetensors.torch import _getdtype  # type: ignore[import]
-
     # Find all safetensors files in the input directory
     safetensors_files = glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))
 
@@ -596,11 +689,9 @@ def _write_overall_metadata_file_from_shards(
     weight_map = {}
 
     for fqn, (tensor_shape, dtype_str) in fqn_to_size_mapping.items():
-        dtype = _getdtype(dtype_str)
-        try:
-            dtype_size = torch.finfo(dtype).bits // 8
-        except TypeError:
-            dtype_size = torch.tensor([], dtype=dtype).element_size()
+        source_dtype = _get_known_dtype(dtype_str)
+        output_dtype = target_dtype if _should_cast_dtype(source_dtype, target_dtype) else source_dtype
+        dtype_size = _get_dtype_size(output_dtype)
 
         total_size += math.prod(tensor_shape) * dtype_size
 
@@ -624,6 +715,7 @@ def _consolidate_safetensors_files(
     num_threads: int,
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
+    target_dtype: torch.dtype | None = None,
 ) -> dict[str, _OutputFileData]:
     # Build output paths
     output_files_data: dict[str, _OutputFileData] = {}
@@ -666,7 +758,7 @@ def _consolidate_safetensors_files(
                 temp_to_final_mapping[temp_path] = final_path
 
             # Step 1: Parse metadata to determine tensor shapes and types
-            _parse_input_metadata(input_files_data, temp_output_files_data)
+            _parse_input_metadata(input_files_data, temp_output_files_data, target_dtype)
 
             # Step 2: Write metadata headers to temp output files
             _write_metadata(temp_output_files_data)
@@ -685,7 +777,7 @@ def _consolidate_safetensors_files(
     else:
         # Write directly to output directory
         # Step 1: Parse metadata to determine tensor shapes and types
-        _parse_input_metadata(input_files_data, output_files_data)
+        _parse_input_metadata(input_files_data, output_files_data, target_dtype)
 
         # Step 2: Write metadata headers to output files
         _write_metadata(output_files_data)
@@ -703,6 +795,7 @@ def consolidate_safetensors_files(
     num_threads: int = 1,
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
+    target_dtype: torch.dtype | None = None,
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
@@ -727,20 +820,28 @@ def consolidate_safetensors_files(
         staging_dir: Optional directory for staging files during consolidation. If provided,
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
+        target_dtype: Optional dtype used to cast floating-point tensors during consolidation.
     """
     start_time = time.time()
-    logger.info(
-        "Consolidating safetensors files from %s to %s. Beginning at time %f",
-        input_dir,
-        output_dir,
-        start_time,
-    )
+    logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
+    if target_dtype is not None:
+        logger.info(
+            "Requested target dtype %s for consolidation. Only floating-point tensors with a different "
+            "source dtype will be cast; tensors already in this dtype and non-floating tensors are unchanged.",
+            target_dtype,
+        )
 
     max_index = max(fqn_to_index_mapping.values())
     fqn_to_file_mapping = {fqn: _gen_file_name(idx, max_index) for fqn, idx in fqn_to_index_mapping.items()}
 
     output_files_data = _consolidate_safetensors_files(
-        input_dir, output_dir, fqn_to_file_mapping, num_threads, use_staging, staging_dir
+        input_dir=input_dir,
+        output_dir=output_dir,
+        fqn_to_file_mapping=fqn_to_file_mapping,
+        num_threads=num_threads,
+        use_staging=use_staging,
+        staging_dir=staging_dir,
+        target_dtype=target_dtype,
     )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
@@ -757,6 +858,7 @@ def consolidate_safetensors_files_on_every_rank(
     process_group: Optional[dist.ProcessGroup] = None,
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
+    target_dtype: torch.dtype | None = None,
 ) -> None:
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
@@ -780,6 +882,7 @@ def consolidate_safetensors_files_on_every_rank(
         staging_dir: Optional directory for staging files during consolidation. If provided,
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
+        target_dtype: Optional dtype used to cast floating-point tensors during consolidation.
     """
 
     start_time = time.time()
@@ -792,13 +895,14 @@ def consolidate_safetensors_files_on_every_rank(
         rank = 0
         world_size = 1
         logger.warning("Distributed environment not initialized. Running in single process mode.")
-    logger.info(
-        "Rank %d/%d: Consolidating safetensors files from %s to %s",
-        rank,
-        world_size,
-        input_dir,
-        output_dir,
-    )
+    if rank == 0:
+        logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
+        if target_dtype is not None:
+            logger.info(
+                "Requested target dtype %s for consolidation. Only floating-point tensors with a different "
+                "source dtype will be cast; tensors already in this dtype and non-floating tensors are unchanged.",
+                target_dtype,
+            )
 
     # Find all unique indices in the mapping
     unique_indices = set(fqn_to_index_mapping.values())
@@ -810,15 +914,16 @@ def consolidate_safetensors_files_on_every_rank(
         if (idx - 1) % world_size == rank:
             indices_for_this_rank.append(idx)
 
-    logger.debug(
-        "Rank %d: Assigned %d output files out of %d total files",
-        rank,
-        len(indices_for_this_rank),
-        len(unique_indices),
-    )
-
     # Filter the fqn_to_index_mapping to only include tensors for this rank
     filtered_mapping = {fqn: idx for fqn, idx in fqn_to_index_mapping.items() if idx in indices_for_this_rank}
+    logger.debug(
+        "Rank %d/%d: assigned %d of %d output file(s) (%d tensor(s)).",
+        rank,
+        world_size,
+        len(indices_for_this_rank),
+        len(unique_indices),
+        len(filtered_mapping),
+    )
 
     if filtered_mapping:
         # Convert index mapping to filename mapping
@@ -836,11 +941,12 @@ def consolidate_safetensors_files_on_every_rank(
             num_threads=num_threads,
             use_staging=use_staging,
             staging_dir=staging_dir,
+            target_dtype=target_dtype,
         )
 
     # Write overall model.index.safetensors.json file with weight map (rank 0 only)
     if rank == 0:
-        _write_overall_metadata_file_from_shards(input_dir, output_dir, fqn_to_index_mapping)
+        _write_overall_metadata_file_from_shards(input_dir, output_dir, fqn_to_index_mapping, target_dtype)
 
     logger.debug(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",

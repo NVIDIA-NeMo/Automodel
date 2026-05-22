@@ -38,6 +38,7 @@ import torch.distributed as dist
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
+    resolve_dtype_cast,
 )
 from nemo_automodel.components.checkpoint._backports.hf_storage import _maybe_rename_index_for_diffusers
 from nemo_automodel.components.distributed.init_utils import (
@@ -59,7 +60,27 @@ def _configure_logging() -> None:
     )
 
 
-def copy_metadata_files(input_dir: str, output_dir: str) -> None:
+def _config_torch_dtype_value(dtype: torch.dtype) -> str:
+    """Return the dtype string expected in Hugging Face config.json."""
+    return str(dtype).removeprefix("torch.")
+
+
+def _update_config_dtype(config_path: str, target_dtype: torch.dtype) -> None:
+    """Update config.json torch_dtype to match a requested consolidated weight dtype."""
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except json.JSONDecodeError:
+        logger.warning("Could not update torch_dtype in %s because it is not valid JSON.", config_path)
+        return
+
+    config["torch_dtype"] = _config_torch_dtype_value(target_dtype)
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+
+
+def copy_metadata_files(input_dir: str, output_dir: str, target_dtype: torch.dtype | None = None) -> None:
     """Copy metadata files from the temporary metadata directory."""
     for item_name in os.listdir(input_dir):
         if item_name == "fqn_to_file_index_mapping.json":
@@ -70,6 +91,8 @@ def copy_metadata_files(input_dir: str, output_dir: str) -> None:
             shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
         else:
             shutil.copy2(src_path, dst_path)
+        if target_dtype is not None and item_name == "config.json" and os.path.isfile(dst_path):
+            _update_config_dtype(dst_path, target_dtype)
 
 
 def _has_consolidated_output(output_dir: str) -> bool:
@@ -125,6 +148,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rename the safetensors index to the Diffusers-compatible filename after consolidation.",
     )
+    parser.add_argument(
+        "--target-dtype",
+        default=None,
+        help=(
+            "Optional dtype for floating-point tensors in the consolidated checkpoint. "
+            "Supported aliases include bf16, bfloat16, fp16, float16, fp32, and float32. "
+            "Integer tensors keep their original dtype."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -133,6 +165,7 @@ def main() -> None:
 
     _configure_logging()
     args = parse_args()
+    target_dtype = resolve_dtype_cast(args.target_dtype)
 
     backend = args.backend
     if backend == "auto":
@@ -160,21 +193,19 @@ def main() -> None:
     with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "r") as f:
         fqn_to_index_mapping = json.load(f)
 
-    if get_rank_safe() == 0:
-        logger.info("Consolidating sharded HF safetensors from %s to %s.", args.input_dir, args.output_dir)
-
     consolidate_safetensors_files_on_every_rank(
         args.input_dir,
         args.output_dir,
         fqn_to_index_mapping,
         num_threads=args.num_threads,
+        target_dtype=target_dtype,
     )
 
     if get_world_size_safe() > 1:
         dist.barrier()
 
     if get_rank_safe() == 0:
-        copy_metadata_files(hf_metadata_dir, args.output_dir)
+        copy_metadata_files(hf_metadata_dir, args.output_dir, target_dtype=target_dtype)
         if args.diffusers_compatible:
             _maybe_rename_index_for_diffusers(args.output_dir)
 

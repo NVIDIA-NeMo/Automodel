@@ -121,6 +121,14 @@ NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolida
 sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/checkpoints/epoch_0_step_20/model/consolidate.sh'
 ```
 
+You can request a floating-point dtype cast during offline export:
+
+```bash
+TARGET_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
+```
+
+This option is usually not needed for FSDP2 training because the default mixed precision policy saves parameters as BF16. It is mainly useful for checkpoints saved with FP32 parameters, or for older/custom training configurations where the sharded safetensors dtype differs from the Hugging Face export dtype you want. Only floating-point tensors with a different source dtype are cast; tensors already in the target dtype and non-floating tensors are left unchanged.
+
 The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
 import torch

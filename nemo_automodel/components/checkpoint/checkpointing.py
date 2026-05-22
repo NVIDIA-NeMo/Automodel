@@ -972,11 +972,17 @@ set -euo pipefail
 #   NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"
 # Slurm example:
 #   sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/consolidate.sh'
+# Optional: set TARGET_DTYPE=bf16 to request a floating-point dtype cast during export.
 NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
 NUM_THREADS="${{NUM_THREADS:-5}}"
+TARGET_DTYPE="${{TARGET_DTYPE:-}}"
 PYTHON="${{PYTHON:-python3}}"
 TORCHRUN="${{TORCHRUN:-torchrun}}"
 PYTHON_MODULE="${{PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}}"
+TARGET_DTYPE_ARGS=()
+if [[ -n "${{TARGET_DTYPE}}" ]]; then
+  TARGET_DTYPE_ARGS=(--target-dtype "${{TARGET_DTYPE}}")
+fi
 
 if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
   "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" -m "${{PYTHON_MODULE}}" \\
@@ -984,14 +990,16 @@ if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
     --num-threads "${{NUM_THREADS}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
-    --output-dir "{output_dir}"{diffusers_arg}
+    --output-dir "{output_dir}"{diffusers_arg} \\
+    "${{TARGET_DTYPE_ARGS[@]}}"
 else
   "${{PYTHON}}" -m "${{PYTHON_MODULE}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
-    --output-dir "{output_dir}"{diffusers_arg}
+    --output-dir "{output_dir}"{diffusers_arg} \\
+    "${{TARGET_DTYPE_ARGS[@]}}"
 fi
 """
         with open(script_path, "w") as f:

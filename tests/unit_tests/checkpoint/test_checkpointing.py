@@ -1134,12 +1134,15 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert os.access(script_path, os.X_OK)
         assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
         assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
+        assert 'TARGET_DTYPE="${TARGET_DTYPE:-}"' in script
         assert 'PYTHON="${PYTHON:-python3}"' in script
         assert 'PYTHON_MODULE="${PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}"' in script
         assert "CONSOLIDATION_TOOL" not in script
         assert 'NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"' in script
         assert "NPROC_PER_NODE * NUM_THREADS within your CPU allocation" in script
         assert "sbatch --cpus-per-task=80" in script
+        assert "TARGET_DTYPE=bf16" in script
+        assert 'TARGET_DTYPE_ARGS=(--target-dtype "${TARGET_DTYPE}")' in script
         assert '-m "${PYTHON_MODULE}" \\' in script
         assert "--backend gloo \\" in script
         assert '--model-name "test/model" \\' in script
@@ -1250,12 +1253,13 @@ class TestOfflineHFConsolidationTool:
             str(output_dir),
             {"w": 1},
             num_threads=5,
+            target_dtype=None,
         )
         mock_rename.assert_called_once_with(str(output_dir))
         assert metadata_dir.exists()
         assert metadata_file.exists()
         assert (output_dir / "config.json").exists()
-        assert f"Consolidating sharded HF safetensors from {input_dir} to {output_dir}." in caplog.text
+        assert f"Consolidating sharded HF safetensors from {input_dir} to {output_dir}." not in caplog.text
         assert f"Successfully exported consolidated HF safetensors to {output_dir}." in caplog.text
 
     def test_main_skips_when_output_exists_and_metadata_was_consumed(self, tmp_path, monkeypatch, caplog):
@@ -1293,6 +1297,55 @@ class TestOfflineHFConsolidationTool:
 
         mock_consolidate.assert_not_called()
         assert f"Consolidated HF safetensors already exist at {output_dir}" in caplog.text
+
+    def test_main_passes_target_dtype_and_updates_config(self, tmp_path, monkeypatch, caplog):
+        from nemo_automodel.tools import offline_hf_consolidation as tool
+
+        input_dir = tmp_path / "model"
+        metadata_dir = input_dir / ".hf_metadata"
+        output_dir = input_dir / "consolidated"
+        metadata_dir.mkdir(parents=True)
+        with open(metadata_dir / "fqn_to_file_index_mapping.json", "w") as f:
+            json.dump({"w": 1}, f)
+        with open(metadata_dir / "config.json", "w") as f:
+            json.dump({"torch_dtype": "float32"}, f)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "offline_hf_consolidation",
+                "--backend",
+                "gloo",
+                "--model-name",
+                "test/model",
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--target-dtype",
+                "bf16",
+            ],
+        )
+        caplog.set_level(logging.INFO)
+
+        with (
+            patch.object(tool, "initialize_distributed"),
+            patch.object(tool, "get_world_size_safe", return_value=1),
+            patch.object(tool, "get_rank_safe", return_value=0),
+            patch.object(tool, "consolidate_safetensors_files_on_every_rank") as mock_consolidate,
+        ):
+            tool.main()
+
+        mock_consolidate.assert_called_once_with(
+            str(input_dir),
+            str(output_dir),
+            {"w": 1},
+            num_threads=5,
+            target_dtype=torch.bfloat16,
+        )
+        with open(output_dir / "config.json", "r") as f:
+            assert json.load(f)["torch_dtype"] == "bfloat16"
+        assert "Casting floating-point tensors" not in caplog.text
 
 
 # =============================================================================
