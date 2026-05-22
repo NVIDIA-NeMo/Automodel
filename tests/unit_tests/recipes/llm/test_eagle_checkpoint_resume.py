@@ -152,6 +152,20 @@ def test_eagle3_extra_state_roundtrip_includes_vocab_mapping(tmp_path):
     assert torch.equal(fresh._module().selected_token_mask, custom_mask)
 
 
+def test_eagle1_load_extra_state_accepts_legacy_filename(tmp_path):
+    """Old checkpoints (pre-refactor) used ``eagle1_meta.pt``. New code reads either."""
+    save_dir = str(tmp_path / "ckpt")
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(
+        {"global_step": 5, "epoch": 2},
+        os.path.join(save_dir, "eagle1_meta.pt"),
+    )
+    recipe = _bare_eagle1_recipe(tmp_path)
+    recipe._load_extra_state(save_dir)
+    assert recipe.runtime.global_step == 5
+    assert recipe._resume_epoch == 2
+
+
 def test_eagle3_load_extra_state_accepts_legacy_filename(tmp_path):
     """Old checkpoints (pre-refactor) used ``eagle3_meta.pt``. New code reads either."""
     save_dir = str(tmp_path / "ckpt")

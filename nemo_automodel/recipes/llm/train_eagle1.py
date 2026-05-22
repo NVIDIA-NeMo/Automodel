@@ -387,6 +387,9 @@ class TrainEagle1Recipe(BaseRecipe):
     def _load_extra_state(self, ckpt_dir: str) -> None:
         """Restore EAGLE-recipe-specific scalars. Subclasses extend this."""
         meta_path = os.path.join(ckpt_dir, "eagle_meta.pt")
+        if not os.path.exists(meta_path):
+            legacy = os.path.join(ckpt_dir, "eagle1_meta.pt")
+            meta_path = legacy if os.path.exists(legacy) else meta_path
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
