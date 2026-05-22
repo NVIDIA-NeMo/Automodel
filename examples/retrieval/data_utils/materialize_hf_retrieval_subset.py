@@ -62,6 +62,7 @@ def main() -> int:
     tmp_corpus_dir = Path(tempfile.mkdtemp(prefix=f".{args.subset}_corpus.", dir=output_dir))
     tmp_train_path = None
     backup_corpus_dir = None
+    committed = False
     try:
         doc_rows = []
         for doc_id in corpus_info.get_all_ids():
@@ -93,18 +94,17 @@ def main() -> int:
         tmp_corpus_dir = None
         tmp_train_path.replace(output_dir / "train.json")
         tmp_train_path = None
-    except Exception:
-        if backup_corpus_dir is not None and backup_corpus_dir.exists():
+        committed = True
+    finally:
+        if not committed and backup_corpus_dir is not None and backup_corpus_dir.exists():
             if corpus_dir.exists():
                 shutil.rmtree(corpus_dir)
             shutil.move(str(backup_corpus_dir), str(corpus_dir))
-        raise
-    finally:
         if tmp_corpus_dir is not None and tmp_corpus_dir.exists():
             shutil.rmtree(tmp_corpus_dir)
         if tmp_train_path is not None and tmp_train_path.exists():
             tmp_train_path.unlink()
-        if backup_corpus_dir is not None and backup_corpus_dir.exists():
+        if committed and backup_corpus_dir is not None and backup_corpus_dir.exists():
             shutil.rmtree(backup_corpus_dir)
 
     logger.info("Wrote %s records and %s corpus documents to %s", len(data_list), len(doc_rows), output_dir)

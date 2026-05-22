@@ -20,6 +20,8 @@ import hashlib
 import json
 import logging
 import math
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -641,7 +643,9 @@ class MineHardNegativesRecipe:
 
         # Compute or load this rank's shard
         local_expected = local_end - local_start
-        local_embeds = self._load_partial_cache_shard(shard_path, local_expected, "query shard")
+        local_embeds = self._load_partial_cache_shard(
+            shard_path, local_expected, "query shard", self._get_cached_embedding_width("query_shape")
+        )
         if local_embeds is None:
             local_texts = self.questions[local_start:local_end]
             local_embeds = self._encode_texts(
@@ -679,8 +683,9 @@ class MineHardNegativesRecipe:
         cache_path: Path,
         expected_size: Optional[int] = None,
         label: str = "embedding shard",
+        expected_width: Optional[int] = None,
     ) -> Optional[np.ndarray]:
-        """Load a reusable partial cache shard, validating readability and row count."""
+        """Load a reusable partial cache shard, validating readability and shape."""
         if not self._should_load_partial_cache(cache_path):
             return None
 
@@ -688,6 +693,10 @@ class MineHardNegativesRecipe:
             cached_shard = _load_npz_array(cache_path)
         except Exception as exc:
             logger.warning("Ignoring unreadable %s cache %s: %s", label, cache_path, exc)
+            return None
+
+        if cached_shard.ndim != 2:
+            logger.info("Cached %s %s is %sD, expected 2D; recomputing shard.", label, cache_path, cached_shard.ndim)
             return None
 
         if expected_size is not None and cached_shard.shape[0] != expected_size:
@@ -700,11 +709,34 @@ class MineHardNegativesRecipe:
             )
             return None
 
+        if expected_width is not None and expected_size != 0 and cached_shard.shape[1] != expected_width:
+            logger.info(
+                "Cached %s %s has embedding width %s, expected %s; recomputing shard.",
+                label,
+                cache_path,
+                cached_shard.shape[1],
+                expected_width,
+            )
+            return None
+
         return cached_shard
+
+    def _get_cached_embedding_width(self, shape_key: str) -> Optional[int]:
+        """Return expected embedding width from matching cache metadata when available."""
+        metadata = self._load_cache_metadata()
+        if metadata is None or metadata.get("version") != EMBEDDINGS_CACHE_METADATA_VERSION:
+            return None
+        shape = metadata.get(shape_key)
+        if not isinstance(shape, list) or len(shape) != 2:
+            return None
+        width = shape[1]
+        return width if isinstance(width, int) and width > 0 else None
 
     def _load_cached_chunk(self, cache_path: Path, expected_size: Optional[int] = None) -> Optional[np.ndarray]:
         """Load a fully-assembled chunk cache if it exists and matches the current chunk."""
-        cached_chunk = self._load_partial_cache_shard(cache_path, expected_size, "document chunk")
+        cached_chunk = self._load_partial_cache_shard(
+            cache_path, expected_size, "document chunk", self._get_cached_embedding_width("document_shape")
+        )
         if cached_chunk is None:
             return None
         if self.dist_env.world_size > 1 and not self.dist_env.is_main:
@@ -740,7 +772,9 @@ class MineHardNegativesRecipe:
 
         # Compute or load this rank's slice
         local_expected = local_end - local_start
-        local_embeds = self._load_partial_cache_shard(rank_cache_path, local_expected, "document rank shard")
+        local_embeds = self._load_partial_cache_shard(
+            rank_cache_path, local_expected, "document rank shard", self._get_cached_embedding_width("document_shape")
+        )
         if local_embeds is None:
             local_texts = texts[local_start:local_end]
             local_embeds = self._encode_texts(
@@ -815,10 +849,26 @@ class MineHardNegativesRecipe:
         Returns:
             numpy array of document embeddings [num_docs, embedding_dim].
         """
-        # Fast path: load from cache if available
-        cached_result = self._load_cached_chunk(cache_path, expected_size=len(doc_indices))
-        if cached_result is not None:
-            return cached_result
+        # Fast path: load from cache if available. In initialized distributed runs, rank0 decides whether the
+        # assembled chunk cache is reusable and broadcasts that decision so every rank takes the same branch.
+        cached_result = None
+        if self.dist_env.world_size > 1 and torch.distributed.is_initialized():
+            cache_hit = False
+            if self.dist_env.is_main:
+                cached_result = self._load_cached_chunk(cache_path, expected_size=len(doc_indices))
+                cache_hit = cached_result is not None
+            flag_device = self.dist_env.device if self.dist_env.device.type == "cuda" else torch.device("cpu")
+            flag = torch.tensor([1 if cache_hit else 0], dtype=torch.int64, device=flag_device)
+            torch.distributed.broadcast(flag, src=0)
+            cache_hit = bool(flag.item())
+            if cache_hit:
+                if self.dist_env.is_main:
+                    return cached_result
+                return np.empty((0, 0), dtype=np.float32)
+        else:
+            cached_result = self._load_cached_chunk(cache_path, expected_size=len(doc_indices))
+            if cached_result is not None:
+                return cached_result
 
         # Fetch document texts
         doc_ids = [self.idx_to_doc[idx] for idx in doc_indices]
@@ -1386,7 +1436,9 @@ class MineHardNegativesRecipe:
                     downscore_mask = downscore_mask & apply_margin_tensor
                     batch_scores[downscore_mask] = float("-inf")
 
-            # Batch-level top-k selection
+            # Batch-level top-k selection. Positives, non-finite scores, and margin-filtered candidates are already
+            # set to -inf, so the initial buffer should normally contain enough valid negatives. The per-query fallback
+            # below expands to all documents only when the initial window is too small.
             k = min(num_negs * TOPK_BUFFER_MULTIPLIER, batch_scores.shape[1])
             topk = batch_scores.topk(k=k, dim=1)
             topk_indices = topk.indices.tolist()
@@ -1404,6 +1456,18 @@ class MineHardNegativesRecipe:
                         continue
                     hard_neg_candidates.append(idx)
                     hard_neg_scores.append(score)
+
+                if len(hard_neg_candidates) < num_negs and k < batch_scores.shape[1]:
+                    expanded_topk = batch_scores[i].topk(k=batch_scores.shape[1], dim=0)
+                    hard_neg_candidates = []
+                    hard_neg_scores = []
+                    for idx, score in zip(expanded_topk.indices.tolist(), expanded_topk.values.tolist()):
+                        if idx in pos_set or not math.isfinite(score):
+                            continue
+                        hard_neg_candidates.append(idx)
+                        hard_neg_scores.append(score)
+                        if len(hard_neg_candidates) == num_negs:
+                            break
 
                 # Limit to num_negs
                 neg_indices_all.append(hard_neg_candidates[:num_negs])
@@ -1493,6 +1557,25 @@ class MineHardNegativesRecipe:
         """
         return {question_id: scores for question_id, scores in zip(self.question_ids, self.pos_scores)}
 
+    def _rewrite_corpus_paths_for_output(self, corpus_config: Any, output_path: Path) -> Any:
+        """Rewrite relative corpus paths so they still point to the input corpus from the output JSON location."""
+        input_dir = Path(self.train_qa_file_path).expanduser().resolve(strict=False).parent
+        output_dir = output_path.expanduser().resolve(strict=False).parent
+
+        def rewrite_entry(entry: Any) -> Any:
+            if not isinstance(entry, dict):
+                return entry
+            rewritten = dict(entry)
+            corpus_path = rewritten.get("path")
+            if isinstance(corpus_path, str) and corpus_path and not os.path.isabs(corpus_path):
+                source_corpus_path = (input_dir / corpus_path).resolve(strict=False)
+                rewritten["path"] = os.path.relpath(source_corpus_path, output_dir)
+            return rewritten
+
+        if isinstance(corpus_config, list):
+            return [rewrite_entry(entry) for entry in corpus_config]
+        return rewrite_entry(corpus_config)
+
     def _write_output(self) -> None:
         """Write the output JSON file with mined hard negatives.
 
@@ -1505,6 +1588,8 @@ class MineHardNegativesRecipe:
         """
         import json
 
+        output_path = Path(self.train_file_output_path)
+
         # Load original input file (preserves all top-level keys like corpus)
         with open(self.train_qa_file_path, "r") as f:
             output = json.load(f)
@@ -1513,8 +1598,10 @@ class MineHardNegativesRecipe:
         neg_docs_by_qid = self._build_negative_docs_by_question_id()
         pos_scores_by_qid = self._build_positive_scores_by_question_id()
 
-        # Add mining metadata
+        # Add mining metadata and keep relative corpus references valid from the output JSON location.
         output["mining"] = {"args": self._get_mining_args_dict()}
+        if "corpus" in output:
+            output["corpus"] = self._rewrite_corpus_paths_for_output(output["corpus"], output_path)
 
         # Iterate through original rows when available so custom row metadata round-trips.
         source_rows = output.get("data") or self.questions_dataset
@@ -1548,7 +1635,6 @@ class MineHardNegativesRecipe:
             output["data"].append(row)
 
         # Ensure output directory exists
-        output_path = Path(self.train_file_output_path)
         input_path = Path(self.train_qa_file_path).expanduser().resolve(strict=False)
         resolved_output_path = output_path.expanduser().resolve(strict=False)
         if resolved_output_path == input_path:
@@ -1560,9 +1646,24 @@ class MineHardNegativesRecipe:
             )
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write output file with formatting
-        with open(output_path, "w") as f:
-            json.dump(output, f, indent=4, ensure_ascii=False)
+        # Write output file with formatting. Write through a same-directory temp file so overwrite runs keep the
+        # previous mined dataset intact if serialization or the filesystem fails mid-write.
+        tmp_output_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=output_path.parent,
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_output_path = Path(f.name)
+                json.dump(output, f, indent=4, ensure_ascii=False)
+            tmp_output_path.replace(output_path)
+            tmp_output_path = None
+        finally:
+            if tmp_output_path is not None and tmp_output_path.exists():
+                tmp_output_path.unlink()
 
         logger.info(f"Output written to {output_path}")
 

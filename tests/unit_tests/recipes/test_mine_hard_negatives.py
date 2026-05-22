@@ -15,6 +15,7 @@
 """Unit tests for MineHardNegativesRecipe — attn_implementation support."""
 
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -327,6 +328,102 @@ def test_write_output_preserves_custom_row_metadata(tmp_path):
     assert output["data"][0]["pos_doc"] == [{"id": "p1", "score": 0.9}]
 
 
+def test_write_output_rewrites_relative_corpus_path_for_new_output_dir(tmp_path):
+    input_dir = tmp_path / "source"
+    output_dir = tmp_path / "mined"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (input_dir / "FEVER_corpus").mkdir()
+    input_file = input_dir / "train.json"
+    output_file = output_dir / "train.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "corpus": [{"path": "./FEVER_corpus"}],
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "question": "Which doc is positive?",
+                        "corpus_id": "demo",
+                        "pos_doc": [{"id": "p1"}],
+                        "neg_doc": [],
+                    }
+                ],
+            }
+        )
+    )
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+        }
+    )
+    recipe.train_qa_file_path = str(input_file)
+    recipe.train_file_output_path = str(output_file)
+    recipe.questions_dataset = json.loads(input_file.read_text())["data"]
+    recipe._build_negative_docs_by_question_id = lambda: {"q0": []}
+    recipe._build_positive_scores_by_question_id = lambda: {"q0": [0.9]}
+    recipe._get_mining_args_dict = lambda: {}
+
+    recipe._write_output()
+
+    output = json.loads(output_file.read_text())
+    corpus_path = output["corpus"][0]["path"]
+    assert os.path.normpath(corpus_path) == os.path.normpath("../source/FEVER_corpus")
+    assert (output_dir / corpus_path).resolve() == (input_dir / "FEVER_corpus").resolve()
+
+
+def test_write_output_uses_atomic_replace_on_dump_failure(tmp_path, monkeypatch):
+    input_file = tmp_path / "input.json"
+    output_file = tmp_path / "output.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "question": "Which doc is positive?",
+                        "corpus_id": "demo",
+                        "pos_doc": [{"id": "p1"}],
+                        "neg_doc": [],
+                    }
+                ]
+            }
+        )
+    )
+    output_file.write_text("existing mined data")
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+            "overwrite_output": True,
+        }
+    )
+    recipe.train_qa_file_path = str(input_file)
+    recipe.train_file_output_path = str(output_file)
+    recipe.overwrite_output = True
+    recipe.questions_dataset = json.loads(input_file.read_text())["data"]
+    recipe._build_negative_docs_by_question_id = lambda: {"q0": []}
+    recipe._build_positive_scores_by_question_id = lambda: {"q0": [0.9]}
+    recipe._get_mining_args_dict = lambda: {}
+
+    original_dump = json.dump
+
+    def failing_dump(obj, fp, *args, **kwargs):
+        if isinstance(obj, dict) and "mining" in obj:
+            fp.write("partial")
+            raise OSError("disk full")
+        return original_dump(obj, fp, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dump", failing_dump)
+
+    with pytest.raises(OSError, match="disk full"):
+        recipe._write_output()
+
+    assert output_file.read_text() == "existing mined data"
+    assert not list(tmp_path.glob(".output.json.*.tmp"))
+
+
 def test_write_output_removes_stale_positive_score_for_non_finite_current_score(tmp_path):
     input_file = tmp_path / "input.json"
     output_file = tmp_path / "output.json"
@@ -469,6 +566,36 @@ def test_load_partial_cache_shard_rejects_unreadable_npz(tmp_path):
     cache_path.write_text("not an npz")
 
     assert recipe._load_partial_cache_shard(cache_path, expected_size=1, label="document rank shard") is None
+
+
+def test_load_partial_cache_shard_rejects_wrong_ndim(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._reuse_partial_embedding_cache = True
+    cache_path = tmp_path / "queries_rank0000.npz"
+    np.savez(cache_path, np.ones((1, 2, 3), dtype=np.float32))
+
+    assert recipe._load_partial_cache_shard(cache_path, expected_size=1, label="query shard") is None
+
+
+def test_load_partial_cache_shard_rejects_width_mismatch_from_metadata(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._reuse_partial_embedding_cache = True
+    cache_path = tmp_path / "queries_rank0000.npz"
+    np.savez(cache_path, np.ones((1, 2), dtype=np.float32))
+    recipe._write_cache_metadata(
+        query_embeddings=np.ones((1, 3), dtype=np.float32),
+        document_embeddings=np.ones((1, 3), dtype=np.float32),
+    )
+
+    assert (
+        recipe._load_partial_cache_shard(
+            cache_path,
+            expected_size=1,
+            label="query shard",
+            expected_width=recipe._get_cached_embedding_width("query_shape"),
+        )
+        is None
+    )
 
 
 def test_full_embeddings_cache_requires_matching_metadata(tmp_path):
@@ -692,6 +819,30 @@ def test_encode_chunk_distributed_recomputes_corrupt_local_rank_shard(tmp_path):
     document_embeddings = recipe._encode_chunk_distributed(["NVLink is fast."], cache_path)
 
     np.testing.assert_array_equal(document_embeddings, recomputed)
+
+
+def test_encode_documents_chunk_uses_broadcast_cache_hit_on_non_main_rank(tmp_path, monkeypatch):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe.dist_env = SimpleNamespace(world_size=2, rank=1, is_main=False, device=torch.device("cpu"))
+    cache_path = tmp_path / "corpus_chunks" / "chunk_0000.npz"
+    cache_path.parent.mkdir()
+    np.savez(cache_path, np.ones((1, 2), dtype=np.float32))
+    recipe._write_cache_metadata(
+        query_embeddings=np.ones((1, 2), dtype=np.float32),
+        document_embeddings=np.ones((1, 2), dtype=np.float32),
+    )
+    recipe._encode_chunk_distributed = MagicMock(side_effect=AssertionError("non-main rank should follow cache hit"))
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def broadcast_cache_hit(flag, src):
+        flag.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "broadcast", broadcast_cache_hit)
+
+    embeddings = recipe._encode_documents_chunk([0], cache_path)
+
+    assert embeddings.shape == (0, 0)
+    recipe._encode_chunk_distributed.assert_not_called()
 
 
 def test_mine_hard_negatives_drops_margin_filtered_candidates():

@@ -238,7 +238,7 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.make_retrieval_dataset
     model_type: bi_encoder
     data_dir_list:
-      - /path/to/train.jsonl
+      - /path/to/train.json
     data_type: train
     n_passages: 5
     seed: 42
@@ -310,7 +310,7 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.make_retrieval_dataset
     model_type: bi_encoder
     data_dir_list:
-      - /path/to/train.jsonl
+      - /path/to/train.json
     data_type: train
     n_passages: 5
     seed: 42
@@ -372,10 +372,10 @@ tokenizer:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
-    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.make_retrieval_dataset
     model_type: cross_encoder
     data_dir_list:
-      - /path/to/train.jsonl
+      - /path/to/train.json
     data_type: train
     n_passages: 5
     seed: 42
@@ -601,7 +601,9 @@ uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mi
   --mining.add_eos_token false
 ```
 
-For multi-node mining, replace `--standalone` with the same explicit rendezvous flags you use for multi-node training:
+For multi-node mining, replace `--standalone` with the same explicit rendezvous flags you use for multi-node training.
+Every rank must be able to read `model_name_or_path`, `tokenizer_name_or_path` if set, `train_qa_file_path`, and the
+corpus path referenced by that JSON at the same filesystem paths:
 
 ```bash
 uv run torchrun \
@@ -627,7 +629,9 @@ Replace `epoch_0_step_499` with the explicit checkpoint directory that you want 
 `LATEST.txt`, read it first and substitute the resolved `epoch_*_step_*` directory; the mining script loads the
 Hugging Face export directly and does not apply AutoModel's checkpoint resolver. The miner refuses to overwrite an
 existing `train_file_output_path` by default. Choose a new output path for each mining run, or pass
-`--mining.overwrite_output true` only when replacing that file is intentional.
+`--mining.overwrite_output true` only when replacing that file is intentional. If the output JSON is written to a
+different directory from the input JSON, the miner rewrites relative `corpus` paths so retraining still resolves the
+original corpus.
 
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
@@ -654,13 +658,15 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 - `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
-  rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
-  length, `corpus_chunk_size`, and world-size combination. The miner validates cache metadata and loads the
-  consolidated arrays to verify fingerprint, shape, and readability before reusing a consolidated cache. The fingerprint includes the mining input
-  file, local model/tokenizer path state, ordered document IDs/content, and embedding settings. Fresh run-specific
-  paths are still easier to reason about, especially for mutable Hub IDs or paths that are overwritten in place. Set `load_embeddings_from_cache: true` only when you intentionally want to reuse every cached
-  query shard, corpus chunk, and consolidated embedding file from the same
-  model/input/prefix/length/`corpus_chunk_size`/world-size run.
+  rank `0` unable to read remote-rank shards.
+- Cache reuse: use a fresh cache directory for each model, dataset, prefix, sequence length, `corpus_chunk_size`, and
+  world-size combination. The miner validates cache metadata and loads the consolidated arrays to verify fingerprint,
+  shape, and readability before reusing a consolidated cache. The fingerprint includes the mining input file, local
+  model/tokenizer path state, ordered document IDs/content, and embedding settings.
+- `load_embeddings_from_cache`: set this to `true` only when you intentionally want to reuse every cached query shard,
+  corpus chunk, and consolidated embedding file from the same
+  model/input/prefix/length/`corpus_chunk_size`/world-size run. Fresh run-specific paths are still easier to reason
+  about, especially for mutable Hub IDs or paths that are overwritten in place.
 
 `pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
 `--mining.pooling` or `--mining.l2_normalize`; the miner rejects unknown mining keys. Mine from a saved bi-encoder export
@@ -679,7 +685,7 @@ Hard-negative mining parallelizes embedding generation across ranks, but the fin
 rank `0` and materializes the full document embedding matrix there. For very large corpora, use a smaller mining slice
 or a custom ANN/blockwise mining workflow instead of expecting this helper to scale to web-scale indexing.
 
-Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. If
+Use the mined output as the next corpus-backed `data_dir_list` source for another bi-encoder pass or for cross-encoder training. If
 the previous run used multiple sources, list the mined file for each source. Hard negative mining excludes document IDs
 listed in each input row's `pos_doc`, but it cannot read an external qrels file or know every semantically relevant
 duplicate. Put all known positive IDs for the query in the mining input, deduplicate the corpus, inspect mined samples,

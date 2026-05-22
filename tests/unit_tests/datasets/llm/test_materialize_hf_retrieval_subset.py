@@ -154,3 +154,51 @@ def test_materialize_hf_retrieval_subset_overwrite_keeps_existing_output_when_lo
 
     assert existing_train_json.read_text() == '{"corpus": [{"path": "./FEVER_corpus"}], "data": []}'
     assert (stale_corpus / "train.parquet").read_text() == "still valid"
+
+
+def test_materialize_hf_retrieval_subset_overwrite_restores_existing_corpus_on_interruption(tmp_path, monkeypatch):
+    existing_train_json = tmp_path / "train.json"
+    existing_train_json.write_text('{"corpus": [{"path": "./FEVER_corpus"}], "data": []}')
+    stale_corpus = tmp_path / "FEVER_corpus"
+    stale_corpus.mkdir()
+    (stale_corpus / "train.parquet").write_text("still valid")
+    data_list = [
+        {
+            "question_id": "q0",
+            "question": "What is the document?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "d0"}],
+            "neg_doc": [],
+        }
+    ]
+    monkeypatch.setattr(
+        materialize_hf_retrieval_subset,
+        "_load_hf_subset",
+        lambda repo_id, subset: (data_list, _FakeCorpusInfo()),
+    )
+    original_replace = materialize_hf_retrieval_subset.Path.replace
+
+    def interrupt_train_replace(self, target):
+        if self.name.startswith(".train."):
+            raise KeyboardInterrupt("stop during commit")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(materialize_hf_retrieval_subset.Path, "replace", interrupt_train_replace)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+            "--overwrite",
+        ],
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="stop during commit"):
+        materialize_hf_retrieval_subset.main()
+
+    assert existing_train_json.read_text() == '{"corpus": [{"path": "./FEVER_corpus"}], "data": []}'
+    assert (stale_corpus / "train.parquet").read_text() == "still valid"
+    assert not list(tmp_path.glob(".FEVER_corpus.backup.*"))
