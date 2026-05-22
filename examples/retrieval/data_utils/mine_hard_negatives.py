@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # To run this script, use the following command:
-# torchrun --nproc_per_node=8 --master_port=29500 ./examples/retrieval/data_utils/mine_hard_negatives.py \
+# uv run torchrun --standalone --nproc_per_node=8 ./examples/retrieval/data_utils/mine_hard_negatives.py \
 #     --config examples/retrieval/data_utils/mining_config.yaml \
 #     --mining.model_name_or_path /path/to/encoder/checkpoint \
 #     --mining.train_qa_file_path /path/to/input.json \

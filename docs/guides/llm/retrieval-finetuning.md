@@ -37,7 +37,7 @@ Before running the examples:
 
 - Use an AutoModel environment with the full GPU training dependencies installed. The NGC container is the safest path
   for multi-GPU runs; for source checkouts, see [Installation](../installation.md) and run
-  `uv sync --locked --all-groups --extra all`.
+  `uv sync --frozen --extra all`.
 - From a source checkout, use `uv run automodel ...`; from an installed environment, use `automodel ...`.
 - Accept access terms for the configured Hugging Face model and set `HF_TOKEN`, or replace the model path with a model
   your environment can download. Retrieval has custom bidirectional backbones for Llama and Ministral3 embedding
@@ -508,7 +508,7 @@ memory and want maximum adaptation.
 After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint:
 
 ```bash
-uv run torchrun --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
+uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
   --mining.train_qa_file_path /path/to/input.json \
@@ -581,7 +581,7 @@ With `save_consolidated: true`, AutoModel also writes a Hugging Face-compatible 
 ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated/
 ```
 
-The `LATEST` symlink points to the most recent checkpoint. To resume from the latest compatible checkpoint, set:
+The `LATEST` symlink points to the most recent checkpoint. To resume exactly from that pointer, set:
 
 ```yaml
 checkpoint:
@@ -590,9 +590,10 @@ checkpoint:
   restore_from: LATEST
 ```
 
-If `checkpoint.restore_from` is omitted, AutoModel still auto-detects the latest compatible checkpoint in
-`checkpoint_dir` and resumes from it. Use a new or empty `checkpoint_dir` for fresh experiments, and rotate or clear
-`training.jsonl` and `validation.jsonl` if you do not want logs from multiple runs appended together.
+Explicit restore paths, including `LATEST`, are loaded directly. If `checkpoint.restore_from` is omitted, AutoModel
+auto-detects the latest compatible checkpoint in `checkpoint_dir` and resumes from it. Use a new or empty
+`checkpoint_dir` for fresh experiments, and rotate or clear `training.jsonl` and `validation.jsonl` if you do not want
+logs from multiple runs appended together.
 
 When `checkpoint.is_async: true`, the `LATEST` symlink can lag the most recent write at job end. For final mining,
 export, or evaluation workflows, prefer the explicit `epoch_*_step_*` checkpoint directory or keep async checkpointing
