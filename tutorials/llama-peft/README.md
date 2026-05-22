@@ -1,4 +1,4 @@
-# Llama LoRA Fine-Tuning
+# PEFT
 
 This directory contains a **parameter-efficient fine-tuning (PEFT)** tutorial for training **LoRA adapters** on **Llama-3.2-1B** with NeMo AutoModel.
 
