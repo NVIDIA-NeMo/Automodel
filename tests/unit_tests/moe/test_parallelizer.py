@@ -498,6 +498,29 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     assert len(model.layers.registered) == 2
 
 
+def test_apply_ac_uses_block_local_checkpointing_when_available(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class BlockWithLocalAC(DummyBlock):
+        def __init__(self):
+            super().__init__()
+            self.activation_checkpointing = False
+
+        def set_activation_checkpointing(self, enabled=True):
+            self.activation_checkpointing = enabled
+
+    block = BlockWithLocalAC()
+    model = DummyModel([block])
+    wrapper_mock = MagicMock()
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+
+    P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
+
+    wrapper_mock.assert_not_called()
+    assert block.activation_checkpointing is True
+    assert model.layers.registered["0"] is block
+
+
 def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
@@ -1492,7 +1515,11 @@ def test_apply_ac_text_config_takes_priority_over_llm_config(monkeypatch):
         return "CTX"
 
     monkeypatch.setattr(P, "create_selective_checkpoint_contexts", fake_create_selective_checkpoint_contexts)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]))
+    monkeypatch.setattr(
+        P,
+        "ptd_checkpoint_wrapper",
+        MagicMock(side_effect=lambda b, **kw: (kw.get("context_fn") and kw["context_fn"](), b)[1]),
+    )
 
     class TextConfig:
         hidden_size = 256

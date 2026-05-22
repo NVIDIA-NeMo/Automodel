@@ -28,6 +28,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
@@ -438,21 +439,22 @@ class TestDeepseekV4ModelSmoke:
         assert indices.dtype == torch.long
 
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
-        """Both HC expand sites mix residual streams as ``comb.T @ x``."""
+        """Both HC expand sites mix residual streams as ``comb.T @ x``.
+
+        The fake HC modules intentionally expose only ``forward`` so this also
+        guards against bypassing module hooks via direct ``compute_weights`` calls.
+        """
 
         class _FixedHC(torch.nn.Module):
             def __init__(self, comb):
                 super().__init__()
                 self.register_buffer("comb", comb)
 
-            def compute_weights(self, hidden_streams):
+            def forward(self, hidden_streams):
                 bsz, seq, hc_mult = hidden_streams.shape[:3]
                 pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
                 post = torch.zeros_like(pre)
                 return pre, post, self.comb.expand(bsz, seq, -1, -1)
-
-            def forward(self, hidden_streams):
-                return self.compute_weights(hidden_streams)
 
         class _ZeroAttention(torch.nn.Module):
             def forward(self, hidden_states, **kwargs):
@@ -499,6 +501,45 @@ class TestDeepseekV4ModelSmoke:
 
         torch.testing.assert_close(actual, expected)
         assert not torch.allclose(expected, wrong_orientation)
+
+    def test_thd_pp_intermediate_hidden_state_keeps_shape(self):
+        """Packed-sequence PP stages must not add a fake batch dim to hidden states."""
+
+        class _HiddenStage(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                del input_ids, kwargs
+                return torch.zeros(1, 8, 4, 16)
+
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.model = _HiddenStage()
+        model.lm_head = None
+        model.mtp = None
+        model.mtp_config = MTPConfig()
+
+        out = model(torch.ones(1, 8, dtype=torch.long), qkv_format="thd")
+
+        assert out.shape == (1, 8, 4, 16)
+
+    def test_thd_first_stage_keeps_batch_axis(self):
+        """DSV4 packed sequence uses seq_lens masks while preserving [1, T] inputs."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+
+        input_ids = torch.ones(1, 8, dtype=torch.long)
+        position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
+        seq_lens = torch.tensor([[8]], dtype=torch.long)
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                seq_lens=seq_lens,
+                seq_lens_padded=seq_lens,
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
 
     @_REQUIRES_CUDA
     def test_forward_shape(self):
