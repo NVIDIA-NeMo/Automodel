@@ -655,25 +655,29 @@ class MineHardNegativesRecipe:
 
         return np.concatenate(parts, axis=0) if parts else np.empty((0, 0), dtype=np.float32)
 
-    def _load_cached_chunk(self, cache_path: Path) -> Optional[np.ndarray]:
-        """Load a fully-assembled chunk cache if it exists.
-
-        In distributed mode, only rank0 loads the cache to avoid redundant IO.
-
-        Args:
-            cache_path: Path to cached chunk file.
-
-        Returns:
-            Cached embeddings array, or None if cache doesn't exist.
-        """
+    def _load_cached_chunk(self, cache_path: Path, expected_size: Optional[int] = None) -> Optional[np.ndarray]:
+        """Load a fully-assembled chunk cache if it exists and matches the current chunk."""
         if not self._should_load_partial_cache(cache_path):
             return None
 
-        # In distributed runs, only rank0 needs the assembled chunk
+        try:
+            cached_chunk = _load_npz_array(cache_path)
+        except Exception as exc:
+            logger.warning("Ignoring unreadable document chunk cache %s: %s", cache_path, exc)
+            return None
+
+        if expected_size is not None and cached_chunk.shape[0] != expected_size:
+            logger.info(
+                "Cached document chunk %s has %s rows, expected %s; recomputing chunk.",
+                cache_path,
+                cached_chunk.shape[0],
+                expected_size,
+            )
+            return None
+
         if self.dist_env.world_size > 1 and not self.dist_env.is_main:
             return np.empty((0, 0), dtype=np.float32)
-
-        return _load_npz_array(cache_path)
+        return cached_chunk
 
     def _encode_chunk_distributed(
         self,
@@ -703,9 +707,19 @@ class MineHardNegativesRecipe:
         rank_cache_path = cache_path.parent / f"{cache_path.stem}_rank{r:04d}{cache_path.suffix}"
 
         # Compute or load this rank's slice
+        local_expected = local_end - local_start
+        local_embeds = None
         if self._should_load_partial_cache(rank_cache_path):
             local_embeds = _load_npz_array(rank_cache_path)
-        else:
+            if local_embeds.shape[0] != local_expected:
+                logger.info(
+                    "Cached rank shard %s has %s rows, expected %s; recomputing shard.",
+                    rank_cache_path,
+                    local_embeds.shape[0],
+                    local_expected,
+                )
+                local_embeds = None
+        if local_embeds is None:
             local_texts = texts[local_start:local_end]
             local_embeds = self._encode_texts(
                 texts=local_texts,
@@ -780,7 +794,7 @@ class MineHardNegativesRecipe:
             numpy array of document embeddings [num_docs, embedding_dim].
         """
         # Fast path: load from cache if available
-        cached_result = self._load_cached_chunk(cache_path)
+        cached_result = self._load_cached_chunk(cache_path, expected_size=len(doc_indices))
         if cached_result is not None:
             return cached_result
 
@@ -941,6 +955,7 @@ class MineHardNegativesRecipe:
             "passage_prefix": self.passage_prefix,
             "query_max_length": self.query_max_length,
             "passage_max_length": self.passage_max_length,
+            "corpus_chunk_size": self.corpus_chunk_size,
             "add_bos_token": self.add_bos_token,
             "add_eos_token": self.add_eos_token,
             "attn_implementation": self.attn_implementation,
@@ -1495,6 +1510,10 @@ class MineHardNegativesRecipe:
                     score = pos_scores[j]
                     if score is not None and math.isfinite(float(score)):
                         pos_doc["score"] = score
+                    else:
+                        pos_doc.pop("score", None)
+                else:
+                    pos_doc.pop("score", None)
 
             # Remove legacy score fields if present
             if "pos_score" in row:

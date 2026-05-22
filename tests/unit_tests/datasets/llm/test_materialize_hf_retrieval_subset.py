@@ -91,6 +91,9 @@ def test_materialize_hf_retrieval_subset_rejects_non_empty_output_dir(tmp_path, 
 
 def test_materialize_hf_retrieval_subset_overwrites_when_requested(tmp_path, monkeypatch):
     (tmp_path / "existing.txt").write_text("replace allowed")
+    stale_corpus = tmp_path / "FEVER_corpus"
+    stale_corpus.mkdir()
+    (stale_corpus / "train-00000-of-00001.parquet").write_text("stale")
     data_list = [
         {
             "question_id": "q0",
@@ -119,3 +122,5 @@ def test_materialize_hf_retrieval_subset_overwrites_when_requested(tmp_path, mon
 
     assert materialize_hf_retrieval_subset.main() == 0
     assert (tmp_path / "train.json").exists()
+    assert not (tmp_path / "FEVER_corpus" / "train-00000-of-00001.parquet").exists()
+    assert (tmp_path / "FEVER_corpus" / "train.parquet").exists()

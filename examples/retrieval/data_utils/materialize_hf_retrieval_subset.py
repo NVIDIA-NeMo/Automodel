@@ -17,6 +17,7 @@
 import argparse
 import json
 import logging
+import shutil
 from pathlib import Path
 
 from datasets import Dataset
@@ -56,6 +57,8 @@ def main() -> int:
     else:
         output_dir.mkdir(parents=True)
     corpus_dir = output_dir / f"{args.subset}_corpus"
+    if args.overwrite and corpus_dir.exists():
+        shutil.rmtree(corpus_dir)
     corpus_dir.mkdir(parents=True, exist_ok=True)
 
     data_list, corpus_info = _load_hf_subset(args.repo_id, args.subset)

@@ -279,6 +279,43 @@ def test_write_output_preserves_original_question_id(tmp_path):
     ]
 
 
+def test_write_output_removes_stale_positive_score_for_non_finite_current_score(tmp_path):
+    input_file = tmp_path / "input.json"
+    output_file = tmp_path / "output.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "question": "Which doc is positive?",
+                        "corpus_id": "demo",
+                        "pos_doc": [{"id": "p1", "score": 0.9}],
+                        "neg_doc": [],
+                    }
+                ]
+            }
+        )
+    )
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+        }
+    )
+    recipe.train_qa_file_path = str(input_file)
+    recipe.train_file_output_path = str(output_file)
+    recipe.questions_dataset = json.loads(input_file.read_text())["data"]
+    recipe._build_negative_docs_by_question_id = lambda: {"q0": []}
+    recipe._build_positive_scores_by_question_id = lambda: {"q0": [None]}
+    recipe._get_mining_args_dict = lambda: {}
+
+    recipe._write_output()
+
+    output = json.loads(output_file.read_text())
+    assert output["data"][0]["pos_doc"] == [{"id": "p1"}]
+
+
 def test_encode_texts_empty_input_returns_empty_array():
     recipe = _make_recipe()
 
@@ -295,6 +332,26 @@ def test_load_cached_chunk_ignored_when_cache_loading_disabled(tmp_path):
     np.savez(cache_path, np.ones((1, 2), dtype=np.float32))
 
     assert recipe._load_cached_chunk(cache_path) is None
+
+
+def test_load_cached_chunk_rejects_shape_mismatch(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._reuse_partial_embedding_cache = True
+    cache_path = tmp_path / "chunk_0000.npz"
+    np.savez(cache_path, np.ones((2, 2), dtype=np.float32))
+
+    assert recipe._load_cached_chunk(cache_path, expected_size=1) is None
+
+
+def test_cache_fingerprint_includes_corpus_chunk_size(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe.corpus_chunk_size = 2
+    first_fingerprint = recipe._build_cache_fingerprint()
+
+    recipe.corpus_chunk_size = 3
+
+    assert first_fingerprint["corpus_chunk_size"] == 2
+    assert recipe._build_cache_fingerprint()["corpus_chunk_size"] == 3
 
 
 def test_full_embeddings_cache_requires_matching_metadata(tmp_path):
