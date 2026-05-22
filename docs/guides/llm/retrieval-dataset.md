@@ -41,7 +41,7 @@ NeMo AutoModel supports **two** input schemas across three source types. They us
 
 | Source | Query field | Required document fields | Best for |
 |--------|-------------|--------------------------|----------|
-| Corpus ID JSON | `question` | `pos_doc`, `neg_doc`, and `corpus_id` IDs resolved through a local corpus | Production data, hard-negative mining, same-document masking |
+| Corpus ID JSON | `question` | `question_id`, `corpus_id`, `pos_doc`, and `neg_doc` IDs resolved through a local corpus | Production data, hard-negative mining, same-document masking |
 | `hf://` AutoModel schema | `question` | `pos_doc`, a companion HF corpus split, and `neg_doc` before training with `n_passages > 1` | Tutorial runs and shared AutoModel retrieval datasets |
 | Inline JSONL | `query` or `question` | Inline text in `pos_doc` and `neg_doc` | Small custom runs when you do not need mining or document-ID masking |
 

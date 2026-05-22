@@ -38,12 +38,13 @@ Before running the examples:
 - Use an AutoModel environment with the full GPU training dependencies installed. The NGC container is the safest path
   for multi-GPU runs; for source checkouts, see [Installation](../installation.md) and run
   `uv sync --frozen --extra all`.
-- From a source checkout, use `uv run automodel ...`; from an installed environment, use `automodel ...`.
+- Run the example commands from a source checkout or an NGC/container workspace that contains the repository
+  `examples/` tree. The YAML configs and mining helpers below are repo-relative; if you use an installed package
+  without the repository, copy the referenced config/script files into your own project and update the paths.
+- From a source checkout, use `uv run automodel ...`; from an installed environment that has local copies of the
+  configs, use `automodel ...`.
 - Accept access terms for the configured Hugging Face model and set `HF_TOKEN`, or replace the model path with a model
-  your environment can download. Retrieval has custom bidirectional backbones for Llama and Ministral3 embedding
-  models, and a custom Llama scoring backbone for cross-encoders. Other Hugging Face model types fall back to
-  `AutoModel` for bi-encoders or `AutoModelForSequenceClassification` for cross-encoders; verify that the tokenizer,
-  pooling, `num_labels`, and any retrieval-specific model arguments are accepted by the replacement model.
+  your environment can download. See the support matrix below before swapping model families.
 - Make sure every rank can read the dataset paths or `hf://` sources.
 
 The commands below use `automodel`; if you are running from a source checkout, prefix them with `uv run`. For direct
@@ -96,6 +97,18 @@ Adjust `--nproc-per-node` to the number of GPUs on your machine. The examples us
 
 The bi-encoder computes a query embedding and passage embeddings independently. The cross-encoder formats each
 query-passage pair into one sequence and predicts a score for each candidate passage.
+
+Supported model families and effective retrieval kwargs:
+
+| Model `config.model_type` | Bi-encoder behavior | Cross-encoder behavior | Effective retrieval kwargs |
+|---------------------------|---------------------|------------------------|----------------------------|
+| `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
+| `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Not supported by the custom retrieval registry today; use a different cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
+| Any other Hugging Face model type | Falls back to `AutoModel` | Falls back to `AutoModelForSequenceClassification` only when the model type is not listed above | Bi-encoder fallback receives standard Hugging Face `from_pretrained` kwargs; `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards `num_labels`; do not assume custom `pooling` or `temperature` are accepted unless that HF class documents them. |
+
+Known model types with a registry entry fail fast when the requested retrieval task is unsupported rather than falling
+back silently. For example, `ministral3` is supported for bi-encoder embeddings but not for the cross-encoder scoring
+recipe.
 
 ## Prepare Data
 
@@ -458,7 +471,9 @@ repeatable: query count, corpus size, qrels source, judged/unjudged handling, ex
 values, baseline checkpoint, and whether confidence intervals or significance tests were used.
 
 For cross-encoders, freeze a first-stage retriever, rerank its top-K candidates, and report reranking metrics on that
-same candidate set. Do not compare cross-encoder candidate-group validation directly to full-corpus bi-encoder metrics.
+same candidate set. Also report first-stage candidate recall or coverage: if a query's positive document is missing
+from the retriever top-K, count that query as a miss rather than dropping it from reranker evaluation. Do not compare
+cross-encoder candidate-group validation directly to full-corpus bi-encoder metrics.
 
 ## Monitor Training
 
@@ -505,7 +520,8 @@ memory and want maximum adaptation.
 
 ## Mine Hard Negatives
 
-After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint:
+After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint. This single-node
+example uses `--standalone`:
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
@@ -513,11 +529,31 @@ uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mi
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
   --mining.train_qa_file_path /path/to/input.json \
   --mining.train_file_output_path /path/to/output.json \
-  --mining.cache_embeddings_dir /path/to/cache \
+  --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
   --mining.query_prefix "query: " \
   --mining.passage_prefix "passage: " \
   --mining.query_max_length 512 \
   --mining.passage_max_length 512 \
+  --mining.add_eos_token false
+```
+
+For multi-node mining, replace `--standalone` with the same explicit rendezvous flags you use for multi-node training:
+
+```bash
+uv run torchrun \
+  --nnodes 2 \
+  --nproc-per-node 8 \
+  --node-rank ${NODE_RANK} \
+  --rdzv-backend c10d \
+  --rdzv-endpoint ${MASTER_ADDR}:${MASTER_PORT} \
+  examples/retrieval/data_utils/mine_hard_negatives.py \
+  --config examples/retrieval/data_utils/mining_config.yaml \
+  --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
+  --mining.train_qa_file_path /path/to/input.json \
+  --mining.train_file_output_path /path/to/output.json \
+  --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
+  --mining.query_prefix "query: " \
+  --mining.passage_prefix "passage: " \
   --mining.add_eos_token false
 ```
 
@@ -527,7 +563,8 @@ candidates, and write mined negatives back to each query.
 
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
-- `hard_negatives_to_mine`: number of negatives to add per query.
+- `hard_negatives_to_mine`: target number of negatives to add per query. The miner can return fewer when the corpus has
+  too few valid candidates or margin filtering removes high-scoring candidates. Audit per-query counts before training.
 - `hard_neg_margin` and `hard_neg_margin_type`: filter near-positive candidates. With `hard_neg_margin_type: perc`,
   candidates scoring above `min_positive_score * hard_neg_margin` are removed; with `abs`, candidates scoring above
   `min_positive_score - hard_neg_margin` are removed. Inspect mined samples when positive scores are low or negative.
@@ -551,7 +588,9 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
 negative mining excludes document IDs listed in each input row's `pos_doc`, but it cannot read an external qrels file or
 know every semantically relevant duplicate. Put all known positive IDs for the query in the mining input, deduplicate the
-corpus, inspect mined samples, and avoid mining from validation or test corpora.
+corpus, inspect mined samples, filter duplicate IDs and `-inf` scores from mined outputs, and avoid mining from
+validation or test corpora. If you unroll multi-positive training data, mine from rows that still carry every known
+positive in `pos_doc`; otherwise sibling positives can be mined as false negatives.
 
 ## Save, Resume, and Use the Checkpoint
 
@@ -575,13 +614,20 @@ Checkpoint directory names use the scheduler step at save time. The saved schedu
 for exact paths prefer the `Saving checkpoint to ...` log line or the `LATEST` pointer over hand-constructing a step
 number.
 
-With `save_consolidated: true`, AutoModel also writes a Hugging Face-compatible model under:
+With `save_consolidated: true` and full fine-tuning, AutoModel also writes a Hugging Face-compatible model under:
 
 ```text
 ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated/
 ```
 
-The `LATEST` symlink points to the most recent checkpoint. To resume exactly from that pointer, set:
+PEFT/LoRA runs save adapter artifacts under the checkpoint `model/` directory instead of the full consolidated export
+path above. Resume LoRA training from the AutoModel checkpoint directory, but use full fine-tuning when you need the
+`model/consolidated` path for the mining command shown in this guide. If you need mining or serving from LoRA weights,
+first produce a HF-loadable merged/exported encoder with your adapter workflow and point
+`--mining.model_name_or_path` at that exported directory.
+
+The `LATEST` symlink points to the most recent checkpoint when it is valid. To resume from the latest resolved
+checkpoint, set:
 
 ```yaml
 checkpoint:
@@ -590,10 +636,11 @@ checkpoint:
   restore_from: LATEST
 ```
 
-Explicit restore paths, including `LATEST`, are loaded directly. If `checkpoint.restore_from` is omitted, AutoModel
-auto-detects the latest compatible checkpoint in `checkpoint_dir` and resumes from it. Use a new or empty
-`checkpoint_dir` for fresh experiments, and rotate or clear `training.jsonl` and `validation.jsonl` if you do not want
-logs from multiple runs appended together.
+`LATEST` is a resolver keyword: AutoModel follows the symlink or pointer file and can fall back to scanning
+`epoch_*_step_*` checkpoint directories if the pointer is not usable. An explicit `epoch_*_step_*` path is the exact
+restore target. If `checkpoint.restore_from` is omitted, AutoModel auto-detects the latest compatible checkpoint in
+`checkpoint_dir` and resumes from it. Use a new or empty `checkpoint_dir` for fresh experiments, and rotate or clear
+`training.jsonl` and `validation.jsonl` if you do not want logs from multiple runs appended together.
 
 When `checkpoint.is_async: true`, the `LATEST` symlink can lag the most recent write at job end. For final mining,
 export, or evaluation workflows, prefer the explicit `epoch_*_step_*` checkpoint directory or keep async checkpointing
@@ -604,8 +651,56 @@ disabled for the final save.
 Use a bi-encoder checkpoint to encode passages, build an approximate nearest-neighbor index, encode queries, and search
 the index. Keep the same tokenizer, pooling, normalization, prefixes, and max lengths that you used for training.
 
+Minimal bi-encoder loading and scoring sketch:
+
+```python
+import torch
+
+from nemo_automodel import NeMoAutoModelBiEncoder, NeMoAutoTokenizer
+
+model_path = "./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated"
+tokenizer = NeMoAutoTokenizer.from_pretrained(model_path, add_eos_token=False)
+model = NeMoAutoModelBiEncoder.from_pretrained(model_path, use_liger_kernel=False).eval()
+device = next(model.parameters()).device
+
+texts = ["query: what does nvlink do?", "passage: NVLink is a high-bandwidth GPU interconnect."]
+tokens = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
+tokens = {key: value.to(device) for key, value in tokens.items()}
+with torch.no_grad():
+    embeddings = model.encode(tokens)
+score = embeddings[0] @ embeddings[1]
+```
+
 Use a cross-encoder checkpoint to rerank a shortlist from a retriever. Cross-encoders score each query-passage pair
 jointly, so they are usually too expensive for first-stage full-corpus search.
+
+Minimal cross-encoder scoring sketch:
+
+```python
+import torch
+
+from nemo_automodel import NeMoAutoModelCrossEncoder, NeMoAutoTokenizer
+
+model_path = "./output/llama3_2_1b_cross_encoder/checkpoints/LATEST/model/consolidated"
+tokenizer = NeMoAutoTokenizer.from_pretrained(model_path, add_eos_token=False)
+model = NeMoAutoModelCrossEncoder.from_pretrained(model_path, use_liger_kernel=False).eval()
+device = next(model.parameters()).device
+
+pairs = [
+    "question: what does nvlink do?\n\npassage: NVLink is a high-bandwidth GPU interconnect.",
+    "question: what does nvlink do?\n\npassage: Dropout regularizes neural networks.",
+]
+tokens = tokenizer(pairs, padding=True, truncation=True, max_length=512, return_tensors="pt")
+tokens = {key: value.to(device) for key, value in tokens.items()}
+with torch.no_grad():
+    logits = model(tokens).logits.squeeze(-1)
+ranking = torch.argsort(logits, descending=True)
+```
+
+Bi-encoder scores are comparable only within the same model, tokenizer, prefix, max-length, pooling, normalization, and
+indexing setup. Mining scores are raw embedding similarities from that exact setup. Cross-encoder logits are
+uncalibrated reranking signals; do not mix them with bi-encoder scores or use one global threshold across model
+versions without calibration.
 
 ## Troubleshooting
 

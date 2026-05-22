@@ -19,10 +19,14 @@
 # Usage:
 # uv run torchrun --standalone --nproc_per_node=8 ./examples/retrieval/data_utils/mine_hard_negatives.py \
 #     --config examples/retrieval/data_utils/mining_config.yaml \
-#     --mining.model_name_or_path /path/to/encoder/checkpoint \
+#     --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
 #     --mining.train_qa_file_path /path/to/input.json \
 #     --mining.train_file_output_path /path/to/output.json \
 #     --mining.cache_embeddings_dir /shared/path/to/cache/<run-specific-name> \
+#     --mining.query_prefix "query: " \
+#     --mining.passage_prefix "passage: " \
+#     --mining.query_max_length 512 \
+#     --mining.passage_max_length 512 \
 #     --mining.add_eos_token false
 
 # Distributed environment settings
@@ -32,7 +36,7 @@ dist_env:
 
 # Mining parameters - can be overridden via command line
 # Required parameters (must be provided via command line or here):
-#   mining.model_name_or_path: Path to encoder checkpoint
+#   mining.model_name_or_path: Path to a HF-loadable encoder export, such as LATEST/model/consolidated
 #   mining.train_qa_file_path: Input QA file
 #   mining.train_file_output_path: Output file with mined negatives
 #   mining.cache_embeddings_dir: Required for multi-rank torchrun; optional only for single-process mining.
