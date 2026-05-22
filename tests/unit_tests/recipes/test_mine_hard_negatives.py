@@ -17,7 +17,9 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
+import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MINING_DEFAULTS, MineHardNegativesRecipe
@@ -122,7 +124,7 @@ def test_extract_mining_params_attn_implementation_explicit(value):
     assert recipe.attn_implementation == value
 
 
-@pytest.mark.parametrize("unknown_field", ["pooling", "l2_normalize"])
+@pytest.mark.parametrize("unknown_field", ["pooling", "l2_normalize", "query_prefx", "hard_negative_to_mine"])
 def test_extract_mining_params_rejects_unknown_fields(unknown_field):
     """Unsupported mining keys should fail loudly instead of being ignored."""
     recipe = _make_recipe({unknown_field: "unused"})
@@ -203,6 +205,8 @@ def test_write_output_preserves_original_question_id(tmp_path):
     recipe._write_output()
 
     output = json.loads(output_file.read_text())
+    assert output["corpus"] == {"path": "/fake/corpus"}
+    assert output["mining"] == {"args": {}}
     assert output["data"] == [
         {
             "question_id": "q0_0",
@@ -213,3 +217,49 @@ def test_write_output_preserves_original_question_id(tmp_path):
             "neg_doc": [{"id": "n1", "score": 0.2}],
         }
     ]
+
+
+def test_encode_texts_empty_input_returns_empty_array():
+    recipe = _make_recipe()
+
+    embeddings = recipe._encode_texts(texts=[], batch_size=2, max_length=16)
+
+    assert embeddings.shape == (0, 0)
+    assert embeddings.dtype == np.float32
+
+
+def test_load_cached_chunk_ignored_when_cache_loading_disabled(tmp_path):
+    recipe = _make_recipe({"load_embeddings_from_cache": False})
+    recipe.load_embeddings_from_cache = False
+    cache_path = tmp_path / "chunk_0000.npz"
+    np.savez(cache_path, np.ones((1, 2), dtype=np.float32))
+
+    assert recipe._load_cached_chunk(cache_path) is None
+
+
+def test_mine_hard_negatives_drops_margin_filtered_candidates():
+    recipe = _make_recipe()
+    recipe.dist_env = MagicMock(device=torch.device("cpu"))
+    query_embeddings = np.array([[1.0, 0.0]], dtype=np.float32)
+    document_embeddings = np.array(
+        [
+            [1.0, 0.0],
+            [0.96, 0.0],
+            [0.2, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    neg_indices, neg_scores, pos_scores = recipe._mine_hard_negatives(
+        query_embeddings=query_embeddings,
+        document_embeddings=document_embeddings,
+        pos_doc_indices=[[0]],
+        batch_size=1,
+        num_negs=2,
+        hard_neg_margin=0.95,
+        hard_neg_margin_type="perc",
+    )
+
+    assert neg_indices == [[2]]
+    assert neg_scores[0][0] == pytest.approx(0.2)
+    assert pos_scores[0][0] == pytest.approx(1.0)

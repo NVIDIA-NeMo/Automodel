@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import sys
+
 from examples.retrieval.data_utils.audit_mined_negatives import audit_training_data
+from examples.retrieval.data_utils.audit_mined_negatives import main as audit_main
 
 
 def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
@@ -46,7 +50,7 @@ def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
         "duplicate_negative": 1,
         "missing_negative_score": 1,
         "non_finite_negative_score": 1,
-        "dropped_negatives": 3,
+        "dropped_negatives": 4,
         "total_findings": 4,
     }
     assert cleaned["corpus"] == training_data["corpus"]
@@ -57,7 +61,7 @@ def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
             "question": "Which document is positive?",
             "corpus_id": "demo",
             "pos_doc": [{"id": 1}],
-            "neg_doc": [{"id": "2", "score": 0.4}, {"id": "4"}],
+            "neg_doc": [{"id": "2", "score": 0.4}],
         }
     ]
     assert findings[0]["original_question_id"] == "q0"
@@ -82,3 +86,63 @@ def test_audit_mined_negatives_preserves_records_without_findings():
     assert summary["total_findings"] == 0
     assert cleaned == training_data
     assert findings == []
+
+
+def test_audit_cli_writes_cleaned_output_and_exits_zero(tmp_path, monkeypatch, capsys):
+    input_file = tmp_path / "mined.json"
+    output_file = tmp_path / "cleaned.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "corpus": {"path": "/corpus"},
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "question": "Which document is positive?",
+                        "corpus_id": "demo",
+                        "pos_doc": [{"id": "1"}],
+                        "neg_doc": [{"id": "1", "score": 1.0}, {"id": "2"}],
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit_mined_negatives.py",
+            str(input_file),
+            "--drop-invalid-negatives",
+            "--output",
+            str(output_file),
+        ],
+    )
+
+    assert audit_main() == 0
+    report = json.loads(capsys.readouterr().out)
+    cleaned = json.loads(output_file.read_text())
+
+    assert report["summary"]["total_findings"] == 2
+    assert report["remaining_summary"]["total_findings"] == 0
+    assert cleaned["data"][0]["neg_doc"] == []
+
+
+def test_audit_cli_exits_nonzero_when_findings_remain(tmp_path, monkeypatch):
+    input_file = tmp_path / "mined.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "pos_doc": [{"id": "1"}],
+                        "neg_doc": [{"id": "1", "score": 1.0}],
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["audit_mined_negatives.py", str(input_file)])
+
+    assert audit_main() == 1

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -507,6 +508,9 @@ class MineHardNegativesRecipe:
         Returns:
             numpy array of embeddings [num_texts, embedding_dim].
         """
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+
         embeddings = []
         num_texts = len(texts)
         num_batches = (num_texts + batch_size - 1) // batch_size
@@ -590,7 +594,7 @@ class MineHardNegativesRecipe:
         shard_path = shard_dir / f"queries_rank{r:04d}.npz"
 
         # Compute or load this rank's shard
-        if shard_path.exists():
+        if self.load_embeddings_from_cache and shard_path.exists():
             local_embeds = _load_npz_array(shard_path)
         else:
             local_texts = self.questions[local_start:local_end]
@@ -619,9 +623,10 @@ class MineHardNegativesRecipe:
             rr_start, rr_end = _compute_rank_partition(num_q, ws, rr)
             expected = rr_end - rr_start
             _validate_shard_shape(rr_path, expected, rr_emb.shape[0])
-            parts.append(rr_emb)
+            if expected > 0:
+                parts.append(rr_emb)
 
-        return np.concatenate(parts, axis=0)
+        return np.concatenate(parts, axis=0) if parts else np.empty((0, 0), dtype=np.float32)
 
     def _load_cached_chunk(self, cache_path: Path) -> Optional[np.ndarray]:
         """Load a fully-assembled chunk cache if it exists.
@@ -634,7 +639,7 @@ class MineHardNegativesRecipe:
         Returns:
             Cached embeddings array, or None if cache doesn't exist.
         """
-        if cache_path is None or not cache_path.exists():
+        if not self.load_embeddings_from_cache or cache_path is None or not cache_path.exists():
             return None
 
         # In distributed runs, only rank0 needs the assembled chunk
@@ -671,7 +676,7 @@ class MineHardNegativesRecipe:
         rank_cache_path = cache_path.parent / f"{cache_path.stem}_rank{r:04d}{cache_path.suffix}"
 
         # Compute or load this rank's slice
-        if rank_cache_path.exists():
+        if self.load_embeddings_from_cache and rank_cache_path.exists():
             local_embeds = _load_npz_array(rank_cache_path)
         else:
             local_texts = texts[local_start:local_end]
@@ -698,9 +703,10 @@ class MineHardNegativesRecipe:
                 rr_emb = _load_npz_array(rr_path)
                 expected = rr_end - rr_start
                 _validate_shard_shape(rr_path, expected, rr_emb.shape[0])
-                parts.append(rr_emb)
+                if expected > 0:
+                    parts.append(rr_emb)
 
-            embeddings = np.concatenate(parts, axis=0)
+            embeddings = np.concatenate(parts, axis=0) if parts else np.empty((0, 0), dtype=np.float32)
             # Save assembled chunk for faster reuse next time
             np.savez(cache_path, embeddings)
             return embeddings
@@ -810,7 +816,7 @@ class MineHardNegativesRecipe:
             chunk_idx += 1
 
         if self.dist_env.is_main:
-            return np.concatenate(all_embeddings, axis=0)
+            return np.concatenate(all_embeddings, axis=0) if all_embeddings else np.empty((0, 0), dtype=np.float32)
         return np.empty((0, 0), dtype=np.float32)
 
     def _load_embeddings_from_cache(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -1008,7 +1014,8 @@ class MineHardNegativesRecipe:
                 - pos_scores: Similarity scores for each positive document
         """
         # Convert document embeddings to tensor once (encoder embeddings are 2D)
-        doc_embeddings_tensor = torch.tensor(document_embeddings, device="cuda")
+        device = self.dist_env.device
+        doc_embeddings_tensor = torch.tensor(document_embeddings, device=device)
 
         neg_indices_all = []
         neg_scores_all = []
@@ -1026,7 +1033,7 @@ class MineHardNegativesRecipe:
             batch_pos_indices = pos_doc_indices[start_idx:end_idx]
 
             # Compute similarity scores: [batch_size, num_docs]
-            batch_query_tensor = torch.tensor(batch_query_embs, device="cuda")
+            batch_query_tensor = torch.tensor(batch_query_embs, device=device)
             batch_scores = batch_query_tensor @ doc_embeddings_tensor.T
 
             # Extract positive scores and mask positives
@@ -1056,7 +1063,7 @@ class MineHardNegativesRecipe:
 
             # Vectorized margin filtering
             if hard_neg_margin is not None:
-                min_pos_tensor = torch.tensor(min_pos_scores, device="cuda")
+                min_pos_tensor = torch.tensor(min_pos_scores, device=device)
 
                 if hard_neg_margin_type.lower() == "abs":
                     threshold = torch.unsqueeze(min_pos_tensor - hard_neg_margin, dim=1)
@@ -1073,14 +1080,20 @@ class MineHardNegativesRecipe:
             k = min(num_negs * TOPK_BUFFER_MULTIPLIER, batch_scores.shape[1])
             topk = batch_scores.topk(k=k, dim=1)
             topk_indices = topk.indices.tolist()
+            topk_scores = topk.values.tolist()
 
             # Post-process: remove any remaining positives and limit to num_negs
             for i, query_pos_indices in enumerate(batch_pos_indices):
                 pos_set = set(query_pos_indices)
 
-                # Filter out positives from top-k candidates
-                hard_neg_candidates = [idx for idx in topk_indices[i] if idx not in pos_set]
-                hard_neg_scores = [batch_scores[i, idx].item() for idx in topk_indices[i] if idx not in pos_set]
+                # Filter out positives and candidates removed by margin filtering.
+                hard_neg_candidates = []
+                hard_neg_scores = []
+                for idx, score in zip(topk_indices[i], topk_scores[i]):
+                    if idx in pos_set or not math.isfinite(score):
+                        continue
+                    hard_neg_candidates.append(idx)
+                    hard_neg_scores.append(score)
 
                 # Limit to num_negs
                 neg_indices_all.append(hard_neg_candidates[:num_negs])

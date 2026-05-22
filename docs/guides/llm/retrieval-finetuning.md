@@ -593,11 +593,21 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
   rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
-  length, and world-size combination; stale cache files can be reused if they are already present.
+  length, and world-size combination. Set `load_embeddings_from_cache: true` only when you intentionally want to reuse
+  every cached query shard, corpus chunk, and consolidated embedding file from the same model/input/prefix/length run.
 
 `pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
 `--mining.pooling` or `--mining.l2_normalize`; the miner rejects unknown mining keys. Mine from a saved bi-encoder export
-produced with the wrapper settings you want, or explicitly reload and export the model with those settings before mining.
+produced with the wrapper settings you want. For an older export that does not carry this metadata, write a new export
+before mining:
+
+```bash
+uv run python examples/retrieval/data_utils/export_biencoder_with_metadata.py \
+  /path/to/export_without_metadata \
+  /path/to/export_for_mining \
+  --pooling last \
+  --no-l2-normalize
+```
 
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
 negative mining excludes document IDs listed in each input row's `pos_doc`, but it cannot read an external qrels file or
@@ -622,9 +632,10 @@ uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
   --output /path/to/mined_audited.json
 ```
 
-The audit flags negatives whose IDs also appear in the row's `pos_doc`, duplicate negative IDs in the same row, missing
-negative scores, and non-finite negative scores. The cleaned output preserves query lineage fields such as
-`original_question_id`, so unrolled examples remain traceable to their source question.
+With `--drop-invalid-negatives --output`, the command exits successfully when the cleaned output has no remaining audit
+findings. The audit flags and drops negatives whose IDs also appear in the row's `pos_doc`, duplicate negative IDs in the
+same row, missing negative scores, and non-finite negative scores. The cleaned output preserves query lineage fields such
+as `original_question_id`, so unrolled examples remain traceable to their source question.
 
 ## Save, Resume, and Use the Checkpoint
 

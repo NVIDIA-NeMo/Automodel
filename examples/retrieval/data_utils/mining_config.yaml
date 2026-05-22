@@ -66,6 +66,7 @@ mining:
   # Caching (required for multi-rank torchrun; use a shared writable path for multi-node).
   # Use a fresh directory per model, dataset, prefix, sequence-length, and world-size combination.
   # cache_embeddings_dir: /path/to/cache/<run-specific-name>
+  # Set true only when every cached shard/chunk came from the same model/input/prefix/length run.
   load_embeddings_from_cache: false
   
   # Mining parameters

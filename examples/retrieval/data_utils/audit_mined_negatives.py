@@ -51,7 +51,7 @@ def audit_records(
     Args:
         records: Retrieval training records from the top-level ``data`` field.
         drop_invalid_negatives: Drop negatives that duplicate positives, duplicate
-            another negative in the same row, or have a non-finite score.
+            another negative in the same row, or have a missing/non-finite score.
         max_findings: Maximum example findings to return.
 
     Returns:
@@ -98,6 +98,7 @@ def audit_records(
             score_state = _score_state(neg_doc)
             if score_state == "missing":
                 summary["missing_negative_score"] += 1
+                should_drop = True
                 row_has_findings = True
                 _append_finding(findings, max_findings, row_idx, record, neg_id, "missing_negative_score")
             elif score_state == "non_finite":
@@ -180,7 +181,10 @@ def main() -> int:
     parser.add_argument(
         "--drop-invalid-negatives",
         action="store_true",
-        help="Drop negatives that are known positives, duplicate row negatives, or have non-finite scores",
+        help=(
+            "Drop negatives that are known positives, duplicate row negatives, or have missing/non-finite scores. "
+            "When used with --output, the exit code is based on the cleaned output."
+        ),
     )
     parser.add_argument("--max-findings", type=int, default=20, help="Maximum finding examples to print")
     parser.add_argument(
@@ -200,14 +204,26 @@ def main() -> int:
         max_findings=args.max_findings,
     )
 
-    print(json.dumps({"summary": summary, "findings": findings}, indent=2))
-
+    exit_summary = summary
+    payload = {"summary": summary, "findings": findings}
     if args.output is not None:
         output_path = Path(args.output)
         with open(output_path, "w") as f:
             json.dump(cleaned_training_data, f, indent=2)
 
-    return 1 if summary["total_findings"] and not args.allow_findings else 0
+        if args.drop_invalid_negatives:
+            remaining_summary, _, remaining_findings = audit_training_data(
+                cleaned_training_data,
+                drop_invalid_negatives=False,
+                max_findings=args.max_findings,
+            )
+            payload["remaining_summary"] = remaining_summary
+            payload["remaining_findings"] = remaining_findings
+            exit_summary = remaining_summary
+
+    print(json.dumps(payload, indent=2))
+
+    return 1 if exit_summary["total_findings"] and not args.allow_findings else 0
 
 
 if __name__ == "__main__":

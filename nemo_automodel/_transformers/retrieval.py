@@ -15,7 +15,9 @@
 """Encoder models for bi-encoder and cross-encoder tasks."""
 
 import inspect
+import json
 import os
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -39,6 +41,23 @@ def _get_retrieval_metadata(config) -> dict:
     """Return saved retrieval wrapper metadata from a model config."""
     metadata = getattr(config, _RETRIEVAL_METADATA_KEY, {})
     return metadata if isinstance(metadata, dict) else {}
+
+
+def _load_encoder_config(model_name_or_path: str, trust_remote_code: bool = False):
+    """Load an encoder config and merge AutoModel v5 metadata when present."""
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    model_path = Path(model_name_or_path)
+    v5_config_path = model_path / "config.v5.json"
+    if not v5_config_path.exists():
+        return config
+
+    with open(v5_config_path, "r") as f:
+        v5_config = json.load(f)
+
+    metadata = v5_config.get(_RETRIEVAL_METADATA_KEY)
+    if isinstance(metadata, dict):
+        setattr(config, _RETRIEVAL_METADATA_KEY, metadata)
+    return config
 
 
 def _coerce_bool(value) -> bool:
@@ -311,7 +330,7 @@ def build_encoder_backbone(
     """
     config = loaded_config
     if config is None:
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        config = _load_encoder_config(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -453,7 +472,7 @@ class BiEncoderModel(nn.Module):
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        config = _load_encoder_config(model_name_or_path, trust_remote_code=trust_remote_code)
         pooling, l2_normalize = _resolve_bi_encoder_options(config, pooling, l2_normalize)
         backbone = build_encoder_backbone(
             model_name_or_path,

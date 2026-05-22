@@ -222,3 +222,46 @@ def test_extract_submodel_without_config_raises():
 
     with pytest.raises(ValueError, match="has no .config attribute"):
         _extract_submodel(model, "language_model")
+
+
+def test_load_encoder_config_merges_v5_retrieval_metadata(tmp_path):
+    """v4-compatible exports keep AutoModel metadata in config.v5.json."""
+    from nemo_automodel._transformers.retrieval import _load_encoder_config
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
+    (tmp_path / "config.v5.json").write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "nemo_retrieval": {"task": "embedding", "pooling": "last", "l2_normalize": False},
+            }
+        )
+    )
+
+    config = _load_encoder_config(str(tmp_path))
+
+    assert config.nemo_retrieval == {"task": "embedding", "pooling": "last", "l2_normalize": False}
+
+
+def test_nemo_auto_biencoder_defaults_do_not_override_saved_metadata(monkeypatch):
+    """The public AutoModel entry point should defer pooling/l2 defaults to the saved config."""
+    from nemo_automodel._transformers import auto_model
+
+    captured = {}
+
+    def fake_base_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        captured["pretrained_model_name_or_path"] = pretrained_model_name_or_path
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        auto_model._NeMoAutoModelForRetrievalBase,
+        "from_pretrained",
+        classmethod(fake_base_from_pretrained),
+    )
+
+    auto_model.NeMoAutoModelBiEncoder.from_pretrained("saved-export")
+
+    assert captured["pretrained_model_name_or_path"] == "saved-export"
+    assert captured["kwargs"]["pooling"] is None
+    assert captured["kwargs"]["l2_normalize"] is None
