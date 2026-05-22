@@ -9,7 +9,7 @@ End-to-end tutorials covering the LLM customization lifecycle using [NeMo AutoMo
 | [**Llama LoRA fine-tune**](./llama-peft/finetune.ipynb) | Instruction tuning data | Memory-efficient LoRA fine-tuning for task adaptation. | L40S | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3DzJSOSWZJuHOqMbZ43Z0knmToC) |
 | Evaluation | Standard benchmarks | Evaluate AutoModel checkpoints with lm-evaluation-harness. | Coming soon | Coming soon |
 | Reasoning SFT | Reasoning instruction data | Fine-tune a model to selectively enable chain-of-thought reasoning via system prompt control. | Coming soon | Coming soon |
-| [Nemotron Parse Fine-Tuning](./nemotron-parse/finetune.ipynb) | [Invoices](https://huggingface.co/datasets/katanaml-org/invoices-donut-data-v1) | Fine-tune Nemotron Parse v1.1 for structured document extraction. | L40S | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy?launchableID=env-3E4KEpLPd6a7KBEDSvQfKelkgTO) |
+| [**Nemotron Parse Fine-Tuning**](./nemotron-parse/finetune.ipynb) | [Invoices](https://huggingface.co/datasets/katanaml-org/invoices-donut-data-v1) | Fine-tune Nemotron Parse v1.1 for structured document extraction. | L40S | [![Launch on Brev](https://brev-assets.s3.us-west-1.amazonaws.com/nv-lb-dark.svg)](https://brev.nvidia.com/launchable/deploy?launchableID=env-3E4KEpLPd6a7KBEDSvQfKelkgTO) |
 
 ## Prerequisites
 
