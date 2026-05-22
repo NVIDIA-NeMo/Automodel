@@ -59,6 +59,7 @@ MINING_DEFAULTS = {
     "corpus_chunk_size": 50000,
     "load_embeddings_from_cache": False,
     "use_negatives_from_file": False,
+    "overwrite_output": False,
     # Prefix and length configuration for embedding generation
     "query_prefix": "",
     "passage_prefix": "",
@@ -180,6 +181,7 @@ class MineHardNegativesRecipe:
         self.corpus_chunk_size = None
         self.load_embeddings_from_cache = None
         self.use_negatives_from_file = None
+        self.overwrite_output = None
 
         # Model loading parameters (populated in setup)
         self.model_name_or_path = None
@@ -320,6 +322,7 @@ class MineHardNegativesRecipe:
         self.corpus_chunk_size = self._get_mining_param("corpus_chunk_size")
         self.load_embeddings_from_cache = self._get_mining_param("load_embeddings_from_cache")
         self.use_negatives_from_file = self._get_mining_param("use_negatives_from_file")
+        self.overwrite_output = self._get_mining_param("overwrite_output")
 
         # Model loading: tokenizer defaults to model path if not specified
         self.tokenizer_name_or_path = self._get_mining_param("tokenizer_name_or_path")
@@ -351,6 +354,16 @@ class MineHardNegativesRecipe:
             raise ValueError("Missing required parameter: --mining.train_file_output_path")
         if self.model_name_or_path is None:
             raise ValueError("Missing required parameter: --mining.model_name_or_path")
+
+        input_path = Path(self.train_qa_file_path).expanduser().resolve(strict=False)
+        output_path = Path(self.train_file_output_path).expanduser().resolve(strict=False)
+        if output_path == input_path:
+            raise ValueError("train_file_output_path must be different from train_qa_file_path")
+        if output_path.exists() and not self.overwrite_output:
+            raise ValueError(
+                f"Output file already exists: {output_path}. "
+                "Choose a new --mining.train_file_output_path or pass --mining.overwrite_output true."
+            )
 
         # Validate margin type if margin is specified
         if self.hard_neg_margin is not None:
@@ -464,7 +477,13 @@ class MineHardNegativesRecipe:
 
             questions.append(question_text)
             question_ids.append(row["question_id"])
-            corpus_ids.append(row["corpus_id"])
+            corpus_id = row["corpus_id"]
+            if corpus_id != self.corpus_id:
+                raise ValueError(
+                    f"Mining input row {row['question_id']} references corpus_id {corpus_id!r}, "
+                    f"but this mining run loaded corpus_id {self.corpus_id!r}. Run one corpus per mining job."
+                )
+            corpus_ids.append(corpus_id)
 
             # Map positive doc IDs to indices
             pos_indices = [self.doc_to_idx[doc["id"]] for doc in row["pos_doc"]]
@@ -621,9 +640,9 @@ class MineHardNegativesRecipe:
         shard_path = shard_dir / f"queries_rank{r:04d}.npz"
 
         # Compute or load this rank's shard
-        if self._should_load_partial_cache(shard_path):
-            local_embeds = _load_npz_array(shard_path)
-        else:
+        local_expected = local_end - local_start
+        local_embeds = self._load_partial_cache_shard(shard_path, local_expected, "query shard")
+        if local_embeds is None:
             local_texts = self.questions[local_start:local_end]
             local_embeds = self._encode_texts(
                 texts=local_texts,
@@ -655,26 +674,39 @@ class MineHardNegativesRecipe:
 
         return np.concatenate(parts, axis=0) if parts else np.empty((0, 0), dtype=np.float32)
 
-    def _load_cached_chunk(self, cache_path: Path, expected_size: Optional[int] = None) -> Optional[np.ndarray]:
-        """Load a fully-assembled chunk cache if it exists and matches the current chunk."""
+    def _load_partial_cache_shard(
+        self,
+        cache_path: Path,
+        expected_size: Optional[int] = None,
+        label: str = "embedding shard",
+    ) -> Optional[np.ndarray]:
+        """Load a reusable partial cache shard, validating readability and row count."""
         if not self._should_load_partial_cache(cache_path):
             return None
 
         try:
-            cached_chunk = _load_npz_array(cache_path)
+            cached_shard = _load_npz_array(cache_path)
         except Exception as exc:
-            logger.warning("Ignoring unreadable document chunk cache %s: %s", cache_path, exc)
+            logger.warning("Ignoring unreadable %s cache %s: %s", label, cache_path, exc)
             return None
 
-        if expected_size is not None and cached_chunk.shape[0] != expected_size:
+        if expected_size is not None and cached_shard.shape[0] != expected_size:
             logger.info(
-                "Cached document chunk %s has %s rows, expected %s; recomputing chunk.",
+                "Cached %s %s has %s rows, expected %s; recomputing shard.",
+                label,
                 cache_path,
-                cached_chunk.shape[0],
+                cached_shard.shape[0],
                 expected_size,
             )
             return None
 
+        return cached_shard
+
+    def _load_cached_chunk(self, cache_path: Path, expected_size: Optional[int] = None) -> Optional[np.ndarray]:
+        """Load a fully-assembled chunk cache if it exists and matches the current chunk."""
+        cached_chunk = self._load_partial_cache_shard(cache_path, expected_size, "document chunk")
+        if cached_chunk is None:
+            return None
         if self.dist_env.world_size > 1 and not self.dist_env.is_main:
             return np.empty((0, 0), dtype=np.float32)
         return cached_chunk
@@ -708,17 +740,7 @@ class MineHardNegativesRecipe:
 
         # Compute or load this rank's slice
         local_expected = local_end - local_start
-        local_embeds = None
-        if self._should_load_partial_cache(rank_cache_path):
-            local_embeds = _load_npz_array(rank_cache_path)
-            if local_embeds.shape[0] != local_expected:
-                logger.info(
-                    "Cached rank shard %s has %s rows, expected %s; recomputing shard.",
-                    rank_cache_path,
-                    local_embeds.shape[0],
-                    local_expected,
-                )
-                local_embeds = None
+        local_embeds = self._load_partial_cache_shard(rank_cache_path, local_expected, "document rank shard")
         if local_embeds is None:
             local_texts = texts[local_start:local_end]
             local_embeds = self._encode_texts(
@@ -1413,6 +1435,7 @@ class MineHardNegativesRecipe:
             "document_embedding_batch_size": self.document_embedding_batch_size,
             "corpus_chunk_size": self.corpus_chunk_size,
             "use_negatives_from_file": self.use_negatives_from_file,
+            "overwrite_output": self.overwrite_output,
             "query_prefix": self.query_prefix,
             "passage_prefix": self.passage_prefix,
             "query_max_length": self.query_max_length,
@@ -1493,11 +1516,11 @@ class MineHardNegativesRecipe:
         # Add mining metadata
         output["mining"] = {"args": self._get_mining_args_dict()}
 
-        # Clear data and rebuild with enriched rows
+        # Iterate through original rows when available so custom row metadata round-trips.
+        source_rows = output.get("data") or self.questions_dataset
         output["data"] = []
-
-        # Iterate through original dataset and enrich with mining results
-        for row in self.questions_dataset:
+        for source_row in source_rows:
+            row = dict(source_row)
             question_id = row["question_id"]
 
             # Replace neg_doc with mined negatives
@@ -1505,7 +1528,8 @@ class MineHardNegativesRecipe:
 
             # Add scores to positive docs
             pos_scores = pos_scores_by_qid.get(question_id, [])
-            for j, pos_doc in enumerate(row.get("pos_doc", [])):
+            row["pos_doc"] = [dict(pos_doc) for pos_doc in row.get("pos_doc", [])]
+            for j, pos_doc in enumerate(row["pos_doc"]):
                 if j < len(pos_scores):
                     score = pos_scores[j]
                     if score is not None and math.isfinite(float(score)):
@@ -1525,6 +1549,15 @@ class MineHardNegativesRecipe:
 
         # Ensure output directory exists
         output_path = Path(self.train_file_output_path)
+        input_path = Path(self.train_qa_file_path).expanduser().resolve(strict=False)
+        resolved_output_path = output_path.expanduser().resolve(strict=False)
+        if resolved_output_path == input_path:
+            raise ValueError("train_file_output_path must be different from train_qa_file_path")
+        if resolved_output_path.exists() and not self.overwrite_output:
+            raise ValueError(
+                f"Output file already exists: {resolved_output_path}. "
+                "Choose a new --mining.train_file_output_path or pass --mining.overwrite_output true."
+            )
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write output file with formatting
@@ -1612,6 +1645,7 @@ class MineHardNegativesRecipe:
         print(f"  corpus_chunk_size:             {self.corpus_chunk_size}")
         print(f"  load_embeddings_from_cache:    {self.load_embeddings_from_cache}")
         print(f"  use_negatives_from_file:       {self.use_negatives_from_file}")
+        print(f"  overwrite_output:              {self.overwrite_output}")
         print("\nEmbedding configuration:")
         print(f"  query_prefix:                  '{self.query_prefix}'")
         print(f"  passage_prefix:                '{self.passage_prefix}'")

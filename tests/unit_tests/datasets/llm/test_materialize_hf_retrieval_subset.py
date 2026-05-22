@@ -124,3 +124,33 @@ def test_materialize_hf_retrieval_subset_overwrites_when_requested(tmp_path, mon
     assert (tmp_path / "train.json").exists()
     assert not (tmp_path / "FEVER_corpus" / "train-00000-of-00001.parquet").exists()
     assert (tmp_path / "FEVER_corpus" / "train.parquet").exists()
+
+
+def test_materialize_hf_retrieval_subset_overwrite_keeps_existing_output_when_load_fails(tmp_path, monkeypatch):
+    existing_train_json = tmp_path / "train.json"
+    existing_train_json.write_text('{"corpus": [{"path": "./FEVER_corpus"}], "data": []}')
+    stale_corpus = tmp_path / "FEVER_corpus"
+    stale_corpus.mkdir()
+    (stale_corpus / "train.parquet").write_text("still valid")
+
+    def raise_load_error(repo_id, subset):
+        raise RuntimeError("temporary load failure")
+
+    monkeypatch.setattr(materialize_hf_retrieval_subset, "_load_hf_subset", raise_load_error)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "materialize_hf_retrieval_subset.py",
+            "nvidia/embed-nemotron-dataset-v1",
+            "FEVER",
+            str(tmp_path),
+            "--overwrite",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="temporary load failure"):
+        materialize_hf_retrieval_subset.main()
+
+    assert existing_train_json.read_text() == '{"corpus": [{"path": "./FEVER_corpus"}], "data": []}'
+    assert (stale_corpus / "train.parquet").read_text() == "still valid"

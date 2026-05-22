@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import shutil
+import tempfile
 from pathlib import Path
 
 from datasets import Dataset
@@ -56,32 +57,55 @@ def main() -> int:
             parser.error(f"output_dir is not empty: {output_dir}. Pass --overwrite to replace existing files.")
     else:
         output_dir.mkdir(parents=True)
-    corpus_dir = output_dir / f"{args.subset}_corpus"
-    if args.overwrite and corpus_dir.exists():
-        shutil.rmtree(corpus_dir)
-    corpus_dir.mkdir(parents=True, exist_ok=True)
-
     data_list, corpus_info = _load_hf_subset(args.repo_id, args.subset)
-    doc_rows = []
-    for doc_id in corpus_info.get_all_ids():
-        document = corpus_info.get_document_by_id(doc_id)
-        doc_rows.append({"id": str(doc_id), "text": document.get("text", "")})
+    corpus_dir = output_dir / f"{args.subset}_corpus"
+    tmp_corpus_dir = Path(tempfile.mkdtemp(prefix=f".{args.subset}_corpus.", dir=output_dir))
+    tmp_train_path = None
+    backup_corpus_dir = None
+    try:
+        doc_rows = []
+        for doc_id in corpus_info.get_all_ids():
+            document = corpus_info.get_document_by_id(doc_id)
+            doc_rows.append({"id": str(doc_id), "text": document.get("text", "")})
 
-    Dataset.from_list(doc_rows).to_parquet(str(corpus_dir / "train.parquet"))
-    metadata = {
-        **corpus_info.metadata,
-        "class": "TextQADataset",
-        "corpus_id": corpus_info.corpus_id,
-    }
-    with open(corpus_dir / "merlin_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2, sort_keys=True)
+        Dataset.from_list(doc_rows).to_parquet(str(tmp_corpus_dir / "train.parquet"))
+        metadata = {
+            **corpus_info.metadata,
+            "class": "TextQADataset",
+            "corpus_id": corpus_info.corpus_id,
+        }
+        with open(tmp_corpus_dir / "merlin_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
 
-    train_json = {
-        "corpus": [{"path": f"./{corpus_dir.name}"}],
-        "data": data_list,
-    }
-    with open(output_dir / "train.json", "w") as f:
-        json.dump(train_json, f, indent=2)
+        train_json = {
+            "corpus": [{"path": f"./{corpus_dir.name}"}],
+            "data": data_list,
+        }
+        with tempfile.NamedTemporaryFile("w", dir=output_dir, prefix=".train.", suffix=".json", delete=False) as f:
+            tmp_train_path = Path(f.name)
+            json.dump(train_json, f, indent=2)
+
+        if corpus_dir.exists():
+            backup_corpus_dir = Path(tempfile.mkdtemp(prefix=f".{corpus_dir.name}.backup.", dir=output_dir))
+            backup_corpus_dir.rmdir()
+            shutil.move(str(corpus_dir), str(backup_corpus_dir))
+        shutil.move(str(tmp_corpus_dir), str(corpus_dir))
+        tmp_corpus_dir = None
+        tmp_train_path.replace(output_dir / "train.json")
+        tmp_train_path = None
+    except Exception:
+        if backup_corpus_dir is not None and backup_corpus_dir.exists():
+            if corpus_dir.exists():
+                shutil.rmtree(corpus_dir)
+            shutil.move(str(backup_corpus_dir), str(corpus_dir))
+        raise
+    finally:
+        if tmp_corpus_dir is not None and tmp_corpus_dir.exists():
+            shutil.rmtree(tmp_corpus_dir)
+        if tmp_train_path is not None and tmp_train_path.exists():
+            tmp_train_path.unlink()
+        if backup_corpus_dir is not None and backup_corpus_dir.exists():
+            shutil.rmtree(backup_corpus_dir)
 
     logger.info("Wrote %s records and %s corpus documents to %s", len(data_list), len(doc_rows), output_dir)
     return 0

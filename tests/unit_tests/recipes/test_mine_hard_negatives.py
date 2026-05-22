@@ -279,6 +279,54 @@ def test_write_output_preserves_original_question_id(tmp_path):
     ]
 
 
+def test_write_output_preserves_custom_row_metadata(tmp_path):
+    input_file = tmp_path / "input.json"
+    output_file = tmp_path / "output.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "question": "Which doc is positive?",
+                        "corpus_id": "demo",
+                        "pos_doc": [{"id": "p1"}],
+                        "neg_doc": [{"id": "old"}],
+                        "source_split": "curated-dev",
+                    }
+                ]
+            }
+        )
+    )
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+        }
+    )
+    recipe.train_qa_file_path = str(input_file)
+    recipe.train_file_output_path = str(output_file)
+    recipe.questions_dataset = [
+        {
+            "question_id": "q0",
+            "question": "Which doc is positive?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "p1"}],
+            "neg_doc": [],
+        }
+    ]
+    recipe._build_negative_docs_by_question_id = lambda: {"q0": [{"id": "n1", "score": 0.2}]}
+    recipe._build_positive_scores_by_question_id = lambda: {"q0": [0.9]}
+    recipe._get_mining_args_dict = lambda: {}
+
+    recipe._write_output()
+
+    output = json.loads(output_file.read_text())
+    assert output["data"][0]["source_split"] == "curated-dev"
+    assert output["data"][0]["neg_doc"] == [{"id": "n1", "score": 0.2}]
+    assert output["data"][0]["pos_doc"] == [{"id": "p1", "score": 0.9}]
+
+
 def test_write_output_removes_stale_positive_score_for_non_finite_current_score(tmp_path):
     input_file = tmp_path / "input.json"
     output_file = tmp_path / "output.json"
@@ -314,6 +362,56 @@ def test_write_output_removes_stale_positive_score_for_non_finite_current_score(
 
     output = json.loads(output_file.read_text())
     assert output["data"][0]["pos_doc"] == [{"id": "p1"}]
+
+
+def test_validate_mining_params_rejects_existing_output_without_overwrite(tmp_path):
+    input_file = tmp_path / "input.json"
+    output_file = tmp_path / "output.json"
+    input_file.write_text("{}")
+    output_file.write_text("existing")
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+        }
+    )
+    recipe._extract_mining_params()
+
+    with pytest.raises(ValueError, match="Output file already exists"):
+        recipe._validate_mining_params()
+
+
+def test_validate_mining_params_allows_existing_output_with_overwrite(tmp_path):
+    input_file = tmp_path / "input.json"
+    output_file = tmp_path / "output.json"
+    input_file.write_text("{}")
+    output_file.write_text("existing")
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+            "overwrite_output": True,
+        }
+    )
+    recipe._extract_mining_params()
+
+    recipe._validate_mining_params()
+
+
+def test_validate_mining_params_rejects_input_output_same_path(tmp_path):
+    input_file = tmp_path / "input.json"
+    input_file.write_text("{}")
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(input_file),
+            "overwrite_output": True,
+        }
+    )
+    recipe._extract_mining_params()
+
+    with pytest.raises(ValueError, match="must be different"):
+        recipe._validate_mining_params()
 
 
 def test_encode_texts_empty_input_returns_empty_array():
@@ -352,6 +450,25 @@ def test_cache_fingerprint_includes_corpus_chunk_size(tmp_path):
 
     assert first_fingerprint["corpus_chunk_size"] == 2
     assert recipe._build_cache_fingerprint()["corpus_chunk_size"] == 3
+
+
+def test_load_partial_cache_shard_rejects_shape_mismatch(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._reuse_partial_embedding_cache = True
+    cache_path = tmp_path / "query_shards" / "queries_rank0000.npz"
+    cache_path.parent.mkdir()
+    np.savez(cache_path, np.ones((2, 2), dtype=np.float32))
+
+    assert recipe._load_partial_cache_shard(cache_path, expected_size=1, label="query shard") is None
+
+
+def test_load_partial_cache_shard_rejects_unreadable_npz(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._reuse_partial_embedding_cache = True
+    cache_path = tmp_path / "chunk_0000_rank0000.npz"
+    cache_path.write_text("not an npz")
+
+    assert recipe._load_partial_cache_shard(cache_path, expected_size=1, label="document rank shard") is None
 
 
 def test_full_embeddings_cache_requires_matching_metadata(tmp_path):
@@ -437,9 +554,23 @@ def test_prepare_data_rejects_duplicate_question_ids():
         {"question_id": "q0", "question": "second", "corpus_id": "demo", "pos_doc": [{"id": "d0"}]},
     ]
     recipe.doc_to_idx = {"d0": 0}
+    recipe.corpus_id = "demo"
     recipe.use_negatives_from_file = False
 
     with pytest.raises(ValueError, match="unique question_id"):
+        recipe._prepare_data()
+
+
+def test_prepare_data_rejects_mismatched_corpus_id():
+    recipe = _make_recipe()
+    recipe.corpus_id = "expected"
+    recipe.questions_dataset = [
+        {"question_id": "q0", "question": "first", "corpus_id": "other", "pos_doc": [{"id": "d0"}]},
+    ]
+    recipe.doc_to_idx = {"d0": 0}
+    recipe.use_negatives_from_file = False
+
+    with pytest.raises(ValueError, match="Run one corpus per mining job"):
         recipe._prepare_data()
 
 
@@ -465,6 +596,58 @@ def test_encode_queries_sharded_handles_empty_rank_shard(tmp_path):
     assert query_embeddings.shape == (1, 2)
 
 
+def test_encode_queries_sharded_recomputes_stale_local_query_shard(tmp_path):
+    recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": True})
+    recipe.cache_embeddings_dir = str(tmp_path)
+    recipe.load_embeddings_from_cache = True
+    recipe._reuse_partial_embedding_cache = True
+    recipe.query_embedding_batch_size = 2
+    recipe.query_max_length = 16
+    recipe.query_prefix = "query: "
+    recipe.questions = ["what is nvlink?"]
+    recipe.dist_env = SimpleNamespace(world_size=2, rank=0, is_main=True, device=torch.device("cpu"))
+    shard_dir = tmp_path / "query_shards"
+    shard_dir.mkdir()
+    np.savez(shard_dir / "queries_rank0000.npz", np.ones((2, 2), dtype=np.float32))
+    recomputed = np.full((1, 2), 4.0, dtype=np.float32)
+    recipe._encode_texts = lambda **_: recomputed
+
+    def write_empty_peer_shard():
+        np.savez(shard_dir / "queries_rank0001.npz", np.empty((0, 0), dtype=np.float32))
+
+    recipe._synchronize_ranks = write_empty_peer_shard
+
+    query_embeddings = recipe._encode_queries_sharded()
+
+    np.testing.assert_array_equal(query_embeddings, recomputed)
+
+
+def test_encode_queries_sharded_recomputes_corrupt_local_query_shard(tmp_path):
+    recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": True})
+    recipe.cache_embeddings_dir = str(tmp_path)
+    recipe.load_embeddings_from_cache = True
+    recipe._reuse_partial_embedding_cache = True
+    recipe.query_embedding_batch_size = 2
+    recipe.query_max_length = 16
+    recipe.query_prefix = "query: "
+    recipe.questions = ["what is nvlink?"]
+    recipe.dist_env = SimpleNamespace(world_size=2, rank=0, is_main=True, device=torch.device("cpu"))
+    shard_dir = tmp_path / "query_shards"
+    shard_dir.mkdir()
+    (shard_dir / "queries_rank0000.npz").write_text("corrupt")
+    recomputed = np.full((1, 2), 5.0, dtype=np.float32)
+    recipe._encode_texts = lambda **_: recomputed
+
+    def write_empty_peer_shard():
+        np.savez(shard_dir / "queries_rank0001.npz", np.empty((0, 0), dtype=np.float32))
+
+    recipe._synchronize_ranks = write_empty_peer_shard
+
+    query_embeddings = recipe._encode_queries_sharded()
+
+    np.testing.assert_array_equal(query_embeddings, recomputed)
+
+
 def test_encode_chunk_distributed_handles_empty_rank_shard(tmp_path):
     recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": False})
     recipe.cache_embeddings_dir = str(tmp_path)
@@ -485,6 +668,30 @@ def test_encode_chunk_distributed_handles_empty_rank_shard(tmp_path):
 
     assert document_embeddings.shape == (1, 2)
     assert (tmp_path / DOCUMENT_EMBEDDINGS_FNAME).exists() is False
+
+
+def test_encode_chunk_distributed_recomputes_corrupt_local_rank_shard(tmp_path):
+    recipe = _make_recipe({"cache_embeddings_dir": str(tmp_path), "load_embeddings_from_cache": True})
+    recipe.cache_embeddings_dir = str(tmp_path)
+    recipe.load_embeddings_from_cache = True
+    recipe._reuse_partial_embedding_cache = True
+    recipe.document_embedding_batch_size = 2
+    recipe.passage_max_length = 16
+    recipe.passage_prefix = "passage: "
+    recipe.dist_env = SimpleNamespace(world_size=2, rank=0, is_main=True, device=torch.device("cpu"))
+    cache_path = tmp_path / "chunk_0000.npz"
+    (tmp_path / "chunk_0000_rank0000.npz").write_text("corrupt")
+    recomputed = np.full((1, 2), 6.0, dtype=np.float32)
+    recipe._encode_texts = lambda **_: recomputed
+
+    def write_empty_peer_shard():
+        np.savez(tmp_path / "chunk_0000_rank0001.npz", np.empty((0, 0), dtype=np.float32))
+
+    recipe._synchronize_ranks = write_empty_peer_shard
+
+    document_embeddings = recipe._encode_chunk_distributed(["NVLink is fast."], cache_path)
+
+    np.testing.assert_array_equal(document_embeddings, recomputed)
 
 
 def test_mine_hard_negatives_drops_margin_filtered_candidates():
