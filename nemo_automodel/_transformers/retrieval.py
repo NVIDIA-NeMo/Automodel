@@ -30,6 +30,44 @@ from nemo_automodel.components.models.common.bidirectional import EncoderStateDi
 
 logger = logging.get_logger(__name__)
 
+_RETRIEVAL_METADATA_KEY = "nemo_retrieval"
+_BI_ENCODER_DEFAULT_POOLING = "avg"
+_BI_ENCODER_DEFAULT_L2_NORMALIZE = True
+
+
+def _get_retrieval_metadata(config) -> dict:
+    """Return saved retrieval wrapper metadata from a model config."""
+    metadata = getattr(config, _RETRIEVAL_METADATA_KEY, {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _coerce_bool(value) -> bool:
+    """Coerce booleans from config values while rejecting ambiguous strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+        raise ValueError(f"Cannot interpret boolean value: {value!r}")
+    return bool(value)
+
+
+def _resolve_bi_encoder_options(config, pooling: Optional[str], l2_normalize: Optional[bool]) -> tuple[str, bool]:
+    """Resolve wrapper options from explicit arguments, saved metadata, then defaults."""
+    metadata = _get_retrieval_metadata(config)
+    resolved_pooling = pooling
+    if resolved_pooling is None:
+        resolved_pooling = metadata.get("pooling", getattr(config, "pooling", _BI_ENCODER_DEFAULT_POOLING))
+
+    resolved_l2_normalize = l2_normalize
+    if resolved_l2_normalize is None:
+        resolved_l2_normalize = metadata.get("l2_normalize", _BI_ENCODER_DEFAULT_L2_NORMALIZE)
+
+    return resolved_pooling, _coerce_bool(resolved_l2_normalize)
+
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
     """Extract a nested submodel from a loaded model using a dotted attribute path."""
@@ -175,7 +213,14 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
-def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
+def configure_encoder_metadata(
+    model: PreTrainedModel,
+    config,
+    *,
+    task: Optional[str] = None,
+    pooling: Optional[str] = None,
+    l2_normalize: Optional[bool] = None,
+) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
     Sets ``config.architectures`` unconditionally.  For custom retrieval
@@ -187,9 +232,22 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     Args:
         model: The backbone ``PreTrainedModel`` instance.
         config: The model's config object (typically ``model.config``).
+        task: Optional retrieval task name saved for downstream loaders.
+        pooling: Optional bi-encoder pooling strategy saved for wrapper reloads.
+        l2_normalize: Optional bi-encoder normalization flag saved for wrapper reloads.
     """
     encoder_class_name = model.__class__.__name__
     config.architectures = [encoder_class_name]
+
+    metadata = dict(_get_retrieval_metadata(config))
+    if task is not None:
+        metadata["task"] = task
+    if pooling is not None:
+        metadata["pooling"] = pooling
+    if l2_normalize is not None:
+        metadata["l2_normalize"] = _coerce_bool(l2_normalize)
+    if metadata:
+        setattr(config, _RETRIEVAL_METADATA_KEY, metadata)
 
     # Only set auto_map for custom retrieval architectures.
     # Standard HF models don't need auto_map pointing to a local model.py.
@@ -212,6 +270,7 @@ def build_encoder_backbone(
     extract_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
+    loaded_config: Optional[object] = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -240,6 +299,7 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
+        loaded_config: Optional config that has already been loaded by the caller.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -249,7 +309,9 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    config = loaded_config
+    if config is None:
+        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -365,14 +427,21 @@ class BiEncoderModel(nn.Module):
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
+        configure_encoder_metadata(
+            self.model,
+            self.config,
+            task=self._TASK,
+            pooling=self.pooling,
+            l2_normalize=self.l2_normalize,
+        )
 
     @classmethod
     def build(
         cls,
         model_name_or_path: str,
         task: str = None,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: Optional[str] = None,
+        l2_normalize: Optional[bool] = None,
         do_distributed_inbatch_negative: bool = False,
         trust_remote_code: bool = False,
         **hf_kwargs,
@@ -384,8 +453,15 @@ class BiEncoderModel(nn.Module):
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
+        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+        pooling, l2_normalize = _resolve_bi_encoder_options(config, pooling, l2_normalize)
         backbone = build_encoder_backbone(
-            model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
+            model_name_or_path,
+            effective_task,
+            trust_remote_code=trust_remote_code,
+            pooling=pooling,
+            loaded_config=config,
+            **hf_kwargs,
         )
 
         return cls(
@@ -447,6 +523,7 @@ class CrossEncoderModel(nn.Module):
     def __init__(self, model: PreTrainedModel):
         super().__init__()
         _init_encoder_common(self, model)
+        configure_encoder_metadata(self.model, self.config, task=self._TASK)
 
     @classmethod
     def build(

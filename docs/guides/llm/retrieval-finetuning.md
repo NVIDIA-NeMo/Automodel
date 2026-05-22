@@ -585,9 +585,6 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   prefixes before mining.
 - `query_max_length` and `passage_max_length`: keep these consistent with training unless you intentionally change
   truncation.
-- `pooling` and `l2_normalize`: the mining script currently loads `NeMoAutoModelBiEncoder.from_pretrained()` with the
-  wrapper defaults (`pooling: avg`, `l2_normalize: true`). Mine with checkpoints trained using those defaults, or use a
-  custom mining entry point that passes the same wrapper settings used during training.
 - `add_bos_token` and `add_eos_token`: match the tokenizer behavior used during training. If omitted, mining falls back
   to tokenizer defaults, which can differ from the training config.
 - `use_negatives_from_file`: include existing negatives from the input file when mining. Existing negatives are prepended
@@ -598,12 +595,36 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
   length, and world-size combination; stale cache files can be reused if they are already present.
 
+`pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
+`--mining.pooling` or `--mining.l2_normalize`; the miner rejects unknown mining keys. Mine from a saved bi-encoder export
+produced with the wrapper settings you want, or explicitly reload and export the model with those settings before mining.
+
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
 negative mining excludes document IDs listed in each input row's `pos_doc`, but it cannot read an external qrels file or
 know every semantically relevant duplicate. Put all known positive IDs for the query in the mining input, deduplicate the
-corpus, inspect mined samples, filter duplicate IDs and `-inf` scores from mined outputs, and avoid mining from
-validation or test corpora. If you unroll multi-positive training data, mine from rows that still carry every known
-positive in `pos_doc`; otherwise sibling positives can be mined as false negatives.
+corpus, inspect mined samples, filter duplicate IDs and non-finite scores such as `-inf` from mined outputs, and avoid
+mining from validation or test corpora. If you unroll multi-positive training data, mine from rows that still carry every
+known positive in `pos_doc`; otherwise sibling positives can be mined as false negatives.
+
+Run the audit utility before reusing mined output:
+
+```bash
+uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
+  /path/to/mined.json
+```
+
+If the report only contains issues that you want to drop automatically, write a cleaned copy:
+
+```bash
+uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
+  /path/to/mined.json \
+  --drop-invalid-negatives \
+  --output /path/to/mined_audited.json
+```
+
+The audit flags negatives whose IDs also appear in the row's `pos_doc`, duplicate negative IDs in the same row, missing
+negative scores, and non-finite negative scores. The cleaned output preserves query lineage fields such as
+`original_question_id`, so unrolled examples remain traceable to their source question.
 
 ## Save, Resume, and Use the Checkpoint
 

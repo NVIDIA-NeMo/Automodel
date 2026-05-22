@@ -89,7 +89,10 @@ mining:
   # Maximum sequence lengths
   query_max_length: 512
   passage_max_length: 512
+  # pooling and l2_normalize are saved model metadata, not mining config keys.
+  # Do not add mining.pooling or mining.l2_normalize here; the miner rejects unknown keys.
   
   # Whether to include negatives from the input file. Existing negatives are prepended to the mined output;
-  # deduplicate/audit the final file before training.
+  # deduplicate/audit the final file before training:
+  # uv run python examples/retrieval/data_utils/audit_mined_negatives.py /path/to/output.json
   use_negatives_from_file: false

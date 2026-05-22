@@ -122,6 +122,15 @@ def test_extract_mining_params_attn_implementation_explicit(value):
     assert recipe.attn_implementation == value
 
 
+@pytest.mark.parametrize("unknown_field", ["pooling", "l2_normalize"])
+def test_extract_mining_params_rejects_unknown_fields(unknown_field):
+    """Unsupported mining keys should fail loudly instead of being ignored."""
+    recipe = _make_recipe({unknown_field: "unused"})
+
+    with pytest.raises(ValueError, match=f"Unknown mining config field\\(s\\): {unknown_field}"):
+        recipe._extract_mining_params()
+
+
 # ---------------------------------------------------------------------------
 # setup() — model loading with/without attn_implementation
 # ---------------------------------------------------------------------------

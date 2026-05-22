@@ -72,6 +72,8 @@ MINING_DEFAULTS = {
     # Attention implementation for model loading
     "attn_implementation": None,  # None = use model default; "sdpa", "flash_attention_2", "eager"
 }
+MINING_PATH_FIELDS = {"train_qa_file_path", "train_file_output_path", "cache_embeddings_dir"}
+MINING_CONFIG_FIELDS = set(MINING_DEFAULTS) | MINING_PATH_FIELDS
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> DistInfo:
@@ -278,6 +280,15 @@ class MineHardNegativesRecipe:
 
     def _extract_mining_params(self):
         """Extract all mining parameters from configuration."""
+        mining_dict = self.mining_cfg.to_dict() if hasattr(self.mining_cfg, "to_dict") else dict(self.mining_cfg)
+        unknown_fields = sorted(set(mining_dict) - MINING_CONFIG_FIELDS)
+        if unknown_fields:
+            supported_fields = ", ".join(sorted(MINING_CONFIG_FIELDS))
+            raise ValueError(
+                f"Unknown mining config field(s): {', '.join(unknown_fields)}. "
+                f"Supported mining fields are: {supported_fields}"
+            )
+
         # Required parameters
         self.train_qa_file_path = self._get_mining_param("train_qa_file_path")
         self.train_file_output_path = self._get_mining_param("train_file_output_path")
