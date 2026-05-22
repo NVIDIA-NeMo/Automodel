@@ -174,9 +174,10 @@ The training recipe does not load a separate qrels file. Materialize qrels into 
 For training, `pos_doc[0]` is the supervised positive. For mining, keep every known positive for the query in `pos_doc`
 so the miner can exclude those IDs; it does not read an external qrels file. If you expand multi-positive queries into
 one row per positive, make sure sibling positives are removed from `neg_doc` and audited out of mined negatives before
-training. Also keep sibling-positive rows out of the same in-batch-negative training batch, disable distributed in-batch
-negatives, or add qrels-aware sampling/masking. Keep the original qrels for offline Recall@K, MRR@K, and nDCG@K
-evaluation.
+training. The helper in `examples/retrieval/data_utils/unroll_pos_docs.py` writes `original_question_id` so mined outputs
+can still be joined back to the original qrels. Also keep sibling-positive rows out of the same in-batch-negative
+training batch, disable distributed in-batch negatives, or add qrels-aware sampling/masking. Keep the original qrels for
+offline Recall@K, MRR@K, and nDCG@K evaluation.
 
 ## Minimal Config Anatomy
 

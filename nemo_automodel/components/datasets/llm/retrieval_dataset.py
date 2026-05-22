@@ -288,6 +288,7 @@ def load_datasets(
                 raise ValueError(f"Missing required fields: {missing} in train_data item: {item}")
             normalized_item = {
                 "question_id": item["question_id"],
+                "original_question_id": item.get("original_question_id", item["question_id"]),
                 "question": item["question"],
                 "corpus_id": item["corpus_id"],
             }
@@ -431,11 +432,13 @@ def _load_hf_subset(repo_id: str, subset: str):
             f"adapter/preprocessor before using direct hf:// loading."
         )
 
-    # 5. Normalize to the standard {question_id, question, corpus_id, pos_doc, neg_doc} shape
+    # 5. Normalize to the standard {question_id, original_question_id, question, corpus_id, pos_doc, neg_doc} shape
     normalized_data = []
     for idx, item in enumerate(queries_hf):
+        question_id = str(item.get("question_id", f"{subset}:{idx}"))
         normalized_item = {
-            "question_id": str(item.get("question_id", f"{subset}:{idx}")),
+            "question_id": question_id,
+            "original_question_id": str(item.get("original_question_id", question_id)),
             "question": item["question"],
             "corpus_id": corpus_id,
         }

@@ -14,6 +14,7 @@
 
 """Unit tests for MineHardNegativesRecipe — attn_implementation support."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -158,3 +159,48 @@ def test_setup_with_attn_implementation(attn_impl):
     assert kwargs["attn_implementation"] == attn_impl
     assert kwargs["use_liger_kernel"] is False
     assert kwargs["use_sdpa_patching"] is True
+
+
+def test_write_output_preserves_original_question_id(tmp_path):
+    """Mined outputs should keep query lineage added by unroll_pos_docs.py."""
+    input_file = tmp_path / "input.json"
+    output_file = tmp_path / "output.json"
+    input_file.write_text(json.dumps({"corpus": {"path": "/fake/corpus"}, "data": []}))
+
+    recipe = _make_recipe(
+        {
+            "train_qa_file_path": str(input_file),
+            "train_file_output_path": str(output_file),
+        }
+    )
+    recipe.train_qa_file_path = str(input_file)
+    recipe.train_file_output_path = str(output_file)
+    recipe.questions_dataset = [
+        {
+            "question_id": "q0_0",
+            "original_question_id": "q0",
+            "question": "Which doc is positive?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "p1"}],
+            "neg_doc": [{"id": "old"}],
+            "pos_score": 0.7,
+            "neg_scores": [0.1],
+        }
+    ]
+    recipe._build_negative_docs_by_question_id = lambda: {"q0_0": [{"id": "n1", "score": 0.2}]}
+    recipe._build_positive_scores_by_question_id = lambda: {"q0_0": [0.9]}
+    recipe._get_mining_args_dict = lambda: {}
+
+    recipe._write_output()
+
+    output = json.loads(output_file.read_text())
+    assert output["data"] == [
+        {
+            "question_id": "q0_0",
+            "original_question_id": "q0",
+            "question": "Which doc is positive?",
+            "corpus_id": "demo",
+            "pos_doc": [{"id": "p1", "score": 0.9}],
+            "neg_doc": [{"id": "n1", "score": 0.2}],
+        }
+    ]

@@ -197,7 +197,12 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
+    "llama_bidirec": ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "ministral3_bidirec": (
+        "nemo_automodel.components.models.ministral_bidirectional.model",
+        "Ministral3BidirectionalConfig",
+    ),
 }
 
 

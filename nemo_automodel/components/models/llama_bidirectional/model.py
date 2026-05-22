@@ -286,7 +286,7 @@ def _register_with_hf_auto_classes():
     This is needed so that AutoModel.from_config(LlamaBidirectionalConfig)
     works inside LlamaForSequenceClassification.__init__.
     """
-    from transformers import AutoConfig, AutoModel
+    from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
 
     try:
         AutoConfig.register(LlamaBidirectionalConfig.model_type, LlamaBidirectionalConfig)
@@ -294,6 +294,12 @@ def _register_with_hf_auto_classes():
         pass  # Already registered
     try:
         AutoModel.register(LlamaBidirectionalConfig, LlamaBidirectionalModel)
+    except ValueError:
+        pass  # Already registered
+    try:
+        AutoModelForSequenceClassification.register(
+            LlamaBidirectionalConfig, LlamaBidirectionalForSequenceClassification
+        )
     except ValueError:
         pass  # Already registered
 
