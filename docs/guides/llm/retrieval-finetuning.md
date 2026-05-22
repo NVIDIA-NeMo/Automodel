@@ -14,7 +14,33 @@ Both recipes use retrieval examples where the first passage is positive and the 
 common workflow is to train a bi-encoder, use it to mine harder negatives, then train either a stronger bi-encoder or a
 cross-encoder reranker.
 
+## Workflow Overview
+
+Most retrieval projects move through the same loop:
+
+```text
+Prepare retrieval data
+  -> Train a bi-encoder
+  -> Validate candidate-group ranking quality
+  -> Mine hard negatives
+  -> Retrain the bi-encoder or train a cross-encoder reranker
+  -> Use the consolidated checkpoint for indexing, mining, reranking, or serving
+```
+
+Start with a bi-encoder when you need embeddings for approximate nearest-neighbor search. Add hard-negative mining after
+the first pass if the model mostly sees easy negatives. Train a cross-encoder when a separate retriever already produces
+a small candidate set and you want a stronger reranking stage.
+
 ## Quickstart
+
+Before running the examples:
+
+- Use an AutoModel environment with the full GPU training dependencies installed. The NGC container is the safest path
+  for multi-GPU runs.
+- From a source checkout, use `uv run automodel ...`; from an installed environment, use `automodel ...`.
+- Accept access terms for the configured Hugging Face model and set `HF_TOKEN`, or replace the model path with a model
+  your environment can download.
+- Make sure every rank can read the dataset paths or `hf://` sources.
 
 Run the Llama 3.2 1B bi-encoder example:
 
@@ -35,17 +61,29 @@ For a small smoke test, override the schedule and sample count from the command 
 
 ```bash
 automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 1 \
+  --step_scheduler.global_batch_size 4 \
+  --step_scheduler.local_batch_size 1 \
   --step_scheduler.max_steps 10 \
-  --dataloader.dataset.max_train_samples 128
+  --dataloader.dataset.max_train_samples 40
 ```
 :::
 
 ## Choose a Recipe
 
-| Use case | Recipe | Model target | Collator | Loss |
-|----------|--------|--------------|----------|------|
-| Dense retrieval, embedding search, RAG candidate generation | `TrainBiEncoderRecipe` | `nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained` | `BiEncoderCollator` | Cross entropy over one positive plus negatives |
-| Reranking a retrieved candidate set | `TrainCrossEncoderRecipe` | `nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained` | `CrossEncoderCollator` | Cross entropy over one positive plus negatives |
+| Need | Use | Why |
+|------|-----|-----|
+| Search across a large corpus | Bi-encoder | Encodes queries and passages independently, so passage embeddings can be indexed once. |
+| RAG candidate generation | Bi-encoder | Produces dense vectors for approximate nearest-neighbor retrieval. |
+| Better ranking for a small shortlist | Cross-encoder | Scores each query-passage pair jointly, which is slower but usually more accurate. |
+| Better negatives for the next training run | Hard-negative mining | Uses a trained bi-encoder to find confusing passages for each query. |
+
+| Component | Bi-encoder | Cross-encoder |
+|-----------|------------|---------------|
+| Recipe | `TrainBiEncoderRecipe` | `TrainCrossEncoderRecipe` |
+| Model target | `nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained` | `nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained` |
+| Dataset mode | `model_type: bi_encoder` | `model_type: cross_encoder` |
+| Collator | `BiEncoderCollator` | `CrossEncoderCollator` |
+| Training objective | Cross entropy over one positive plus negatives | Cross entropy over one positive plus negatives |
 
 The bi-encoder computes a query embedding and passage embeddings independently. The cross-encoder formats each
 query-passage pair into one sequence and predicts a score for each candidate passage.
@@ -78,9 +116,92 @@ data_dir_list:
 `n_passages` controls how many passages are sampled for each query. For example, `n_passages: 5` means one positive
 and four negatives. If a record has fewer negatives than requested, negatives are repeated to fill the group.
 
+## Minimal Config Anatomy
+
+This minimal bi-encoder config shows the pieces that must be present in a runnable retrieval fine-tuning job. The
+sections below explain the model-specific parts in more detail.
+
+```yaml
+recipe: TrainBiEncoderRecipe
+seed: 42
+temperature: 0.02
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 1
+  max_steps: 10
+  ckpt_every_steps: 10
+  val_every_steps: 10
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  pooling: avg
+  l2_normalize: true
+  torch_dtype: bfloat16
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  add_eos_token: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    model_type: bi_encoder
+    data_dir_list:
+      - /path/to/train.jsonl
+    data_type: train
+    n_passages: 5
+    seed: 42
+    do_shuffle: true
+    max_train_samples: 40
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    pad_to_multiple_of: 8
+  shuffle: true
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-6
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_warmup_steps: 2
+  lr_decay_style: linear
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./output/llama3_2_1b_encoder/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+```
+
+For a cross-encoder, change `recipe`, `model._target_`, `dataloader.dataset.model_type`, and `dataloader.collate_fn`
+to the cross-encoder values shown below.
+
 ## Configure a Bi-Encoder
 
-A bi-encoder config has four important parts: the model, tokenizer, retrieval dataset, and `BiEncoderCollator`.
+A bi-encoder config has four important parts: the model, tokenizer, retrieval dataset, and `BiEncoderCollator`. This
+snippet is an excerpt; keep the scheduler, optimizer, checkpoint, and distributed sections from the full config or one
+of the examples.
 
 ```yaml
 recipe: TrainBiEncoderRecipe
@@ -139,7 +260,8 @@ The complete example is
 
 A cross-encoder config uses the same retrieval dataset factory, but sets `model_type: cross_encoder` and uses
 `CrossEncoderCollator`. The dataset transform flattens each query with its positive and negative passages so the model
-scores each query-passage pair.
+scores each query-passage pair. This snippet is an excerpt; keep the same scheduler, optimizer, checkpoint, and
+distributed structure as the bi-encoder config.
 
 ```yaml
 recipe: TrainCrossEncoderRecipe
@@ -187,6 +309,22 @@ Important knobs:
 The complete example is
 [`examples/retrieval/cross_encoder/llama3_2_1b.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
 
+## Distributed Launch and Batch Size
+
+Launch examples with `automodel <config.yaml> --nproc-per-node <gpus>`. The retrieval recipes support data-parallel
+training through the configured distributed strategy; pipeline parallelism is not supported for encoder recipes today.
+
+The step scheduler computes gradient accumulation from:
+
+```text
+gradient_accumulation_steps = global_batch_size / (local_batch_size * data_parallel_size)
+```
+
+`global_batch_size` must be divisible by `local_batch_size * data_parallel_size`, and the result must be at least `1`.
+For memory pressure, reduce `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or
+`rerank_max_length`), then `n_passages`. Bi-encoders scale memory with query length plus `n_passages` passage sequences;
+cross-encoders scale with `n_passages` combined query-passage sequences.
+
 ## Add Validation
 
 Both examples include a commented `validation_dataloader` block. Enable it when you have a held-out retrieval file:
@@ -215,8 +353,13 @@ validation_dataloader:
   num_workers: 0
 ```
 
-Validation logs `val_loss`, `val_acc1`, and `val_mrr`. For cross-encoder validation, use `model_type: cross_encoder` and
-`CrossEncoderCollator` instead.
+Validation logs `val_loss`, `val_acc1`, and `val_mrr` to `validation.jsonl` under `checkpoint.checkpoint_dir`. These
+metrics measure ranking within each candidate group in the validation file; they are not full-corpus Recall@K or nDCG
+metrics. For cross-encoder validation, use `model_type: cross_encoder` and `CrossEncoderCollator` instead.
+
+```bash
+tail -n 5 ./output/llama3_2_1b_encoder/checkpoints/validation.jsonl
+```
 
 ## Enable LoRA
 
@@ -246,16 +389,24 @@ memory and want maximum adaptation.
 
 ## Mine Hard Negatives
 
-After an initial bi-encoder run, mine harder negatives with the saved encoder checkpoint:
+After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint:
 
 ```bash
 torchrun --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
-  --mining.model_name_or_path /path/to/encoder/checkpoint \
+  --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
   --mining.train_qa_file_path /path/to/input.json \
   --mining.train_file_output_path /path/to/output.json \
-  --mining.cache_embeddings_dir /path/to/cache
+  --mining.cache_embeddings_dir /path/to/cache \
+  --mining.query_prefix "query:" \
+  --mining.passage_prefix "passage:" \
+  --mining.query_max_length 512 \
+  --mining.passage_max_length 512
 ```
+
+Hard-negative mining expects the corpus ID-based retrieval JSON format described in the dataset guide, not the inline
+JSONL shortcut. The input must reference one corpus so the miner can build a passage embedding cache, retrieve
+candidates, and write mined negatives back to each query.
 
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
@@ -265,10 +416,12 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 - `query_max_length` and `passage_max_length`: keep these consistent with training unless you intentionally change
   truncation.
 - `use_negatives_from_file`: include existing negatives from the input file when mining.
+- `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
+  assembles the final embedding cache and score outputs, so plan memory and local disk accordingly.
 
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training.
 
-## Save and Use the Checkpoint
+## Save, Resume, and Use the Checkpoint
 
 Set checkpointing in the config:
 
@@ -280,8 +433,36 @@ checkpoint:
   save_consolidated: true
 ```
 
-With `save_consolidated: true`, AutoModel writes a Hugging Face-compatible consolidated checkpoint under the checkpoint
-directory. Use that directory for downstream embedding generation, hard-negative mining, or serving.
+Each save creates a versioned directory such as:
+
+```text
+./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_500/
+```
+
+With `save_consolidated: true`, AutoModel also writes a Hugging Face-compatible model under:
+
+```text
+./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_500/model/consolidated/
+```
+
+The `LATEST` symlink points to the most recent checkpoint. To resume from the latest compatible checkpoint, set:
+
+```yaml
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./output/llama3_2_1b_encoder/checkpoints
+  restore_from: LATEST
+```
+
+Use a unique `checkpoint_dir` per experiment unless you intentionally want to resume an existing run.
+
+## Use the Model
+
+Use a bi-encoder checkpoint to encode passages, build an approximate nearest-neighbor index, encode queries, and search
+the index. Keep the same tokenizer, pooling, normalization, prefixes, and max lengths that you used for training.
+
+Use a cross-encoder checkpoint to rerank a shortlist from a retriever. Cross-encoders score each query-passage pair
+jointly, so they are usually too expensive for first-stage full-corpus search.
 
 ## Troubleshooting
 
@@ -291,6 +472,7 @@ directory. Use that directory for downstream embedding generation, hard-negative
 | Loss does not move | Verify the positive passage is first and negatives are not duplicates of the positive. |
 | Poor retrieval quality | Mine harder negatives and align train/inference prefixes. |
 | OOM at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`; use LoRA for larger backbones. |
+| Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
 | Different mining and training behavior | Match tokenizer settings, prefixes, and max lengths across training and mining. |
 
 ## Related Files
