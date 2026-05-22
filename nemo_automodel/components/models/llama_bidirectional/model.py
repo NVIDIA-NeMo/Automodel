@@ -207,12 +207,22 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         # produced NaNs and broke L2_Retrieval / cross-encoder training. Bypass
         # the buggy base by initializing `score` in-place here, then defer to
         # super() for everything else.
+        #
+        # IMPORTANT: only run our direct in-place init when the weight has not
+        # already been initialized (e.g. by a checkpoint loader). The base
+        # class's `init.normal_` is guarded by `_is_hf_initialized`, so its
+        # double-call when reloading a fine-tuned checkpoint is a no-op; our
+        # raw `.normal_` is not, and would overwrite trained values with fresh
+        # random samples — silently regressing eval quality after reload.
         if module is self.score:
+            if getattr(module.weight, "_is_hf_initialized", False):
+                return
             std = getattr(self.config, "initializer_range", 0.02) or 0.02
             with torch.no_grad():
                 module.weight.normal_(mean=0.0, std=std)
                 if module.bias is not None:
                     module.bias.zero_()
+            module.weight._is_hf_initialized = True
             return
         super()._init_weights(module)
 
