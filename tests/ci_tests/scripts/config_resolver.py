@@ -18,7 +18,7 @@ See ci_config.yaml for the layered resolution stack and override schema.
 
 CLI:
     --base       Recipe YAML
-    --phase      nightly | release | convergence | performance | robustness
+    --phase      nightly | release | convergence | performance | checkpoint_robustness
     --output     Resolved YAML path (required unless --dry-run)
     --dry-run    Print the merge stack to stdout instead of writing
 """
@@ -155,12 +155,20 @@ def main() -> int:
     recipe = _load(args.base)
     ci_config = _load(CI_CONFIG_FILE)
 
+    # Shared phase defaults from ci_config.yaml -> phases[<phase>].
     phase_defaults = (ci_config.get("phases") or {}).get(args.phase) or {}
+    # Recipe-name-pattern overrides from ci_config.yaml -> conditional[].
     conditional_layer = _resolve_conditional_layer(
         ci_config.get("conditional") or [], args.phase, args.base.stem
     )
-    ci_section = (recipe.get("ci") or {}).get(args.phase) or {}
+    # Per-recipe overrides from recipe.ci.<phase>; fixture-arg keys (read by
+    # consumers like pytest, listed under ci_config.fixture_keys) are skipped.
+    ci_section_raw = (recipe.get("ci") or {}).get(args.phase) or {}
+    fixture_keys = set((ci_config.get("fixture_keys") or {}).get(args.phase) or [])
+    ci_section = {k: v for k, v in ci_section_raw.items() if k not in fixture_keys}
+    # Env-driven overrides from ci_config.yaml -> env[].
     env_layer = _resolve_env_layer(ci_config.get("env") or {}, args.phase)
+    # Per-run dynamic values from ci_config.yaml -> computed[].
     computed_layer = _resolve_computed_layer(ci_config.get("computed") or [], args.phase)
 
     layers = [
@@ -175,7 +183,6 @@ def main() -> int:
     for _, payload in layers:
         for dotted_key, value in payload.items():
             _set_dotted(config, dotted_key, value)
-    config.pop("ci", None)
 
     if args.dry_run:
         print(f"Resolution stack for --phase {args.phase}:")

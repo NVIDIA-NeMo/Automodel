@@ -23,6 +23,7 @@
 #   6. computed[...]         per-run dynamic values
 #
 # Override targets are flat dotted keys into the recipe's top-level config.
+# `fixture_keys` (see bottom) lists keys to skip when applying recipe.ci.<phase>.
 
 phases:
   nightly: &nightly_defaults
@@ -41,7 +42,9 @@ phases:
 
   performance: {}
 
-  robustness:
+  # Phase key matches the recipe's ci.checkpoint_robustness section so per-recipe
+  # overrides resolve naturally.
+  checkpoint_robustness:
     step_scheduler.max_steps: 5
     step_scheduler.ckpt_every_steps: 5
     step_scheduler.val_every_steps: 5
@@ -70,7 +73,7 @@ conditional:
 
   # peft/lora recipes disable triton in the robustness pytest harness.
   - when_recipe_contains_any: [peft, lora]
-    phases: [robustness]
+    phases: [checkpoint_robustness]
     apply:
       peft.use_triton: false
 
@@ -92,7 +95,7 @@ computed:
 
   - target: checkpoint.checkpoint_dir
     format: "{PIPELINE_DIR}/{TEST_NAME}/robustness_checkpoint"
-    phases: [robustness]
+    phases: [checkpoint_robustness]
 
   - target: wandb.name
     format: "{TEST_NAME}"
@@ -101,3 +104,23 @@ computed:
   - target: wandb.project
     format: "automodel-convergence-test-{date:%Y%m%d}"
     phases: [convergence]
+
+# Keys in recipe.ci.<phase> that are read by phase-specific consumers (pytest
+# fixtures, etc.) -- NOT config overrides. The resolver leaves them in the
+# resolved YAML's ci.<phase> block but does not apply them to the top-level.
+fixture_keys:
+  checkpoint_robustness:
+    - check_fused_qkv_keys
+    - check_phantom_keys
+    - check_resume
+    - cross_tp_kl_threshold
+    - cross_tp_size
+    - experts_implementation
+    - hf_device_map_auto
+    - hf_kl_threshold
+    - kl_threshold
+    - no_check_resume
+    - resume_loss_threshold
+    - skip_hf_reload
+    - tokenizer_name
+    - trust_remote_code

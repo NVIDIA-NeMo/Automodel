@@ -79,7 +79,7 @@ fi
 if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   RESOLVED_ROBUSTNESS_CONFIG=$($CONFIG_RESOLVER \
     --base "/opt/Automodel/${CONFIG_PATH}" \
-    --phase robustness \
+    --phase checkpoint_robustness \
     --output "$TEST_DIR/robustness_config.yaml")
 
   ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \

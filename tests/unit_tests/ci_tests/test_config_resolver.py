@@ -81,7 +81,7 @@ def test_env_layer_applies_when_set_and_phase_matches(monkeypatch):
 
 def test_env_layer_skips_when_phase_excluded(monkeypatch):
     monkeypatch.setenv("MAX_STEPS", "99")
-    layer = config_resolver._resolve_env_layer(ENV_SPEC, phase="robustness")
+    layer = config_resolver._resolve_env_layer(ENV_SPEC, phase="checkpoint_robustness")
     assert layer == {}
 
 
@@ -152,7 +152,7 @@ CONDITIONAL_ENTRIES = [
     },
     {
         "when_recipe_contains_any": ["peft", "lora"],
-        "phases": ["robustness"],
+        "phases": ["checkpoint_robustness"],
         "apply": {"peft.use_triton": False},
     },
 ]
@@ -184,7 +184,7 @@ def test_conditional_layer_phase_filter_excludes_non_robustness(monkeypatch):
 
 
 def test_conditional_layer_contains_any_match():
-    out = config_resolver._resolve_conditional_layer(CONDITIONAL_ENTRIES, "robustness", "llama_lora")
+    out = config_resolver._resolve_conditional_layer(CONDITIONAL_ENTRIES, "checkpoint_robustness", "llama_lora")
     assert out == {"peft.use_triton": False}
 
 
@@ -228,7 +228,7 @@ def _run_resolver(args: list[str], env: dict | None = None) -> subprocess.Comple
 
 
 def test_end_to_end_phase_defaults_and_ci_section(tmp_path, synthetic_recipe):
-    """Phase defaults apply; recipe ci.<phase> overrides them; ci: block stripped from output."""
+    """Phase defaults apply; recipe ci.<phase> overrides them; ci: block preserved for downstream consumers."""
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
     _run_resolver(["--base", str(synthetic_recipe), "--phase", "nightly", "--output", str(out)], env=env)
@@ -241,8 +241,6 @@ def test_end_to_end_phase_defaults_and_ci_section(tmp_path, synthetic_recipe):
     assert resolved["step_scheduler"]["max_steps"] == 7
     # Computed override applied
     assert resolved["checkpoint"]["checkpoint_dir"] == f"{tmp_path}/t1/checkpoint"
-    # ci: section stripped
-    assert "ci" not in resolved
 
 
 def test_end_to_end_env_overrides_ci_section(tmp_path, synthetic_recipe):
@@ -259,7 +257,7 @@ def test_end_to_end_robustness_ignores_max_steps_env(tmp_path, synthetic_recipe)
     """ci_config.yaml's env entry restricts MAX_STEPS to non-robustness phases, so it must not leak in."""
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1", "MAX_STEPS": "999"}
-    _run_resolver(["--base", str(synthetic_recipe), "--phase", "robustness", "--output", str(out)], env=env)
+    _run_resolver(["--base", str(synthetic_recipe), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
 
     resolved = yaml.load(out.open())
     assert resolved["step_scheduler"]["max_steps"] == 5  # robustness phase default holds
@@ -285,10 +283,35 @@ def test_end_to_end_robustness_peft_disables_triton(tmp_path):
     recipe.write_text("step_scheduler: {global_batch_size: 8}\nci: {recipe_owner: t}\n")
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
-    _run_resolver(["--base", str(recipe), "--phase", "robustness", "--output", str(out)], env=env)
+    _run_resolver(["--base", str(recipe), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
 
     resolved = yaml.load(out.open())
     assert resolved["peft"]["use_triton"] is False
+
+
+def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
+    """Non-config fixture-arg keys in ci.checkpoint_robustness must not leak into the top-level config."""
+    recipe = tmp_path / "llama_squad.yaml"
+    recipe.write_text(
+        "step_scheduler: {global_batch_size: 8}\n"
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
+        "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
+        "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
+    )
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
+    _run_resolver(["--base", str(recipe), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
+
+    resolved = yaml.load(out.open())
+    # Dotted key applied as a normal override
+    assert resolved["dataset"]["limit_dataset_samples"] == 500
+    # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
+    # and do NOT pollute the top level.
+    assert "hf_kl_threshold" not in resolved
+    assert "tokenizer_name" not in resolved
+    assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
 
 
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):
