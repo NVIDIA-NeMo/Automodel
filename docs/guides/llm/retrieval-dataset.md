@@ -15,7 +15,11 @@ The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_datas
 
 ## Supported Input Formats
 
-NeMo Automodel supports **two** input schemas:
+NeMo Automodel supports **two** input schemas. They use different dataset factories:
+
+- Use `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and `hf://` sources.
+- Use `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset` for inline JSONL where
+  document text is stored directly in each record.
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
@@ -78,7 +82,7 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 
 ## YAML Usage (Dataset + Collator)
 
-Use the dataset factory plus the bi-encoder collator:
+Use the corpus/HF dataset factory plus the bi-encoder collator for corpus ID-based JSON or `hf://` sources:
 
 ```yaml
 dataloader:
@@ -86,11 +90,32 @@ dataloader:
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     data_dir_list:
-      - /abs/path/to/train.jsonl   # or train.json (corpus-id format)
+      - /abs/path/to/train.json    # or hf://nvidia/embed-nemotron-dataset-v1/FEVER
     data_type: train
     n_passages: 5                 # 1 positive + 4 negatives
     do_shuffle: true
     use_dataset_instruction: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    pad_to_multiple_of: 8
+```
+
+Use the inline dataset factory for inline JSONL:
+
+```yaml
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    data_dir_list:
+      - /abs/path/to/train.jsonl
+    data_type: train
+    n_passages: 5                 # 1 positive + 4 negatives
+    do_shuffle: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512

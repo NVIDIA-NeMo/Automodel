@@ -40,6 +40,16 @@ Recipes for distilling knowledge from a large teacher model into a smaller, more
 - Example model: Llama 3.2 1B
 - How-to guide: [Knowledge distillation](llm/knowledge-distillation.md)
 
+### Retrieval Fine-Tuning
+
+Bi-encoder and cross-encoder recipes for embedding search, RAG candidate generation, and reranking.
+
+- Folder: [examples/retrieval](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/retrieval)
+- Example models: Llama 3.2 1B, Llama-Embed-Nemotron-8B
+- How-to guides:
+  - [Retrieval fine-tuning](llm/retrieval-finetuning.md)
+  - [Retrieval dataset](llm/retrieval-dataset.md)
+
 ### Benchmark Configurations
 
 Curated configurations for benchmarking different training stacks and settings (e.g., Torch vs. TransformerEngine + DeepEP, various model sizes, MoE variants).
@@ -68,7 +78,7 @@ Simple generation script and configurations for VLMs.
 ## Diffusion Models (Text-to-Image & Text-to-Video)
 
 Text-to-image and text-to-video diffusion models can generate visual content from natural language descriptions. Fine-tuning lets you adapt these models to a specific style, domain, or dataset — for example, generating product videos in your brand's aesthetic. Pretraining gives you full control when no existing model fits your needs.
- 
+
 This section walks through the full workflow in NeMo AutoModel: preparing your dataset, training the model, and generating outputs.
 
 ### Fine-Tuning

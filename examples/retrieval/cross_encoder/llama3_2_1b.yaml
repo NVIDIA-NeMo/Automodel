@@ -52,9 +52,8 @@ dataloader:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     model_type: cross_encoder
     data_dir_list:
-      - retriever_models_research/training_datasets/nqsh_shuffled_50k.json
-      - retriever_models_research/training_datasets/mldr_en_perc95_small.json
-      - retriever_models_research/training_datasets/miracl_train_es_llama3_1b_4m_512len.json
+      - hf://nvidia/embed-nemotron-dataset-v1/FEVER
+      - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
     data_type: train
     n_passages: 5
     seed: 42
@@ -136,4 +135,4 @@ distributed:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir> 
+#   save_dir: <your_wandb_save_dir>
