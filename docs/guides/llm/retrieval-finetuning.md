@@ -36,7 +36,8 @@ a small candidate set and you want a stronger reranking stage.
 Before running the examples:
 
 - Use an AutoModel environment with the full GPU training dependencies installed. The NGC container is the safest path
-  for multi-GPU runs.
+  for multi-GPU runs; for source checkouts, see [Installation](../installation.md) and run
+  `uv sync --locked --all-groups --extra all`.
 - From a source checkout, use `uv run automodel ...`; from an installed environment, use `automodel ...`.
 - Accept access terms for the configured Hugging Face model and set `HF_TOKEN`, or replace the model path with a model
   your environment can download. Retrieval has custom bidirectional backbones for Llama and Ministral3 embedding
@@ -45,7 +46,8 @@ Before running the examples:
   pooling, `num_labels`, and any retrieval-specific model arguments are accepted by the replacement model.
 - Make sure every rank can read the dataset paths or `hf://` sources.
 
-The commands below use `automodel`; if you are running from a source checkout, prefix them with `uv run`.
+The commands below use `automodel`; if you are running from a source checkout, prefix them with `uv run`. For direct
+`torchrun` commands, use `uv run torchrun ...` from a source checkout, or activate an installed environment first.
 
 Start with a one-GPU smoke test:
 
@@ -116,6 +118,12 @@ The key field requirements differ by source:
 
 `neg_doc` must be present for local JSON and JSONL sources. It may be `[]` only when `n_passages: 1`; when
 `n_passages > 1`, provide at least one negative.
+
+:::{warning}
+`n_passages: 1` is useful for schema checks or custom negative strategies, but it is not a good default training setup.
+The standard bi-encoder and cross-encoder recipes need at least one negative candidate for meaningful contrastive or
+reranking supervision, unless you add a custom strategy such as qrels-aware in-batch negatives.
+:::
 
 For quick custom experiments, inline JSONL is the simplest format. Use the inline dataset factory for these files, and
 switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
@@ -233,8 +241,9 @@ distributed:
 ```
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataloader.dataset.model_type`, and `dataloader.collate_fn`
-to the cross-encoder values shown below. Also set `model.num_labels: 1`, keep `model.temperature`, and replace
-`q_max_len` / `p_max_len` with `rerank_max_length` in the collator.
+to the cross-encoder values shown below. Also set `model.num_labels: 1`, set the loss temperature under
+`model.temperature`, replace `q_max_len` / `p_max_len` with `rerank_max_length` in the collator, and use a separate
+`checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`.
 
 ## Configure a Bi-Encoder
 
@@ -297,7 +306,7 @@ Important knobs:
   negatives. Keep it disabled for ColBERT-style pooling.
 
 The complete example is
-[`examples/retrieval/bi_encoder/llama3_2_1b.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
+[`examples/retrieval/bi_encoder/llama3_2_1b.yaml`](../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml).
 
 ## Configure a Cross-Encoder
 
@@ -350,7 +359,7 @@ Important knobs:
   to index `0`.
 
 The complete example is
-[`examples/retrieval/cross_encoder/llama3_2_1b.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).
+[`examples/retrieval/cross_encoder/llama3_2_1b.yaml`](../../../examples/retrieval/cross_encoder/llama3_2_1b.yaml).
 
 ## Distributed Launch and Batch Size
 
@@ -362,7 +371,7 @@ For multi-node runs, launch with your cluster launcher or an external `torchrun`
 rank and rendezvous endpoint:
 
 ```bash
-torchrun \
+uv run torchrun \
   --nnodes 2 \
   --nproc-per-node 8 \
   --node-rank ${NODE_RANK} \
@@ -499,7 +508,7 @@ memory and want maximum adaptation.
 After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint:
 
 ```bash
-torchrun --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
+uv run torchrun --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
   --mining.train_qa_file_path /path/to/input.json \
@@ -614,8 +623,8 @@ jointly, so they are usually too expensive for first-stage full-corpus search.
 
 ## Related Files
 
-- Bi-encoder recipe: [`nemo_automodel/recipes/retrieval/train_bi_encoder.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/retrieval/train_bi_encoder.py)
-- Cross-encoder recipe: [`nemo_automodel/recipes/retrieval/train_cross_encoder.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/retrieval/train_cross_encoder.py)
+- Bi-encoder recipe: [`nemo_automodel/recipes/retrieval/train_bi_encoder.py`](../../../nemo_automodel/recipes/retrieval/train_bi_encoder.py)
+- Cross-encoder recipe: [`nemo_automodel/recipes/retrieval/train_cross_encoder.py`](../../../nemo_automodel/recipes/retrieval/train_cross_encoder.py)
 - Retrieval dataset guide: [Retrieval Dataset](retrieval-dataset.md)
 - Llama-Embed-Nemotron-8B example:
-  [`examples/retrieval/bi_encoder/llama_embed_nemotron_8b/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b)
+  [`examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml`](../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)

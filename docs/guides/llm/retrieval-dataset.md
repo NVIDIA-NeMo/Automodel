@@ -1,6 +1,6 @@
 # Retrieval Dataset for Bi-Encoders and Cross-Encoders
 
-NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
+NeMo AutoModel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
 **query** paired with **one positive** document and **one or more negative** documents.
 
 This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and
@@ -33,7 +33,7 @@ and false-negative filtering, even when each training row uses one positive.
 
 ## Supported Input Formats
 
-NeMo Automodel supports **two** input schemas across three source types. They use different dataset factories:
+NeMo AutoModel supports **two** input schemas across three source types. They use different dataset factories:
 
 - Use `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and `hf://` sources.
 - Use `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset` for inline JSONL where
@@ -237,3 +237,9 @@ dataloader:
 - `neg_doc` must be present in local JSON and JSONL training records. It may be empty only when `n_passages: 1`.
 - `hf://` sources may omit `neg_doc` in the source dataset, but add negatives before training with `n_passages > 1`.
 - If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document.
+
+:::{warning}
+`n_passages: 1` is a schema escape hatch, not a good default training setup. The standard bi-encoder and cross-encoder
+recipes need at least one negative candidate for meaningful contrastive or reranking supervision, unless you add a
+custom negative strategy such as qrels-aware in-batch negatives.
+:::

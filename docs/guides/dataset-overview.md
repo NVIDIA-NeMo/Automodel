@@ -2,7 +2,7 @@
 
 This page summarizes the datasets supported in NeMo AutoModel for LLM, VLM, and retrieval training and shows how to plug in your own datasets using Python functions or the YAML `_target_` mechanism.
 
-- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), and [Retrieval dataset](llm/retrieval-dataset.md) for deeper, task-specific guides.
+- See also: [LLM datasets](llm/dataset.md), [VLM datasets](vlm/dataset.md), [Retrieval dataset](llm/retrieval-dataset.md), and [Retrieval fine-tuning](llm/retrieval-finetuning.md) for deeper, task-specific guides.
 
 - If a dataset you need is missing, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and example schema so we can prioritize support.
 ---
@@ -247,7 +247,7 @@ dataloader:
   batch_size: 2
   shuffle: true
 ```
-See the detailed guide, [Retrieval dataset](llm/retrieval-dataset.md), for more information.
+See [Retrieval dataset](llm/retrieval-dataset.md) for schema details and [Retrieval fine-tuning](llm/retrieval-finetuning.md) for the end-to-end workflow.
 
 ### NanoGPT Binary Shards (Pretraining)
 - Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
