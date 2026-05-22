@@ -29,11 +29,14 @@ full recipe — exercising the code shape that gets shipped:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import nemo_automodel.recipes.vlm.finetune as vlm_finetune
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -280,6 +283,221 @@ def test_maybe_set_pp_first_stage_embed_input_meta_guard_conditions(recipe_kwarg
 
     assert first_stage.inputs_meta == ("old-first",)
     assert later_stage.inputs_meta == ("old-later",)
+
+
+class _FakeCPMesh:
+    mesh_dim_names = ("cp",)
+
+    def __getitem__(self, key):
+        assert key == "cp"
+        return SimpleNamespace(size=lambda: 2)
+
+
+class _ScheduleSpy:
+    def __init__(self):
+        self.calls = []
+
+    def step(self, model_input=None, *, target=None, losses=None, **batch):
+        self.calls.append({"model_input": model_input, "target": target, "batch": batch})
+        if losses is not None:
+            losses.append(torch.tensor(1.25))
+
+
+def test_forward_backward_step_pp_cp_first_stage_uses_inputs_embeds(monkeypatch):
+    inputs_embeds = torch.randn(2, 6, 8)
+    labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
+    model = _SpyVLM(prepared={"inputs_embeds": inputs_embeds})
+    schedule = _ScheduleSpy()
+    seq_lens = []
+    first_stage = SimpleNamespace(is_first=True, inputs_meta=None)
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.device_mesh = _FakeCPMesh()
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [model]
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(
+        pp_microbatch_size=2,
+        info=SimpleNamespace(
+            has_first_stage=True,
+            has_last_stage=True,
+            stages=[first_stage, SimpleNamespace(is_first=False, inputs_meta=None)],
+            schedule=schedule,
+        ),
+        update_seq_len=seq_lens.append,
+    )
+    batch = {
+        "input_ids": torch.ones(2, 6, dtype=torch.long),
+        "pixel_values": torch.zeros(2, 3, 4, 4),
+        "labels": labels,
+    }
+    seen_cp_batch = {}
+
+    def _make_cp_batch_and_ctx(device_mesh, cp_batch):
+        seen_cp_batch.update(cp_batch)
+        return nullcontext, cp_batch
+
+    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
+    monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
+
+    loss_buffer = []
+    FinetuneRecipeForVLM._forward_backward_step(
+        recipe,
+        0,
+        batch,
+        loss_buffer=loss_buffer,
+        num_label_tokens=labels.numel(),
+        num_batches=1,
+    )
+
+    assert len(model.calls) == 1
+    assert model.calls[0]["_pre_embed_only"] is True
+    assert "inputs_embeds" in seen_cp_batch
+    assert "input_ids" not in seen_cp_batch
+    assert "pixel_values" not in seen_cp_batch
+    assert seq_lens == [inputs_embeds.shape[1]]
+    assert len(schedule.calls) == 1
+    assert schedule.calls[0]["model_input"] is inputs_embeds
+    assert torch.equal(schedule.calls[0]["target"], labels)
+    assert schedule.calls[0]["batch"] == {}
+    assert tuple(first_stage.inputs_meta[0].shape) == (2, 6, 8)
+    assert first_stage.inputs_meta[0].dtype == inputs_embeds.dtype
+    assert torch.equal(loss_buffer[0], torch.tensor(1.25))
+
+
+class _FakePPModel:
+    def __init__(self, stage0):
+        self.parts = [stage0]
+        self.pp_batch_size = 4
+        self.pp_microbatch_size = 2
+
+
+class _StageWithCPPrepare:
+    def prepare_model_inputs_for_cp(self):
+        return {}
+
+
+class _StageWithoutCPPrepare:
+    pass
+
+
+def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
+    monkeypatch.setattr(vlm_finetune, "AutoPipeline", _FakePPModel)
+    monkeypatch.setattr(
+        vlm_finetune,
+        "build_distributed",
+        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+    )
+    monkeypatch.setattr(vlm_finetune, "setup_logging", lambda: None)
+    monkeypatch.setattr(vlm_finetune, "apply_cache_compatibility_patches", lambda: None)
+    monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda *args, **kwargs: "rng")
+    monkeypatch.setattr(vlm_finetune, "build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
+    monkeypatch.setattr(
+        vlm_finetune,
+        "setup_distributed",
+        lambda cfg, world_size: SimpleNamespace(
+            strategy_config=SimpleNamespace(),
+            pipeline_config=SimpleNamespace(),
+            moe_config=None,
+            activation_checkpointing=False,
+            pp_enabled=True,
+            device_mesh=None,
+            moe_mesh=None,
+            cp_size=cp_size,
+            pp_size=2,
+        ),
+    )
+    monkeypatch.setattr(
+        vlm_finetune,
+        "build_checkpoint_config",
+        lambda *args, **kwargs: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+    )
+    monkeypatch.setattr(
+        vlm_finetune,
+        "Checkpointer",
+        lambda **kwargs: SimpleNamespace(
+            config=kwargs["config"],
+            load_base_model=lambda *args, **kwargs: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(vlm_finetune, "build_model", lambda *args, **kwargs: _FakePPModel(stage0))
+    monkeypatch.setattr(
+        vlm_finetune,
+        "build_optimizer",
+        lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)],
+    )
+
+    def _build_dataloader(*args, **kwargs):
+        dataloader_calls.append(kwargs)
+        return "dl", "processor"
+
+    monkeypatch.setattr(vlm_finetune, "build_dataloader", _build_dataloader)
+    monkeypatch.setattr(
+        vlm_finetune,
+        "build_step_scheduler",
+        lambda *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),
+    )
+    monkeypatch.setattr(vlm_finetune, "build_lr_scheduler", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        vlm_finetune,
+        "build_metric_logger",
+        lambda *args, **kwargs: SimpleNamespace(log=lambda *args, **kwargs: None, close=lambda: None),
+    )
+    monkeypatch.setattr(vlm_finetune.torch.cuda, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_log_experiment_details", lambda self: None)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_log_library_versions", lambda self: None)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_log_model_and_optimizer_details", lambda *args, **kwargs: None)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_setup_garbage_collection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "load_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_log_step_scheduler_details", lambda *args, **kwargs: None)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_dp_rank", lambda self, include_cp=False: 0)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_tp_rank", lambda self: 0)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_pp_rank", lambda self: 0)
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_get_dp_group_size", lambda self, include_cp=False: 1)
+
+
+def _minimal_pp_setup_cfg():
+    return ConfigNode(
+        {
+            "model": {
+                "pretrained_model_name_or_path": "dummy/model",
+                "backend": {},
+            },
+            "dataset": {"path_or_dataset": "dummy"},
+            "dataloader": {},
+            "step_scheduler": {"local_batch_size": 4, "global_batch_size": 4},
+            "optimizer": {},
+            "loss_fn": {},
+            "checkpoint": {"best_metric_key": "default"},
+            "distributed": {"pipeline": {"pp_microbatch_size": 2}},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("cp_size", "stage0", "expected_pp_n_microbatches"),
+    [
+        (2, _StageWithCPPrepare(), None),
+        (1, _StageWithCPPrepare(), 2),
+        (2, _StageWithoutCPPrepare(), 2),
+    ],
+)
+def test_setup_skips_pp_media_prechunk_when_cp_preembeds_vlm_inputs(
+    monkeypatch,
+    cp_size,
+    stage0,
+    expected_pp_n_microbatches,
+):
+    dataloader_calls = []
+    _patch_pp_setup_minimals(monkeypatch, cp_size=cp_size, stage0=stage0, dataloader_calls=dataloader_calls)
+    trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
+
+    trainer.setup()
+
+    assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
 
 
 # -----------------------------------------------------------------------------
