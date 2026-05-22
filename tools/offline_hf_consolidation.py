@@ -14,7 +14,11 @@
 
 """Compatibility wrapper for the packaged offline HF consolidation module."""
 
-from nemo_automodel.tools.offline_hf_consolidation import main
+import sys
+
+from nemo_automodel.tools import offline_hf_consolidation as _impl
 
 if __name__ == "__main__":
-    main()
+    _impl.main()
+else:
+    sys.modules[__name__] = _impl

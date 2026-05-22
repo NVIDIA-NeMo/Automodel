@@ -24,7 +24,7 @@ if str(TOOLS_DIR) not in sys.path:
 import pytest
 
 
-def test_copy_metadata_files_moves_and_cleans(tmp_path):
+def test_copy_metadata_files_copies_and_preserves_source(tmp_path):
     from offline_hf_consolidation import copy_metadata_files
 
     meta_dir = tmp_path / ".hf_metadata"
@@ -38,9 +38,11 @@ def test_copy_metadata_files_moves_and_cleans(tmp_path):
 
     copy_metadata_files(str(meta_dir), str(out_dir))
 
-    # Input metadata directory should be removed
-    assert not meta_dir.exists()
-    # Non-mapping files moved
+    # Input metadata directory is preserved for repeatable offline export.
+    assert meta_dir.exists()
+    assert (meta_dir / "config.json").exists()
+    assert (meta_dir / "fqn_to_file_index_mapping.json").exists()
+    # Non-mapping files copied.
     assert (out_dir / "config.json").exists()
     # Mapping file should not be copied into the output directory here
     assert not (out_dir / "fqn_to_file_index_mapping.json").exists()
@@ -69,8 +71,8 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_consolidate(input_dir, output_dir, fqn_to_index_mapping, num_threads):
-        captured["args"] = (input_dir, output_dir, fqn_to_index_mapping, num_threads)
+    def fake_consolidate(input_dir, output_dir, fqn_to_index_mapping, num_threads, target_dtype):
+        captured["args"] = (input_dir, output_dir, fqn_to_index_mapping, num_threads, target_dtype)
 
     monkeypatch.setattr(script, "consolidate_safetensors_files_on_every_rank", fake_consolidate)
 
@@ -94,16 +96,19 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
     # Consolidation called with expected arguments
     assert "args" in captured
-    called_in_dir, called_out_dir, called_mapping, called_threads = captured["args"]
+    called_in_dir, called_out_dir, called_mapping, called_threads, called_target_dtype = captured["args"]
     assert Path(called_in_dir) == in_dir
     assert Path(called_out_dir) == out_dir
     assert called_mapping == mapping
     assert called_threads == 2
+    assert called_target_dtype is None
 
-    # Metadata copied (except mapping) and source metadata dir removed
+    # Metadata copied (except mapping) and source metadata dir preserved.
     assert (out_dir / "config.json").exists()
     assert not (out_dir / "fqn_to_file_index_mapping.json").exists()
-    assert not meta_dir.exists()
+    assert meta_dir.exists()
+    assert (meta_dir / "config.json").exists()
+    assert (meta_dir / "fqn_to_file_index_mapping.json").exists()
 
 
 def test_main_raises_if_missing_metadata(tmp_path, monkeypatch):
