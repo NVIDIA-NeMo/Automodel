@@ -50,7 +50,7 @@ records before training:
 
 1. Put every passage in a corpus split with stable `id` and `text` values.
 2. For each query, write one or more training records with `question_id`, `question`, `corpus_id`, `pos_doc`, and
-   `neg_doc`.
+   `neg_doc`. Use unique `question_id` values within each mining file; hard-negative mining writes results back by ID.
 3. For training, use the first relevant document in each record as `pos_doc[0]`; expand multi-positive queries into
    multiple records if you want every positive to become a supervised positive.
 4. For hard-negative mining, include all known positive document IDs for that query in the row's `pos_doc`. The miner

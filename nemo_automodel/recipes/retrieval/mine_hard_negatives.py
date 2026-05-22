@@ -104,8 +104,10 @@ def _load_npz_array(path: Path) -> np.ndarray:
     Returns:
         Loaded numpy array.
     """
-    cached = np.load(path)
-    return cached[cached.files[0]]
+    with np.load(path) as cached:
+        if not cached.files:
+            raise ValueError(f"NPZ archive contains no arrays: {path}")
+        return cached[cached.files[0]]
 
 
 def _compute_rank_partition(total_size: int, world_size: int, rank: int) -> Tuple[int, int]:
@@ -475,6 +477,18 @@ class MineHardNegativesRecipe:
             supplied_negative_document_indices.append(neg_indices)
 
         assert len(questions) == len(question_ids)
+        seen_question_ids = set()
+        duplicate_question_ids = []
+        for question_id in question_ids:
+            if question_id in seen_question_ids:
+                duplicate_question_ids.append(question_id)
+            seen_question_ids.add(question_id)
+        if duplicate_question_ids:
+            duplicate_examples = ", ".join(str(question_id) for question_id in duplicate_question_ids[:5])
+            raise ValueError(
+                "Mining requires unique question_id values so mined negatives can be written back unambiguously. "
+                f"Duplicate question_id values include: {duplicate_examples}"
+            )
 
         self.questions = questions
         self.question_ids = question_ids
@@ -965,6 +979,7 @@ class MineHardNegativesRecipe:
         metadata: Optional[Dict[str, Any]],
         query_shape: Optional[Tuple[int, ...]] = None,
         document_shape: Optional[Tuple[int, ...]] = None,
+        expected_fingerprint: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Check whether cache metadata matches the current mining run."""
         if metadata is None:
@@ -973,7 +988,9 @@ class MineHardNegativesRecipe:
         if metadata.get("version") != EMBEDDINGS_CACHE_METADATA_VERSION:
             logger.info("Embedding cache metadata version changed; recomputing embeddings.")
             return False
-        if metadata.get("fingerprint") != self._build_cache_fingerprint():
+        if expected_fingerprint is None:
+            expected_fingerprint = self._build_cache_fingerprint()
+        if metadata.get("fingerprint") != expected_fingerprint:
             logger.info("Embedding cache fingerprint does not match this mining run; recomputing embeddings.")
             return False
 
@@ -1024,7 +1041,10 @@ class MineHardNegativesRecipe:
             and cache_path.exists()
         )
 
-    def _load_embeddings_from_cache(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _load_embeddings_from_cache(
+        self,
+        expected_fingerprint: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Load query and document embeddings from cache.
 
         Returns:
@@ -1040,10 +1060,25 @@ class MineHardNegativesRecipe:
         if not query_path.exists() or not doc_path.exists():
             return None, None
 
-        query_embeddings = _load_npz_array(query_path)
-        doc_embeddings = _load_npz_array(doc_path)
+        if expected_fingerprint is None:
+            expected_fingerprint = self._build_cache_fingerprint()
         metadata = self._load_cache_metadata()
-        if not self._cache_metadata_matches(metadata, query_embeddings.shape, doc_embeddings.shape):
+        if not self._cache_metadata_matches(metadata, expected_fingerprint=expected_fingerprint):
+            return None, None
+
+        try:
+            query_embeddings = _load_npz_array(query_path)
+            doc_embeddings = _load_npz_array(doc_path)
+        except Exception as exc:
+            logger.warning("Ignoring unreadable embedding cache in %s: %s", cache_dir, exc)
+            return None, None
+
+        if not self._cache_metadata_matches(
+            metadata,
+            query_embeddings.shape,
+            doc_embeddings.shape,
+            expected_fingerprint=expected_fingerprint,
+        ):
             return None, None
 
         return query_embeddings, doc_embeddings
@@ -1057,7 +1092,8 @@ class MineHardNegativesRecipe:
         doc_path = cache_dir / DOCUMENT_EMBEDDINGS_FNAME
         if not query_path.exists() or not doc_path.exists():
             return False
-        return self._cache_metadata_matches(self._load_cache_metadata())
+        query_embeddings, doc_embeddings = self._load_embeddings_from_cache()
+        return query_embeddings is not None and doc_embeddings is not None
 
     def _save_embeddings_to_cache(
         self,
@@ -1093,28 +1129,31 @@ class MineHardNegativesRecipe:
         # Try loading from cache first.
         #
         # In distributed runs, only rank0 needs the consolidated embeddings for mining.
-        # To avoid redundant IO, rank0 checks for cache presence and broadcasts a cache_hit flag;
-        # only rank0 reads the cache files.
+        # To avoid redundant IO, rank0 validates the consolidated cache before broadcasting a hit;
+        # non-main ranks only proceed with dummy arrays when rank0 has already loaded a valid cache.
         self._reuse_partial_embedding_cache = self.load_embeddings_from_cache
         if self.load_embeddings_from_cache and self.cache_embeddings_dir:
             cache_hit = False
+            query_embeddings = None
+            document_embeddings = None
+            expected_fingerprint = None
             if self.dist_env.world_size > 1 and torch.distributed.is_initialized():
                 if self.dist_env.is_main:
-                    cache_hit = self._has_full_embeddings_cache()
+                    expected_fingerprint = self._build_cache_fingerprint()
+                    query_embeddings, document_embeddings = self._load_embeddings_from_cache(expected_fingerprint)
+                    cache_hit = query_embeddings is not None and document_embeddings is not None
                 # Broadcast decision from rank0 to all ranks (NCCL requires CUDA tensors).
                 flag_device = self.dist_env.device if self.dist_env.device.type == "cuda" else torch.device("cpu")
                 flag = torch.tensor([1 if cache_hit else 0], dtype=torch.int64, device=flag_device)
                 torch.distributed.broadcast(flag, src=0)
                 cache_hit = bool(flag.item())
             else:
-                cache_hit = self._has_full_embeddings_cache()
+                expected_fingerprint = self._build_cache_fingerprint()
+                query_embeddings, document_embeddings = self._load_embeddings_from_cache(expected_fingerprint)
+                cache_hit = query_embeddings is not None and document_embeddings is not None
 
             if cache_hit:
                 if self.dist_env.is_main:
-                    logger.info("Loading embeddings from cache (rank0 only)...")
-                    query_embeddings, document_embeddings = self._load_embeddings_from_cache()
-                    if query_embeddings is None or document_embeddings is None:
-                        raise RuntimeError("Embedding cache was marked reusable but failed validation during load.")
                     logger.info(
                         f"Loaded embeddings from cache: queries={query_embeddings.shape}, "
                         f"documents={document_embeddings.shape}"
@@ -1125,7 +1164,13 @@ class MineHardNegativesRecipe:
 
             if self.dist_env.is_main:
                 logger.info("Cache not found or incomplete, generating embeddings...")
-            self._reuse_partial_embedding_cache = False
+            metadata = self._load_cache_metadata()
+            if expected_fingerprint is None:
+                expected_fingerprint = self._build_cache_fingerprint()
+            self._reuse_partial_embedding_cache = self._cache_metadata_matches(
+                metadata,
+                expected_fingerprint=expected_fingerprint,
+            )
 
         # Generate query embeddings (shard across ranks if distributed)
         query_embeddings = None
@@ -1201,7 +1246,7 @@ class MineHardNegativesRecipe:
         num_negs: int,
         hard_neg_margin: Optional[float] = None,
         hard_neg_margin_type: Optional[str] = None,
-    ) -> Tuple[List[List[int]], List[List[float]], List[List[float]]]:
+    ) -> Tuple[List[List[int]], List[List[float]], List[List[float | None]]]:
         """Mine hard negatives for each query.
 
         This implementation uses the following key behaviors:
@@ -1223,7 +1268,7 @@ class MineHardNegativesRecipe:
             Tuple of:
                 - neg_indices: List of hard negative indices per query
                 - neg_scores: Similarity scores for each hard negative
-                - pos_scores: Similarity scores for each positive document
+                - pos_scores: Similarity scores for each positive document; None when the raw score is non-finite
         """
         if query_embeddings.ndim != 2 or document_embeddings.ndim != 2:
             raise ValueError(
@@ -1272,7 +1317,10 @@ class MineHardNegativesRecipe:
                     batch_scores[i, pos_idx] = float("-inf")
 
                 # Reconstruct scores in original order (preserves pos_doc order for output)
-                query_pos_scores = [scores_by_idx[pos_idx] for pos_idx in pos_indices]
+                query_pos_scores = [
+                    score if math.isfinite(score) else None
+                    for score in (scores_by_idx[pos_idx] for pos_idx in pos_indices)
+                ]
                 batch_pos_scores.append(query_pos_scores)
 
                 # Track minimum positive score for margin filtering
@@ -1397,10 +1445,10 @@ class MineHardNegativesRecipe:
 
         return negative_docs_by_question_id
 
-    def _build_positive_scores_by_question_id(self) -> Dict[str, List[float]]:
+    def _build_positive_scores_by_question_id(self) -> Dict[str, List[float | None]]:
         """Build mapping from question_id to positive document scores.
 
-        Scores are in the same order as pos_doc in the original data.
+        Scores are in the same order as pos_doc in the original data. Non-finite scores are stored as None.
 
         Returns:
             Dict mapping question_id to list of positive scores.
@@ -1444,7 +1492,9 @@ class MineHardNegativesRecipe:
             pos_scores = pos_scores_by_qid.get(question_id, [])
             for j, pos_doc in enumerate(row.get("pos_doc", [])):
                 if j < len(pos_scores):
-                    pos_doc["score"] = pos_scores[j]
+                    score = pos_scores[j]
+                    if score is not None and math.isfinite(float(score)):
+                        pos_doc["score"] = score
 
             # Remove legacy score fields if present
             if "pos_score" in row:

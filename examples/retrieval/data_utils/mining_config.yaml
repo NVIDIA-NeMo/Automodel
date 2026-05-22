@@ -65,8 +65,8 @@ mining:
   
   # Caching (required for multi-rank torchrun; use a shared writable path for multi-node).
   # Use a fresh directory per model, dataset, prefix, sequence-length, and world-size combination.
-  # The miner validates cache metadata before reuse, but fresh run-specific paths are still clearest,
-  # especially for mutable Hub IDs or local paths that are overwritten in place.
+  # The miner validates cache metadata plus consolidated array shape/readability before reuse.
+  # Fresh directories are still clearest for mutable Hub IDs or overwritten local paths.
   # cache_embeddings_dir: /path/to/cache/<run-specific-name>
   # Set true only when every cached shard/chunk came from the same model/input/prefix/length/world-size run.
   load_embeddings_from_cache: false

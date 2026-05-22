@@ -352,3 +352,41 @@ def test_nemo_auto_biencoder_defaults_do_not_override_saved_metadata(monkeypatch
     assert captured["pretrained_model_name_or_path"] == "saved-export"
     assert captured["kwargs"]["pooling"] is None
     assert captured["kwargs"]["l2_normalize"] is None
+
+
+def test_biencoder_build_applies_saved_retrieval_metadata(monkeypatch):
+    """BiEncoderModel.build should use pooling/l2 metadata loaded from the saved config."""
+    from nemo_automodel._transformers import retrieval
+
+    class FakeConfig:
+        name_or_path = "saved-export"
+        nemo_retrieval = {"task": "embedding", "pooling": "last", "l2_normalize": False}
+
+    class FakeModel:
+        config = FakeConfig()
+
+    config = FakeConfig()
+    captured = {}
+
+    def fake_build_encoder_backbone(model_name_or_path, task, **kwargs):
+        captured["model_name_or_path"] = model_name_or_path
+        captured["task"] = task
+        captured["pooling"] = kwargs.get("pooling")
+        captured["loaded_config"] = kwargs.get("loaded_config")
+        return FakeModel()
+
+    monkeypatch.setattr(retrieval, "_load_encoder_config", lambda *_, **__: config)
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", fake_build_encoder_backbone)
+
+    model = retrieval.BiEncoderModel.build("saved-export")
+
+    assert model.pooling == "last"
+    assert model.l2_normalize is False
+    assert captured == {
+        "model_name_or_path": "saved-export",
+        "task": "embedding",
+        "pooling": "last",
+        "loaded_config": config,
+    }
+    assert model.config.nemo_retrieval["pooling"] == "last"
+    assert model.config.nemo_retrieval["l2_normalize"] is False

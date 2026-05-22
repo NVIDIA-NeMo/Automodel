@@ -331,8 +331,59 @@ def test_full_embeddings_cache_rejects_shape_mismatch(tmp_path):
     recipe._save_embeddings_to_cache(query_embeddings, document_embeddings)
     np.savez(tmp_path / QUERY_EMBEDDINGS_FNAME, np.ones((2, 2), dtype=np.float32))
 
-    assert recipe._has_full_embeddings_cache()
+    assert not recipe._has_full_embeddings_cache()
     assert recipe._load_embeddings_from_cache() == (None, None)
+
+
+def test_generate_embeddings_recomputes_when_full_cache_payload_is_invalid(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._save_embeddings_to_cache(np.ones((1, 2), dtype=np.float32), np.ones((1, 2), dtype=np.float32))
+    np.savez(tmp_path / QUERY_EMBEDDINGS_FNAME, np.ones((2, 2), dtype=np.float32))
+    recomputed_query = np.full((1, 2), 2.0, dtype=np.float32)
+    recomputed_documents = np.full((1, 2), 3.0, dtype=np.float32)
+    recipe._encode_queries = lambda: recomputed_query
+    recipe._encode_all_documents = lambda: recomputed_documents
+
+    query_embeddings, document_embeddings = recipe._generate_embeddings()
+
+    np.testing.assert_array_equal(query_embeddings, recomputed_query)
+    np.testing.assert_array_equal(document_embeddings, recomputed_documents)
+
+
+def test_generate_embeddings_reuses_partial_cache_when_metadata_matches(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    expected_query = np.ones((1, 2), dtype=np.float32)
+    expected_documents = np.ones((1, 2), dtype=np.float32)
+    recipe._write_cache_metadata(expected_query, expected_documents)
+
+    def encode_queries():
+        assert recipe._reuse_partial_embedding_cache
+        return expected_query
+
+    def encode_documents():
+        assert recipe._reuse_partial_embedding_cache
+        return expected_documents
+
+    recipe._encode_queries = encode_queries
+    recipe._encode_all_documents = encode_documents
+
+    query_embeddings, document_embeddings = recipe._generate_embeddings()
+
+    np.testing.assert_array_equal(query_embeddings, expected_query)
+    np.testing.assert_array_equal(document_embeddings, expected_documents)
+
+
+def test_prepare_data_rejects_duplicate_question_ids():
+    recipe = _make_recipe()
+    recipe.questions_dataset = [
+        {"question_id": "q0", "question": "first", "corpus_id": "demo", "pos_doc": [{"id": "d0"}]},
+        {"question_id": "q0", "question": "second", "corpus_id": "demo", "pos_doc": [{"id": "d0"}]},
+    ]
+    recipe.doc_to_idx = {"d0": 0}
+    recipe.use_negatives_from_file = False
+
+    with pytest.raises(ValueError, match="unique question_id"):
+        recipe._prepare_data()
 
 
 def test_encode_queries_sharded_handles_empty_rank_shard(tmp_path):
@@ -457,7 +508,7 @@ def test_mine_hard_negatives_skips_margin_when_positive_score_is_non_finite():
 
     assert neg_indices == [[1]]
     assert neg_scores[0][0] == pytest.approx(0.2)
-    assert pos_scores[0][0] == float("-inf")
+    assert pos_scores[0][0] is None
 
 
 def test_mine_hard_negatives_rejects_token_level_embeddings():

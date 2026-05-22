@@ -28,7 +28,7 @@ def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
                 "original_question_id": "q0",
                 "question": "Which document is positive?",
                 "corpus_id": "demo",
-                "pos_doc": [{"id": 1}],
+                "pos_doc": [{"id": 1, "score": 0.8}],
                 "neg_doc": [
                     {"id": "1", "score": 0.9},
                     {"id": "2", "score": 0.4},
@@ -46,6 +46,8 @@ def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
         "records": 1,
         "negatives": 5,
         "rows_with_findings": 1,
+        "missing_positive_score": 0,
+        "non_finite_positive_score": 0,
         "negative_is_known_positive": 1,
         "duplicate_negative": 1,
         "missing_negative_score": 1,
@@ -61,11 +63,31 @@ def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
             "original_question_id": "q0",
             "question": "Which document is positive?",
             "corpus_id": "demo",
-            "pos_doc": [{"id": 1}],
+            "pos_doc": [{"id": 1, "score": 0.8}],
             "neg_doc": [{"id": "2", "score": 0.4}],
         }
     ]
     assert findings[0]["original_question_id"] == "q0"
+
+
+def test_audit_mined_negatives_reports_positive_score_findings():
+    training_data = {
+        "data": [
+            {
+                "question_id": "q0",
+                "pos_doc": [{"id": "1"}, {"id": "2", "score": float("nan")}],
+                "neg_doc": [{"id": "3", "score": 0.1}],
+            }
+        ]
+    }
+
+    summary, _, findings = audit_training_data(training_data)
+
+    assert summary["missing_positive_score"] == 1
+    assert summary["non_finite_positive_score"] == 1
+    assert summary["total_findings"] == 2
+    assert findings[0]["positive_id"] == "1"
+    assert findings[1]["positive_id"] == "2"
 
 
 def test_audit_mined_negatives_preserves_records_without_findings():
@@ -76,7 +98,7 @@ def test_audit_mined_negatives_preserves_records_without_findings():
                 "question_id": "q0",
                 "question": "Which document is positive?",
                 "corpus_id": "demo",
-                "pos_doc": [{"id": "1"}],
+                "pos_doc": [{"id": "1", "score": 0.8}],
                 "neg_doc": [{"id": "2", "score": 0.2}],
             }
         ],
@@ -101,7 +123,7 @@ def test_audit_cli_writes_cleaned_output_and_exits_zero(tmp_path, monkeypatch, c
                         "question_id": "q0",
                         "question": "Which document is positive?",
                         "corpus_id": "demo",
-                        "pos_doc": [{"id": "1"}],
+                        "pos_doc": [{"id": "1", "score": 0.8}],
                         "neg_doc": [{"id": "1", "score": 1.0}, {"id": "2"}],
                     }
                 ],
@@ -137,7 +159,7 @@ def test_audit_cli_exits_nonzero_when_findings_remain(tmp_path, monkeypatch):
                 "data": [
                     {
                         "question_id": "q0",
-                        "pos_doc": [{"id": "1"}],
+                        "pos_doc": [{"id": "1", "score": 0.8}],
                         "neg_doc": [{"id": "1", "score": 1.0}],
                     }
                 ]
@@ -157,7 +179,7 @@ def test_audit_cli_allow_findings_exits_zero(tmp_path, monkeypatch):
                 "data": [
                     {
                         "question_id": "q0",
-                        "pos_doc": [{"id": "1"}],
+                        "pos_doc": [{"id": "1", "score": 0.8}],
                         "neg_doc": [{"id": "1", "score": 1.0}],
                     }
                 ]
@@ -178,7 +200,7 @@ def test_audit_cli_min_negatives_catches_rows_cleaned_to_empty(tmp_path, monkeyp
                 "data": [
                     {
                         "question_id": "q0",
-                        "pos_doc": [{"id": "1"}],
+                        "pos_doc": [{"id": "1", "score": 0.8}],
                         "neg_doc": [{"id": "1", "score": 1.0}],
                     }
                 ]

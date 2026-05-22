@@ -38,12 +38,23 @@ def main() -> int:
     parser.add_argument(
         "output_dir", type=str, help="Directory where train.json and the corpus directory will be written"
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow writing into a non-empty output directory.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            parser.error(f"output_dir must be a directory: {output_dir}")
+        if any(output_dir.iterdir()) and not args.overwrite:
+            parser.error(f"output_dir is not empty: {output_dir}. Pass --overwrite to replace existing files.")
+    else:
+        output_dir.mkdir(parents=True)
     corpus_dir = output_dir / f"{args.subset}_corpus"
     corpus_dir.mkdir(parents=True, exist_ok=True)
 

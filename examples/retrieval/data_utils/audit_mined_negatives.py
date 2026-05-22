@@ -30,7 +30,7 @@ def _doc_id(doc: Any) -> str:
 
 
 def _score_state(doc: Any) -> str:
-    """Classify a mined negative score as finite, missing, or non-finite."""
+    """Classify a mined document score as finite, missing, or non-finite."""
     if not isinstance(doc, dict) or "score" not in doc:
         return "missing"
     try:
@@ -54,6 +54,7 @@ def audit_records(
         drop_invalid_negatives: Drop negatives that duplicate positives, duplicate
             another negative in the same row, or have a missing/non-finite score.
         max_findings: Maximum example findings to return.
+        min_negatives: Minimum number of negatives each row must retain after optional cleanup.
 
     Returns:
         A tuple of ``(summary, cleaned_records, finding_examples)``.
@@ -62,6 +63,8 @@ def audit_records(
         "records": len(records),
         "negatives": 0,
         "rows_with_findings": 0,
+        "missing_positive_score": 0,
+        "non_finite_positive_score": 0,
         "negative_is_known_positive": 0,
         "duplicate_negative": 0,
         "missing_negative_score": 0,
@@ -78,6 +81,22 @@ def audit_records(
         seen_neg_ids = set()
         cleaned_negatives = []
         row_has_findings = False
+
+        for pos_doc in record.get("pos_doc", []):
+            pos_id = _doc_id(pos_doc)
+            score_state = _score_state(pos_doc)
+            if score_state == "missing":
+                summary["missing_positive_score"] += 1
+                row_has_findings = True
+                _append_finding(
+                    findings, max_findings, row_idx, record, pos_id, "missing_positive_score", doc_role="positive"
+                )
+            elif score_state == "non_finite":
+                summary["non_finite_positive_score"] += 1
+                row_has_findings = True
+                _append_finding(
+                    findings, max_findings, row_idx, record, pos_id, "non_finite_positive_score", doc_role="positive"
+                )
 
         for neg_doc in record.get("neg_doc", []):
             summary["negatives"] += 1
@@ -126,7 +145,9 @@ def audit_records(
         cleaned_records.append(cleaned_record)
 
     summary["total_findings"] = (
-        summary["negative_is_known_positive"]
+        summary["missing_positive_score"]
+        + summary["non_finite_positive_score"]
+        + summary["negative_is_known_positive"]
         + summary["duplicate_negative"]
         + summary["missing_negative_score"]
         + summary["non_finite_negative_score"]
@@ -140,16 +161,19 @@ def _append_finding(
     max_findings: int,
     row_idx: int,
     record: dict[str, Any],
-    neg_id: str | None,
+    doc_id: str | None,
     issue: str,
+    *,
+    doc_role: str = "negative",
 ) -> None:
     """Append a compact finding example up to the configured limit."""
     if len(findings) >= max_findings:
         return
+    id_key = "positive_id" if doc_role == "positive" else "negative_id"
     finding = {
         "row": row_idx,
         "question_id": record.get("question_id"),
-        "negative_id": neg_id,
+        id_key: doc_id,
         "issue": issue,
     }
     if "original_question_id" in record:

@@ -526,14 +526,38 @@ memory and want maximum adaptation.
 
 ## Mine Hard Negatives
 
-After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint. This single-node
-example uses `--standalone`:
+After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint. Hard-negative mining
+expects the corpus ID-based retrieval JSON format described in the dataset guide, not the inline JSONL shortcut. The
+input must reference one corpus so the miner can build a passage embedding cache, retrieve candidates, and write mined
+negatives back to each query. Each mining row must have a unique `question_id`; duplicate IDs make the output mapping
+ambiguous and are rejected.
+
+The quickstart configs use `hf://` sources for the first train/eval path. The miner currently reads a local
+corpus-backed retrieval JSON file instead of `hf://` URIs directly. For a train -> mine -> retrain loop, first
+materialize or preprocess your selected HF subset into the corpus ID JSON schema from
+[Retrieval Dataset](retrieval-dataset.md), then set `--mining.train_qa_file_path` to that local JSON file.
+
+For an AutoModel-schema HF subset such as `FEVER`, materialize one corpus-backed mining input with:
+
+```bash
+uv run python examples/retrieval/data_utils/materialize_hf_retrieval_subset.py \
+  nvidia/embed-nemotron-dataset-v1 \
+  FEVER \
+  /path/to/retrieval-data/fever-mining
+```
+
+This writes `/path/to/retrieval-data/fever-mining/train.json` and a local `FEVER_corpus/` directory. Run the command
+once per subset/corpus that you want to mine; the helper intentionally processes one corpus per run and refuses to write
+into a non-empty output directory unless you pass `--overwrite`. The mining examples below use that local
+`train.json` path.
+
+This single-node example uses `--standalone`:
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
-  --mining.train_qa_file_path /path/to/input.json \
+  --mining.train_qa_file_path /path/to/retrieval-data/fever-mining/train.json \
   --mining.train_file_output_path /path/to/output.json \
   --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
   --mining.query_prefix "query: " \
@@ -555,7 +579,7 @@ uv run torchrun \
   examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
-  --mining.train_qa_file_path /path/to/input.json \
+  --mining.train_qa_file_path /path/to/retrieval-data/fever-mining/train.json \
   --mining.train_file_output_path /path/to/output.json \
   --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
   --mining.query_prefix "query: " \
@@ -568,28 +592,6 @@ uv run torchrun \
 Replace `epoch_0_step_499` with the explicit checkpoint directory that you want to mine from. If you only have
 `LATEST.txt`, read it first and substitute the resolved `epoch_*_step_*` directory; the mining script loads the
 Hugging Face export directly and does not apply AutoModel's checkpoint resolver.
-
-Hard-negative mining expects the corpus ID-based retrieval JSON format described in the dataset guide, not the inline
-JSONL shortcut. The input must reference one corpus so the miner can build a passage embedding cache, retrieve
-candidates, and write mined negatives back to each query.
-
-The quickstart configs use `hf://` sources for the first train/eval path. The miner currently reads a local
-corpus-backed retrieval JSON file instead of `hf://` URIs directly. For a train -> mine -> retrain loop, first
-materialize or preprocess your selected HF subset into the corpus ID JSON schema from
-[Retrieval Dataset](retrieval-dataset.md), then set `--mining.train_qa_file_path` to that local JSON file. The mining
-commands below assume that local corpus-backed input.
-
-For an AutoModel-schema HF subset such as `FEVER`, materialize one corpus-backed mining input with:
-
-```bash
-uv run python examples/retrieval/data_utils/materialize_hf_retrieval_subset.py \
-  nvidia/embed-nemotron-dataset-v1 \
-  FEVER \
-  /path/to/retrieval-data/fever-mining
-```
-
-This writes `/path/to/retrieval-data/fever-mining/train.json` and a local `FEVER_corpus/` directory. Run the command
-once per subset/corpus that you want to mine; the mining helper intentionally processes one corpus per run.
 
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
@@ -613,10 +615,10 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
   rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
-  length, and world-size combination. The miner validates a cache fingerprint that includes the mining input file,
-  local model/tokenizer path state, ordered document IDs/content, and embedding settings before reusing consolidated
-  caches. Fresh run-specific paths are still easier to reason about, especially for mutable Hub IDs or paths that are
-  overwritten in place. Set `load_embeddings_from_cache: true` only when you intentionally want to reuse every cached
+  length, and world-size combination. The miner validates cache metadata and loads the consolidated arrays to verify
+  fingerprint, shape, and readability before reusing a consolidated cache. The fingerprint includes the mining input
+  file, local model/tokenizer path state, ordered document IDs/content, and embedding settings. Fresh run-specific
+  paths are still easier to reason about, especially for mutable Hub IDs or paths that are overwritten in place. Set `load_embeddings_from_cache: true` only when you intentionally want to reuse every cached
   query shard, corpus chunk, and consolidated embedding file from the same model/input/prefix/length/world-size run.
 
 `pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
@@ -668,8 +670,9 @@ uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
 ```
 
 With `--drop-invalid-negatives --output`, the command exits successfully when the cleaned output has no remaining audit
-findings and still satisfies `--min-negatives` if you set it. The audit flags and drops negatives whose IDs also appear
-in the row's `pos_doc`, duplicate negative IDs in the same row, missing negative scores, and non-finite negative scores.
+findings and still satisfies `--min-negatives` if you set it. The audit flags missing or non-finite positive scores, and
+flags and drops negatives whose IDs also appear in the row's `pos_doc`, duplicate negative IDs in the same row, missing
+negative scores, and non-finite negative scores.
 The cleaned output preserves query lineage fields such as `original_question_id`, so unrolled examples remain traceable
 to their source question.
 
