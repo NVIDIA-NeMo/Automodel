@@ -50,7 +50,7 @@ extensions = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "documentation.md"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "documentation.md", "guides/llm/retrieval-dataset-2.md"]
 
 # -- Options for MyST Parser (Markdown) --------------------------------------
 # MyST Parser settings

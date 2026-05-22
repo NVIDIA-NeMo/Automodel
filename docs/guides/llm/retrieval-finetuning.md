@@ -42,7 +42,23 @@ Before running the examples:
   your environment can download.
 - Make sure every rank can read the dataset paths or `hf://` sources.
 
-Run the Llama 3.2 1B bi-encoder example:
+The commands below use `automodel`; if you are running from a source checkout, prefix them with `uv run`.
+
+Start with a one-GPU smoke test:
+
+```bash
+automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 1 \
+  --dist_env.timeout_minutes 30 \
+  --step_scheduler.global_batch_size 4 \
+  --step_scheduler.local_batch_size 1 \
+  --step_scheduler.max_steps 10 \
+  --dataloader.dataset.max_train_samples 40
+```
+
+The first artifact to check is `training.jsonl` under `checkpoint.checkpoint_dir`. JSONL metrics are buffered, so
+stdout/stderr are still the best live signal during a very short run.
+
+Scale the Llama 3.2 1B bi-encoder example to the GPUs on your machine:
 
 ```bash
 automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
@@ -54,21 +70,7 @@ Run the matching cross-encoder example:
 automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
 
-Adjust `--nproc-per-node` to the number of GPUs on your machine. The examples use FSDP2 and bfloat16 by default. If the
-first launch downloads a model, reads from a slow filesystem, or runs across multiple nodes, increase
-`dist_env.timeout_minutes` beyond the short example default.
-
-:::{tip}
-For a small smoke test, override the schedule and sample count from the command line:
-
-```bash
-automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 1 \
-  --step_scheduler.global_batch_size 4 \
-  --step_scheduler.local_batch_size 1 \
-  --step_scheduler.max_steps 10 \
-  --dataloader.dataset.max_train_samples 40
-```
-:::
+Adjust `--nproc-per-node` to the number of GPUs on your machine. The examples use FSDP2 and bfloat16 by default.
 
 ## Choose a Recipe
 
@@ -334,8 +336,26 @@ The complete example is
 
 ## Distributed Launch and Batch Size
 
-Launch examples with `automodel <config.yaml> --nproc-per-node <gpus>`. The retrieval recipes support data-parallel
-training through the configured distributed strategy; pipeline parallelism is not supported for encoder recipes today.
+Launch single-node examples with `automodel <config.yaml> --nproc-per-node <gpus>`. The retrieval recipes support
+data-parallel training through the configured distributed strategy; pipeline parallelism is not supported for encoder
+recipes today.
+
+For multi-node runs, launch with your cluster launcher or an external `torchrun` command so every node has an explicit
+rank and rendezvous endpoint:
+
+```bash
+torchrun \
+  --nnodes 2 \
+  --nproc-per-node 8 \
+  --node-rank ${NODE_RANK} \
+  --rdzv-backend c10d \
+  --rdzv-endpoint ${MASTER_ADDR}:${MASTER_PORT} \
+  -m nemo_automodel.cli.app examples/retrieval/bi_encoder/llama3_2_1b.yaml
+```
+
+Use a shared or pre-populated Hugging Face cache on every node, make dataset paths visible to every rank, and use a
+unique `checkpoint_dir` for each experiment. Increase `dist_env.timeout_minutes` for first model downloads, slow shared
+filesystems, multi-node collectives, or large checkpoint writes.
 
 The step scheduler computes gradient accumulation from:
 
@@ -344,9 +364,17 @@ gradient_accumulation_steps = global_batch_size / (local_batch_size * data_paral
 ```
 
 `global_batch_size` must be divisible by `local_batch_size * data_parallel_size`, and the result must be at least `1`.
-For memory pressure, reduce `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or
-`rerank_max_length`), then `n_passages`. Bi-encoders scale memory with query length plus `n_passages` passage sequences;
-cross-encoders scale with `n_passages` combined query-passage sequences.
+In pure data parallelism, `data_parallel_size` is the total GPU count. With tensor or context parallelism enabled, it is
+`world_size / (tp_size * cp_size)`. For example, two 8-GPU nodes with `tp_size: 1` and `cp_size: 1` have
+`data_parallel_size: 16`; with `tp_size: 2`, they have `data_parallel_size: 8`.
+
+`local_batch_size` is the number of query groups per rank. For memory pressure, reduce
+`step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or `rerank_max_length`), then
+`n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences;
+cross-encoders scale with `local_batch_size * n_passages` combined query-passage sequences.
+
+Current retrieval datasets are map-style datasets loaded in each process, not streaming distributed inputs. Pre-cache
+HF data on each node or use a shared cache, and budget CPU RAM and local disk per rank for corpus-backed datasets.
 
 ## Add Validation
 
@@ -384,14 +412,31 @@ metrics. For cross-encoder validation, use `model_type: cross_encoder` and `Cros
 tail -n 5 ./output/llama3_2_1b_encoder/checkpoints/validation.jsonl
 ```
 
+## Evaluate Retrieval Quality
+
+Candidate-group validation is a smoke test for the training objective. To decide whether a bi-encoder is useful for RAG
+candidate generation, evaluate against a fixed held-out corpus and qrels:
+
+1. Encode corpus passages with the same tokenizer, pooling, normalization, passage prefix, and `p_max_len` used in
+   training.
+2. Build an ANN or exact top-k index. With `l2_normalize: true`, use inner product or cosine similarity.
+3. Encode held-out queries with the matching query prefix and `q_max_len`.
+4. Report full-corpus Recall@K, MRR@K, and nDCG@K for the K values your application uses.
+
+For cross-encoders, freeze a first-stage retriever, rerank its top-K candidates, and report reranking metrics on that
+same candidate set. Do not compare cross-encoder candidate-group validation directly to full-corpus bi-encoder metrics.
+
 ## Monitor Training
 
-Training metrics are written to `training.jsonl` under `checkpoint.checkpoint_dir`. Watch `loss`, `grad_norm`, learning
-rate, GPU memory, and step time during smoke tests before scaling to a longer run:
+Training metrics are written to `training.jsonl` under `checkpoint.checkpoint_dir`. The file logger buffers records
+before flushing, so `tail -f` is useful for completed or longer runs but may not update during a short smoke test:
 
 ```bash
 tail -f ./output/llama3_2_1b_encoder/checkpoints/training.jsonl
 ```
+
+Use stdout/stderr as the live per-step signal today. Watch `loss`, `grad_norm`, learning rate, GPU memory, and step time
+before scaling to a longer run.
 
 The examples include a commented `wandb` block. Enable it when you want remote tracking, and tune
 `step_scheduler.log_remote_every_steps` to control remote logging cadence.
@@ -494,7 +539,13 @@ checkpoint:
   restore_from: LATEST
 ```
 
-Use a unique `checkpoint_dir` per experiment unless you intentionally want to resume an existing run.
+If `checkpoint.restore_from` is omitted, AutoModel still auto-detects the latest compatible checkpoint in
+`checkpoint_dir` and resumes from it. Use a new or empty `checkpoint_dir` for fresh experiments, and rotate or clear
+`training.jsonl` and `validation.jsonl` if you do not want logs from multiple runs appended together.
+
+When `checkpoint.is_async: true`, the `LATEST` symlink can lag the most recent write at job end. For final mining,
+export, or evaluation workflows, prefer the explicit `epoch_*_step_*` checkpoint directory or keep async checkpointing
+disabled for the final save.
 
 ## Use the Model
 
@@ -515,7 +566,9 @@ jointly, so they are usually too expensive for first-stage full-corpus search.
 | OOM at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`; use LoRA for larger backbones. |
 | Distributed launch times out | Increase `dist_env.timeout_minutes`, especially for first model downloads, slow filesystems, or multi-node runs. |
 | Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
-| Different mining and training behavior | Match tokenizer settings, prefixes, and max lengths across training and mining. |
+| `training.jsonl` does not update during a smoke test | Use stdout/stderr for live monitoring; JSONL metrics are buffered before flush. |
+| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`; AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
+| Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text including trailing spaces across training and mining. |
 
 ## Related Files
 

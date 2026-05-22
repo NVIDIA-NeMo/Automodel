@@ -29,7 +29,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained
