@@ -2,8 +2,8 @@
 name: retrieval-models
 version: "1.0.0"
 author: NeMo AutoModel maintainers
-description: Work on NeMo AutoModel retrieval encoder support, including bi-encoder embedding and cross-encoder scoring backbones, wrapper and registry wiring, retrieval recipes, and focused validation.
-when_to_use: Adding, modifying, or debugging retrieval model support; working with NeMoAutoModelBiEncoder, NeMoAutoModelCrossEncoder, bidirectional causal-decoder backbones, retrieval recipe configs, retrieval dataset/collator shape issues, or encoder save/reload metadata.
+description: "NeMo AutoModel retrieval internals: bi/cross-encoder wrappers, bidirectional backbones, recipes, collators, and metadata. Not for LoRA or causal LM generation."
+when_to_use: Adding, modifying, or debugging retrieval model support; working with NeMoAutoModelBiEncoder, NeMoAutoModelCrossEncoder, bidirectional causal-decoder backbones, retrieval recipe configs, retrieval dataset/collator shape issues, or encoder save/reload metadata. Do not use for standard LLM generation or PEFT/LoRA tasks unless they also touch retrieval model wrappers, datasets, collators, or recipes.
 tags:
   - nemo-automodel
   - retrieval
@@ -29,6 +29,10 @@ generation. Retrieval support has three layers that are easy to mix up:
    `SUPPORTED_BACKBONES`.
 3. Concrete backbone classes under `nemo_automodel/components/models/`, such as
    `llama_bidirectional` and `ministral_bidirectional`.
+
+If the prompt is about standard causal generation, instruction tuning, LoRA,
+PEFT, or launcher setup without retrieval model wrappers, datasets, collators,
+or recipes, stop using this skill and choose the relevant LLM training skill.
 
 ## Prerequisites
 
@@ -68,11 +72,13 @@ Start with the narrowest surface that matches the task:
 
 1. Classify the change as backbone, wrapper, recipe/config, or dataset/collator.
 2. Read the matching files from the first-files list before planning edits.
-3. Preserve the bi-encoder or cross-encoder shape contract while making the
+3. For failures, shape mismatches, save/reload metadata issues, or unexpected
+   recipe behavior, read `PITFALLS.md` before proposing a fix.
+4. Preserve the bi-encoder or cross-encoder shape contract while making the
    smallest code change.
-4. Add or update the focused unit test that proves the contract changed or still
+5. Add or update the focused unit test that proves the contract changed or still
    holds.
-5. Run the smallest validation command from this skill, then broaden only if the
+6. Run the smallest validation command from this skill, then broaden only if the
    change touches distributed training, checkpointing, or full recipe execution.
 
 ## Choose The Implementation Path
@@ -147,6 +153,21 @@ Bi-encoder training keeps query and passage encoding separate.
 When `do_distributed_inbatch_negative` is enabled, keep `passage_doc_ids` from
 the collator so duplicate positives can be masked across gathered passages.
 ColBERT pooling does not support distributed in-batch negatives.
+
+## Existing Bi-Encoder Migration
+
+For an existing fine-tuned encoder loaded with
+`NeMoAutoModelBiEncoder.from_pretrained`, verify the loader path and embedding
+contract before editing model code:
+
+- Read `auto_model.py` for the public entry point, then `retrieval.py` for
+  `BiEncoderModel.build`, pooling, normalization, and `SUPPORTED_BACKBONES`.
+- Decide whether the checkpoint needs a custom bidirectional backbone or the
+  HuggingFace `AutoModel` fallback.
+- Run a tiny forward pass and confirm embeddings are `[batch, hidden]`, finite,
+  correctly typed, stable under padding, and normalized when expected.
+- For migrations, compare a fixed query/document pair for deterministic shape,
+  finite values, and ranking direction before chasing numerical drift.
 
 ## Cross-Encoder Contract
 
@@ -233,11 +254,7 @@ touches the model wrapper, dataset/collator contract, or retrieval recipe.
   mask and each attention layer's `is_causal` flag.
 - Read `PITFALLS.md` for deeper failure patterns before widening the change.
 
-## Evaluation Scenarios
+## Evaluation
 
-| Prompt | Expected behavior |
-| --- | --- |
-| "Add retrieval encoder support for a causal decoder backbone." | Uses this skill plus `model-onboarding`, implements a bidirectional backbone, updates registry and `SUPPORTED_BACKBONES`, and adds tiny non-causal and build-resolution tests. |
-| "My cross-encoder recipe fails when reshaping logits." | Uses this skill plus `recipe-development`, checks `model_type`, `n_passages`, `val_n_passages`, flattening, and `CrossEncoderCollator` labels before changing model code. |
-| "Change the bi-encoder dataset to use inline JSONL." | Uses this skill to choose `retrieval_dataset_inline.make_retrieval_dataset`, verify grouped `[positive, negatives...]` output, and run collator/dataset unit tests. |
-| "Build a RAG demo app that calls an existing embedding endpoint." | Does not use this skill unless the task also changes NeMo AutoModel retrieval model, dataset, collator, or recipe code. |
+Live evaluation scenarios live in `evals/evals.json`. Validate them with
+`astra-skill-eval validate skills/retrieval-models` before running agent evals.
