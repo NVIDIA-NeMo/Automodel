@@ -1,4 +1,4 @@
-# Retrieval Dataset (Embedding Fine-tuning)
+# Retrieval Dataset for Bi-Encoders and Cross-Encoders
 
 NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
 **query** paired with **one positive** document and **one or more negative** documents.
@@ -7,7 +7,7 @@ This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encode
 `examples/retrieval/cross_encoder/`) together with the retrieval collators. For an end-to-end training workflow, see
 [Retrieval Fine-Tuning](retrieval-finetuning.md).
 
-## What the Bi-Encoder Consumes
+## Raw Records and Runtime Schemas
 
 The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face
 `datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
@@ -22,6 +22,10 @@ The cross-encoder recipe consumes the same raw retrieval records, but sets `mode
 transform flattens each query with its positive and negative passages, and `CrossEncoderCollator` serializes each
 query-passage pair for reranking.
 
+Training uses exactly one positive passage per example: the first item in `pos_doc`. For datasets with multiple
+relevant passages, either choose a canonical positive, expand the record into one example per positive, or add a
+multi-positive loss/masking strategy before training.
+
 ## Supported Input Formats
 
 NeMo Automodel supports **two** input schemas. They use different dataset factories:
@@ -29,6 +33,12 @@ NeMo Automodel supports **two** input schemas. They use different dataset factor
 - Use `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and `hf://` sources.
 - Use `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset` for inline JSONL where
   document text is stored directly in each record.
+
+| Source | Query field | Required document fields | Best for |
+|--------|-------------|--------------------------|----------|
+| Corpus ID JSON | `question` | `pos_doc`, `neg_doc`, and `corpus_id` IDs resolved through a local corpus | Production data, hard-negative mining, same-document masking |
+| `hf://` AutoModel schema | `question` | `pos_doc`, optional `neg_doc`, and a companion HF corpus split | Tutorial runs and shared AutoModel retrieval datasets |
+| Inline JSONL | `query` or `question` | Inline text in `pos_doc` and `neg_doc` | Small custom runs when you do not need mining or document-ID masking |
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
@@ -55,7 +65,9 @@ This is the format used by NeMo retriever pipelines where documents live in a se
 
 **Corpus requirements**
 
-Each corpus directory must contain a `merlin_metadata.json` file.
+Each corpus directory must contain a `merlin_metadata.json` file and a Hugging Face-loadable `train` split with at least
+`id` and `text` columns. For `class: TextQADataset`, AutoModel calls `datasets.load_dataset(<corpus path>)["train"]`,
+then resolves `pos_doc` and `neg_doc` IDs against that split.
 
 Minimal example:
 
@@ -63,10 +75,43 @@ Minimal example:
 { "class": "TextQADataset", "corpus_id": "wiki_corpus" }
 ```
 
+Minimal local layout:
+
+```text
+retrieval-data/
+  train.json
+  wiki_corpus/
+    merlin_metadata.json
+    train.parquet   # or another load_dataset-compatible train split with id,text columns
+```
+
+The `corpus_id` in `merlin_metadata.json` must match the `corpus_id` in each training record. Relative corpus paths in
+`train.json` are resolved relative to the JSON file.
+
 :::{note}
 - `pos_doc` and `neg_doc` can be lists of `{"id": ...}` dicts or raw IDs (they are normalized internally).
+- Training uses `pos_doc[0]` as the positive. Additional positives are ignored unless you expand the data before
+  training.
 - If you set `use_dataset_instruction: true`, optional fields like `query_instruction` and `passage_instruction` in `merlin_metadata.json` are surfaced to the collator.
 :::
+
+### Hugging Face `hf://` Sources
+
+Direct `hf://` loading expects the AutoModel retrieval schema, not arbitrary Hugging Face retrieval datasets. The URI
+format is:
+
+```text
+hf://<org>/<repo>/<subset>
+```
+
+Each subset must provide:
+
+- `<subset>/dataset_metadata.json` with `corpus_id` metadata and `ids_only: false`
+- a `<subset>_corpus` train split with `id` and `text` columns
+- a `<subset>` train split with `question` and `pos_doc`; `neg_doc` may be absent but must be available before training
+  with `n_passages > 1`
+
+Datasets with BEIR, DPR, MS MARCO, MIRACL, or other layouts need a preprocessing step before direct `hf://` loading.
 
 ### Inline-Text JSONL (No Corpus Required)
 
@@ -84,7 +129,9 @@ This is convenient for custom fine-tuning pipelines where the documents are incl
 - `pos_doc` and `neg_doc` can be either:
   - strings (interpreted as document text), or
   - lists of strings, or
-  - dicts with at least `text` (optionally `image`, `nr_ocr`) for multimodal use cases.
+  - dicts with at least `text`.
+- The current LLM retrieval collators tokenize text only. Do not rely on inline `image` or OCR fields unless you add a
+  custom preprocessing and collator path.
 - If `corpus_id` is not provided, it defaults to `__inline__`.
 - `use_dataset_instruction: true` has no effect for pure inline records (instructions come from corpus metadata).
 :::
@@ -98,6 +145,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: bi_encoder
     data_dir_list:
       - /abs/path/to/train.json    # or hf://nvidia/embed-nemotron-dataset-v1/FEVER
     data_type: train
@@ -120,6 +168,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   dataset:
     _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    model_type: bi_encoder
     data_dir_list:
       - /abs/path/to/train.jsonl
     data_type: train
@@ -134,10 +183,29 @@ dataloader:
     pad_to_multiple_of: 8
 ```
 
-For cross-encoder training, keep the same dataset factory and set `model_type: cross_encoder`, then replace the collator
-with `nemo_automodel.components.datasets.llm.CrossEncoderCollator`.
+For cross-encoder training, keep the same dataset factory, set `model_type: cross_encoder`, and use
+`CrossEncoderCollator` arguments:
+
+```yaml
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    model_type: cross_encoder
+    data_dir_list:
+      - /abs/path/to/train.jsonl
+    data_type: train
+    n_passages: 5
+    do_shuffle: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.CrossEncoderCollator
+    rerank_max_length: 512
+    prompt_template: "question:{query} \n \n passage:{passage}"
+    pad_to_multiple_of: 8
+```
 
 ## Requirements
 
 - `pos_doc` must be **non-empty**.
+- `neg_doc` must be present. It may be empty only when `n_passages: 1`.
 - If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document.

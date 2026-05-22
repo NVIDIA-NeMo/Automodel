@@ -92,13 +92,28 @@ query-passage pair into one sequence and predicts a score for each candidate pas
 
 ## Prepare Data
 
-Use the retrieval dataset format described in [Retrieval Dataset](retrieval-dataset.md). Each record needs:
+Use the retrieval dataset format described in [Retrieval Dataset](retrieval-dataset.md). Choose the data path that
+matches the workflow you need:
 
-- a query, stored as `question` or `query`
-- at least one positive passage in `pos_doc`
-- negatives in `neg_doc` when `n_passages > 1`
+| Data path | Use when | Notes |
+|-----------|----------|-------|
+| `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
+| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record; no document IDs are available for same-document masking. |
+| Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
 
-For quick custom experiments, inline JSONL is the simplest format. Use the inline dataset factory for these files:
+The key field requirements differ by source:
+
+| Source | Required query field | Required document fields |
+|--------|----------------------|--------------------------|
+| Corpus ID JSON | `question` | `question_id`, `corpus_id`, non-empty `pos_doc`, and present `neg_doc` |
+| `hf://` AutoModel schema | `question` | non-empty `pos_doc`; `neg_doc` is optional in the source but required before training with negatives |
+| Inline JSONL | `query` or `question` | non-empty `pos_doc`, and present `neg_doc` |
+
+`neg_doc` must be present for local JSON and JSONL sources. It may be `[]` only when `n_passages: 1`; when
+`n_passages > 1`, provide at least one negative.
+
+For quick custom experiments, inline JSONL is the simplest format. Use the inline dataset factory for these files, and
+switch to corpus ID-based JSON before hard-negative mining:
 
 ```json
 {"query":"What does NVLink do?","pos_doc":"NVLink is a high-bandwidth GPU interconnect.","neg_doc":["CUDA is a programming model.","Tensor Cores accelerate matrix math."]}
@@ -115,8 +130,10 @@ data_dir_list:
   - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData
 ```
 
-`n_passages` controls how many passages are sampled for each query. For example, `n_passages: 5` means one positive
-and four negatives. If a record has fewer negatives than requested, negatives are repeated to fill the group.
+`n_passages` controls the size of each query group. For example, `n_passages: 5` means one positive and four negatives.
+Training uses the first item in `pos_doc` as the positive, then takes negatives from `neg_doc` in order. If a record has
+fewer negatives than requested, negatives are repeated cyclically to fill the group. Treat repetition as a fallback for
+shape compatibility; for real training and validation, prefer enough distinct negatives or lower `n_passages`.
 
 ## Minimal Config Anatomy
 
@@ -197,7 +214,8 @@ distributed:
 ```
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataloader.dataset.model_type`, and `dataloader.collate_fn`
-to the cross-encoder values shown below.
+to the cross-encoder values shown below. Also set `model.num_labels: 1`, keep `model.temperature`, and replace
+`q_max_len` / `p_max_len` with `rerank_max_length` in the collator.
 
 ## Configure a Bi-Encoder
 
@@ -252,10 +270,11 @@ Important knobs:
 - `query_prefix` and `passage_prefix`: add task-specific text before tokenization. Keep these aligned between training,
   hard-negative mining, and inference.
 - `do_distributed_inbatch_negative`: optional model setting that treats passages from other data-parallel ranks as
-  additional negatives. It is useful for larger distributed runs and uses document IDs from corpus-backed datasets to
-  avoid treating the same document as a negative for itself. It all-gathers passage embeddings across data-parallel
-  ranks, so expect extra communication and score-matrix memory. Use corpus-backed data when you need same-document
-  masking, and keep it disabled for ColBERT-style pooling.
+  additional negatives. Enable it with `model.do_distributed_inbatch_negative: true` or the CLI override
+  `--model.do_distributed_inbatch_negative true`. Today it all-gathers over the default process group, so use it only
+  for pure DP/FSDP retrieval runs (`tp_size: 1`, `cp_size: 1`). Same-document masking requires `doc_id` fields from
+  corpus-backed or custom datasets; inline JSONL does not provide duplicate-document masking. Keep it disabled for
+  ColBERT-style pooling.
 
 The complete example is
 [`examples/retrieval/bi_encoder/llama3_2_1b.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
@@ -414,8 +433,8 @@ torchrun --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py
   --mining.train_qa_file_path /path/to/input.json \
   --mining.train_file_output_path /path/to/output.json \
   --mining.cache_embeddings_dir /path/to/cache \
-  --mining.query_prefix "query:" \
-  --mining.passage_prefix "passage:" \
+  --mining.query_prefix "query: " \
+  --mining.passage_prefix "passage: " \
   --mining.query_max_length 512 \
   --mining.passage_max_length 512
 ```
@@ -428,14 +447,19 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
 - `hard_negatives_to_mine`: number of negatives to add per query.
 - `hard_neg_margin` and `hard_neg_margin_type`: filter near-positive candidates.
-- `query_prefix` and `passage_prefix`: keep these consistent with the bi-encoder training config.
+- `query_prefix` and `passage_prefix`: keep these semantically consistent with the bi-encoder training config. The
+  miner concatenates prefixes directly, while `BiEncoderCollator` inserts a space after non-empty prefixes; include the
+  trailing space in mining prefixes.
 - `query_max_length` and `passage_max_length`: keep these consistent with training unless you intentionally change
   truncation.
 - `use_negatives_from_file`: include existing negatives from the input file when mining.
 - `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly.
 
-Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training.
+Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
+negative mining excludes known positives by document ID, but it cannot know every semantically relevant duplicate unless
+your qrels/corpus encode that relationship. Deduplicate the corpus, exclude all known positives, inspect mined samples,
+and avoid mining from validation or test corpora.
 
 ## Save, Resume, and Use the Checkpoint
 
