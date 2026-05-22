@@ -24,8 +24,7 @@ This script will download the dataset and prepare it for training.
 Run the model finetuning with the specified configuration using 8 GPUs:
 
 ```bash
-torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py \
-    --config examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml
+automodel examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml --nproc-per-node 8
 ```
 
 The final model checkpoint in Hugging Face format will be stored in `output/llama_embed_nemotron_8b/epoch_0_step_28614/model/consolidated`

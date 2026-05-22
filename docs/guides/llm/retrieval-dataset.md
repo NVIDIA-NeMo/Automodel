@@ -15,6 +15,8 @@ The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_datas
 - `question`: query string
 - `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
+- `doc_id`: list of document IDs aligned with `doc_text` for corpus-backed and `hf://` sources. Pure inline JSONL
+  does not provide real document IDs for duplicate-document masking unless you add them in a custom preprocessing path.
 - `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
   provides instructions via metadata
 
@@ -24,11 +26,12 @@ query-passage pair for reranking.
 
 Training uses exactly one positive passage per example: the first item in `pos_doc`. For datasets with multiple
 relevant passages, either choose a canonical positive, expand the record into one example per positive, or add a
-multi-positive loss/masking strategy before training.
+multi-positive loss/masking strategy before training. Keep the full set of known positives in your qrels or corpus
+metadata for evaluation and false-negative filtering, even when each training row uses one positive.
 
 ## Supported Input Formats
 
-NeMo Automodel supports **two** input schemas. They use different dataset factories:
+NeMo Automodel supports **two** input schemas across three source types. They use different dataset factories:
 
 - Use `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and `hf://` sources.
 - Use `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset` for inline JSONL where
@@ -39,6 +42,17 @@ NeMo Automodel supports **two** input schemas. They use different dataset factor
 | Corpus ID JSON | `question` | `pos_doc`, `neg_doc`, and `corpus_id` IDs resolved through a local corpus | Production data, hard-negative mining, same-document masking |
 | `hf://` AutoModel schema | `question` | `pos_doc`, optional `neg_doc`, and a companion HF corpus split | Tutorial runs and shared AutoModel retrieval datasets |
 | Inline JSONL | `query` or `question` | Inline text in `pos_doc` and `neg_doc` | Small custom runs when you do not need mining or document-ID masking |
+
+Separate qrels files are not consumed directly by the training dataset factory. Convert qrels-style data into retrieval
+records before training:
+
+1. Put every passage in a corpus split with stable `id` and `text` values.
+2. For each query, write one or more training records with `question_id`, `question`, `corpus_id`, `pos_doc`, and
+   `neg_doc`.
+3. Use the first relevant document in each record as `pos_doc[0]`; expand multi-positive queries into multiple records
+   if you want every positive to become a supervised positive.
+4. Preserve the complete qrels separately for full-corpus evaluation and for excluding all known positives during
+   negative mining.
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
@@ -160,6 +174,10 @@ dataloader:
     passage_prefix: "passage:"
     pad_to_multiple_of: 8
 ```
+
+For corpus ID JSON and `hf://` sources, `do_shuffle: true` shuffles rows only when `max_train_samples` is set before
+subsampling. Training order is controlled by the dataloader or distributed sampler. For inline JSONL, `do_shuffle: true`
+shuffles the loaded rows directly.
 
 Use the inline dataset factory for inline JSONL:
 

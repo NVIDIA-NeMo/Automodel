@@ -39,7 +39,10 @@ Before running the examples:
   for multi-GPU runs.
 - From a source checkout, use `uv run automodel ...`; from an installed environment, use `automodel ...`.
 - Accept access terms for the configured Hugging Face model and set `HF_TOKEN`, or replace the model path with a model
-  your environment can download.
+  your environment can download. Retrieval has custom bidirectional backbones for Llama and Ministral3 embedding
+  models, and a custom Llama scoring backbone for cross-encoders. Other Hugging Face model types fall back to
+  `AutoModel` for bi-encoders or `AutoModelForSequenceClassification` for cross-encoders; verify that the tokenizer,
+  pooling, `num_labels`, and any retrieval-specific model arguments are accepted by the replacement model.
 - Make sure every rank can read the dataset paths or `hf://` sources.
 
 The commands below use `automodel`; if you are running from a source checkout, prefix them with `uv run`.
@@ -115,12 +118,18 @@ The key field requirements differ by source:
 `n_passages > 1`, provide at least one negative.
 
 For quick custom experiments, inline JSONL is the simplest format. Use the inline dataset factory for these files, and
-switch to corpus ID-based JSON before hard-negative mining:
+switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
 
 ```json
 {"query":"What does NVLink do?","pos_doc":"NVLink is a high-bandwidth GPU interconnect.","neg_doc":["CUDA is a programming model.","Tensor Cores accelerate matrix math."]}
 {"query":"What is retrieval augmented generation?","pos_doc":"RAG grounds generation by retrieving relevant context.","neg_doc":["Beam search expands candidate tokens.","Dropout regularizes training."]}
 ```
+
+To migrate inline data to corpus ID JSON, assign a stable document ID to each unique passage, write those passages into
+a corpus split with `id` and `text` columns, then replace inline `pos_doc` and `neg_doc` strings with those IDs. Keep
+all known positives for each query in your qrels or source metadata, even if each training row uses only the first
+positive. Otherwise, in-batch negatives and mined hard negatives can accidentally treat another relevant passage as a
+negative.
 
 For larger corpora, use the corpus ID-based JSON format from the dataset guide. Use
 `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and for `hf://` sources that
@@ -136,6 +145,9 @@ data_dir_list:
 Training uses the first item in `pos_doc` as the positive, then takes negatives from `neg_doc` in order. If a record has
 fewer negatives than requested, negatives are repeated cyclically to fill the group. Treat repetition as a fallback for
 shape compatibility; for real training and validation, prefer enough distinct negatives or lower `n_passages`.
+
+The training recipe does not load a separate qrels file. Materialize qrels into training records before fine-tuning, and
+keep the original qrels for offline Recall@K, MRR@K, and nDCG@K evaluation.
 
 ## Minimal Config Anatomy
 
@@ -423,20 +435,27 @@ candidate generation, evaluate against a fixed held-out corpus and qrels:
 3. Encode held-out queries with the matching query prefix and `q_max_len`.
 4. Report full-corpus Recall@K, MRR@K, and nDCG@K for the K values your application uses.
 
+AutoModel does not currently provide a one-command full-corpus retrieval evaluator in this guide. Use your existing IR
+evaluation stack or a small script around the consolidated checkpoint and report enough run details to make the result
+repeatable: query count, corpus size, qrels source, judged/unjudged handling, exact versus ANN search settings, K
+values, baseline checkpoint, and whether confidence intervals or significance tests were used.
+
 For cross-encoders, freeze a first-stage retriever, rerank its top-K candidates, and report reranking metrics on that
 same candidate set. Do not compare cross-encoder candidate-group validation directly to full-corpus bi-encoder metrics.
 
 ## Monitor Training
 
-Training metrics are written to `training.jsonl` under `checkpoint.checkpoint_dir`. The file logger buffers records
-before flushing, so `tail -f` is useful for completed or longer runs but may not update during a short smoke test:
+Training metrics are written to `training.jsonl` under `checkpoint.checkpoint_dir`. The file logger buffers records in
+chunks before writing and flushes the remaining records on close, so `tail -f` is useful for completed or longer runs
+but may not update during a short smoke test:
 
 ```bash
 tail -f ./output/llama3_2_1b_encoder/checkpoints/training.jsonl
 ```
 
 Use stdout/stderr as the live per-step signal today. Watch `loss`, `grad_norm`, learning rate, GPU memory, and step time
-before scaling to a longer run.
+before scaling to a longer run. On preempted or timed-out jobs, recent buffered JSONL metrics may be missing even when
+stdout/stderr showed them.
 
 The examples include a commented `wandb` block. Enable it when you want remote tracking, and tune
 `step_scheduler.log_remote_every_steps` to control remote logging cadence.
@@ -499,7 +518,9 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   truncation.
 - `use_negatives_from_file`: include existing negatives from the input file when mining.
 - `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
-  assembles the final embedding cache and score outputs, so plan memory and local disk accordingly.
+  assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
+  mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
+  rank `0` unable to read remote-rank shards.
 
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
 negative mining excludes known positives by document ID, but it cannot know every semantically relevant duplicate unless

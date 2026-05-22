@@ -238,17 +238,24 @@ See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example w
 For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](../../examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
 
 ### Retrieval (Embedding Fine-Tuning)
-- Factory: `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
-- Collator: `nemo_automodel.components.datasets.llm.BiEncoderCollator`
+- Factory for corpus ID JSON and `hf://` AutoModel-schema sources:
+  `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
+- Factory for inline JSONL:
+  `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset`
+- Collators: `nemo_automodel.components.datasets.llm.BiEncoderCollator` or
+  `nemo_automodel.components.datasets.llm.CrossEncoderCollator`
 - Use case: embedding model fine-tuning with (query, positive doc, negative docs) contrastive learning
-- Supported schemas:
+- Supported retrieval sources:
   - Corpus-ID JSON (Merlin/NeMo-retriever style)
+  - `hf://` sources that already follow the AutoModel retrieval schema
   - Inline-text JSONL (e.g., `{"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}`)
-- Example YAML:
+- Inline JSONL example:
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-  data_dir_list: /abs/path/to/train.jsonl
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+  model_type: bi_encoder
+  data_dir_list:
+    - /abs/path/to/train.jsonl
   data_type: train
   n_passages: 5
 collate_fn:
