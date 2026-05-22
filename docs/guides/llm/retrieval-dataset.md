@@ -40,7 +40,7 @@ NeMo Automodel supports **two** input schemas across three source types. They us
 | Source | Query field | Required document fields | Best for |
 |--------|-------------|--------------------------|----------|
 | Corpus ID JSON | `question` | `pos_doc`, `neg_doc`, and `corpus_id` IDs resolved through a local corpus | Production data, hard-negative mining, same-document masking |
-| `hf://` AutoModel schema | `question` | `pos_doc`, optional `neg_doc`, and a companion HF corpus split | Tutorial runs and shared AutoModel retrieval datasets |
+| `hf://` AutoModel schema | `question` | `pos_doc`, a companion HF corpus split, and `neg_doc` before training with `n_passages > 1` | Tutorial runs and shared AutoModel retrieval datasets |
 | Inline JSONL | `query` or `question` | Inline text in `pos_doc` and `neg_doc` | Small custom runs when you do not need mining or document-ID masking |
 
 Separate qrels files are not consumed directly by the training dataset factory. Convert qrels-style data into retrieval
@@ -49,10 +49,12 @@ records before training:
 1. Put every passage in a corpus split with stable `id` and `text` values.
 2. For each query, write one or more training records with `question_id`, `question`, `corpus_id`, `pos_doc`, and
    `neg_doc`.
-3. Use the first relevant document in each record as `pos_doc[0]`; expand multi-positive queries into multiple records
-   if you want every positive to become a supervised positive.
-4. Preserve the complete qrels separately for full-corpus evaluation and for excluding all known positives during
-   negative mining.
+3. For training, use the first relevant document in each record as `pos_doc[0]`; expand multi-positive queries into
+   multiple records if you want every positive to become a supervised positive.
+4. For hard-negative mining, include all known positive document IDs for that query in the row's `pos_doc`. The miner
+   excludes only IDs present in the input row, not an external qrels file.
+5. Preserve the complete qrels separately for full-corpus evaluation and audit mined negatives against them before
+   reusing the output for training.
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
@@ -225,5 +227,6 @@ dataloader:
 ## Requirements
 
 - `pos_doc` must be **non-empty**.
-- `neg_doc` must be present. It may be empty only when `n_passages: 1`.
+- `neg_doc` must be present in local JSON and JSONL training records. It may be empty only when `n_passages: 1`.
+- `hf://` sources may omit `neg_doc` in the source dataset, but add negatives before training with `n_passages > 1`.
 - If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document.

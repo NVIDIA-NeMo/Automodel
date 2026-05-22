@@ -146,8 +146,11 @@ Training uses the first item in `pos_doc` as the positive, then takes negatives 
 fewer negatives than requested, negatives are repeated cyclically to fill the group. Treat repetition as a fallback for
 shape compatibility; for real training and validation, prefer enough distinct negatives or lower `n_passages`.
 
-The training recipe does not load a separate qrels file. Materialize qrels into training records before fine-tuning, and
-keep the original qrels for offline Recall@K, MRR@K, and nDCG@K evaluation.
+The training recipe does not load a separate qrels file. Materialize qrels into retrieval records before fine-tuning.
+For training, `pos_doc[0]` is the supervised positive. For mining, keep every known positive for the query in `pos_doc`
+so the miner can exclude those IDs; it does not read an external qrels file. If you expand multi-positive queries into
+one row per positive, make sure sibling positives are removed from `neg_doc` and audited out of mined negatives before
+training with in-batch negatives. Keep the original qrels for offline Recall@K, MRR@K, and nDCG@K evaluation.
 
 ## Minimal Config Anatomy
 
@@ -510,7 +513,9 @@ candidates, and write mined negatives back to each query.
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
 - `hard_negatives_to_mine`: number of negatives to add per query.
-- `hard_neg_margin` and `hard_neg_margin_type`: filter near-positive candidates.
+- `hard_neg_margin` and `hard_neg_margin_type`: filter near-positive candidates. With `hard_neg_margin_type: perc`,
+  candidates scoring above `min_positive_score * hard_neg_margin` are removed; with `abs`, candidates scoring above
+  `min_positive_score - hard_neg_margin` are removed. Inspect mined samples when positive scores are low or negative.
 - `query_prefix` and `passage_prefix`: keep these semantically consistent with the bi-encoder training config. The
   miner concatenates prefixes directly, while `BiEncoderCollator` inserts a space after non-empty prefixes; include the
   trailing space in mining prefixes.
@@ -523,9 +528,9 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   rank `0` unable to read remote-rank shards.
 
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
-negative mining excludes known positives by document ID, but it cannot know every semantically relevant duplicate unless
-your qrels/corpus encode that relationship. Deduplicate the corpus, exclude all known positives, inspect mined samples,
-and avoid mining from validation or test corpora.
+negative mining excludes document IDs listed in each input row's `pos_doc`, but it cannot read an external qrels file or
+know every semantically relevant duplicate. Put all known positive IDs for the query in the mining input, deduplicate the
+corpus, inspect mined samples, and avoid mining from validation or test corpora.
 
 ## Save, Resume, and Use the Checkpoint
 
@@ -542,8 +547,12 @@ checkpoint:
 Each save creates a versioned directory such as:
 
 ```text
-./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_500/
+./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/
 ```
+
+Checkpoint directory names use the scheduler step at save time. The saved scheduler state advances to the next step, so
+for exact paths prefer the `Saving checkpoint to ...` log line or the `LATEST` pointer over hand-constructing a step
+number.
 
 With `save_consolidated: true`, AutoModel also writes a Hugging Face-compatible model under:
 

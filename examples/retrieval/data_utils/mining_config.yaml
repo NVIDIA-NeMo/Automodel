@@ -21,7 +21,8 @@
 #     --config examples/retrieval/data_utils/mining_config.yaml \
 #     --mining.model_name_or_path /path/to/encoder/checkpoint \
 #     --mining.train_qa_file_path /path/to/input.json \
-#     --mining.train_file_output_path /path/to/output.json
+#     --mining.train_file_output_path /path/to/output.json \
+#     --mining.cache_embeddings_dir /shared/path/to/cache
 
 # Distributed environment settings
 dist_env:
@@ -33,6 +34,7 @@ dist_env:
 #   mining.model_name_or_path: Path to encoder checkpoint
 #   mining.train_qa_file_path: Input QA file
 #   mining.train_file_output_path: Output file with mined negatives
+#   mining.cache_embeddings_dir: Required for multi-rank torchrun; optional only for single-process mining
 
 mining:
   # Model path - REQUIRED (override via --mining.model_name_or_path)
@@ -63,12 +65,14 @@ mining:
   # train_qa_file_path: /path/to/input.json
   # train_file_output_path: /path/to/output.json
   
-  # Caching (optional)
+  # Caching (required for multi-rank torchrun; use a shared writable path for multi-node)
   # cache_embeddings_dir: /path/to/cache
   load_embeddings_from_cache: false
   
   # Mining parameters
   hard_negatives_to_mine: 20
+  # hard_neg_margin_type=perc removes candidates scoring above min_positive_score * hard_neg_margin.
+  # hard_neg_margin_type=abs removes candidates scoring above min_positive_score - hard_neg_margin.
   hard_neg_margin: 0.95
   hard_neg_margin_type: perc
   mining_batch_size: 128

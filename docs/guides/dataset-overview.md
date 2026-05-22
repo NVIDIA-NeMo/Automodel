@@ -251,17 +251,21 @@ For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_
   - Inline-text JSONL (e.g., `{"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}`)
 - Inline JSONL example:
 ```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
-  model_type: bi_encoder
-  data_dir_list:
-    - /abs/path/to/train.jsonl
-  data_type: train
-  n_passages: 5
-collate_fn:
-  _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
-  q_max_len: 512
-  p_max_len: 512
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset
+    model_type: bi_encoder
+    data_dir_list:
+      - /abs/path/to/train.jsonl
+    data_type: train
+    n_passages: 5
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+    q_max_len: 512
+    p_max_len: 512
+  batch_size: 2
+  shuffle: true
 ```
 See the detailed guide, [Retrieval dataset](llm/retrieval-dataset.md), for more information.
 
