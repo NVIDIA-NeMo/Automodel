@@ -62,27 +62,6 @@ dataset:
 ```
 See the detailed guide, [Column-Mapped Text Instruction Dataset](llm/column-mapped-text-instruction-dataset.md), for more information.
 
-- **ChatDataset (multi-turn conversations and tool calling)**
-  - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
-  - Use case: multi-turn conversations and tool calling in OpenAI chat format
-  - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
-  - Key args:
-    - `path_or_dataset_id`: path to local file(s) or HuggingFace dataset ID
-    - `tokenizer`: tokenizer instance (required. Must have chat template support)
-    - `split`: dataset split (e.g., "train", "validation")
-    - `name`: dataset configuration/subset name
-    - `seq_length`: maximum sequence length for padding/truncation
-    - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
-    - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
-    - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
-    - `chat_template`: optional override for tokenizer's chat template
-    - `skip_invalid_samples`: if ``true``, skip malformed JSONL lines when reading local files (warnings log skip counts); default ``false`` fails fast on a bad line
-  - Notes:
-    - Requires a tokenizer with chat template support
-    - Supports both single-turn and multi-turn tool calling
-    - Tool definitions are provided in a `tools` field at the conversation level
-    - Tool calls appear in assistant messages via `tool_calls` field
-    - Tool responses use the `tool` role
 ### ChatDataset (Multi-Turn Conversations and Tool Calling)
 - Class: `nemo_automodel.components.datasets.llm.ChatDataset`
 - Use case: multi-turn conversations and tool calling in OpenAI chat format
@@ -237,14 +216,15 @@ dataset:
 See the [Function Calling guide](llm/toolcalling.md) for an end-to-end example with FunctionGemma.
 For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](../../examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
 
-### Retrieval (Embedding Fine-Tuning)
+### Retrieval Fine-Tuning
 - Factory for corpus ID JSON and `hf://` AutoModel-schema sources:
   `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
 - Factory for inline JSONL:
   `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset`
 - Collators: `nemo_automodel.components.datasets.llm.BiEncoderCollator` or
   `nemo_automodel.components.datasets.llm.CrossEncoderCollator`
-- Use case: embedding model fine-tuning with (query, positive doc, negative docs) contrastive learning
+- Use case: bi-encoder embedding fine-tuning with contrastive query/passage groups, or cross-encoder reranking over
+  query/passage pairs
 - Supported retrieval sources:
   - Corpus-ID JSON (Merlin/NeMo-retriever style)
   - `hf://` sources that already follow the AutoModel retrieval schema

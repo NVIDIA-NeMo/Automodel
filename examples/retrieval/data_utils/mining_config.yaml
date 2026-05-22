@@ -22,7 +22,8 @@
 #     --mining.model_name_or_path /path/to/encoder/checkpoint \
 #     --mining.train_qa_file_path /path/to/input.json \
 #     --mining.train_file_output_path /path/to/output.json \
-#     --mining.cache_embeddings_dir /shared/path/to/cache
+#     --mining.cache_embeddings_dir /shared/path/to/cache/<run-specific-name> \
+#     --mining.add_eos_token false
 
 # Distributed environment settings
 dist_env:
@@ -34,7 +35,8 @@ dist_env:
 #   mining.model_name_or_path: Path to encoder checkpoint
 #   mining.train_qa_file_path: Input QA file
 #   mining.train_file_output_path: Output file with mined negatives
-#   mining.cache_embeddings_dir: Required for multi-rank torchrun; optional only for single-process mining
+#   mining.cache_embeddings_dir: Required for multi-rank torchrun; optional only for single-process mining.
+#                                Use a fresh path per model/dataset/prefix/length/world-size combination.
 
 mining:
   # Model path - REQUIRED (override via --mining.model_name_or_path)
@@ -43,20 +45,9 @@ mining:
   # Tokenizer path - defaults to model_name_or_path if not specified
   # tokenizer_name_or_path: /path/to/tokenizer
 
-  # Tokenizer special token behavior
-  # 
-  # DEFAULT (recommended for Automodel-trained models):
-  #   Leave commented out to use Automodel's tokenizer defaults.
-  #   This ensures mining stays synchronized with training behavior.
-  #
-  # OVERRIDE (for models trained in other frameworks):
-  #   Uncomment and set explicitly only when mining with models trained
-  #   outside Automodel that used specific tokenizer configurations.
-  #
-  # Examples:
-  #   - Automodel models: Leave commented (uses Automodel defaults)
-  #   - nvidia/llama-embed-nemotron-8b: add_bos_token: true, add_eos_token: false
-  #   - Custom external model: Check training config and set accordingly
+  # Tokenizer special token behavior. Match the tokenizer settings used during training.
+  # If left commented, mining falls back to tokenizer defaults, which may differ from
+  # the fine-tuning config.
   #
   # add_bos_token: true
   # add_eos_token: false
@@ -65,8 +56,9 @@ mining:
   # train_qa_file_path: /path/to/input.json
   # train_file_output_path: /path/to/output.json
   
-  # Caching (required for multi-rank torchrun; use a shared writable path for multi-node)
-  # cache_embeddings_dir: /path/to/cache
+  # Caching (required for multi-rank torchrun; use a shared writable path for multi-node).
+  # Use a fresh directory per model, dataset, prefix, sequence-length, and world-size combination.
+  # cache_embeddings_dir: /path/to/cache/<run-specific-name>
   load_embeddings_from_cache: false
   
   # Mining parameters
@@ -82,7 +74,8 @@ mining:
   document_embedding_batch_size: 16
   corpus_chunk_size: 50000
   
-  # Text prefixes (for models trained with prefixes)
+  # Text prefixes (for models trained with prefixes). Mining supports static prefixes only; if training used
+  # use_dataset_instruction, materialize equivalent instruction text into these prefixes or into the mining input.
   query_prefix: ""
   passage_prefix: ""
   
@@ -90,5 +83,6 @@ mining:
   query_max_length: 512
   passage_max_length: 512
   
-  # Whether to include negatives from the input file
+  # Whether to include negatives from the input file. Existing negatives are prepended to the mined output;
+  # deduplicate/audit the final file before training.
   use_negatives_from_file: false

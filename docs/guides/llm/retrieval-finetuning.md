@@ -129,7 +129,7 @@ To migrate inline data to corpus ID JSON, assign a stable document ID to each un
 a corpus split with `id` and `text` columns, then replace inline `pos_doc` and `neg_doc` strings with those IDs. Keep
 all known positives for each query in your qrels or source metadata, even if each training row uses only the first
 positive. Otherwise, in-batch negatives and mined hard negatives can accidentally treat another relevant passage as a
-negative.
+negative. The detailed source schemas and conversion rules live in [Retrieval Dataset](retrieval-dataset.md).
 
 For larger corpora, use the corpus ID-based JSON format from the dataset guide. Use
 `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and for `hf://` sources that
@@ -150,7 +150,9 @@ The training recipe does not load a separate qrels file. Materialize qrels into 
 For training, `pos_doc[0]` is the supervised positive. For mining, keep every known positive for the query in `pos_doc`
 so the miner can exclude those IDs; it does not read an external qrels file. If you expand multi-positive queries into
 one row per positive, make sure sibling positives are removed from `neg_doc` and audited out of mined negatives before
-training with in-batch negatives. Keep the original qrels for offline Recall@K, MRR@K, and nDCG@K evaluation.
+training. Also keep sibling-positive rows out of the same in-batch-negative training batch, disable distributed in-batch
+negatives, or add qrels-aware sampling/masking. Keep the original qrels for offline Recall@K, MRR@K, and nDCG@K
+evaluation.
 
 ## Minimal Config Anatomy
 
@@ -290,8 +292,9 @@ Important knobs:
   additional negatives. Enable it with `model.do_distributed_inbatch_negative: true` or the CLI override
   `--model.do_distributed_inbatch_negative true`. Today it all-gathers over the default process group, so use it only
   for pure DP/FSDP retrieval runs (`tp_size: 1`, `cp_size: 1`). Same-document masking requires `doc_id` fields from
-  corpus-backed or custom datasets; inline JSONL does not provide duplicate-document masking. Keep it disabled for
-  ColBERT-style pooling.
+  corpus-backed or custom datasets; inline JSONL does not provide duplicate-document masking. For multi-positive queries
+  expanded into separate rows, keep it disabled unless your sampler or masking prevents sibling positives from becoming
+  negatives. Keep it disabled for ColBERT-style pooling.
 
 The complete example is
 [`examples/retrieval/bi_encoder/llama3_2_1b.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
@@ -369,8 +372,10 @@ torchrun \
 ```
 
 Use a shared or pre-populated Hugging Face cache on every node, make dataset paths visible to every rank, and use a
-unique `checkpoint_dir` for each experiment. Increase `dist_env.timeout_minutes` for first model downloads, slow shared
-filesystems, multi-node collectives, or large checkpoint writes.
+unique `checkpoint_dir` for each experiment. For multi-node training, `checkpoint_dir` must be on a shared, persistent
+filesystem mounted at the same path from every node; relative `./output/...` paths are appropriate only when they resolve
+to shared storage. Increase `dist_env.timeout_minutes` for first model downloads, slow shared filesystems, multi-node
+collectives, or large checkpoint writes.
 
 The step scheduler computes gradient accumulation from:
 
@@ -503,7 +508,8 @@ torchrun --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py
   --mining.query_prefix "query: " \
   --mining.passage_prefix "passage: " \
   --mining.query_max_length 512 \
-  --mining.passage_max_length 512
+  --mining.passage_max_length 512 \
+  --mining.add_eos_token false
 ```
 
 Hard-negative mining expects the corpus ID-based retrieval JSON format described in the dataset guide, not the inline
@@ -518,14 +524,20 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   `min_positive_score - hard_neg_margin` are removed. Inspect mined samples when positive scores are low or negative.
 - `query_prefix` and `passage_prefix`: keep these semantically consistent with the bi-encoder training config. The
   miner concatenates prefixes directly, while `BiEncoderCollator` inserts a space after non-empty prefixes; include the
-  trailing space in mining prefixes.
+  trailing space in mining prefixes. The miner supports static prefixes only. If training used
+  `use_dataset_instruction: true`, materialize the same instruction text into the mining input or equivalent static
+  prefixes before mining.
 - `query_max_length` and `passage_max_length`: keep these consistent with training unless you intentionally change
   truncation.
-- `use_negatives_from_file`: include existing negatives from the input file when mining.
+- `add_bos_token` and `add_eos_token`: match the tokenizer behavior used during training. If omitted, mining falls back
+  to tokenizer defaults, which can differ from the training config.
+- `use_negatives_from_file`: include existing negatives from the input file when mining. Existing negatives are prepended
+  to the output and mined negatives are appended, so deduplicate and audit the output before using it for training.
 - `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
-  rank `0` unable to read remote-rank shards.
+  rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
+  length, and world-size combination; stale cache files can be reused if they are already present.
 
 Use the mined output as the next `data_dir_list` source for another bi-encoder pass or for cross-encoder training. Hard
 negative mining excludes document IDs listed in each input row's `pos_doc`, but it cannot read an external qrels file or
@@ -557,7 +569,7 @@ number.
 With `save_consolidated: true`, AutoModel also writes a Hugging Face-compatible model under:
 
 ```text
-./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_500/model/consolidated/
+./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated/
 ```
 
 The `LATEST` symlink points to the most recent checkpoint. To resume from the latest compatible checkpoint, set:

@@ -26,8 +26,10 @@ query-passage pair for reranking.
 
 Training uses exactly one positive passage per example: the first item in `pos_doc`. For datasets with multiple
 relevant passages, either choose a canonical positive, expand the record into one example per positive, or add a
-multi-positive loss/masking strategy before training. Keep the full set of known positives in your qrels or corpus
-metadata for evaluation and false-negative filtering, even when each training row uses one positive.
+multi-positive loss/masking strategy before training. If expanded rows for the same query can share a batch, keep
+distributed in-batch negatives disabled unless you also prevent sibling positives from becoming negatives through
+qrels-aware sampling or masking. Keep the full set of known positives in your qrels or corpus metadata for evaluation
+and false-negative filtering, even when each training row uses one positive.
 
 ## Supported Input Formats
 
@@ -53,7 +55,9 @@ records before training:
    multiple records if you want every positive to become a supervised positive.
 4. For hard-negative mining, include all known positive document IDs for that query in the row's `pos_doc`. The miner
    excludes only IDs present in the input row, not an external qrels file.
-5. Preserve the complete qrels separately for full-corpus evaluation and audit mined negatives against them before
+5. If you expand one query into multiple positive rows, keep those sibling-positive rows out of the same in-batch-negative
+   training batch or use qrels-aware masking.
+6. Preserve the complete qrels separately for full-corpus evaluation and audit mined negatives against them before
    reusing the output for training.
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
@@ -108,7 +112,9 @@ The `corpus_id` in `merlin_metadata.json` must match the `corpus_id` in each tra
 - `pos_doc` and `neg_doc` can be lists of `{"id": ...}` dicts or raw IDs (they are normalized internally).
 - Training uses `pos_doc[0]` as the positive. Additional positives are ignored unless you expand the data before
   training.
-- If you set `use_dataset_instruction: true`, optional fields like `query_instruction` and `passage_instruction` in `merlin_metadata.json` are surfaced to the collator.
+- To train with corpus instructions, set `use_dataset_instruction: true` on both the dataset and the bi-encoder
+  collator. The dataset surfaces `query_instruction` and `passage_instruction` from `merlin_metadata.json`; the collator
+  prepends them before tokenization.
 :::
 
 ### Hugging Face `hf://` Sources
@@ -174,6 +180,7 @@ dataloader:
     p_max_len: 512
     query_prefix: "query:"
     passage_prefix: "passage:"
+    use_dataset_instruction: false
     pad_to_multiple_of: 8
 ```
 
