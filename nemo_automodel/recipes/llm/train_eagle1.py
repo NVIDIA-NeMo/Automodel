@@ -325,9 +325,6 @@ class TrainEagle1Recipe(BaseRecipe):
             os.path.join(path, "eagle_meta.pt"),
         )
 
-    def _update_latest_symlink(self, path: str) -> None:
-        self._update_checkpoint_symlink("LATEST", path)
-
     def load_checkpoint(self, restore_from: str | None = None) -> None:
         """Resolve and restore a checkpoint produced by ``save_checkpoint``.
 
