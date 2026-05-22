@@ -103,12 +103,15 @@ Supported model families and effective retrieval kwargs:
 | Model `config.model_type` | Bi-encoder behavior | Cross-encoder behavior | Effective retrieval kwargs |
 |---------------------------|---------------------|------------------------|----------------------------|
 | `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
-| `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Not supported by the custom retrieval registry today; use a different cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
+| `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today; use a different direct cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
 | Any other Hugging Face model type | Falls back to `AutoModel` | Falls back to `AutoModelForSequenceClassification` only when the model type is not listed above | Bi-encoder fallback receives standard Hugging Face `from_pretrained` kwargs; `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards `num_labels`; do not assume custom `pooling` or `temperature` are accepted unless that HF class documents them. |
 
 Known model types with a registry entry fail fast when the requested retrieval task is unsupported rather than falling
-back silently. For example, `ministral3` is supported for bi-encoder embeddings but not for the cross-encoder scoring
-recipe.
+back silently. For example, direct `ministral3` loading is supported for bi-encoder embeddings but not for the
+cross-encoder scoring recipe. If you are extracting a text tower from a parent checkpoint, set
+`model.extract_submodel: language_model`; extracted text backbones use the extraction path, where supported extracted
+types use registered retrieval classes and unsupported extracted types can fall back to Hugging Face sequence
+classification for cross-encoder scoring.
 
 ## Prepare Data
 
@@ -319,7 +322,7 @@ Important knobs:
   negatives. Keep it disabled for ColBERT-style pooling.
 
 The complete example is
-[`examples/retrieval/bi_encoder/llama3_2_1b.yaml`](../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml).
+{download}`examples/retrieval/bi_encoder/llama3_2_1b.yaml <../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml>`.
 
 ## Configure a Cross-Encoder
 
@@ -372,7 +375,7 @@ Important knobs:
   to index `0`.
 
 The complete example is
-[`examples/retrieval/cross_encoder/llama3_2_1b.yaml`](../../../examples/retrieval/cross_encoder/llama3_2_1b.yaml).
+{download}`examples/retrieval/cross_encoder/llama3_2_1b.yaml <../../../examples/retrieval/cross_encoder/llama3_2_1b.yaml>`.
 
 ## Distributed Launch and Batch Size
 
@@ -526,7 +529,7 @@ example uses `--standalone`:
 ```bash
 uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
-  --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
+  --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
   --mining.train_qa_file_path /path/to/input.json \
   --mining.train_file_output_path /path/to/output.json \
   --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
@@ -548,14 +551,20 @@ uv run torchrun \
   --rdzv-endpoint ${MASTER_ADDR}:${MASTER_PORT} \
   examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
-  --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated \
+  --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
   --mining.train_qa_file_path /path/to/input.json \
   --mining.train_file_output_path /path/to/output.json \
   --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
   --mining.query_prefix "query: " \
   --mining.passage_prefix "passage: " \
+  --mining.query_max_length 512 \
+  --mining.passage_max_length 512 \
   --mining.add_eos_token false
 ```
+
+Replace `epoch_0_step_499` with the explicit checkpoint directory that you want to mine from. If you only have
+`LATEST.txt`, read it first and substitute the resolved `epoch_*_step_*` directory; the mining script loads the
+Hugging Face export directly and does not apply AutoModel's checkpoint resolver.
 
 Hard-negative mining expects the corpus ID-based retrieval JSON format described in the dataset guide, not the inline
 JSONL shortcut. The input must reference one corpus so the miner can build a passage embedding cache, retrieve
@@ -575,6 +584,9 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   prefixes before mining.
 - `query_max_length` and `passage_max_length`: keep these consistent with training unless you intentionally change
   truncation.
+- `pooling` and `l2_normalize`: the mining script currently loads `NeMoAutoModelBiEncoder.from_pretrained()` with the
+  wrapper defaults (`pooling: avg`, `l2_normalize: true`). Mine with checkpoints trained using those defaults, or use a
+  custom mining entry point that passes the same wrapper settings used during training.
 - `add_bos_token` and `add_eos_token`: match the tokenizer behavior used during training. If omitted, mining falls back
   to tokenizer defaults, which can differ from the training config.
 - `use_negatives_from_file`: include existing negatives from the input file when mining. Existing negatives are prepended
@@ -617,8 +629,13 @@ number.
 With `save_consolidated: true` and full fine-tuning, AutoModel also writes a Hugging Face-compatible model under:
 
 ```text
-./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated/
+./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated/
 ```
+
+Use the concrete `epoch_*_step_*` directory printed in your logs. Some workflows also create a `LATEST` symlink, but
+direct Hugging Face and mining loads expect a real exported model path. If your run produced `LATEST.txt` instead of a
+symlink, read that file and substitute the resolved checkpoint directory before calling `from_pretrained()` or
+`mine_hard_negatives.py`.
 
 PEFT/LoRA runs save adapter artifacts under the checkpoint `model/` directory instead of the full consolidated export
 path above. Resume LoRA training from the AutoModel checkpoint directory, but use full fine-tuning when you need the
@@ -658,13 +675,15 @@ import torch
 
 from nemo_automodel import NeMoAutoModelBiEncoder, NeMoAutoTokenizer
 
-model_path = "./output/llama3_2_1b_encoder/checkpoints/LATEST/model/consolidated"
+model_path = "./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated"
 tokenizer = NeMoAutoTokenizer.from_pretrained(model_path, add_eos_token=False)
 model = NeMoAutoModelBiEncoder.from_pretrained(model_path, use_liger_kernel=False).eval()
 device = next(model.parameters()).device
 
 texts = ["query: what does nvlink do?", "passage: NVLink is a high-bandwidth GPU interconnect."]
-tokens = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
+tokenized = tokenizer(texts, padding=False, truncation=True, max_length=512, return_token_type_ids=False)
+tokenized = [{key: tokenized[key][idx] for key in tokenized.keys()} for idx in range(len(texts))]
+tokens = tokenizer.pad(tokenized, padding="longest", return_tensors="pt")
 tokens = {key: value.to(device) for key, value in tokens.items()}
 with torch.no_grad():
     embeddings = model.encode(tokens)
@@ -681,16 +700,19 @@ import torch
 
 from nemo_automodel import NeMoAutoModelCrossEncoder, NeMoAutoTokenizer
 
-model_path = "./output/llama3_2_1b_cross_encoder/checkpoints/LATEST/model/consolidated"
+model_path = "./output/llama3_2_1b_cross_encoder/checkpoints/epoch_0_step_499/model/consolidated"
 tokenizer = NeMoAutoTokenizer.from_pretrained(model_path, add_eos_token=False)
 model = NeMoAutoModelCrossEncoder.from_pretrained(model_path, use_liger_kernel=False).eval()
 device = next(model.parameters()).device
 
+prompt_template = "question:{query} \n \n passage:{passage}"
 pairs = [
-    "question: what does nvlink do?\n\npassage: NVLink is a high-bandwidth GPU interconnect.",
-    "question: what does nvlink do?\n\npassage: Dropout regularizes neural networks.",
+    prompt_template.format(query="what does nvlink do?", passage="NVLink is a high-bandwidth GPU interconnect."),
+    prompt_template.format(query="what does nvlink do?", passage="Dropout regularizes neural networks."),
 ]
-tokens = tokenizer(pairs, padding=True, truncation=True, max_length=512, return_tensors="pt")
+tokenized = tokenizer(pairs, padding=False, truncation=True, max_length=512, return_token_type_ids=False)
+tokenized = [{key: tokenized[key][idx] for key in tokenized.keys()} for idx in range(len(pairs))]
+tokens = tokenizer.pad(tokenized, padding="longest", return_tensors="pt")
 tokens = {key: value.to(device) for key, value in tokens.items()}
 with torch.no_grad():
     logits = model(tokens).logits.squeeze(-1)
@@ -719,8 +741,10 @@ versions without calibration.
 
 ## Related Files
 
-- Bi-encoder recipe: [`nemo_automodel/recipes/retrieval/train_bi_encoder.py`](../../../nemo_automodel/recipes/retrieval/train_bi_encoder.py)
-- Cross-encoder recipe: [`nemo_automodel/recipes/retrieval/train_cross_encoder.py`](../../../nemo_automodel/recipes/retrieval/train_cross_encoder.py)
+- Bi-encoder recipe:
+  {download}`nemo_automodel/recipes/retrieval/train_bi_encoder.py <../../../nemo_automodel/recipes/retrieval/train_bi_encoder.py>`
+- Cross-encoder recipe:
+  {download}`nemo_automodel/recipes/retrieval/train_cross_encoder.py <../../../nemo_automodel/recipes/retrieval/train_cross_encoder.py>`
 - Retrieval dataset guide: [Retrieval Dataset](retrieval-dataset.md)
 - Llama-Embed-Nemotron-8B example:
-  [`examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml`](../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)
+  {download}`examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml <../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml>`

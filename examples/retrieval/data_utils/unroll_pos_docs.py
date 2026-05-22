@@ -39,8 +39,8 @@ Input Format:
 
 Output:
     Same format, but each record starts with a different supervised positive:
-    {"question_id": "q0_0", "question": "...", "pos_doc": [{"id": "d1"}, {"id": "d2"}]}
-    {"question_id": "q0_1", "question": "...", "pos_doc": [{"id": "d2"}, {"id": "d1"}]}
+    {"question_id": "q0_0", "original_question_id": "q0", "pos_doc": [{"id": "d1"}, {"id": "d2"}]}
+    {"question_id": "q0_1", "original_question_id": "q0", "pos_doc": [{"id": "d2"}, {"id": "d1"}]}
 
 Usage:
     uv run python examples/retrieval/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json
@@ -58,11 +58,12 @@ from pathlib import Path
 from typing import Any
 
 
-def _doc_id(doc: Any) -> Any:
+def _doc_id(doc: Any) -> str:
     """Return a document ID from either a raw ID or a {"id": ...} mapping."""
-    if isinstance(doc, dict):
-        return doc.get("id")
-    return doc
+    raw_id = doc.get("id") if isinstance(doc, dict) else doc
+    if raw_id is None:
+        raise ValueError(f"Document entry is missing an id: {doc!r}")
+    return str(raw_id)
 
 
 def _drop_known_positives_from_negatives(neg_docs: list[Any], pos_docs: list[Any]) -> list[Any]:
@@ -103,6 +104,7 @@ def unroll_training_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ordered_pos_docs = [pos_doc] + [other_pos_doc for j, other_pos_doc in enumerate(pos_docs) if j != idx]
                 new_record = {
                     "question_id": f"{base_question_id}_{idx}",
+                    "original_question_id": record.get("original_question_id", base_question_id),
                     "question": record["question"],
                     "corpus_id": record["corpus_id"],
                     "pos_doc": ordered_pos_docs,
@@ -115,7 +117,7 @@ def unroll_training_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unroll training data with multiple positive docs into single-pos-doc records"
+        description="Unroll training data so each sibling positive is supervised first while preserving all positives"
     )
     parser.add_argument("input_file", type=str, help="Path to input training JSON file")
     parser.add_argument(
