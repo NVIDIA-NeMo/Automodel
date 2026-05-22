@@ -294,7 +294,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_31b_cord_v2/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: false # Turn on for inline HF export during every checkpoint save.
 
 distributed:
   strategy: fsdp2
@@ -405,11 +405,19 @@ vlm_checkpoints/gemma4_31b_cord_v2/
 
 ## Step 5 — Evaluate the Fine-Tuned Model
 
-### Load consolidated checkpoint with HF AutoModelForMultimodalLM
+### Export and Load a Consolidated Checkpoint with HF AutoModelForMultimodalLM
 
-Because we set `save_consolidated: true` in the config, each checkpoint contains
-an HF-compatible `model/consolidated/` directory. Use HF's `AutoModelForMultimodalLM`
-for inference (generation), and load the processor from the **base model** path.
+Because the config uses `save_consolidated: false`, each checkpoint stores sharded
+safetensors plus a generated helper. Run the helper for the checkpoint you want
+to evaluate:
+
+```bash
+bash vlm_checkpoints/gemma4_31b_cord_v2/<checkpoint>/model/consolidate.sh
+```
+
+The helper writes an HF-compatible `model/consolidated/` directory. Use HF's
+`AutoModelForMultimodalLM` for inference (generation), and load the processor
+from the **base model** path.
 
 ```python
 import json

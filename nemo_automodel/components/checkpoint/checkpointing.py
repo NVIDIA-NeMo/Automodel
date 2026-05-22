@@ -964,9 +964,14 @@ class Checkpointer:
 set -euo pipefail
 
 # Offline HF safetensors consolidation helper.
-# Defaults are conservative for login nodes and small CPU machines. On a CPU
-# compute node, increase parallelism, for example:
+# Defaults are conservative for login nodes and small CPU machines. For large
+# checkpoints, run this on a CPU compute node and increase parallelism. Work is
+# split across NPROC_PER_NODE worker processes, and each process uses NUM_THREADS
+# writer threads; keep NPROC_PER_NODE * NUM_THREADS within your CPU allocation.
+# Example for an 80-core CPU node:
 #   NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"
+# Slurm example:
+#   sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/consolidate.sh'
 NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
 NUM_THREADS="${{NUM_THREADS:-5}}"
 PYTHON="${{PYTHON:-python3}}"

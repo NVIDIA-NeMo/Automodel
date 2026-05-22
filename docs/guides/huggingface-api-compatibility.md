@@ -221,9 +221,9 @@ tok = NeMoAutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")</code></pre
 
 ## Checkpoints: Save in NeMo AutoModel, Load Everywhere
 
-NeMo AutoModel training recipes write checkpoints in Hugging Face-compatible layouts, including consolidated safetensors that you can load directly with Transformers:
+NeMo AutoModel training recipes write checkpoints as sharded safetensors by default and generate a per-checkpoint helper that can export Hugging Face-compatible consolidated safetensors after training:
 
 - See [checkpointing](checkpointing.md) for checkpoint formats and example directory layouts.
 - See [model coverage](../model-coverage/overview.md) for notes on how model support depends on the pinned Transformers version.
 
-If your goal is: **train/fine-tune in NeMo AutoModel → deploy in the HF ecosystem**, the recommended workflow is to enable consolidated safetensors checkpoints and then load them with the standard HF APIs or downstream inference engines.
+If your goal is: **train/fine-tune in NeMo AutoModel → deploy in the HF ecosystem**, the recommended workflow is to keep `model_save_format: safetensors` and `save_consolidated: false` during training, run `bash <checkpoint>/model/consolidate.sh` after training, and then load `model/consolidated/` with the standard HF APIs or downstream inference engines. Set `save_consolidated: true` only when you intentionally want inline HF export at every checkpoint save.

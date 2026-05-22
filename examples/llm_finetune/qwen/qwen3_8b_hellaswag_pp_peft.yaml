@@ -52,7 +52,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/qwen3_8b_pp_peft/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2

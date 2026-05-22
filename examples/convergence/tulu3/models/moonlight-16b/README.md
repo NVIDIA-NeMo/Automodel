@@ -55,7 +55,9 @@ torchrun --nproc-per-node 8 --tee 3 examples/llm_finetune/finetune.py \
 ## Eval
 
 ```bash
-CKPT="$(readlink -f checkpoints_convergence/moonlight_16b_flashoptim/LATEST)/model/consolidated"
+CKPT_ROOT="$(readlink -f checkpoints_convergence/moonlight_16b_flashoptim/LATEST)"
+bash "$CKPT_ROOT/model/consolidate.sh"
+CKPT="$CKPT_ROOT/model/consolidated"
 
 bash examples/convergence/tulu3/eval/run_eval.sh \
     --model-path "$CKPT" \

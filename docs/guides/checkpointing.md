@@ -26,10 +26,11 @@ Changing between output formats can be done seamlessly through the recipe's `yam
 checkpoint:
     ...
     model_save_format: safetensors # Format for saving (torch_save or safetensors)
-    save_consolidated: false # Set to true if you want inline consolidated checkpoints.
+    save_consolidated: false # Turn on for inline HF export during every checkpoint save.
+                             # Recommended: keep false and run <checkpoint>/model/consolidate.sh after training.
     ...
 ```
-> **Note:** For Hugging Face serving compatibility, run the generated consolidation helper after training or set `save_consolidated: true` to export consolidated checkpoints inline.
+> **Note:** Hugging Face export, both inline and offline, requires `model_save_format: safetensors`. For serving compatibility, run the generated consolidation helper after training or set `save_consolidated: true` to export consolidated checkpoints inline.
 
 ::: {note}
 The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
@@ -61,7 +62,7 @@ The following command runs the LLM fine-tuning recipe on two GPUs and saves the 
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format safetensors \
-    --checkpoint.save_consolidated True
+    --checkpoint.save_consolidated False
 ```
 
 ::: {note}
@@ -74,7 +75,7 @@ If you're running on a single GPU, you can run:
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format safetensors \
-    --checkpoint.save_consolidated True
+    --checkpoint.save_consolidated False
 ```
 
 After running for a few seconds, the standard output should be:
@@ -91,14 +92,7 @@ checkpoints/
 ├── LOWEST_VAL -> epoch_0_step_20
 └── epoch_0_step_20
    ├── model
-   │   ├── consolidated
-   │   │   ├── config.json
-   │   │   ├── generation_config.json
-   │   │   ├── model-00001-of-00001.safetensors
-   │   │   ├── model.safetensors.index.json
-   │   │   ├── special_tokens_map.json
-   │   │   ├── tokenizer.json
-   │   │   └── tokenizer_config.json
+   │   ├── consolidate.sh
    │   ├── shard-00001-model-00001-of-00001.safetensors
    │   └── shard-00002-model-00001-of-00001.safetensors
    └── optim
@@ -109,7 +103,25 @@ checkpoints/
 
 The `epoch_0_step_20/` directory stores the full training state from step `20` of the first epoch, including both the model and optimizer states.
 
-We can load and run the consolidated checkpoint using the Hugging Face Transformers API directly:
+Run the generated helper after training to export a Hugging Face-compatible checkpoint:
+
+```bash
+bash checkpoints/epoch_0_step_20/model/consolidate.sh
+```
+
+The helper defaults to one CPU worker process with five writer threads so it is safe on small machines. For large checkpoints, run it on a CPU compute node and increase parallelism:
+
+```bash
+NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolidate.sh
+```
+
+`NPROC_PER_NODE` controls worker processes, and `NUM_THREADS` controls writer threads per process. Keep `NPROC_PER_NODE * NUM_THREADS` within your CPU allocation. You can also submit the helper to a CPU Slurm partition, for example:
+
+```bash
+sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/checkpoints/epoch_0_step_20/model/consolidate.sh'
+```
+
+The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
 import torch
 from transformers import pipeline
@@ -133,8 +145,10 @@ Although this example uses the Hugging Face Transformers API, the `consolidated/
 ## PEFT
 When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
 
-### Why Consolidated Checkpoints?
-Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo Automodel automatically saves a single, consolidated Hugging Face–compatible checkpoint when using PEFT. This makes it:
+PEFT checkpoints save adapter files directly under `model/` and do not generate or need `model/consolidate.sh`.
+
+### Why Consolidated Adapter Checkpoints?
+Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo Automodel automatically saves a compact Hugging Face-compatible adapter checkpoint when using PEFT. This makes it:
 
 - easier to manage and share (just the adapters),
 - compatible with Hugging Face Transformers out of the box,
@@ -147,7 +161,7 @@ To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
-After training, you'll get a compact, consolidated Safetensors checkpoint that can be loaded directly with Hugging Face tools:
+After training, you'll get a compact Safetensors adapter checkpoint that can be loaded directly with Hugging Face tools:
 
 ```
 checkpoints/

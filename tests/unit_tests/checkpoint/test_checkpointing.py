@@ -1138,6 +1138,8 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert 'PYTHON_MODULE="${PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}"' in script
         assert "CONSOLIDATION_TOOL" not in script
         assert 'NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"' in script
+        assert "NPROC_PER_NODE * NUM_THREADS within your CPU allocation" in script
+        assert "sbatch --cpus-per-task=80" in script
         assert '-m "${PYTHON_MODULE}" \\' in script
         assert "--backend gloo \\" in script
         assert '--model-name "test/model" \\' in script

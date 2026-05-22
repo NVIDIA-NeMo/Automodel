@@ -60,7 +60,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/ling_mini_2_0_lora
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2

@@ -78,7 +78,7 @@ Start from an existing config (e.g., `models/qwen3-4b/qwen3_4b_cp1_flashoptim.ya
 
 **Consider changing:**
 - `dataset.seq_length` — based on truncation analysis
-- `step_scheduler.local_batch_size` — based on GPU memory. Use 2 for TE FusedAdam (FP32 master weights need more memory for checkpoint consolidation)
+- `step_scheduler.local_batch_size` — based on GPU memory. Use 2 for TE FusedAdam because FP32 master weights need more memory.
 - `distributed.cp_size` / `ep_size` — based on model size and architecture
 - `optimizer.lr` — 1e-5 is a good starting point
 
@@ -135,14 +135,16 @@ torchrun --nproc-per-node 8 --tee 3 \
 
 Monitor: loss should decrease from ~0.8 to ~0.5-0.6 over 1000 steps. Watch for NaN/Inf in loss or grad_norm.
 
-**Important:** Use absolute paths for `--checkpoint.checkpoint_dir`. If using TE FusedAdam, set `local_batch_size: 2` to leave memory headroom for checkpoint consolidation.
+**Important:** Use absolute paths for `--checkpoint.checkpoint_dir`. If using TE FusedAdam, set `local_batch_size: 2` to leave memory headroom for optimizer state.
 
 ## 9. Evaluate
 
 Run IFEval with thinking off and on:
 
 ```bash
-CKPT="$(readlink -f checkpoints/<run>/LATEST)/model/consolidated"
+CKPT_ROOT="$(readlink -f checkpoints/<run>/LATEST)"
+bash "$CKPT_ROOT/model/consolidate.sh"
+CKPT="$CKPT_ROOT/model/consolidated"
 
 bash eval/run_eval.sh \
     --model-path "$CKPT" \

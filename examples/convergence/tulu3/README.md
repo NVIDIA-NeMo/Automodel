@@ -94,15 +94,18 @@ We evaluate with `enable_thinking=False` by default since Tulu-3 doesn't train t
 # One-time setup
 bash eval/setup_lm_eval.sh
 
+CKPT="$(readlink -f checkpoints/LATEST)"
+bash "$CKPT/model/consolidate.sh"
+
 # Run evaluation (non-thinking, default)
 bash eval/run_eval.sh \
-    --model-path checkpoints/LATEST/model/consolidated \
+    --model-path "$CKPT/model/consolidated" \
     --tokenizer Qwen/Qwen3-30B-A3B \
     --tasks ifeval
 
 # Optional: compare thinking-mode performance against base model
 bash eval/run_eval.sh \
-    --model-path checkpoints/LATEST/model/consolidated \
+    --model-path "$CKPT/model/consolidated" \
     --tokenizer Qwen/Qwen3-30B-A3B \
     --tasks ifeval \
     --thinking

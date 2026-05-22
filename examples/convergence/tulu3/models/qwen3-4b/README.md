@@ -24,7 +24,7 @@ python data/prefilter_dataset.py \
 
 Then pass the cached path via `--dataset.path_or_dataset_id <cached_dir>`.
 
-> **Note**: TE FusedAdam requires `local_batch_size: 2` (not 8) to avoid NCCL errors during checkpoint consolidation. The larger optimizer state (FP32 master weights + remainders) exhausts GPU memory headroom needed by the NCCL gather.
+> **Note**: TE FusedAdam requires `local_batch_size: 2` (not 8). The larger optimizer state (FP32 master weights + remainders) needs additional GPU memory headroom during training.
 
 ## Results (rebased on main)
 

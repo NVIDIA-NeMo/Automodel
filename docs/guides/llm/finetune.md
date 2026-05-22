@@ -326,7 +326,7 @@ Each log line reports the current loss, gradient norm, peak GPU memory, and toke
 
 ### Checkpoint Contents
 
-Checkpoints are saved in native Hugging Face format, so no conversion is required — they work directly with Transformers, PEFT, vLLM, lm-eval-harness, and other tools in the Hugging Face ecosystem. SFT and PEFT produce different checkpoint layouts. **SFT checkpoints** contain the full model weights at `model/consolidated/` — a single, self-contained Hugging Face model directory created by gathering distributed shards into one location — and can be loaded directly. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs) — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
+Checkpoints are saved as Hugging Face-compatible safetensors. By default, SFT writes sharded model weights plus a generated `model/consolidate.sh` helper; run the helper after training to create `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. You can also set `save_consolidated: true` when you intentionally want inline HF export at every checkpoint save. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs), save those adapter files directly under `model/`, and do not use `model/consolidate.sh` — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
 
 :::{dropdown} Checkpoint directory structure
 **SFT checkpoint:**
@@ -336,14 +336,7 @@ checkpoints/epoch_0_step_10/
 ├── config.yaml
 ├── dataloader.pt
 ├── model
-│   ├── consolidated
-│   │   ├── config.json
-│   │   ├── model-00001-of-00001.safetensors
-│   │   ├── model.safetensors.index.json
-│   │   ├── special_tokens_map.json
-│   │   ├── tokenizer.json
-│   │   ├── tokenizer_config.json
-│   │   └── generation_config.json
+│   ├── consolidate.sh
 │   ├── shard-00001-model-00001-of-00001.safetensors
 │   └── shard-00002-model-00001-of-00001.safetensors
 ├── optim
@@ -352,7 +345,7 @@ checkpoints/epoch_0_step_10/
 ├── rng.pt
 └── step_scheduler.pt
 
-4 directories, 11 files
+3 directories, 9 files
 ```
 
 **PEFT checkpoint:**
@@ -377,11 +370,17 @@ checkpoints/epoch_0_step_10/
 
 ## Run Inference
 
-Inference uses the Hugging Face `generate` API. Because SFT checkpoints are self-contained while PEFT checkpoints store only adapter weights (see [Checkpoint Contents](#checkpoint-contents)), the loading procedure differs between the two modes.
+Inference uses the Hugging Face `generate` API. Because exported SFT checkpoints are self-contained while PEFT checkpoints store only adapter weights (see [Checkpoint Contents](#checkpoint-contents)), the loading procedure differs between the two modes.
 
 ### SFT Inference
 
-The SFT checkpoint at `model/consolidated/` is a complete Hugging Face model and can be loaded directly:
+If `save_consolidated: false`, first run the generated helper for the checkpoint you want to load:
+
+```bash
+bash checkpoints/epoch_0_step_10/model/consolidate.sh
+```
+
+The exported SFT checkpoint at `model/consolidated/` is a complete Hugging Face model and can be loaded directly:
 
 ```python
 import torch
@@ -453,7 +452,7 @@ A decreasing validation loss across checkpoints indicates the model is learning.
 
 ### After Training: lm-eval-harness
 
-For task-specific benchmarks (e.g., MMLU, GSM8k, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint:
+For task-specific benchmarks (e.g., MMLU, GSM8k, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint. For SFT runs with `save_consolidated: false`, run `bash checkpoints/epoch_0_step_20/model/consolidate.sh` before pointing evaluation at `model/consolidated/`:
 
 ```bash
 pip install lm-eval
@@ -481,7 +480,7 @@ Run lm-eval-harness on the base model *before* fine-tuning to establish a baseli
 
 ## Publish to the Hugging Face Hub
 
-Fine-tuned checkpoints and PEFT adapters are stored in Hugging Face-native format and can be uploaded directly to the Hub.
+Fine-tuned checkpoints and PEFT adapters are stored in Hugging Face-native format and can be uploaded directly to the Hub. For SFT runs with `save_consolidated: false`, upload `model/consolidated/` after running the generated consolidation helper.
 
 1. Install the Hugging Face Hub library (if not already installed):
 
@@ -548,6 +547,8 @@ Make sure vLLM is installed (`pip install vllm`, or use an environment that incl
 :::
 
 ### SFT Checkpoint with vLLM
+
+If `save_consolidated: false`, run the generated `model/consolidate.sh` helper before serving from `model/consolidated/`.
 
 ```python
 from vllm import LLM, SamplingParams
@@ -696,9 +697,9 @@ checkpoint:
                                 # to persist checkpoints across container restarts.
   model_save_format: safetensors  # "safetensors" (recommended, faster and safer) or
                                   # "torch_save" (legacy pickle-based format)
-  save_consolidated: True  # when true, writes a single HuggingFace-compatible checkpoint
-                           # to model/consolidated/ that can be loaded directly by
-                           # Transformers, vLLM, etc. Requires safetensors format.
+  save_consolidated: False # turn on for inline HF export during every checkpoint save.
+                           # Recommended: keep false and run
+                           # <checkpoint>/model/consolidate.sh after training.
 
 # Training Dataset
 # _target_ → make_squad_dataset: a factory function that downloads the SQuAD
