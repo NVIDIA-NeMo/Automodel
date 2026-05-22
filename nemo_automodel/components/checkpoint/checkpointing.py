@@ -14,6 +14,7 @@
 
 import gc
 import glob
+import json
 import logging
 import os
 import time
@@ -157,6 +158,23 @@ def _estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | Non
     return total
 
 
+def _get_safetensors_index_total_size(index_path: str | None) -> int | None:
+    """Return the total checkpoint size recorded in a HuggingFace safetensors index."""
+    if index_path is None:
+        return None
+    index_file = Path(index_path)
+    if index_file.is_dir():
+        index_file = index_file / "model.safetensors.index.json"
+    try:
+        with open(index_file) as f:
+            index = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    total_size = index.get("metadata", {}).get("total_size")
+    return total_size if isinstance(total_size, int) else None
+
+
 def _estimate_tensor_bytes(tensor: torch.Tensor) -> int:
     """Estimate logical bytes in a tensor without materializing it."""
     return int(tensor.numel()) * int(tensor.element_size())
@@ -165,6 +183,11 @@ def _estimate_tensor_bytes(tensor: torch.Tensor) -> int:
 def _format_bytes(num_bytes: int) -> str:
     """Format bytes as a human-readable GiB value."""
     return f"{num_bytes / 1024**3:.1f} GiB"
+
+
+def _format_output_file_count(count: int) -> str:
+    """Format the output shard count for user-facing log messages."""
+    return f"{count} output {'file' if count == 1 else 'files'}"
 
 
 if _is_geq_torch_2_9():
@@ -930,23 +953,48 @@ class Checkpointer:
         fqn_to_index_mapping: Optional[dict[str, int]],
     ) -> None:
         """Warn when inline consolidated export is large enough to waste GPU allocation time."""
-        if not self._should_write_consolidated_safetensors() or not _is_rank_0():
+        if not self._should_write_consolidated_safetensors():
             return
-        estimated_bytes = _estimate_state_dict_bytes(state_dict)
+        estimated_bytes = self._get_original_hf_index_total_size()
+        is_hf_index_estimate = estimated_bytes is not None
+        if estimated_bytes is None:
+            estimated_bytes = _estimate_state_dict_bytes(state_dict)
+        if not _is_rank_0():
+            return
         if estimated_bytes is None or estimated_bytes < _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES:
             return
         world_size = _get_world_size_safe()
         output_file_count = len(set(fqn_to_index_mapping.values())) if fqn_to_index_mapping else 1
-        logger.warning(
-            "checkpoint.save_consolidated=True is exporting approximately %s of HF safetensors inside the "
-            "training job. This can leave GPU ranks idle during filesystem writes. The current mapping has "
-            "%d output file(s) across world_size=%d. For large checkpoints, consider "
-            "checkpoint.save_consolidated=false and run the generated consolidation script after training: "
-            "bash <checkpoint>/model/consolidate.sh",
-            _format_bytes(estimated_bytes),
-            output_file_count,
-            world_size,
-        )
+        output_file_summary = _format_output_file_count(output_file_count)
+        if is_hf_index_estimate:
+            logger.warning(
+                "checkpoint.save_consolidated=True is exporting ~%s of HF safetensors during checkpoint save "
+                "(size from HF index; %s, world_size=%d). This can idle GPU ranks; prefer "
+                "save_consolidated=false and run bash <checkpoint>/model/consolidate.sh after training.",
+                _format_bytes(estimated_bytes),
+                output_file_summary,
+                world_size,
+            )
+        else:
+            logger.warning(
+                "checkpoint.save_consolidated=True may be exporting a large HF checkpoint; this rank's local "
+                "estimate is ~%s (full size may differ under distributed parallelism; %s, world_size=%d). Prefer "
+                "save_consolidated=false and run bash <checkpoint>/model/consolidate.sh after training.",
+                _format_bytes(estimated_bytes),
+                output_file_summary,
+                world_size,
+            )
+
+    def _get_original_hf_index_total_size(self) -> int | None:
+        """Return the original HF safetensors index total size, if available."""
+        try:
+            index_path = get_safetensors_index_path(
+                self.config.model_cache_dir,
+                self.config.model_repo_id,
+            )
+        except (FileNotFoundError, ValueError):
+            return None
+        return _get_safetensors_index_total_size(index_path)
 
     def get_offline_consolidation_script_path(self, weights_path: str) -> str:
         """Return the offline consolidation helper script path for a checkpoint root."""

@@ -1201,10 +1201,48 @@ class TestOfflineConsolidationScriptAndWarnings:
 
         checkpointer._warn_if_large_inline_consolidation({"w": FakeLargeTensor()}, {"w": 1})
 
-        assert "approximately 50.0 GiB" in caplog.text
-        assert "1 output file(s) across world_size=256" in caplog.text
-        assert "generated consolidation script after training" in caplog.text
+        assert "may be exporting a large HF checkpoint" in caplog.text
+        assert "this rank's local estimate is ~50.0 GiB" in caplog.text
+        assert "full size may differ under distributed parallelism" in caplog.text
+        assert "1 output file, world_size=256" in caplog.text
+        assert "~50.0 GiB" in caplog.text
+        assert "save_consolidated=false" in caplog.text
         assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
+
+    def test_save_time_uses_hf_index_size_before_distributed_fallback(self, tmp_path, caplog):
+        cache_dir = tmp_path / "cache"
+        model_dir = cache_dir / "models--test--model" / "snapshots" / "abc123"
+        model_dir.mkdir(parents=True)
+        with open(model_dir / "model.safetensors.index.json", "w") as f:
+            json.dump({"metadata": {"total_size": 64 * 1024**3}, "weight_map": {}}, f)
+
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
+        checkpointer.config.model_cache_dir = str(cache_dir)
+        checkpointer.config.model_repo_id = "test/model"
+        caplog.clear()
+        caplog.set_level(logging.WARNING)
+
+        class FakeSmallLocalTensor:
+            def numel(self):
+                return 1024
+
+            def element_size(self):
+                return 2
+
+        with (
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_world_size", return_value=64),
+            patch("torch.distributed.all_reduce") as mock_all_reduce,
+        ):
+            checkpointer._warn_if_large_inline_consolidation({"w": FakeSmallLocalTensor()}, {"w": 1})
+
+        mock_all_reduce.assert_not_called()
+        assert "is exporting ~64.0 GiB of HF safetensors during checkpoint save" in caplog.text
+        assert "size from HF index" in caplog.text
+        assert "1 output file, world_size=64" in caplog.text
+        assert "~64.0 GiB" in caplog.text
 
 
 class TestOfflineHFConsolidationTool:

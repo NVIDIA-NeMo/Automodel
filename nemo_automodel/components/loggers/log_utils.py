@@ -179,7 +179,7 @@ def _ensure_root_handler_with_formatter(formatter: logging.Formatter) -> None:
 
 def setup_logging(
     logging_level: int = logging.INFO,
-    filter_warning: bool = False,
+    filter_warning: bool = True,
     modules_to_filter: Optional[list[str]] = None,
     set_level_for_all_loggers: bool = False,
 ) -> None:
