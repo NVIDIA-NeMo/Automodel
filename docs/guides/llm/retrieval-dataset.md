@@ -1,17 +1,26 @@
 # Retrieval Dataset (Embedding Fine-tuning)
 
-NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
+NeMo Automodel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
+**query** paired with **one positive** document and **one or more negative** documents.
 
-This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and `examples/retrieval/cross_encoder/`) together with the `BiEncoderCollator`.
+This dataset is used by the retrieval recipes (see `examples/retrieval/bi_encoder/` and
+`examples/retrieval/cross_encoder/`) together with the retrieval collators. For an end-to-end training workflow, see
+[Retrieval Fine-Tuning](retrieval-finetuning.md).
 
 ## What the Bi-Encoder Consumes
 
-The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face `datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
+The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face
+`datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
 
 - `question`: query string
 - `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
-- `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus provides instructions via metadata
+- `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
+  provides instructions via metadata
+
+The cross-encoder recipe consumes the same raw retrieval records, but sets `model_type: cross_encoder`. Its dataset
+transform flattens each query with its positive and negative passages, and `CrossEncoderCollator` serializes each
+query-passage pair for reranking.
 
 ## Supported Input Formats
 
@@ -124,6 +133,9 @@ dataloader:
     passage_prefix: "passage:"
     pad_to_multiple_of: 8
 ```
+
+For cross-encoder training, keep the same dataset factory and set `model_type: cross_encoder`, then replace the collator
+with `nemo_automodel.components.datasets.llm.CrossEncoderCollator`.
 
 ## Requirements
 

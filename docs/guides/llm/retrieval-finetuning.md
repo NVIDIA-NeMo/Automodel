@@ -54,7 +54,9 @@ Run the matching cross-encoder example:
 automodel examples/retrieval/cross_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
 
-Adjust `--nproc-per-node` to the number of GPUs on your machine. The examples use FSDP2 and bfloat16 by default.
+Adjust `--nproc-per-node` to the number of GPUs on your machine. The examples use FSDP2 and bfloat16 by default. If the
+first launch downloads a model, reads from a slow filesystem, or runs across multiple nodes, increase
+`dist_env.timeout_minutes` beyond the short example default.
 
 :::{tip}
 For a small smoke test, override the schedule and sample count from the command line:
@@ -251,7 +253,9 @@ Important knobs:
   hard-negative mining, and inference.
 - `do_distributed_inbatch_negative`: optional model setting that treats passages from other data-parallel ranks as
   additional negatives. It is useful for larger distributed runs and uses document IDs from corpus-backed datasets to
-  avoid treating the same document as a negative for itself.
+  avoid treating the same document as a negative for itself. It all-gathers passage embeddings across data-parallel
+  ranks, so expect extra communication and score-matrix memory. Use corpus-backed data when you need same-document
+  masking, and keep it disabled for ColBERT-style pooling.
 
 The complete example is
 [`examples/retrieval/bi_encoder/llama3_2_1b.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
@@ -361,6 +365,18 @@ metrics. For cross-encoder validation, use `model_type: cross_encoder` and `Cros
 tail -n 5 ./output/llama3_2_1b_encoder/checkpoints/validation.jsonl
 ```
 
+## Monitor Training
+
+Training metrics are written to `training.jsonl` under `checkpoint.checkpoint_dir`. Watch `loss`, `grad_norm`, learning
+rate, GPU memory, and step time during smoke tests before scaling to a longer run:
+
+```bash
+tail -f ./output/llama3_2_1b_encoder/checkpoints/training.jsonl
+```
+
+The examples include a commented `wandb` block. Enable it when you want remote tracking, and tune
+`step_scheduler.log_remote_every_steps` to control remote logging cadence.
+
 ## Enable LoRA
 
 Retrieval recipes support the same PEFT block used by other AutoModel fine-tuning recipes. Uncomment or add `peft` to
@@ -469,9 +485,11 @@ jointly, so they are usually too expensive for first-stage full-corpus search.
 | Symptom | Check |
 |---------|-------|
 | Training fails with empty negatives | Ensure every record has `neg_doc` when `n_passages > 1`. |
+| Dataset records fail to load | Check the supported schemas in [Retrieval Dataset](retrieval-dataset.md). |
 | Loss does not move | Verify the positive passage is first and negatives are not duplicates of the positive. |
 | Poor retrieval quality | Mine harder negatives and align train/inference prefixes. |
 | OOM at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`; use LoRA for larger backbones. |
+| Distributed launch times out | Increase `dist_env.timeout_minutes`, especially for first model downloads, slow filesystems, or multi-node runs. |
 | Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
 | Different mining and training behavior | Match tokenizer settings, prefixes, and max lengths across training and mining. |
 
