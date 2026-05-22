@@ -50,6 +50,7 @@ def test_audit_mined_negatives_reports_and_cleans_invalid_rows():
         "duplicate_negative": 1,
         "missing_negative_score": 1,
         "non_finite_negative_score": 1,
+        "rows_with_too_few_negatives": 0,
         "dropped_negatives": 4,
         "total_findings": 4,
     }
@@ -146,3 +147,60 @@ def test_audit_cli_exits_nonzero_when_findings_remain(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["audit_mined_negatives.py", str(input_file)])
 
     assert audit_main() == 1
+
+
+def test_audit_cli_allow_findings_exits_zero(tmp_path, monkeypatch):
+    input_file = tmp_path / "mined.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "pos_doc": [{"id": "1"}],
+                        "neg_doc": [{"id": "1", "score": 1.0}],
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["audit_mined_negatives.py", str(input_file), "--allow-findings"])
+
+    assert audit_main() == 0
+
+
+def test_audit_cli_min_negatives_catches_rows_cleaned_to_empty(tmp_path, monkeypatch, capsys):
+    input_file = tmp_path / "mined.json"
+    output_file = tmp_path / "cleaned.json"
+    input_file.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "question_id": "q0",
+                        "pos_doc": [{"id": "1"}],
+                        "neg_doc": [{"id": "1", "score": 1.0}],
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit_mined_negatives.py",
+            str(input_file),
+            "--drop-invalid-negatives",
+            "--output",
+            str(output_file),
+            "--min-negatives",
+            "1",
+        ],
+    )
+
+    assert audit_main() == 1
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["remaining_summary"]["rows_with_too_few_negatives"] == 1
+    assert report["remaining_findings"][0]["issue"] == "too_few_negatives"

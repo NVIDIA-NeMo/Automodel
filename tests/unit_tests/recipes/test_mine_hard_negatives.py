@@ -42,6 +42,16 @@ _BASE_MINING = {
 }
 
 
+class _FakeDocumentsDataset:
+    path = "/fake/corpus"
+
+    def __init__(self, text="NVLink is a high-bandwidth GPU interconnect."):
+        self.text = text
+
+    def get_document_by_id(self, doc_id):
+        return {"text": self.text, "image": "", "nr_ocr": ""}
+
+
 def _make_recipe(mining_overrides=None):
     """Create a MineHardNegativesRecipe with a real ConfigNode config.
 
@@ -64,6 +74,7 @@ def _make_cache_ready_recipe(tmp_path):
     recipe.model_name_or_path = "/fake/model"
     recipe.tokenizer_name_or_path = "/fake/tokenizer"
     recipe.train_qa_file_path = "/fake/input.json"
+    recipe.corpus_id = "demo"
     recipe.corpus_path = "/fake/corpus"
     recipe.query_prefix = "query: "
     recipe.passage_prefix = "passage: "
@@ -75,6 +86,7 @@ def _make_cache_ready_recipe(tmp_path):
     recipe.questions = ["what is nvlink?"]
     recipe.question_ids = ["q0"]
     recipe.idx_to_doc = {0: "d0"}
+    recipe.documents_dataset = _FakeDocumentsDataset()
     recipe.dist_env = SimpleNamespace(world_size=1, rank=0, is_main=True, device=torch.device("cpu"))
     recipe.model = SimpleNamespace(pooling="avg", l2_normalize=True)
     return recipe
@@ -202,6 +214,24 @@ def test_setup_with_attn_implementation(attn_impl):
     assert kwargs["use_sdpa_patching"] is True
 
 
+def test_setup_rejects_colbert_pooling():
+    """The public setup path should reject token-level ColBERT embeddings before mining."""
+    cfg = ConfigNode({"mining": dict(_BASE_MINING)})
+    recipe = MineHardNegativesRecipe(cfg)
+    mock_model = MagicMock(pooling="colbert")
+    mock_model.to.return_value = mock_model
+
+    with (
+        patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.build_distributed") as mock_dist,
+        patch("nemo_automodel.recipes.retrieval.mine_hard_negatives.NeMoAutoModelBiEncoder") as mock_auto,
+        pytest.raises(ValueError, match="ColBERT pooling"),
+    ):
+        mock_dist.return_value = MagicMock(device="cpu")
+        mock_auto.from_pretrained.return_value = mock_model
+
+        recipe.setup()
+
+
 def test_write_output_preserves_original_question_id(tmp_path):
     """Mined outputs should keep query lineage added by unroll_pos_docs.py."""
     input_file = tmp_path / "input.json"
@@ -284,6 +314,16 @@ def test_full_embeddings_cache_requires_matching_metadata(tmp_path):
     assert recipe._load_embeddings_from_cache() == (None, None)
 
 
+def test_full_embeddings_cache_rejects_changed_document_content(tmp_path):
+    recipe = _make_cache_ready_recipe(tmp_path)
+    recipe._save_embeddings_to_cache(np.ones((1, 2), dtype=np.float32), np.ones((1, 2), dtype=np.float32))
+
+    recipe.documents_dataset.text = "The corpus text changed under the same document ID."
+
+    assert not recipe._has_full_embeddings_cache()
+    assert recipe._load_embeddings_from_cache() == (None, None)
+
+
 def test_full_embeddings_cache_rejects_shape_mismatch(tmp_path):
     recipe = _make_cache_ready_recipe(tmp_path)
     query_embeddings = np.ones((1, 2), dtype=np.float32)
@@ -291,7 +331,7 @@ def test_full_embeddings_cache_rejects_shape_mismatch(tmp_path):
     recipe._save_embeddings_to_cache(query_embeddings, document_embeddings)
     np.savez(tmp_path / QUERY_EMBEDDINGS_FNAME, np.ones((2, 2), dtype=np.float32))
 
-    assert not recipe._has_full_embeddings_cache()
+    assert recipe._has_full_embeddings_cache()
     assert recipe._load_embeddings_from_cache() == (None, None)
 
 
@@ -391,6 +431,33 @@ def test_mine_hard_negatives_drops_raw_non_finite_scores():
     assert neg_indices == [[2]]
     assert neg_scores[0][0] == pytest.approx(0.2)
     assert pos_scores[0][0] == pytest.approx(1.0)
+
+
+def test_mine_hard_negatives_skips_margin_when_positive_score_is_non_finite():
+    recipe = _make_recipe()
+    recipe.dist_env = MagicMock(device=torch.device("cpu"))
+    query_embeddings = np.array([[1.0, 0.0]], dtype=np.float32)
+    document_embeddings = np.array(
+        [
+            [np.nan, 0.0],
+            [0.2, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    neg_indices, neg_scores, pos_scores = recipe._mine_hard_negatives(
+        query_embeddings=query_embeddings,
+        document_embeddings=document_embeddings,
+        pos_doc_indices=[[0]],
+        batch_size=1,
+        num_negs=1,
+        hard_neg_margin=0.95,
+        hard_neg_margin_type="perc",
+    )
+
+    assert neg_indices == [[1]]
+    assert neg_scores[0][0] == pytest.approx(0.2)
+    assert pos_scores[0][0] == float("-inf")
 
 
 def test_mine_hard_negatives_rejects_token_level_embeddings():

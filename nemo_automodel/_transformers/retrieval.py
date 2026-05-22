@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
@@ -83,10 +84,15 @@ def _load_encoder_config(model_name_or_path: str, trust_remote_code: bool = Fals
         **_get_auto_config_load_kwargs(hf_kwargs),
     )
     model_path = Path(model_id)
-    v5_config_path = model_path / "config.v5.json"
-    if v5_config_path.exists():
-        _load_v5_retrieval_metadata(config, v5_config_path)
-        return config
+    subfolder = hf_kwargs.get("subfolder")
+    local_v5_config_paths = []
+    if subfolder is not None:
+        local_v5_config_paths.append(model_path / str(subfolder) / "config.v5.json")
+    local_v5_config_paths.append(model_path / "config.v5.json")
+    for v5_config_path in local_v5_config_paths:
+        if v5_config_path.exists():
+            _load_v5_retrieval_metadata(config, v5_config_path)
+            return config
 
     # Local directory exports write config.v5.json beside config.json. Hub exports need
     # an explicit sidecar download because AutoConfig only loads config.json.
@@ -98,7 +104,14 @@ def _load_encoder_config(model_name_or_path: str, trust_remote_code: bool = Fals
             filename="config.v5.json",
             **_get_hf_hub_download_kwargs(hf_kwargs),
         )
-    except Exception:
+    except EntryNotFoundError:
+        return config
+    except Exception as exc:
+        logger.warning(
+            "Unable to load config.v5.json for %s; falling back to config.json retrieval metadata/defaults. Error: %s",
+            model_id,
+            exc,
+        )
         return config
 
     _load_v5_retrieval_metadata(config, hub_v5_config_path)

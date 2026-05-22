@@ -193,6 +193,7 @@ class MineHardNegativesRecipe:
         # Data (populated in setup)
         self.questions_dataset = None
         self.documents_dataset = None
+        self.corpus_id = None
         self.corpus_path = None
         self.doc_to_idx = None
         self.idx_to_doc = None
@@ -417,11 +418,12 @@ class MineHardNegativesRecipe:
                 f"Corpus paths: {list(corpus_dict.keys())}"
             )
 
-        self.corpus_path = list(corpus_dict.keys())[0]
-        self.documents_dataset = corpus_dict[self.corpus_path]
+        self.corpus_id = list(corpus_dict.keys())[0]
+        self.documents_dataset = corpus_dict[self.corpus_id]
+        self.corpus_path = getattr(self.documents_dataset, "path", self.corpus_id)
         self.questions_dataset = dataset
 
-        logger.info(f"Loaded {len(dataset)} questions from corpus: {self.corpus_path}")
+        logger.info(f"Loaded {len(dataset)} questions from corpus: {self.corpus_id} ({self.corpus_path})")
 
     def _build_document_mappings(self):
         """Build bidirectional mappings between document IDs and indices.
@@ -838,11 +840,60 @@ class MineHardNegativesRecipe:
             hasher.update(b"\0")
         return hasher.hexdigest()
 
+    def _hash_file_contents(self, path_value: Optional[str]) -> Optional[str]:
+        """Hash the contents of a local file when it is available."""
+        if path_value is None:
+            return None
+        path = Path(str(path_value))
+        if not path.is_file():
+            return None
+        hasher = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _hash_local_path_state(self, path_value: Optional[str]) -> Optional[str]:
+        """Hash local file names, sizes, and mtimes for mutable model/tokenizer paths."""
+        if path_value is None:
+            return None
+        path = Path(str(path_value))
+        if not path.exists():
+            return None
+        files = [path] if path.is_file() else sorted(file_path for file_path in path.rglob("*") if file_path.is_file())
+        root = path if path.is_dir() else path.parent
+        hasher = hashlib.sha256()
+        hasher.update(str(path.resolve()).encode("utf-8"))
+        for file_path in files:
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            relative_path = file_path.relative_to(root)
+            hasher.update(str(relative_path).encode("utf-8"))
+            hasher.update(str(stat.st_size).encode("utf-8"))
+            hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+        return hasher.hexdigest()
+
     def _get_ordered_doc_ids(self) -> List[Any]:
         """Return document IDs in embedding row order."""
         if isinstance(self.idx_to_doc, dict):
             return [self.idx_to_doc[idx] for idx in sorted(self.idx_to_doc)]
         return list(self.idx_to_doc or [])
+
+    def _hash_ordered_document_contents(self) -> Optional[str]:
+        """Hash ordered corpus document IDs and text used for passage embeddings."""
+        if self.documents_dataset is None:
+            return None
+        hasher = hashlib.sha256()
+        for doc_id in self._get_ordered_doc_ids():
+            document = self.documents_dataset.get_document_by_id(doc_id)
+            hasher.update(str(doc_id).encode("utf-8"))
+            hasher.update(b"\0")
+            serialized_document = json.dumps(document, sort_keys=True, default=str, separators=(",", ":"))
+            hasher.update(serialized_document.encode("utf-8"))
+            hasher.update(b"\0")
+        return hasher.hexdigest()
 
     def _get_model_pooling(self):
         """Return pooling metadata from the live model or cached model metadata."""
@@ -866,7 +917,12 @@ class MineHardNegativesRecipe:
             "model_name_or_path": str(self.model_name_or_path),
             "tokenizer_name_or_path": str(self.tokenizer_name_or_path),
             "train_qa_file_path": str(self.train_qa_file_path),
+            "train_qa_file_hash": self._hash_file_contents(self.train_qa_file_path),
+            "model_path_state_hash": self._hash_local_path_state(self.model_name_or_path),
+            "tokenizer_path_state_hash": self._hash_local_path_state(self.tokenizer_name_or_path),
+            "corpus_id": str(self.corpus_id),
             "corpus_path": str(self.corpus_path),
+            "corpus_path_state_hash": self._hash_local_path_state(self.corpus_path),
             "query_prefix": self.query_prefix,
             "passage_prefix": self.passage_prefix,
             "query_max_length": self.query_max_length,
@@ -882,6 +938,7 @@ class MineHardNegativesRecipe:
             "question_ids_hash": self._hash_cache_values(self.question_ids),
             "questions_hash": self._hash_cache_values(self.questions),
             "document_ids_hash": self._hash_cache_values(self._get_ordered_doc_ids()),
+            "document_content_hash": self._hash_ordered_document_contents(),
         }
 
     def _cache_metadata_path(self) -> Optional[Path]:
@@ -1000,13 +1057,7 @@ class MineHardNegativesRecipe:
         doc_path = cache_dir / DOCUMENT_EMBEDDINGS_FNAME
         if not query_path.exists() or not doc_path.exists():
             return False
-        try:
-            query_shape = _load_npz_array(query_path).shape
-            doc_shape = _load_npz_array(doc_path).shape
-        except Exception:
-            logger.warning("Ignoring unreadable embedding cache under %s", cache_dir)
-            return False
-        return self._cache_metadata_matches(self._load_cache_metadata(), query_shape, doc_shape)
+        return self._cache_metadata_matches(self._load_cache_metadata())
 
     def _save_embeddings_to_cache(
         self,
@@ -1206,6 +1257,7 @@ class MineHardNegativesRecipe:
 
             # Extract positive scores and mask positives
             min_pos_scores = []  # Minimum positive score per query (for margin filtering)
+            apply_margin = []
             batch_pos_scores = []
 
             for i, pos_indices in enumerate(batch_pos_indices):
@@ -1224,10 +1276,13 @@ class MineHardNegativesRecipe:
                 batch_pos_scores.append(query_pos_scores)
 
                 # Track minimum positive score for margin filtering
-                if query_pos_scores:
-                    min_pos_scores.append(min(scores_by_idx.values()))
+                finite_pos_scores = [score for score in scores_by_idx.values() if math.isfinite(score)]
+                if finite_pos_scores:
+                    min_pos_scores.append(min(finite_pos_scores))
+                    apply_margin.append(True)
                 else:
                     min_pos_scores.append(0.0)  # Handle edge case of no positives
+                    apply_margin.append(False)
 
             # Vectorized margin filtering
             if hard_neg_margin is not None:
@@ -1242,6 +1297,8 @@ class MineHardNegativesRecipe:
 
                 if threshold is not None:
                     downscore_mask = batch_scores > threshold
+                    apply_margin_tensor = torch.tensor(apply_margin, dtype=torch.bool, device=device).unsqueeze(1)
+                    downscore_mask = downscore_mask & apply_margin_tensor
                     batch_scores[downscore_mask] = float("-inf")
 
             # Batch-level top-k selection

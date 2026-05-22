@@ -45,6 +45,7 @@ def audit_records(
     *,
     drop_invalid_negatives: bool = False,
     max_findings: int = 20,
+    min_negatives: int = 0,
 ) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]]]:
     """Audit retrieval records and optionally drop invalid mined negatives.
 
@@ -65,6 +66,7 @@ def audit_records(
         "duplicate_negative": 0,
         "missing_negative_score": 0,
         "non_finite_negative_score": 0,
+        "rows_with_too_few_negatives": 0,
         "dropped_negatives": 0,
         "total_findings": 0,
     }
@@ -112,6 +114,11 @@ def audit_records(
                 continue
             cleaned_negatives.append(neg_doc)
 
+        if len(cleaned_negatives) < min_negatives:
+            summary["rows_with_too_few_negatives"] += 1
+            row_has_findings = True
+            _append_finding(findings, max_findings, row_idx, record, None, "too_few_negatives")
+
         if row_has_findings:
             summary["rows_with_findings"] += 1
         cleaned_record = dict(record)
@@ -123,6 +130,7 @@ def audit_records(
         + summary["duplicate_negative"]
         + summary["missing_negative_score"]
         + summary["non_finite_negative_score"]
+        + summary["rows_with_too_few_negatives"]
     )
     return summary, cleaned_records, findings
 
@@ -132,7 +140,7 @@ def _append_finding(
     max_findings: int,
     row_idx: int,
     record: dict[str, Any],
-    neg_id: str,
+    neg_id: str | None,
     issue: str,
 ) -> None:
     """Append a compact finding example up to the configured limit."""
@@ -154,6 +162,7 @@ def audit_training_data(
     *,
     drop_invalid_negatives: bool = False,
     max_findings: int = 20,
+    min_negatives: int = 0,
 ) -> tuple[dict[str, int], dict[str, Any], list[dict[str, Any]]]:
     """Audit a top-level retrieval JSON object."""
     records = training_data.get("data", [])
@@ -161,6 +170,7 @@ def audit_training_data(
         records,
         drop_invalid_negatives=drop_invalid_negatives,
         max_findings=max_findings,
+        min_negatives=min_negatives,
     )
     cleaned_training_data = dict(training_data)
     cleaned_training_data["data"] = cleaned_records
@@ -188,11 +198,19 @@ def main() -> int:
     )
     parser.add_argument("--max-findings", type=int, default=20, help="Maximum finding examples to print")
     parser.add_argument(
+        "--min-negatives",
+        type=int,
+        default=0,
+        help="Require at least this many negatives per row after optional cleanup.",
+    )
+    parser.add_argument(
         "--allow-findings",
         action="store_true",
         help="Exit with status 0 even when the audit reports findings",
     )
     args = parser.parse_args()
+    if args.min_negatives < 0:
+        parser.error("--min-negatives must be non-negative")
 
     input_path = Path(args.input_file)
     with open(input_path, "r") as f:
@@ -202,6 +220,7 @@ def main() -> int:
         training_data,
         drop_invalid_negatives=args.drop_invalid_negatives,
         max_findings=args.max_findings,
+        min_negatives=args.min_negatives,
     )
 
     exit_summary = summary
@@ -216,6 +235,7 @@ def main() -> int:
                 cleaned_training_data,
                 drop_invalid_negatives=False,
                 max_findings=args.max_findings,
+                min_negatives=args.min_negatives,
             )
             payload["remaining_summary"] = remaining_summary
             payload["remaining_findings"] = remaining_findings

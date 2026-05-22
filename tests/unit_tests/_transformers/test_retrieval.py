@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+import logging
 
 import pytest
 import torch
@@ -243,6 +244,27 @@ def test_load_encoder_config_merges_v5_retrieval_metadata(tmp_path):
     assert config.nemo_retrieval == {"task": "embedding", "pooling": "last", "l2_normalize": False}
 
 
+def test_load_encoder_config_merges_local_subfolder_v5_retrieval_metadata(tmp_path):
+    """Local exports with a subfolder keep metadata beside the loaded config."""
+    from nemo_automodel._transformers.retrieval import _load_encoder_config
+
+    model_subfolder = tmp_path / "model"
+    model_subfolder.mkdir()
+    (model_subfolder / "config.json").write_text(json.dumps({"model_type": "bert"}))
+    (model_subfolder / "config.v5.json").write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "nemo_retrieval": {"task": "embedding", "pooling": "weighted_avg", "l2_normalize": False},
+            }
+        )
+    )
+
+    config = _load_encoder_config(str(tmp_path), subfolder="model")
+
+    assert config.nemo_retrieval == {"task": "embedding", "pooling": "weighted_avg", "l2_normalize": False}
+
+
 def test_load_encoder_config_merges_hub_v5_retrieval_metadata(monkeypatch, tmp_path):
     """Hub exports can recover AutoModel metadata from config.v5.json sidecars."""
     from nemo_automodel._transformers import retrieval
@@ -289,6 +311,23 @@ def test_load_encoder_config_merges_hub_v5_retrieval_metadata(monkeypatch, tmp_p
         "kwargs": {"revision": "main", "token": "token"},
     }
     assert config.nemo_retrieval == {"task": "embedding", "pooling": "cls", "l2_normalize": True}
+
+
+def test_load_encoder_config_warns_on_unexpected_hub_sidecar_failure(monkeypatch, caplog):
+    """Transient Hub/cache failures should not silently fall back to defaults."""
+    from nemo_automodel._transformers import retrieval
+
+    class FakeConfig:
+        model_type = "bert"
+
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", lambda *_, **__: FakeConfig())
+    monkeypatch.setattr(retrieval, "hf_hub_download", lambda *_, **__: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    caplog.set_level(logging.WARNING, logger="nemo_automodel._transformers.retrieval")
+    config = retrieval._load_encoder_config("nvidia/example-retriever")
+
+    assert not hasattr(config, "nemo_retrieval")
+    assert "Unable to load config.v5.json" in caplog.text
 
 
 def test_nemo_auto_biencoder_defaults_do_not_override_saved_metadata(monkeypatch):

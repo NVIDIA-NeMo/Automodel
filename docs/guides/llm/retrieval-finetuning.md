@@ -579,6 +579,18 @@ materialize or preprocess your selected HF subset into the corpus ID JSON schema
 [Retrieval Dataset](retrieval-dataset.md), then set `--mining.train_qa_file_path` to that local JSON file. The mining
 commands below assume that local corpus-backed input.
 
+For an AutoModel-schema HF subset such as `FEVER`, materialize one corpus-backed mining input with:
+
+```bash
+uv run python examples/retrieval/data_utils/materialize_hf_retrieval_subset.py \
+  nvidia/embed-nemotron-dataset-v1 \
+  FEVER \
+  /path/to/retrieval-data/fever-mining
+```
+
+This writes `/path/to/retrieval-data/fever-mining/train.json` and a local `FEVER_corpus/` directory. Run the command
+once per subset/corpus that you want to mine; the mining helper intentionally processes one corpus per run.
+
 Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
 
 - `hard_negatives_to_mine`: target number of negatives to add per query. The miner can return fewer when the corpus has
@@ -601,10 +613,11 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
   rank `0` unable to read remote-rank shards. Use a fresh cache directory for each model, dataset, prefix, sequence
-  length, and world-size combination. The miner validates a cache fingerprint before reuse, but fresh run-specific
-  paths are still easier to reason about. Set `load_embeddings_from_cache: true` only when you intentionally want to
-  reuse every cached query shard, corpus chunk, and consolidated embedding file from the same
-  model/input/prefix/length/world-size run.
+  length, and world-size combination. The miner validates a cache fingerprint that includes the mining input file,
+  local model/tokenizer path state, ordered document IDs/content, and embedding settings before reusing consolidated
+  caches. Fresh run-specific paths are still easier to reason about, especially for mutable Hub IDs or paths that are
+  overwritten in place. Set `load_embeddings_from_cache: true` only when you intentionally want to reuse every cached
+  query shard, corpus chunk, and consolidated embedding file from the same model/input/prefix/length/world-size run.
 
 `pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
 `--mining.pooling` or `--mining.l2_normalize`; the miner rejects unknown mining keys. Mine from a saved bi-encoder export
@@ -635,11 +648,14 @@ Run the audit utility before reusing mined output:
 ```bash
 uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
   /path/to/mined.json \
+  --min-negatives 1 \
   --allow-findings
 ```
 
 `--allow-findings` keeps this first inspection command from failing the shell when it finds issues. Omit it in CI or
-quality gates when findings should fail the job.
+quality gates when findings should fail the job. `--min-negatives 1` flags rows that would fail or become degenerate
+when retraining with `n_passages > 1`; increase it if your next training config requires more distinct negatives before
+oversampling.
 
 If the report only contains issues that you want to drop automatically, write a cleaned copy:
 
@@ -647,13 +663,15 @@ If the report only contains issues that you want to drop automatically, write a 
 uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
   /path/to/mined.json \
   --drop-invalid-negatives \
+  --min-negatives 1 \
   --output /path/to/mined_audited.json
 ```
 
 With `--drop-invalid-negatives --output`, the command exits successfully when the cleaned output has no remaining audit
-findings. The audit flags and drops negatives whose IDs also appear in the row's `pos_doc`, duplicate negative IDs in the
-same row, missing negative scores, and non-finite negative scores. The cleaned output preserves query lineage fields such
-as `original_question_id`, so unrolled examples remain traceable to their source question.
+findings and still satisfies `--min-negatives` if you set it. The audit flags and drops negatives whose IDs also appear
+in the row's `pos_doc`, duplicate negative IDs in the same row, missing negative scores, and non-finite negative scores.
+The cleaned output preserves query lineage fields such as `original_question_id`, so unrolled examples remain traceable
+to their source question.
 
 ## Save, Resume, and Use the Checkpoint
 
