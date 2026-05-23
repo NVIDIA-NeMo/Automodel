@@ -139,6 +139,51 @@ def test_position_ids_synthesized_from_inputs_embeds_seq_dim(monkeypatch):
     assert torch.equal(pos[0], torch.arange(12))
 
 
+def test_position_ids_synthesized_for_each_batch_row(monkeypatch):
+    """Synthesized 2D position_ids must match the batch dimension so later CP
+    sharding keeps positions aligned with each sample."""
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", lambda **kw: object())
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    inputs_embeds = torch.randn(3, 8, 16)
+    batch = {"inputs_embeds": inputs_embeds, "labels": torch.zeros(3, 8, dtype=torch.long)}
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert batch["position_ids"].shape == (3, 8)
+    expected = torch.arange(8).expand(3, -1)
+    assert torch.equal(batch["position_ids"], expected)
+
+
+def test_singleton_position_ids_expand_to_batch_size(monkeypatch):
+    """A caller-provided [1, S] position tensor should expand to [B, S] before
+    the CP context records buffers."""
+    captured = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    inputs_embeds = torch.randn(2, 8, 16)
+    position_ids = torch.arange(8).unsqueeze(0)
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "labels": torch.zeros(2, 8, dtype=torch.long),
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert batch["position_ids"].shape == (2, 8)
+    assert captured["cp_buffers"][2] is batch["position_ids"]
+    assert torch.equal(batch["position_ids"], torch.arange(8).expand(2, -1))
+
+
 def test_inputs_embeds_no_op_when_cp_size_le_1():
     """cp_size<=1 short-circuit must apply to the inputs_embeds path too."""
     device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
@@ -324,12 +369,8 @@ def test_padding_mask_pad_value_is_True_not_False(monkeypatch):
     # Positions 0..3 unchanged
     assert torch.equal(padded[0, :6], padding_mask[0])
     # Positions 6, 7 are cp-pad slots -- MUST be True (pad), not False
-    assert bool(padded[0, 6].item()) is True, (
-        "cp-pad slot 6 should be marked as padding (True)"
-    )
-    assert bool(padded[0, 7].item()) is True, (
-        "cp-pad slot 7 should be marked as padding (True)"
-    )
+    assert bool(padded[0, 6].item()) is True, "cp-pad slot 6 should be marked as padding (True)"
+    assert bool(padded[0, 7].item()) is True, "cp-pad slot 7 should be marked as padding (True)"
 
 
 def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
@@ -344,9 +385,7 @@ def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
     # (the runtime code path is currently unreachable because attention_mask
     # is popped at line 272).
     src = open(_cu.__file__).read()
-    assert '"attention_mask": False' in src, (
-        "PAD_FILL must explicitly map attention_mask -> False (HF: 0 = pad)"
-    )
+    assert '"attention_mask": False' in src, "PAD_FILL must explicitly map attention_mask -> False (HF: 0 = pad)"
 
 
 def test_padding_mirrors_padding_mask_back_into_batch(monkeypatch):
@@ -384,9 +423,7 @@ def test_padding_mirrors_padding_mask_back_into_batch(monkeypatch):
     assert batch["position_ids"].shape[1] == expected_padded_len
     assert batch["padding_mask"].shape[1] == expected_padded_len
     # And the mirror is the same object the cp_buffers hold (not a stale copy)
-    pmask_idx = next(
-        i for i, b in enumerate(captured["cp_buffers"]) if b is batch["padding_mask"]
-    )
+    pmask_idx = next(i for i, b in enumerate(captured["cp_buffers"]) if b is batch["padding_mask"])
     assert pmask_idx >= 3, "padding_mask must come after the primary trio"
 
 
@@ -428,7 +465,6 @@ def test_padding_input_ids_path_int_padding_with_zero(monkeypatch):
     monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
-    seq_len = 6
     input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
     labels = torch.tensor([[1, 2, 3, 4, 5, 6]])
     batch = {"input_ids": input_ids, "labels": labels}
