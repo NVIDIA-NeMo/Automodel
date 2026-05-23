@@ -24,6 +24,9 @@ VLM_PP_MEDIA_KEY = "_vlm_pp_media_chunks"
 
 _VLM_MEDIA_KEYS = (
     "pixel_values",
+    "patch_pixel_values",
+    "num_patches",
+    "patch_newline_mask",
     "image_grid_hws",
     "image_grid_thw",
     "image_sizes",
@@ -119,6 +122,64 @@ def chunk_vlm_media(
     return pixel_values_chunks, image_grid_chunks
 
 
+def chunk_step3_media(
+    pixel_values: torch.Tensor,
+    *,
+    batch_size: int,
+    n_microbatches: int,
+    num_patches: torch.Tensor | None = None,
+    patch_pixel_values: torch.Tensor | None = None,
+    patch_newline_mask: torch.Tensor | None = None,
+) -> dict[str, list[torch.Tensor]]:
+    """Chunk Step3-style image tensors for PP microbatches.
+
+    Step3 processors emit one full image per sample in ``pixel_values`` and a
+    flat list of optional crop patches in ``patch_pixel_values``. ``num_patches``
+    maps samples to the flat patch tensor.
+    """
+    if pixel_values.shape[0] != batch_size:
+        raise ValueError(
+            "Step3 VLM PP chunking expects one full image tensor per sample: "
+            f"pixel_values.shape={tuple(pixel_values.shape)}, batch_size={batch_size}."
+        )
+
+    if num_patches is None:
+        num_patches = torch.zeros(batch_size, dtype=torch.long, device=pixel_values.device)
+    else:
+        num_patches = num_patches.to(dtype=torch.long).view(-1)
+        if num_patches.numel() != batch_size:
+            raise ValueError(
+                f"num_patches must have length batch_size={batch_size}, got shape={tuple(num_patches.shape)}."
+            )
+
+    samples_per_mb = -(-batch_size // n_microbatches)
+    cumsum_patches = torch.cumsum(num_patches.cpu(), dim=0)
+
+    result: dict[str, list[torch.Tensor]] = {
+        "pixel_values": [],
+        "num_patches": [],
+    }
+    if patch_pixel_values is not None:
+        result["patch_pixel_values"] = []
+    if patch_newline_mask is not None:
+        result["patch_newline_mask"] = []
+
+    for mb_idx in range(n_microbatches):
+        sample_start = mb_idx * samples_per_mb
+        sample_end = min(sample_start + samples_per_mb, batch_size)
+        result["pixel_values"].append(pixel_values[sample_start:sample_end])
+        result["num_patches"].append(num_patches[sample_start:sample_end])
+
+        patch_start = 0 if sample_start == 0 else int(cumsum_patches[sample_start - 1].item())
+        patch_end = int(cumsum_patches[sample_end - 1].item()) if sample_end > 0 else patch_start
+        if patch_pixel_values is not None:
+            result["patch_pixel_values"].append(patch_pixel_values[patch_start:patch_end])
+        if patch_newline_mask is not None:
+            result["patch_newline_mask"].append(patch_newline_mask[patch_start:patch_end])
+
+    return result
+
+
 def _select_image_grid(
     image_grid_hws: torch.Tensor | None,
     image_grid_thw: torch.Tensor | None,
@@ -154,6 +215,9 @@ def prepare_vlm_media_for_pp(
         return batch
 
     pixel_values = batch.pop("pixel_values", None)
+    patch_pixel_values = batch.pop("patch_pixel_values", None)
+    num_patches = batch.pop("num_patches", None)
+    patch_newline_mask = batch.pop("patch_newline_mask", None)
     image_grid_hws = batch.pop("image_grid_hws", None)
     image_grid_thw = batch.pop("image_grid_thw", None)
     image_sizes = batch.pop("image_sizes", None)
@@ -167,10 +231,15 @@ def prepare_vlm_media_for_pp(
     pp_media: dict[str, list[torch.Tensor]] = {}
 
     if pixel_values is not None and image_grid is None:
-        raise ValueError(
-            "VLM PP media prep requires media metadata with pixel_values. Expected one of "
-            "image_grid_hws, image_grid_thw, image_sizes, or image_position_ids."
+        step3_media = chunk_step3_media(
+            pixel_values,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+            num_patches=num_patches,
+            patch_pixel_values=patch_pixel_values,
+            patch_newline_mask=patch_newline_mask,
         )
+        pp_media.update(step3_media)
 
     if pixel_values_videos is not None and video_grid_thw is None:
         raise ValueError("VLM PP media prep requires video_grid_thw with pixel_values_videos.")
@@ -238,6 +307,9 @@ def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: M
         if "pixel_values" in pp_media:
             stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
             stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
+            stage0_model._vlm_num_patches_chunks = pp_media.get("num_patches")
+            stage0_model._vlm_patch_pixel_values_chunks = pp_media.get("patch_pixel_values")
+            stage0_model._vlm_patch_newline_mask_chunks = pp_media.get("patch_newline_mask")
             staged = True
         if "pixel_values_videos" in pp_media:
             stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
@@ -252,6 +324,9 @@ def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: M
         if staged and stage0_model is not None:
             stage0_model._vlm_pixel_values_chunks = None
             stage0_model._vlm_image_grid_hws_chunks = None
+            stage0_model._vlm_num_patches_chunks = None
+            stage0_model._vlm_patch_pixel_values_chunks = None
+            stage0_model._vlm_patch_newline_mask_chunks = None
             stage0_model._vlm_pixel_values_videos_chunks = None
             stage0_model._vlm_video_grid_thw_chunks = None
             stage0_model._vlm_chunk_idx = None

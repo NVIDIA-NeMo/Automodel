@@ -172,6 +172,27 @@ def test_default_registry_has_static_entries():
         assert arch_name in inst.model_arch_name_to_cls.keys()
 
 
+def test_step3p7_registry_and_custom_config_registration():
+    """Step3p7 VLM support is available through the lazy registry and AutoConfig."""
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS, MODEL_ARCH_MAPPING
+
+    assert MODEL_ARCH_MAPPING["Step3p7ForConditionalGeneration"] == (
+        "nemo_automodel.components.models.step3p7.model",
+        "Step3p7ForConditionalGeneration",
+    )
+    assert MODEL_ARCH_MAPPING["Step3p6ForConditionalGeneration"] == (
+        "nemo_automodel.components.models.step3p7.model",
+        "Step3p7ForConditionalGeneration",
+    )
+    assert _CUSTOM_CONFIG_REGISTRATIONS["step3p5v"] == (
+        "nemo_automodel.components.models.step3p7.configuration_step3p7",
+        "Step3p7Config",
+    )
+    assert CONFIG_MAPPING["step3p5v"].__name__ == "Step3p7Config"
+
+
 def test_resolve_custom_model_cls_found():
     """resolve_custom_model_cls returns the class when it exists and has no supports_config."""
     from nemo_automodel._transformers import registry as reg
