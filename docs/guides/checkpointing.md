@@ -127,7 +127,7 @@ You can request a floating-point dtype cast during offline export:
 TARGET_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
 ```
 
-This option is usually not needed for FSDP2 training because the default mixed precision policy saves parameters as BF16. It is mainly useful for checkpoints saved with FP32 parameters, or for older/custom training configurations where the sharded safetensors dtype differs from the Hugging Face export dtype you want. Only floating-point tensors with a different source dtype are cast; tensors already in the target dtype and non-floating tensors are left unchanged.
+Use `TARGET_DTYPE` when the consolidated Hugging Face bundle should use a different floating-point dtype from the saved checkpoint, such as `TARGET_DTYPE=bf16` to export an FP32 training checkpoint as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only floating-point tensors with a different source dtype are cast; tensors already in the target dtype and non-floating tensors are left unchanged.
 
 The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
