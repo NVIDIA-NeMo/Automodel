@@ -45,6 +45,8 @@ Step-3.7-Flash is positioned as a multimodal foundation model for agents and age
 
 This documentation-only branch does not add a recipe YAML.
 
+See the [Step-3.7-Flash fine-tuning guide](../../../guides/vlm/step-3-7.md) for the expected training setup and launch notes.
+
 ## Agent Frameworks
 
 Step-3.7-Flash continues support for agent integrations such as OpenClaw, HermesAgent, and KiloClaw.

@@ -100,6 +100,7 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 | **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](guides/dllm/finetune.md)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3-5.md)                |
+| **Fine-tune agentic VLM-MoE** | You need image/video context for agentic developer workflows                       | Image / video + text dataset                      | VLM (MoE) | [Fine-tune Step-3.7-Flash](guides/vlm/step-3-7.md)        |
 | **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](guides/audio/qwen3-omni-asr.md) |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.md)         |
@@ -262,6 +263,7 @@ Sequence Classification <guides/llm/sequence-classification.md>
 Gemma 3 / 3n <guides/omni/gemma3-3n.md>
 Gemma 4 <guides/vlm/gemma4.md>
 Qwen3.5-VL <guides/vlm/qwen3-5.md>
+Step-3.7-Flash <guides/vlm/step-3-7.md>
 Nemotron-Omni <guides/vlm/nemotron-omni.md>
 Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
 Qwen3-Omni ASR <guides/audio/qwen3-omni-asr.md>
