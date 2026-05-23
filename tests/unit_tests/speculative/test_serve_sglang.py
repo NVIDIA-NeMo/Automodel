@@ -80,6 +80,27 @@ def test_resolve_draft_artifacts_rewrites_stale_exported_config(tmp_path: Path):
     assert rewritten["architectures"] == ["LlamaForCausalLMEagle3"]
 
 
+def test_resolve_draft_artifacts_dry_run_does_not_modify_stale_config(tmp_path: Path):
+    """dry_run=True must return expected paths but never touch files on disk."""
+    checkpoint_dir = tmp_path / "epoch_0_step_1000"
+    model_dir = checkpoint_dir / "model"
+    model_dir.mkdir(parents=True)
+    stale_config = model_dir / "config.json"
+    stale_content = json.dumps({"architectures": ["LlamaEagle3DraftModel"]})
+    stale_config.write_text(stale_content, encoding="utf-8")
+    config_mtime_before = stale_config.stat().st_mtime_ns
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    torch.save(torch.arange(4), model_dir / "speculative_token_map.pt")
+
+    resolved_model, resolved_token_map = resolve_draft_artifacts(str(checkpoint_dir), "EAGLE3", dry_run=True)
+
+    assert resolved_model == str(model_dir)
+    assert resolved_token_map == str(model_dir / "speculative_token_map.pt")
+    # The stale config must be left untouched in dry-run mode.
+    assert stale_config.stat().st_mtime_ns == config_mtime_before, "config.json must not be rewritten in dry-run mode"
+    assert stale_config.read_text(encoding="utf-8") == stale_content
+
+
 def test_resolve_draft_artifacts_eagle1_skips_token_map_and_architecture_rewrite(
     tmp_path: Path,
     monkeypatch,
