@@ -76,11 +76,11 @@ The SFT and LoRA training loss curves are shown below.
 **SFT**
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/303b1a02-53b6-4994-a3ac-7fd296f61761" alt="Step-3.7-Flash SFT training loss curve" width="700">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/step3_7_sft.png" alt="Step-3.7-Flash SFT training loss curve" width="700">
 </p>
 
 **LoRA**
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/5b0f011b-8130-498e-8678-1edf45586bae" alt="Step-3.7-Flash LoRA training loss curve" width="700">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/vlm/step3_7_lora.png" alt="Step-3.7-Flash LoRA training loss curve" width="700">
 </p>
