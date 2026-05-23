@@ -266,6 +266,7 @@ Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 dLLM Fine-Tuning <guides/dllm/finetune.md>
 QAT <guides/quantization-aware-training.md>
 Databricks <guides/llm/databricks.md>
+SGLang EAGLE Serving <guides/speculative/serve_with_sglang.md>
 ::::
 
 ::::{toctree}
