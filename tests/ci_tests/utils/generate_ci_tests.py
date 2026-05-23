@@ -81,8 +81,11 @@ def _discover_via_glob(automodel_dir: str, examples_subpath: str) -> list[Path]:
 
 
 def _discover_via_recipe_list(automodel_dir: str, scope: str, test_folder: str) -> list[Path]:
-    """Read configs/<test_folder>/<scope>_recipes.yml and return the recipe paths it lists."""
+    """Read configs/<test_folder>/<scope>_recipes.yml; return [] if the file is absent."""
     config_path = Path(automodel_dir) / "tests" / "ci_tests" / "configs" / test_folder / f"{scope}_recipes.yml"
+    if not config_path.is_file():
+        print(f"INFO: no recipe list at {config_path}; generating empty pipeline", file=sys.stderr)
+        return []
     with open(config_path, "r", encoding="utf-8") as f:
         test_configs = yaml.load(f)
     examples_dir = test_configs.get("examples_dir", test_folder)
@@ -281,9 +284,8 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
     with open(override_path, "r", encoding="utf-8") as f:
         config_override = yaml.load(f) or {}
 
+    # Empty yml_configs is fine -- some (folder, scope) combos have no recipes.
     yml_configs = detect_yml_configurations(automodel_dir, scope, test_folder)
-    if not yml_configs:
-        raise Exception(f"No yml configurations were found under {automodel_dir}/examples/{test_folder}")
 
     exempt_models = set(config_override.get("exempt_models") or [])
     exempt_configs = set(config_override.get("exempt_configs") or [])
