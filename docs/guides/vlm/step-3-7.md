@@ -4,10 +4,6 @@
 
 [stepfun-ai/Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is Stepfun AI's 198B-A13B Mixture-of-Experts vision-language model. It builds on the Step-3.5-Flash language architecture and adds native image and video understanding for agentic developer workflows.
 
-<p align="center">
-  <strong>[Image placeholder: Step-3.7-Flash benchmark, architecture overview, or training curve]</strong>
-</p>
-
 Step-3.7-Flash is positioned for agentic use cases where image or video context is part of the task. Target workflows include frontend development from mockups, data-processing tasks, screenshot-based debugging, and tool-calling agents that need stable structured outputs.
 
 To set up your environment to run NeMo AutoModel, follow the [installation guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
@@ -75,8 +71,16 @@ srun --output=output.out \
 
 ## Training Results
 
-Training results are pending.
+The SFT and LoRA training loss curves are shown below.
+
+**SFT**
 
 <p align="center">
-  <strong>[Image placeholder: Step-3.7-Flash training loss curve]</strong>
+  <img src="https://github.com/user-attachments/assets/303b1a02-53b6-4994-a3ac-7fd296f61761" alt="Step-3.7-Flash SFT training loss curve" width="700">
+</p>
+
+**LoRA**
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/5b0f011b-8130-498e-8678-1edf45586bae" alt="Step-3.7-Flash LoRA training loss curve" width="700">
 </p>
