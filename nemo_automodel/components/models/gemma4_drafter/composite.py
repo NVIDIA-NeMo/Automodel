@@ -94,8 +94,14 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             returned by ``NeMoAutoModelForCausalLM.from_pretrained``).
         drafter_loss_weight: Multiplier ``lambda`` applied to the drafter loss
             in the recipe.
-        drafter_num_steps: Number of recurrent drafter steps to run. Default 1
-            matches the released checkpoint, which is a one-step recurrent cell.
+        drafter_num_steps: Number of recurrent drafter steps K to run per
+            training batch. With K = 1 the composite is the EAGLE-1-style
+            single-step setup; with K > 1 the drafter runs autoregressively
+            for K rounds, feeding its previous-round ``last_hidden_state``
+            (already post-projected to H_b) and a teacher-forced shifted
+            token id back into itself, matching the Gemma 4 drafter blog's
+            recipe. ``shared_kv_states`` is captured from a single base
+            forward and reused at every round.
     """
 
     supports_gradient_checkpointing = True
@@ -120,10 +126,9 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         self.share_embedding_with_base = bool(share_embedding_with_base)
         self.base_activation_checkpointing = bool(base_activation_checkpointing)
 
-        if self.drafter_num_steps != 1:
-            raise NotImplementedError(
-                "Gemma4WithDrafter currently supports drafter_num_steps=1 (matches the "
-                f"released drafter's one-step recurrent cell). Got {self.drafter_num_steps}."
+        if self.drafter_num_steps < 1:
+            raise ValueError(
+                f"drafter_num_steps must be >= 1, got {self.drafter_num_steps}."
             )
 
         # Backbone hidden size used to build the drafter's pre-projection input.
@@ -164,6 +169,39 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             for p in self.base.parameters():
                 p.requires_grad_(False)
             logger.info("Gemma4WithDrafter: froze all base parameters (freeze_base_for_drafter=True).")
+
+        # Freeze drafter sub-modules whose parameters never receive gradient
+        # during joint SFT. Leaving them in the optimizer parameter group means
+        # AdamW skips them on every step and never creates the per-param
+        # ``step`` / ``exp_avg`` state. DCP then saves a checkpoint without
+        # those keys, and resuming a later run fails the optimizer-state
+        # planner with e.g.
+        # "Missing key in checkpoint state_dict: optim.state.drafter.<param>.step".
+        # ``build_optimizer`` filters on ``requires_grad``, so freezing keeps
+        # them out of the optimizer entirely and preserves resume parity.
+        #
+        # 1. ``post_projection`` (``H_d -> H_b``) produces the recurrent feedback
+        #    ``last_hidden_state`` consumed by drafter step k > 0. Only freeze it
+        #    when ``drafter_num_steps == 1`` because then its output is unused and
+        #    no gradient flows. For multi-step training every step k > 0 reads
+        #    its output, so leave it trainable.
+        # 2. ``masked_embedding.centroids`` (only present when
+        #    ``config.use_ordered_embeddings=True``) is fed into a ``torch.topk``
+        #    immediately, and topk's discrete index output blocks gradient flow
+        #    back to ``centroids.weight``. Always frozen regardless of K; the
+        #    released drafter's centroids are learned via K-means clustering of
+        #    the embedding table, not joint SFT.
+        if self.drafter_num_steps == 1:
+            post_proj = getattr(self.drafter, "post_projection", None)
+            if post_proj is not None:
+                for p in post_proj.parameters():
+                    p.requires_grad_(False)
+        masked_embedding = getattr(self.drafter, "masked_embedding", None)
+        if masked_embedding is not None:
+            centroids = getattr(masked_embedding, "centroids", None)
+            if centroids is not None:
+                for p in centroids.parameters():
+                    p.requires_grad_(False)
 
         if self.base_activation_checkpointing:
             enable_fn = getattr(self.base, "gradient_checkpointing_enable", None)
@@ -221,8 +259,12 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
                 the recipe's processor / checkpoint-config helpers (which read
                 this key from the model config) keep working.
             drafter_loss_weight: ``lambda`` multiplier on the drafter loss.
-            drafter_num_steps: Number of recurrent drafter steps. Currently
-                must be 1.
+            drafter_num_steps: Number of recurrent drafter steps K per batch.
+                ``K = 1`` is EAGLE-1-style single-step; ``K > 1`` matches the
+                Gemma 4 drafter blog's multi-token-prediction (MTP) training
+                recipe -- the drafter consumes its previous round's
+                post-projected hidden state plus a teacher-forced shifted
+                token id at every subsequent round.
             freeze_base_for_drafter: If True, freeze all base parameters so
                 only the drafter is trained (drafter-only sub-case). Default
                 False (joint training).
@@ -285,10 +327,16 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
                     "(the drafter's shared_kv_states path is not CP-safe). "
                     "Set `cp_size: 1` in the distributed config."
                 )
-        if torch_dtype is not None and torch_dtype != torch.bfloat16:
-            raise ValueError(
-                f"Gemma4WithDrafter requires torch_dtype=torch.bfloat16 (the drafter is bf16-only). Got {torch_dtype}."
-            )
+        # ``torch_dtype`` arrives either as a ``torch.dtype`` (when constructed
+        # in Python) or as a string like ``"torch.bfloat16"`` / ``"bfloat16"``
+        # (when the YAML loader hands it through verbatim). Accept both.
+        if torch_dtype is not None:
+            _accepted = (torch.bfloat16, "torch.bfloat16", "bfloat16")
+            if torch_dtype not in _accepted:
+                raise ValueError(
+                    f"Gemma4WithDrafter requires torch_dtype=torch.bfloat16 (the drafter is bf16-only). "
+                    f"Got {torch_dtype!r}."
+                )
 
         # Imported here to avoid a circular import at module load time.
         from nemo_automodel._transformers.auto_model import (
@@ -419,22 +467,62 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
 
         # The Gemma 4 input embedding already multiplies by sqrt(H_b) via
         # `Gemma4TextScaledWordEmbedding.embed_scale`, so we use its output as-is.
+        # The embed table is shared between base and drafter (per the Gemma 4
+        # drafter blog). We thread the base's table through every
+        # recurrent round.
         base_embed_layer = self.base.get_input_embeddings()
         if input_ids is None:
             raise ValueError("Gemma4WithDrafter.forward requires `input_ids` (drafter consumes them).")
-        embed = base_embed_layer(input_ids)
-        inputs_embeds = torch.cat([embed, h_final], dim=-1)
 
-        drafter_out = self.drafter(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            shared_kv_states=shared_kv,
-        )
+        # ------------------------------------------------------------------
+        # Recurrent drafter rounds (k = 0 .. K-1)
+        # ------------------------------------------------------------------
+        # Round 0: token-side  = embed(input_ids[t])
+        #          backbone    = base.h_final[t]                  (H_b)
+        # Round k>=1:
+        #          token-side  = embed(input_ids[t + k])          (teacher forced)
+        #          backbone    = prev_drafter.last_hidden_state[t]
+        #                        (already post-projected to H_b)
+        #
+        # ``shared_kv_states`` is captured once from the base forward and
+        # reused at every round since the drafter cross-attends to the target
+        # KV cache rather than building its own. ``position_ids`` and the
+        # token-side ``attention_mask`` are likewise constant across rounds.
+        drafter_logits_list: list[torch.Tensor] = []
+        prev_last_hidden_state: Optional[torch.Tensor] = None
+        for k in range(self.drafter_num_steps):
+            if k == 0:
+                embed_k = base_embed_layer(input_ids)
+                backbone_k = h_final
+            else:
+                # Build the teacher-forced shifted token ids: position t of
+                # round k holds ``input_ids[t + k]`` so the drafter is asked to
+                # predict ``input_ids[t + k + 1]``. The trailing ``k`` positions
+                # have no defined source token; fill with 0 -- the recipe's
+                # ``_shift_labels_left`` already pads the same positions with
+                # ``-100`` so the CE loss ignores them.
+                shifted_ids = torch.zeros_like(input_ids)
+                if k < input_ids.size(-1):
+                    shifted_ids[..., : input_ids.size(-1) - k] = input_ids[..., k:]
+                embed_k = base_embed_layer(shifted_ids)
+                backbone_k = prev_last_hidden_state  # type: ignore[assignment]
+
+            inputs_embeds_k = torch.cat([embed_k, backbone_k], dim=-1)
+            drafter_out_k = self.drafter(
+                inputs_embeds=inputs_embeds_k,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                shared_kv_states=shared_kv,
+            )
+            drafter_logits_list.append(drafter_out_k.logits)
+            # ``Gemma4AssistantForCausalLM.forward`` already applies
+            # ``post_projection`` and returns the result as
+            # ``last_hidden_state`` (it is H_b-dim, ready to feed back).
+            prev_last_hidden_state = drafter_out_k.last_hidden_state
 
         return Gemma4JointOutput(
             logits=logits_base,
-            drafter_logits=[drafter_out.logits],
+            drafter_logits=drafter_logits_list,
             drafter_loss_weight=self.drafter_loss_weight,
             hidden_states=hidden_states,
         )
@@ -509,6 +597,43 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
             peft_config=None,
             tokenizer=tokenizer,
         )
+
+    def load_pretrained(
+        self,
+        load_directory: str,
+        checkpointer: Optional["Checkpointer"] = None,
+        **kwargs,
+    ) -> None:
+        """Load weights from the two-subdir layout written by ``save_pretrained``.
+
+        Mirrors the save side: reads ``<load_directory>/base/model`` and
+        ``<load_directory>/drafter/model`` (the standard ``Checkpointer.save_model``
+        output layout) and routes them to ``self.base`` and ``self.drafter``
+        respectively. Used by the recipe's resume path when a checkpoint
+        directory was produced by this composite.
+
+        Args:
+            load_directory: A checkpoint directory containing ``base/`` and
+                ``drafter/`` sub-directories (e.g. ``<ckpt_dir>/epoch_X_step_Y``).
+            checkpointer: The recipe's :class:`Checkpointer` instance.
+            **kwargs: Reserved; ignored.
+        """
+        if checkpointer is None:
+            raise ValueError(
+                "Gemma4WithDrafter.load_pretrained requires `checkpointer`. The recipe "
+                "should pass its `self.checkpointer` instance."
+            )
+        base_model_dir = os.path.join(load_directory, "base", "model")
+        drafter_model_dir = os.path.join(load_directory, "drafter", "model")
+        for path, name in ((base_model_dir, "base"), (drafter_model_dir, "drafter")):
+            if not os.path.isdir(path):
+                raise FileNotFoundError(
+                    f"Gemma4WithDrafter.load_pretrained: expected sub-checkpoint at {path} "
+                    f"(produced by save_pretrained). Resuming a joint composite from a "
+                    f"non-composite checkpoint is not supported."
+                )
+        checkpointer.load_model(self.base, base_model_dir)
+        checkpointer.load_model(self.drafter, drafter_model_dir)
 
 
 __all__ = ["Gemma4JointOutput", "Gemma4WithDrafter"]
