@@ -61,15 +61,20 @@ def _ensure_fake_wandb():
 
 def test_log_train_metrics_calls_mlflow(monkeypatch):
     # Defer import until after fake wandb is in place
+    import mlflow
+
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+
+    # Recipe now calls module-level mlflow.log_metrics directly, gated by mlflow.active_run()
+    log_metrics_mock = Mock()
+    monkeypatch.setattr(mlflow, "active_run", lambda: object())
+    monkeypatch.setattr(mlflow, "log_metrics", log_metrics_mock)
 
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
     # Minimal attributes required by the method
     recipe.dist_env = types.SimpleNamespace(is_main=True)
     recipe.step_scheduler = types.SimpleNamespace(step=7, is_remote_logging_step=True)
     recipe.metric_logger_train = types.SimpleNamespace(log=lambda x: None)
-    mlflow_mock = Mock()
-    recipe.mlflow_logger = types.SimpleNamespace(log_metrics=mlflow_mock)
     recipe.comet_logger = None
 
     # Avoid cuda calls on environments without GPUs
@@ -92,20 +97,24 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
     )
     recipe.log_train_metrics(log_data)
 
-    mlflow_mock.assert_called_once()
-    args, kwargs = mlflow_mock.call_args
+    log_metrics_mock.assert_called_once()
+    args, kwargs = log_metrics_mock.call_args
     # First arg is a flat dict of metrics + step/epoch/timestamp
     assert isinstance(args[0], dict) and kwargs.get("step") == log_data.step
 
 
 def test_log_val_metrics_calls_mlflow(monkeypatch):
     # Defer import until after fake wandb is in place
+    import mlflow
+
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+
+    log_metrics_mock = Mock()
+    monkeypatch.setattr(mlflow, "active_run", lambda: object())
+    monkeypatch.setattr(mlflow, "log_metrics", log_metrics_mock)
 
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg=None)
     recipe.dist_env = types.SimpleNamespace(is_main=True)
-    mlflow_mock = Mock()
-    recipe.mlflow_logger = types.SimpleNamespace(log_metrics=mlflow_mock)
     recipe.comet_logger = None
     # No JSONL logger passed (None) to keep test minimal
 
@@ -114,6 +123,6 @@ def test_log_val_metrics_calls_mlflow(monkeypatch):
     )
     recipe.log_val_metrics("default", log_data, metric_logger=None)
 
-    mlflow_mock.assert_called_once()
-    args, kwargs = mlflow_mock.call_args
+    log_metrics_mock.assert_called_once()
+    args, kwargs = log_metrics_mock.call_args
     assert isinstance(args[0], dict) and kwargs.get("step") == log_data.step

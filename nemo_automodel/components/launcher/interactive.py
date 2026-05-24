@@ -63,7 +63,7 @@ _INSTALL_MSG = (
     "  pip install nemo_automodel[all]     # with CUDA & all extras\n\n"
     "For SLURM clusters, use sbatch with the reference slurm.sub script.\n"
     "For SkyPilot or NeMo-Run, add a skypilot: or nemo_run: section to your YAML.\n\n"
-    "See: https://github.com/NVIDIA/NeMo-Automodel#readme"
+    "See: https://github.com/NVIDIA-NeMo/Automodel#readme"
 )
 
 

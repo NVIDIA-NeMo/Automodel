@@ -93,6 +93,10 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
     "image_grid_hws",
     "image_grid_thw",
     "image_sizes",
+    "patch_pixel_values",
+    "num_patches",
+    "patch_newline_mask",
+    "image_embeds",
     # Video
     "pixel_values_videos",
     # Audio / sound
@@ -123,6 +127,30 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
     if dropped:
         logger.debug("Dropping unsupported forward kwargs for %s: %s", type(model).__name__, dropped)
     return filtered
+
+
+def get_lm_head_module(model: nn.Module) -> nn.Module | None:
+    """Return the model's LM head module, if one can be found."""
+    if hasattr(model, "get_output_embeddings"):
+        lm_head = model.get_output_embeddings()
+        if lm_head is not None:
+            return lm_head
+    for name, module in model.named_modules():
+        if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
+            return module
+    return None
+
+
+def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
+    """Return the model's LM-head weight, materializing DTensor weights when needed."""
+    lm_head = get_lm_head_module(model)
+    if lm_head is not None:
+        weight = lm_head.weight
+        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if "lm_head" in name and name.endswith(".weight"):
+            return param.full_tensor() if hasattr(param, "full_tensor") else param
+    raise ValueError("lm_head.weight not found in model")
 
 
 def _get_logical_numel(param) -> int:
@@ -359,6 +387,22 @@ def freeze_unused_kv_sharing_params(model):
             num_hidden - 1,
             num_kv_shared,
         )
+
+
+def freeze_deepseek_v4_indexer_params(model):
+    """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return
+
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if ".self_attn.compressor.indexer." in name:
+            param.requires_grad_(False)
+            frozen_count += 1
+
+    if frozen_count > 0:
+        logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
 
 
 def cast_mixed_dtype_params_to_bf16(model):
