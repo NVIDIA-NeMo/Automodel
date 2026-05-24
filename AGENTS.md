@@ -219,6 +219,7 @@ file gives step-by-step instructions an AI agent can follow.
 | 8 | cicd                     | `cicd`                     | Commit/PR workflow, CI trigger mechanism, failure investigation |
 | 9 | testing                  | `testing`                  | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
 | 10 | fern-docs               | `fern-docs`                | Maintain the Fern docs site under `fern/` — pages, slugs, redirects, version aliases, library reference |
+| 11 | automodel-researcher     | `automodel-researcher`     | Autonomous fine-tuning experiment loops for minimizing validation loss |
 
 **Always read the relevant `SKILL.md` before starting any task it covers —
 skills are mandatory context, not optional background reading.**
