@@ -33,7 +33,7 @@ model:
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: te
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
