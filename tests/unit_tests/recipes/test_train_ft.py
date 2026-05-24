@@ -305,7 +305,7 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
         "is_async": True,
     }
 
-    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.checkpoint.config_builder"):
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.recipes.llm.train_ft"):
         config = build_checkpoint_config(
             cfg_ckpt=cfg_ckpt,
             cache_dir=None,
@@ -659,6 +659,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             self.epochs = [0]
             self.is_val_step = False
             self.is_ckpt_step = False
+            self.sigterm_flag = False
 
         def set_epoch(self, epoch):
             self.epoch = epoch
