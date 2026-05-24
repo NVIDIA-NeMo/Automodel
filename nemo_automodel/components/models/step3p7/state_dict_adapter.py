@@ -26,6 +26,13 @@ from nemo_automodel.components.models.step3p5.state_dict_adapter import Step3p5S
 from nemo_automodel.components.moe.config import MoEConfig
 
 
+def _mtp_layer_range(config: Any) -> tuple[int, int]:
+    text_config = getattr(config, "text_config", config)
+    start = int(getattr(text_config, "mtp_base_layer_idx", getattr(text_config, "num_hidden_layers", 0)) or 0)
+    depth = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
+    return start, start + depth
+
+
 class Step3p7StateDictAdapter(StateDictAdapter):
     """Adapter for Step3.7 VLM checkpoints.
 
@@ -68,6 +75,8 @@ class Step3p7StateDictAdapter(StateDictAdapter):
 
     @staticmethod
     def _to_native_text_key(key: str) -> str:
+        if key.startswith("mtp."):
+            return key
         if key.startswith("model."):
             return "model.language_model." + key[len("model.") :]
         if key.startswith("language_model."):
@@ -95,6 +104,27 @@ class Step3p7StateDictAdapter(StateDictAdapter):
             return key[len("model.") :]
         return key
 
+    def _map_mtp_from_hf(self, key: str) -> str | None:
+        match = re.match(r"(?:(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.(?P<suffix>.+)", key)
+        if match is None:
+            return None
+
+        mtp_start, mtp_end = _mtp_layer_range(self.config)
+        layer_idx = int(match.group("layer"))
+        if mtp_start <= layer_idx < mtp_end:
+            depth = layer_idx - mtp_start
+            return f"mtp.layers.{depth}.{match.group('suffix')}"
+        return None
+
+    def _map_mtp_to_hf(self, key: str) -> str | None:
+        match = re.match(r"mtp\.layers\.(?P<depth>\d+)\.(?P<suffix>.+)", key)
+        if match is None:
+            return None
+
+        mtp_start, _ = _mtp_layer_range(self.config)
+        layer_idx = mtp_start + int(match.group("depth"))
+        return f"model.layers.{layer_idx}.{match.group('suffix')}"
+
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
@@ -105,6 +135,11 @@ class Step3p7StateDictAdapter(StateDictAdapter):
         native: dict[str, Any] = {}
 
         for key, value in hf_state_dict.items():
+            mtp_key = self._map_mtp_from_hf(key)
+            if mtp_key is not None:
+                native[mtp_key] = value
+                continue
+
             if self._is_text_key(key):
                 text_hf[self._to_text_hf_key(key)] = value
                 continue
@@ -145,6 +180,11 @@ class Step3p7StateDictAdapter(StateDictAdapter):
         **kwargs: Any,
     ) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex")
+        mtp_key = self._map_mtp_to_hf(fqn)
+        if mtp_key is not None:
+            if exclude_key_regex and re.match(exclude_key_regex, mtp_key):
+                return []
+            return [(mtp_key, tensor)]
         if fqn.startswith("model.language_model."):
             text_key = "model." + fqn[len("model.language_model.") :]
             return self.text_adapter.convert_single_tensor_to_hf(text_key, tensor, **kwargs)

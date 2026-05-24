@@ -8,18 +8,23 @@ from nemo_automodel.components.models.step3p7.state_dict_adapter import Step3p7S
 from nemo_automodel.components.moe.config import MoEConfig
 
 
-def _adapter(dtype=torch.float32):
+def _adapter(dtype=torch.float32, num_nextn_predict_layers=0, mtp_base_layer_idx=None):
+    text_config = {
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "moe_intermediate_size": 2,
+        "moe_num_experts": 3,
+        "moe_top_k": 1,
+        "num_hidden_layers": 1,
+        "num_nextn_predict_layers": num_nextn_predict_layers,
+        "vocab_size": 16,
+        "head_dim": 2,
+    }
+    if mtp_base_layer_idx is not None:
+        text_config["mtp_base_layer_idx"] = mtp_base_layer_idx
+
     config = Step3p7Config(
-        text_config={
-            "hidden_size": 4,
-            "intermediate_size": 8,
-            "moe_intermediate_size": 2,
-            "moe_num_experts": 3,
-            "moe_top_k": 1,
-            "num_hidden_layers": 1,
-            "vocab_size": 16,
-            "head_dim": 2,
-        }
+        text_config=text_config,
     )
     moe_config = MoEConfig(
         dim=4,
@@ -135,6 +140,41 @@ def test_to_hf_maps_text_and_non_text_keys_with_exclude_filter():
     assert "vision_model.conv.weight" not in hf
     assert "vit_large_projector.weight" in hf
     assert "other.weight" in hf
+
+
+def test_from_hf_maps_step37_mtp_layers_in_step37_adapter():
+    adapter = _adapter(dtype=torch.float32, num_nextn_predict_layers=2, mtp_base_layer_idx=1)
+    base_norm = torch.ones(4)
+    mtp_enorm = torch.randn(4)
+    mtp_head = torch.randn(16, 4)
+
+    native = adapter.from_hf(
+        {
+            "model.layers.0.input_layernorm.weight": base_norm,
+            "model.layers.1.enorm.weight": mtp_enorm,
+            "model.layers.2.transformer.shared_head.output.weight": mtp_head,
+        }
+    )
+
+    assert native["model.language_model.layers.0.input_layernorm.weight"] is base_norm
+    assert native["mtp.layers.0.enorm.weight"] is mtp_enorm
+    assert native["mtp.layers.1.transformer.shared_head.output.weight"] is mtp_head
+
+
+def test_to_hf_maps_step37_mtp_layers_in_step37_adapter():
+    adapter = _adapter(dtype=torch.float32, num_nextn_predict_layers=2, mtp_base_layer_idx=1)
+    mtp_enorm = torch.randn(4)
+    mtp_head = torch.randn(16, 4)
+
+    hf = adapter.to_hf(
+        {
+            "mtp.layers.0.enorm.weight": mtp_enorm,
+            "mtp.layers.1.transformer.shared_head.output.weight": mtp_head,
+        }
+    )
+
+    assert hf["model.layers.1.enorm.weight"] is mtp_enorm
+    assert hf["model.layers.2.transformer.shared_head.output.weight"] is mtp_head
 
 
 def test_convert_single_tensor_to_hf_passthrough_and_exclude():

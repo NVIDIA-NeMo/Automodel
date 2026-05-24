@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import (
+    Step3p5VConfig,
     Step3p7Config,
     Step3p7TextConfig,
     StepRoboticsVisionEncoderConfig,
@@ -62,6 +63,30 @@ def test_text_config_normalizes_layer_values_and_torch_dtype():
     assert config.to_dict()["torch_dtype"] == "bfloat16"
 
 
+def test_text_config_preserves_explicit_mtp_base_layer_idx():
+    config = Step3p7TextConfig(
+        num_hidden_layers=4,
+        num_nextn_predict_layers=2,
+        mtp_base_layer_idx=6,
+        layer_types=[
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+        ],
+        swiglu_limits=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    )
+
+    assert config.mtp_base_layer_idx == 6
+    assert config.layer_types == ["full_attention", "sliding_attention", "full_attention", "sliding_attention"]
+    assert config.mtp_layer_types == ["full_attention", "sliding_attention"]
+    assert config.mtp_swiglu_limits == [6.0, 7.0]
+
+
 def test_normalize_per_layer_values_branches():
     assert _normalize_per_layer_values(None, 2) is None
     assert _normalize_per_layer_values([], 2) == []
@@ -85,6 +110,14 @@ def test_step3p7_config_builds_nested_defaults_and_json_safe_dict():
     assert config.hidden_size == config.text_config.hidden_size
     assert config.max_position_embeddings == config.text_config.max_position_embeddings
     assert config.to_dict()["dtype"] == "float16"
+    assert config.model_type == "step3p7"
+
+
+def test_step3p5v_config_preserves_legacy_model_type():
+    config = Step3p5VConfig()
+
+    assert isinstance(config, Step3p7Config)
+    assert config.model_type == "step3p5v"
 
 
 def test_step3p7_config_accepts_dicts_and_existing_text_config():

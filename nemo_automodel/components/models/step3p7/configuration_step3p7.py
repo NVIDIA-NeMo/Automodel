@@ -73,6 +73,8 @@ class Step3p7TextConfig(PretrainedConfig):
         num_attention_heads: int = 64,
         num_attention_groups: int = 8,
         num_hidden_layers: int = 45,
+        num_nextn_predict_layers: int = 0,
+        mtp_base_layer_idx: Optional[int] = None,
         max_seq_len: int = 128000,
         vocab_size: int = 128815,
         rms_norm_eps: float = 1e-5,
@@ -147,10 +149,19 @@ class Step3p7TextConfig(PretrainedConfig):
         **kwargs,
     ) -> None:
         torch_dtype = kwargs.get("torch_dtype")
+        raw_layer_types = list(layer_types) if layer_types is not None else None
+        raw_swiglu_limits = list(swiglu_limits) if swiglu_limits is not None else None
+        raw_swiglu_limits_shared = list(swiglu_limits_shared) if swiglu_limits_shared is not None else None
+        raw_partial_rotary_factors = kwargs.get("partial_rotary_factors")
+        raw_partial_rotary_factors = (
+            list(raw_partial_rotary_factors) if raw_partial_rotary_factors is not None else None
+        )
+        raw_rope_theta = list(rope_theta) if isinstance(rope_theta, list) else None
+        raw_use_rope_layers = list(use_rope_layers) if use_rope_layers is not None else None
         layer_types = _normalize_per_layer_values(layer_types, num_hidden_layers)
         swiglu_limits = _normalize_per_layer_values(swiglu_limits, num_hidden_layers)
         swiglu_limits_shared = _normalize_per_layer_values(swiglu_limits_shared, num_hidden_layers)
-        partial_rotary_factors = kwargs.get("partial_rotary_factors")
+        partial_rotary_factors = raw_partial_rotary_factors
         kwargs["partial_rotary_factors"] = _normalize_per_layer_values(partial_rotary_factors, num_hidden_layers)
         if isinstance(rope_theta, list):
             rope_theta = _normalize_per_layer_values(rope_theta, num_hidden_layers)
@@ -165,6 +176,10 @@ class Step3p7TextConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_attention_groups = num_attention_groups
         self.num_hidden_layers = num_hidden_layers
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        if mtp_base_layer_idx is None:
+            mtp_base_layer_idx = num_hidden_layers
+        self.mtp_base_layer_idx = int(mtp_base_layer_idx)
         self.max_seq_len = max_seq_len
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
@@ -191,6 +206,24 @@ class Step3p7TextConfig(PretrainedConfig):
         self.swiglu_limits = swiglu_limits
         self.swiglu_limits_shared = swiglu_limits_shared
         self.use_rope_layers = use_rope_layers
+        self.mtp_layer_types = _slice_mtp_per_layer_values(
+            raw_layer_types, self.mtp_base_layer_idx, num_nextn_predict_layers, "sliding_attention"
+        )
+        self.mtp_swiglu_limits = _slice_mtp_per_layer_values(
+            raw_swiglu_limits, self.mtp_base_layer_idx, num_nextn_predict_layers, 0.0
+        )
+        self.mtp_swiglu_limits_shared = _slice_mtp_per_layer_values(
+            raw_swiglu_limits_shared, self.mtp_base_layer_idx, num_nextn_predict_layers, 0.0
+        )
+        self.mtp_partial_rotary_factors = _slice_mtp_per_layer_values(
+            raw_partial_rotary_factors, self.mtp_base_layer_idx, num_nextn_predict_layers, 1.0
+        )
+        self.mtp_rope_theta = _slice_mtp_per_layer_values(
+            raw_rope_theta, self.mtp_base_layer_idx, num_nextn_predict_layers, 10000.0
+        )
+        self.mtp_use_rope_layers = _slice_mtp_per_layer_values(
+            raw_use_rope_layers, self.mtp_base_layer_idx, num_nextn_predict_layers, True
+        )
         self.yarn_only_types = yarn_only_types
         super().__init__(**kwargs)
         if torch_dtype is not None:
@@ -220,12 +253,29 @@ def _normalize_per_layer_values(
     return normalized
 
 
+def _slice_mtp_per_layer_values(
+    values: Optional[Sequence[Any]],
+    num_hidden_layers: int,
+    num_nextn_predict_layers: int,
+    default: Any,
+) -> list[Any]:
+    if num_nextn_predict_layers <= 0:
+        return []
+    if values is None:
+        return [default] * num_nextn_predict_layers
+    values = list(values)
+    start = min(num_hidden_layers, len(values))
+    mtp_values = values[start : start + num_nextn_predict_layers]
+    if len(mtp_values) < num_nextn_predict_layers:
+        fill = values[-1] if values else default
+        mtp_values.extend([fill] * (num_nextn_predict_layers - len(mtp_values)))
+    return mtp_values
+
+
 class Step3p7Config(PretrainedConfig):
     """Top-level configuration for Step3.7 vision-language checkpoints."""
 
-    # This loader is a compatibility shim for original Step VL checkpoints
-    # whose top-level config model_type is `step3p5v`.
-    model_type = "step3p5v"
+    model_type = "step3p7"
 
     def __init__(
         self,
@@ -271,3 +321,9 @@ class Step3p7Config(PretrainedConfig):
 
     def to_dict(self):
         return _json_safe_value(super().to_dict())
+
+
+class Step3p5VConfig(Step3p7Config):
+    """Compatibility config for original Step VLM checkpoints using ``step3p5v``."""
+
+    model_type = "step3p5v"

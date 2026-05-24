@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -23,9 +24,12 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.mtp import roll_tensor
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.model import Step3p5Model
 from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
+from nemo_automodel.components.models.step3p7.mtp import build_mtp_config_from_hf, build_step3p5_mtp
 from nemo_automodel.components.models.step3p7.state_dict_adapter import Step3p7StateDictAdapter
 from nemo_automodel.components.models.step3p7.vision_encoder import StepRoboticsVisionEncoder
 from nemo_automodel.components.moe.config import MoEConfig
@@ -34,6 +38,15 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Step3p7CausalLMOutput:
+    """Step3.7 CausalLM output with optional per-depth MTP logits."""
+
+    logits: torch.Tensor
+    mtp_per_depth_logits: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 def _debug_vision_enabled() -> bool:
@@ -293,6 +306,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     _keep_in_fp32_modules = ["rotary_emb"]
 
     _pp_keep_self_forward: bool = True
+    mtp_outputs_are_logits = True
 
     @classmethod
     def from_config(
@@ -325,6 +339,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         self.config = config
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
+        mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = Step3p7Model(
             config,
             backend=self.backend,
@@ -339,13 +354,26 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = getattr(config.text_config, "pad_token_id", None)
+        dtype = get_dtype(getattr(config.text_config, "torch_dtype", "bfloat16"), torch.bfloat16)
+
+        self.mtp_config = build_mtp_config_from_hf(config.text_config, loss_scaling_factor=mtp_loss_scaling_factor)
+        if self.mtp_config.enabled:
+            self.mtp = build_step3p5_mtp(
+                config=config.text_config,
+                mtp_config=self.mtp_config,
+                backend=self.backend,
+                moe_config=self.model.moe_config,
+                dtype=dtype,
+            )
+        else:
+            self.mtp = None
 
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Step3p7StateDictAdapter(
                 self.config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(getattr(config.text_config, "torch_dtype", "bfloat16"), torch.bfloat16),
+                dtype=dtype,
             )
 
     @property
@@ -374,6 +402,71 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     def get_decoder(self):
         return self.model.get_decoder()
 
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+        if self.mtp is not None and "mtp" not in stage_modules[-1]:
+            stage_modules[-1].append("mtp")
+        return stage_modules
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        hidden_shape = (microbatch_size, seq_len, self.config.text_config.hidden_size)
+        vocab_shape = (microbatch_size, seq_len, self.config.text_config.vocab_size)
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+
+        def meta(shape: tuple[int, ...]) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=dtype)
+
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = (meta(hidden_shape), *(meta(hidden_shape) for _ in range(mtp_depth)))
+
+        primary_shape = vocab_shape if self.lm_head is not None else hidden_shape
+        mtp_shape = vocab_shape if self.lm_head is not None else hidden_shape
+        outputs_meta = (meta(primary_shape), *(meta(mtp_shape) for _ in range(mtp_depth)))
+        return inputs_meta, outputs_meta
+
+    def _is_pipeline_parallel_stage(self) -> bool:
+        if self.lm_head is None:
+            return True
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is None:
+            return False
+        if getattr(language_model, "embed_tokens", None) is None:
+            return True
+        if not hasattr(language_model, "layers"):
+            return False
+        try:
+            return len(language_model.layers) != int(self.config.text_config.num_hidden_layers)
+        except TypeError:
+            return False
+
+    def _build_mtp_embed_inputs_from_embeds(self, inputs_embeds: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        cur_embeds = inputs_embeds
+        embed_inputs = []
+        for _ in range(self.mtp_config.num_layers):
+            cur_embeds = roll_tensor(cur_embeds, shifts=-1, dim=1)
+            embed_inputs.append(cur_embeds)
+        return tuple(embed_inputs)
+
+    def _make_position_ids(self, hidden: torch.Tensor, position_ids: torch.Tensor | None) -> torch.Tensor:
+        if position_ids is not None:
+            return position_ids
+        return torch.arange(hidden.shape[1], device=hidden.device).unsqueeze(0).expand(hidden.shape[0], -1)
+
     def prepare_model_inputs_for_cp(
         self,
         input_ids: torch.Tensor,
@@ -397,7 +490,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
-        *,
+        *mtp_embed_inputs: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
@@ -409,6 +502,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             if input_ids is None:
                 raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
             return self.prepare_model_inputs_for_cp(input_ids=input_ids, **kwargs)
+
+        is_pp_stage = self._is_pipeline_parallel_stage()
+        pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
+        use_mtp = self.mtp is not None and self.training
 
         pixel_values = kwargs.get("pixel_values", None)
         has_image_tokens = (
@@ -473,6 +570,24 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if self.backend.attn == "te" and attention_mask is not None:
             attention_mask = None
 
+        need_mtp_source_embeds = (use_mtp or (pp_mtp_enabled and self.lm_head is None)) and not mtp_embed_inputs
+        if need_mtp_source_embeds and inputs_embeds is None and input_ids is not None:
+            if input_ids.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                inputs_embeds = input_ids
+            elif getattr(self.model.language_model, "embed_tokens", None) is not None:
+                multimodal_embeddings = self.model.get_multimodal_embeddings(
+                    pixel_values=kwargs.get("pixel_values", None),
+                    patch_pixel_values=kwargs.get("patch_pixel_values", None),
+                    num_patches=kwargs.get("num_patches", None),
+                    image_embeds=kwargs.get("image_embeds", None),
+                )
+                inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
+
+        if pp_mtp_enabled and self.lm_head is None and not mtp_embed_inputs:
+            if inputs_embeds is None:
+                raise ValueError("First PP stage requires input_ids or inputs_embeds to build MTP embeddings.")
+            mtp_embed_inputs = self._build_mtp_embed_inputs_from_embeds(inputs_embeds)
+
         hidden_states = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -482,7 +597,57 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         )
 
         logits = self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
-        return logits
+
+        if pp_mtp_enabled and self.lm_head is None:
+            return (logits, *mtp_embed_inputs)
+
+        mtp_per_depth_logits = None
+        if use_mtp:
+            if is_pp_stage and not mtp_embed_inputs:
+                raise ValueError("Final PP stage requires propagated MTP embeddings")
+            position_ids = self._make_position_ids(hidden_states, position_ids)
+            freqs_cis = position_ids_to_freqs_cis(
+                self.model.language_model.rotary_emb,
+                position_ids,
+                qkv_format=kwargs.get("qkv_format", "bshd"),
+                for_fused_rope=self.backend.rope_fusion,
+                cp_size=kwargs.get("cp_size", 1),
+            )
+            mtp_kwargs = {
+                "hidden_states": hidden_states,
+                "freqs_cis": freqs_cis,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "padding_mask": padding_mask,
+            }
+            if mtp_embed_inputs:
+                mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
+            elif inputs_embeds is not None:
+                mtp_kwargs["embed_inputs"] = self._build_mtp_embed_inputs_from_embeds(inputs_embeds)
+            else:
+                mtp_kwargs["input_ids"] = input_ids
+                mtp_kwargs["embed_fn"] = self.model.language_model.embed_tokens
+            mtp_per_depth_logits = self.mtp(**mtp_kwargs)
+        elif pp_mtp_enabled and self.lm_head is not None:
+            mtp_per_depth_logits = [
+                logits.new_empty(logits.shape) for _ in range(int(getattr(self.mtp_config, "num_layers", 0) or 0))
+            ]
+
+        if is_pp_stage:
+            if pp_mtp_enabled:
+                if self.training and self.mtp is None:
+                    raise ValueError("Final PP stage has MTP enabled but does not own the MTP module")
+                return (logits, *mtp_per_depth_logits)
+            return logits
+
+        if mtp_per_depth_logits is None:
+            return logits
+
+        return Step3p7CausalLMOutput(
+            logits=logits,
+            mtp_per_depth_logits=mtp_per_depth_logits,
+            mtp_loss_scaling_factor=self.mtp_config.loss_scaling_factor,
+        )
 
     @torch.no_grad()
     def initialize_weights(
@@ -506,6 +671,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                     a=-cutoff_factor * final_out_std,
                     b=cutoff_factor * final_out_std,
                 )
+            if self.mtp is not None:
+                for sublayer in self.mtp.layers:
+                    sublayer.init_weights(buffer_device=buffer_device)
 
         cast_model_to_dtype(self, dtype)
         with buffer_device:

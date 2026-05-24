@@ -30,6 +30,14 @@ model:
   pretrained_model_name_or_path: stepfun-ai/Step-3.7-Flash
   trust_remote_code: false
   torch_dtype: bfloat16
+  text_config:
+    # Keep standard finetuning MTP-free by default. Set to 3 to enable
+    # Step3.7 MTP training with the auxiliary loss below, for example:
+    #   --model.text_config.num_nextn_predict_layers=3
+    num_nextn_predict_layers: 0
+  # Keep finetuning conservative unless explicitly reproducing MTP pretraining.
+  # Override this with --model.mtp_loss_scaling_factor=<factor> if needed.
+  mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

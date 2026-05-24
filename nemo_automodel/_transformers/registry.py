@@ -220,7 +220,8 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
-    "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
+    "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
+    "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
 

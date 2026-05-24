@@ -70,9 +70,11 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -783,6 +785,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
 
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
@@ -1029,12 +1033,38 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                    hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=out.mtp_loss_scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                    )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
