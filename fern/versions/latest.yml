@@ -19,9 +19,6 @@ navigation:
       - page: "Repository Structure"
         path: ./v0.4/pages/repository-structure.mdx
         slug: repo-structure
-      - page: "Release Notes"
-        path: ./v0.4/pages/release-notes.mdx
-        slug: release-notes
   - section: "Announcements"
     contents:
       - page: "Announcements"
@@ -60,8 +57,6 @@ navigation:
             path: ./v0.4/pages/model-coverage/llm/qwen/qwen3-moe.mdx
           - page: "Qwen3-Next"
             path: ./v0.4/pages/model-coverage/llm/qwen/qwen3-next.mdx
-          - page: "ERNIE 4.5"
-            path: ./v0.4/pages/model-coverage/llm/baidu/ernie4-5.mdx
           - page: "DeepSeek"
             path: ./v0.4/pages/model-coverage/llm/deepseek-ai/deepseek.mdx
           - page: "DeepSeek-V3"
@@ -154,10 +149,6 @@ navigation:
             path: ./v0.4/pages/model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
             path: ./v0.4/pages/model-coverage/llm/tencent/hy3.mdx
-          - page: "MiMo-V2-Flash"
-            path: ./v0.4/pages/model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
-          - page: "Ling 2.0"
-            path: ./v0.4/pages/model-coverage/llm/inclusionai/ling-2.mdx
       - section: "Vision Language Models (VLMs)"
         slug: vision-language-models
         contents:
@@ -316,7 +307,7 @@ navigation:
       - page: "Run on a Cluster"
         path: ./v0.4/pages/launcher/slurm.mdx
         slug: slurm-cluster
-      - page: "Run with NeMo Run"
+      - page: "Run with NeMo-Run"
         path: ./v0.4/pages/launcher/nemo-run.mdx
         slug: nemo-run
       - page: "Run on Any Cloud with SkyPilot"
