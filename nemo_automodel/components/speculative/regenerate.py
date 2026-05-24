@@ -357,12 +357,8 @@ def _iter_samples(
     messages_column: str,
 ) -> Any:
     """Yield rows' ``messages_column`` from an HF dataset or a list of dicts."""
-    if hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__"):
-        for row in dataset:
-            yield row[messages_column]
-    else:
-        for row in dataset:
-            yield row[messages_column]
+    for row in dataset:
+        yield row[messages_column]
 
 
 async def _run(args: argparse.Namespace) -> int:

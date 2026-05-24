@@ -24,6 +24,7 @@ import pytest
 from nemo_automodel.components.speculative.regenerate import (
     GenerationConfig,
     _build_manifest,
+    _chat_completion,
     _ensure_manifest_compatible,
     _existing_shard_indices,
     _extract_prompt_messages,
@@ -487,3 +488,66 @@ def test_run_resume_skips_already_written_shards(tmp_path: Path, monkeypatch):
     # Shard 0 must be byte-identical to the first pass.
     assert (tmp_path / "shard-000000.parquet").read_bytes() == shard0_bytes_before
     assert (tmp_path / "shard-000000.parquet").stat().st_mtime_ns == shard0_mtime_before
+
+
+class _SequentialSession:
+    """Returns a pre-defined sequence of _FakeResponse objects, one per POST call."""
+
+    def __init__(self, responses: list[_FakeResponse]):
+        self._responses = iter(responses)
+        self.call_count = 0
+
+    def post(self, url, *, json, timeout=None):  # noqa: A002
+        self.call_count += 1
+        return next(self._responses)
+
+
+def test_chat_completion_retries_on_5xx_then_succeeds(monkeypatch):
+    """_chat_completion must retry on 5xx and return the content on eventual success."""
+    import nemo_automodel.components.speculative.regenerate as regen
+
+    sleep_calls: list[float] = []
+
+    async def fast_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(regen.asyncio, "sleep", fast_sleep)
+
+    success_payload = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    session = _SequentialSession(
+        [
+            _FakeResponse({}, status=500),  # attempt 0 → retry
+            _FakeResponse({}, status=429),  # attempt 1 → retry
+            _FakeResponse(success_payload, status=200),  # attempt 2 → success
+        ]
+    )
+
+    result = asyncio.run(_chat_completion(session, "http://stub/completions", {}, timeout_s=1.0, max_retries=3))
+
+    assert result == "ok"
+    assert session.call_count == 3
+    assert len(sleep_calls) == 2  # slept once after each failed attempt
+    assert sleep_calls[0] == 1.0  # 2**0 = 1
+    assert sleep_calls[1] == 2.0  # 2**1 = 2
+
+
+def test_chat_completion_raises_after_max_retries_exhausted(monkeypatch):
+    """_chat_completion must raise after max_retries+1 total attempts without success."""
+    import nemo_automodel.components.speculative.regenerate as regen
+
+    sleep_calls: list[float] = []
+
+    async def fast_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(regen.asyncio, "sleep", fast_sleep)
+
+    # Always 500 — never succeeds.
+    session = _SequentialSession([_FakeResponse({}, status=500)] * 10)
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        asyncio.run(_chat_completion(session, "http://stub/completions", {}, timeout_s=1.0, max_retries=2))
+
+    # max_retries=2 → 3 total attempts, 2 sleeps
+    assert session.call_count == 3
+    assert len(sleep_calls) == 2
