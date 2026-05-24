@@ -162,7 +162,7 @@ def test_build_model_passes_freeze_config():
             return {"freeze_language_model": False, "freeze_vision_tower": True}
 
     with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
+        build_model(
             cfg_model=cfg_model,
             cfg_freeze=FreezeConfig(),
             cfg_peft=None,
@@ -430,6 +430,53 @@ def _patch_pp_optim_step_dependencies(monkeypatch):
         "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
         lambda model_parts, pp_enabled: None,
     )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: None,
+    )
+
+
+@pytest.mark.cuda(False)
+def test_run_train_step_clears_first_microbatch_after_first_batch(monkeypatch):
+    recipe, _ = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=2)
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100, 2, -100]]),
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        },
+        {
+            "labels": torch.tensor([[-100, 3, -100, 4]]),
+            "input_ids": torch.tensor([[5, 6, 7, 8]]),
+        },
+    ]
+    events = []
+
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_grad_accumulation",
+        lambda model_parts, pp_enabled: events.append("prepare"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_for_final_backward",
+        lambda model_parts, pp_enabled: events.append("final"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.prepare_after_first_microbatch",
+        lambda: events.append("after_first"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.scale_grads_and_clip_grad_norm",
+        lambda **kwargs: 0.0,
+    )
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        events.append(f"forward_{idx}")
+        loss_buffer.append(torch.tensor(1.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+
+    recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert events == ["prepare", "forward_0", "after_first", "final", "forward_1"]
 
 
 @pytest.mark.cuda(False)
@@ -793,8 +840,6 @@ class DummyModelConfigWithAdapter:
 def test_vlm_build_model_with_adapter():
     """Test that model with state_dict_adapter is properly instantiated in VLM."""
 
-    cfg_opt = DummyOptConfig(lr=0.01)
-
     # Create a config that simulates NeMoAutoModel's internal infrastructure handling
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
@@ -980,7 +1025,7 @@ def test_vlm_build_optimizer_disables_foreach_with_tp():
             seed=42,
             device_mesh=mock_device_mesh,
         )
-        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
+        build_optimizer(model, cfg_opt, None, mock_device_mesh)
 
     assert cfg_opt.foreach is False
 

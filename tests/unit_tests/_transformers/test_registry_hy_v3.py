@@ -14,7 +14,6 @@
 
 """Verify HYV3 model + config are registered in nemo_automodel._transformers.registry."""
 
-import pytest
 
 
 class TestArchMapping:

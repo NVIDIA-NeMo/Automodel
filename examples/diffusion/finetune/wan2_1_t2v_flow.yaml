@@ -20,7 +20,7 @@ step_scheduler:
   num_epochs: 100
   log_every: 2
   # max_steps: null  # Set to limit training to a specific number of steps
-  # save_checkpoint_every_epoch: true  # Set to false to disable epoch-boundary checkpoints
+  save_checkpoint_every_epoch: false
 
 data:
   dataloader:
@@ -38,6 +38,11 @@ optim:
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    foreach: true
+
+performance:
+  check_loss: false
+  grad_clip_foreach: true
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -67,6 +72,10 @@ fsdp:
   pp_size: 1
   dp_replicate_size: 1
   dp_size: 8
+  defer_fsdp_grad_sync: true
+  enable_fsdp2_prefetch: true
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
 
 checkpoint:
   enabled: true

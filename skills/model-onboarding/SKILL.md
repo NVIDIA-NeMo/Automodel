@@ -291,8 +291,8 @@ def test_training_loss_decreases(model, tiny_config):
 ### 5.1 Update model coverage page
 
 Edit the appropriate file in `docs/model-coverage/`:
-- LLM/MoE: `docs/model-coverage/llm.md`
-- VLM: `docs/model-coverage/vlm.md`
+- LLM/MoE: `docs/model-coverage/llm/index.md`
+- VLM: `docs/model-coverage/vlm/index.md`
 
 Add a row with the model name, supported features (TP, PP, FSDP, LoRA, QLoRA), and any limitations.
 

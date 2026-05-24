@@ -24,7 +24,9 @@ try:
 except Exception:
     DIFFUSERS_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(not DIFFUSERS_AVAILABLE, reason="diffusers not available or incompatible with current transformers version")
+pytestmark = pytest.mark.skipif(
+    not DIFFUSERS_AVAILABLE, reason="diffusers not available or incompatible with current transformers version"
+)
 
 MODULE_PATH = "nemo_automodel._diffusers.auto_diffusion_pipeline"
 
@@ -125,7 +127,9 @@ def test_iter_pipeline_modules_fallback_attribute_scan():
 # =============================================================================
 
 
-@pytest.mark.parametrize("torch_dtype,expected_dtype", [("auto", None), (torch.float16, torch.float16), ("float32", torch.float32)])
+@pytest.mark.parametrize(
+    "torch_dtype,expected_dtype", [("auto", None), (torch.float16, torch.float16), ("float32", torch.float32)]
+)
 def test_move_module_to_device_respects_dtype(torch_dtype, expected_dtype):
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _move_module_to_device
 
@@ -184,12 +188,14 @@ def test_pipeline_spec_from_dict_none():
 def test_pipeline_spec_from_dict_with_values():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import PipelineSpec
 
-    spec = PipelineSpec.from_dict({
-        "transformer_cls": "FluxTransformer2DModel",
-        "subfolder": "transformer",
-        "load_full_pipeline": True,
-        "unknown_field": "ignored",
-    })
+    spec = PipelineSpec.from_dict(
+        {
+            "transformer_cls": "FluxTransformer2DModel",
+            "subfolder": "transformer",
+            "load_full_pipeline": True,
+            "unknown_field": "ignored",
+        }
+    )
     assert spec.transformer_cls == "FluxTransformer2DModel"
     assert spec.load_full_pipeline is True
 
@@ -258,9 +264,48 @@ def test_create_parallel_manager_explicit_fsdp2():
         patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
     ):
         MockFSDP2.return_value = Mock()
-        manager = _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
+        _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
 
     MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+
+
+def test_create_parallel_manager_fsdp2_passes_perf_options():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+
+    mock_mesh = Mock()
+    mock_moe_mesh = Mock()
+    with (
+        patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
+        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
+        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+    ):
+        MockFSDP2.return_value = Mock()
+        _create_parallel_manager(
+            {
+                "_manager_type": "fsdp2",
+                "world_size": 1,
+                "sequence_parallel": True,
+                "tp_plan": {"layer": "colwise"},
+                "patch_is_packed_sequence": True,
+                "defer_fsdp_grad_sync": False,
+                "enable_async_tensor_parallel": True,
+                "enable_compile": True,
+                "enable_fsdp2_prefetch": True,
+                "fsdp2_backward_prefetch_depth": 4,
+                "fsdp2_forward_prefetch_depth": 3,
+            }
+        )
+
+    config_kwargs = MockConfig.call_args.kwargs
+    assert config_kwargs["sequence_parallel"] is True
+    assert config_kwargs["tp_plan"] == {"layer": "colwise"}
+    assert config_kwargs["patch_is_packed_sequence"] is True
+    assert config_kwargs["defer_fsdp_grad_sync"] is False
+    assert config_kwargs["enable_async_tensor_parallel"] is True
+    assert config_kwargs["enable_compile"] is True
+    assert config_kwargs["enable_fsdp2_prefetch"] is True
+    assert config_kwargs["fsdp2_backward_prefetch_depth"] == 4
+    assert config_kwargs["fsdp2_forward_prefetch_depth"] == 3
 
 
 def test_create_parallel_manager_unknown_type_raises():
@@ -485,7 +530,8 @@ def test_from_pretrained_load_for_training_makes_params_trainable():
         patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False),
     ):
         pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
-            "dummy", load_for_training=True,
+            "dummy",
+            load_for_training=True,
         )
 
     assert all(p.requires_grad for p in mod.parameters())
@@ -516,7 +562,8 @@ def test_from_pretrained_components_to_load_filters_modules():
         patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False),
     ):
         pipe, _ = NeMoAutoDiffusionPipeline.from_pretrained(
-            "dummy", components_to_load=["unet"],
+            "dummy",
+            components_to_load=["unet"],
         )
 
     # Only unet should be moved, not text_encoder

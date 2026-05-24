@@ -141,7 +141,9 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", or "flex").
+        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
+            For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
+            indexer, and Sinkhorn kernels together.
         linear: Linear layer backend ("torch" or "te").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
         rope_fusion: Whether to use fused RoPE (requires TE).
@@ -151,6 +153,14 @@ class BackendConfig:
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
+        dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
+            manager instance across MoE layers.
+        dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
+            and allocate dispatched tensors on the communication stream.
+        disable_shared_expert_overlap: When True, run shared experts sequentially on the
+            current CUDA stream instead of overlapping them on a side stream with the
+            grouped-expert dispatch. Useful as an escape hatch when the side-stream
+            overlap interacts poorly with the dispatcher backend.
         enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
@@ -165,7 +175,7 @@ class BackendConfig:
             torch.dtype or string (e.g., "torch.float32", "float32").
     """
 
-    attn: Literal["te", "sdpa", "flex"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
@@ -178,6 +188,9 @@ class BackendConfig:
         else "torch"
     )
     dispatcher_num_sms: int = 20
+    dispatcher_share_token_dispatcher: bool = True
+    dispatcher_async_dispatch: bool = False
+    disable_shared_expert_overlap: bool = False
     enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -479,11 +492,13 @@ def _has_dtensor_params(model: nn.Module) -> bool:
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
-    """Cast modules matching *fp32_keywords* back to float32.
+    """Cast modules or individual tensors matching *fp32_keywords* back to float32.
 
-    Only safe for unsharded models (plain tensors).  FSDP2 requires uniform
-    dtype within each parameter group, so this must not be called on
-    DTensor-sharded models.
+    Only safe for unsharded models (plain tensors). FSDP2 requires uniform
+    dtype within each parameter group, so this must not be called on DTensor-sharded
+    models. Keywords may name modules (for example ``norm``) or individual
+    parameters (for example ``attn_hc.fn``), matching HuggingFace's strict fp32
+    module declarations.
 
     Args:
         model: The model (already cast to the target dtype).
@@ -492,10 +507,18 @@ def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
     for name, module in model.named_modules():
         if any(kw in name for kw in fp32_keywords):
             module.to(torch.float32)
+    for name, param in model.named_parameters():
+        if any(kw in name for kw in fp32_keywords):
+            param.data = param.data.to(torch.float32)
+    for name, buf in model.named_buffers():
+        if any(kw in name for kw in fp32_keywords):
+            module_name, _, buffer_name = name.rpartition(".")
+            module = model.get_submodule(module_name) if module_name else model
+            module._buffers[buffer_name] = buf.to(torch.float32)
 
 
 def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
-    """Cast only buffers (not parameters) of matching modules back to float32.
+    """Cast only matching buffers (not parameters) back to float32.
 
     Safe for FSDP2-sharded models because buffers are plain tensors, not
     DTensors managed by FSDP2.
@@ -508,6 +531,11 @@ def _restore_fp32_buffers(model: nn.Module, fp32_keywords: list[str]) -> None:
         if any(kw in name for kw in fp32_keywords):
             for buf_name, buf in module.named_buffers(recurse=False):
                 module._buffers[buf_name] = buf.to(torch.float32)
+    for name, buf in model.named_buffers():
+        if any(kw in name for kw in fp32_keywords):
+            module_name, _, buffer_name = name.rpartition(".")
+            module = model.get_submodule(module_name) if module_name else model
+            module._buffers[buffer_name] = buf.to(torch.float32)
 
 
 __all__ = [

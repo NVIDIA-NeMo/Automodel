@@ -315,6 +315,42 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
             attention_mask = None
 
+        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
+        consumed_vlm_chunk = False
+
+        if pixel_values is None:
+            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
+            if image_chunks is not None and chunk_idx < len(image_chunks):
+                image_chunk = image_chunks[chunk_idx]
+                if image_chunk.numel() > 0:
+                    pixel_values = image_chunk
+                    image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
+                    if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
+                        image_grid = image_grid_chunks[chunk_idx]
+                        if image_grid is not None and image_grid.numel() > 0:
+                            if image_grid.shape[-1] == 2:
+                                ones = torch.ones(
+                                    image_grid.shape[0], 1, dtype=image_grid.dtype, device=image_grid.device
+                                )
+                                image_grid_thw = torch.cat([ones, image_grid], dim=-1)
+                            else:
+                                image_grid_thw = image_grid
+                consumed_vlm_chunk = True
+
+        if pixel_values_videos is None:
+            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
+            if video_chunks is not None and chunk_idx < len(video_chunks):
+                video_chunk = video_chunks[chunk_idx]
+                if video_chunk.numel() > 0:
+                    pixel_values_videos = video_chunk
+                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
+                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
+                        video_grid_thw = video_grid_chunks[chunk_idx]
+                consumed_vlm_chunk = True
+
+        if consumed_vlm_chunk:
+            self._vlm_chunk_idx = chunk_idx + 1
+
         # 1. Get input embeddings
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -330,6 +366,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 feature_attention_mask=feature_attention_mask,
                 audio_feature_lengths=audio_feature_lengths,
             )
+            # get_audio_features returns a BaseModelOutputWithPooling (audio_tower's
+            # encoder output); extract the hidden state before moving to the embedding
+            # device/dtype, matching the .pooler_output extraction used for images/videos
+            # below.
+            if hasattr(audio_features, "last_hidden_state"):
+                audio_features = audio_features.last_hidden_state
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)

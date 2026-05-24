@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_dion_optimizer(optimizer_factory: Any) -> bool:
+    """Return whether an optimizer factory targets a Dion-family optimizer."""
     name = getattr(optimizer_factory, "__name__", "")
     module = getattr(optimizer_factory, "__module__", "")
     return module.startswith("dion") or name in {"Dion", "Dion2", "Muon", "NorMuon"}
