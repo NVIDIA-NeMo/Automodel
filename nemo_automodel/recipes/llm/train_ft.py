@@ -106,6 +106,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
+from nemo_automodel.recipes._component_builders import _callable_and_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -330,31 +331,34 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
     """
+    optimizer_factory, optimizer_kwargs = _callable_and_kwargs(cfg_opt)
+
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
     # optimizers like TE FusedAdam that accept dtype kwargs.
     for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
-        val = getattr(cfg_opt, attr, None)
+        val = optimizer_kwargs.get(attr, None)
         if isinstance(val, str):
-            setattr(cfg_opt, attr, dtype_from_str(val))
+            optimizer_kwargs[attr] = dtype_from_str(val)
 
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
-        cfg_opt.foreach = False
+        optimizer_kwargs["foreach"] = False
 
     optimizer = []
-    has_dion_optimizer = is_dion_optimizer(cfg_opt)
+    has_dion_optimizer = is_dion_optimizer(optimizer_factory)
     for part in getattr(model, "parts", [model]):
         trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
         assert len(trainable_params) > 0, "trainable_params cannot be empty"
         # TODO(@akoumparouli): no branching for building the optimizer, refactor.
         if has_dion_optimizer:
             tmp_optimizer = build_dion_optimizer(
-                cfg_opt=cfg_opt,
+                optimizer_factory=optimizer_factory,
+                optimizer_kwargs=optimizer_kwargs,
                 model=part,
                 distributed_mesh=device_mesh,
             )
         else:
-            tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
+            tmp_optimizer = optimizer_factory(params=trainable_params, **optimizer_kwargs)
         if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
             tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
