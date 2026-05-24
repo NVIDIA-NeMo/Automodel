@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.training.step_builder import build_step_scheduler
+from nemo_automodel.components.training.api import build_step_scheduler
 
 __all__ = ["build_step_scheduler"]

@@ -16,9 +16,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+    from nemo_automodel.components.distributed.config import DistributedConfig
+    from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
@@ -40,8 +46,8 @@ def build_optimizer(
     model: torch.nn.Module,
     optimizer_factory: Callable[..., torch.optim.Optimizer],
     optimizer_kwargs: Mapping[str, Any] | None,
-    distributed_config: Any,
-    device_mesh: Any,
+    distributed_config: DistributedConfig | None,
+    device_mesh: DeviceMesh | None,
 ):
     """Build optimizers for a model or model parts.
 
@@ -93,8 +99,8 @@ def build_optimizer(
 
 def build_lr_scheduler(
     scheduler_kwargs: Mapping[str, Any] | None,
-    optimizer: Any,
-    step_scheduler: Any,
+    optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
+    step_scheduler: StepScheduler,
 ) -> list[OptimizerParamScheduler] | None:
     """Build the learning rate scheduler.
 

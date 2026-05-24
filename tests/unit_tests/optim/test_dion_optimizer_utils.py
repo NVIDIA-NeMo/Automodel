@@ -508,7 +508,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_dion_optimizer_single_model(self, monkeypatch):
         """When is_dion_optimizer returns True, build_dion_optimizer is called."""
-        import nemo_automodel.components.optim.build as optim_build_mod
+        import nemo_automodel.components.optim.api as optim_build_mod
 
         model = self._make_simple_model()
         sentinel_mesh = MagicMock()
@@ -538,7 +538,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_dion_optimizer_with_parts(self, monkeypatch):
         """When model has `parts`, build_dion_optimizer is called per part."""
-        import nemo_automodel.components.optim.build as optim_build_mod
+        import nemo_automodel.components.optim.api as optim_build_mod
 
         model = self._make_parts_model()
         build_calls = []
@@ -564,7 +564,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_non_dion_optimizer_single_model(self, monkeypatch):
         """When is_dion_optimizer returns False, normal instantiate path is used."""
-        import nemo_automodel.components.optim.build as optim_build_mod
+        import nemo_automodel.components.optim.api as optim_build_mod
 
         model = self._make_simple_model()
         instantiate_calls = []
@@ -583,7 +583,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_non_dion_optimizer_with_parts(self, monkeypatch):
         """Non-dion optimizer with model.parts -> instantiate per part."""
-        import nemo_automodel.components.optim.build as optim_build_mod
+        import nemo_automodel.components.optim.api as optim_build_mod
 
         model = self._make_parts_model()
         instantiate_calls = []

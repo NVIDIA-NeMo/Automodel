@@ -15,10 +15,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch import nn
 
 
-def build_loss_fn(loss_factory: Callable[..., Any], loss_kwargs: Mapping[str, Any] | None = None) -> Any:
+def build_loss_fn(loss_factory: Callable[..., nn.Module], loss_kwargs: Mapping[str, Any] | None = None) -> nn.Module:
     """Build a loss function.
 
     Args:

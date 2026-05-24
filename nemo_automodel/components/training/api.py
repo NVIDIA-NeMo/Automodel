@@ -15,14 +15,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.training.step_scheduler import StepScheduler
+
+if TYPE_CHECKING:
+    from torch.utils.data import DataLoader
 
 
 def build_step_scheduler(
     scheduler_kwargs: Mapping[str, Any] | None,
-    dataloader: Any,
+    dataloader: DataLoader,
     dp_group_size: int,
     local_batch_size: int,
 ) -> StepScheduler:

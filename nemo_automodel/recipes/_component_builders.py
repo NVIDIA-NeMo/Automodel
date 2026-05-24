@@ -18,7 +18,6 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from nemo_automodel.components.checkpoint import build_checkpoint_config as _build_checkpoint_config
-from nemo_automodel.components.loggers.mlflow_utils import build_mlflow as _build_mlflow
 from nemo_automodel.components.loggers.wandb_utils import build_wandb as _build_wandb
 from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
 from nemo_automodel.components.optim import build_lr_scheduler as _build_lr_scheduler
@@ -123,9 +122,6 @@ def build_wandb(cfg: Any):
 
 
 def build_mlflow(cfg: Any):
-    model_name = _model_name_from_cfg(cfg.model) if hasattr(cfg, "model") else None
-    return _build_mlflow(
-        mlflow_kwargs=_as_dict(cfg.mlflow),
-        model_name=model_name,
-        step_scheduler_kwargs=_as_dict(cfg.step_scheduler) if hasattr(cfg, "step_scheduler") else None,
-    )
+    from nemo_automodel.components.loggers.mlflow_utils import configure_mlflow
+
+    return configure_mlflow(cfg)
