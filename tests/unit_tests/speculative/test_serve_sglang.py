@@ -138,6 +138,47 @@ def test_resolve_draft_artifacts_eagle1_skips_token_map_and_architecture_rewrite
     )
 
 
+def test_export_patches_num_hidden_layers_from_state_dict(tmp_path: Path, monkeypatch):
+    """Exported config must reflect the drafter's actual layer count, not the target model's."""
+    checkpoint_dir = tmp_path / "epoch_0_step_1000"
+    checkpoint_dir.mkdir()
+    # Simulate a target-model config with num_hidden_layers=32.
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaEagle3DraftModel"], "num_hidden_layers": 32}), encoding="utf-8"
+    )
+    (checkpoint_dir / "draft_model.pt").write_bytes(b"placeholder")
+    torch.save({"selected_token_ids": torch.tensor([3, 7, 9])}, checkpoint_dir / "eagle3_meta.pt")
+
+    # Drafter state dict has only one transformer layer.
+    drafter_state_dict = {
+        "fc.weight": torch.ones(2, 2),
+        "layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
+        "layers.0.mlp.gate_proj.weight": torch.ones(2, 2),
+    }
+
+    def _fake_save_file(state_dict, path: str) -> None:
+        Path(path).write_bytes(b"fake-safetensors")
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.speculative.serve_sglang._load_safetensors_save_file",
+        lambda: _fake_save_file,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.speculative.serve_sglang._torch_load",
+        lambda path: (
+            drafter_state_dict if path.name == "draft_model.pt" else {"selected_token_ids": torch.tensor([3, 7, 9])}
+        ),
+    )
+
+    resolve_draft_artifacts(str(checkpoint_dir), "EAGLE3")
+
+    exported_config = json.loads((checkpoint_dir / "model" / "config.json").read_text(encoding="utf-8"))
+    assert exported_config["num_hidden_layers"] == 1, (
+        "exported config must use the drafter's layer count (1), not the target model's (32)"
+    )
+    assert exported_config["architectures"] == ["LlamaForCausalLMEagle3"]
+
+
 def test_build_sglang_argv_exports_recipe_checkpoint_and_passes_token_map(
     tmp_path: Path,
     monkeypatch,

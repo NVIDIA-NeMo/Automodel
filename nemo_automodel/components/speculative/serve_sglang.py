@@ -50,6 +50,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -115,15 +116,23 @@ def _torch_load(path: Path) -> Any:
         return torch.load(path, map_location="cpu")
 
 
-def _rewrite_config_for_sglang(src_config_path: Path, dst_config_path: Path, algorithm: str) -> None:
+def _rewrite_config_for_sglang(
+    src_config_path: Path,
+    dst_config_path: Path,
+    algorithm: str,
+    *,
+    num_hidden_layers: int | None = None,
+) -> None:
     """Copy ``src_config_path`` to ``dst_config_path`` and normalize ``architectures``.
 
     For algorithms in ``_SGLANG_ARCHITECTURE_FOR_ALGORITHM`` the
     ``architectures`` field is rewritten to the SGLang-canonical class name
     (e.g. ``LlamaForCausalLMEagle3``). For other algorithms the original
-    field is preserved. The write is staged through a sibling ``.tmp`` file
-    and finalized with ``os.replace`` so an interrupted write cannot leave
-    the destination half-truncated when rewriting in place.
+    field is preserved. When ``num_hidden_layers`` is provided it is written
+    into the config so the exported drafter reflects its actual depth rather
+    than the target model's depth. The write is staged through a sibling
+    ``.tmp`` file and finalized with ``os.replace`` so an interrupted write
+    cannot leave the destination half-truncated when rewriting in place.
     """
     with src_config_path.open("r") as f:
         config = json.load(f)
@@ -131,6 +140,9 @@ def _rewrite_config_for_sglang(src_config_path: Path, dst_config_path: Path, alg
     if expected is not None and config.get("architectures") != [expected]:
         logger.info("Rewriting architectures: %s -> %s", config.get("architectures"), [expected])
         config["architectures"] = [expected]
+    if num_hidden_layers is not None and config.get("num_hidden_layers") != num_hidden_layers:
+        logger.info("Rewriting num_hidden_layers: %s -> %d", config.get("num_hidden_layers"), num_hidden_layers)
+        config["num_hidden_layers"] = num_hidden_layers
     tmp_path = dst_config_path.with_suffix(dst_config_path.suffix + ".tmp")
     with tmp_path.open("w") as f:
         json.dump(config, f, indent=2)
@@ -145,6 +157,12 @@ def _config_needs_rewrite(config_path: Path, algorithm: str) -> bool:
     with config_path.open("r") as f:
         config = json.load(f)
     return config.get("architectures") != [expected]
+
+
+def _infer_num_hidden_layers(state_dict: dict[str, Any]) -> int | None:
+    """Infer num_hidden_layers from a state dict by counting unique layer indices."""
+    indices = {int(m.group(1)) for key in state_dict if (m := re.search(r"\blayers\.(\d+)\b", key))}
+    return len(indices) if indices else None
 
 
 def _regenerate_token_map(meta_path: Path, token_map_path: Path) -> None:
@@ -189,13 +207,17 @@ def _maybe_export_training_checkpoint(
         return export_dir, token_map_path
 
     export_dir.mkdir(parents=True, exist_ok=True)
+    state_dict: dict[str, Any] | None = None
     if not exported_weights.exists():
         logger.info("Exporting draft checkpoint %s -> %s", draft_model_path, exported_weights)
         save_file = _load_safetensors_save_file()
         state_dict = _torch_load(draft_model_path)
         save_file(state_dict, str(exported_weights))
     if not exported_config.exists():
-        _rewrite_config_for_sglang(config_path, exported_config, algorithm)
+        if state_dict is None:
+            state_dict = _torch_load(draft_model_path)
+        num_hidden_layers = _infer_num_hidden_layers(state_dict)
+        _rewrite_config_for_sglang(config_path, exported_config, algorithm, num_hidden_layers=num_hidden_layers)
     if token_map_path is not None and not token_map_path.exists():
         _regenerate_token_map(checkpoint_dir / "eagle3_meta.pt", token_map_path)
     return export_dir, token_map_path
