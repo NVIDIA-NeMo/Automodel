@@ -48,8 +48,8 @@ rng:
 
 model:
   _target_: nemo_automodel.components.models.gemma4_drafter.composite.Gemma4WithDrafter.from_pretrained
-  pretrained_model_name_or_path: /workspace/hf_gemma4_e4b_it
-  drafter_path: /workspace/hf_gemma4_e4b_it_assistant
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
+  drafter_path: google/gemma-4-E4B-it-assistant
   # Joint training knobs. drafter_loss_weight = 0.01. Cleaner descent than 0.1; the drafter's gradient through
   # the shared-KV path destabilizes the base at higher weight.
   drafter_loss_weight: 0.01
@@ -137,10 +137,10 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-wandb:
-  project: eevee-4
-  name: eevee4-e4b-it_drafter_medpix_2epochs_multi_step_k4
-  dir: vlm_checkpoints/gemma4_4b_joint_drafter_multi_step/
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: <your-run-name>
 
 ci:
   recipe_owner: athitten

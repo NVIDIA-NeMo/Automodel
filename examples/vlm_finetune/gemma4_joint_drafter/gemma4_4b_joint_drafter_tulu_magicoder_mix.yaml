@@ -48,8 +48,8 @@ rng:
 
 model:
   _target_: nemo_automodel.components.models.gemma4_drafter.composite.Gemma4WithDrafter.from_pretrained
-  pretrained_model_name_or_path: /workspace/hf_gemma4_e4b_it
-  drafter_path: /workspace/hf_gemma4_e4b_it_assistant
+  pretrained_model_name_or_path: google/gemma-4-E4B-it
+  drafter_path: google/gemma-4-E4B-it-assistant
   drafter_loss_weight: 0.01
   drafter_num_steps: 4
   # K=4 + bf16 + 2048 fixed-pad pushes activation memory past 80GB on H100
@@ -135,11 +135,10 @@ freeze_config:
   freeze_audio_tower: true
   freeze_language_model: false
 
-wandb:
-  project: eevee-4
-  entity: nvidia
-  name: eevee4-e4b-it_drafter_text_mix_tulu3_magicoder
-  dir: vlm_checkpoints/gemma4_4b_joint_drafter_text_mix/
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: <your-run-name>
 
 ci:
   recipe_owner: athitten

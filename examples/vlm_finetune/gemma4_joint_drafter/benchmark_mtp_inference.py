@@ -38,16 +38,19 @@ Per-prompt and aggregate stats are printed:
 * number of *target-model* forward calls (instrumented via a forward hook)
 * average accepted tokens per target-model step (= tokens / target-forwards)
 
-Default checkpoint roots point at ``epoch_0_step_999`` (the last fully-saved
-joint checkpoint; ``step_1249`` lost its drafter to a mid-save crash).
+Both ``--base-ckpt`` and ``--drafter-ckpt`` are required and must point at
+HF-consolidated checkpoint directories (each containing ``config.json`` and
+the model weights). These are typically produced by the joint fine-tuning
+recipe under
+``<ckpt_dir>/<epoch_X_step_Y>/{base,drafter}/model/consolidated``.
 
 Usage:
 
 .. code-block:: bash
 
-    python examples/vlm_finetune/gemma4/benchmark_mtp_inference.py \
-        --base-ckpt  vlm_checkpoints/gemma4_4b_joint_drafter_text_mix_v6/epoch_0_step_999/base/model/consolidated \
-        --drafter-ckpt vlm_checkpoints/gemma4_4b_joint_drafter_text_mix_v6/epoch_0_step_999/drafter/model/consolidated \
+    python examples/vlm_finetune/gemma4_joint_drafter/benchmark_mtp_inference.py \
+        --base-ckpt    /path/to/<run>/<epoch_X_step_Y>/base/model/consolidated \
+        --drafter-ckpt /path/to/<run>/<epoch_X_step_Y>/drafter/model/consolidated \
         --max-new-tokens 256 \
         --num-assistant-tokens 4
 
@@ -346,20 +349,20 @@ def _print_summary(no_mtp: dict[str, float], mtp: dict[str, float]) -> None:
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_BASE = (
-    # "vlm_checkpoints/gemma4_4b_joint_drafter_text_mix_v6/epoch_0_step_999/base/model/consolidated"
-    "vlm_checkpoints/gemma4_4b_joint_drafter_text_mix_v9_gbs64_val50/epoch_0_step_499/base/model/consolidated"
-)
-_DEFAULT_DRAFTER = (
-    # "vlm_checkpoints/gemma4_4b_joint_drafter_text_mix_v6/epoch_0_step_999/drafter/model/consolidated"
-    "vlm_checkpoints/gemma4_4b_joint_drafter_text_mix_v9_gbs64_val50/epoch_0_step_499/drafter/model/consolidated"
-)
-
-
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--base-ckpt", default=_DEFAULT_BASE, help="HF consolidated dir for base.")
-    p.add_argument("--drafter-ckpt", default=_DEFAULT_DRAFTER, help="HF consolidated dir for drafter.")
+    p.add_argument(
+        "--base-ckpt",
+        required=True,
+        help="HF-consolidated checkpoint directory for the base model "
+        "(must contain config.json and the model weights).",
+    )
+    p.add_argument(
+        "--drafter-ckpt",
+        required=True,
+        help="HF-consolidated checkpoint directory for the drafter model "
+        "(must contain config.json and the model weights).",
+    )
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument(
         "--num-assistant-tokens",
