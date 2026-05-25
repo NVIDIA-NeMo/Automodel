@@ -39,6 +39,7 @@ from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe, _all_redu
 from nemo_automodel.recipes.llm.train_eagle1 import main as eagle1_main
 from nemo_automodel.recipes.llm.train_eagle2 import TrainEagle2Recipe
 from nemo_automodel.recipes.llm.train_eagle2 import main as eagle2_main
+from nemo_automodel.recipes.llm.train_eagle3 import main as eagle3_main
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -302,6 +303,11 @@ def test_eagle1_main_requires_config():
 def test_eagle2_main_requires_config():
     with pytest.raises(ValueError, match="You must specify --config"):
         eagle2_main(config_path=None)
+
+
+def test_eagle3_main_requires_config():
+    with pytest.raises(ValueError, match="You must specify --config"):
+        eagle3_main(config_path=None)
 
 
 # ---------------------------------------------------------------------------
