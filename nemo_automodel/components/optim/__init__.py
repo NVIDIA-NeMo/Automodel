@@ -13,12 +13,25 @@
 # limitations under the License.
 
 from .api import build_lr_scheduler, build_optimizer
-from .config import LRSchedulerConfig, OptimizerConfig
+from .config import (
+    AdamConfig,
+    AdamWConfig,
+    FlashAdamWConfig,
+    FusedAdamConfig,
+    LRSchedulerConfig,
+    MuonConfig,
+    OptimizerConfig,
+)
 from .scheduler import OptimizerParamScheduler
 from .utils import build_dion_optimizer, is_dion_optimizer
 
 __all__ = [
+    "AdamConfig",
+    "AdamWConfig",
+    "FlashAdamWConfig",
+    "FusedAdamConfig",
     "LRSchedulerConfig",
+    "MuonConfig",
     "OptimizerConfig",
     "OptimizerParamScheduler",
     "build_lr_scheduler",

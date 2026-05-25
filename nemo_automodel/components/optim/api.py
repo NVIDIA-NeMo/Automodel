@@ -74,7 +74,7 @@ def build_optimizer(
     """
     if config is not None:
         optimizer_factory = _resolve_optimizer(config.name)
-        optimizer_kwargs = {"lr": config.lr, "weight_decay": config.weight_decay, **config.extra_kwargs}
+        optimizer_kwargs = config.to_kwargs()
     elif optimizer_factory is None:
         raise ValueError("Either config or optimizer_factory must be provided")
 
