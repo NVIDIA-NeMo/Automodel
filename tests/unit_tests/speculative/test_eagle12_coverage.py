@@ -295,12 +295,12 @@ def test_all_reduce_mean_non_distributed():
 
 
 def test_eagle1_main_requires_config():
-    with pytest.raises(ValueError, match="config_path is required"):
+    with pytest.raises(ValueError, match="You must specify --config"):
         eagle1_main(config_path=None)
 
 
 def test_eagle2_main_requires_config():
-    with pytest.raises(ValueError, match="config_path is required"):
+    with pytest.raises(ValueError, match="You must specify --config"):
         eagle2_main(config_path=None)
 
 
