@@ -14,7 +14,7 @@
 
 """Llama-style dense LLM draft model for EAGLE-1 / EAGLE-2 training.
 
-Config-driven; supports Llama, Qwen2, and Qwen3 dense via standard HF config
+Config-driven; supports Llama and Phi-3 dense via standard HF config
 fields (``attention_bias``, ``mlp_bias``, ``rope_theta``/``rope_scaling``,
 ``rms_norm_eps``). Class names are retained for checkpoint-architectures
 compatibility.
@@ -158,7 +158,7 @@ class EagleLlamaDecoderLayer(nn.Module):
 class LlamaEagleDraftModel(PreTrainedModel):
     """Llama-style dense draft that predicts next-step hidden states.
 
-    Works with Llama, Qwen2, and Qwen3 dense configs. The class name is
+    Works with Llama and Phi-3 dense configs. The class name is
     retained for backward compatibility with already-trained checkpoints.
     """
 

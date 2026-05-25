@@ -54,18 +54,7 @@ class DraftSpec:
 # states, not the per-expert routing internals).
 _DENSE_ARCHITECTURES: tuple[str, ...] = (
     "LlamaForCausalLM",
-    "Qwen2ForCausalLM",
-    "Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM",
-    "MistralForCausalLM",
-    "MixtralForCausalLM",
-    "DeepseekV2ForCausalLM",
-    "DeepseekV3ForCausalLM",
-    "Gemma2ForCausalLM",
-    "Gemma3ForCausalLM",
     "Phi3ForCausalLM",
-    "Phi4ForCausalLM",
-    "GraniteForCausalLM",
 )
 
 

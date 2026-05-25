@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Qwen2, Qwen3)."""
+"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3)."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle3Recipe(BaseRecipe):
-    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Qwen2, Qwen3)."""
+    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -177,9 +177,9 @@ class TrainEagle3Recipe(BaseRecipe):
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
-        # Reuse the target's concrete config class (LlamaConfig / Qwen2Config /
-        # Qwen3Config / ...) so architecture-specific defaults like
-        # attention_bias and head_dim flow into the draft.
+        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
+        # so architecture-specific defaults like attention_bias and head_dim
+        # flow into the draft.
         draft_config_obj = type(target_config).from_dict(draft_config)
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())

@@ -18,10 +18,10 @@ The implementation is config-driven and supports any HuggingFace dense
 decoder-only architecture whose layout matches Llama: GQA attention with
 optional Q/K/V/O bias (`config.attention_bias`), SwiGLU MLP with optional
 bias (`config.mlp_bias`), RMSNorm, and rotary position embeddings parameterized
-by `config.rope_theta` / `config.rope_scaling`. This covers Llama 2/3, Qwen2,
-and Qwen3 dense (Qwen3 sets `head_dim` independently of
-`hidden_size / num_attention_heads`, which the attention layer already reads
-via `getattr(config, "head_dim", ...)`).
+by `config.rope_theta` / `config.rope_scaling`. This currently covers Llama
+and Phi-3 dense (Phi-3 omits `attention_bias` / `mlp_bias`, which the
+attention and MLP layers already read via
+`getattr(config, "<field>", False)`).
 
 Class names and the public `architectures` string remain ``LlamaEagle3*`` for
 backward compatibility with already-trained checkpoints and with SGLang's
@@ -442,7 +442,7 @@ class Eagle3LlamaModel(nn.Module):
 
 
 class LlamaEagle3DraftModel(PreTrainedModel):
-    """Llama-style dense EAGLE-3 draft model (Llama, Qwen2, Qwen3).
+    """Llama-style dense EAGLE-3 draft model (Llama, Phi-3).
 
     State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
     checkpoint can be loaded by SGLang's inference engine without any
@@ -454,7 +454,7 @@ class LlamaEagle3DraftModel(PreTrainedModel):
     implementation is config-driven and works for any HF dense decoder-only
     config that exposes ``hidden_size``, ``num_attention_heads``,
     ``num_key_value_heads``, ``attention_bias``, ``mlp_bias``, ``rope_theta``,
-    and ``rms_norm_eps``. Qwen3's decoupled ``head_dim`` is read via
+    and ``rms_norm_eps``. A decoupled ``head_dim`` is read via
     ``getattr(config, "head_dim", ...)`` in the attention layer.
 
     Scope:
