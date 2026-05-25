@@ -242,7 +242,14 @@ class DFlashStrategy(DLLMStrategy):
     - ``block_size`` (default 0) — draft block size; 0 reads from draft config.
     - ``loss_decay_gamma`` (default 0.0) — γ for Eq. 4; 0 uses paper defaults.
     - ``num_blocks_per_sample`` (default 1) — N anchor blocks per sequence per
-      step, enabling the multi-block sparse-attention pass from §4.2.
+      step, enabling the multi-block sparse-attention pass from §4.2. Paper
+      default is 512 (Appendix A.1); requires ``attention_backend=flex_attention``.
+    - ``attention_backend`` (default ``"sdpa"``) — ``"sdpa"`` materialises a
+      dense ``[B, 1, N·bs, S+N·bs]`` mask (OOMs at high N); ``"flex_attention"``
+      uses a sparse :class:`BlockMask` and matches the paper's setup.
+    - ``overlap_anchors`` (default ``True``) — when ``True``, anchors are
+      sampled independently (paper behaviour); when ``False``, anchors are
+      forced non-overlapping (stars-and-bars, caps at ``seq_len // block_size``).
     """
 
     def __init__(self):
@@ -253,6 +260,8 @@ class DFlashStrategy(DLLMStrategy):
         self.num_blocks_per_sample: int = 1
         self.layer_ids: list = []
         self.dflash_loss_fn = None
+        self.attention_backend: str = "sdpa"
+        self.overlap_anchors: bool = True
 
     @property
     def loss_log_key(self) -> str:
@@ -359,14 +368,39 @@ class DFlashStrategy(DLLMStrategy):
 
         # --- Multi-block ---
         self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
+        self.overlap_anchors = bool(dflash_cfg.get("overlap_anchors", True))
+
+        # --- Attention backend (sdpa | flex_attention) ---
+        backend = str(dflash_cfg.get("attention_backend", "sdpa")).lower()
+        if backend not in ("sdpa", "flex_attention"):
+            raise ValueError(
+                f"dflash.attention_backend must be 'sdpa' or 'flex_attention', got {backend!r}"
+            )
+        if backend == "flex_attention":
+            from nemo_automodel.components.attention.dflash_mask import flex_attention_available
+
+            if not flex_attention_available():
+                raise RuntimeError(
+                    "attention_backend='flex_attention' requires torch.nn.attention.flex_attention; "
+                    "upgrade PyTorch or set attention_backend='sdpa'."
+                )
+            # Route the draft model's per-layer attention through transformers'
+            # flex_attention dispatcher. The draft model reads
+            # ``self.config._attn_implementation`` at runtime via ALL_ATTENTION_FUNCTIONS.
+            if draft_cfg is not None:
+                draft_cfg._attn_implementation = "flex_attention"
+        self.attention_backend = backend
 
         logger.info(
-            "DFlash setup: target=%s, block_size=%d, num_blocks=%d, layer_ids=%s, loss_gamma=%.1f",
+            "DFlash setup: target=%s, block_size=%d, num_blocks=%d, layer_ids=%s, "
+            "loss_gamma=%.1f, attention_backend=%s, overlap_anchors=%s",
             target_model_id,
             self.block_size,
             self.num_blocks_per_sample,
             self.layer_ids,
             loss_gamma,
+            self.attention_backend,
+            self.overlap_anchors,
         )
 
     # ------------------------------------------------------------------
@@ -412,34 +446,54 @@ class DFlashStrategy(DLLMStrategy):
         num_blocks: int,
         loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample N non-overlapping anchor blocks and return concatenated tensors.
+        """Sample ``num_blocks`` anchor positions and return concatenated tensors.
 
-        Uses the stars-and-bars transformation so all valid N-tuples are
-        equally likely: transform indices t_i ∈ [0, avail) to
-        starts_i = t_i + i * block_size + 1.
+        Two sampling modes (controlled by ``self.overlap_anchors``):
+
+        * **Overlapping (paper default, ``overlap_anchors=True``)**: each anchor
+          is drawn independently from ``[1, valid_len - block_size]``. Multiple
+          anchors may land at the same position; downstream blocks live in
+          separate KV slots, so "overlap" only means two blocks share a context
+          tail in the original sequence — they are still attention-isolated.
+          Required for paper-default ``num_blocks_per_sample=512``.
+
+        * **Non-overlapping (``overlap_anchors=False``)**: stars-and-bars
+          construction places ``n = min(num_blocks, (valid_len-1)//block_size)``
+          anchors with at least ``block_size`` gap between consecutive starts.
+          Use this only with the SDPA backend at small N — caps at
+          ``seq_len // block_size`` (e.g. 255 for seq_len=4096, block_size=16).
 
         Returns:
-            starts: sorted list of N anchor positions (ints).
-            block_output_ids: [B, N*block_size] — anchor+mask tokens.
-            block_targets: [B, N*(block_size-1)] — ground-truth tokens.
-            block_mask: [B, N*(block_size-1)] — float valid-position mask.
+            starts: sorted list of ``n`` anchor positions (ints, batch-shared).
+            block_output_ids: ``[B, n*block_size]`` — anchor+mask tokens.
+            block_targets:    ``[B, n*(block_size-1)]`` — ground-truth tokens.
+            block_mask:       ``[B, n*(block_size-1)]`` — float valid-position mask.
         """
         B = input_ids.size(0)
         device = input_ids.device
         valid_len = int(attn.sum(dim=1).min().item())
+        max_anchor = valid_len - self.block_size  # latest valid anchor position
 
-        # Clamp to however many blocks fit without overlap.
-        max_n = max(1, (valid_len - 1) // self.block_size)
-        n = min(num_blocks, max_n)
-
-        # avail = number of "slack" positions for the starts transformation.
-        avail = valid_len - n * self.block_size
-        if n == 1 or avail < 1:
+        if max_anchor < 1:
+            # Sequence too short for any block — fall through to single-anchor path.
             start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn, loss_mask)
             return [start], boi, bt, bm
 
-        perm = torch.randperm(avail, device=device)[:n].sort().values  # [n], values in [0, avail)
-        starts = (perm + torch.arange(n, device=device) * self.block_size + 1).tolist()
+        if self.overlap_anchors:
+            # Independent sampling — paper's "randomly sample anchor tokens" (§4.2).
+            n = max(1, num_blocks)
+            anchors = torch.randint(1, max_anchor + 1, (n,), device=device)
+            starts = anchors.sort().values.tolist()
+        else:
+            max_n = max(1, (valid_len - 1) // self.block_size)
+            n = min(num_blocks, max_n)
+            avail = valid_len - n * self.block_size
+            if n == 1 or avail < 1:
+                start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn, loss_mask)
+                return [start], boi, bt, bm
+            perm = torch.randperm(avail, device=device)[:n].sort().values
+            starts = (perm + torch.arange(n, device=device) * self.block_size + 1).tolist()
+
         starts = [int(s) for s in starts]
 
         effective = attn if loss_mask is None else attn * loss_mask
@@ -457,35 +511,6 @@ class DFlashStrategy(DLLMStrategy):
             torch.cat(bt_list, dim=1),
             torch.cat(bm_list, dim=1),
         )
-
-    @staticmethod
-    def _build_block_attention_mask(
-        starts: list[int],
-        block_size: int,
-        ctx_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Build the sparse block-diagonal additive attention mask (§4.2).
-
-        Shape: ``[1, 1, N*block_size, ctx_len + N*block_size]``
-
-        Block *b* rows attend only to:
-        - context columns 0..starts[b]-1 (own causal prefix), and
-        - noise columns ctx_len + b*block_size .. ctx_len+(b+1)*block_size-1
-          (own block; bidirectional).
-
-        All other entries are ``-inf``.
-        """
-        n = len(starts)
-        total = ctx_len + n * block_size
-        mask = torch.full((1, 1, n * block_size, total), float("-inf"), dtype=dtype, device=device)
-        for b, start in enumerate(starts):
-            r0, r1 = b * block_size, (b + 1) * block_size
-            mask[:, :, r0:r1, :start] = 0.0  # context prefix
-            c0 = ctx_len + b * block_size
-            mask[:, :, r0:r1, c0 : c0 + block_size] = 0.0  # own block
-        return mask
 
     def pre_step(self, recipe, batches) -> tuple[int, int]:
         """Sample anchor blocks and run frozen target forwards for all microbatches."""
@@ -572,12 +597,37 @@ class DFlashStrategy(DLLMStrategy):
         block_pos = torch.cat([torch.arange(s, s + self.block_size, device=device) for s in starts])
         position_ids = torch.cat([ctx_pos, block_pos]).unsqueeze(0).expand(B, -1)
 
-        # Sparse block-diagonal attention mask (only needed for n > 1).
-        attn_mask: Optional[torch.Tensor] = None
-        if n > 1:
-            attn_mask = DFlashStrategy._build_block_attention_mask(
-                starts, self.block_size, ctx_len, noise_embedding.dtype, device
+        # Sparse block-diagonal attention mask. For N=1 with the SDPA backend
+        # we can skip the mask — the context-prefix slicing in
+        # _run_target_forward already prevents post-anchor context leakage. For
+        # FlexAttention we always build a BlockMask so the dispatcher gets the
+        # expected type.
+        attn_mask = None
+        if n > 1 or self.attention_backend == "flex_attention":
+            from nemo_automodel.components.attention.dflash_mask import (
+                create_dflash_block_mask,
+                create_dflash_sdpa_mask,
             )
+
+            anchor_positions = torch.tensor(starts, dtype=torch.long, device=device).view(1, n).expand(B, -1)
+            block_keep_mask = torch.ones(B, n, dtype=torch.bool, device=device)
+            if self.attention_backend == "flex_attention":
+                attn_mask = create_dflash_block_mask(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    ctx_len=ctx_len,
+                    block_size=self.block_size,
+                    device=device,
+                )
+            else:
+                attn_mask = create_dflash_sdpa_mask(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    ctx_len=ctx_len,
+                    block_size=self.block_size,
+                    device=device,
+                    dtype=noise_embedding.dtype,
+                )
 
         draft = recipe.model_parts[0]
         sync_ctx = (
