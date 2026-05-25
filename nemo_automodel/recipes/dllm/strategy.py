@@ -120,6 +120,7 @@ class DLLMStrategy(ABC):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
+        num_ar_tokens: Optional[int] = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
@@ -133,6 +134,7 @@ class DLLMStrategy(ABC):
             batch,
             loss_buffer=loss_buffer,
             num_diffusion_tokens=num_diffusion_tokens,
+            num_ar_tokens=num_ar_tokens,
             num_batches=num_batches,
             is_train=is_train,
         )
@@ -528,6 +530,7 @@ class DFlashStrategy(DLLMStrategy):
         *,
         loss_buffer: list,
         num_diffusion_tokens: int,
+        num_ar_tokens: Optional[int] = None,
         num_batches: int,
         is_train: bool = True,
     ) -> None:
