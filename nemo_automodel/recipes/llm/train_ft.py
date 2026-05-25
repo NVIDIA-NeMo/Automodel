@@ -104,7 +104,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-from nemo_automodel.recipes._component_builders import _callable_and_kwargs, build_mlflow, build_wandb
+from nemo_automodel.recipes._component_builders import _callable_and_kwargs, build_loss_fn, build_mlflow, build_wandb
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -404,18 +404,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
-
-
-def build_loss_fn(cfg_loss):
-    """Build a loss function.
-
-    Args:
-        cfg_loss (ConfigNode): Loss function configuration.
-
-    Returns:
-        The instantiated loss function on the specified device.
-    """
-    return cfg_loss.instantiate()
 
 
 def compute_trust_remote_code_from_model(cfg_model):

@@ -82,7 +82,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._component_builders import build_mlflow, build_wandb
+from nemo_automodel.recipes._component_builders import build_loss_fn, build_mlflow, build_wandb
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -246,18 +246,6 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         ckpt_kwargs |= user_cfg
     checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
     return checkpoint_config
-
-
-def build_loss_fn(cfg_loss):
-    """Build a loss function.
-
-    Args:
-        cfg_loss: Loss function configuration.
-
-    Returns:
-        The instantiated loss function.
-    """
-    return cfg_loss.instantiate()
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
