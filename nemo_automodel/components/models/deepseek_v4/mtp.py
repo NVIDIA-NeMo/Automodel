@@ -77,14 +77,14 @@ class DeepseekV4MTPBlock(nn.Module):
         self.hnorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
 
         mtp_attn_cfg = copy.copy(config)
-        ratios = getattr(config, "compress_ratios", None)
-        if ratios is None:
-            mtp_attn_cfg.compress_ratios = None
+        layer_types = config.layer_types
+        if layer_types is None:
+            mtp_attn_cfg.layer_types = None
         else:
-            ratios = list(ratios)
-            if layer_idx >= len(ratios):
-                ratios.extend([0] * (layer_idx + 1 - len(ratios)))
-            mtp_attn_cfg.compress_ratios = ratios
+            layer_types = list(layer_types)
+            if layer_idx >= len(layer_types):
+                layer_types.extend(["sliding_attention"] * (layer_idx + 1 - len(layer_types)))
+            mtp_attn_cfg.layer_types = layer_types
         self.self_attn = DeepseekV4Attention(mtp_attn_cfg, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
         self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)

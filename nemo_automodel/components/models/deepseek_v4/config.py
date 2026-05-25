@@ -23,7 +23,7 @@ class DeepseekV4Config(PretrainedConfig):
     DeepSeek V4 differs from V3/V3.2 in several key ways:
     - Attention: GQA (num_key_value_heads=1) with Q-LoRA and grouped O-LoRA instead of MLA.
     - No dense MLP layers: all transformer blocks use MoE FFN.
-    - Per-layer sliding/compressed attention via compress_ratios.
+    - Per-layer sliding/compressed attention via layer_types and compress_rates.
     - First num_hash_layers use hash-clustering (HC) attention for dynamic token grouping.
     - Learnable attention sink token for sliding-window layers.
     - New MoE gate scoring: sqrtsoftplus with noaux_tc routing.
@@ -64,10 +64,11 @@ class DeepseekV4Config(PretrainedConfig):
         max_position_embeddings: int = 1048576,
         rope_theta: float = 10000.0,
         rope_scaling: dict | None = None,
-        # Compressed/sliding-window attention (per-layer)
-        # compress_ratios[i]: 0 = full attention, >0 = compressed local window
+        # Compressed/sliding-window attention.
+        # layer_types[i] selects sliding, compressed sparse, or heavily compressed attention.
+        layer_types: list | None = None,
         compress_rope_theta: float = 160000.0,
-        compress_ratios: list | None = None,
+        compress_rates: dict | None = None,
         sliding_window: int = 128,
         # Hash-clustering attention for the first num_hash_layers layers
         num_hash_layers: int = 3,
@@ -118,7 +119,11 @@ class DeepseekV4Config(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.compress_rope_theta = compress_rope_theta
-        self.compress_ratios = compress_ratios or []
+        self.layer_types = layer_types or ["sliding_attention"] * num_hidden_layers
+        self.compress_rates = compress_rates or {
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        }
         self.sliding_window = sliding_window
         self.num_hash_layers = num_hash_layers
         self.hc_eps = hc_eps
