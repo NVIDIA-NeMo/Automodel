@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from nemo_automodel.components.checkpoint import build_checkpoint_config as _build_checkpoint_config
-from nemo_automodel.components.loggers.wandb_utils import build_wandb as _build_wandb
+from nemo_automodel.components.loggers.api import build_wandb as _build_wandb
 from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
 from nemo_automodel.components.optim import build_lr_scheduler as _build_lr_scheduler
 from nemo_automodel.components.optim import build_optimizer as _build_optimizer
@@ -129,9 +129,11 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 
 
 def build_wandb(cfg: Any):
+    from nemo_automodel.components.loggers.config import WandbConfig
+
     model_name = _model_name_from_cfg(cfg.model) if hasattr(cfg, "model") else None
     return _build_wandb(
-        wandb_kwargs=_as_dict(cfg.wandb),
+        config=WandbConfig(**_as_dict(cfg.wandb)),
         run_config=_as_dict(cfg),
         model_name=model_name,
     )
