@@ -1,0 +1,54 @@
+recipe: TrainEagle2Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+recipe_args:
+  # Phi3 dense target. See ``examples/speculative/eagle3/phi_eagle3_perfectblend.yaml``
+  # for notes on Phi3Config's missing ``attention_bias`` / ``mlp_bias`` and
+  # how the EAGLE draft handles that. EAGLE-2 reuses the EAGLE-1 training
+  # objective; only the inference-time tree policy differs.
+  target_model_name_or_path: microsoft/Phi-3-mini-4k-instruct
+
+  # NOTE: PerfectBlend was regenerated with the Llama-3.1 tokenizer. Using
+  # it with a Phi-3 target works for smoke testing the codepath but is not
+  # correct for a real training run. For a production Phi-3 draft,
+  # regenerate the data with the Phi-3 tokenizer via
+  # ``components/speculative/regenerate.py``.
+  train_data_path: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
+  val_data_path: null
+
+  train_split: "train[:200000]"
+  val_split: null
+
+  output_dir: ./outputs/eagle2_phi_perfectblend
+
+  seq_length: 2048
+
+  micro_batch_size: 1
+  grad_accumulation_steps: 4
+  num_workers: 4
+
+  num_epochs: 1
+  draft_num_hidden_layers: 1
+  hidden_loss_weight: 1.0
+  token_loss_weight: 0.1
+  freeze_embeddings: true
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 20
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle2_phi_perfectblend/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  # restore_from: LATEST  # set to "LATEST", a subdir name like "epoch_1_step_100", or an absolute path

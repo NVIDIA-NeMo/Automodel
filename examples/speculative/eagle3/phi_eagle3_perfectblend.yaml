@@ -1,0 +1,60 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+recipe_args:
+  # Phi3 dense target. ``Phi3Config`` does not define ``attention_bias`` /
+  # ``mlp_bias`` (Llama / Qwen do), and the draft reads those via
+  # ``getattr(config, "<field>", False)``. Phi3's target uses a fused
+  # ``qkv_proj`` internally but that's target-side -- the draft only
+  # consumes post-block hidden states, so this remains a pure dense-draft
+  # path.
+  target_model_name_or_path: microsoft/Phi-3-mini-4k-instruct
+
+  # NOTE: PerfectBlend was regenerated with the Llama-3.1 tokenizer. Using
+  # it with a Phi-3 target works mechanically (token ids are integers fed
+  # through Phi-3's embedding) but is **not** correct for a real training
+  # run -- the draft will learn off-distribution token statistics. For a
+  # production Phi-3 draft, regenerate the data with the Phi-3 tokenizer
+  # via ``components/speculative/regenerate.py``. The config below is
+  # intended for smoke testing the codepath end-to-end.
+  train_data_path: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
+  val_data_path: null
+
+  train_split: "train[:200000]"
+  val_split: null
+
+  output_dir: ./outputs/eagle3_phi_perfectblend
+
+  seq_length: 2048
+
+  micro_batch_size: 1
+  grad_accumulation_steps: 4
+  num_workers: 4
+
+  num_epochs: 1
+
+  ttt_steps: 4
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 20
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 2.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_phi_perfectblend/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  # restore_from: LATEST  # set to "LATEST", a subdir name like "epoch_1_step_100", or an absolute path
