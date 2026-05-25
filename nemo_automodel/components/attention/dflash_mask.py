@@ -51,6 +51,57 @@ def flex_attention_available() -> bool:
     return _FLEX_AVAILABLE
 
 
+# Singleton-cached torch.compile of ``create_block_mask``. The mask_mod closure
+# changes per step (new anchor positions), but the create_block_mask machinery
+# itself is identical — compiling once and reusing avoids per-step Python
+# overhead of evaluating mask_mod across the BlockMask grid.
+# Mirrors SpecForge's WrappedCreateBlockMask (specforge/modeling/draft/flex_attention.py).
+#
+# Mirrors the graceful-fallback pattern used by
+# nemo_automodel.components.utils.compile_utils.compile_model: if torch.compile
+# raises during construction or first call, return the uncompiled
+# create_block_mask so training is never blocked by a compile-side bug.
+_compiled_create_block_mask = None
+_compile_attempted = False
+_compile_failed = False
+
+
+def _get_compiled_create_block_mask():
+    """Lazy-initialise a compiled ``create_block_mask`` and cache it.
+
+    Returns the uncompiled fallback if construction or invocation of the
+    compiled version raises (matches the fallback semantics of
+    ``compile_utils.compile_model``).
+    """
+    global _compiled_create_block_mask, _compile_attempted, _compile_failed
+    if not _FLEX_AVAILABLE:
+        raise RuntimeError("FlexAttention not available; cannot compile create_block_mask.")
+    if _compile_failed:
+        return create_block_mask
+    if _compiled_create_block_mask is not None:
+        return _compiled_create_block_mask
+    if _compile_attempted:
+        # Construction succeeded earlier; just return cached.
+        return _compiled_create_block_mask or create_block_mask
+
+    _compile_attempted = True
+    import torch
+
+    try:
+        _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=False)
+    except Exception as exc:  # noqa: BLE001 — match compile_model's broad fallback.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "torch.compile(create_block_mask) construction failed; falling back to uncompiled "
+            "create_block_mask. Reason: %s",
+            exc,
+        )
+        _compile_failed = True
+        return create_block_mask
+    return _compiled_create_block_mask
+
+
 def create_dflash_sdpa_mask(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
@@ -104,6 +155,7 @@ def create_dflash_block_mask(
     ctx_len: int,
     block_size: int,
     device: torch.device,
+    use_compile: bool = True,
 ) -> "BlockMask":
     """Build a sparse FlexAttention :class:`BlockMask` for DFlash training.
 
@@ -118,6 +170,9 @@ def create_dflash_block_mask(
         ctx_len:          context length.
         block_size:       block size.
         device:           torch device.
+        use_compile:      Cache and reuse a torch.compile'd ``create_block_mask``
+            across calls (default True). Set to False when running on PyTorch
+            builds that hit Inductor errors during compile.
 
     Returns:
         :class:`torch.nn.attention.flex_attention.BlockMask`.
@@ -150,11 +205,38 @@ def create_dflash_block_mask(
         in_bounds = q_block < N
         return (ctx_visible | noise_visible) & keep & in_bounds
 
-    return create_block_mask(
-        dflash_mask_mod,
-        B=B,
-        H=None,
-        Q_LEN=Q_LEN,
-        KV_LEN=KV_LEN,
-        device=device,
-    )
+    # ``BLOCK_SIZE`` is left at the default (128). It MUST be a multiple of the
+    # underlying flex_attention kernel's BLOCK_M / BLOCK_N (128 on H100); setting
+    # it equal to our draft block_size (16) would in theory give finer-grained
+    # sparsity but triggers Inductor's "Q and KV block size must be divisible
+    # by BLOCK_M and BLOCK_N" lowering error at runtime.
+    builder = _get_compiled_create_block_mask() if use_compile else create_block_mask
+    try:
+        return builder(
+            dflash_mask_mod,
+            B=B,
+            H=None,
+            Q_LEN=Q_LEN,
+            KV_LEN=KV_LEN,
+            device=device,
+        )
+    except Exception as exc:  # noqa: BLE001 — same graceful-fallback as compile_model.
+        if builder is create_block_mask:
+            raise
+        global _compile_failed
+        _compile_failed = True
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Compiled create_block_mask invocation failed; falling back to uncompiled for this and "
+            "subsequent calls. Reason: %s",
+            exc,
+        )
+        return create_block_mask(
+            dflash_mask_mod,
+            B=B,
+            H=None,
+            Q_LEN=Q_LEN,
+            KV_LEN=KV_LEN,
+            device=device,
+        )
