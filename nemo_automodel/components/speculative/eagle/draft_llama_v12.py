@@ -59,14 +59,18 @@ class EagleLlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
         self.k_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
     def _repeat_kv(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -111,9 +115,13 @@ class EagleLlamaMLP(nn.Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False)
+        )
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False))
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=getattr(config, "mlp_bias", False)
+        )
         self.act_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

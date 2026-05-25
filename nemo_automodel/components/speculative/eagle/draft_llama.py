@@ -167,10 +167,18 @@ class Eagle3LlamaAttention(nn.Module):
         self.attn_implementation = attn_impl
 
         in_features = config.hidden_size * 2
-        self.q_proj = nn.Linear(in_features, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(in_features, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(in_features, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.q_proj = nn.Linear(
+            in_features, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
+        self.k_proj = nn.Linear(
+            in_features, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
+        self.v_proj = nn.Linear(
+            in_features, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
     def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -345,9 +353,13 @@ class Eagle3LlamaMLP(nn.Module):
         super().__init__()
         from transformers.activations import ACT2FN
 
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False)
+        )
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False))
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=getattr(config, "mlp_bias", False)
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
