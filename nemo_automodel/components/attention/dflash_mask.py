@@ -151,5 +151,10 @@ def create_dflash_block_mask(
         return (ctx_visible | noise_visible) & keep & in_bounds
 
     return create_block_mask(
-        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device,
+        dflash_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
     )

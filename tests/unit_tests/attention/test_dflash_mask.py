@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -145,9 +143,7 @@ def test_flex_block_mask_matches_reference():
         device=device,
     )
     dense = block_mask.to_dense()  # (B, H, Q, KV) — H is broadcast dim (1)
-    ref = _reference_dflash_mask(
-        anchor_positions.cpu(), block_keep_mask.cpu(), ctx_len, block_size
-    ).to(device)
+    ref = _reference_dflash_mask(anchor_positions.cpu(), block_keep_mask.cpu(), ctx_len, block_size).to(device)
 
     # BlockMask granularity may be coarser than 1×1; reference is element-exact.
     # When BLOCK_SIZE in create_block_mask divides block_size cleanly the dense view should match.

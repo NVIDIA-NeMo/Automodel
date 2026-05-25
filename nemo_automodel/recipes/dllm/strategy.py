@@ -44,7 +44,6 @@ from nemo_automodel.components.datasets.dllm.corruption import (
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import (
-    DFlashDecayLoss,
     HybridDiffusionLLMLoss,
     MDLMCrossEntropyLoss,
 )
@@ -373,9 +372,7 @@ class DFlashStrategy(DLLMStrategy):
         # --- Attention backend (sdpa | flex_attention) ---
         backend = str(dflash_cfg.get("attention_backend", "sdpa")).lower()
         if backend not in ("sdpa", "flex_attention"):
-            raise ValueError(
-                f"dflash.attention_backend must be 'sdpa' or 'flex_attention', got {backend!r}"
-            )
+            raise ValueError(f"dflash.attention_backend must be 'sdpa' or 'flex_attention', got {backend!r}")
         if backend == "flex_attention":
             from nemo_automodel.components.attention.dflash_mask import flex_attention_available
 
