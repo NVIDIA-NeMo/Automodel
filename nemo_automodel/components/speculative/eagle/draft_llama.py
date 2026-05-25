@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-based draft model for EAGLE-3 training.
+"""Llama-style dense LLM draft model for EAGLE-3 training.
 
-Module naming is aligned to ``sglang/srt/models/llama_eagle3.py`` so that a
-checkpoint produced by this trainer can be loaded directly by SGLang's
-``LlamaForCausalLMEagle3.load_weights`` without any key remapping. The state
-dict layout is:
+The implementation is config-driven and supports any HuggingFace dense
+decoder-only architecture whose layout matches Llama: GQA attention with
+optional Q/K/V/O bias (`config.attention_bias`), SwiGLU MLP with optional
+bias (`config.mlp_bias`), RMSNorm, and rotary position embeddings parameterized
+by `config.rope_theta` / `config.rope_scaling`. This covers Llama 2/3, Qwen2,
+and Qwen3 dense (Qwen3 sets `head_dim` independently of
+`hidden_size / num_attention_heads`, which the attention layer already reads
+via `getattr(config, "head_dim", ...)`).
+
+Class names and the public `architectures` string remain ``LlamaEagle3*`` for
+backward compatibility with already-trained checkpoints and with SGLang's
+``LlamaForCausalLMEagle3.load_weights`` (the saved state dict layout is
+unchanged):
 
     model.embed_tokens.weight
     model.fc.weight
@@ -41,7 +50,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import LlamaConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
@@ -131,7 +140,7 @@ class Eagle3LlamaAttention(nn.Module):
     batch.
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -330,9 +339,9 @@ class Eagle3LlamaAttention(nn.Module):
 
 
 class Eagle3LlamaMLP(nn.Module):
-    """Standard Llama SwiGLU MLP on hidden-size activations."""
+    """Standard Llama-style SwiGLU MLP on hidden-size activations."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         from transformers.activations import ACT2FN
 
@@ -356,7 +365,7 @@ class Eagle3LlamaDecoderLayer(nn.Module):
     hidden]`` concatenation (always true for our single-layer draft).
     """
 
-    def __init__(self, config: LlamaConfig, layer_id: int = 0):
+    def __init__(self, config: PretrainedConfig, layer_id: int = 0):
         super().__init__()
         self.layer_id = layer_id
         self.is_input_layer = layer_id == 0
@@ -405,7 +414,7 @@ class Eagle3LlamaModel(nn.Module):
     training-facing public API.
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
@@ -421,7 +430,7 @@ class Eagle3LlamaModel(nn.Module):
 
 
 class LlamaEagle3DraftModel(PreTrainedModel):
-    """Minimal Llama-only EAGLE-3 draft model.
+    """Llama-style dense EAGLE-3 draft model (Llama, Qwen2, Qwen3).
 
     State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
     checkpoint can be loaded by SGLang's inference engine without any
@@ -429,17 +438,23 @@ class LlamaEagle3DraftModel(PreTrainedModel):
     ``qkv_proj`` and ``gate/up_proj`` into ``gate_up_proj`` via its
     standard ``stacked_params_mapping``).
 
-    This intentionally starts narrow:
-    - Llama config only
+    The class name is retained for checkpoint-architectures compatibility; the
+    implementation is config-driven and works for any HF dense decoder-only
+    config that exposes ``hidden_size``, ``num_attention_heads``,
+    ``num_key_value_heads``, ``attention_bias``, ``mlp_bias``, ``rope_theta``,
+    and ``rms_norm_eps``. Qwen3's decoupled ``head_dim`` is read via
+    ``getattr(config, "head_dim", ...)`` in the attention layer.
+
+    Scope:
     - single draft decoder layer
     - no KV-cache optimization
     - no speculative runtime integration
     """
 
-    config_class = LlamaConfig
+    config_class = PretrainedConfig
     base_model_prefix = "model"
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self.config = config
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)

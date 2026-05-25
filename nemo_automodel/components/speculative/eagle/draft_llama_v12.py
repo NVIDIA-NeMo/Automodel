@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-based draft model for EAGLE-1 / EAGLE-2 training."""
+"""Llama-style dense LLM draft model for EAGLE-1 / EAGLE-2 training.
+
+Config-driven; supports Llama, Qwen2, and Qwen3 dense via standard HF config
+fields (``attention_bias``, ``mlp_bias``, ``rope_theta``/``rope_scaling``,
+``rms_norm_eps``). Class names are retained for checkpoint-architectures
+compatibility.
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from transformers import LlamaConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
@@ -44,7 +50,7 @@ def _build_causal_mask(
 class EagleLlamaAttention(nn.Module):
     """Standard Llama-style self attention for the EAGLE-1/2 draft."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -103,7 +109,7 @@ class EagleLlamaAttention(nn.Module):
 class EagleLlamaMLP(nn.Module):
     """Standard SwiGLU MLP used by the EAGLE-1/2 draft."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
@@ -117,7 +123,7 @@ class EagleLlamaMLP(nn.Module):
 class EagleLlamaDecoderLayer(nn.Module):
     """Single decoder layer for the minimal EAGLE-1/2 draft model."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.self_attn = EagleLlamaAttention(config)
         self.mlp = EagleLlamaMLP(config)
@@ -142,12 +148,16 @@ class EagleLlamaDecoderLayer(nn.Module):
 
 
 class LlamaEagleDraftModel(PreTrainedModel):
-    """Minimal Llama draft that predicts next-step hidden states."""
+    """Llama-style dense draft that predicts next-step hidden states.
 
-    config_class = LlamaConfig
+    Works with Llama, Qwen2, and Qwen3 dense configs. The class name is
+    retained for backward compatibility with already-trained checkpoints.
+    """
+
+    config_class = PretrainedConfig
     main_input_name = "input_ids"
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)

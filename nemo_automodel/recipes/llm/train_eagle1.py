@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-only EAGLE-1 training recipe."""
+"""EAGLE-1 / EAGLE-2 training recipe for Llama-style dense LLMs (Llama, Qwen2, Qwen3)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig, LlamaConfig
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -62,7 +62,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle1Recipe(BaseRecipe):
-    """Recipe for minimal Llama-only EAGLE-1 training."""
+    """Recipe for EAGLE-1 training on Llama-style dense LLMs (Llama, Qwen2, Qwen3)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -83,10 +83,13 @@ class TrainEagle1Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        if "LlamaForCausalLM" not in architectures:
-            raise ValueError(f"TrainEagle1Recipe currently supports only LlamaForCausalLM, got {architectures}")
-        if not isinstance(target_config, LlamaConfig):
-            raise ValueError(f"Expected LlamaConfig for EAGLE-1 training, got {type(target_config).__name__}")
+        # Llama-style dense LLMs that share the GQA + SwiGLU + RoPE layout the
+        # draft model expects. Adding a new architecture is safe as long as
+        # its config exposes the same fields (attention_bias, mlp_bias,
+        # rope_theta/rope_scaling, rms_norm_eps).
+        _SUPPORTED_ARCHITECTURES = {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+        if not (set(architectures) & _SUPPORTED_ARCHITECTURES):
+            raise ValueError(f"TrainEagle1Recipe supports {sorted(_SUPPORTED_ARCHITECTURES)}, got {architectures}")
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -130,9 +133,11 @@ class TrainEagle1Recipe(BaseRecipe):
         draft_config = target_config.to_dict()
         draft_config["architectures"] = ["LlamaEagleDraftModel"]
         draft_config["draft_num_hidden_layers"] = int(recipe_cfg.get("draft_num_hidden_layers", 1))
-        self.draft_model = LlamaEagleDraftModel(LlamaConfig.from_dict(draft_config)).to(
-            device=self.device, dtype=self.compute_dtype
-        )
+        # Reuse the target's concrete config class (LlamaConfig / Qwen2Config /
+        # Qwen3Config) so architecture-specific defaults like attention_bias
+        # and head_dim flow into the draft.
+        draft_config_obj = type(target_config).from_dict(draft_config)
+        self.draft_model = LlamaEagleDraftModel(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
