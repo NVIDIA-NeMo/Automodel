@@ -57,14 +57,8 @@ def build_checkpoint_config(
     model_repo_id: str | None,
     is_peft: bool,
 ):
-    from nemo_automodel.components.checkpoint.config import CheckpointConfig
-
-    if cfg_ckpt is None:
-        config = None
-    else:
-        config = CheckpointConfig(**_as_dict(cfg_ckpt))
     return _build_checkpoint_config(
-        config=config,
+        checkpoint_kwargs=_as_dict(cfg_ckpt) if cfg_ckpt is not None else None,
         cache_dir=cache_dir,
         model_repo_id=model_repo_id,
         is_peft=is_peft,
