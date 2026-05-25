@@ -70,16 +70,21 @@ def _require_pyarrow() -> None:
         raise RuntimeError("pyarrow and pyarrow.parquet are required to prepare inline retrieval Parquet shards.")
 
 
-def _discover_corpus_dir(input_json: Path) -> Path:
+def _discover_corpus_dir(input_json: Path, chunk_size: int = 1 << 20) -> Path:
     """Read the top-level ``corpus.path`` field without loading the JSON data array."""
-    header_lines = []
+    header = ""
     with input_json.open("r", encoding="utf-8") as f:
-        for line in f:
-            if '"data"' in line:
+        while True:
+            data_key_idx = header.find('"data"')
+            if data_key_idx >= 0:
+                header = header[:data_key_idx].rstrip()
                 break
-            header_lines.append(line)
 
-    header = "".join(header_lines).rstrip()
+            chunk = f.read(chunk_size)
+            if not chunk:
+                raise ValueError(f"Could not find top-level 'data' array in {input_json}")
+            header += chunk
+
     if header.endswith(","):
         header = header[:-1].rstrip()
     header = f"{header}\n}}"
