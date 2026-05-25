@@ -46,8 +46,8 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
-    LlamaEagle3DraftModel,
 )
+from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
@@ -102,13 +102,11 @@ class TrainEagle3Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        # Llama-style dense LLMs that share the GQA + SwiGLU + RoPE layout the
-        # draft model expects. Adding a new architecture is safe as long as
-        # its config exposes the same fields (attention_bias, mlp_bias,
-        # rope_theta/rope_scaling, rms_norm_eps).
-        _SUPPORTED_ARCHITECTURES = {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
-        if not (set(architectures) & _SUPPORTED_ARCHITECTURES):
-            raise ValueError(f"TrainEagle3Recipe supports {sorted(_SUPPORTED_ARCHITECTURES)}, got {architectures}")
+        # Dispatch via the eagle registry. New architectures are added by
+        # appending to ``_DENSE_ARCHITECTURES`` (or registering a custom
+        # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
+        # no recipe change required.
+        draft_spec = resolve_eagle3_draft_spec(architectures)
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -180,10 +178,10 @@ class TrainEagle3Recipe(BaseRecipe):
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
         # Reuse the target's concrete config class (LlamaConfig / Qwen2Config /
-        # Qwen3Config) so architecture-specific defaults like attention_bias
-        # and head_dim flow into the draft.
+        # Qwen3Config / ...) so architecture-specific defaults like
+        # attention_bias and head_dim flow into the draft.
         draft_config_obj = type(target_config).from_dict(draft_config)
-        self.draft_model = LlamaEagle3DraftModel(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
