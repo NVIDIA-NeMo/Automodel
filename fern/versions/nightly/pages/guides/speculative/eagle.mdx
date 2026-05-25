@@ -287,6 +287,9 @@ recipe_args:
   ttt_steps: 4                 # TTT unroll depth (higher = better but slower)
   draft_vocab_size: 32000      # smaller vocab = faster drafter
 
+  # The drafter copies the target's embedding table at init; this flag
+  # freezes those copied weights so only the draft transformer layers
+  # and lm_head are trained.
   freeze_embeddings: true
   shuffle_seed: 42
   log_every_steps: 20
@@ -302,6 +305,8 @@ optimizer:
 checkpoint:
   enabled: true
   checkpoint_dir: ./outputs/eagle3_llama8b/checkpoints
+  # The recipe defaults to safetensors + consolidated; these lines are
+  # shown explicitly for clarity but can be omitted.
   model_save_format: safetensors
   save_consolidated: true
 ```
@@ -318,7 +323,7 @@ checkpoint:
 | `grad_accumulation_steps` | Gradient accumulation for larger effective batches |
 | `ttt_steps` | TTT unroll depth; 4 is the default, cost is linear per step |
 | `draft_vocab_size` | Draft output vocabulary size; smaller = faster inference |
-| `freeze_embeddings` | Keep target embeddings frozen (always `true`) |
+| `freeze_embeddings` | Freeze the embedding table copied from the target so only draft layers train (recommended `true`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |
 
 ### Launch training
@@ -562,6 +567,7 @@ optimizer:
 checkpoint:
   enabled: true
   checkpoint_dir: ./outputs/eagle1_llama8b/checkpoints
+  # Defaults to safetensors + consolidated; can be omitted.
   model_save_format: safetensors
   save_consolidated: true
 ```
