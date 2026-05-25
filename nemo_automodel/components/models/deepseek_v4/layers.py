@@ -599,10 +599,8 @@ def eager_attention_with_sink(
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)).float() * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.shape[-1]].float()
-    if hasattr(module, "sinks_param"):
-        sinks = module.sinks_param(query)
-    else:
-        sinks = module.sinks
+    sinks_param = getattr(module, "sinks_param", None)
+    sinks = sinks_param(query) if isinstance(sinks_param, DeepseekV4FP32Parameter) else module.sinks
     sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined = torch.cat([attn_weights, sinks.float()], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
@@ -643,9 +641,12 @@ class DeepseekV4FP32Parameter(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(value.to(torch.float32))
 
-    def forward(self, reference: torch.Tensor | None = None) -> torch.Tensor:
-        del reference
-        return self.weight
+    def forward(self, _fsdp_input: torch.Tensor) -> torch.Tensor:
+        # This holder may be wrapped as its own FSDP2 unit. Return an activation
+        # tensor instead of the raw parameter so post-forward resharding cannot
+        # invalidate the storage before the caller consumes it. FSDP2 expects a
+        # non-empty forward input tuple during activation-checkpoint recompute.
+        return self.weight.clone()
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -681,7 +682,7 @@ class DeepseekV4Indexer(nn.Module):
 
     @property
     def ape(self) -> torch.Tensor:
-        return self.ape_param()
+        return self.ape_param(self.ape_param.weight)
 
     def forward(
         self,
@@ -705,7 +706,7 @@ class DeepseekV4Indexer(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
+                self.ape_param(hidden_states),
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -772,7 +773,7 @@ class DeepseekV4Compressor(nn.Module):
 
     @property
     def ape(self) -> torch.Tensor:
-        return self.ape_param()
+        return self.ape_param(self.ape_param.weight)
 
     def _set_hca_param_sync_group(self, process_group) -> None:
         self._hca_param_sync_group = process_group
@@ -842,7 +843,7 @@ class DeepseekV4Compressor(nn.Module):
             _pool_windows(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
+                self.ape_param(hidden_states),
                 self.compress_ratio,
                 self.head_dim,
                 overlap=self.overlap,
@@ -1025,7 +1026,8 @@ class DeepseekV4Attention(nn.Module):
         self.config = config
         self.backend = backend or BackendConfig()
         self.layer_idx = layer_idx
-        self.compress_ratio = int(config.compress_ratios[layer_idx]) if config.compress_ratios else 0
+        layer_type = config.layer_types[layer_idx]
+        self.compress_ratio = 0 if layer_type == "sliding_attention" else int(config.compress_rates[layer_type])
         self.num_heads = config.num_attention_heads
         # Single KV head broadcast to all attention heads (``num_key_value_groups == num_heads``).
         self.num_key_value_groups = config.num_attention_heads
@@ -1057,7 +1059,7 @@ class DeepseekV4Attention(nn.Module):
 
     @property
     def sinks(self) -> torch.Tensor:
-        return self.sinks_param()
+        return self.sinks_param(self.sinks_param.weight)
 
     def forward(
         self,

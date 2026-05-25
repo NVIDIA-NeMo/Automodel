@@ -36,6 +36,7 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "self_attn.compressor.indexer.wkv",
     "self_attn.compressor.indexer.wgate",
     "self_attn.compressor.indexer.ape_param",
+    "mlp.gate",
 )
 
 
