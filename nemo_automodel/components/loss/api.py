@@ -17,18 +17,39 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from nemo_automodel.components.loss.config import LossConfig, _resolve_loss
+
 if TYPE_CHECKING:
     from torch import nn
 
 
-def build_loss_fn(loss_factory: Callable[..., nn.Module], loss_kwargs: Mapping[str, Any] | None = None) -> nn.Module:
+def build_loss_fn(
+    config: LossConfig | None = None,
+    *,
+    loss_factory: Callable[..., nn.Module] | None = None,
+    loss_kwargs: Mapping[str, Any] | None = None,
+) -> nn.Module:
     """Build a loss function.
 
+    Accepts either a ``LossConfig`` (preferred for external integrations)
+    or an explicit ``(loss_factory, loss_kwargs)`` pair (used by
+    ``_component_builders`` when resolving from YAML).
+
     Args:
+        config: Typed loss config.  When provided, ``loss_factory`` and
+            ``loss_kwargs`` are derived from it.
         loss_factory: Callable or class that creates the loss function.
+            Ignored when ``config`` is provided.
         loss_kwargs: Optional keyword arguments passed to the loss factory.
+            Ignored when ``config`` is provided.
 
     Returns:
         Instantiated loss function.
     """
+    if config is not None:
+        loss_factory = _resolve_loss(config.name)
+        loss_kwargs = config.to_kwargs()
+    elif loss_factory is None:
+        raise ValueError("Either config or loss_factory must be provided")
+
     return loss_factory(**dict(loss_kwargs or {}))
