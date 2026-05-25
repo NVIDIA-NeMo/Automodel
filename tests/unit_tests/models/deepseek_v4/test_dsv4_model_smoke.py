@@ -28,6 +28,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
@@ -118,6 +119,96 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_dsv4_hca_param_sync_group_uses_only_1d_mesh(self):
+        named_hca_group = object()
+        unnamed_hca_group = object()
+        shape_only_hca_group = object()
+
+        class NamedOneDimMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return named_hca_group
+
+        class UnnamedOneDimMesh:
+            mesh_dim_names = None
+            ndim = 1
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return unnamed_hca_group
+
+        class UnnamedTwoDimMesh:
+            mesh_dim_names = None
+            ndim = 2
+
+        class ShapeOnlyOneDimMesh:
+            shape = (2,)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return shape_only_hca_group
+
+        class TwoDimMesh:
+            mesh_dim_names = ("dp", "tp")
+
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(None) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedOneDimMesh()) is unnamed_hca_group
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedTwoDimMesh()) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(ShapeOnlyOneDimMesh()) is shape_only_hca_group
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
+
+    def test_dsv4_fsdp_attaches_hca_group_before_all_fp32_fast_path(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
+        model = _make_model(cfg)
+        block = model.model.layers["0"]
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        hca_group = object()
+
+        class FakeMesh:
+            ndim = 1
+            mesh_dim_names = None
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return hca_group
+
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=FakeMesh(),
+            mp_policy=input_policy,
+            offload_policy=object(),
+        )
+
+        assert block.self_attn.compressor._hca_param_sync_group is hca_group
+        assert len(calls) == 1
+        assert calls[0][0] is block
+        assert calls[0][1]["mp_policy"].param_dtype == torch.float32
+        assert calls[0][1]["mp_policy"].reduce_dtype == torch.float32
+
     def test_dsv4_fsdp_wraps_fp32_islands_without_ignored_trainable_tensors(self, monkeypatch):
         cfg = _tiny_config(
             num_hidden_layers=1,
@@ -152,6 +243,17 @@ class TestDeepseekV4ModelSmoke:
 
         monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
 
+        hca_group = object()
+
+        class FakeMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return hca_group
+
         input_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -161,12 +263,13 @@ class TestDeepseekV4ModelSmoke:
 
         dsv4_fsdp.fully_shard_deepseek_v4(
             block,
-            mesh=object(),
+            mesh=FakeMesh(),
             mp_policy=input_policy,
             offload_policy=object(),
             ignored_params=ignored_expert_params,
         )
 
+        assert block.self_attn.compressor._hca_param_sync_group is hca_group
         calls_by_name = {name: kwargs for name, kwargs in calls}
         expected_fp32_modules = {
             "attn_hc",
@@ -336,21 +439,22 @@ class TestDeepseekV4ModelSmoke:
         assert indices.dtype == torch.long
 
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
-        """Both HC expand sites mix residual streams as ``comb.T @ x``."""
+        """Both HC expand sites mix residual streams as ``comb.T @ x``.
+
+        The fake HC modules intentionally expose only ``forward`` so this also
+        guards against bypassing module hooks via direct ``compute_weights`` calls.
+        """
 
         class _FixedHC(torch.nn.Module):
             def __init__(self, comb):
                 super().__init__()
                 self.register_buffer("comb", comb)
 
-            def compute_weights(self, hidden_streams):
+            def forward(self, hidden_streams):
                 bsz, seq, hc_mult = hidden_streams.shape[:3]
                 pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
                 post = torch.zeros_like(pre)
                 return pre, post, self.comb.expand(bsz, seq, -1, -1)
-
-            def forward(self, hidden_streams):
-                return self.compute_weights(hidden_streams)
 
         class _ZeroAttention(torch.nn.Module):
             def forward(self, hidden_states, **kwargs):
@@ -398,6 +502,45 @@ class TestDeepseekV4ModelSmoke:
         torch.testing.assert_close(actual, expected)
         assert not torch.allclose(expected, wrong_orientation)
 
+    def test_thd_pp_intermediate_hidden_state_keeps_shape(self):
+        """Packed-sequence PP stages must not add a fake batch dim to hidden states."""
+
+        class _HiddenStage(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                del input_ids, kwargs
+                return torch.zeros(1, 8, 4, 16)
+
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.model = _HiddenStage()
+        model.lm_head = None
+        model.mtp = None
+        model.mtp_config = MTPConfig()
+
+        out = model(torch.ones(1, 8, dtype=torch.long), qkv_format="thd")
+
+        assert out.shape == (1, 8, 4, 16)
+
+    def test_thd_first_stage_keeps_batch_axis(self):
+        """DSV4 packed sequence uses seq_lens masks while preserving [1, T] inputs."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+
+        input_ids = torch.ones(1, 8, dtype=torch.long)
+        position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
+        seq_lens = torch.tensor([[8]], dtype=torch.long)
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                seq_lens=seq_lens,
+                seq_lens_padded=seq_lens,
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
+
     @_REQUIRES_CUDA
     def test_forward_shape(self):
         """Forward pass produces logits of the right shape."""
@@ -407,7 +550,8 @@ class TestDeepseekV4ModelSmoke:
         bsz, seq = 2, 8
         input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            # forward returns DeepseekV4CausalLMOutput; pull .logits.
+            logits = model(input_ids).logits
 
         assert logits.shape == (bsz, seq, cfg.vocab_size), f"unexpected shape {logits.shape}"
         assert not logits.isnan().any(), "logits contain NaN"
@@ -424,7 +568,7 @@ class TestDeepseekV4ModelSmoke:
         input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq))
         labels = torch.randint(0, cfg.vocab_size, (bsz, seq))
 
-        logits = model(input_ids)
+        logits = model(input_ids).logits
         loss = torch.nn.functional.cross_entropy(logits.view(-1, cfg.vocab_size), labels.view(-1))
         loss.backward()
 
@@ -514,7 +658,7 @@ class TestDeepseekV4ModelSmoke:
             for seq in [1, 4, 16, 32]:
                 input_ids = torch.randint(0, cfg.vocab_size, (1, seq))
                 with torch.no_grad():
-                    logits = model(input_ids)
+                    logits = model(input_ids).logits
                 assert logits.shape == (1, seq, cfg.vocab_size)
 
 

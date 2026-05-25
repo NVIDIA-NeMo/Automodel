@@ -24,7 +24,7 @@
 
 | Model | HF ID |
 |---|---|
-| InternVL3.5 4B | [`OpenGVLab/InternVL3-5-4B`](https://huggingface.co/OpenGVLab/InternVL3-5-4B) |
+| InternVL3.5 4B | [`OpenGVLab/InternVL3_5-4B`](https://huggingface.co/OpenGVLab/InternVL3_5-4B) |
 
 ## Example Recipes
 
@@ -85,4 +85,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- [OpenGVLab/InternVL3-5-4B](https://huggingface.co/OpenGVLab/InternVL3-5-4B)
+- [OpenGVLab/InternVL3_5-4B](https://huggingface.co/OpenGVLab/InternVL3_5-4B)

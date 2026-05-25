@@ -1,0 +1,91 @@
+---
+title: "Qwen2 MoE"
+description: ""
+---
+[Qwen1.5-MoE](https://qwenlm.github.io/) is a Mixture-of-Experts variant from Alibaba Cloud that activates only a fraction of parameters per token, enabling efficient training and inference at scale.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE) |
+| **Architecture** | `Qwen2MoeForCausalLM` |
+| **Parameters** | 14.3B total / 2.7B active |
+| **HF Org** | [Qwen](https://huggingface.co/Qwen) |
+
+</Info>
+
+## Available Models
+
+- **Qwen1.5-MoE-A2.7B**: 14.3B total parameters, 2.7B activated per token
+
+## Architecture
+
+- `Qwen2MoeForCausalLM`
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Qwen1.5 MoE A2.7B | [`Qwen/Qwen1.5-MoE-A2.7B`](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B) |
+| Qwen1.5 MoE A2.7B Chat | [`Qwen/Qwen1.5-MoE-A2.7B-Chat`](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [qwen1_5_moe_a2_7b_qlora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml) | QLoRA — Qwen1.5 MoE A2.7B |
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](/get-started/installation)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml
+```
+
+<Accordion title="Run with Docker">
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen1_5_moe_a2_7b_qlora.yaml
+```
+</Accordion>
+
+See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
+
+## Fine-Tuning
+
+See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft) and the [Large MoE Fine-Tuning Guide](/recipes-e2e-examples/large-moe-fine-tuning).
+
+## Hugging Face Model Cards
+
+- [Qwen/Qwen1.5-MoE-A2.7B](https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B)

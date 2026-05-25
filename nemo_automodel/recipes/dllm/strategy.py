@@ -37,10 +37,17 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.datasets.dllm.corruption import corrupt_uniform
+from nemo_automodel.components.datasets.dllm.corruption import (
+    corrupt_blockwise,
+    corrupt_uniform,
+)
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
-from nemo_automodel.components.loss.dllm_loss import MDLMCrossEntropyLoss
+from nemo_automodel.components.loss.dllm_loss import (
+    DFlashDecayLoss,
+    HybridDiffusionLLMLoss,
+    MDLMCrossEntropyLoss,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +178,46 @@ class MDLMStrategy(DLLMStrategy):
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
         batch["input_ids"] = noisy_input_ids
         batch.pop("attention_mask", None)  # MDLM models are bidirectional
+        return batch
+
+
+class HybridStrategy(DLLMStrategy):
+    """Strategy for hybrid diffusion + AR models (e.g., Nemotron-Labs-Diffusion).
+
+    - Loss: :class:`HybridDiffusionLLMLoss` with configurable ``ar_loss_alpha``.
+    - Corruption: uniform when ``block_size`` is ``None``, blockwise otherwise.
+    - Batch: model receives clean tokens + ``masked_indices`` sidecar; the
+      model applies masking internally during its forward pass.
+    - Normalization: hybrid models normalize diffusion loss by the corrupted
+      (noise) token count, not the full supervised count.
+    """
+
+    @property
+    def normalization_mode(self) -> str:
+        return "noise"
+
+    def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        return HybridDiffusionLLMLoss(alpha=float(dllm_cfg.get("ar_loss_alpha", 1.0)))
+
+    def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+        if block_size is None:
+            return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
+        return corrupt_blockwise(
+            input_ids,
+            loss_mask,
+            mask_token_id,
+            block_size=block_size,
+            eps=eps,
+            half_life_ratio=half_life_ratio if half_life_ratio is not None else 0.25,
+        )
+
+    def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
+        batch["input_ids"] = clean_input_ids
+        batch["masked_indices"] = noise_mask
+        batch.pop("attention_mask", None)
+        batch.pop("use_cache", None)
+        batch["labels"] = clean_input_ids
+        batch["skip_loss"] = True
         return batch
 
 
@@ -593,6 +640,7 @@ class DFlashStrategy(DLLMStrategy):
 
 DLLM_STRATEGIES: Dict[str, type] = {
     "mdlm": MDLMStrategy,
+    "hybrid": HybridStrategy,
     "dflash": DFlashStrategy,
 }
 

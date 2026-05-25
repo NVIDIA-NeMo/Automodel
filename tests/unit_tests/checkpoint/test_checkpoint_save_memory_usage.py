@@ -18,7 +18,6 @@ import gc
 import os
 import sys
 import threading
-import time
 import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path

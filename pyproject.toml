@@ -147,11 +147,18 @@ vlm = [
     "pillow",
     "qwen-omni-utils",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "soundfile",
     "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
 cli = [
     "pyyaml",
+]
+s3 = [
+    "boto3>=1.34",
+]
+msc = [
+    "multi-storage-client>=0.13",
 ]
 all = [
     "nemo_automodel[cuda]",
@@ -159,13 +166,14 @@ all = [
     "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
     "nemo_automodel[fla]",
+    "nemo_automodel[s3]",
     "nemo_automodel[vlm]",
 ]
 
 [project.urls]
 Homepage = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/"
-Repository = "https://github.com/NVIDIA/NeMo-Automodel"
-Download = "https://github.com/NVIDIA/NeMo-Automodel/releases"
+Repository = "https://github.com/NVIDIA-NeMo/Automodel"
+Download = "https://github.com/NVIDIA-NeMo/Automodel/releases"
 
 [project.scripts]
 automodel = "nemo_automodel.cli.app:main"
@@ -188,7 +196,7 @@ linting = [
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
-test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = ["coverage", "pytest", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -312,6 +320,8 @@ omit = [
     # Vendored from https://github.com/uccl-project/uccl/tree/main/ep/deep_ep_wrapper
     "nemo_automodel/components/moe/uccl_ep/_buffer.py",
     "nemo_automodel/components/moe/uccl_ep/_utils.py",
+    # Vendored DeepSeek V4 TileLang kernels (Miles upstream, Apache-2.0)
+    "nemo_automodel/components/models/deepseek_v4/kernels/*.py",
     "config.py",
     "config-3.py",
     # transformer v5 backports
