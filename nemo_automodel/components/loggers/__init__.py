@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.loggers.api import build_comet, build_wandb
+from nemo_automodel.components.loggers.api import build_comet, build_mlflow, build_wandb
 from nemo_automodel.components.loggers.config import CometConfig, MLflowConfig, WandbConfig
 
-__all__ = ["CometConfig", "MLflowConfig", "WandbConfig", "build_comet", "build_wandb"]
+__all__ = ["CometConfig", "MLflowConfig", "WandbConfig", "build_comet", "build_mlflow", "build_wandb"]

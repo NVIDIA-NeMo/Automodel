@@ -140,6 +140,17 @@ def build_wandb(cfg: Any):
 
 
 def build_mlflow(cfg: Any):
-    from nemo_automodel.components.loggers.mlflow_utils import configure_mlflow
+    from nemo_automodel.components.loggers.api import build_mlflow as _build_mlflow
+    from nemo_automodel.components.loggers.config import MLflowConfig
 
-    return configure_mlflow(cfg)
+    mlflow_dict = _as_dict(cfg.mlflow) if hasattr(cfg, "mlflow") and cfg.mlflow else {}
+    if not mlflow_dict:
+        return None
+    # Extract run_config; use to_yaml_dict if available (ConfigNode), else plain dict.
+    run_config = cfg.to_yaml_dict(use_orig_values=True) if hasattr(cfg, "to_yaml_dict") else _as_dict(cfg)
+    checkpoint_dir = cfg.get("checkpoint.checkpoint_dir", None) if hasattr(cfg, "get") else None
+    return _build_mlflow(
+        config=MLflowConfig(**mlflow_dict),
+        checkpoint_dir=checkpoint_dir,
+        run_config=run_config,
+    )
