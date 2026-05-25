@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM strategies (MDLMStrategy, DFlashStrategy) and get_dllm_strategy."""
+"""Tests for dLLM strategies (MDLMStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
 
 import types
 
@@ -20,12 +20,14 @@ import pytest
 import torch
 
 from nemo_automodel.components.loss.dllm_loss import (
+    HybridDiffusionLLMLoss,
     MDLMCrossEntropyLoss,
 )
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
     DFlashStrategy,
     DLLMStrategy,
+    HybridStrategy,
     MDLMStrategy,
     get_dllm_strategy,
 )
@@ -39,6 +41,9 @@ class TestDLLMStrategyRegistry:
     def test_mdlm_in_strategies(self):
         assert "mdlm" in DLLM_STRATEGIES
 
+    def test_hybrid_in_strategies(self):
+        assert "hybrid" in DLLM_STRATEGIES
+
     def test_dflash_in_strategies(self):
         assert "dflash" in DLLM_STRATEGIES
 
@@ -49,6 +54,10 @@ class TestDLLMStrategyRegistry:
     def test_get_mdlm_strategy(self):
         s = get_dllm_strategy("mdlm")
         assert isinstance(s, MDLMStrategy)
+
+    def test_get_hybrid_strategy(self):
+        s = get_dllm_strategy("hybrid")
+        assert isinstance(s, HybridStrategy)
 
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError, match="Unknown dllm.mode"):
@@ -229,6 +238,84 @@ class TestLLaDAIntegration:
         filtered = {k: v for k, v in result.items() if k in llada_params}
         assert "input_lengths" not in filtered
         assert "input_ids" in filtered
+
+
+# ---------------------------------------------------------------------------
+# HybridStrategy tests
+# ---------------------------------------------------------------------------
+
+
+class TestHybridStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return HybridStrategy()
+
+    def test_create_loss_fn_type(self, strategy):
+        loss_fn = strategy.create_loss_fn({"ar_loss_alpha": 0.3})
+        assert isinstance(loss_fn, HybridDiffusionLLMLoss)
+        assert loss_fn.alpha == 0.3
+
+    def test_create_loss_fn_default_alpha(self, strategy):
+        loss_fn = strategy.create_loss_fn({})
+        assert loss_fn.alpha == 1.0
+
+    def test_apply_corruption_uniform_when_no_block_size(self, strategy):
+        """block_size=None should select uniform corruption (constant p_mask per row)."""
+        torch.manual_seed(42)
+        B, L = 2, 16
+        input_ids = torch.randint(0, 100, (B, L))
+        loss_mask = torch.ones(B, L, dtype=torch.long)
+        noisy, noise_mask, p_mask = strategy.apply_corruption(
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.001,
+            block_size=None,
+            half_life_ratio=None,
+        )
+        assert noisy.shape == (B, L)
+        assert noise_mask.shape == (B, L)
+        assert p_mask.shape == (B, L)
+        for b in range(B):
+            assert torch.allclose(p_mask[b], p_mask[b, 0].expand_as(p_mask[b]))
+
+    def test_apply_corruption_blockwise_when_block_size_set(self, strategy):
+        """block_size=4 should invoke the blockwise corruption path."""
+        torch.manual_seed(42)
+        B, L = 2, 16
+        input_ids = torch.randint(0, 100, (B, L))
+        loss_mask = torch.ones(B, L, dtype=torch.long)
+        noisy, noise_mask, p_mask = strategy.apply_corruption(
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.001,
+            block_size=4,
+            half_life_ratio=None,
+        )
+        assert noisy.shape == (B, L)
+        assert noise_mask.shape == (B, L)
+        assert p_mask.shape == (B, L)
+
+    def test_prepare_batch_passes_clean_input_ids(self, strategy):
+        """Hybrid models receive clean tokens plus a masked_indices sidecar."""
+        batch = {
+            "input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "attention_mask": torch.ones(2, 4),
+            "use_cache": True,
+        }
+        noisy = torch.full((2, 4), 100, dtype=torch.long)
+        noise_mask = torch.tensor([[True, False, True, False], [False, True, False, True]])
+        clean = torch.arange(8, dtype=torch.long).reshape(2, 4)
+
+        result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
+
+        assert (result["input_ids"] == clean).all()
+        assert (result["masked_indices"] == noise_mask).all()
+        assert (result["labels"] == clean).all()
+        assert result["skip_loss"] is True
+        assert "attention_mask" not in result
+        assert "use_cache" not in result
 
 
 # ---------------------------------------------------------------------------

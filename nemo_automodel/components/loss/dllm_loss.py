@@ -78,7 +78,10 @@ class MDLMCrossEntropyLoss(nn.Module):
         noise_mask: torch.Tensor,
         p_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        loss_mask_ar: Optional[torch.Tensor] = None,
         num_diffusion_tokens: Optional[int] = None,
+        num_ar_tokens: Optional[int] = None,
+        causal_logits: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Compute the MDLM cross-entropy loss.
 
@@ -111,6 +114,112 @@ class MDLMCrossEntropyLoss(nn.Module):
             loss = loss / max(num_diffusion_tokens, 1)
 
         return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
+
+
+class HybridDiffusionLLMLoss(nn.Module):
+    """Combined diffusion + optional AR loss for hybrid diffusion LLM models.
+
+    Used by Nemotron-Labs-Diffusion. The diffusion component computes
+    MDLM-style loss at noise-masked positions, weighted by ``1/p_mask``. An
+    optional autoregressive (AR) component adds standard cross-entropy at AR
+    positions (the causal branch of model output).
+
+    Total loss = alpha * diffusion_loss + ar_loss.
+    """
+
+    def __init__(self, alpha: float = 1.0, fp32_upcast: bool = True):
+        """Initialize the hybrid loss.
+
+        Args:
+            alpha: Weight for the diffusion loss component.
+            fp32_upcast: If True, upcast logits to float32 for numerical stability.
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.fp32_upcast = fp32_upcast
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        noise_mask: torch.Tensor,
+        p_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        loss_mask_ar: Optional[torch.Tensor] = None,
+        num_diffusion_tokens: Optional[int] = None,
+        num_ar_tokens: Optional[int] = None,
+        causal_logits: Optional[torch.Tensor] = None,
+    ) -> DLLMLossOutput:
+        """Compute the hybrid diffusion + AR loss.
+
+        Args:
+            logits: Model output logits, shape ``[B, L, V]`` or
+                ``[B, L+L_ar, V]`` if the model produces both diffusion and AR
+                logits in a single concatenated tensor (legacy path).
+            target_ids: Clean token IDs, shape ``[B, L]``.
+            noise_mask: Boolean mask of corrupted positions, shape ``[B, L]``.
+            p_mask: Per-position masking probability, shape ``[B, L]``.
+            loss_mask: Diffusion loss mask (supervised positions), shape ``[B, L]``.
+            loss_mask_ar: AR loss mask, shape ``[B, L]``. If None, no AR loss.
+            num_diffusion_tokens: Total diffusion label tokens for normalization.
+            num_ar_tokens: Total AR label tokens for normalization.
+            causal_logits: Optional separate AR logits, shape ``[B, L, V]``.
+                When provided, avoids the concat/split of the legacy layout.
+
+        Returns:
+            :class:`DLLMLossOutput` with combined ``total_loss`` and the pure
+            (alpha-weighted) diffusion loss exposed as ``dllm_loss``.
+        """
+        input_ids_len = target_ids.shape[1]
+
+        # Legacy path: split concatenated logits when causal_logits not passed
+        # separately. Must happen before _compute_per_token_nll consumes the
+        # DTensor. For DTensor input we all-gather first (unavoidable for the
+        # legacy concat layout).
+        if causal_logits is None:
+            if isinstance(logits, DTensor):
+                logits_full = logits.full_tensor()
+                if logits_full.shape[1] > input_ids_len:
+                    causal_logits = logits_full[:, input_ids_len:]
+                    logits = logits_full[:, :input_ids_len]
+                else:
+                    logits = logits_full
+                del logits_full
+            elif logits.shape[1] > input_ids_len:
+                causal_logits = logits[:, input_ids_len:]
+                logits = logits[:, :input_ids_len]
+
+        # --- Diffusion loss ---
+        token_nll = _compute_per_token_nll(logits, target_ids)  # [B, L]
+        del logits
+
+        mask = noise_mask & loss_mask.bool()
+        p_mask_safe = p_mask.clamp(min=1e-8)
+
+        inv_p = torch.nan_to_num(1.0 / p_mask_safe, posinf=1.0, neginf=1.0)
+        masked_weighted = token_nll * inv_p
+        dllm_loss = (masked_weighted * mask.float()).sum()
+        del token_nll
+        if num_diffusion_tokens is not None:
+            dllm_loss = dllm_loss / max(num_diffusion_tokens, 1)
+
+        total_loss = self.alpha * dllm_loss
+
+        # --- Optional AR loss ---
+        if causal_logits is not None and loss_mask_ar is not None:
+            ar_targets = target_ids[:, 1:]
+            ar_logits = causal_logits[:, :-1]
+            ar_nll = _compute_per_token_nll(ar_logits, ar_targets)
+            del causal_logits, ar_logits
+
+            ar_mask = loss_mask_ar[:, 1:].float()
+            ar_loss = (ar_nll * ar_mask).sum()
+            if num_ar_tokens is not None:
+                ar_loss = ar_loss / max(num_ar_tokens, 1)
+
+            total_loss = total_loss + ar_loss
+
+        return DLLMLossOutput(total_loss=total_loss, dllm_loss=(self.alpha * dllm_loss).detach())
 
 
 class DFlashDecayLoss(nn.Module):

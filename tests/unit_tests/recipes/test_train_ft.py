@@ -32,6 +32,7 @@ from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.recipes.llm.train_ft import (
+    PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
     build_model,
@@ -72,6 +73,38 @@ class DummyIterableDataset(IterableDataset):  # noqa: D401
 def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kwargs via attribute
     dl_factory_capture.captured = kwargs
     return "dl"
+
+
+def test_pipeline_causal_lm_loss_adds_mtp_tuple_output():
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(3, 5, bias=False)
+            self.mtp_config = SimpleNamespace(loss_scaling_factor=0.2)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    torch.manual_seed(123)
+    model = DummyModel()
+    model.train()
+    loss_fn = MaskedCrossEntropy(fp32_upcast=False, reduction="sum")
+    wrapper = PipelineCausalLMLoss(loss_fn, model)
+
+    logits = torch.randn(1, 4, 5)
+    mtp_h = torch.randn(1, 4, 3)
+    labels = torch.tensor([[1, 2, 3, 4]])
+
+    got = wrapper((logits, mtp_h), labels)
+    shifted_labels = torch.tensor([[2, 3, 4, -100]])
+    expected = loss_fn(logits=logits, labels=labels) + 0.2 * loss_fn(
+        logits=model.lm_head(mtp_h),
+        labels=shifted_labels,
+    )
+
+    torch.testing.assert_close(got, expected)
 
 
 def test_build_validation_dataloader_pp_enabled(caplog):
@@ -258,7 +291,7 @@ def test_peft_without_pipeline_parallelism(caplog):
                                     cfg_peft=cfg_peft,
                                     seed=42,
                                 )
-                                optimizer = build_optimizer(model, cfg_opt, None, None)
+                                _ = build_optimizer(model, cfg_opt, None, None)
 
                             # Verify that apply_lora was called
                             assert mock_apply_lora.called, "apply_lora_to_linear_modules should be called"
@@ -659,6 +692,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
             self.epochs = [0]
             self.is_val_step = False
             self.is_ckpt_step = False
+            self.sigterm_flag = False
 
         def set_epoch(self, epoch):
             self.epoch = epoch
@@ -940,36 +974,20 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
 
 
 def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch):
-    """Test that _run_validation_epoch sends val_loss from last stage to main rank for PP."""
+    """Test that _run_validation_epoch broadcasts val_loss from last stage to main rank for PP."""
     from contextlib import nullcontext
 
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    # Track distributed send/recv calls
-    send_calls = []
-    recv_calls = []
-
-    def mock_send(tensor, dst):
-        send_calls.append((tensor.item(), dst))
-
-    def mock_recv(tensor, src):
-        recv_calls.append((tensor, src))
-        # Simulate receiving a value
-        tensor.fill_(0.5)
-
-    monkeypatch.setattr("torch.distributed.send", mock_send)
-    monkeypatch.setattr("torch.distributed.recv", mock_recv)
 
     # Set up recipe attributes for validation - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
     object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
     object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
 
-    # Mock device_mesh.mesh to return rank 0 as last stage
-    mock_mesh = MagicMock()
-    mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
-    object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+    # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe broadcasts
+    # within the PP group instead of doing send/recv to global rank 0).
+    monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
 
     # Set dist_env.rank to 0 (last stage and main rank are the same in this test)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
@@ -1012,33 +1030,27 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
 
 def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch):
-    """Test that main rank receives val_loss from last stage when they differ."""
+    """Test that main rank receives val_loss from last stage via the PP broadcast helper."""
     from contextlib import nullcontext
 
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=False)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
-
-    recv_calls = []
-
-    def mock_send(tensor, dst):
-        pass
-
-    def mock_recv(tensor, src):
-        recv_calls.append(src)
-        tensor.fill_(0.5)
-
-    monkeypatch.setattr("torch.distributed.send", mock_send)
-    monkeypatch.setattr("torch.distributed.recv", mock_recv)
 
     # Set up recipe attributes - use object.__setattr__ to bypass state tracking
     object.__setattr__(recipe, "model_parts", [DummyModel()])
     object.__setattr__(recipe, "step_scheduler", SimpleNamespace(step=1, epoch=0))
     object.__setattr__(recipe, "optimizer", [SimpleNamespace(param_groups=[{"lr": 0.01}])])
 
-    # Mock device_mesh.mesh to return rank 3 as last stage
-    mock_mesh = MagicMock()
-    mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 3)
-    object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+    # Track calls to the PP last-stage broadcast helper and simulate the last
+    # stage's value of 0.5 propagating into the non-last-stage tensor.
+    broadcast_calls = []
+
+    def mock_broadcast(tensor):
+        broadcast_calls.append(tensor)
+        tensor.fill_(0.5)
+        return tensor
+
+    monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", mock_broadcast)
 
     # Main rank (0) is different from last stage (3)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
@@ -1069,8 +1081,9 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
 
     result = recipe._run_validation_epoch(val_dataloader)
 
-    # Main rank should have received from src_rank=3
-    assert 3 in recv_calls, "Main rank should receive val_loss from last stage (rank 3)"
+    # Main rank should have invoked the PP broadcast helper to pull val_loss
+    # and pp_num_tokens from the last PP stage (two calls total).
+    assert len(broadcast_calls) >= 1, "Main rank should broadcast val_loss from the last PP stage"
     assert isinstance(result.metrics["val_loss"], float)
 
 
@@ -1192,7 +1205,7 @@ def test_build_model_with_quantized_model_config():
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, None)
+                    _ = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated with quantization config
     assert model is not None
@@ -1216,7 +1229,7 @@ def test_build_model_without_quant_config():
                         cfg_peft=cfg_peft,
                         seed=42,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, None)
+                    _ = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated without quantization config
     assert model is not None
@@ -1252,7 +1265,7 @@ def test_build_optimizer_disables_foreach_with_tp():
                         seed=42,
                         device_mesh=mock_mesh,
                     )
-                    optimizer = build_optimizer(model, cfg_opt, None, mock_mesh)
+                    _ = build_optimizer(model, cfg_opt, None, mock_mesh)
 
     # Verify foreach was disabled
     assert cfg_opt.foreach is False
@@ -1460,6 +1473,52 @@ def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
     captured = getattr(mod.dl_factory_capture, "captured")
     assert "collate_fn" in captured
     assert callable(captured["collate_fn"])
+
+
+def test_build_dataloader_pp_deepseek_v4_skips_mask_collate(caplog):
+    """DeepSeek V4 computes causal masks internally, so PP mask precomputation is skipped."""
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyIterableDataset",
+            "tokenizer": None,
+            "num_shards": 4,
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
+    cfg_ps = ConfigNode({})
+
+    mock_config = MagicMock(model_type="deepseek_v4")
+    with (
+        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
+        patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
+        caplog.at_level(logging.INFO),
+    ):
+        dl, tok = build_dataloader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=2,
+            global_batch_size=4,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=True,
+        )
+
+    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
+    captured = getattr(mod.dl_factory_capture, "captured")
+    assert "collate_fn" not in captured
+    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+    add_masks.assert_not_called()
 
 
 def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
@@ -1727,9 +1786,9 @@ class TestRunTrainOptimStepSetsMoEScale:
         if pp_enabled:
             pp_info = SimpleNamespace(has_first_stage=True, has_last_stage=True)
             object.__setattr__(recipe, "pp", SimpleNamespace(info=pp_info, update_seq_len=lambda seq_len: None))
-            mock_mesh = MagicMock()
-            mock_mesh.reshape.return_value.__getitem__ = lambda self, idx: MagicMock(item=lambda: 0)
-            object.__setattr__(recipe, "device_mesh", SimpleNamespace(mesh=mock_mesh))
+            # Stub the PP last-stage broadcast helper (post-d96f1b20 the recipe
+            # broadcasts inside the PP group instead of using send/recv).
+            monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", lambda t: t)
         object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
 
         monkeypatch.setattr(
@@ -1763,10 +1822,6 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         # 3 valid labels out of 4
         batches = [{"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[1, 2, 3, -100]])}]
-
-        # Mock PP loss reporting path
-        monkeypatch.setattr("torch.distributed.send", lambda *a, **k: None)
-        monkeypatch.setattr("torch.distributed.recv", lambda *a, **k: None)
 
         recipe._run_train_optim_step(batches)
 

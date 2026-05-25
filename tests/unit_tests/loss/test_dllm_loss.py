@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from nemo_automodel.components.loss.dllm_loss import (
     DFlashDecayLoss,
     DLLMLossOutput,
+    HybridDiffusionLLMLoss,
     MDLMCrossEntropyLoss,
     _compute_per_token_nll,
 )
@@ -133,6 +134,114 @@ class TestMDLMCrossEntropyLoss:
         ce = F.cross_entropy(logits.reshape(-1, 16), target_ids.reshape(-1), reduction="none").reshape(1, 6)
         expected = ce[0, 2] * (1.0 / 0.5)
         assert torch.allclose(result.total_loss, expected, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# HybridDiffusionLLMLoss
+# ---------------------------------------------------------------------------
+
+
+class TestHybridDiffusionLLMLoss:
+    def test_returns_dllm_loss_output(self, dummy_inputs):
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
+        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert isinstance(result, DLLMLossOutput)
+
+    def test_diffusion_only_when_no_causal_logits(self, dummy_inputs):
+        """Without causal logits, total_loss == alpha * dllm_loss."""
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
+        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert torch.allclose(result.total_loss, result.dllm_loss, atol=1e-6)
+
+    def test_ar_component_increases_total_loss(self, dummy_inputs):
+        """When causal logits are present, total_loss > alpha * dllm_loss."""
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        causal_logits = torch.randn(B, L, V)
+        combined_logits = torch.cat([logits, causal_logits], dim=1)  # [B, 2L, V]
+        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
+        result = loss_fn(
+            combined_logits,
+            target_ids,
+            noise_mask,
+            p_mask,
+            loss_mask,
+            loss_mask_ar=loss_mask,
+        )
+        assert result.total_loss.item() > result.dllm_loss.item()
+
+    def test_alpha_scales_diffusion_loss(self, dummy_inputs):
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        result_a03 = HybridDiffusionLLMLoss(alpha=0.3)(logits, target_ids, noise_mask, p_mask, loss_mask)
+        result_a10 = HybridDiffusionLLMLoss(alpha=1.0)(logits, target_ids, noise_mask, p_mask, loss_mask)
+        ratio = result_a03.total_loss.item() / result_a10.total_loss.item()
+        assert abs(ratio - 0.3) < 1e-5
+
+    def test_zero_dllm_loss_when_no_noise(self, dummy_inputs):
+        logits, target_ids, _, p_mask, loss_mask = dummy_inputs
+        noise_mask = torch.zeros(B, L, dtype=torch.bool)
+        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
+        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
+        assert result.dllm_loss.item() == 0.0
+
+    def test_normalization_by_num_diffusion_tokens(self, dummy_inputs):
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        loss_fn = HybridDiffusionLLMLoss(alpha=1.0)
+        result_unnorm = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
+        result_norm = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask, num_diffusion_tokens=10)
+        assert torch.allclose(result_norm.total_loss, result_unnorm.total_loss / 10, atol=1e-5)
+
+    def test_ar_normalization(self, dummy_inputs):
+        """AR loss should be normalized by num_ar_tokens."""
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        causal_logits = torch.randn(B, L, V)
+        combined_logits = torch.cat([logits, causal_logits], dim=1)
+        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
+        result_unnorm = loss_fn(
+            combined_logits,
+            target_ids,
+            noise_mask,
+            p_mask,
+            loss_mask,
+            loss_mask_ar=loss_mask,
+        )
+        result_norm = loss_fn(
+            combined_logits,
+            target_ids,
+            noise_mask,
+            p_mask,
+            loss_mask,
+            loss_mask_ar=loss_mask,
+            num_diffusion_tokens=10,
+            num_ar_tokens=10,
+        )
+        assert torch.allclose(result_norm.total_loss, result_unnorm.total_loss / 10, atol=1e-5)
+
+    def test_separate_causal_logits_path_matches_concat(self, dummy_inputs):
+        """Passing causal_logits separately should produce the same result as the concat layout."""
+        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
+        causal_logits = torch.randn(B, L, V)
+        combined_logits = torch.cat([logits, causal_logits], dim=1)
+        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
+        result_concat = loss_fn(
+            combined_logits,
+            target_ids,
+            noise_mask,
+            p_mask,
+            loss_mask,
+            loss_mask_ar=loss_mask,
+        )
+        result_separate = loss_fn(
+            logits,
+            target_ids,
+            noise_mask,
+            p_mask,
+            loss_mask,
+            loss_mask_ar=loss_mask,
+            causal_logits=causal_logits,
+        )
+        assert torch.allclose(result_concat.total_loss, result_separate.total_loss, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

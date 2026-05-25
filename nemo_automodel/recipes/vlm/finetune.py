@@ -31,6 +31,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import mlflow
 import torch
 import torch.nn as nn
 import wandb
@@ -61,6 +62,11 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.mlflow_utils import (
+    configure_mlflow,
+    end_mlflow_active_run_as_killed,
+    to_float_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -71,6 +77,7 @@ from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
@@ -685,6 +692,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            if configure_mlflow(self.cfg) is not None:
+                logging.info("MLflow experiment tracking enabled")
+
         # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
@@ -774,11 +785,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.pp = None
 
         # Extract mRoPE position-id builder from the model so VLM neat packing can
-        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
-        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        # produce 3D position_ids per sample. Without this, packed multimodal
+        # training silently degrades mRoPE to plain 1D positions.
         get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
         pp_n_microbatches = None
-        if self.pp_enabled:
+        pp_cp_preembed = (
+            self.pp_enabled
+            and self.dist_setup.cp_size > 1
+            and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
+        )
+        if self.pp_enabled and not pp_cp_preembed:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         self.dataloader, self.processor = build_dataloader(
@@ -892,7 +908,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.checkpointer.close()
 
+        # Mark the MLflow run KILLED if training exited via SIGTERM.
+        if self.step_scheduler.sigterm_flag:
+            end_mlflow_active_run_as_killed()
+
     # ------------------ helpers ------------------
+    def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
+        if (
+            not self.pp_enabled
+            or not getattr(self.pp.info, "has_first_stage", False)
+            or not model_input.dtype.is_floating_point
+            or model_input.ndim != 3
+        ):
+            return
+
+        for stage in self.pp.info.stages:
+            if stage.is_first:
+                stage.inputs_meta = (
+                    torch.empty(
+                        self.pp.pp_microbatch_size,
+                        model_input.shape[1],
+                        model_input.shape[2],
+                        device="meta",
+                        dtype=model_input.dtype,
+                    ),
+                )
+
     def _forward_backward_step(
         self,
         idx,
@@ -912,15 +953,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
         )
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
+            if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
+                mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                with torch.no_grad():
+                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                for k in VLM_INPUT_KEYS:
+                    batch.pop(k, None)
+                batch.update(prepared)
+            else:
+                for k in VLM_INPUT_KEYS:
+                    if k != "input_ids":
+                        batch.pop(k, None)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
@@ -938,12 +983,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else:
                     targets = None
 
-                input_ids = batch.pop("input_ids")
-                self.pp.update_seq_len(input_ids.shape[1])
+                model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+                model_input = batch.pop(model_input_key)
+                self.pp.update_seq_len(model_input.shape[1])
+                self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(model_input, target=targets, losses=losses, **batch)
                     else:
                         self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
@@ -1040,6 +1087,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if i == 0:
+                prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
@@ -1226,6 +1276,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
 
@@ -1251,10 +1304,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
+        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

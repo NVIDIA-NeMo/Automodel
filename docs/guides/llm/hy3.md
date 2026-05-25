@@ -97,4 +97,4 @@ srun --output=output.out \
 - Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
 - To enable Weights & Biases logging, set your `WANDB_API_KEY` and uncomment the `wandb` section at the bottom of the YAML file.
 - The full recipe uses `pp_size=4` and `ep_size=32` (128 GPUs total). Valid `ep_size` values are any divisor of 192 (e.g. 8, 16, 24, 32, 48, 64, 96, 192); adjust `pp_size` and `--nproc-per-node` to match your node count.
-- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml), which builds only the first 4 layers.
+- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml).

@@ -25,11 +25,17 @@ Import them directly from those modules.
 """
 
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
+from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
+from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 
 __all__ = [
+    "EagleTrainerModule",
     "Eagle3TrainerModule",
+    "HFEagleTargetModel",
     "HFEagle3TargetModel",
+    "LlamaEagleDraftModel",
     "LlamaEagle3DraftModel",
 ]
