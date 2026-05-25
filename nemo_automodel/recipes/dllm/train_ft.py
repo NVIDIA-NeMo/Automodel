@@ -85,9 +85,15 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         # restoration here only — other recipes are unaffected.
         # ``self.cfg.model`` is a ``ConfigNode``; use attribute access (no
         # ``__setitem__``) and check ``__dict__`` for explicit user overrides.
+        # Only set _restore_loaded_dtype for NeMo model loading paths — it is
+        # an internal NeMo flag unknown to vanilla transformers.AutoModel, and
+        # passing it to trust_remote_code models (e.g. DFlashDraftModel) raises
+        # a TypeError.
         model_cfg = self.cfg.get("model", None)
         if model_cfg is not None and "_restore_loaded_dtype" not in model_cfg.__dict__:
-            model_cfg._restore_loaded_dtype = False
+            target = str(model_cfg.get("_target_", ""))
+            if "nemo_automodel" in target:
+                model_cfg._restore_loaded_dtype = False
 
         # Let parent build model, optimizer, dataloader, scheduler, etc.
         super().setup()
