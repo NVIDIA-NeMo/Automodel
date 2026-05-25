@@ -82,8 +82,12 @@ def build_optimizer(model: Any, cfg_opt: Any, distributed_config: Any, device_me
 
 
 def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any):
+    from nemo_automodel.components.optim.config import LRSchedulerConfig
+
+    if cfg is None:
+        return _build_lr_scheduler(config=None, optimizer=optimizer, step_scheduler=step_scheduler)
     return _build_lr_scheduler(
-        scheduler_kwargs=_as_dict(cfg) if cfg is not None else None,
+        config=LRSchedulerConfig(**_as_dict(cfg)),
         optimizer=optimizer,
         step_scheduler=step_scheduler,
     )

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.optim.config import LRSchedulerConfig
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.shared.utils import dtype_from_str
@@ -98,21 +99,21 @@ def build_optimizer(
 
 
 def build_lr_scheduler(
-    scheduler_kwargs: Mapping[str, Any] | None,
+    config: LRSchedulerConfig | None,
     optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
     step_scheduler: StepScheduler,
 ) -> list[OptimizerParamScheduler] | None:
     """Build the learning rate scheduler.
 
     Args:
-        scheduler_kwargs: Optional keyword overrides for OptimizerParamScheduler.
-        optimizer: The optimizer to be scheduled.
+        config: LR scheduler configuration.  ``None`` disables scheduling.
+        optimizer: The optimizer(s) to be scheduled.
         step_scheduler: The step scheduler to extract training parameters.
 
     Returns:
         Configured optimizer parameter schedulers, or None if not configured.
     """
-    if scheduler_kwargs is None:
+    if config is None:
         return None
 
     # Calculate total steps for the training run
@@ -125,38 +126,39 @@ def build_lr_scheduler(
     if step_scheduler.max_steps is not None:
         total_steps = min(total_steps, step_scheduler.max_steps)
 
-    optimizer_param_schedulers = []
-    user_kwargs = dict(scheduler_kwargs)
-    default_kwargs = dict(
-        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-        lr_decay_steps=total_steps,
-        lr_decay_style="cosine",
-        wd_incr_steps=total_steps,
-        wd_incr_style="constant",
-    )
-
     if not isinstance(optimizer, list):
         optimizer = [optimizer]
 
+    optimizer_param_schedulers = []
     for opt in optimizer:
         base_lr = opt.param_groups[0]["lr"]
-        default_kwargs.update(
-            dict(
-                optimizer=opt,
-                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
-                max_lr=base_lr,
-                min_lr=base_lr * 0.01,  # End at 1% of base LR
-                start_wd=opt.param_groups[0].get("weight_decay", 0.0),
-                end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            )
+        base_wd = opt.param_groups[0].get("weight_decay", 0.0)
+
+        scheduler = OptimizerParamScheduler(
+            optimizer=opt,
+            init_lr=config.init_lr if config.init_lr is not None else base_lr * 0.1,
+            max_lr=config.max_lr if config.max_lr is not None else base_lr,
+            min_lr=config.min_lr if config.min_lr is not None else base_lr * 0.01,
+            lr_warmup_steps=config.lr_warmup_steps
+            if config.lr_warmup_steps is not None
+            else min(1000, total_steps // 10),
+            lr_decay_steps=config.lr_decay_steps if config.lr_decay_steps is not None else total_steps,
+            lr_decay_style=config.lr_decay_style,
+            start_wd=config.start_wd if config.start_wd is not None else base_wd,
+            end_wd=config.end_wd if config.end_wd is not None else base_wd,
+            wd_incr_steps=config.wd_incr_steps if config.wd_incr_steps is not None else total_steps,
+            wd_incr_style=config.wd_incr_style,
+            use_checkpoint_opt_param_scheduler=config.use_checkpoint_opt_param_scheduler,
+            override_opt_param_scheduler=config.override_opt_param_scheduler,
+            wsd_decay_steps=config.wsd_decay_steps,
+            lr_wsd_decay_style=config.lr_wsd_decay_style,
         )
-        default_kwargs.update(user_kwargs)
-        optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
+        optimizer_param_schedulers.append(scheduler)
 
     logger.info(
         f"Building LR scheduler with total_steps={total_steps}, "
-        f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
-        f"decay_style={default_kwargs['lr_decay_style']}"
+        f"warmup_steps={optimizer_param_schedulers[0].lr_warmup_steps}, "
+        f"decay_style={config.lr_decay_style}"
     )
 
     return optimizer_param_schedulers
