@@ -94,10 +94,16 @@ def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any):
 
 
 def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_batch_size: int):
-    scheduler_kwargs = _as_dict(cfg) if cfg is not None else None
-    assert scheduler_kwargs is None or "_target_" not in scheduler_kwargs, "_target_ not permitted in step scheduler"
+    from nemo_automodel.components.training.config import StepSchedulerConfig
+
+    if cfg is None:
+        config = None
+    else:
+        kwargs = _as_dict(cfg)
+        assert "_target_" not in kwargs, "_target_ not permitted in step scheduler"
+        config = StepSchedulerConfig(**kwargs)
     return _build_step_scheduler(
-        scheduler_kwargs=scheduler_kwargs,
+        config=config,
         dataloader=dataloader,
         dp_group_size=dp_group_size,
         local_batch_size=local_batch_size,

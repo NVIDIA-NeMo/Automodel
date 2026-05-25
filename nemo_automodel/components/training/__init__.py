@@ -13,5 +13,6 @@
 # limitations under the License.
 
 from nemo_automodel.components.training.api import build_step_scheduler
+from nemo_automodel.components.training.config import StepSchedulerConfig
 
-__all__ = ["build_step_scheduler"]
+__all__ = ["StepSchedulerConfig", "build_step_scheduler"]
