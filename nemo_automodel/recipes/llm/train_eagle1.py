@@ -539,3 +539,7 @@ def main(config_path: str | None = None):
     trainer = TrainEagle1Recipe(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()
