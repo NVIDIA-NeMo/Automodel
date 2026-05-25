@@ -261,9 +261,6 @@ navigation:
       - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
         path: ./v0.4/pages/guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
-      - page: "Train an EAGLE Drafter for Speculative Decoding"
-        path: ./v0.4/pages/guides/speculative/eagle.mdx
-        slug: eagle-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ./v0.4/pages/guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
