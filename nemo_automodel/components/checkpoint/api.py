@@ -20,7 +20,7 @@ from typing import Any
 
 from huggingface_hub import constants as hf_constants
 
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 
 logger = logging.getLogger(__name__)
 
