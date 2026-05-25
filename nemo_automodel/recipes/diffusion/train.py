@@ -40,8 +40,9 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
+from nemo_automodel.recipes._component_builders import build_wandb
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed, build_wandb
+from nemo_automodel.recipes.llm.train_ft import build_distributed
 
 
 def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:

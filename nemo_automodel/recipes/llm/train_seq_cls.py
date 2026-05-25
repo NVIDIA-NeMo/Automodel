@@ -70,7 +70,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             # Reuse helper from NTP recipe
-            from nemo_automodel.recipes.llm.train_ft import build_wandb
+            from nemo_automodel.recipes._component_builders import build_wandb
 
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))

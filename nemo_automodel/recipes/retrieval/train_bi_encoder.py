@@ -34,6 +34,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.recipes._component_builders import build_wandb
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
@@ -41,7 +42,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_distributed,
     build_lr_scheduler,
     build_step_scheduler,
-    build_wandb,
 )
 from nemo_automodel.shared.te_patches import apply_te_patches
 

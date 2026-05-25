@@ -42,7 +42,6 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from wandb import Settings
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -73,7 +72,6 @@ from nemo_automodel.components.loggers.comet_utils import build_comet
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
-    configure_mlflow,
     end_mlflow_active_run_as_killed,
     to_float_metrics,
 )
@@ -106,7 +104,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-from nemo_automodel.recipes._component_builders import _callable_and_kwargs
+from nemo_automodel.recipes._component_builders import _callable_and_kwargs, build_mlflow, build_wandb
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -804,27 +802,6 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     return optimizer_param_schedulers
 
 
-def build_wandb(cfg) -> wandb.Run:
-    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
-
-    Args:
-        cfg: Configuration for wandb.
-
-    Returns:
-        The wandb instance.
-    """
-    assert cfg.get("wandb", None) is not None
-    kwargs = cfg.wandb.to_dict()
-    if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
-    run = wandb.init(
-        **kwargs,
-        config=cfg.to_dict(),
-        settings=Settings(silent=True),
-    )
-    return run
-
-
 def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: Optional[nn.Module] = None):
     """Build validation dataloaders from validation dataset config entries."""
 
@@ -916,7 +893,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("🚀 View run at {}".format(run.url))
 
         if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            if configure_mlflow(self.cfg) is not None:
+            if build_mlflow(self.cfg) is not None:
                 logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None

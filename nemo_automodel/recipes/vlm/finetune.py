@@ -42,7 +42,6 @@ from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-from wandb import Settings
 
 from nemo_automodel._transformers import (
     NeMoAutoModelForCausalLM,
@@ -63,7 +62,6 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
-    configure_mlflow,
     end_mlflow_active_run_as_killed,
     to_float_metrics,
 )
@@ -84,6 +82,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
+from nemo_automodel.recipes._component_builders import build_mlflow, build_wandb
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
@@ -578,27 +577,6 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     return optimizer_param_schedulers
 
 
-def build_wandb(cfg) -> wandb.Run:
-    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
-
-    Args:
-        cfg: Configuration for wandb.
-
-    Returns:
-        The wandb instance.
-    """
-    assert cfg.get("wandb", None) is not None
-    kwargs = cfg.wandb.to_dict()
-    if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
-    run = wandb.init(
-        **kwargs,
-        config=cfg.to_dict(),
-        settings=Settings(silent=True),
-    )
-    return run
-
-
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     """Calculate the loss.
 
@@ -693,7 +671,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("🚀 View run at {}".format(run.url))
 
         if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            if configure_mlflow(self.cfg) is not None:
+            if build_mlflow(self.cfg) is not None:
                 logging.info("MLflow experiment tracking enabled")
 
         # Log experiment details on main rank
