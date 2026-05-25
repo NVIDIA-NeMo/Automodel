@@ -20,7 +20,46 @@ Look at ``api.py`` for the builder functions that consume these configs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class OptimizerConfig:
+    """User-facing optimizer configuration.
+
+    Follows the veRL/VeOmni pattern: a ``name`` string that the builder
+    resolves to a callable, plus common hyper-parameters as explicit fields.
+    Optimizer-specific kwargs go in ``extra_kwargs``.
+
+    Works from CLI, YAML, or Python::
+
+        # Python (e.g. veRL integration)
+        OptimizerConfig(name="torch.optim.AdamW", lr=1e-4)
+
+        # YAML
+        optimizer:
+          name: torch.optim.AdamW
+          lr: 1e-4
+          weight_decay: 0.01
+          extra_kwargs:
+            betas: [0.9, 0.95]
+
+    Attributes:
+        name: Dotted import path to the optimizer class (e.g.
+            ``"torch.optim.AdamW"``, ``"flashoptim.FlashAdamW"``).
+            Resolved by the builder via ``importlib``.
+        lr: Learning rate.
+        weight_decay: Weight decay coefficient.
+        extra_kwargs: Arbitrary additional keyword arguments forwarded to
+            the optimizer constructor.  Use this for optimizer-specific
+            params like ``betas``, ``momentum``, ``eps``, etc.
+    """
+
+    name: str = "torch.optim.AdamW"
+    lr: float = 1e-4
+    weight_decay: float = 0.01
+    extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -67,4 +106,22 @@ class LRSchedulerConfig:
     lr_wsd_decay_style: str | None = None
 
 
-__all__ = ["LRSchedulerConfig"]
+def _resolve_optimizer(name: str) -> Any:
+    """Resolve a dotted path to an optimizer class.
+
+    ``"torch.optim.AdamW"`` → ``torch.optim.AdamW``
+    """
+    import importlib
+
+    parts = name.rsplit(".", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Expected a dotted path like 'torch.optim.AdamW', got '{name}'")
+    module_path, cls_name = parts
+    module = importlib.import_module(module_path)
+    cls = getattr(module, cls_name, None)
+    if cls is None:
+        raise ImportError(f"Cannot find '{cls_name}' in module '{module_path}'")
+    return cls
+
+
+__all__ = ["OptimizerConfig", "LRSchedulerConfig"]

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.optim.config import LRSchedulerConfig
+from nemo_automodel.components.optim.config import LRSchedulerConfig, OptimizerConfig, _resolve_optimizer
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.shared.utils import dtype_from_str
@@ -45,23 +45,39 @@ def _fully_shard_megatron_optimizer(model_part: torch.nn.Module, optimizer: torc
 
 def build_optimizer(
     model: torch.nn.Module,
-    optimizer_factory: Callable[..., torch.optim.Optimizer],
-    optimizer_kwargs: Mapping[str, Any] | None,
-    distributed_config: DistributedConfig | None,
-    device_mesh: DeviceMesh | None,
+    config: OptimizerConfig | None = None,
+    *,
+    optimizer_factory: Callable[..., torch.optim.Optimizer] | None = None,
+    optimizer_kwargs: Mapping[str, Any] | None = None,
+    distributed_config: DistributedConfig | None = None,
+    device_mesh: DeviceMesh | None = None,
 ):
     """Build optimizers for a model or model parts.
 
+    Accepts either an ``OptimizerConfig`` (preferred for external integrations
+    like veRL) or an explicit ``(optimizer_factory, optimizer_kwargs)`` pair
+    (used by ``_component_builders`` when resolving from YAML).
+
     Args:
         model: The model to build optimizers for.
+        config: Typed optimizer config.  When provided, ``optimizer_factory``
+            and ``optimizer_kwargs`` are derived from it.
         optimizer_factory: Callable or class that creates an optimizer.
-        optimizer_kwargs: Optional keyword arguments passed to the optimizer factory.
+            Ignored when ``config`` is provided.
+        optimizer_kwargs: Keyword arguments forwarded to the optimizer factory.
+            Ignored when ``config`` is provided.
         distributed_config: Distributed strategy configuration.
         device_mesh: Device mesh used for tensor/data parallelism.
 
     Returns:
         List of optimizers, one per model part.
     """
+    if config is not None:
+        optimizer_factory = _resolve_optimizer(config.name)
+        optimizer_kwargs = {"lr": config.lr, "weight_decay": config.weight_decay, **config.extra_kwargs}
+    elif optimizer_factory is None:
+        raise ValueError("Either config or optimizer_factory must be provided")
+
     optimizer_kwargs = dict(optimizer_kwargs or {})
 
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for

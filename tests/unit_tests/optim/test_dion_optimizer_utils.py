@@ -528,7 +528,10 @@ class TestBuildOptimizerDionBranch:
         )
 
         optimizers = optim_build_mod.build_optimizer(
-            model, fake_optimizer_factory, {"foreach": True}, None, sentinel_mesh
+            model,
+            optimizer_factory=fake_optimizer_factory,
+            optimizer_kwargs={"foreach": True},
+            device_mesh=sentinel_mesh,
         )
 
         assert optimizers == ["fake_dion_opt"]
@@ -555,7 +558,9 @@ class TestBuildOptimizerDionBranch:
             ),
         )
 
-        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, {"foreach": True}, None, None)
+        optimizers = optim_build_mod.build_optimizer(
+            model, optimizer_factory=fake_optimizer_factory, optimizer_kwargs={"foreach": True}
+        )
 
         assert len(build_calls) == 2
         assert build_calls[0] is model.parts[0]
@@ -575,7 +580,9 @@ class TestBuildOptimizerDionBranch:
 
         monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, {"foreach": True}, None, None)
+        optimizers = optim_build_mod.build_optimizer(
+            model, optimizer_factory=fake_optimizer_factory, optimizer_kwargs={"foreach": True}
+        )
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
@@ -594,7 +601,9 @@ class TestBuildOptimizerDionBranch:
 
         monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, {"foreach": True}, None, None)
+        optimizers = optim_build_mod.build_optimizer(
+            model, optimizer_factory=fake_optimizer_factory, optimizer_kwargs={"foreach": True}
+        )
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2

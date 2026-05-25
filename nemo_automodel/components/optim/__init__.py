@@ -13,12 +13,13 @@
 # limitations under the License.
 
 from .api import build_lr_scheduler, build_optimizer
-from .config import LRSchedulerConfig
+from .config import LRSchedulerConfig, OptimizerConfig
 from .scheduler import OptimizerParamScheduler
 from .utils import build_dion_optimizer, is_dion_optimizer
 
 __all__ = [
     "LRSchedulerConfig",
+    "OptimizerConfig",
     "OptimizerParamScheduler",
     "build_lr_scheduler",
     "build_optimizer",
