@@ -62,11 +62,15 @@ class TestProcessInputForTHD:
         assert result["input_ids"].shape == (12,)
         assert result["position_ids"].shape == (12,)
 
-        # Check cu_seqlens - uses seq_lens_padded values for CP compatibility
-        # First batch: padded lengths [4, 2] -> cumsum [0, 4, 6]
-        # Second batch: padded lengths [3, 3] -> cumsum [6, 9, 12]
-        expected_cu_seqlens = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
+        # cu_seqlens uses real (unpadded) seq_lens; cu_seqlens_padded uses
+        # padded values. Both are emitted because they differ in multiple
+        # entries (inter-sub-seq padding) — TE will use pad_between_seqs=True.
+        # First batch: real [3, 2] -> cumsum [0, 3, 5], padded [4, 2] -> [0, 4, 6]
+        # Second batch: real [2, 3] -> [5, 7, 10], padded [3, 3] -> [6, 9, 12]
+        expected_cu_seqlens = torch.tensor([0, 3, 5, 7, 10], dtype=torch.int32)
+        expected_cu_seqlens_padded = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"], expected_cu_seqlens)
+        assert torch.equal(result["cu_seqlens_padded"], expected_cu_seqlens_padded)
 
     def test_with_variable_num_sequences_and_padding(self):
         """Test with variable number of sequences per example (seq_lens padding with -1000)."""
@@ -84,11 +88,14 @@ class TestProcessInputForTHD:
         assert result["input_ids"].shape == (12,)
         assert result["position_ids"].shape == (12,)
 
-        # Check cu_seqlens - uses seq_lens_padded values (filters out -1000)
-        # First batch: padded lengths [4, 2] -> cumsum [0, 4, 6]
-        # Second batch: padded length [6] (second is -1000, filtered) -> cumsum [6, 12]
-        expected_cu_seqlens = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
+        # cu_seqlens uses real seq_lens (filtered for -1000); cu_seqlens_padded
+        # uses padded. Both are emitted because they differ in multiple entries.
+        # First batch: real [3, 2] -> [0, 3, 5], padded [4, 2] -> [0, 4, 6]
+        # Second batch: real [6] -> [5, 11], padded [6] -> [6, 12]
+        expected_cu_seqlens = torch.tensor([0, 3, 5, 11], dtype=torch.int32)
+        expected_cu_seqlens_padded = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"], expected_cu_seqlens)
+        assert torch.equal(result["cu_seqlens_padded"], expected_cu_seqlens_padded)
 
     def test_with_qkv_format_preservation(self):
         """Test that non-tensor keys like qkv_format are preserved."""
@@ -278,15 +285,18 @@ class TestProcessInputForTHD:
         assert result["input_ids"].shape == (2, 12)
         assert result["labels"].shape == (2, 12)
 
-        # Check cu_seqlens for first chunk - uses seq_lens_padded values [4, 2] and [3, 3]
-        # First batch: [4, 2] -> cumsum [0, 4, 6]
-        # Second batch: [3, 3] -> cumsum [6, 9, 12]
-        expected_cu_seqlens_0 = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
-        assert torch.equal(result["cu_seqlens"][0], expected_cu_seqlens_0)
-
-        # Check cu_seqlens for second chunk - uses seq_lens_padded values [4, 2] and [3, 3]
-        expected_cu_seqlens_1 = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
-        assert torch.equal(result["cu_seqlens"][1], expected_cu_seqlens_1)
+        # cu_seqlens uses real (unpadded) seq_lens; cu_seqlens_padded uses
+        # padded values. Both arrays present because they differ in multiple
+        # entries (inter-sub-seq padding). For each chunk:
+        # Real: [3, 2] -> [0, 3, 5]; [2, 3] -> [5, 7, 10]
+        # Padded: [4, 2] -> [0, 4, 6]; [3, 3] -> [6, 9, 12]
+        expected_cu_seqlens_chunk = torch.tensor([0, 3, 5, 7, 10], dtype=torch.int32)
+        expected_cu_padded_chunk = torch.tensor([0, 4, 6, 9, 12], dtype=torch.int32)
+        assert torch.equal(result["cu_seqlens"][0], expected_cu_seqlens_chunk)
+        assert torch.equal(result["cu_seqlens"][1], expected_cu_seqlens_chunk)
+        assert "cu_seqlens_padded" in result
+        assert torch.equal(result["cu_seqlens_padded"][0], expected_cu_padded_chunk)
+        assert torch.equal(result["cu_seqlens_padded"][1], expected_cu_padded_chunk)
 
     def test_chunking_with_embeddings(self):
         """Test chunking with 3D embeddings input."""
@@ -337,17 +347,20 @@ class TestProcessInputForTHDWithChunks:
         # cu_seqlens should be [num_chunks, max_seqs_across_chunks+1]
         assert result["cu_seqlens"].shape[0] == 2
 
-        # First chunk - uses seq_lens_padded values [4, 2] and [6]
-        # First batch: [4, 2] -> cumsum [0, 4, 6]
-        # Second batch: [6] -> cumsum [6, 12]
-        expected_cu_seqlens_0 = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
-        assert torch.equal(result["cu_seqlens"][0], expected_cu_seqlens_0)
-
-        # Second chunk - uses seq_lens_padded values [4] and [3, 3]
-        # Third batch: [4] -> cumsum [0, 4]
-        # Fourth batch: [3, 3] -> cumsum [4, 7, 10]
-        expected_cu_seqlens_1 = torch.tensor([0, 4, 7, 10], dtype=torch.int32)
-        assert torch.equal(result["cu_seqlens"][1], expected_cu_seqlens_1)
+        # cu_seqlens uses REAL (unpadded) seq_lens; cu_seqlens_padded uses
+        # padded values. Both arrays are stacked because at least one chunk
+        # emits cu_seqlens_padded (multiple per-chunk entries differ).
+        # Chunk 0: real [3, 2, 6] -> [0, 3, 5, 11]; padded [4, 2, 6] -> [0, 4, 6, 12]
+        # Chunk 1: real [4, 2, 3] -> [0, 4, 6, 9]; padded [4, 3, 3] -> [0, 4, 7, 10]
+        expected_cu_0 = torch.tensor([0, 3, 5, 11], dtype=torch.int32)
+        expected_cu_1 = torch.tensor([0, 4, 6, 9], dtype=torch.int32)
+        expected_cu_padded_0 = torch.tensor([0, 4, 6, 12], dtype=torch.int32)
+        expected_cu_padded_1 = torch.tensor([0, 4, 7, 10], dtype=torch.int32)
+        assert torch.equal(result["cu_seqlens"][0], expected_cu_0)
+        assert torch.equal(result["cu_seqlens"][1], expected_cu_1)
+        assert "cu_seqlens_padded" in result
+        assert torch.equal(result["cu_seqlens_padded"][0], expected_cu_padded_0)
+        assert torch.equal(result["cu_seqlens_padded"][1], expected_cu_padded_1)
 
     def test_single_chunk(self):
         """Test with num_chunks=1 (no actual chunking)."""
@@ -524,3 +537,138 @@ class TestProcessInputForTHDWithChunks:
 
         assert result["input_ids"].shape == (num_chunks, tokens_per_chunk)
         assert result["cu_seqlens"].shape[0] == num_chunks
+
+
+class TestTrailingPadAbsorption:
+    """Tests for the trailing-pack-pad absorption gate in process_input_for_thd.
+
+    The bug captured in /opt/Automodel/te_bug_report/ was: a "short" microbatch
+    (fewer real sub-sequences than the pack capacity) had its trailing
+    pack-padding unconditionally absorbed into the last cu_seqlens entry,
+    producing a 576-token sub-seq in a batch with ``max_seqlen=112``. TE's
+    cuDNN-fused-attn-bwd then wrote OOB. These tests pin the corrected
+    behaviour: absorb only when the trailing pad fits within a single
+    max-length sub-sequence.
+    """
+
+    def test_short_microbatch_extends_with_dummy_slots(self):
+        """Captured failing case: 5 sub-seqs of 112 in a 1024-pack.
+
+        Trailing pad is 1024 - 5*112 = 464 > max_seqlen=112. Neither
+        absorbing into the last slot (creates a 576-token slot the kernel
+        can't handle) nor ``pad_between_seqs=True`` (cuDNN OOB) is safe.
+        Instead, EXTEND ``cu_seqlens`` with dummy max_seqlen-sized slots
+        that span the trailing pack-pad region.
+        """
+        packed = 1024
+        sub = 112
+        seq_lens = torch.tensor([[sub, sub, sub, sub, sub, -1000, -1000, -1000, -1000]])
+        seq_lens_padded = torch.tensor([[sub, sub, sub, sub, sub + (packed - 5 * sub),
+                                          -1000, -1000, -1000, -1000]])
+        batch = {
+            "input_ids": torch.zeros((1, packed), dtype=torch.long),
+            "labels": torch.zeros((1, packed), dtype=torch.long),
+            "position_ids": torch.arange(packed).unsqueeze(0),
+            "seq_lens": seq_lens,
+            "seq_lens_padded": seq_lens_padded,
+        }
+        result = process_input_for_thd(batch)
+
+        # cu_seqlens is extended with dummy slots. Trailing pad = 464:
+        # 4 full dummy slots of 112 (4*112=448), then a 16-token remainder slot.
+        # Original 5 real sub-seqs cover [0..560]; extension adds [672, 784,
+        # 896, 1008, 1024]. Total 10 sub-seqs, each ≤ max_seqlen=112.
+        expected_cu = torch.tensor(
+            [0, 112, 224, 336, 448, 560, 672, 784, 896, 1008, 1024],
+            dtype=torch.int32,
+        )
+        assert torch.equal(result["cu_seqlens"], expected_cu), (
+            f"cu_seqlens should be extended with dummy slots; "
+            f"got {result['cu_seqlens'].tolist()}"
+        )
+        # All slot widths ≤ max_seqlen (kernel-safe).
+        widths = result["cu_seqlens"][1:] - result["cu_seqlens"][:-1]
+        assert widths.max().item() <= 112, f"slot widths exceed max_seqlen: {widths.tolist()}"
+        # No pad_between_seqs path needed.
+        assert "cu_seqlens_padded" not in result, (
+            "cu_seqlens_padded should be dropped after dummy-slot extension"
+        )
+        # max_seqlen unchanged.
+        assert int(result["max_seqlen"].item()) == 112
+
+    def test_full_microbatch_still_absorbs(self):
+        """Common-case smoke (steps 0-4): pack is nearly full, trailing pad
+        small. Absorption must still fire to keep TE on its faster code
+        path (no pad_between_seqs=True).
+        """
+        packed = 1024
+        sub = 112
+        # 9 real sub-seqs, last one inflated by 16 trailing pack pad.
+        # cumsum(real)=1008; cumsum(padded)=1024; trailing_pad=16 <= max_seqlen=112.
+        seq_lens = torch.tensor([[sub] * 9])
+        seq_lens_padded = torch.tensor([[sub] * 8 + [sub + 16]])
+        batch = {
+            "input_ids": torch.zeros((1, packed), dtype=torch.long),
+            "labels": torch.zeros((1, packed), dtype=torch.long),
+            "position_ids": torch.arange(packed).unsqueeze(0),
+            "seq_lens": seq_lens,
+            "seq_lens_padded": seq_lens_padded,
+        }
+        result = process_input_for_thd(batch)
+
+        # Absorption fires → cu_seqlens[-1] == packed_size.
+        assert int(result["cu_seqlens"][-1].item()) == packed
+        # cu_seqlens_padded is NOT emitted (it's equal to cu_seqlens, gated
+        # out by the emit check).
+        assert "cu_seqlens_padded" not in result, (
+            "cu_seqlens_padded should be omitted when absorption fired"
+        )
+
+    def test_split_into_chunks_mixed_short_and_full(self):
+        """Two-chunk batch where chunk 0 is a full pack (absorbs) and chunk 1
+        is short (gets extended with dummy slots). Both chunks should end at
+        packed_size and have all slot widths ≤ max_seqlen so the kernel is
+        safe per microbatch.
+        """
+        packed = 1024
+        sub = 112
+        seq_lens = torch.tensor([
+            [sub] * 9,
+            [sub, sub, sub, sub, sub, -1000, -1000, -1000, -1000],
+        ])
+        seq_lens_padded = torch.tensor([
+            [sub] * 8 + [sub + 16],
+            [sub, sub, sub, sub, sub + (packed - 5 * sub), -1000, -1000, -1000, -1000],
+        ])
+        batch = {
+            "input_ids": torch.zeros((2, packed), dtype=torch.long),
+            "labels": torch.zeros((2, packed), dtype=torch.long),
+            "position_ids": torch.arange(packed).unsqueeze(0).expand(2, -1),
+            "seq_lens": seq_lens,
+            "seq_lens_padded": seq_lens_padded,
+        }
+        result = split_batch_into_thd_chunks(batch, num_chunks=2)
+
+        assert "cu_seqlens" in result
+        # Both chunks took the absorbed-or-extended path so cu_seqlens_padded
+        # equals cu_seqlens for both — split_batch_into_thd_chunks therefore
+        # omits the padded key (no chunk emits it).
+        assert "cu_seqlens_padded" not in result
+
+        # Chunk 0 (absorbed) — last non-sentinel value == packed_size.
+        c0_cu = result["cu_seqlens"][0]
+        c0_real = c0_cu[c0_cu != -1000]
+        assert int(c0_real[-1].item()) == packed
+        c0_widths = c0_real[1:] - c0_real[:-1]
+        assert c0_widths.max().item() <= sub + 16  # last absorbed slot = 128
+
+        # Chunk 1 (extended with dummies) — last non-sentinel value == packed_size,
+        # and the cu_seqlens now has MORE entries than just the 5 real sub-seqs.
+        c1_cu = result["cu_seqlens"][1]
+        c1_real = c1_cu[c1_cu != -1000]
+        assert int(c1_real[-1].item()) == packed
+        assert c1_real.numel() > 6, "short microbatch should be extended with dummy slots"
+        c1_widths = c1_real[1:] - c1_real[:-1]
+        assert c1_widths.max().item() <= sub, (
+            f"all slot widths must be ≤ max_seqlen={sub}; got {c1_widths.tolist()}"
+        )
