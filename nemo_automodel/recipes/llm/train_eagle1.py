@@ -535,8 +535,6 @@ class TrainEagle1Recipe(BaseRecipe):
 
 def main(config_path: str | None = None):
     """Entrypoint for ``TrainEagle1Recipe``."""
-    if config_path is None:
-        raise ValueError("config_path is required for TrainEagle1Recipe")
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainEagle1Recipe(cfg)
     trainer.setup()
