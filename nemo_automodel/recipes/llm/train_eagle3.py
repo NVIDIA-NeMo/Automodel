@@ -263,6 +263,12 @@ class TrainEagle3Recipe(BaseRecipe):
         """Build the checkpointer using the same plumbing as the standard recipes."""
         ckpt_cfg = self.cfg.get("checkpoint", None)
         default_dir = str(self.output_dir / "checkpoints")
+        # EAGLE recipes construct the draft model directly and bypass
+        # `apply_model_infrastructure`, which is where `_pre_shard_hf_state_dict_keys`
+        # would normally be attached. Capture the pre-shard keys here so the
+        # consolidated-safetensors path in `_maybe_build_consolidated_index`
+        # has something to diff against instead of `None`.
+        draft_state_dict_keys = list(self.draft_model.state_dict().keys())
         ckpt_kwargs = dict(
             enabled=True,
             checkpoint_dir=default_dir,
@@ -271,11 +277,14 @@ class TrainEagle3Recipe(BaseRecipe):
             model_cache_dir=hf_constants.HF_HUB_CACHE,
             save_consolidated=True,
             is_peft=False,
+            model_state_dict_keys=draft_state_dict_keys,
         )
         if ckpt_cfg is not None:
             user_cfg = ckpt_cfg.to_dict() if hasattr(ckpt_cfg, "to_dict") else dict(ckpt_cfg)
             user_cfg.pop("restore_from", None)
             ckpt_kwargs.update(user_cfg)
+        if ckpt_kwargs.get("model_state_dict_keys") is None:
+            ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
@@ -672,8 +681,6 @@ class TrainEagle3Recipe(BaseRecipe):
 
 def main(config_path=None):
     """Main entry point for the EAGLE-3 recipe."""
-    if config_path is None:
-        raise ValueError("config_path is required for TrainEagle3Recipe")
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainEagle3Recipe(cfg)
     trainer.setup()
