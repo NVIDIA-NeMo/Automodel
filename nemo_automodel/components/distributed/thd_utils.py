@@ -154,9 +154,7 @@ def process_input_for_thd(
 
         # Compute max_seqlen from the FINAL cu_seqlens to honor TE's contract
         # (``max_seqlen_q >= max(cu_seqlens[i+1] - cu_seqlens[i])``, see TE's
-        # cpp_extensions/fused_attn.py:152-159). Smaller-than-actual is UB
-        # and was the original crash cause: pre-absorption max_seqlen=112
-        # combined with an absorbed 576-wide slot.
+        # cpp_extensions/fused_attn.py:152-159).
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
 
