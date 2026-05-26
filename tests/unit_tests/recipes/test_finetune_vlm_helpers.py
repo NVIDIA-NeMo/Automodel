@@ -1219,7 +1219,7 @@ class TestBuildCheckpointConfig:
         assert config.model_save_format.value == "safetensors"
         assert config.model_repo_id == "org/model"
         assert config.model_cache_dir == "/tmp/cache"
-        assert config.save_consolidated is False
+        assert config.save_consolidated.value == "final"
         assert config.is_peft is False
 
     def test_build_checkpoint_config_with_custom_config(self):
@@ -1239,7 +1239,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
-        assert config.save_consolidated is False
+        assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
     def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
@@ -1269,7 +1269,7 @@ class TestBuildCheckpointConfig:
         # checkpoint_dir is preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
         # other user-provided torch_save options are discarded (defaults restored)
-        assert config.save_consolidated is False
+        assert config.save_consolidated.value == "final"
         assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
@@ -2654,7 +2654,10 @@ class TestChunkVlmMedia:
         n_images_per_sample = torch.tensor([3, 1])
 
         pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=2,
+            n_microbatches=2,
             n_images_per_sample=n_images_per_sample,
         )
         assert len(pv_chunks) == 2
@@ -2670,7 +2673,10 @@ class TestChunkVlmMedia:
         pixel_values = torch.randn(int(patch_counts.sum()), 64)
 
         pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 2
@@ -2708,7 +2714,10 @@ class TestChunkVlmMedia:
 
         with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
             chunk_vlm_media(
-                pixel_values, image_grid, batch_size=2, n_microbatches=2,
+                pixel_values,
+                image_grid,
+                batch_size=2,
+                n_microbatches=2,
             )
 
     def test_n_videos_per_sample_packed(self):

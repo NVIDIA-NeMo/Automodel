@@ -61,7 +61,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

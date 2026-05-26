@@ -39,7 +39,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints_convergence/moonlight_16b_flashoptim/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

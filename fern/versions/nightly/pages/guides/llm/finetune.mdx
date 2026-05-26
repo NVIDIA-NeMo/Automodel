@@ -329,7 +329,7 @@ Each log line reports the current loss, gradient norm, peak GPU memory, and toke
 
 ### Checkpoint Contents
 
-Checkpoints are saved as Hugging Face-compatible safetensors. By default, SFT writes sharded model weights plus a generated `model/consolidate.sh` helper; run the helper after training to create `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. You can also set `save_consolidated: true` when you intentionally want inline HF export at every checkpoint save. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs), save those adapter files directly under `model/`, and do not use `model/consolidate.sh` — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
+Checkpoints are saved as Hugging Face-compatible safetensors. By default, SFT writes sharded model weights plus a generated `model/consolidate.sh` helper; run the helper after training to create `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. You can also set `save_consolidated: final` to export consolidated HF weights only for the final checkpoint. Use `save_consolidated: every` (or legacy `true`) only when you intentionally want inline HF export at every checkpoint save. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs), save those adapter files directly under `model/`, and do not use `model/consolidate.sh` — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
 
 <Accordion title="Checkpoint directory structure">
 **SFT checkpoint:**
@@ -703,9 +703,8 @@ checkpoint:
                                 # to persist checkpoints across container restarts.
   model_save_format: safetensors  # "safetensors" (recommended, faster and safer) or
                                   # "torch_save" (legacy pickle-based format)
-  save_consolidated: False # turn on for inline HF export during every checkpoint save.
-                           # Recommended: keep false and run
-                           # <checkpoint>/model/consolidate.sh after training.
+  save_consolidated: final # recommended: export consolidated HF weights only for the final checkpoint.
+                           # Other modes: false (sharded only) or every/true (export every checkpoint).
 
 # Training Dataset
 # _target_ → make_squad_dataset: a factory function that downloads the SQuAD

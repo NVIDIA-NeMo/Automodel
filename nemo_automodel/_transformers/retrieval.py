@@ -313,6 +313,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             weights_path=save_directory,
             peft_config=kwargs.get("peft_config", None),
             tokenizer=kwargs.get("tokenizer", None),
+            is_final_checkpoint=kwargs.get("is_final_checkpoint", False),
         )
         return
 

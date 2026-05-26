@@ -176,7 +176,7 @@ class TestApplyModelInfrastructurePostShardInit:
             )
 
         checkpoint_config = MockCheckpointer.call_args.args[0]
-        assert checkpoint_config.save_consolidated is False
+        assert checkpoint_config.save_consolidated.value == "false"
 
     def test_from_config_meta_calls_initialize_model_weights(self):
         """from_config path (load_base_model=False) on meta device should call initialize_model_weights."""

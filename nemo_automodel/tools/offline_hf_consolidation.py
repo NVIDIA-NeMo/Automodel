@@ -65,7 +65,7 @@ def _config_torch_dtype_value(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _update_config_dtype(config_path: str, target_dtype: torch.dtype) -> None:
+def _update_config_dtype(config_path: str, cast_dtype: torch.dtype) -> None:
     """Update config.json torch_dtype to match a requested consolidated weight dtype."""
     try:
         with open(config_path, "r") as f:
@@ -74,13 +74,13 @@ def _update_config_dtype(config_path: str, target_dtype: torch.dtype) -> None:
         logger.warning("Could not update torch_dtype in %s because it is not valid JSON.", config_path)
         return
 
-    config["torch_dtype"] = _config_torch_dtype_value(target_dtype)
+    config["torch_dtype"] = _config_torch_dtype_value(cast_dtype)
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
 
 
-def copy_metadata_files(input_dir: str, output_dir: str, target_dtype: torch.dtype | None = None) -> None:
+def copy_metadata_files(input_dir: str, output_dir: str, cast_dtype: torch.dtype | None = None) -> None:
     """Copy metadata files from the temporary metadata directory."""
     for item_name in os.listdir(input_dir):
         if item_name == "fqn_to_file_index_mapping.json":
@@ -91,8 +91,8 @@ def copy_metadata_files(input_dir: str, output_dir: str, target_dtype: torch.dty
             shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
         else:
             shutil.copy2(src_path, dst_path)
-        if target_dtype is not None and item_name == "config.json" and os.path.isfile(dst_path):
-            _update_config_dtype(dst_path, target_dtype)
+        if cast_dtype is not None and item_name == "config.json" and os.path.isfile(dst_path):
+            _update_config_dtype(dst_path, cast_dtype)
 
 
 def _has_consolidated_output(output_dir: str) -> bool:
@@ -149,7 +149,7 @@ def parse_args() -> argparse.Namespace:
         help="Rename the safetensors index to the Diffusers-compatible filename after consolidation.",
     )
     parser.add_argument(
-        "--target-dtype",
+        "--cast-dtype",
         default=None,
         help=(
             "Optional dtype for floating-point tensors in the consolidated checkpoint. "
@@ -165,7 +165,7 @@ def main() -> None:
 
     _configure_logging()
     args = parse_args()
-    target_dtype = resolve_dtype_cast(args.target_dtype)
+    cast_dtype = resolve_dtype_cast(args.cast_dtype)
 
     backend = args.backend
     if backend == "auto":
@@ -198,14 +198,14 @@ def main() -> None:
         args.output_dir,
         fqn_to_index_mapping,
         num_threads=args.num_threads,
-        target_dtype=target_dtype,
+        cast_dtype=cast_dtype,
     )
 
     if get_world_size_safe() > 1:
         dist.barrier()
 
     if get_rank_safe() == 0:
-        copy_metadata_files(hf_metadata_dir, args.output_dir, target_dtype=target_dtype)
+        copy_metadata_files(hf_metadata_dir, args.output_dir, cast_dtype=cast_dtype)
         if args.diffusers_compatible:
             _maybe_rename_index_for_diffusers(args.output_dir)
 

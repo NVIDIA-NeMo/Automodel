@@ -84,4 +84,5 @@ class HFCheckpointingMixin:
             weights_path=save_directory,
             peft_config=kwargs.get("peft_config", None),
             tokenizer=tokenizer,
+            is_final_checkpoint=kwargs.get("is_final_checkpoint", False),
         )

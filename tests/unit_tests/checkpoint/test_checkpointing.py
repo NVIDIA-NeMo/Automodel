@@ -26,9 +26,11 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _extract_file_index_with_status,
     get_fqn_to_file_index_mapping,
 )
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
+    SaveConsolidatedMode,
     _divide_keys_by_size,
     _equally_divide_layers,
     _is_custom_model,
@@ -1124,7 +1126,7 @@ class TestOfflineConsolidationScriptAndWarnings:
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
         model_dir = tmp_path / "epoch_0_step_1" / "model"
         model_dir.mkdir(parents=True)
-        caplog.set_level(logging.INFO)
+        caplog.set_level(logging.DEBUG)
 
         checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
 
@@ -1134,25 +1136,22 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert os.access(script_path, os.X_OK)
         assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
         assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
-        assert 'TARGET_DTYPE="${TARGET_DTYPE:-}"' in script
+        assert 'CAST_DTYPE="${CAST_DTYPE:-}"' in script
         assert 'PYTHON="${PYTHON:-python3}"' in script
         assert 'PYTHON_MODULE="${PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}"' in script
         assert "CONSOLIDATION_TOOL" not in script
         assert 'NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"' in script
         assert "NPROC_PER_NODE * NUM_THREADS within your CPU allocation" in script
         assert "sbatch --cpus-per-task=80" in script
-        assert "TARGET_DTYPE=bf16" in script
-        assert 'TARGET_DTYPE_ARGS=(--target-dtype "${TARGET_DTYPE}")' in script
+        assert "CAST_DTYPE=bf16" in script
+        assert 'CAST_DTYPE_ARGS=(--cast-dtype "${CAST_DTYPE}")' in script
         assert '-m "${PYTHON_MODULE}" \\' in script
         assert "--backend gloo \\" in script
         assert '--model-name "test/model" \\' in script
         assert f'--input-dir "{model_dir}" \\' in script
         assert f'--output-dir "{model_dir / "consolidated"}"' in script
         assert "--diffusers-compatible" not in script
-        assert (
-            f"Wrote offline HF safetensors consolidation helper script to {script_path}. "
-            "Run it after training to export HF weights."
-        ) in caplog.text
+        assert f"Wrote offline HF safetensors consolidation helper script to {script_path}." in caplog.text
 
     def test_writes_diffusers_compatible_consolidate_script(self, tmp_path):
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False, diffusers_compatible=True)
@@ -1165,14 +1164,82 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert f'--output-dir "{model_dir / "consolidated"}" \\' in script
         assert "--diffusers-compatible" in script
 
-    def test_does_not_write_script_when_inline_consolidation_is_enabled(self, tmp_path):
+    def test_writes_script_when_inline_consolidation_is_enabled(self, tmp_path):
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated=True)
         model_dir = tmp_path / "epoch_0_step_1" / "model"
         model_dir.mkdir(parents=True)
 
         checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
 
-        assert not (model_dir / "consolidate.sh").exists()
+        assert (model_dir / "consolidate.sh").exists()
+
+    def test_final_consolidation_mode_writes_script_for_non_final_checkpoints(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+        model_dir = tmp_path / "epoch_0_step_1" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        assert (model_dir / "consolidate.sh").exists()
+
+    def test_final_consolidation_mode_writes_script_for_final_checkpoint(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+        model_dir = tmp_path / "epoch_0_step_9" / "model"
+        model_dir.mkdir(parents=True)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+
+        assert (model_dir / "consolidate.sh").exists()
+
+    def test_final_checkpoint_logs_helper_hint_for_sharded_only_export(self, tmp_path, caplog):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated=False)
+        model_dir = tmp_path / "epoch_0_step_9" / "model"
+        model_dir.mkdir(parents=True)
+        caplog.set_level(logging.INFO)
+
+        checkpointer._maybe_write_offline_consolidation_script(str(model_dir))
+        checkpointer._maybe_log_final_offline_consolidation_hint(str(model_dir), is_final_checkpoint=True)
+
+        assert "Final checkpoint was saved with checkpoint.save_consolidated=false" in caplog.text
+        assert f"run bash {model_dir / 'consolidate.sh'}" in caplog.text
+
+    def test_inline_consolidation_preserves_hf_metadata_for_offline_helper(self, tmp_path):
+        hf_metadata_dir = tmp_path / "model" / ".hf_metadata"
+        consolidated_dir = tmp_path / "model" / "consolidated"
+        tokenizer_dir = hf_metadata_dir / "tokenizer"
+        hf_metadata_dir.mkdir(parents=True)
+        consolidated_dir.mkdir(parents=True)
+        tokenizer_dir.mkdir()
+        (hf_metadata_dir / "config.json").write_text("{}")
+        (hf_metadata_dir / "fqn_to_file_index_mapping.json").write_text('{"w": 1}')
+        (tokenizer_dir / "tokenizer.json").write_text("{}")
+
+        with patch("torch.distributed.is_initialized", return_value=False):
+            ConsolidatedHFAddon().post_save(
+                consolidated_path=str(consolidated_dir),
+                hf_metadata_path=str(hf_metadata_dir),
+            )
+
+        assert (hf_metadata_dir / "config.json").exists()
+        assert (hf_metadata_dir / "fqn_to_file_index_mapping.json").exists()
+        assert (tokenizer_dir / "tokenizer.json").exists()
+        assert (consolidated_dir / "config.json").exists()
+        assert (consolidated_dir / "tokenizer" / "tokenizer.json").exists()
+        assert not (consolidated_dir / "fqn_to_file_index_mapping.json").exists()
+
+    def test_save_consolidated_normalizes_legacy_bools(self, tmp_path):
+        assert self._make_checkpointer(tmp_path, save_consolidated=True).config.save_consolidated is (
+            SaveConsolidatedMode.EVERY
+        )
+        assert self._make_checkpointer(tmp_path, save_consolidated=False).config.save_consolidated is (
+            SaveConsolidatedMode.FALSE
+        )
+
+    def test_final_consolidation_only_exports_on_final_checkpoint(self, tmp_path):
+        checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
+
+        assert checkpointer._should_write_consolidated_safetensors(is_final_checkpoint=False) is False
+        assert checkpointer._should_write_consolidated_safetensors(is_final_checkpoint=True) is True
 
     def test_setup_warns_for_inline_consolidation(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setenv("WORLD_SIZE", "1")
@@ -1180,10 +1247,12 @@ class TestOfflineConsolidationScriptAndWarnings:
 
         self._make_checkpointer(tmp_path, save_consolidated=True)
 
-        assert "exports HuggingFace safetensors during every checkpoint save" in caplog.text
+        assert "checkpoint.save_consolidated=every exports HuggingFace safetensors during every checkpoint save" in (
+            caplog.text
+        )
         assert "world_size" not in caplog.text
         assert "can leave GPUs idle during consolidation and filesystem writes" in caplog.text
-        assert "Recommended: checkpoint.save_consolidated=false" in caplog.text
+        assert "Recommended: checkpoint.save_consolidated=final" in caplog.text
         assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
 
     def test_save_time_warns_for_large_inline_consolidation(self, tmp_path, monkeypatch, caplog):
@@ -1206,7 +1275,7 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert "full size may differ under distributed parallelism" in caplog.text
         assert "1 output file, world_size=256" in caplog.text
         assert "~50.0 GiB" in caplog.text
-        assert "save_consolidated=false" in caplog.text
+        assert "save_consolidated=final" in caplog.text
         assert "bash <checkpoint>/model/consolidate.sh" in caplog.text
 
     def test_save_time_uses_hf_index_size_before_distributed_fallback(self, tmp_path, caplog):
@@ -1239,7 +1308,7 @@ class TestOfflineConsolidationScriptAndWarnings:
             checkpointer._warn_if_large_inline_consolidation({"w": FakeSmallLocalTensor()}, {"w": 1})
 
         mock_all_reduce.assert_not_called()
-        assert "is exporting ~64.0 GiB of HF safetensors during checkpoint save" in caplog.text
+        assert "checkpoint.save_consolidated=every is exporting ~64.0 GiB of HF safetensors" in caplog.text
         assert "size from HF index" in caplog.text
         assert "1 output file, world_size=64" in caplog.text
         assert "~64.0 GiB" in caplog.text
@@ -1291,7 +1360,7 @@ class TestOfflineHFConsolidationTool:
             str(output_dir),
             {"w": 1},
             num_threads=5,
-            target_dtype=None,
+            cast_dtype=None,
         )
         mock_rename.assert_called_once_with(str(output_dir))
         assert metadata_dir.exists()
@@ -1336,7 +1405,7 @@ class TestOfflineHFConsolidationTool:
         mock_consolidate.assert_not_called()
         assert f"Consolidated HF safetensors already exist at {output_dir}" in caplog.text
 
-    def test_main_passes_target_dtype_and_updates_config(self, tmp_path, monkeypatch, caplog):
+    def test_main_passes_cast_dtype_and_updates_config(self, tmp_path, monkeypatch, caplog):
         from nemo_automodel.tools import offline_hf_consolidation as tool
 
         input_dir = tmp_path / "model"
@@ -1360,7 +1429,7 @@ class TestOfflineHFConsolidationTool:
                 str(input_dir),
                 "--output-dir",
                 str(output_dir),
-                "--target-dtype",
+                "--cast-dtype",
                 "bf16",
             ],
         )
@@ -1379,7 +1448,7 @@ class TestOfflineHFConsolidationTool:
             str(output_dir),
             {"w": 1},
             num_threads=5,
-            target_dtype=torch.bfloat16,
+            cast_dtype=torch.bfloat16,
         )
         with open(output_dir / "config.json", "r") as f:
             assert json.load(f)["torch_dtype"] == "bfloat16"

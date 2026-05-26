@@ -383,7 +383,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> Chec
         model_save_format="safetensors",
         model_repo_id=model_repo_id,
         model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=False,
+        save_consolidated="final",
         is_peft=is_peft,
     )
     user_cfg = {}

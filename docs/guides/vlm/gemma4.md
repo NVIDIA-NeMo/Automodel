@@ -295,7 +295,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_31b_cord_v2/
   model_save_format: safetensors
-  save_consolidated: false # Turn on for inline HF export during every checkpoint save.
+  save_consolidated: final # Recommended: export consolidated HF weights only for the final checkpoint.
 
 distributed:
   strategy: fsdp2
@@ -408,9 +408,9 @@ vlm_checkpoints/gemma4_31b_cord_v2/
 
 ### Export and Load a Consolidated Checkpoint with HF AutoModelForMultimodalLM
 
-Because the config uses `save_consolidated: false`, each checkpoint stores sharded
-safetensors plus a generated helper. Run the helper for the checkpoint you want
-to evaluate:
+Because the config uses `save_consolidated: final`, the final checkpoint includes
+`model/consolidated/`. Earlier checkpoints store sharded safetensors plus a
+generated helper; run the helper for an earlier checkpoint you want to evaluate:
 
 ```bash
 bash vlm_checkpoints/gemma4_31b_cord_v2/<checkpoint>/model/consolidate.sh

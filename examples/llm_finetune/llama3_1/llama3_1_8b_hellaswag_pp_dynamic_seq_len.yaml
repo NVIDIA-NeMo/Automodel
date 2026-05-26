@@ -50,7 +50,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: false
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

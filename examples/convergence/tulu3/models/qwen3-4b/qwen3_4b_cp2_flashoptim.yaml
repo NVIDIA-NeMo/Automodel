@@ -30,7 +30,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints_convergence/qwen3_4b_tulu3_cp2/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

@@ -117,11 +117,11 @@ class ConsolidatedHFAddon:
 
     def post_save(self, **kwargs) -> None:
         """
-        Move the saved HF metadata to the consolidated directory.
+        Copy the saved HF metadata to the consolidated directory.
 
-        The reason we keep it this way is because the HF metadata needs to be available
-        for offline consolidation, otherwise any changes made to the config during training
-        will be lost.
+        The reason we keep it this way is because the HF metadata needs to stay
+        available for offline consolidation and re-export, otherwise any changes
+        made to the config during training will be lost.
 
         Expected kwargs:
             consolidated_path (str): Target directory for consolidated artifacts.
@@ -134,14 +134,17 @@ class ConsolidatedHFAddon:
             return
 
         if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
-            # Move each item inside hf_metadata_dir into consolidated_path
+            # Copy each public metadata item into consolidated_path while keeping
+            # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
                 if item_name == "fqn_to_file_index_mapping.json":
-                    continue  # this is saved by the consolidation step
+                    continue  # internal helper metadata, not part of the HF output
                 src_path = os.path.join(hf_metadata_path, item_name)
                 dst_path = os.path.join(consolidated_path, item_name)
-                shutil.move(src_path, dst_path)
-            shutil.rmtree(hf_metadata_path, ignore_errors=True)
+                if os.path.isdir(src_path):
+                    shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src_path, dst_path)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 

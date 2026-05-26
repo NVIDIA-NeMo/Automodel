@@ -74,7 +74,7 @@ def test_write_scalar_tensor(tmp_path):
 
 
 @pytest.mark.run_only_on("CPU")
-def test_consolidate_casts_float_tensors_only_when_target_dtype_is_set(tmp_path, caplog):
+def test_consolidate_casts_float_tensors_only_when_cast_dtype_is_set(tmp_path, caplog):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     input_dir.mkdir()
@@ -96,7 +96,7 @@ def test_consolidate_casts_float_tensors_only_when_target_dtype_is_set(tmp_path,
         input_dir=str(input_dir),
         output_dir=str(output_dir),
         fqn_to_index_mapping={"float_weight": 1, "int_weight": 1},
-        target_dtype=torch.bfloat16,
+        cast_dtype=torch.bfloat16,
     )
 
     output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
@@ -109,7 +109,7 @@ def test_consolidate_casts_float_tensors_only_when_target_dtype_is_set(tmp_path,
         index = json.load(f)
     expected_total_size = tensors["float_weight"].numel() * 2 + tensors["int_weight"].numel() * 8
     assert index["metadata"]["total_size"] == expected_total_size
-    assert "Requested target dtype torch.bfloat16 for consolidation." in caplog.text
+    assert "Requested cast dtype torch.bfloat16 for consolidation." in caplog.text
     assert "tensors already in this dtype and non-floating tensors are unchanged." in caplog.text
 
 

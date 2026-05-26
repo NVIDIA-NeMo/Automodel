@@ -26,11 +26,16 @@ Changing between output formats can be done seamlessly through the recipe's `yam
 checkpoint:
     ...
     model_save_format: safetensors # Format for saving (torch_save or safetensors)
-    save_consolidated: false # Turn on for inline HF export during every checkpoint save.
-                             # Recommended: keep false and run <checkpoint>/model/consolidate.sh after training.
+    save_consolidated: final # Recommended: export consolidated HF weights only for the final checkpoint.
+                             # Other modes: false (sharded only) or every/true (export every checkpoint).
     ...
 ```
-> **Note:** Hugging Face export, both inline and offline, requires `model_save_format: safetensors`. For serving compatibility, run the generated consolidation helper after training or set `save_consolidated: true` to export consolidated checkpoints inline.
+> **Note:** `save_consolidated` accepts:
+> - `final` (recommended): keep intermediate checkpoints sharded and export consolidated HF weights only for the final checkpoint.
+> - `false`: save sharded checkpoints only. Run the generated `model/consolidate.sh` helper later if you need HF weights.
+> - `every` (or legacy `true`): export consolidated HF weights during every checkpoint save. Use this only when every checkpoint must be immediately loadable by HF tools.
+>
+> AutoModel writes a `model/consolidate.sh` helper next to safetensors model shards. Use this helper to create a Hugging Face-compatible `model/consolidated/` directory after training for `save_consolidated: false` checkpoints, or for earlier checkpoints when using `save_consolidated: final`. Creating consolidated Hugging Face weights requires `model_save_format: safetensors`.
 
 ::: {note}
 The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
@@ -62,7 +67,7 @@ The following command runs the LLM fine-tuning recipe on two GPUs and saves the 
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format safetensors \
-    --checkpoint.save_consolidated False
+    --checkpoint.save_consolidated final
 ```
 
 ::: {note}
@@ -75,7 +80,7 @@ If you're running on a single GPU, you can run:
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
     --checkpoint.model_save_format safetensors \
-    --checkpoint.save_consolidated False
+    --checkpoint.save_consolidated final
 ```
 
 After running for a few seconds, the standard output should be:
@@ -124,10 +129,10 @@ sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/
 You can request a floating-point dtype cast during offline export:
 
 ```bash
-TARGET_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
+CAST_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
 ```
 
-Use `TARGET_DTYPE` when the consolidated Hugging Face bundle should use a different floating-point dtype from the saved checkpoint, such as `TARGET_DTYPE=bf16` to export an FP32 training checkpoint as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only floating-point tensors with a different source dtype are cast; tensors already in the target dtype and non-floating tensors are left unchanged.
+Use `CAST_DTYPE` when the consolidated Hugging Face bundle should use a different floating-point dtype from the saved checkpoint, such as `CAST_DTYPE=bf16` to export an FP32 training checkpoint as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only floating-point tensors with a different source dtype are cast; tensors already in the cast dtype and non-floating tensors are left unchanged.
 
 The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python
