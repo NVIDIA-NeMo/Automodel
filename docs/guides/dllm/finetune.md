@@ -221,7 +221,7 @@ torchrun --nproc-per-node=8 \
     -c examples/dllm_sft/nemotron_labs_diffusion_sft.yaml
 ```
 
-## Generation / Inference
+## Run Inference
 
 The generation script ([`generate.py`](../../../examples/dllm_generate/generate.py)) supports chat, raw, and infilling modes. Pick the sampler that matches the trained family with `--sampler {llada,nemotron}`.
 
