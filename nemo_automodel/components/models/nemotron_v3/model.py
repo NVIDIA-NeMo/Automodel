@@ -162,11 +162,8 @@ class NemotronV3Model(nn.Module):
         else:
             hidden_states = inputs_embeds
 
-        # When qkv_format="thd" is explicitly requested AND we're using TE
-        # attention (which natively supports THD), squeeze to 2D [T, H] so
-        # attention layers pick the THD branch. Other attention backends
-        # (sdpa, flex) only support 4D BSHD, so leave hidden_states as
-        # [B, S, H] and rely on cu_seqlens for mamba's seq_idx alone.
+        # TE natively supports THD; squeeze to [T, H] so attention layers
+        # pick the THD branch. SDPA/flex only support 4D BSHD.
         _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
         squeezed_for_thd = False
         if (
@@ -180,13 +177,8 @@ class NemotronV3Model(nn.Module):
 
         is_thd = hidden_states.dim() == 2
 
-        # ``seq_idx`` is what Mamba consumes for per-token segment boundaries.
-        # Under neat packing it's derived in the outer ``NemotronHForCausalLM``
-        # forward from ``_packed_seq_ids`` and threaded down via kwargs.
-        # Non-THD path (no THD collator) doesn't emit ``cu_seqlens`` — recover
-        # it from a 2D indexed attention_mask so mamba's seq_idx derivation
-        # has something to work with. Skipped when attention_mask is the neat
-        # 4D bool mask (seq_idx is already built upstream from _packed_seq_ids).
+        # Non-THD-collater path doesn't emit cu_seqlens — recover it from a
+        # 2D indexed attention_mask so mamba's seq_idx derivation has input.
         if (
             "cu_seqlens" not in kwargs
             and attention_mask is not None
@@ -196,57 +188,38 @@ class NemotronV3Model(nn.Module):
             seq_lens = attention_mask.sum(dim=-1).to(torch.int32)
             kwargs["cu_seqlens"] = F.pad(seq_lens.cumsum(0).to(torch.int32), (1, 0))
 
-        # Normalize cu_seqlens / cu_seqlens_padded / max_seqlen to 1D / 0D.
-        # The THD collator emits per-microbatch rows stacked as
-        # ``[num_microbatches, max_K]`` (cu_seqlens / _padded) and
-        # ``[num_microbatches]`` (max_seqlen), with ``-1000`` right-padding on
-        # cu_seqlens rows so they're rectangular across chunks with differing
-        # sub-seq counts (see ``thd_utils.split_batch_into_thd_chunks.pad_and_stack``).
-        # PyTorch PP then ``tensor_split``-chunks along dim 0, so each stage
-        # forward receives ``[1, max_K]`` (cu_seqlens) and ``[1]`` (max_seqlen).
-        # Squeeze to 1D / 0D, strip any sentinel right-pad, and clone to a
-        # fresh contiguous tensor so the values survive the TE backward (PP
-        # may free view-backed kwarg storage). Otherwise the kernel sees
-        # ``-1000`` boundaries and either writes OOB (TE cuDNN-fused-attn-bwd
-        # on a 576-token "phantom" sub-seq) or computes garbage seq_idx
-        # (mamba).
+        # Per-microbatch arrives as [1, K] (THD collator stacks per-MB and PP
+        # tensor_splits dim 0). Squeeze to 1D, strip the -1000 right-pad
+        # sentinels from pad_and_stack, and clone to a fresh tensor so the
+        # values survive TE backward (PP may free view-backed kwarg storage).
         _SEQLEN_SENTINEL = -1000
         for _k in ("cu_seqlens", "cu_seqlens_padded"):
             _v = kwargs.get(_k)
             if isinstance(_v, torch.Tensor) and _v.dim() == 2 and _v.shape[0] == 1:
                 _v = _v.squeeze(0)
             if isinstance(_v, torch.Tensor) and _v.dim() == 1:
-                # Strip sentinel right-pad if present (cheap no-op when absent).
                 if (_v == _SEQLEN_SENTINEL).any():
                     _v = _v[_v != _SEQLEN_SENTINEL]
                 kwargs[_k] = _v.contiguous().clone()
-        # max_seqlen may arrive as [1] tensor; flatten to a scalar tensor.
         _ms = kwargs.get("max_seqlen")
         if isinstance(_ms, torch.Tensor) and _ms.dim() >= 1 and _ms.numel() == 1:
             kwargs["max_seqlen"] = _ms.flatten()[0].clone()
 
-        # Get 4D causal mask for attention layers (from precomputed masks).
         causal_mask = causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else None
 
-        # Detect neat-packed SDPA path: ``seq_idx`` was already built upstream
-        # from ``_packed_seq_ids`` and attention_mask is a 4D block-causal
-        # bool. Under this path Mamba relies on seq_idx alone (no 2D padding
-        # mask is meaningful), and the 4D mask is the attention mask.
+        # Neat-packed SDPA path: seq_idx came from _packed_seq_ids upstream
+        # and attention_mask is the 4D block-causal bool mask. Mamba uses
+        # seq_idx (no 2D mask); attention uses the 4D mask directly.
         _neat_packed = "seq_idx" in kwargs and attention_mask is not None and attention_mask.dim() == 4
 
-        # Apply transformer layers
         for layer in self.layers.values():
-            # Pass appropriate mask based on layer type
             if is_thd:
                 mask = None
             elif _neat_packed:
-                # Mamba uses seq_idx for segment boundaries; pass no mask.
-                # Attention gets the 4D block-causal mask directly.
                 mask = attention_mask if layer.block_type == "attention" else None
             elif layer.block_type == "attention":
-                # Attention layers use 4D causal mask; fall back to 2D attention_mask
-                # when causal_mask is None (e.g. during TE+CP training where CP split
-                # removes the precomputed 4D mask) so TE can use padding_causal mode.
+                # Fall back to 2D attention_mask when causal_mask is None
+                # (e.g. TE+CP, where the CP split drops the precomputed 4D mask).
                 mask = causal_mask if causal_mask is not None else attention_mask
             elif layer.block_type == "mamba":
                 # Mamba layers use 2D padding mask during prefill, None during decode
@@ -263,12 +236,10 @@ class NemotronV3Model(nn.Module):
                 **kwargs,
             )
 
-        # Final norm (skipped on non-last PP stages where the splitter trims
-        # the norm module to None).
+        # Norm is None on non-last PP stages (splitter trims it).
         if getattr(self, "norm", None) is not None:
             hidden_states = self.norm(hidden_states)
 
-        # Restore batch dimension if we squeezed for THD
         if squeezed_for_thd:
             hidden_states = hidden_states.unsqueeze(0)
 
@@ -290,7 +261,6 @@ class NemotronV3Model(nn.Module):
             if getattr(self, "norm", None) is not None:
                 self.norm.reset_parameters()
 
-        # Initialize all layers via delegation
         for block in self.layers.values():
             block.init_weights(buffer_device=buffer_device)
 
@@ -302,14 +272,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     per-step KV caching for attention layers and recurrent state caching for Mamba2 layers.
     """
 
-    # Prevent GenerationMixin from creating a DynamicCache: the hybrid Mamba2/Attention
-    # architecture uses its own NemotronHybridCache.
+    # Hybrid Mamba2/Attention uses NemotronHybridCache, not DynamicCache.
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
 
-    # Keep our own PP-aware forward (with hybrid mask routing, THD squeeze,
-    # mamba kwargs, MTP variadic propagation). Skips ``patch_hf_model_for_pp``
-    # at split time — see hf_utils.py:591-600.
+    # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
 
     @classmethod
@@ -406,7 +373,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             dtype=dtype,
         )
 
-        # self.mtp is None when num_nextn_predict_layers is absent or 0.
         self.mtp_config = build_mtp_config_from_hf(
             config,
             loss_scaling_factor=mtp_loss_scaling_factor,
@@ -414,10 +380,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             use_repeated_layer=mtp_use_repeated_layer,
         )
         if self.mtp_config.enabled:
-            # Resolve block types from either ``mtp_hybrid_override_pattern``
-            # (symbol-string form) or ``mtp_layers_block_type`` (list form).
-            # The list flows through here so build_nemotron_v3_mtp doesn't
-            # need to re-parse the (possibly sentinel) MTPConfig.layer_pattern.
             block_types = _resolve_block_types_per_sublayer(config)
             self.mtp = build_nemotron_v3_mtp(
                 config,
@@ -430,7 +392,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         else:
             self.mtp = None
 
-        # Create state_dict_adapter if enabled (needed to convert HF checkpoints)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = NemotronV3StateDictAdapter(
                 config=config,
@@ -439,7 +400,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 dtype=dtype,
             )
 
-        # Required by GenerationMixin.generate()
+        # Required by GenerationMixin.generate().
         self.generation_config = GenerationConfig()
 
     @property
@@ -578,12 +539,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         else:
             primary_out = meta(hidden_shape)
         outputs_meta = append_mtp(primary_out)
-        # Last stage emits an extra [B, S] int32 ``seq_idx`` tail when MTP is
-        # enabled. The model's last-stage forward stashes the per-microbatch
-        # sub-sequence id tensor here so the loss fn can mask MTP label rolls
-        # at sub-sequence boundaries. Using the output tuple (rather than a
-        # side-channel queue on the loss fn) keeps the seq_idx bonded to its
-        # microbatch by the PP runtime itself — schedule-agnostic.
+        # Last stage appends an int32 [B, S] seq_idx so the loss fn can mask
+        # MTP label rolls across sub-seq boundaries — bonded to its microbatch
+        # via the PP output-tuple contract (schedule-agnostic).
         if self.lm_head is not None and mtp_depth > 0:
             outputs_meta = (*outputs_meta, meta((microbatch_size, seq_len), d=torch.int32))
         return inputs_meta, outputs_meta
@@ -627,17 +585,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
 
-        # Neat-packed SDPA path: ``_packed_seq_ids`` is the indexed [B,S]
-        # 1-based per-token sub-sequence id (0 = pad). Convert once here to
-        # Mamba's ``seq_idx`` (int32; equality classes are what matter, so
-        # the 1-based form works directly) and drop the original key so
-        # downstream layers / the inner model see only seq_idx. Both the
-        # backbone forward and MTP sublayer chain will consume seq_idx from
-        # kwargs / mtp_kwargs.  We also derive a 2D padding_mask from
-        # ``_packed_seq_ids`` (1 = real token, 0 = pad) because Mamba's
-        # mixer multiplies ``hidden_states * attention_mask.unsqueeze(-1)``
-        # which only works for a 2D mask, and the neat collater puts a 4D
-        # block-causal bool mask under ``attention_mask`` (for SDPA).
+        # Neat-packed SDPA: convert _packed_seq_ids (1-based [B,S] int, 0=pad)
+        # to mamba's seq_idx and derive a 2D padding_mask. The neat collater
+        # already supplies a 4D attention_mask, but mamba's mixer multiplies
+        # hidden_states by a 2D mask, so we need both.
         _packed_seq_ids = kwargs.pop("_packed_seq_ids", None)
         if isinstance(_packed_seq_ids, torch.Tensor) and "seq_idx" not in kwargs:
             kwargs["seq_idx"] = _packed_seq_ids.to(torch.int32).contiguous()
@@ -650,13 +601,10 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             else getattr(self.config, "output_hidden_states", False)
         )
 
-        # Stash the pre-squeeze ``[B, S]`` int input_ids so the MTP embedding
-        # tuple can be built AFTER the inner forward — FSDP2 requires the
-        # root module's forward (``self.model``) to run before any of its
-        # children's forwards, otherwise the lazy-init check at
-        # ``_fsdp_state.py:_lazy_init`` raises. We build the tuple post-
-        # inner-forward but use the pre-squeeze shape so the emitted tensors
-        # match the ``[B, S, H]`` contract from ``get_pipeline_stage_metas``.
+        # Stash pre-squeeze [B, S] input_ids: the MTP embed tuple must be
+        # built AFTER self.model() runs (FSDP2 root lazy-init requires the
+        # root forward first) but with the pre-squeeze shape so emitted
+        # tensors match the [B, S, H] contract from get_pipeline_stage_metas.
         pre_squeeze_input_ids = (
             input_ids
             if (
@@ -670,13 +618,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             else None
         )
 
-        # THD format covers both the data layout (qkv_format=='thd') and
-        # whether we should squeeze to ``[T, H]`` for the attention backend.
-        # Squeezing only helps TE (which natively supports THD); SDPA/flex
-        # expect 4D BSHD. Keep ``is_thd`` true whenever qkv_format='thd' so
-        # the post-forward unsqueeze still restores the batch dim for the
-        # 2D-returning inner model variants — only gate the *squeeze* on
-        # the backend.
+        # Squeezing to [T, H] only helps TE; SDPA/flex need 4D BSHD. Keep
+        # is_thd true regardless so the post-forward unsqueeze still fires.
         _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
         is_thd = kwargs.get("qkv_format") == "thd"
         squeeze_for_thd = is_thd and _attn_impl == "te"
@@ -687,15 +630,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             attention_mask = None
             causal_mask_mapping = None
 
-        # MoE module consumes a padding mask derived from attention_mask. On
-        # non-first stages where the trainer's collate-built attention_mask
-        # arrives as a chunked kwarg, derive it here too.
+        # MoE needs a padding_mask; derive from attention_mask when missing.
         if padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()
 
-        # Forward through base model. On non-first stages, the hidden-state
-        # tensor arrives in ``input_ids`` (the PP positional input slot) and
-        # the inner model routes it through its ``inputs_embeds`` branch.
+        # On non-first PP stages, the upstream hidden-state tensor arrives in
+        # the input_ids slot; the inner model routes it via inputs_embeds.
         hidden_states = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -706,20 +646,16 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             **kwargs,
         )
 
-        # Now that the root forward has run, FSDP2 has lazy-initialized the
-        # root state and is happy with subsequent child-only calls. Build
-        # the per-depth MTP token embeddings from the pre-squeeze ``[B, S]``
-        # input_ids so the emitted tensors stay ``[B, S, H]`` (matching the
-        # `get_pipeline_stage_metas` contract) regardless of THD squeezing.
+        # Root forward has run; FSDP2 lazy-init is satisfied. Build MTP embed
+        # tuple from pre-squeeze [B, S] ids so emitted shapes match
+        # get_pipeline_stage_metas.
         if pre_squeeze_input_ids is not None:
             mtp_embed_inputs = self._build_mtp_embed_inputs_for_pp(pre_squeeze_input_ids)
 
-        # Mark cache as having state after the first forward pass (prefill done)
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        # LM head only exists on the last stage. Non-final stages return the
-        # backbone's post-norm/no-norm hidden state.
+        # lm_head is None on non-last PP stages; return raw hidden_states.
         if has_lm_head:
             if isinstance(logits_to_keep, int) and logits_to_keep == 0:
                 logits = self.lm_head(hidden_states)
@@ -733,9 +669,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             logits = hidden_states
 
         loss = None
+        # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.
         if labels is not None and has_lm_head and not is_pp_stage:
-            # Non-PP path computes its own loss. Under PP, loss is computed
-            # by ``PipelineCausalLMLoss`` from the returned tuple.
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = nn.functional.cross_entropy(
@@ -743,21 +678,18 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 shift_labels.view(-1),
             )
 
-        # MTP head: lives on the last PP stage (or on rank 0 in non-PP). On
-        # non-final / non-owning stages, emit placeholder empties so the
-        # inter-stage tuple arity (``1 + D``) is constant across all stages.
-        # Final stage in eval mode also emits placeholders (matches DSV4).
+        # MTP head: last PP stage in training only. Other stages / eval emit
+        # placeholder empties below so the tuple arity stays 1 + D.
         mtp_per_depth_h: list[torch.Tensor] | None = None
         if self.mtp is not None and self.training:
             mtp_attention_mask = (
                 causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else attention_mask
             )
-            # Thread the THD-packing context from the outer kwargs (built by
-            # the recipe's THD batch processor) into the MTP sublayer call
-            # chain. Without this, the MTP attention sublayer would auto-
-            # detect ``qkv_format='bshd'`` from the 3D hidden_states shape and
-            # treat the packed sequence as one contiguous causal block,
-            # bleeding attention across sequence boundaries.
+            # Forward THD-packing context to the MTP sublayers; without it
+            # they'd auto-detect bshd from the 3D shape and bleed attention
+            # across sub-seq boundaries. cp_rank/cp_size must also be
+            # forwarded — the CP forward pre-hook only attaches to the
+            # backbone attention, not to MTP sublayers that share the class.
             mtp_kwargs = {
                 "position_ids": position_ids,
                 "attention_mask": mtp_attention_mask,
@@ -770,34 +702,20 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 "max_seqlen_q",
                 "max_seqlen_kv",
                 "seq_idx",
-                # CP context: backbone attention receives cp_rank/cp_size via
-                # an attention forward pre-hook (set by
-                # ``attach_context_parallel_hooks``). MTP sublayer attention
-                # reuses the same NemotronV3Attention class but goes through
-                # a different call site, so we must forward CP context
-                # explicitly. Without these TE's CP-aware flash-varlen path
-                # has wrong indices and produces illegal-memory-access.
                 "cp_rank",
                 "cp_size",
             ):
                 if _k in kwargs:
                     _v = kwargs[_k]
-                    # TE THD path expects 1D ``[num_seqs+1]`` cu_seqlens. The
-                    # THD collator emits stacked ``[num_microbatches, K]``
-                    # rows that PP ``tensor_split``s along dim 0, so each
-                    # per-microbatch row reaches us as ``[1, K]``. The inner
-                    # backbone forward already normalizes for its own use,
-                    # but we re-normalize for the MTP call chain.
+                    # Same per-microbatch [1, K] → 1D normalization as in
+                    # NemotronV3Model.forward; re-applied for the MTP chain.
                     if _k in ("cu_seqlens", "cu_seqlens_padded", "seq_idx") and isinstance(_v, torch.Tensor):
                         if _v.dim() == 2 and _v.shape[0] == 1:
                             _v = _v.squeeze(0)
                         if _v.dim() == 1:
-                            # Strip THD-collator sentinels (-1000) before they
-                            # reach the MTP sublayer's TE attention. Without
-                            # this, the kernel sees pairs like (1024, -1000)
-                            # which it interprets as a (-2024)-length sub-seq
-                            # and OOB-writes during backward. Matches the
-                            # backbone filter in NemotronV3Model.forward.
+                            # Strip pad_and_stack's -1000 sentinels; TE would
+                            # interpret pairs like (1024, -1000) as a negative-
+                            # length sub-seq and OOB-write during backward.
                             if (_v == -1000).any():
                                 _v = _v[_v != -1000]
                             _v = _v.contiguous().clone()
@@ -815,7 +733,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 )
 
             if mtp_embeds_for_call:
-                # Final PP stage: embeddings were produced upstream.
+                # Final PP stage: embeddings produced upstream.
                 mtp_per_depth_h = self.mtp(
                     hidden_states=mtp_hidden,
                     embed_inputs=mtp_embeds_for_call,
@@ -829,54 +747,31 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                     embed_fn=self.model.embed_tokens,
                     **mtp_kwargs,
                 )
-            # If hidden_states was squeezed for MTP and downstream consumers
-            # expect 3D, restore. (Currently no downstream consumer expects
-            # it; per-depth outputs are returned as their own list.)
             if is_thd and mtp_per_depth_h is not None:
                 mtp_per_depth_h = [h.unsqueeze(0) if h.dim() == 2 else h for h in mtp_per_depth_h]
         elif pp_mtp_enabled and has_lm_head:
-            # Final stage in eval, or MTP-enabled config without self.mtp on
-            # this rank — keep tuple arity by emitting empties.
+            # Eval, or no MTP on this rank — emit empties to keep tuple arity.
             mtp_per_depth_h = [hidden_states.new_empty(hidden_states.shape) for _ in range(mtp_depth)]
 
-        # Restore the batch dim for THD only when the inner forward returned
-        # 2D logits.  When the caller feeds the model via ``inputs_embeds``
-        # (shape ``[1, T, H]``), ``NemotronHModel.forward`` squeezes to
-        # ``[T, H]`` for the layer stack and unsqueezes back to ``[1, T, H]``
-        # before returning (see the ``squeezed_for_thd`` branch); the lm_head
-        # then yields ``[1, T, V]`` already and a second unsqueeze here would
-        # produce a spurious ``[1, 1, T, V]``.
+        # Restore batch dim only when inner forward returned 2D — inputs_embeds
+        # path already produces [1, T, V] and would become [1, 1, T, V] here.
         if is_thd and logits.dim() == 2:
             logits = logits.unsqueeze(0)
 
-        # PP path: return a tuple.
-        #
-        # First/middle stages emit ``(hidden_states, *mtp_embed_inputs)`` with
-        # arity ``1 + D``. The next stage gets its own per-microbatch
-        # ``_packed_seq_ids`` via PP-chunked kwargs, so seq_idx isn't passed
-        # between mid-stages.
-        #
-        # The LAST stage emits ``(logits, *mtp_per_depth_h, seq_idx)`` with
-        # arity ``1 + D + 1`` when MTP is enabled. The ``seq_idx`` tail binds
-        # the per-microbatch sub-sequence layout to its corresponding loss
-        # call — the PP runtime guarantees the output of forward(mb_i) is
-        # passed to _compute_loss(mb_i), so the loss fn always sees the right
-        # seq_idx for the microbatch it's reducing. Works for every PP
-        # schedule, not just 1f1b/interleaved1f1b.
+        # PP return contract:
+        #   mid stages: (hidden_states, *mtp_embed_inputs)              arity 1+D
+        #   last stage: (logits,        *mtp_per_depth_h,  seq_idx)     arity 1+D+1
+        # The seq_idx tail binds the per-microbatch sub-seq layout to its loss
+        # call via the PP runtime's forward(mb_i)→loss(mb_i) contract.
         if is_pp_stage:
             if pp_mtp_enabled:
                 if not has_lm_head:
                     return (logits, *mtp_embed_inputs)
                 assert mtp_per_depth_h is not None
-                # Build the seq_idx tail. Sources in order of preference:
-                #   1. ``seq_idx`` already in kwargs (neat-path upstream
-                #      conversion from ``_packed_seq_ids``).
-                #   2. ``cu_seqlens`` in kwargs (THD/TE pack path); derive
-                #      per-token sub-seq id via searchsorted (same as the
-                #      mamba layer's internal derivation).
-                #   3. No packing → all-1 sentinel; the loss-fn's cross-
-                #      sub-seq mask becomes a no-op.
-                # Derive [B, S] from logits in all cases.
+                # seq_idx tail sources, in order of preference:
+                #   1. kwargs["seq_idx"] (neat-path).
+                #   2. derived from kwargs["cu_seqlens"] (THD/TE path).
+                #   3. all-1 sentinel — loss-fn cross-boundary mask is a no-op.
                 if logits.dim() == 3:
                     _B, _S = logits.shape[:2]
                 elif logits.dim() == 2:
@@ -903,8 +798,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 return (logits, *mtp_per_depth_h, _seq_idx_tail)
             return logits
 
-        # Non-PP path: dataclass return for compatibility with existing
-        # consumers and the recipe's MTP loss reader.
+        # Non-PP: dataclass return for the recipe's MTP loss reader.
         return NemotronHCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
