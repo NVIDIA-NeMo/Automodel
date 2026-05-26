@@ -213,7 +213,7 @@ torchrun --nproc-per-node=8 \
     -c examples/dllm_sft/dflash_sft.yaml
 ```
 
-Nemotron-Labs-Diffusion:
+### Fine-Tune Nemotron-Labs-Diffusion
 
 ```bash
 torchrun --nproc-per-node=8 \
