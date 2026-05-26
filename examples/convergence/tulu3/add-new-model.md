@@ -1,8 +1,8 @@
-# Adding a New Model to the Convergence Pipeline
+# Add a New Model to the Convergence Pipeline
 
 This guide walks through adding a new model to the Tulu-3 convergence pipeline. We use Qwen3-4B as the running example.
 
-## 1. Create a Model Directory
+## Create a Model Directory
 
 ```
 models/<model-name>/
@@ -12,7 +12,7 @@ models/<model-name>/
   <model>_cp1_te_fusedadam.yaml # TE FusedAdam config
 ```
 
-## 2. Get the Chat Template
+## Get the Chat Template
 
 Thinking models need a custom chat template that strips `<think>` tags from training labels. Without it, SFT on non-reasoning data produces high death loop rates.
 
@@ -24,7 +24,7 @@ print(tokenizer.chat_template)
 
 Save as `models/<model-name>/chat_template.jinja`. The key modification: wrap thinking content in `{% generation %}` / `{% endgeneration %}` tags so it appears in training but the model learns to produce direct answers.
 
-## 3. Establish Baselines
+## Establish Baselines
 
 Run eval on the **pretrained model** (no SFT) before doing anything else:
 
@@ -46,7 +46,7 @@ python inference/analyze_quality.py /tmp/eval_baseline/ --export /tmp/baseline_q
 
 Record the baseline numbers — IFEval accuracy, death loop rate, abrupt ending rate.
 
-## 4. Check Truncation and Pre-filter
+## Check Truncation and Pre-Filter
 
 ```bash
 python data/check_truncation.py \
@@ -65,9 +65,10 @@ python data/prefilter_dataset.py \
     --cache_dir /tmp/tulu3_filtered
 ```
 
-The cached Parquet directory is passed to training via `--dataset.path_or_dataset_id`.
+The cached Parquet directory is passed to training using `--dataset.path_or_dataset_id`.
 
-## 5. Write Training Configs
+## Write Training Configs
+
 
 Start from an existing config (e.g., `models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml`).
 
@@ -88,7 +89,7 @@ Start from an existing config (e.g., `models/qwen3-4b/qwen3_4b_cp1_flashoptim.ya
 - Add `model.backend.rms_norm: torch_fp32` for numerical stability
 - Set `model.backend.rope_fusion: false` if using CP
 
-## 6. Validate Data Pipeline
+## Validate Data Pipeline
 
 ```bash
 python data/validate_data.py \
@@ -105,7 +106,7 @@ All 5 assertions must pass:
 - `no_eos_in_padding` — no eos_token_id in padding positions
 - `eos_in_content` — eos_token_id present in content
 
-## 7. Run Model Verification
+## Run Model Verification
 
 Compare your NeMo implementation against HF Transformers before training:
 
@@ -118,7 +119,7 @@ python model-verification/compare_activations.py \
 
 All decoder layers should have cosine similarity > 0.99. If not, investigate weight loading, RoPE, or normalization differences.
 
-## 8. Train
+## Train
 
 ```bash
 CACHED=/tmp/tulu3_filtered/<cached_dir>
@@ -137,7 +138,7 @@ Monitor: loss should decrease from ~0.8 to ~0.5-0.6 over 1000 steps. Watch for N
 
 **Important:** Use absolute paths for `--checkpoint.checkpoint_dir`. If using TE FusedAdam, set `local_batch_size: 2` to leave memory headroom for optimizer state.
 
-## 9. Evaluate
+## Evaluate
 
 Run IFEval with thinking off and on:
 
@@ -164,7 +165,7 @@ bash eval/run_eval.sh \
 
 **Important:** Use `readlink -f` to resolve LATEST symlink. Use absolute paths. For dense models, use `--dp-size 1`.
 
-## 10. Run Inference Quality Analysis
+## Run Inference Quality Analysis
 
 ```bash
 python inference/analyze_quality.py \
@@ -178,7 +179,7 @@ python inference/analyze_quality.py \
 
 Compare against baselines (step 3). Check all 4 failure modes:
 - **Death loop** — should be < 20%, ideally < 10%
-- **Abrupt ending** — should improve significantly vs pretrained baseline
+- **Abrupt ending** — should improve significantly vs. pretrained baseline
 - **Missing EOS** — should be 0%
 - **Empty response** — should be 0%
 

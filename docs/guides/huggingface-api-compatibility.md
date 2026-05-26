@@ -16,8 +16,8 @@ NeMo AutoModel currently pins Hugging Face Transformers to the **v4** major line
 
 This means:
 
-- NeMo AutoModel is primarily tested and released against **Transformers v4.x**
-- New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo AutoModel as well (similar to upgrading `transformers` directly)
+- NeMo AutoModel is primarily tested and released against **Transformers v4.x**.
+- New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo AutoModel as well (similar to upgrading `transformers` directly).
 
 ### Transformers v5 (Forward-Compatibility and Checkpoint Interoperability)
 
@@ -190,7 +190,7 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))</code></pre></div>
 :::
 
 
-### Tokenizers (Transformers vs NeMo AutoModel)
+### Tokenizers (Transformers vs. NeMo AutoModel)
 
 NeMo AutoModel provides `NeMoAutoTokenizer` as a Transformers-like auto-tokenizer with a small registry for specialized backends (and a safe fallback when no specialization is needed).
 
@@ -226,4 +226,4 @@ NeMo AutoModel training recipes write checkpoints as sharded safetensors by defa
 - See [checkpointing](checkpointing.md) for checkpoint formats and example directory layouts.
 - See [model coverage](../model-coverage/overview.md) for notes on how model support depends on the pinned Transformers version.
 
-If your goal is: **train/fine-tune in NeMo AutoModel → deploy in the HF ecosystem**, the recommended workflow is to keep `model_save_format: safetensors` and `save_consolidated: false` during training, run `bash <checkpoint>/model/consolidate.sh` after training, and then load `model/consolidated/` with the standard HF APIs or downstream inference engines. Set `save_consolidated: true` only when you intentionally want inline HF export at every checkpoint save.
+If your goal is to **train/fine-tune in NeMo AutoModel → deploy in the HF ecosystem**, the recommended workflow is to keep `model_save_format: safetensors` and `save_consolidated: false` during training, run `bash <checkpoint>/model/consolidate.sh` after training, and then load `model/consolidated/` with the standard HF APIs or downstream inference engines. Set `save_consolidated: true` only if you want inline HF export at every checkpoint save.

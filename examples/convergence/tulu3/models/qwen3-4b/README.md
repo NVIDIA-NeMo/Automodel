@@ -1,6 +1,6 @@
 # Qwen3-4B — Tulu-3 Convergence
 
-Dense 4B model. 8 GPUs, FSDP, with CP=1 baselines plus a corrected CP=2 rerun on Tulu-3 (pre-filtered to seq_length=2048).
+Dense 4B model. 8 GPUs, FSDP, with CP=1 baselines plus a corrected CP=2 rerun on Tulu-3 (pre-filtered to `seq_length=2048`).
 
 ## Configs
 
@@ -22,7 +22,7 @@ python data/prefilter_dataset.py \
     --cache_dir /tmp/tulu3_filtered
 ```
 
-Then pass the cached path via `--dataset.path_or_dataset_id <cached_dir>`.
+Then pass the cached path using `--dataset.path_or_dataset_id <cached_dir>`.
 
 > **Note**: TE FusedAdam requires `local_batch_size: 2` (not 8). The larger optimizer state (FP32 master weights + remainders) needs additional GPU memory headroom during training.
 

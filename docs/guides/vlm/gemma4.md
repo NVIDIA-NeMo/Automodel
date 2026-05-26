@@ -1,7 +1,7 @@
-# Fine-Tuning Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide
+# Fine-Tune Gemma 4 31B on CORD-v2 Receipts — End-to-End Guide
 
 **A step-by-step guide for fine-tuning Gemma 4 31B to extract structured receipt data
-from scanned images using [NeMo Automodel](https://github.com/NVIDIA-NeMo/Automodel).**
+from scanned images using [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel).**
 
 ---
 
@@ -53,7 +53,7 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 
 ## Step 0 — Environment Setup
 
-This guide runs **inside** the NeMo Automodel Docker container:
+This guide runs **inside** the NeMo AutoModel Docker container:
 
 ```bash
 docker run -it --rm --gpus all --ipc=host --network host \
@@ -65,11 +65,11 @@ huggingface-cli login          # needed for gated model access
 cd /opt/Automodel
 ```
 
-> **Note**: Gemma 4 requires the transformers version that include the model implementation. Please make sure proper transformers is installed.
+> **Note**: Gemma 4 requires a `transformers` version that includes the model implementation. Please make sure proper transformers is installed.
 
 ---
 
-## Step 1 — Explore the CORD-v2 Dataset
+## Explore the CORD-v2 Dataset
 
 [CORD-v2](https://huggingface.co/datasets/naver-clova-ix/cord-v2) is a Consolidated
 Receipt Dataset for Post-OCR Parsing containing scanned receipts with structured
@@ -118,9 +118,9 @@ Ground-truth keys: ['menu', 'sub_total', 'total', 'void_menu']
   void_menu: []
 ```
 
-### Target format: JSON-to-token conversion
+### Target Format: JSON-to-Token Conversion
 
-NeMo Automodel converts structured JSON into an XML-like **token sequence** using
+NeMo AutoModel converts structured JSON into an XML-like **token sequence** using
 the `json2token()` function. This is the format the model is trained to produce:
 
 ```python
@@ -144,7 +144,7 @@ Total length: 827 chars
 
 ---
 
-## Step 2 — Evaluate the Base Model (Before Fine-Tuning)
+## Evaluate the Base Model (Before Fine-Tuning)
 
 Load the pretrained Gemma 4 31B model and run it on receipt images. The base model
 will produce free-form descriptions instead of structured token sequences.
@@ -261,10 +261,12 @@ including ABRA KADABRA FLAME GRILLED for 39,000 and Lemon Tea for 7,000...
 
 ---
 
-## Step 3 — Training Configuration
+## Configure Training
 ### YAML config
 
-You can save the yaml below as `gemma4_31b_cord_v2.yaml` for training cord_v2 dataset. 
+### YAML Config
+
+You can save the YAML below as `gemma4_31b_cord_v2.yaml` to train on the CORD-v2 dataset.
 
 ```yaml
 
@@ -343,7 +345,7 @@ and brings initial loss down to ~3.
 
 ---
 
-## Step 4 — Launch Fine-Tuning
+## Launch Fine-Tuning
 
 ```bash
 torchrun --nproc-per-node=8 \
@@ -352,13 +354,13 @@ torchrun --nproc-per-node=8 \
     2>&1 | tee logs/train_gemma4_31b_cord_v2.log
 ```
 
-### What to watch
+### What to Watch
 
 - **Loss** drops rapidly from ~0.73 to ~0.04 in the first 50 steps, then stabilizes around 0.005
 - **Validation loss** reaches ~0.018 by step 199 (best checkpoint)
 - Training takes ~15 min on 8x H100 (300 steps, 800 training samples)
 
-### Training log
+### Training Log
 
 ```
 step    0 | loss 0.7350 | grad_norm  35.65 | lr 1.18e-06 | mem 60.90 GiB | tps/gpu  45
@@ -375,7 +377,7 @@ Validation:
   step 299 | val_loss 0.0192
 ```
 
-### Checkpoints saved
+### Checkpoints Saved
 
 ```
 vlm_checkpoints/gemma4_31b_cord_v2/
@@ -402,7 +404,7 @@ vlm_checkpoints/gemma4_31b_cord_v2/
 
 ---
 
-## Step 5 — Evaluate the Fine-Tuned Model
+## Evaluate the Fine-Tuned Model
 
 ### Export and Load a Consolidated Checkpoint with HF AutoModelForMultimodalLM
 
@@ -446,7 +448,7 @@ print("Evaluating fine-tuned model:")
 ft_avg_ned, ft_results = evaluate_receipts(model, processor, dataset["test"])
 ```
 
-### Fine-tuned output (test sample 1 -- perfect NED=0.0)
+### Fine-Tuned Output (Test Sample 1 — Perfect NED=0.0)
 
 ```
 <s_total><s_total_price>91000</s_total_price><s_cashprice>91000</s_cashprice>
@@ -455,7 +457,7 @@ ft_avg_ned, ft_results = evaluate_receipts(model, processor, dataset["test"])
 <s_nm>Y.BASO PROM</s_nm></s_menu>
 ```
 
-### Parsing the structured output
+### Parse the Structured Output
 
 You can convert the token sequence back to a structured dict:
 
@@ -497,9 +499,9 @@ Example parsed output (test sample 4):
 
 ---
 
-## Step 6 — Results Comparison
+## Compare Results
 
-### Metrics (20 test samples)
+### Metrics (20 Test Samples)
 
 | Metric | Fine-Tuned (epoch_1_step_199) |
 |--------|-------------------------------|
@@ -508,7 +510,7 @@ Example parsed output (test sample 4):
 | Perfect matches (NED=0.0) | 10/20 (50%) |
 | Near-perfect (NED<0.05) | 14/20 (70%) |
 
-### Field-level extraction accuracy (actual)
+### Field-Level Extraction Accuracy (Actual)
 
 ```
 Field                 Correct / Total  Accuracy
