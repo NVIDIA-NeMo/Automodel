@@ -127,9 +127,7 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
         self.base_activation_checkpointing = bool(base_activation_checkpointing)
 
         if self.drafter_num_steps < 1:
-            raise ValueError(
-                f"drafter_num_steps must be >= 1, got {self.drafter_num_steps}."
-            )
+            raise ValueError(f"drafter_num_steps must be >= 1, got {self.drafter_num_steps}.")
 
         # Backbone hidden size used to build the drafter's pre-projection input.
         # The drafter's pre_projection layer expects ``2 * backbone_hidden_size``

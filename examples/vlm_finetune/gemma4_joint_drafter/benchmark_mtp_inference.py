@@ -73,7 +73,6 @@ from typing import Any
 
 import torch
 
-
 # 20-item MT-Bench-style single-turn prompt set. These are paraphrased prompts
 # in the same spirit as the MT-Bench v1 single-turn questions and cover the
 # eight MT-Bench categories (writing, roleplay, reasoning, math, coding,

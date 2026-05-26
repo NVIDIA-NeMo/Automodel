@@ -266,13 +266,19 @@ class TestCompositeForward:
         with pytest.raises(ValueError, match="input_ids"):
             comp(input_ids=None)
 
-    def test_drafter_num_steps_other_than_one_rejected(self, device_and_dtype):
+    def test_drafter_num_steps_validates_range(self, device_and_dtype):
+        """K < 1 raises ValueError; K >= 1 is supported (1 = single-step, >1 = multi-step recurrence)."""
         device, dtype = device_and_dtype
         torch.manual_seed(0)
         base, base_text_cfg = _build_tiny_base(device, dtype)
         drafter, _ = _build_tiny_drafter(base_text_cfg, device, dtype)
-        with pytest.raises(NotImplementedError, match="drafter_num_steps"):
-            Gemma4WithDrafter(base, drafter, drafter_num_steps=2)
+        # K=0 (or any value below 1) is invalid and must be rejected.
+        with pytest.raises(ValueError, match="drafter_num_steps"):
+            Gemma4WithDrafter(base, drafter, drafter_num_steps=0)
+        # K>=2 is the multi-step recurrent path (per the Gemma 4 drafter
+        # tech report) and is supported.
+        comp = Gemma4WithDrafter(base, drafter, drafter_num_steps=2)
+        assert comp.drafter_num_steps == 2
 
 
 # ---------------------------------------------------------------------------
