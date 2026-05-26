@@ -590,6 +590,14 @@ def format_chat_template(
             truncation=truncation,
             seq_length=seq_length,
         )
+        # _build_multiturn_assistant_mask computes indices from unpadded (left-aligned)
+        # lengths. Left-padding tokenizers right-align content — shift mask to match.
+        if getattr(tokenizer, "padding_side", "right") == "left":
+            attn_mask = tokenized_chat.get("attention_mask")
+            if attn_mask is not None:
+                pad_len = len(input_ids) - sum(attn_mask)
+                if pad_len > 0:
+                    mask = [0] * pad_len + mask[: len(mask) - pad_len]
     else:
         mask = [1] * len(input_ids)
 

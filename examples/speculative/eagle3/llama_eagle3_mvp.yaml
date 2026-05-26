@@ -46,3 +46,10 @@ optimizer:
   lr: 1.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_llama_mvp/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
+  # restore_from: LATEST  # set to "LATEST", a subdir name like "epoch_1_step_100", or an absolute path

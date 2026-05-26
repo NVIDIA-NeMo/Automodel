@@ -147,6 +147,7 @@ vlm = [
     "pillow",
     "qwen-omni-utils",
     "qwen-vl-utils[decord]; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+    "soundfile",
     "timm<=1.0.22",
     "torchcodec; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
 ]
@@ -195,7 +196,7 @@ linting = [
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
-test = ["coverage", "pytest", "peft>=0.18.1", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = ["coverage", "pytest", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -319,6 +320,8 @@ omit = [
     # Vendored from https://github.com/uccl-project/uccl/tree/main/ep/deep_ep_wrapper
     "nemo_automodel/components/moe/uccl_ep/_buffer.py",
     "nemo_automodel/components/moe/uccl_ep/_utils.py",
+    # Vendored DeepSeek V4 TileLang kernels (Miles upstream, Apache-2.0)
+    "nemo_automodel/components/models/deepseek_v4/kernels/*.py",
     "config.py",
     "config-3.py",
     # transformer v5 backports

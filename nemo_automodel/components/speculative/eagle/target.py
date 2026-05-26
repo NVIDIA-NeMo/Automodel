@@ -96,10 +96,16 @@ class HFEagle3TargetModel:
         return aux_layer_ids
 
     def _get_transformer_layers(self) -> Iterable[nn.Module]:
+        # Common HF causal-LM layouts:
+        #   model.model.layers              (Llama, Qwen, Mistral, Gemma, Phi, ...)
+        #   model.layers                    (some VLM text backbones exposed directly)
+        #   model.transformer.h             (GPT2 / Falcon-style)
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             return self.model.model.layers
         if hasattr(self.model, "layers"):
             return self.model.layers
+        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+            return self.model.transformer.h
         raise ValueError("Unsupported model structure for EAGLE-3 aux-layer capture")
 
     def get_input_embeddings(self) -> nn.Embedding:

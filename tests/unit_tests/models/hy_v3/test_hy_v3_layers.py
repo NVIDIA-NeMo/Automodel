@@ -23,7 +23,6 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.hy_v3.config import HYV3Config
 from nemo_automodel.components.models.hy_v3.layers import HYV3Attention
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
