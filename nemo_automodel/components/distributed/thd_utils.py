@@ -203,7 +203,7 @@ def process_input_for_thd(
     result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
-        "cu_seqlens": cu_seqlens if cu_seqlens is not None else cu_seqlens_padded,
+        "cu_seqlens": cu_seqlens,
         "labels": labels_thd,
         "padding_mask": (input_ids_thd == padding_token_id),
     }
