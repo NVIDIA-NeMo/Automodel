@@ -1,0 +1,83 @@
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: true
+  dim: 8
+  alpha: 32
+  use_triton: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 8
+  ckpt_every_steps: 250
+  val_every_steps: 50
+  max_steps: 250
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  dp_size: none
+  cp_size: 1
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  eps: 0.00000001
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 0.000001
+  lr_warmup_steps: 207
+  lr_decay_steps: 20000
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: CHECKPOINT_DIR
+  model_save_format: safetensors
+  save_consolidated: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+clip_grad_norm:
+  max_norm: 0.8
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 7777
+  ranked: true
+
+packed_sequence:
+  packed_sequence_size: 1024
+
+wandb:
+  project: peft-llama
+  name: bs8-lr1e-4-warmup207-clip0.8

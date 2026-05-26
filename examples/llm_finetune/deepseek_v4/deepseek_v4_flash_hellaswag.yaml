@@ -25,6 +25,7 @@ step_scheduler:
   local_batch_size: 8
   ckpt_every_steps: 500
   val_every_steps: 500
+  gc_every_steps: 10
   num_epochs: 1
   max_steps: 100
 
@@ -71,7 +72,7 @@ model:
   mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: tilelang
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false

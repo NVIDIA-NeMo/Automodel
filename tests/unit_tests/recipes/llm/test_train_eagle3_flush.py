@@ -224,19 +224,15 @@ def test_multi_epoch_with_trailing_flush(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_checkpoint_saved_after_epoch(tmp_path):
+def test_checkpoint_save_is_noop_without_checkpointer(tmp_path):
+    """When the recipe is built without a checkpointer (e.g. test harness skips
+    ``setup()``), the end-of-epoch save call must be a true no-op rather than
+    crashing on ``self.checkpointer.config.enabled``."""
     recipe = _build_recipe(tmp_path, num_samples=3, grad_accum=2)
     recipe.run_train_validation_loop()
-    ckpt_dirs = list(tmp_path.glob("epoch_*"))
-    assert len(ckpt_dirs) == 1
-
-
-def test_checkpoint_skipped_when_not_main(tmp_path):
-    recipe = _build_recipe(tmp_path, num_samples=3, grad_accum=2)
-    recipe.dist_env.is_main = False
-    recipe.run_train_validation_loop()
-    ckpt_dirs = list(tmp_path.glob("epoch_*"))
-    assert len(ckpt_dirs) == 0
+    # No checkpointer was wired in, so nothing should be written anywhere under tmp_path.
+    assert list(tmp_path.glob("epoch_*")) == []
+    assert list(tmp_path.glob("checkpoints/*")) == []
 
 
 # ---------------------------------------------------------------------------

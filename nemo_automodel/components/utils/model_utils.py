@@ -93,6 +93,10 @@ VLM_INPUT_KEYS: tuple[str, ...] = (
     "image_grid_hws",
     "image_grid_thw",
     "image_sizes",
+    "patch_pixel_values",
+    "num_patches",
+    "patch_newline_mask",
+    "image_embeds",
     # Video
     "pixel_values_videos",
     # Audio / sound
