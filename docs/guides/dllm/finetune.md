@@ -236,7 +236,7 @@ python examples/dllm_generate/generate.py \
     --sampler llada
 ```
 
-### Nemotron-Labs-Diffusion Generation
+### Generate with Nemotron-Labs-Diffusion
 
 ```bash
 python examples/dllm_generate/generate.py \
