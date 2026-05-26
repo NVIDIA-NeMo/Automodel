@@ -55,6 +55,7 @@ class DraftSpec:
 _DENSE_ARCHITECTURES: tuple[str, ...] = (
     "LlamaForCausalLM",
     "Phi3ForCausalLM",
+    "Qwen3ForCausalLM",
 )
 
 
