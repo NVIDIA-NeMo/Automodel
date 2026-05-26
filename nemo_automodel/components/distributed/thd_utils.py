@@ -113,12 +113,9 @@ def process_input_for_thd(
     cu_seqlens_padded = None
     max_seqlen = None
     if seq_lens is not None:
-        # Filter out padding values and flatten
-        # seq_lens shape: [batch_size, num_packs] -> flatten and remove padding values
         seq_lens_flat = seq_lens.reshape(-1)
         valid_seq_lens = seq_lens_flat[seq_lens_flat != seq_lens_padding_value]
 
-        # Compute cumulative sequence lengths for attention
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], dtype=valid_seq_lens.dtype, device=valid_seq_lens.device),
@@ -126,13 +123,8 @@ def process_input_for_thd(
             ]
         )
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(device=valid_seq_lens.device)
-        # NOTE: max_seqlen is computed AFTER the trailing-pad absorption below,
-        # from the final cu_seqlens, so it satisfies TE's contract that
-        # ``max_seqlen_q >= max(cu_seqlens_q[i+1] - cu_seqlens_q[i])``.
-        # See transformer_engine/pytorch/cpp_extensions/fused_attn.py:152-159.
 
         if seq_lens_padded is not None:
-            # Same processing for padded sequence lengths
             seq_lens_padded_flat = seq_lens_padded.reshape(-1)
             valid_seq_lens_padded = seq_lens_padded_flat[seq_lens_padded_flat != seq_lens_padding_value]
 
@@ -141,36 +133,10 @@ def process_input_for_thd(
             )
             cu_seqlens_padded = cu_seqlens_padded.to(dtype=torch.int32).to(device=valid_seq_lens_padded.device)
 
-        # Absorb trailing pack-level pad into the last sub-sequence's
-        # ``cu_seqlens`` entry — but ONLY when the padding is purely trailing
-        # (i.e., CP is off / cp_size == 1).
-        #
-        # Two distinct kinds of padding can be in ``cu_seqlens_padded``:
-        #   1. PURELY TRAILING (cp_size==1): only the last sub-sequence's
-        #      length grows to absorb pack-level padding. ``cu_seqlens`` and
-        #      ``cu_seqlens_padded`` differ ONLY in the last entry. We can
-        #      absorb the trailing pad into ``cu_seqlens`` and avoid TE's
-        #      ``pad_between_seqs=True`` code path entirely.
-        #
-        #   2. CP-DIVISIBILITY PADDING (cp_size>1): each sub-sequence is
-        #      individually rounded up to a multiple of ``2*cp_size``
-        #      (see ``packed_sequence.py:_pad_pack``). This places real
-        #      padding tokens BETWEEN sub-sequences so CP can shard
-        #      sequence-dim cleanly. ``cu_seqlens`` and ``cu_seqlens_padded``
-        #      differ in multiple entries. Here ``pad_between_seqs=True`` is
-        #      required and we must NOT collapse the two — the kernel needs
-        #      both to compute attention over real tokens while reading
-        #      from the padded buffer.
-        #
-        # Detection: only absorb when the two arrays agree on every entry
-        # except the last (case 1 above). The post-absorption ``max_seqlen``
-        # (computed below from the final cu_seqlens) correctly reflects the
-        # absorbed slot width, so the kernel never sees a slot wider than
-        # the max_seqlen we claim. Verified safe via
-        # /opt/Automodel/te_bug_report/te_thd_repro_MINIMAL.py: feeding TE
-        # cu_seqlens=[0,112,224,336,448,1024] with truthful max_seqlen=576
-        # runs cleanly; the original captured crash was specifically caused
-        # by lying (max_seqlen=112 with a 576-wide slot).
+        # Trailing-only pack-pad (cp_size==1): absorb into cu_seqlens[-1] so
+        # the emit gate below drops cu_seqlens_padded and TE skips its
+        # pad_between_seqs=True path. CP>1 differs in multiple entries and
+        # falls through; both arrays are emitted and TE handles padding.
         if (
             cu_seqlens is not None
             and cu_seqlens_padded is not None
@@ -184,35 +150,16 @@ def process_input_for_thd(
                 _extended = cu_seqlens.clone()
                 _extended[-1] = _total
                 cu_seqlens = _extended
-                # Drop ``cu_seqlens_padded`` from the emit by marking it
-                # identical to ``cu_seqlens``; the emit gate below then
-                # skips it, which skips the ``pad_between_seqs=True``
-                # branch in attention/utils.py.
                 cu_seqlens_padded = cu_seqlens.clone()
-        # CP case (cu_seqlens differs from cu_seqlens_padded in multiple
-        # entries) falls through unchanged — both tensors are emitted and TE
-        # uses pad_between_seqs=True correctly.
 
-        # Compute max_seqlen from the FINAL cu_seqlens so TE's contract
-        # (max_seqlen_q >= max(cu_seqlens[i+1] - cu_seqlens[i])) is satisfied.
-        # The absorption above can grow cu_seqlens[-1] to total_tokens;
-        # max_seqlen must reflect that growth or the cuDNN-fused-attn-bwd
-        # kernel writes OOB.
+        # Compute max_seqlen from the FINAL cu_seqlens to honor TE's contract
+        # (``max_seqlen_q >= max(cu_seqlens[i+1] - cu_seqlens[i])``, see TE's
+        # cpp_extensions/fused_attn.py:152-159). Smaller-than-actual is UB
+        # and was the original crash cause: pre-absorption max_seqlen=112
+        # combined with an absorbed 576-wide slot.
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
 
-    # Emit cu_seqlens (unpadded — real sequence lengths) and cu_seqlens_padded
-    # (with intra-pack padding included) as SEPARATE keys, plus max_seqlen.
-    # Downstream consumers:
-    #   * TE attention preprocess (attention/utils.py) requires both to set
-    #     ``pad_between_seqs=True`` correctly when the pack has pad tokens.
-    #     Without ``cu_seqlens_padded``, TE computes attention over pad
-    #     positions, which has produced cuDNN err 700 in BWD on this
-    #     container.
-    #   * Mamba's seq_idx (nemotron_v3/layers.py:282) accepts either; the
-    #     padded variant works because mamba scans the full token stream.
-    #   * MTP loss (loss/mtp.py::calculate_mtp_loss) uses the unpadded
-    #     ``cu_seqlens`` for per-sequence label-roll masking.
     result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
@@ -220,19 +167,14 @@ def process_input_for_thd(
         "labels": labels_thd,
         "padding_mask": (input_ids_thd == padding_token_id),
     }
-    # Only emit cu_seqlens_padded when it actually differs from cu_seqlens
-    # (i.e., when padding exists between sub-sequences). After the trailing-
-    # pad absorption above, cu_seqlens_padded == cu_seqlens in the common
-    # case, and emitting it would force TE's ``pad_between_seqs=True``
-    # branch unnecessarily — which TE flash-attn handles by returning only
-    # the cu_seqlens-defined real tokens, breaking the residual addition
-    # downstream.
+    # Emit cu_seqlens_padded only when it differs from cu_seqlens — its
+    # presence is what flips TE's pad_between_seqs=True path in
+    # attention/utils.py.
     if cu_seqlens_padded is not None and not torch.equal(cu_seqlens_padded, cu_seqlens):
         result["cu_seqlens_padded"] = cu_seqlens_padded
     if max_seqlen is not None:
         result["max_seqlen"] = max_seqlen
 
-    # Preserve qkv_format and other non-tensor keys from the original batch
     for key, value in batch.items():
         if key not in result and not isinstance(value, torch.Tensor):
             result[key] = value
@@ -338,7 +280,6 @@ def split_batch_into_thd_chunks(
         for i in range(num_chunks)
     ]
 
-    # Stack results
     stacked: dict = {
         "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
         "labels": torch.stack([c["labels"] for c in chunk_results]),
@@ -346,12 +287,8 @@ def split_batch_into_thd_chunks(
         "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
         "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
     }
-    # Stack ``cu_seqlens_padded`` whenever ANY chunk emits it (i.e. did not
-    # absorb its trailing pack-pad). For chunks that did absorb (no padded
-    # variant in their result), fall back to ``cu_seqlens`` — those rows have
-    # cu_seqlens_padded == cu_seqlens semantically. This keeps the stacked
-    # tensor rectangular and lets per-microbatch TE attention consumers see
-    # consistent kwargs across chunks.
+    # Emit cu_seqlens_padded whenever any chunk emits it; absorbed chunks
+    # fall back to their cu_seqlens (semantically equal) for rectangularity.
     if any("cu_seqlens_padded" in c for c in chunk_results):
         stacked["cu_seqlens_padded"] = pad_and_stack(
             [c.get("cu_seqlens_padded", c["cu_seqlens"]) for c in chunk_results],
