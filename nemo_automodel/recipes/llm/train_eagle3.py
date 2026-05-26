@@ -120,10 +120,16 @@ class TrainEagle3Recipe(BaseRecipe):
         # ``from_pretrained`` loads the full target on every rank and OOMs.
         # When absent, the recipe keeps the original single-GPU-per-rank
         # behavior so existing 8B-class dense recipes are unaffected.
+        # ``force_hf`` is opt-in. Default ``False`` so HF architectures
+        # with an AutoModel custom impl (e.g. ``Qwen3MoeForCausalLM``,
+        # ``LlamaForCausalLM``) take the custom path, which unlocks the
+        # MoE infra (EP, ``GroupedExperts``, DeepEP). Set
+        # ``recipe_args.target_force_hf: true`` in YAML to force the
+        # plain HF implementation.
         target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
-            force_hf=True,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
         self.dist_setup = None
         self.distributed_config = None

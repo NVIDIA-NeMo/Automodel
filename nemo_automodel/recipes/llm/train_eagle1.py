@@ -99,10 +99,11 @@ class TrainEagle1Recipe(BaseRecipe):
         # Optional ``distributed:`` YAML section. Required for targets that
         # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). Absent =>
         # original single-GPU-per-rank behavior, preserved for 8B-class dense.
+        # ``force_hf`` opt-in; see the train_eagle3 recipe for rationale.
         target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
-            force_hf=True,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
         )
         self.dist_setup = None
         self.distributed_config = None
