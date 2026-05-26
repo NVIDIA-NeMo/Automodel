@@ -791,7 +791,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         pp_n_microbatches = None
         pp_cp_preembed = (
             self.pp_enabled
-            and self.dist_setup.cp_size > 1
+            and self.mesh_context.cp_size > 1
             and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
         )
         if self.pp_enabled and not pp_cp_preembed:

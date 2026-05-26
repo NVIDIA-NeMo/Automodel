@@ -395,7 +395,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
         vlm_finetune,
-        "setup_distributed",
+        "create_mesh_context_from_config",
         lambda cfg, world_size: SimpleNamespace(
             strategy_config=SimpleNamespace(),
             pipeline_config=SimpleNamespace(),
