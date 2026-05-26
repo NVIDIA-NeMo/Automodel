@@ -33,8 +33,6 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import mlflow
-import os
-
 import torch
 import torch.nn as nn
 import wandb
@@ -159,15 +157,6 @@ def _uses_thd_collater(cfg_dataloader):
     if not hasattr(cfg_dataloader, "collate_fn"):
         return False
     cf = cfg_dataloader.collate_fn
-    if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-        rank = int(os.environ.get("RANK", "0"))
-        cf_repr = (
-            f"name={getattr(cf, '__name__', None)} module={getattr(cf, '__module__', None)} type={type(cf).__name__}"
-        )
-        print(
-            f"[NEMO_PP_PACK_DEBUG rank={rank}] _uses_thd_collater: cf={cf!r} {cf_repr}",
-            flush=True,
-        )
     if cf == packed_sequence_thd_collater:
         return True
     # Fallback: match by qualified name (handles wrapper/partial cases).
@@ -1364,21 +1353,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # attention layers) under PP and left cu_seqlens unbuilt downstream.
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-            rank = int(os.environ.get("RANK", "0"))
-            _pre_keys = {
-                k: (tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__)
-                for k, v in batch.items()
-            }
-            _bcfg = getattr(_model_or_cfg, "backend", None)
-            _battn = getattr(_bcfg, "attn", None) if _bcfg is not None else None
-            print(
-                f"[NEMO_PP_PACK_DEBUG rank={rank}] cp_utils ENTRY: use_te={_use_te_value} "
-                f"(te_attn={_te_attn} thd_collater={_thd_collater}) "
-                f"num_chunks={_num_chunks_value} model_or_cfg_type={type(_model_or_cfg).__name__} "
-                f"model.backend.attn={_battn} batch_keys={_pre_keys}",
-                flush=True,
-            )
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
@@ -1386,16 +1360,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_num_chunks_value,
         )
-        if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-            rank = int(os.environ.get("RANK", "0"))
-            _post_keys = {
-                k: (tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__)
-                for k, v in batch.items()
-            }
-            print(
-                f"[NEMO_PP_PACK_DEBUG rank={rank}] cp_utils EXIT: batch_keys={_post_keys}",
-                flush=True,
-            )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -1429,104 +1393,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 _cu = batch_filtered.get("cu_seqlens")
                 if isinstance(_cu, torch.Tensor) and _cu.dim() == 2 and _cu.shape[0] == 1:
                     _cu = _cu.squeeze(0)
-                if (
-                    self.pp.info.has_last_stage
-                    and getattr(self.pp.info.schedule, "_loss_fn", None) is not None
-                ):
+                if self.pp.info.has_last_stage and getattr(self.pp.info.schedule, "_loss_fn", None) is not None:
                     _loss_fn_obj = self.pp.info.schedule._loss_fn
                     if hasattr(_loss_fn_obj, "cu_seqlens"):
                         _loss_fn_obj.cu_seqlens = _cu
-                if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-                    rank = int(os.environ.get("RANK", "0"))
-                    keys_info = {
-                        k: (tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__)
-                        for k, v in batch_filtered.items()
-                    }
-                    print(
-                        f"[NEMO_PP_PACK_DEBUG rank={rank}] batch_filtered keys: {keys_info} "
-                        f"input_ids.shape={tuple(input_ids.shape)}",
-                        flush=True,
-                    )
-
-                # Optional batch REPLAY for offline TE-bug repro investigation.
-                # Gated on NEMO_REPLAY_BATCH_DIR: load step0_rank{r}.pt and use it
-                # for every training step (overrides the dataloader output).
-                # Tests user hypothesis: does the bug need varying input data?
-                # Optional: copy microbatch 0 into ALL microbatch slots.
-                # Tests whether the data content of a SPECIFIC microbatch is
-                # the trigger (vs the per-mb cu_seqlens shape).
-                if os.environ.get("NEMO_COPY_MB0_TO_ALL") == "1" and is_train:
-                    for _k in ("input_ids", "labels", "position_ids"):
-                        if _k == "input_ids" and isinstance(input_ids, torch.Tensor) and input_ids.dim() == 2:
-                            input_ids[1:] = input_ids[0]
-                        if _k == "labels" and isinstance(labels, torch.Tensor) and labels.dim() == 2:
-                            labels[1:] = labels[0]
-                            if targets is not None:
-                                targets[1:] = targets[0]
-                    for _k, _v in batch_filtered.items():
-                        if isinstance(_v, torch.Tensor) and _v.dim() >= 1 and _v.shape[0] > 1:
-                            _v[1:] = _v[0]
-                            batch_filtered[_k] = _v
-
-                _replay_dir = os.environ.get("NEMO_REPLAY_BATCH_DIR")
-                _replay_step = int(os.environ.get("NEMO_REPLAY_BATCH_STEP", "0"))
-                # Override individual components of the replayed batch from a
-                # DIFFERENT step. Use this to mix step-N input_ids with step-M's
-                # padding_mask, etc. — bisect which field triggers the bug.
-                _override_step = os.environ.get("NEMO_REPLAY_OVERRIDE_STEP")  # e.g. "5"
-                _override_what = os.environ.get("NEMO_REPLAY_OVERRIDE_WHAT", "")  # csv: input_ids,padding_mask,targets,cu_seqlens,position_ids,max_seqlen
-                if _replay_dir and is_train:
-                    _rank = int(os.environ.get("RANK", "0"))
-                    _replay_path = os.path.join(_replay_dir, f"step{_replay_step:04d}_rank{_rank}.pt")
-                    if os.path.exists(_replay_path):
-                        _b = torch.load(_replay_path, weights_only=False)
-                        # Optional mixed override from a different step's batch
-                        _bo = None
-                        if _override_step is not None and _override_what:
-                            _ov_path = os.path.join(_replay_dir, f"step{int(_override_step):04d}_rank{_rank}.pt")
-                            if os.path.exists(_ov_path):
-                                _bo = torch.load(_ov_path, weights_only=False)
-                                _which = set(_override_what.split(","))
-                                if "input_ids" in _which and _bo["input_ids"] is not None:
-                                    _b["input_ids"] = _bo["input_ids"]
-                                if "targets" in _which and _bo["targets"] is not None:
-                                    _b["targets"] = _bo["targets"]
-                                for k in ("padding_mask", "cu_seqlens", "position_ids", "max_seqlen"):
-                                    if k in _which and k in _bo["batch_filtered"]:
-                                        _b["batch_filtered"][k] = _bo["batch_filtered"][k]
-                        if _b["input_ids"] is not None:
-                            input_ids = _b["input_ids"].to(input_ids.device)
-                        if _b["targets"] is not None:
-                            targets = _b["targets"].to(targets.device)
-                        batch_filtered = {
-                            k: (v.to(input_ids.device) if isinstance(v, torch.Tensor) else v)
-                            for k, v in _b["batch_filtered"].items()
-                        }
-
-                # Optional batch dump for offline TE-bug repro investigation.
-                # Gated on NEMO_DUMP_BATCH_DIR; saves per-step per-rank batch
-                # tensors (input_ids, batch_filtered, targets) to disk so a
-                # standalone script can replay the exact failing input.
-                _dump_dir = os.environ.get("NEMO_DUMP_BATCH_DIR")
-                if _dump_dir and is_train:
-                    _rank = int(os.environ.get("RANK", "0"))
-                    _step = int(getattr(self.step_scheduler, "step", -1))
-                    os.makedirs(_dump_dir, exist_ok=True)
-                    _path = os.path.join(_dump_dir, f"step{_step:04d}_rank{_rank}.pt")
-                    _payload = {
-                        "step": _step,
-                        "rank": _rank,
-                        "has_first_stage": self.pp.info.has_first_stage,
-                        "has_last_stage": self.pp.info.has_last_stage,
-                        "input_ids": input_ids.detach().cpu() if isinstance(input_ids, torch.Tensor) else None,
-                        "targets": targets.detach().cpu() if isinstance(targets, torch.Tensor) else None,
-                        "batch_filtered": {
-                            k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                            for k, v in batch_filtered.items()
-                        },
-                    }
-                    torch.save(_payload, _path)
-
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:

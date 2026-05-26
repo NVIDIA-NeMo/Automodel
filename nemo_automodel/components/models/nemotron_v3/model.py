@@ -15,31 +15,12 @@
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-# Temporary debug knob — set NEMO_PP_PACK_DEBUG=1 to print packing/PP info for
-# the first few microbatches per rank.  Remove once smoke verification is done.
-_PP_DEBUG = os.environ.get("NEMO_PP_PACK_DEBUG", "0") == "1"
-_PP_DEBUG_LIMIT = int(os.environ.get("NEMO_PP_PACK_DEBUG_LIMIT", "4"))
-
-
-def _pp_debug_log(prefix: str, msg: str) -> None:
-    """Print a debug line tagged with rank + a per-process call count."""
-    if not _PP_DEBUG:
-        return
-    counter = getattr(_pp_debug_log, "_count", 0)
-    if counter >= _PP_DEBUG_LIMIT * 4:  # cap total prints per rank
-        return
-    _pp_debug_log._count = counter + 1
-    rank = int(os.environ.get("RANK", "0"))
-    print(f"[NEMO_PP_PACK_DEBUG rank={rank}] {prefix}: {msg}", flush=True)
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -205,15 +186,12 @@ class NemotronV3Model(nn.Module):
         # ``seq_idx`` is what Mamba consumes for per-token segment boundaries.
         # Under neat packing it's derived in the outer ``NemotronHForCausalLM``
         # forward from ``_packed_seq_ids`` and threaded down via kwargs.
-        seq_idx_source = "kwargs" if "seq_idx" in kwargs else None
-
         # PP+packing (THD path): cu_seqlens is per-batch and its leading dim
         # is ``num_seqs+1`` (not batch), so PyTorch's PP schedule cannot chunk
         # it as a kwarg. The first stage receives cu_seqlens via packed-
         # collate; subsequent stages do not. Rebuild it from a 2D indexed
         # attention_mask when missing. Skip this when attention_mask is the
         # neat 4D mask (seq_idx is already built upstream from _packed_seq_ids).
-        cu_seqlens_source = "kwargs" if "cu_seqlens" in kwargs else None
         if (
             "cu_seqlens" not in kwargs
             and attention_mask is not None
@@ -222,7 +200,6 @@ class NemotronV3Model(nn.Module):
         ):
             seq_lens = attention_mask.sum(dim=-1).to(torch.int32)
             kwargs["cu_seqlens"] = F.pad(seq_lens.cumsum(0).to(torch.int32), (1, 0))
-            cu_seqlens_source = "rebuilt-from-attention_mask"
 
         # Normalize cu_seqlens / cu_seqlens_padded / max_seqlen to 1D / 0D.
         # PyTorch PP chunks positional args along dim 0 but broadcasts kwargs
@@ -250,58 +227,10 @@ class NemotronV3Model(nn.Module):
                 if (_v == _SEQLEN_SENTINEL).any():
                     _v = _v[_v != _SEQLEN_SENTINEL]
                 kwargs[_k] = _v.contiguous().clone()
-                if _k == "cu_seqlens":
-                    cu_seqlens_source = (cu_seqlens_source or "kwargs") + "-squeezed"
-        # Debug: print cu_seqlens reaching each forward when env var set.
-        # KEEP this in until the bug is conclusively fixed — it's the only
-        # observability we have into the per-microbatch kernel input.
-        if os.environ.get("NEMO_CU_DEBUG") == "1":
-            _r = int(os.environ.get("RANK", "0"))
-            _cu = kwargs.get("cu_seqlens")
-            _cup = kwargs.get("cu_seqlens_padded")
-            _ms = kwargs.get("max_seqlen")
-            _pos = kwargs.get("position_ids")
-            _cu_shape = tuple(_cu.shape) if isinstance(_cu, torch.Tensor) else None
-            _pos_shape = tuple(_pos.shape) if isinstance(_pos, torch.Tensor) else None
-            print(
-                f"[CU_DEBUG rank{_r}] src={cu_seqlens_source} cu_shape={_cu_shape} "
-                f"cu={_cu.tolist() if isinstance(_cu, torch.Tensor) else _cu} "
-                f"cu_pad={_cup.tolist() if isinstance(_cup, torch.Tensor) else _cup} "
-                f"max_sl={_ms.item() if isinstance(_ms, torch.Tensor) else _ms} "
-                f"pos_shape={_pos_shape} "
-                f"pos_max={_pos.max().item() if isinstance(_pos, torch.Tensor) else None}",
-                flush=True,
-            )
         # max_seqlen may arrive as [1] tensor; flatten to a scalar tensor.
         _ms = kwargs.get("max_seqlen")
         if isinstance(_ms, torch.Tensor) and _ms.dim() >= 1 and _ms.numel() == 1:
             kwargs["max_seqlen"] = _ms.flatten()[0].clone()
-
-        if _PP_DEBUG:
-            am_shape = tuple(attention_mask.shape) if attention_mask is not None else None
-            am_dtype = str(attention_mask.dtype) if attention_mask is not None else None
-            cu_t = kwargs.get("cu_seqlens")
-            cu_repr = f"shape={tuple(cu_t.shape)} vals={cu_t.tolist()[:8]}" if isinstance(cu_t, torch.Tensor) else None
-            si_t = kwargs.get("seq_idx")
-            si_repr = (
-                f"shape={tuple(si_t.shape)} dtype={si_t.dtype} "
-                f"head={si_t.flatten()[:12].tolist()}"
-                if isinstance(si_t, torch.Tensor)
-                else None
-            )
-            _pp_debug_log(
-                "NemotronV3Model.forward",
-                (
-                    f"is_thd={is_thd} hidden={tuple(hidden_states.shape)} "
-                    f"embed_tokens={'set' if getattr(self, 'embed_tokens', None) is not None else 'None'} "
-                    f"norm={'set' if getattr(self, 'norm', None) is not None else 'None'} "
-                    f"qkv_format={kwargs.get('qkv_format')} "
-                    f"attention_mask=(shape={am_shape}, dtype={am_dtype}) "
-                    f"cu_seqlens=({cu_repr}, source={cu_seqlens_source}) "
-                    f"seq_idx=({si_repr}, source={seq_idx_source}) "
-                    f"num_layers_on_stage={len(self.layers)}"
-                ),
-            )
 
         # TODO: attention mask currently does not work. A default causal mask is applied.
 
@@ -312,11 +241,7 @@ class NemotronV3Model(nn.Module):
         # from ``_packed_seq_ids`` and attention_mask is a 4D block-causal
         # bool. Under this path Mamba relies on seq_idx alone (no 2D padding
         # mask is meaningful), and the 4D mask is the attention mask.
-        _neat_packed = (
-            "seq_idx" in kwargs
-            and attention_mask is not None
-            and attention_mask.dim() == 4
-        )
+        _neat_packed = "seq_idx" in kwargs and attention_mask is not None and attention_mask.dim() == 4
 
         # Apply transformer layers
         for layer in self.layers.values():
@@ -726,18 +651,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if isinstance(_packed_seq_ids, torch.Tensor) and "seq_idx" not in kwargs:
             kwargs["seq_idx"] = _packed_seq_ids.to(torch.int32).contiguous()
             if padding_mask is None:
-                padding_mask = (_packed_seq_ids == 0)
-            if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-                _rank = int(os.environ.get("RANK", "0"))
-                _si = kwargs["seq_idx"]
-                _uniq = torch.unique(_si).tolist()[:8]
-                print(
-                    f"[NEMO_PP_PACK_DEBUG rank={_rank}] NemotronHForCausalLM.forward: "
-                    f"_packed_seq_ids -> seq_idx shape={tuple(_si.shape)} "
-                    f"unique_head={_uniq} head={_si.flatten()[:16].tolist()} "
-                    f"padding_mask={(tuple(padding_mask.shape) if isinstance(padding_mask, torch.Tensor) else None)}",
-                    flush=True,
-                )
+                padding_mask = _packed_seq_ids == 0
 
         output_hidden_states = (
             output_hidden_states
@@ -881,10 +795,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                     # may broadcast our kwarg unchunked as ``[1, num_seqs+1]``;
                     # the inner backbone forward already normalizes for its
                     # own use, but we re-normalize for the MTP call chain.
-                    if (
-                        _k in ("cu_seqlens", "cu_seqlens_padded", "seq_idx")
-                        and isinstance(_v, torch.Tensor)
-                    ):
+                    if _k in ("cu_seqlens", "cu_seqlens_padded", "seq_idx") and isinstance(_v, torch.Tensor):
                         if _v.dim() == 2 and _v.shape[0] == 1:
                             _v = _v.squeeze(0)
                         if _v.dim() == 1:
@@ -929,9 +840,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             # expect 3D, restore. (Currently no downstream consumer expects
             # it; per-depth outputs are returned as their own list.)
             if is_thd and mtp_per_depth_h is not None:
-                mtp_per_depth_h = [
-                    h.unsqueeze(0) if h.dim() == 2 else h for h in mtp_per_depth_h
-                ]
+                mtp_per_depth_h = [h.unsqueeze(0) if h.dim() == 2 else h for h in mtp_per_depth_h]
         elif pp_mtp_enabled and has_lm_head:
             # Final stage in eval, or MTP-enabled config without self.mtp on
             # this rank — keep tuple arity by emitting empties.
@@ -989,9 +898,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                         _cu1d = _cu.squeeze(0) if (_cu.dim() == 2 and _cu.shape[0] == 1) else _cu
                         if _cu1d.dim() == 1:
                             _positions = torch.arange(_S, device=_cu1d.device)
-                            _seq_idx_1d = torch.searchsorted(
-                                _cu1d[1:].contiguous(), _positions
-                            ).to(torch.int32)
+                            _seq_idx_1d = torch.searchsorted(_cu1d[1:].contiguous(), _positions).to(torch.int32)
                             _seq_idx_tail = _seq_idx_1d.unsqueeze(0).expand(_B, _S).contiguous()
                 if not isinstance(_seq_idx_tail, torch.Tensor):
                     _seq_idx_tail = torch.ones((_B, _S), dtype=torch.int32, device=logits.device)

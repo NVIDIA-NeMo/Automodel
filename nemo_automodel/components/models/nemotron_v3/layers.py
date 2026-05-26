@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-import os
 
 import torch
 import torch.nn.functional as F
@@ -85,37 +84,6 @@ class NemotronV3Attention(nn.Module):
         else:
             qkv_format = "bshd"
             bsz, seqlen, _ = hidden_states.size()
-
-        # Temporary debug — log packing context reaching the attention layer.
-        # Gated by NEMO_PP_PACK_DEBUG=1; capped at 6 prints per process.
-        if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-            _ctr = getattr(NemotronV3Attention.forward, "_dbg_count", 0)
-            if _ctr < 8:
-                NemotronV3Attention.forward._dbg_count = _ctr + 1
-                _rank = int(os.environ.get("RANK", "0"))
-                _cu = attn_kwargs.get("cu_seqlens")
-                _cu_repr = (
-                    f"shape={tuple(_cu.shape)} vals={_cu.tolist()[:8]}" if isinstance(_cu, torch.Tensor) else None
-                )
-                _si = attn_kwargs.get("seq_idx")
-                _si_repr = (
-                    f"shape={tuple(_si.shape)} dtype={_si.dtype} unique_head={torch.unique(_si).tolist()[:8]}"
-                    if isinstance(_si, torch.Tensor)
-                    else None
-                )
-                # Tag: "mtp" if layer_idx >= num_hidden_layers (MTP sublayers
-                # reuse this attention class with a synthetic idx beyond the
-                # backbone layer range).
-                _role = "mtp" if (layer_idx is not None and layer_idx >= self.num_hidden_layers) else "backbone"
-                print(
-                    f"[NEMO_PP_PACK_DEBUG rank={_rank}] NemotronV3Attention.forward "
-                    f"[{_role}]: hidden={tuple(hidden_states.shape)} qkv_format={qkv_format} "
-                    f"attention_mask={tuple(attention_mask.shape) if isinstance(attention_mask, torch.Tensor) else None} "
-                    f"dtype={(attention_mask.dtype if isinstance(attention_mask, torch.Tensor) else None)} "
-                    f"cu_seqlens=({_cu_repr}) seq_idx=({_si_repr}) layer_idx={layer_idx} "
-                    f"attn_kwargs_keys={sorted(attn_kwargs.keys())}",
-                    flush=True,
-                )
 
         q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
@@ -313,10 +281,8 @@ class NemotronV3Mamba2Mixer(nn.Module):
 
         # Build seq_idx for Mamba kernel (marks sequence boundaries for packing / CP).
         seq_idx = kwargs.get("seq_idx", None)
-        _seq_idx_source = "kwargs" if seq_idx is not None else None
         if seq_idx is None and "cu_seqlens" in kwargs:
             cu_seqlens = kwargs["cu_seqlens"]
-            _seq_idx_source = "derived-from-cu_seqlens"
             # cu_seqlens from the THD batch is GLOBAL (pre-TE-partitioning).
             # When CP is active, the mamba kernel receives the global sequence
             # (after all-to-all gather).  Scale total_len by cp_size so that
@@ -334,22 +300,6 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # --- Path A: Training (no cache) → fused kernel ---
         if not use_cache:
             from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
-
-            if os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-                _ctr = getattr(NemotronV3Mamba2Mixer.forward, "_dbg_count", 0)
-                if _ctr < 6:
-                    NemotronV3Mamba2Mixer.forward._dbg_count = _ctr + 1
-                    _rank = int(os.environ.get("RANK", "0"))
-                    _si_uniq = torch.unique(seq_idx).tolist()[:8] if isinstance(seq_idx, torch.Tensor) else None
-                    print(
-                        f"[NEMO_PP_PACK_DEBUG rank={_rank}] Mamba2 kernel: "
-                        f"hidden={tuple(hidden_states.shape)} "
-                        f"seq_idx=({tuple(seq_idx.shape) if isinstance(seq_idx, torch.Tensor) else None}, "
-                        f"unique_head={_si_uniq}, "
-                        f"source={_seq_idx_source}) "
-                        f"attention_mask_dim={(attention_mask.dim() if isinstance(attention_mask, torch.Tensor) else None)}",
-                        flush=True,
-                    )
 
             if attention_mask is not None:
                 hidden_states = hidden_states * attention_mask.unsqueeze(-1)

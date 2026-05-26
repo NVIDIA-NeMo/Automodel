@@ -227,30 +227,12 @@ class MTPModule(nn.Module):
             if input_ids is None or embed_fn is None:
                 raise ValueError("MTPModule.forward requires either embed_inputs or (input_ids, embed_fn)")
 
-        import os as _os  # noqa: PLC0415
-
         num_iterations = self.num_depths
         num_sublayers_per_depth = self.pattern_length
         use_repeated = self.mtp_config.use_repeated_layer
         per_depth_h: list[torch.Tensor] = []
         cur_input_ids = input_ids
         cur_position_ids = position_ids
-        if _os.environ.get("NEMO_PP_PACK_DEBUG") == "1":
-            _ctr = getattr(MTPModule.forward, "_dbg_count", 0)
-            if _ctr < 4:
-                MTPModule.forward._dbg_count = _ctr + 1
-                _rank = int(_os.environ.get("RANK", "0"))
-                _cu = block_kwargs.get("cu_seqlens")
-                print(
-                    f"[NEMO_PP_PACK_DEBUG rank={_rank}] MTPModule.forward enter: "
-                    f"hidden={tuple(hidden_states.shape)} num_depths={num_iterations} "
-                    f"sublayers_per_depth={num_sublayers_per_depth} "
-                    f"embed_inputs_len={len(embed_inputs) if embed_inputs is not None else None} "
-                    f"qkv_format={block_kwargs.get('qkv_format')} "
-                    f"cu_seqlens_shape={tuple(_cu.shape) if isinstance(_cu, torch.Tensor) else None} "
-                    f"block_kwargs_keys={sorted(block_kwargs.keys())}",
-                    flush=True,
-                )
         for depth in range(num_iterations):
             if embed_inputs is not None:
                 decoder_input = embed_inputs[depth]
