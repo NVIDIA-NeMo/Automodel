@@ -69,36 +69,25 @@ def calculate_mtp_loss(
     cur_labels = labels
     total = mtp_per_depth_h[0].new_zeros(())
 
-    # Build a per-token sequence index used to mask cross-sequence label
-    # rolls. Prefer an explicit ``seq_idx`` (neat-packed path); else derive
-    # one from ``cu_seqlens`` (THD path).
     if seq_idx is None and cu_seqlens is not None:
         cs = cu_seqlens
         if cs.dim() == 2 and cs.shape[0] == 1:
             cs = cs.squeeze(0)
         if cs.dim() == 1:
-            # Last entry of cu_seqlens is the total token count (== seq dim).
             total_len = int(cs[-1].item()) if labels.dim() == 1 else labels.shape[-1]
             positions = torch.arange(total_len, device=labels.device)
-            # Sequence membership: searchsorted on cs[1:] gives index in
-            # [0, num_seqs-1] for each position. ``right=True`` so a position
-            # equal to a boundary (e.g. position == cu_seqlens[k], the first
-            # token of sub-seq k) maps to ``k``, not ``k-1``.
+            # ``right=True`` so a position equal to a boundary (the first token
+            # of sub-seq k, position == cu_seqlens[k]) maps to k, not k-1.
             seq_idx = torch.searchsorted(cs[1:].contiguous(), positions, right=True)
             if labels.dim() == 2:
-                # Broadcast to ``[B, S]`` (each row of the BSHD batch shares
-                # the same packed-sequence layout in our recipe path).
                 seq_idx = seq_idx.unsqueeze(0).expand(labels.shape[0], -1)
     elif seq_idx is not None:
-        # Match labels' rank/batch broadcast if needed.
         if seq_idx.dim() == 1 and labels.dim() == 2:
             seq_idx = seq_idx.unsqueeze(0).expand(labels.shape[0], -1)
         elif seq_idx.dim() == 2 and labels.dim() == 1 and seq_idx.shape[0] == 1:
             seq_idx = seq_idx.squeeze(0)
-        # Sanity: by the time we get here under PP, the caller is expected
-        # to have already chunked seq_idx to match the per-microbatch labels
-        # (see ``PipelineCausalLMLoss.forward`` + recipe wiring). A mismatch
-        # is a bug, not a runtime condition to silently swallow.
+        # Under PP the caller must chunk seq_idx to per-microbatch shape; a
+        # mismatch is a wiring bug, not a runtime condition to swallow.
         if seq_idx.shape != labels.shape:
             raise ValueError(
                 f"calculate_mtp_loss: seq_idx.shape={tuple(seq_idx.shape)} does not "
@@ -112,10 +101,9 @@ def calculate_mtp_loss(
         n_invalid = min(k + 1, masked.shape[-1])
         masked[..., -n_invalid:] = ignore_index
 
-        # Packing-aware mask: at depth k, the label at position t is the
-        # token originally at position t+k+1. If that source position
-        # belongs to a different sub-sequence than t, the prediction would
-        # cross a sequence boundary — mask it out.
+        # Mask labels whose rolled source (position t+k+1) lives in a
+        # different sub-seq than position t — predictions across sub-seq
+        # boundaries are nonsensical.
         if seq_idx is not None:
             rolled_seq_idx = roll_tensor(seq_idx, shifts=-(k + 1), dim=-1)
             cross_seq = rolled_seq_idx != seq_idx
@@ -148,35 +136,28 @@ def calculate_mtp_loss(
 class PipelineCausalLMLoss(nn.Module):
     """Pipeline schedule loss that can add MTP auxiliary CE on the last stage.
 
-    Per-microbatch sub-sequence info (``seq_idx``) is read from a trailing
-    element of the model's last-stage output tuple — the model appends an
-    ``[B, S] int32`` tail when MTP is enabled (see
-    ``NemotronHForCausalLM.forward`` and ``get_pipeline_stage_metas``).
-    This binds each microbatch's seq_idx to its corresponding loss call via
-    the PP runtime's output→loss contract, so the wiring is robust against
-    any PP schedule (1f1b, interleaved1f1b, gpipe, zero_bubble, v_schedule,
-    looped_bfs, etc.).
-
-    Legacy ``cu_seqlens`` (THD-pack path) is still supported as a fallback
-    for models that don't emit a seq_idx tail.
+    Per-microbatch ``seq_idx`` is read from a trailing element of the
+    last-stage output tuple — the model appends an ``[B, S] int32`` tail
+    when MTP is enabled. This binds each microbatch's seq_idx to its loss
+    call via the PP runtime's output→loss contract, so the wiring is
+    schedule-agnostic. Legacy ``cu_seqlens`` (THD path) is a fallback for
+    models that don't emit a seq_idx tail.
     """
 
     def __init__(self, loss_fn: nn.Module, model: nn.Module):
         super().__init__()
         self.loss_fn = loss_fn
         self.model = model
-        # THD-pack legacy fallback — only set when the model does not emit a
-        # seq_idx tail and the recipe is on the cu_seqlens path.
+        # Legacy THD-pack fallback used when the model has no seq_idx tail.
         self.cu_seqlens: Optional[torch.Tensor] = None
 
     @staticmethod
     def _extract_seq_idx_tail(output) -> tuple[Optional[torch.Tensor], object]:
         """Detect and strip a trailing per-microbatch seq_idx from output.
 
-        Convention: when MTP is enabled the last-stage model output is
-        ``(logits, *mtp_per_depth_h, seq_idx)`` where the tail is an
-        ``[B, S] int32`` tensor. No other tuple element is int32, so dtype is
-        a sufficient discriminator.
+        Convention: with MTP enabled the last-stage output is
+        ``(logits, *mtp_per_depth_h, seq_idx)`` with an ``[B, S] int32``
+        tail — dtype alone discriminates.
         """
         if isinstance(output, tuple) and len(output) > 0:
             last = output[-1]
