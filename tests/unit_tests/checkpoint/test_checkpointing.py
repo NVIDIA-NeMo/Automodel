@@ -20,11 +20,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _DIFFUSERS_INDEX_FN,
     _extract_file_index_with_status,
+    get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
+)
+from nemo_automodel.components.checkpoint._backports.hf_utils import (
+    FQN_TO_DTYPE_MAPPING_FILENAME,
+    FQN_TO_FILE_INDEX_MAPPING_FILENAME,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -87,6 +93,32 @@ def test_get_fqn_to_file_index_mapping_uses_index_json_for_qwen35_names(tmp_path
         "model.layers.0.weight": 1,
         "model.layers.1.weight": 2,
         "lm_head.weight": 3,
+    }
+
+
+def test_get_fqn_to_dtype_mapping_reads_safetensors_headers_and_applies_key_mapping(tmp_path):
+    save_file(
+        {
+            "orig.layers.0.weight": torch.ones(2, dtype=torch.bfloat16),
+            "orig.layers.1.weight": torch.ones(2, dtype=torch.float32),
+        },
+        tmp_path / "model-00001-of-00001.safetensors",
+    )
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {
+            "orig.layers.0.weight": "model-00001-of-00001.safetensors",
+            "orig.layers.1.weight": "model-00001-of-00001.safetensors",
+        },
+    }
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+
+    mapping = get_fqn_to_dtype_mapping(str(tmp_path), {r"^orig\.": "model."})
+
+    assert mapping == {
+        "model.layers.0.weight": "BF16",
+        "model.layers.1.weight": "F32",
     }
 
 
@@ -308,12 +340,14 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
 
     with patch("nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path", return_value=None):
         mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state)
 
     assert mapping == {
         "a.weight": 1,
         "b.weight": 2,
         "c.weight": 2,
     }
+    assert dtype_mapping is None
     assert "No original HF safetensors shard index found for config-only/model" in caplog.text
     assert "2 output shard(s)" in caplog.text
 
@@ -1211,7 +1245,8 @@ class TestOfflineConsolidationScriptAndWarnings:
         consolidated_dir.mkdir(parents=True)
         tokenizer_dir.mkdir()
         (hf_metadata_dir / "config.json").write_text("{}")
-        (hf_metadata_dir / "fqn_to_file_index_mapping.json").write_text('{"w": 1}')
+        (hf_metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).write_text('{"w": 1}')
+        (hf_metadata_dir / FQN_TO_DTYPE_MAPPING_FILENAME).write_text('{"w": "BF16"}')
         (tokenizer_dir / "tokenizer.json").write_text("{}")
 
         with patch("torch.distributed.is_initialized", return_value=False):
@@ -1221,11 +1256,13 @@ class TestOfflineConsolidationScriptAndWarnings:
             )
 
         assert (hf_metadata_dir / "config.json").exists()
-        assert (hf_metadata_dir / "fqn_to_file_index_mapping.json").exists()
+        assert (hf_metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).exists()
+        assert (hf_metadata_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
         assert (tokenizer_dir / "tokenizer.json").exists()
         assert (consolidated_dir / "config.json").exists()
         assert (consolidated_dir / "tokenizer" / "tokenizer.json").exists()
-        assert not (consolidated_dir / "fqn_to_file_index_mapping.json").exists()
+        assert not (consolidated_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).exists()
+        assert not (consolidated_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
 
     def test_save_consolidated_normalizes_legacy_bools(self, tmp_path):
         assert self._make_checkpointer(tmp_path, save_consolidated=True).config.save_consolidated is (
@@ -1324,8 +1361,10 @@ class TestOfflineHFConsolidationTool:
         metadata_dir = input_dir / ".hf_metadata"
         output_dir = input_dir / "consolidated"
         metadata_dir.mkdir(parents=True)
-        with open(metadata_dir / "fqn_to_file_index_mapping.json", "w") as f:
+        with open(metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME, "w") as f:
             json.dump({"w": 1}, f)
+        with open(metadata_dir / FQN_TO_DTYPE_MAPPING_FILENAME, "w") as f:
+            json.dump({"w": "BF16"}, f)
         metadata_file = metadata_dir / "config.json"
         metadata_file.write_text("{}")
 
@@ -1361,11 +1400,13 @@ class TestOfflineHFConsolidationTool:
             {"w": 1},
             num_threads=5,
             cast_dtype=None,
+            fqn_to_dtype_mapping={"w": "BF16"},
         )
         mock_rename.assert_called_once_with(str(output_dir))
         assert metadata_dir.exists()
         assert metadata_file.exists()
         assert (output_dir / "config.json").exists()
+        assert not (output_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
         assert f"Consolidating sharded HF safetensors from {input_dir} to {output_dir}." not in caplog.text
         assert f"Successfully exported consolidated HF safetensors to {output_dir}." in caplog.text
 
@@ -1412,7 +1453,7 @@ class TestOfflineHFConsolidationTool:
         metadata_dir = input_dir / ".hf_metadata"
         output_dir = input_dir / "consolidated"
         metadata_dir.mkdir(parents=True)
-        with open(metadata_dir / "fqn_to_file_index_mapping.json", "w") as f:
+        with open(metadata_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME, "w") as f:
             json.dump({"w": 1}, f)
         with open(metadata_dir / "config.json", "w") as f:
             json.dump({"torch_dtype": "float32"}, f)
@@ -1449,6 +1490,7 @@ class TestOfflineHFConsolidationTool:
             {"w": 1},
             num_threads=5,
             cast_dtype=torch.bfloat16,
+            fqn_to_dtype_mapping=None,
         )
         with open(output_dir / "config.json", "r") as f:
             assert json.load(f)["torch_dtype"] == "bfloat16"

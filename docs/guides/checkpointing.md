@@ -108,7 +108,7 @@ checkpoints/
 
 The `epoch_0_step_20/` directory stores the full training state from step `20` of the first epoch, including both the model and optimizer states.
 
-Run the generated helper after training to export a Hugging Face-compatible checkpoint:
+Because this example uses `save_consolidated: final`, intermediate checkpoints such as `epoch_0_step_20/` do not include `model/consolidated/` before the run reaches the final checkpoint. To export this intermediate checkpoint for Hugging Face-compatible tools, run the generated helper:
 
 ```bash
 bash checkpoints/epoch_0_step_20/model/consolidate.sh
@@ -126,13 +126,15 @@ NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolida
 sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/checkpoints/epoch_0_step_20/model/consolidate.sh'
 ```
 
-You can request a floating-point dtype cast during offline export:
+By default, consolidated export uses the original Hugging Face safetensors headers when they are available. Ordinary floating-point tensors are restored to their original per-tensor HF dtype, such as BF16, FP16, or FP32, even if the saved sharded checkpoint uses a different floating dtype. If the run started from config-only weights or the original HF metadata is unavailable, export keeps the saved checkpoint dtype. If an original quantized or packed tensor was saved as a floating-point tensor, export leaves it as float and emits a warning.
+
+You can request an explicit floating-point dtype cast during offline export:
 
 ```bash
 CAST_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
 ```
 
-Use `CAST_DTYPE` when the consolidated Hugging Face bundle should use a different floating-point dtype from the saved checkpoint, such as `CAST_DTYPE=bf16` to export an FP32 training checkpoint as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only floating-point tensors with a different source dtype are cast; tensors already in the cast dtype and non-floating tensors are left unchanged.
+Use `CAST_DTYPE` when the consolidated Hugging Face bundle should override the default per-tensor dtype behavior, such as `CAST_DTYPE=bf16` to export ordinary floating-point tensors as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only ordinary floating-point tensors with a different source dtype are cast; tensors already in the cast dtype, FP8 tensors, and non-floating tensors are left unchanged.
 
 The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
 ```python

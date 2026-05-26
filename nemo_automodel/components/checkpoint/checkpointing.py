@@ -46,6 +46,7 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
     _maybe_rename_index_for_diffusers,
+    get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
 )
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
@@ -407,6 +408,7 @@ class Checkpointer:
         )
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
+        fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state)
         self._warn_if_large_inline_consolidation(state_dict, fqn_to_file_index_mapping, is_final_checkpoint)
 
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
@@ -419,13 +421,14 @@ class Checkpointer:
                 tokenizer=tokenizer,
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
+                fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
             )
         self._maybe_write_offline_consolidation_script(model_dir)
 
         storage_writer = self._get_storage_writer(
-            consolidated_dir, fqn_to_file_index_mapping, model_dir, consolidate_on_all_ranks
+            consolidated_dir, fqn_to_file_index_mapping, fqn_to_dtype_mapping, model_dir, consolidate_on_all_ranks
         )
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
@@ -440,6 +443,7 @@ class Checkpointer:
                 num_threads=5,
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
+                fqn_to_dtype_mapping=fqn_to_dtype_mapping,
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -1214,10 +1218,34 @@ fi
             fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
         return fqn_to_file_index_mapping
 
+    def _maybe_build_original_dtype_mapping(self, model_state: ModelState) -> Optional[dict[str, str]]:
+        """
+        Build FQN to original HF safetensors dtype mapping for consolidated export.
+
+        Returns None when the run started from config-only weights or the original HF
+        safetensors headers are not available. In that case consolidation keeps the
+        saved checkpoint dtype unless the user explicitly passes CAST_DTYPE to the
+        offline helper.
+        """
+        if not self._should_write_hf_metadata():
+            return None
+
+        index_path = get_safetensors_index_path(
+            self.config.model_cache_dir,
+            self.config.model_repo_id,
+        )
+        if not index_path:
+            return None
+
+        model = model_state.model[0]
+        dtype_mapping = get_fqn_to_dtype_mapping(index_path, getattr(model, "_checkpoint_conversion_mapping", None))
+        return dtype_mapping or None
+
     def _get_storage_writer(
         self,
         consolidated_output_path: Optional[str],
         fqn_to_index_mapping: Optional[dict[str, int]],
+        fqn_to_dtype_mapping: Optional[dict[str, str]],
         model_path: str,
         consolidate_on_all_ranks: bool = False,
     ) -> Optional[_HuggingFaceStorageWriter]:
@@ -1227,6 +1255,7 @@ fi
         Args:
             consolidated_output_path: Optional path for consolidated artifacts.
             fqn_to_index_mapping: Optional mapping from FQN to shard index.
+            fqn_to_dtype_mapping: Optional mapping from FQN to original HF safetensors dtype string.
             model_path: Path where the model checkpoint is saved.
             consolidate_on_all_ranks: If True, consolidate on all ranks on the main process.
 
@@ -1239,6 +1268,7 @@ fi
                 save_sharded=True,
                 consolidated_output_path=consolidated_output_path if not consolidate_on_all_ranks else None,
                 fqn_to_index_mapping=fqn_to_index_mapping,
+                fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 staging_dir=self.config.staging_dir,
                 diffusers_compatible=self.config.diffusers_compatible,
             )

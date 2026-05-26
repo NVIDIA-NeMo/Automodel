@@ -62,6 +62,8 @@ _DTYPE_CAST_ALIASES: dict[str, torch.dtype] = {
 }
 
 _DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {dtype: key for key, dtype in DTYPE_MAP.items()}
+_FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu}
+_QUANTIZED_DTYPE_WARNING_LIMIT = 5
 
 
 def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
@@ -106,7 +108,70 @@ def _should_cast_dtype(source_dtype: torch.dtype, cast_dtype: torch.dtype | None
     """Return True when a tensor should be cast to the requested output dtype."""
     if cast_dtype is None or source_dtype == cast_dtype:
         return False
-    return torch.empty((), dtype=source_dtype).is_floating_point()
+    return _is_regular_floating_dtype(source_dtype)
+
+
+def _is_regular_floating_dtype(dtype: torch.dtype) -> bool:
+    """Return True for floating dtypes that are safe dtype-preservation targets."""
+    return torch.empty((), dtype=dtype).is_floating_point() and dtype not in _FP8_DTYPES
+
+
+def _warn_quantized_dtype_mismatches(mismatches: list[tuple[str, str, str]]) -> None:
+    """Warn once when original quantized/packed tensors are kept as dequantized floats."""
+    if not mismatches:
+        return
+
+    examples = ", ".join(
+        f"{fqn}: original {original_dtype_str}, saved {source_dtype_str}"
+        for fqn, original_dtype_str, source_dtype_str in mismatches[:_QUANTIZED_DTYPE_WARNING_LIMIT]
+    )
+    omitted = len(mismatches) - _QUANTIZED_DTYPE_WARNING_LIMIT
+    suffix = f"; {omitted} more tensor(s) omitted" if omitted > 0 else ""
+    logger.warning(
+        "Original checkpoint tensor(s) were quantized or packed, but saved tensor(s) are floating point. "
+        "Leaving them as float and treating output as a dequantized Hugging Face checkpoint. Examples: %s%s.",
+        examples,
+        suffix,
+    )
+
+
+def _resolve_output_dtype(
+    fqn: str,
+    source_dtype_str: str,
+    cast_dtype: torch.dtype | None,
+    fqn_to_dtype_mapping: dict[str, str] | None,
+    quantized_dtype_mismatches: list[tuple[str, str, str]] | None = None,
+) -> tuple[torch.dtype, str]:
+    """Resolve the output dtype for a tensor.
+
+    Explicit cast_dtype wins for ordinary floating-point tensors. Otherwise,
+    original HF dtype metadata restores ordinary floating-point tensors per FQN
+    when available; checkpoints without that metadata keep the saved dtype.
+    """
+    source_dtype = _get_known_dtype(source_dtype_str)
+    if cast_dtype is not None:
+        output_dtype = cast_dtype if _should_cast_dtype(source_dtype, cast_dtype) else source_dtype
+        output_dtype_str = (
+            _get_safetensors_dtype_str(output_dtype) if output_dtype != source_dtype else source_dtype_str
+        )
+        return output_dtype, output_dtype_str
+
+    if not fqn_to_dtype_mapping or fqn not in fqn_to_dtype_mapping:
+        return source_dtype, source_dtype_str
+
+    original_dtype_str = fqn_to_dtype_mapping[fqn]
+    original_dtype = _get_known_dtype(original_dtype_str)
+    if original_dtype == source_dtype:
+        return source_dtype, source_dtype_str
+
+    if _is_regular_floating_dtype(original_dtype) and torch.empty((), dtype=source_dtype).is_floating_point():
+        return original_dtype, original_dtype_str
+
+    # If a quantized/packed original tensor was saved as float, keep the float
+    # value as a dequantized export instead of pretending we can restore packing.
+    if torch.empty((), dtype=source_dtype).is_floating_point() and quantized_dtype_mismatches is not None:
+        quantized_dtype_mismatches.append((fqn, original_dtype_str, source_dtype_str))
+    return source_dtype, source_dtype_str
 
 
 @dataclass
@@ -163,6 +228,7 @@ def _parse_input_metadata(
     input_files_data: dict[str, _InputFileData],
     output_files_data: dict[str, _OutputFileData],
     cast_dtype: torch.dtype | None = None,
+    fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> None:
     """
     Parse metadata from input safetensors files to determine the full tensor shapes and types.
@@ -208,6 +274,7 @@ def _parse_input_metadata(
                     cur_size[i] = max(cur_size[i], sizes[i] + offsets[i])
 
     # Now that we know the full size of each tensor, populate the output file data
+    quantized_dtype_mismatches: list[tuple[str, str, str]] = []
     for fqn, tensor_info in fqn_to_size_mapping.items():
         tensor_size = tensor_info[0]
         dtype_str = tensor_info[1]
@@ -215,9 +282,12 @@ def _parse_input_metadata(
             # Add this tensor to the output file if it's already assigned there
             if fqn in output_data.fqn_data:
                 source_dtype = _get_known_dtype(dtype_str)
-                output_dtype = cast_dtype if _should_cast_dtype(source_dtype, cast_dtype) else source_dtype
-                output_dtype_str = (
-                    _get_safetensors_dtype_str(output_dtype) if output_dtype != source_dtype else dtype_str
+                output_dtype, output_dtype_str = _resolve_output_dtype(
+                    fqn,
+                    dtype_str,
+                    cast_dtype,
+                    fqn_to_dtype_mapping,
+                    quantized_dtype_mismatches,
                 )
                 output_data.fqn_data[fqn] = _FqnData(
                     shape_in_file=tensor_size,
@@ -226,6 +296,7 @@ def _parse_input_metadata(
                     source_dtype_size=_get_dtype_size(source_dtype),
                     source_dtype_str=dtype_str,
                 )
+    _warn_quantized_dtype_mismatches(quantized_dtype_mismatches)
 
 
 def _write_metadata(
@@ -631,6 +702,7 @@ def _write_overall_metadata_file_from_shards(
     output_dir: str,
     fqn_to_index_mapping: dict[str, int],
     cast_dtype: torch.dtype | None = None,
+    fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> None:
     """
     Write the overall metadata file by reading metadata from input shard files.
@@ -689,8 +761,12 @@ def _write_overall_metadata_file_from_shards(
     weight_map = {}
 
     for fqn, (tensor_shape, dtype_str) in fqn_to_size_mapping.items():
-        source_dtype = _get_known_dtype(dtype_str)
-        output_dtype = cast_dtype if _should_cast_dtype(source_dtype, cast_dtype) else source_dtype
+        output_dtype, _ = _resolve_output_dtype(
+            fqn,
+            dtype_str,
+            cast_dtype,
+            fqn_to_dtype_mapping,
+        )
         dtype_size = _get_dtype_size(output_dtype)
 
         total_size += math.prod(tensor_shape) * dtype_size
@@ -716,6 +792,7 @@ def _consolidate_safetensors_files(
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
     cast_dtype: torch.dtype | None = None,
+    fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> dict[str, _OutputFileData]:
     # Build output paths
     output_files_data: dict[str, _OutputFileData] = {}
@@ -758,7 +835,7 @@ def _consolidate_safetensors_files(
                 temp_to_final_mapping[temp_path] = final_path
 
             # Step 1: Parse metadata to determine tensor shapes and types
-            _parse_input_metadata(input_files_data, temp_output_files_data, cast_dtype)
+            _parse_input_metadata(input_files_data, temp_output_files_data, cast_dtype, fqn_to_dtype_mapping)
 
             # Step 2: Write metadata headers to temp output files
             _write_metadata(temp_output_files_data)
@@ -777,7 +854,7 @@ def _consolidate_safetensors_files(
     else:
         # Write directly to output directory
         # Step 1: Parse metadata to determine tensor shapes and types
-        _parse_input_metadata(input_files_data, output_files_data, cast_dtype)
+        _parse_input_metadata(input_files_data, output_files_data, cast_dtype, fqn_to_dtype_mapping)
 
         # Step 2: Write metadata headers to output files
         _write_metadata(output_files_data)
@@ -796,6 +873,7 @@ def consolidate_safetensors_files(
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
     cast_dtype: torch.dtype | None = None,
+    fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> None:
     """
     Main function to consolidate sharded safetensors files into one or more output files.
@@ -821,13 +899,15 @@ def consolidate_safetensors_files(
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
+        fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
     """
     start_time = time.time()
     logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
     if cast_dtype is not None:
         logger.info(
-            "Requested cast dtype %s for consolidation. Only floating-point tensors with a different "
-            "source dtype will be cast; tensors already in this dtype and non-floating tensors are unchanged.",
+            "Requested cast dtype %s for consolidation. Only ordinary floating-point tensors with a different "
+            "source dtype will be cast; tensors already in this dtype, FP8 tensors, and non-floating tensors "
+            "are unchanged.",
             cast_dtype,
         )
 
@@ -842,6 +922,7 @@ def consolidate_safetensors_files(
         use_staging=use_staging,
         staging_dir=staging_dir,
         cast_dtype=cast_dtype,
+        fqn_to_dtype_mapping=fqn_to_dtype_mapping,
     )
 
     # Step 4: Write overall model.index.safetensors.json file with weight map
@@ -859,6 +940,7 @@ def consolidate_safetensors_files_on_every_rank(
     use_staging: bool = False,
     staging_dir: Optional[str] = None,
     cast_dtype: torch.dtype | None = None,
+    fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> None:
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
@@ -883,6 +965,7 @@ def consolidate_safetensors_files_on_every_rank(
                     temporary files will be created in this directory instead of the system temp.
                     Only used when use_staging=True. Useful when system temp has limited space.
         cast_dtype: Optional dtype used to cast floating-point tensors during consolidation.
+        fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
     """
 
     start_time = time.time()
@@ -899,8 +982,9 @@ def consolidate_safetensors_files_on_every_rank(
         logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
         if cast_dtype is not None:
             logger.info(
-                "Requested cast dtype %s for consolidation. Only floating-point tensors with a different "
-                "source dtype will be cast; tensors already in this dtype and non-floating tensors are unchanged.",
+                "Requested cast dtype %s for consolidation. Only ordinary floating-point tensors with a different "
+                "source dtype will be cast; tensors already in this dtype, FP8 tensors, and non-floating tensors "
+                "are unchanged.",
                 cast_dtype,
             )
 
@@ -942,11 +1026,18 @@ def consolidate_safetensors_files_on_every_rank(
             use_staging=use_staging,
             staging_dir=staging_dir,
             cast_dtype=cast_dtype,
+            fqn_to_dtype_mapping=fqn_to_dtype_mapping,
         )
 
     # Write overall model.index.safetensors.json file with weight map (rank 0 only)
     if rank == 0:
-        _write_overall_metadata_file_from_shards(input_dir, output_dir, fqn_to_index_mapping, cast_dtype)
+        _write_overall_metadata_file_from_shards(
+            input_dir,
+            output_dir,
+            fqn_to_index_mapping,
+            cast_dtype,
+            fqn_to_dtype_mapping,
+        )
 
     logger.debug(
         "Rank %d: Done consolidating. Processed %d unique indices in %.2f secs.",

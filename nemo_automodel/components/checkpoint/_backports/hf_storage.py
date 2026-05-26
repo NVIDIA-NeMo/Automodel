@@ -100,6 +100,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         num_threads_consolidation: Optional[int] = None,
         staging_dir: Optional[str] = None,
         diffusers_compatible: bool = False,
+        fqn_to_dtype_mapping: Optional[dict[str, str]] = None,
     ) -> None:
         """
         Initialize the huggingface writer pointing to path.
@@ -122,6 +123,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                         temp files will be created here instead of system temp.
             diffusers_compatible: If True, rename the index file to diffusion_pytorch_model.safetensors.index.json
                         so checkpoints are loadable via diffusers from_pretrained().
+            fqn_to_dtype_mapping: Optional mapping from tensor FQN to original HF safetensors dtype string.
         """
         if token is not None:
             super().__init__(
@@ -139,6 +141,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         self._consolidated_output_path = consolidated_output_path
         self._staging_dir = staging_dir
         self._diffusers_compatible = diffusers_compatible
+        self._fqn_to_dtype_mapping = fqn_to_dtype_mapping
 
         if num_threads_consolidation:
             self._num_threads_consolidation = num_threads_consolidation
@@ -204,6 +207,7 @@ class _HuggingFaceStorageWriter(FsspecWriter):
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
                 use_staging=True,
                 staging_dir=self._staging_dir,
+                fqn_to_dtype_mapping=self._fqn_to_dtype_mapping,
             )
             if self._diffusers_compatible:
                 _maybe_rename_index_for_diffusers(self._consolidated_output_path)
@@ -480,6 +484,43 @@ def get_fqn_to_file_index_mapping(
         )
 
     return fqn_to_file_index_mapping
+
+
+def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """
+    Get the FQN to original safetensors dtype mapping from HF shard headers.
+
+    Args:
+        reference_model_path: Path to reference model to copy dtype metadata from.
+        key_mapping: Optional regex key mapping applied in the same way as load-time HF key conversion.
+
+    Returns:
+        A mapping from tensor FQN to the original safetensors dtype string.
+    """
+    fqn_to_dtype_mapping: dict[str, str] = {}
+    filenames: set[str] = set()
+
+    index_file = os.path.join(reference_model_path, _metadata_fn)
+    if os.path.isfile(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        filenames.update(index.get("weight_map", {}).values())
+    else:
+        filenames.update(filename for filename in os.listdir(reference_model_path) if filename.endswith(SUFFIX))
+
+    for filename in sorted(filenames):
+        shard_path = os.path.join(reference_model_path, filename)
+        if not os.path.isfile(shard_path):
+            continue
+        with open(shard_path, "rb") as f:
+            safetensors_metadata, _ = _get_safetensors_file_metadata(f)
+        for key, val in safetensors_metadata.items():
+            if key == DEFAULT_EXTRA_METADATA_KEY:
+                continue
+            fqn = _get_key_renaming_mapping(key, key_mapping)
+            fqn_to_dtype_mapping[str(fqn)] = val[DTYPE_KEY]
+
+    return fqn_to_dtype_mapping
 
 
 # the following function is taken from https://github.com/huggingface/transformers/blob/b85ed49e0a5f1bd9fd887f497d055b22b9319a12/src/transformers/modeling_utils.py#L4989-L5047

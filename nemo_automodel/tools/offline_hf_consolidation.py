@@ -41,6 +41,10 @@ from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors 
     resolve_dtype_cast,
 )
 from nemo_automodel.components.checkpoint._backports.hf_storage import _maybe_rename_index_for_diffusers
+from nemo_automodel.components.checkpoint._backports.hf_utils import (
+    FQN_TO_DTYPE_MAPPING_FILENAME,
+    FQN_TO_FILE_INDEX_MAPPING_FILENAME,
+)
 from nemo_automodel.components.distributed.init_utils import (
     get_rank_safe,
     get_world_size_safe,
@@ -83,7 +87,7 @@ def _update_config_dtype(config_path: str, cast_dtype: torch.dtype) -> None:
 def copy_metadata_files(input_dir: str, output_dir: str, cast_dtype: torch.dtype | None = None) -> None:
     """Copy metadata files from the temporary metadata directory."""
     for item_name in os.listdir(input_dir):
-        if item_name == "fqn_to_file_index_mapping.json":
+        if item_name in {FQN_TO_FILE_INDEX_MAPPING_FILENAME, FQN_TO_DTYPE_MAPPING_FILENAME}:
             continue
         src_path = os.path.join(input_dir, item_name)
         dst_path = os.path.join(output_dir, item_name)
@@ -190,8 +194,13 @@ def main() -> None:
             return
         raise FileNotFoundError("Expected to find the .hf_metadata directory in the input directory.")
 
-    with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "r") as f:
+    with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "r") as f:
         fqn_to_index_mapping = json.load(f)
+    fqn_to_dtype_mapping = None
+    fqn_to_dtype_mapping_path = os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME)
+    if os.path.exists(fqn_to_dtype_mapping_path):
+        with open(fqn_to_dtype_mapping_path, "r") as f:
+            fqn_to_dtype_mapping = json.load(f)
 
     consolidate_safetensors_files_on_every_rank(
         args.input_dir,
@@ -199,6 +208,7 @@ def main() -> None:
         fqn_to_index_mapping,
         num_threads=args.num_threads,
         cast_dtype=cast_dtype,
+        fqn_to_dtype_mapping=fqn_to_dtype_mapping,
     )
 
     if get_world_size_safe() > 1:

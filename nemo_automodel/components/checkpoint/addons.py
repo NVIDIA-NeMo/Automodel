@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from torch import nn
 
+from nemo_automodel.components.checkpoint._backports.hf_utils import (
+    FQN_TO_DTYPE_MAPPING_FILENAME,
+    FQN_TO_FILE_INDEX_MAPPING_FILENAME,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -54,10 +58,12 @@ class ConsolidatedHFAddon:
             model_state (ModelState): Wrapper holding the model parts.
             hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
+            fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
         fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
+        fqn_to_dtype_mapping = kwargs.get("fqn_to_dtype_mapping", None)
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
@@ -110,8 +116,11 @@ class ConsolidatedHFAddon:
                 tokenizer.save_pretrained(hf_metadata_dir)
 
             # save the fqn_to_file_index_mapping file
-            with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "w") as f:
+            with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
                 json.dump(fqn_to_file_index_mapping, f, indent=2, sort_keys=True)
+            if fqn_to_dtype_mapping:
+                with open(os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME), "w") as f:
+                    json.dump(fqn_to_dtype_mapping, f, indent=2, sort_keys=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -137,7 +146,7 @@ class ConsolidatedHFAddon:
             # Copy each public metadata item into consolidated_path while keeping
             # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
-                if item_name == "fqn_to_file_index_mapping.json":
+                if item_name in {FQN_TO_FILE_INDEX_MAPPING_FILENAME, FQN_TO_DTYPE_MAPPING_FILENAME}:
                     continue  # internal helper metadata, not part of the HF output
                 src_path = os.path.join(hf_metadata_path, item_name)
                 dst_path = os.path.join(consolidated_path, item_name)
