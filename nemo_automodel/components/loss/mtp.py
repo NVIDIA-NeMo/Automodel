@@ -81,8 +81,10 @@ def calculate_mtp_loss(
             total_len = int(cs[-1].item()) if labels.dim() == 1 else labels.shape[-1]
             positions = torch.arange(total_len, device=labels.device)
             # Sequence membership: searchsorted on cs[1:] gives index in
-            # [0, num_seqs-1] for each position.
-            seq_idx = torch.searchsorted(cs[1:].contiguous(), positions)
+            # [0, num_seqs-1] for each position. ``right=True`` so a position
+            # equal to a boundary (e.g. position == cu_seqlens[k], the first
+            # token of sub-seq k) maps to ``k``, not ``k-1``.
+            seq_idx = torch.searchsorted(cs[1:].contiguous(), positions, right=True)
             if labels.dim() == 2:
                 # Broadcast to ``[B, S]`` (each row of the BSHD batch shares
                 # the same packed-sequence layout in our recipe path).
@@ -178,11 +180,7 @@ class PipelineCausalLMLoss(nn.Module):
         """
         if isinstance(output, tuple) and len(output) > 0:
             last = output[-1]
-            if (
-                isinstance(last, torch.Tensor)
-                and last.dtype == torch.int32
-                and last.dim() == 2
-            ):
+            if isinstance(last, torch.Tensor) and last.dtype == torch.int32 and last.dim() == 2:
                 return last, output[:-1]
         return None, output
 

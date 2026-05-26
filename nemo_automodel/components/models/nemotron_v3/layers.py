@@ -95,14 +95,11 @@ class NemotronV3Attention(nn.Module):
                 _rank = int(os.environ.get("RANK", "0"))
                 _cu = attn_kwargs.get("cu_seqlens")
                 _cu_repr = (
-                    f"shape={tuple(_cu.shape)} vals={_cu.tolist()[:8]}"
-                    if isinstance(_cu, torch.Tensor)
-                    else None
+                    f"shape={tuple(_cu.shape)} vals={_cu.tolist()[:8]}" if isinstance(_cu, torch.Tensor) else None
                 )
                 _si = attn_kwargs.get("seq_idx")
                 _si_repr = (
-                    f"shape={tuple(_si.shape)} dtype={_si.dtype} "
-                    f"unique_head={torch.unique(_si).tolist()[:8]}"
+                    f"shape={tuple(_si.shape)} dtype={_si.dtype} unique_head={torch.unique(_si).tolist()[:8]}"
                     if isinstance(_si, torch.Tensor)
                     else None
                 )
@@ -327,7 +324,12 @@ class NemotronV3Mamba2Mixer(nn.Module):
             cp_size = self.cp.cp_size if self.cp is not None else 1
             total_len = (hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]) * cp_size
             positions = torch.arange(total_len, device=hidden_states.device)
-            seq_idx = (torch.searchsorted(cu_seqlens[1:], positions)).unsqueeze(0).to(torch.int32)
+            # ``right=True`` so a position equal to a boundary (the first token of
+            # a new sub-seq, position == cu_seqlens[k]) maps to ``k``, not ``k-1``.
+            # Without this mamba's SSD scan resets state one token late at every
+            # sub-seq boundary — the first token of a new sub-seq sees the
+            # previous sub-seq's accumulated state.
+            seq_idx = torch.searchsorted(cu_seqlens[1:], positions, right=True).unsqueeze(0).to(torch.int32)
 
         # --- Path A: Training (no cache) → fused kernel ---
         if not use_cache:
@@ -338,11 +340,7 @@ class NemotronV3Mamba2Mixer(nn.Module):
                 if _ctr < 6:
                     NemotronV3Mamba2Mixer.forward._dbg_count = _ctr + 1
                     _rank = int(os.environ.get("RANK", "0"))
-                    _si_uniq = (
-                        torch.unique(seq_idx).tolist()[:8]
-                        if isinstance(seq_idx, torch.Tensor)
-                        else None
-                    )
+                    _si_uniq = torch.unique(seq_idx).tolist()[:8] if isinstance(seq_idx, torch.Tensor) else None
                     print(
                         f"[NEMO_PP_PACK_DEBUG rank={_rank}] Mamba2 kernel: "
                         f"hidden={tuple(hidden_states.shape)} "
