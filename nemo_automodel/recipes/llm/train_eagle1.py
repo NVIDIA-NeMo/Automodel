@@ -43,6 +43,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
@@ -163,6 +164,12 @@ class TrainEagle1Recipe(BaseRecipe):
             lr=self.peak_lr,
             betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
             weight_decay=opt_cfg.get("weight_decay", 0.0),
+        )
+        warn_if_torch_adam_with_bf16_params(
+            optimizer=self.optimizer,
+            optimizer_cfg=opt_cfg,
+            context="llm_eagle1",
+            logger=logger,
         )
         self.grad_accumulation_steps = recipe_cfg.get("grad_accumulation_steps", 1)
         self.max_grad_norm = recipe_cfg.get("max_grad_norm", 1.0)
