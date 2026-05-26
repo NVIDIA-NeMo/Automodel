@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-only EAGLE-1 training recipe."""
+"""EAGLE-1 / EAGLE-2 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig, LlamaConfig
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -41,7 +41,7 @@ from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloade
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
-from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import (
@@ -62,7 +62,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle1Recipe(BaseRecipe):
-    """Recipe for minimal Llama-only EAGLE-1 training."""
+    """Recipe for EAGLE-1 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -83,10 +83,11 @@ class TrainEagle1Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        if "LlamaForCausalLM" not in architectures:
-            raise ValueError(f"TrainEagle1Recipe currently supports only LlamaForCausalLM, got {architectures}")
-        if not isinstance(target_config, LlamaConfig):
-            raise ValueError(f"Expected LlamaConfig for EAGLE-1 training, got {type(target_config).__name__}")
+        # Dispatch via the eagle registry. New architectures are added by
+        # appending to ``_DENSE_ARCHITECTURES`` (or registering a custom
+        # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
+        # no recipe change required.
+        draft_spec = resolve_eagle1_draft_spec(architectures)
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -130,9 +131,11 @@ class TrainEagle1Recipe(BaseRecipe):
         draft_config = target_config.to_dict()
         draft_config["architectures"] = ["LlamaEagleDraftModel"]
         draft_config["draft_num_hidden_layers"] = int(recipe_cfg.get("draft_num_hidden_layers", 1))
-        self.draft_model = LlamaEagleDraftModel(LlamaConfig.from_dict(draft_config)).to(
-            device=self.device, dtype=self.compute_dtype
-        )
+        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
+        # so architecture-specific defaults like attention_bias and head_dim
+        # flow into the draft.
+        draft_config_obj = type(target_config).from_dict(draft_config)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
@@ -532,9 +535,11 @@ class TrainEagle1Recipe(BaseRecipe):
 
 def main(config_path: str | None = None):
     """Entrypoint for ``TrainEagle1Recipe``."""
-    if config_path is None:
-        raise ValueError("config_path is required for TrainEagle1Recipe")
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainEagle1Recipe(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()

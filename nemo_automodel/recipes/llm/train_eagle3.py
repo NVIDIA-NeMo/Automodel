@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-only EAGLE-3 training recipe."""
+"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig, LlamaConfig
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -46,8 +46,8 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
-    LlamaEagle3DraftModel,
 )
+from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
@@ -81,7 +81,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle3Recipe(BaseRecipe):
-    """Recipe for the minimal Llama-only EAGLE-3 training MVP."""
+    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -102,10 +102,11 @@ class TrainEagle3Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        if "LlamaForCausalLM" not in architectures:
-            raise ValueError(f"TrainEagle3Recipe currently supports only LlamaForCausalLM, got {architectures}")
-        if not isinstance(target_config, LlamaConfig):
-            raise ValueError(f"Expected LlamaConfig for MVP EAGLE-3 training, got {type(target_config).__name__}")
+        # Dispatch via the eagle registry. New architectures are added by
+        # appending to ``_DENSE_ARCHITECTURES`` (or registering a custom
+        # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
+        # no recipe change required.
+        draft_spec = resolve_eagle3_draft_spec(architectures)
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -176,9 +177,11 @@ class TrainEagle3Recipe(BaseRecipe):
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
-        self.draft_model = LlamaEagle3DraftModel(LlamaConfig.from_dict(draft_config)).to(
-            device=self.device, dtype=self.compute_dtype
-        )
+        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
+        # so architecture-specific defaults like attention_bias and head_dim
+        # flow into the draft.
+        draft_config_obj = type(target_config).from_dict(draft_config)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
