@@ -402,6 +402,14 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Benchmark MTP speculative decoding for a trained Gemma 4 base + drafter pair.
+
+    Parses CLI args (base checkpoint, drafter checkpoint, decoding knobs), loads
+    both models in bf16 onto CUDA, runs the MT-Bench-style prompt set once without
+    speculative decoding and once with the drafter attached, and prints per-prompt
+    and aggregate stats (tokens/sec, target-model forward count, average accepted
+    tokens per target step).
+    """
     args = _parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required.")
