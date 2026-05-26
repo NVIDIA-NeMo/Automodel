@@ -175,9 +175,18 @@ class LlamaEagleDraftModel(PreTrainedModel):
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embeddings: nn.Embedding) -> None:
-        """Copy the target model token embeddings into the draft embeddings."""
+        """Copy the target model token embeddings into the draft embeddings.
+
+        When the target is wrapped with FSDP2, its ``embed_tokens.weight`` is
+        a ``DTensor`` sharded across ranks.  Gather to a local full tensor
+        before copying into the (unsharded) draft parameter -- otherwise
+        ``aten.copy_`` raises a mixed Tensor/DTensor error.
+        """
+        target_weight = target_embeddings.weight
+        if hasattr(target_weight, "full_tensor"):
+            target_weight = target_weight.full_tensor()
         with torch.no_grad():
-            self.embed_tokens.weight.copy_(target_embeddings.weight.to(self.embed_tokens.weight.device))
+            self.embed_tokens.weight.copy_(target_weight.to(self.embed_tokens.weight.device))
 
     def freeze_embeddings(self) -> None:
         """Freeze draft token embeddings."""
