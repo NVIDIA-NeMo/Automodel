@@ -45,7 +45,7 @@ docker run --gpus all -it --rm --shm-size=8g -v $(pwd)/checkpoints:/tmp/checkpoi
 ```
 
 :::{important}
-Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Saving Checkpoints When Using Docker](../checkpointing.md#saving-checkpoints-when-using-docker).
+Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Save Checkpoints When Using Docker](../checkpointing.md#save-checkpoints-when-using-docker).
 :::
 
 For the full set of installation methods, see the [installation guide](../installation.md).
@@ -214,7 +214,7 @@ peft:
 | `dim` | The low-rank dimension *r* — controls adapter capacity. Larger values learn more but use more memory. |
 | `alpha` | Scaling factor applied to the adapter output (`alpha / dim`). Higher values give adapters more influence during training. |
 
-Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead — see [Switching Between SFT and PEFT](#switching-between-sft-and-peft).
+Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead — see [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
 #### QLoRA (Quantized Low-Rank Adaptation)
 

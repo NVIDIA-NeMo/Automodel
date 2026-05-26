@@ -266,7 +266,7 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ...
 ```
 
-## Saving Checkpoints When Using Docker
+## Save Checkpoints When Using Docker
 
 When training inside a Docker container (see [Installation Guide](/get-started/installation)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
 
