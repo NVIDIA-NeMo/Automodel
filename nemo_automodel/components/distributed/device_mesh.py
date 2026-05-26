@@ -55,7 +55,6 @@ def create_mesh_context(
     world_size: int | None = None,
     pipeline_config: PipelineConfig | dict | None = None,
     moe_config: MoEParallelizerConfig | dict | None = None,
-    activation_checkpointing: bool | None = None,
     **strategy_kwargs: Any,
 ) -> MeshContext:
     """Create a :class:`MeshContext` from a strategy name or config object.
@@ -80,9 +79,6 @@ def create_mesh_context(
         moe_config: Optional MoE parallelizer config object or kwargs dict. A
             default ``MoEParallelizerConfig`` is created when ``ep_size > 1`` and
             no config is supplied.
-        activation_checkpointing: Whether activation checkpointing is enabled.
-            For non-EP FSDP/DDP/Megatron configs this is also routed onto the
-            strategy config, matching recipe setup behavior.
         **strategy_kwargs: Strategy-specific config fields used when *strategy*
             is a string.
 
@@ -103,14 +99,8 @@ def create_mesh_context(
 
     strategy_config = _resolve_strategy_config(
         strategy,
-        ep_size=ep_size,
-        activation_checkpointing=activation_checkpointing,
         strategy_kwargs=strategy_kwargs,
     )
-    if activation_checkpointing is None:
-        activation_checkpointing = bool(getattr(strategy_config, "activation_checkpointing", False))
-    elif (ep_size or 1) <= 1 and hasattr(strategy_config, "activation_checkpointing"):
-        setattr(strategy_config, "activation_checkpointing", activation_checkpointing)
 
     device_mesh, moe_mesh = _create_device_meshes(
         strategy_config,
@@ -127,7 +117,6 @@ def create_mesh_context(
         strategy_config=strategy_config,
         pipeline_config=_resolve_pipeline_config(pipeline_config, pp_size),
         moe_config=_resolve_moe_config(moe_config, ep_size),
-        activation_checkpointing=activation_checkpointing,
         device_mesh=device_mesh,
         moe_mesh=moe_mesh,
     )
@@ -136,8 +125,6 @@ def create_mesh_context(
 def _resolve_strategy_config(
     strategy: str | FSDP2Config | MegatronFSDPConfig | DDPConfig,
     *,
-    ep_size: int,
-    activation_checkpointing: bool | None,
     strategy_kwargs: dict[str, Any],
 ) -> FSDP2Config | MegatronFSDPConfig | DDPConfig:
     """Resolve a strategy name or config object into a strategy config."""
@@ -156,8 +143,6 @@ def _resolve_strategy_config(
 
     strategy_cls = STRATEGY_MAP[strategy_name]
     strategy_kwargs = strategy_kwargs.copy()
-    if activation_checkpointing is not None and (ep_size or 1) <= 1:
-        strategy_kwargs["activation_checkpointing"] = activation_checkpointing
     _validate_strategy_kwargs(strategy_name, strategy_cls, strategy_kwargs)
     return strategy_cls(**strategy_kwargs)
 

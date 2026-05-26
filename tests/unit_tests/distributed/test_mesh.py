@@ -57,7 +57,6 @@ class TestMeshContextDefaults:
         assert ctx.strategy_config is None
         assert ctx.pipeline_config is None
         assert ctx.moe_config is None
-        assert ctx.activation_checkpointing is False
         assert ctx.device_mesh is None
         assert ctx.moe_mesh is None
 
@@ -75,10 +74,6 @@ class TestMeshContextDefaults:
         mc = MoEParallelizerConfig(ignore_router_for_ac=True)
         ctx = MeshContext(moe_config=mc)
         assert ctx.moe_config is mc
-
-    def test_activation_checkpointing_flag(self):
-        ctx = MeshContext(activation_checkpointing=True)
-        assert ctx.activation_checkpointing is True
 
 
 # ---------------------------------------------------------------------------

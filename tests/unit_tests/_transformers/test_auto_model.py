@@ -80,7 +80,6 @@ class TestResolveMeshContext:
         assert mesh.strategy_config is distributed_config
         assert mesh.pipeline_config is None
         assert mesh.moe_config is moe_config
-        assert mesh.activation_checkpointing is True
         assert resolved_distributed_config is distributed_config
         assert resolved_pipeline_config is None
         assert resolved_moe_config is moe_config
@@ -89,14 +88,13 @@ class TestResolveMeshContext:
     def test_mesh_context_input_supplies_default_configs(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
-        distributed_config = FSDP2Config()
+        distributed_config = FSDP2Config(activation_checkpointing=True)
         moe_config = MoEParallelizerConfig()
         source_mesh = MeshContext.from_meshes(
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
             strategy_config=distributed_config,
             moe_config=moe_config,
-            activation_checkpointing=True,
         )
 
         mesh, resolved_distributed_config, _, resolved_moe_config, activation_checkpointing = _resolve_mesh_context(
@@ -112,15 +110,14 @@ class TestResolveMeshContext:
         assert mesh.moe_mesh is moe_mesh
         assert mesh.strategy_config is distributed_config
         assert mesh.moe_config is moe_config
-        assert mesh.activation_checkpointing is True
         assert resolved_distributed_config is distributed_config
         assert resolved_moe_config is moe_config
         assert activation_checkpointing is True
 
     def test_explicit_configs_override_mesh_context_defaults(self):
-        source_config = FSDP2Config(sequence_parallel=False)
+        source_config = FSDP2Config(sequence_parallel=False, activation_checkpointing=True)
         override_config = FSDP2Config(sequence_parallel=True)
-        source_mesh = MeshContext(strategy_config=source_config, activation_checkpointing=True)
+        source_mesh = MeshContext(strategy_config=source_config)
 
         mesh, resolved_distributed_config, _, _, activation_checkpointing = _resolve_mesh_context(
             device_mesh=source_mesh,
@@ -188,14 +185,13 @@ class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_mesh_context_as_device_mesh(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
-        distributed_config = FSDP2Config()
+        distributed_config = FSDP2Config(activation_checkpointing=True)
         moe_config = MoEParallelizerConfig()
         mesh_context = MeshContext.from_meshes(
             device_mesh,
             moe_mesh,
             strategy_config=distributed_config,
             moe_config=moe_config,
-            activation_checkpointing=True,
         )
         sentinel_model = object()
 

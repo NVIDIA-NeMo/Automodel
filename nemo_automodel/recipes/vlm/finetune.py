@@ -122,7 +122,7 @@ def build_model(
     distributed_config=None,
     pipeline_config=None,
     cfg_moe=None,
-    activation_checkpointing=False,
+    activation_checkpointing: bool | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -139,6 +139,8 @@ def build_model(
             "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
+        if activation_checkpointing is not None:
+            kwargs["activation_checkpointing"] = activation_checkpointing
 
         if cfg_moe is not None:
             from nemo_automodel.components.moe.config import MoEParallelizerConfig
@@ -151,7 +153,6 @@ def build_model(
                 moe_dict.pop("activation_checkpointing", None)
                 moe_dict.pop("_target_", None)
                 kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
-            kwargs["activation_checkpointing"] = activation_checkpointing
 
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
@@ -686,6 +687,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.moe_mesh = self.mesh_context.moe_mesh
         self.pp_enabled = self.mesh_context.pp_enabled
         self.pipeline_config = self.mesh_context.pipeline_config
+        self.activation_checkpointing = self.cfg.get("distributed.activation_checkpointing", False)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -769,7 +771,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_config=self.distributed_config,
             pipeline_config=self.pipeline_config,
             cfg_moe=self.mesh_context.moe_config,
-            activation_checkpointing=self.mesh_context.activation_checkpointing,
+            activation_checkpointing=self.activation_checkpointing,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

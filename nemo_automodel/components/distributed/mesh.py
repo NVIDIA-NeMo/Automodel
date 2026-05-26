@@ -14,8 +14,8 @@
 
 """Typed MeshContext dataclass, validation, and strategy map.
 
-``MeshContext`` is the single source of truth for everything related to
-distributed training: strategy config, device meshes, and axis names.
+``MeshContext`` is the single source of truth for distributed topology:
+strategy config, device meshes, and axis names.
 
 Parallelism sizes (``tp_size``, ``pp_size``, etc.) are derived at runtime
 from the attached ``DeviceMesh`` objects via ``@property``.  When no mesh
@@ -116,14 +116,12 @@ class MeshContext:
         moe_mesh: MoE-specific device mesh.
         pipeline_config: Pipeline-parallel schedule/splitting config.
         moe_config: MoE parallelizer settings.
-        activation_checkpointing: Whether activation checkpointing is enabled.
     """
 
     # config fields
     strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None
     pipeline_config: Optional["PipelineConfig"] = None
     moe_config: Optional["MoEParallelizerConfig"] = None
-    activation_checkpointing: bool = False
 
     # runtime mesh references
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
@@ -213,7 +211,6 @@ class MeshContext:
         strategy_config: Optional[Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]] = None,
         pipeline_config: Optional["PipelineConfig"] = None,
         moe_config: Optional["MoEParallelizerConfig"] = None,
-        activation_checkpointing: bool = False,
     ) -> "MeshContext":
         """Build a :class:`MeshContext` from ``DeviceMesh`` objects.
 
@@ -225,7 +222,6 @@ class MeshContext:
             strategy_config=strategy_config,
             pipeline_config=pipeline_config,
             moe_config=moe_config,
-            activation_checkpointing=activation_checkpointing,
             device_mesh=device_mesh,
             moe_mesh=moe_mesh,
         )
