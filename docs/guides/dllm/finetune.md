@@ -29,7 +29,7 @@ NeMo AutoModel currently supports the following dLLM model families:
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package using pip or Docker |
 | **2. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, dLLM mode, and training settings |
 | **3. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` |
-| **4. Generate** | [Generation / Inference](#generation--inference) | Generate text from a fine-tuned checkpoint |
+| **4. Generate** | [Run Inference](#run-inference) | Generate text from a fine-tuned checkpoint |
 
 ### Supported Models
 
