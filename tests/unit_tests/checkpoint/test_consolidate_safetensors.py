@@ -221,6 +221,40 @@ def test_consolidate_keeps_saved_dtype_when_original_hf_dtype_metadata_is_missin
 
 
 @pytest.mark.run_only_on("CPU")
+def test_consolidate_ignores_mapping_keys_missing_from_input_shards(tmp_path, caplog):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {"transformer.wte.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2)}
+    dcp_metadata = {"transformer.wte.weight": {"saved_offsets": [0, 0]}}
+    save_file(
+        tensors,
+        input_dir / "model-00001-of-00001.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
+    )
+    caplog.set_level(logging.WARNING)
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={"transformer.wte.weight": 1, "lm_head.weight": 1},
+    )
+
+    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
+    assert set(output_tensors) == {"transformer.wte.weight"}
+    torch.testing.assert_close(output_tensors["transformer.wte.weight"], tensors["transformer.wte.weight"])
+
+    with open(output_dir / "model.safetensors.index.json", "r") as f:
+        index = json.load(f)
+    assert index["weight_map"] == {"transformer.wte.weight": "model-00001-of-00001.safetensors"}
+    assert index["metadata"]["total_size"] == tensors["transformer.wte.weight"].numel() * 4
+    assert "Ignoring 1 tensor(s) from the consolidation shard mapping" in caplog.text
+    assert "lm_head.weight" in caplog.text
+
+
+@pytest.mark.run_only_on("CPU")
 def test_consolidate_keeps_float_when_original_dtype_is_quantized(tmp_path, caplog):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"

@@ -71,8 +71,15 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_consolidate(input_dir, output_dir, fqn_to_index_mapping, num_threads, target_dtype):
-        captured["args"] = (input_dir, output_dir, fqn_to_index_mapping, num_threads, target_dtype)
+    def fake_consolidate(input_dir, output_dir, fqn_to_index_mapping, num_threads, cast_dtype, fqn_to_dtype_mapping):
+        captured["args"] = (
+            input_dir,
+            output_dir,
+            fqn_to_index_mapping,
+            num_threads,
+            cast_dtype,
+            fqn_to_dtype_mapping,
+        )
 
     monkeypatch.setattr(script, "consolidate_safetensors_files_on_every_rank", fake_consolidate)
 
@@ -96,12 +103,15 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
     # Consolidation called with expected arguments
     assert "args" in captured
-    called_in_dir, called_out_dir, called_mapping, called_threads, called_target_dtype = captured["args"]
+    called_in_dir, called_out_dir, called_mapping, called_threads, called_cast_dtype, called_dtype_mapping = captured[
+        "args"
+    ]
     assert Path(called_in_dir) == in_dir
     assert Path(called_out_dir) == out_dir
     assert called_mapping == mapping
     assert called_threads == 2
-    assert called_target_dtype is None
+    assert called_cast_dtype is None
+    assert called_dtype_mapping is None
 
     # Metadata copied (except mapping) and source metadata dir preserved.
     assert (out_dir / "config.json").exists()

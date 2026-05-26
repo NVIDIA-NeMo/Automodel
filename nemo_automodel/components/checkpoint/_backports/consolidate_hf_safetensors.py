@@ -64,6 +64,7 @@ _DTYPE_CAST_ALIASES: dict[str, torch.dtype] = {
 _DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {dtype: key for key, dtype in DTYPE_MAP.items()}
 _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu}
 _QUANTIZED_DTYPE_WARNING_LIMIT = 5
+_MISSING_FQN_WARNING_LIMIT = 5
 
 
 def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
@@ -210,6 +211,37 @@ class _OutputFileData:
     fqn_data: dict[str, _FqnData] = field(default_factory=dict)
 
 
+def _drop_missing_output_fqns(
+    output_files_data: dict[str, _OutputFileData],
+    available_fqns: set[str],
+) -> None:
+    """Drop mapped output tensors that are not present in the input shard metadata."""
+    missing_fqns: list[str] = []
+    for output_path in list(output_files_data):
+        output_data = output_files_data[output_path]
+        for fqn in list(output_data.fqn_data):
+            if fqn in available_fqns:
+                continue
+            missing_fqns.append(fqn)
+            del output_data.fqn_data[fqn]
+        if not output_data.fqn_data:
+            del output_files_data[output_path]
+
+    if not missing_fqns:
+        return
+
+    examples = ", ".join(missing_fqns[:_MISSING_FQN_WARNING_LIMIT])
+    omitted = len(missing_fqns) - _MISSING_FQN_WARNING_LIMIT
+    suffix = f"; {omitted} more tensor(s) omitted" if omitted > 0 else ""
+    logger.warning(
+        "Ignoring %d tensor(s) from the consolidation shard mapping because they were not present in the input "
+        "safetensors shard metadata. This can happen for tied-weight aliases. Examples: %s%s.",
+        len(missing_fqns),
+        examples,
+        suffix,
+    )
+
+
 @dataclass
 class _InputFileData:
     """
@@ -297,6 +329,7 @@ def _parse_input_metadata(
                     source_dtype_str=dtype_str,
                 )
     _warn_quantized_dtype_mismatches(quantized_dtype_mismatches)
+    _drop_missing_output_fqns(output_files_data, set(fqn_to_size_mapping))
 
 
 def _write_metadata(
@@ -845,6 +878,8 @@ def _consolidate_safetensors_files(
 
             # Step 4: Copy completed files from temp to final destination
             for temp_path, final_path in temp_to_final_mapping.items():
+                if temp_path not in temp_output_files_data:
+                    continue
                 shutil.copy2(temp_path, final_path)
                 logger.info("Copied %s to %s", temp_path, final_path)
 

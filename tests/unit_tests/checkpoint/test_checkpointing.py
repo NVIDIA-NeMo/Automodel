@@ -41,6 +41,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
+    _normalize_dtype_mapping_to_state_dict_keys,
     _reinit_non_persistent_buffers,
     _summarize_state_dict_key_diff,
 )
@@ -340,7 +341,7 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
 
     with patch("nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path", return_value=None):
         mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
-        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state)
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
 
     assert mapping == {
         "a.weight": 1,
@@ -350,6 +351,68 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
     assert dtype_mapping is None
     assert "No original HF safetensors shard index found for config-only/model" in caplog.text
     assert "2 output shard(s)" in caplog.text
+
+
+def test_normalize_dtype_mapping_to_state_dict_keys_uses_hf_base_model_prefix():
+    dtype_mapping = {
+        "h.0.ln_1.weight": "BF16",
+        "wte.weight": "BF16",
+        "lm_head.weight": "F32",
+        "unused.weight": "BF16",
+    }
+    state_dict_keys = [
+        "transformer.h.0.ln_1.weight",
+        "transformer.wte.weight",
+        "lm_head.weight",
+    ]
+
+    normalized = _normalize_dtype_mapping_to_state_dict_keys(dtype_mapping, state_dict_keys, "transformer")
+
+    assert normalized == {
+        "transformer.h.0.ln_1.weight": "BF16",
+        "transformer.wte.weight": "BF16",
+        "lm_head.weight": "F32",
+    }
+
+
+def test_original_dtype_mapping_is_keyed_by_export_state_dict(tmp_path):
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    save_file(
+        {
+            "h.0.ln_1.weight": torch.ones(1, dtype=torch.bfloat16),
+            "wte.weight": torch.ones(1, dtype=torch.bfloat16),
+            "unused.weight": torch.ones(1, dtype=torch.float32),
+        },
+        reference_dir / "model.safetensors",
+    )
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    model_state = SimpleNamespace(model=[SimpleNamespace(base_model_prefix="transformer")])
+    state_dict = {
+        "transformer.h.0.ln_1.weight": torch.ones(1),
+        "transformer.wte.weight": torch.ones(1),
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path",
+        return_value=str(reference_dir),
+    ):
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert dtype_mapping == {
+        "transformer.h.0.ln_1.weight": "BF16",
+        "transformer.wte.weight": "BF16",
+    }
 
 
 def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():

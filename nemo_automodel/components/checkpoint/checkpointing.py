@@ -101,6 +101,27 @@ def _normalize_save_consolidated(value: bool | str | SaveConsolidatedMode) -> Sa
     )
 
 
+def _normalize_dtype_mapping_to_state_dict_keys(
+    fqn_to_dtype_mapping: dict[str, str], state_dict_keys: list[str], base_model_prefix: str | None = None
+) -> dict[str, str]:
+    """Align original HF dtype metadata with the keys that will be exported."""
+    state_dict_key_set = set(state_dict_keys)
+    normalized: dict[str, str] = {}
+    prefix = base_model_prefix.strip(".") if base_model_prefix else None
+
+    for fqn, dtype_str in fqn_to_dtype_mapping.items():
+        if fqn in state_dict_key_set:
+            normalized[fqn] = dtype_str
+            continue
+
+        if prefix and not fqn.startswith(f"{prefix}."):
+            prefixed_fqn = f"{prefix}.{fqn}"
+            if prefixed_fqn in state_dict_key_set:
+                normalized[prefixed_fqn] = dtype_str
+
+    return normalized
+
+
 def _is_geq_torch_2_9() -> bool:
     """
     Check if the current torch version is greater than or equal to 2.9.0.
@@ -408,7 +429,7 @@ class Checkpointer:
         )
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
-        fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state)
+        fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
         self._warn_if_large_inline_consolidation(state_dict, fqn_to_file_index_mapping, is_final_checkpoint)
 
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
@@ -982,8 +1003,8 @@ class Checkpointer:
         logger.warning(
             "checkpoint.save_consolidated=every exports HuggingFace safetensors during every checkpoint save "
             "and can leave GPUs idle during consolidation and filesystem writes. Recommended: "
-            "checkpoint.save_consolidated=final, or checkpoint.save_consolidated=false and after training run "
-            "bash <checkpoint>/model/consolidate.sh.",
+            "checkpoint.save_consolidated=final, or checkpoint.save_consolidated=false and run "
+            "bash <checkpoint>/model/consolidate.sh after training.",
         )
 
     def _warn_if_large_inline_consolidation(
@@ -1012,8 +1033,8 @@ class Checkpointer:
             logger.warning(
                 "checkpoint.save_consolidated=every is exporting ~%s of HF safetensors during checkpoint save "
                 "(size from HF index; %s, world_size=%d). This can idle GPU ranks; prefer "
-                "save_consolidated=final, or save_consolidated=false and after training run "
-                "bash <checkpoint>/model/consolidate.sh.",
+                "save_consolidated=final, or save_consolidated=false and run "
+                "bash <checkpoint>/model/consolidate.sh after training.",
                 _format_bytes(estimated_bytes),
                 output_file_summary,
                 world_size,
@@ -1022,8 +1043,8 @@ class Checkpointer:
             logger.warning(
                 "checkpoint.save_consolidated=every may be exporting a large HF checkpoint; this rank's local "
                 "estimate is ~%s (full size may differ under distributed parallelism; %s, world_size=%d). Prefer "
-                "save_consolidated=final, or save_consolidated=false and after training run "
-                "bash <checkpoint>/model/consolidate.sh.",
+                "save_consolidated=final, or save_consolidated=false and run "
+                "bash <checkpoint>/model/consolidate.sh after training.",
                 _format_bytes(estimated_bytes),
                 output_file_summary,
                 world_size,
@@ -1218,7 +1239,9 @@ fi
             fqn_to_file_index_mapping[fqn] = fqn_to_file_index_mapping.get(fqn, default_index)
         return fqn_to_file_index_mapping
 
-    def _maybe_build_original_dtype_mapping(self, model_state: ModelState) -> Optional[dict[str, str]]:
+    def _maybe_build_original_dtype_mapping(
+        self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
+    ) -> Optional[dict[str, str]]:
         """
         Build FQN to original HF safetensors dtype mapping for consolidated export.
 
@@ -1239,7 +1262,13 @@ fi
 
         model = model_state.model[0]
         dtype_mapping = get_fqn_to_dtype_mapping(index_path, getattr(model, "_checkpoint_conversion_mapping", None))
-        return dtype_mapping or None
+        if not dtype_mapping:
+            return None
+
+        normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
+            dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
+        )
+        return normalized_dtype_mapping or None
 
     def _get_storage_writer(
         self,
