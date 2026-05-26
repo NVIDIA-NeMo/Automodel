@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3)."""
+"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3) and MoE backbones (Qwen3-MoE)."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle3Recipe(BaseRecipe):
-    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3)."""
+    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3) and MoE backbones (Qwen3-MoE)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
