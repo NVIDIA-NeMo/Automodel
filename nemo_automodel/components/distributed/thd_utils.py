@@ -113,9 +113,10 @@ def process_input_for_thd(
             ]
         )
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(device=valid_seq_lens.device)
-        # Compute max sequence length on-device (avoid a CPU sync inside TE).
-        if valid_seq_lens.numel() > 0:
-            max_seqlen = valid_seq_lens.max().to(dtype=torch.int32)
+        # NOTE: max_seqlen is computed AFTER the trailing-pad absorption below,
+        # from the final cu_seqlens, so it satisfies TE's contract that
+        # ``max_seqlen_q >= max(cu_seqlens_q[i+1] - cu_seqlens_q[i])``.
+        # See transformer_engine/pytorch/cpp_extensions/fused_attn.py:152-159.
 
         if seq_lens_padded is not None:
             # Same processing for padded sequence lengths
@@ -134,10 +135,9 @@ def process_input_for_thd(
         # Two distinct kinds of padding can be in ``cu_seqlens_padded``:
         #   1. PURELY TRAILING (cp_size==1): only the last sub-sequence's
         #      length grows to absorb pack-level padding. ``cu_seqlens`` and
-        #      ``cu_seqlens_padded`` differ ONLY in the last entry. This is
-        #      gratuitous from the kernel's perspective (no padding between
-        #      sub-sequences) — we can absorb it into ``cu_seqlens`` and
-        #      avoid TE's ``pad_between_seqs=True`` code path entirely.
+        #      ``cu_seqlens_padded`` differ ONLY in the last entry. We can
+        #      absorb the trailing pad into ``cu_seqlens`` and avoid TE's
+        #      ``pad_between_seqs=True`` code path entirely.
         #
         #   2. CP-DIVISIBILITY PADDING (cp_size>1): each sub-sequence is
         #      individually rounded up to a multiple of ``2*cp_size``
@@ -150,84 +150,43 @@ def process_input_for_thd(
         #      from the padded buffer.
         #
         # Detection: only absorb when the two arrays agree on every entry
-        # except the last (case 1 above).
+        # except the last (case 1 above). The post-absorption ``max_seqlen``
+        # (computed below from the final cu_seqlens) correctly reflects the
+        # absorbed slot width, so the kernel never sees a slot wider than
+        # the max_seqlen we claim. Verified safe via
+        # /opt/Automodel/te_bug_report/te_thd_repro_MINIMAL.py: feeding TE
+        # cu_seqlens=[0,112,224,336,448,1024] with truthful max_seqlen=576
+        # runs cleanly; the original captured crash was specifically caused
+        # by lying (max_seqlen=112 with a 576-wide slot).
         if (
             cu_seqlens is not None
             and cu_seqlens_padded is not None
             and cu_seqlens.numel() == cu_seqlens_padded.numel()
             and cu_seqlens.numel() > 1
+            and torch.equal(cu_seqlens[:-1], cu_seqlens_padded[:-1])
         ):
-            # Trailing-only iff all entries except possibly the last are equal.
-            _trailing_only = torch.equal(cu_seqlens[:-1], cu_seqlens_padded[:-1])
-            if _trailing_only:
-                _total = int(total_tokens)
-                _real_total = int(cu_seqlens[-1].item())
-                _trailing_pad = _total - _real_total
-                # Only absorb the trailing pack-pad into ``cu_seqlens`` when
-                # the gap fits within a single max-length sub-sequence. For a
-                # "short" microbatch (fewer real sub-seqs than a full pack),
-                # the gap can be much larger than ``max_seqlen`` and the
-                # absorbed last sub-seq would violate cuDNN-fused-attn-bwd's
-                # per-sub-seq buffer assumption (captured failing batch had
-                # cu_seqlens jump 448 -> 1024 with max_seqlen=112 ⇒ OOB write).
-                _max_sl = int(max_seqlen.item()) if max_seqlen is not None else _total
-                if 0 < _trailing_pad <= _max_sl:
-                    # Small trailing pad — absorb into the last sub-seq.
-                    # cuDNN-fused-attn tolerates a slot slightly larger than
-                    # max_seqlen (e.g. 128 vs 112) in the common full-pack case.
-                    _extended = cu_seqlens.clone()
-                    _extended[-1] = _total
-                    cu_seqlens = _extended
-                    # Drop ``cu_seqlens_padded`` from the emit by marking it
-                    # identical to ``cu_seqlens``; the emit check at line ~205
-                    # then skips it, which skips the ``pad_between_seqs=True``
-                    # branch in attention/utils.py.
-                    cu_seqlens_padded = cu_seqlens.clone()
-                elif _trailing_pad > _max_sl:
-                    # Large trailing pad ("short microbatch": the pack has
-                    # fewer real sub-seqs than the dataloader produced for
-                    # peer microbatches). Neither absorption (creates a
-                    # too-large last slot) nor ``pad_between_seqs=True``
-                    # (cuDNN-fused-attn-bwd OOB writes on a slot wider than
-                    # max_seqlen, see /opt/Automodel/te_bug_report/) is safe
-                    # for the kernel. Instead, EXTEND cu_seqlens with dummy
-                    # ``max_seqlen``-sized slots that span the trailing pack
-                    # pad, AND regenerate position_ids to reset at each new
-                    # slot. Each new "sub-seq" is entirely pad (already
-                    # marked in padding_mask), so the kernel processes them
-                    # as normal short sub-seqs and loss/MoE-routing skip
-                    # them.
-                    _acc = _real_total
-                    _new_entries: list[int] = []
-                    while _total - _acc > _max_sl:
-                        _acc += _max_sl
-                        _new_entries.append(_acc)
-                    if _acc < _total:
-                        _new_entries.append(_total)
-                    if _new_entries:
-                        _extra = torch.tensor(_new_entries, dtype=cu_seqlens.dtype,
-                                              device=cu_seqlens.device)
-                        cu_seqlens = torch.cat([cu_seqlens, _extra])
-                        cu_seqlens_padded = cu_seqlens.clone()
-                        # Reset position_ids inside the trailing region so
-                        # each new dummy slot starts at position 0. Without
-                        # this, position_ids retain their linear continuation
-                        # from ``_pad_pack`` (e.g. running up to 575 for a
-                        # 576-token "phantom" sub-seq), feeding garbage
-                        # rotations into RoPE on the dummy slots.
-                        if position_ids_thd is not None:
-                            _prev = _real_total
-                            for _end in _new_entries:
-                                _w = _end - _prev
-                                position_ids_thd[_prev:_end] = torch.arange(
-                                    _w,
-                                    dtype=position_ids_thd.dtype,
-                                    device=position_ids_thd.device,
-                                )
-                                _prev = _end
+            _total = int(total_tokens)
+            _real_total = int(cu_seqlens[-1].item())
+            if _real_total < _total:
+                _extended = cu_seqlens.clone()
+                _extended[-1] = _total
+                cu_seqlens = _extended
+                # Drop ``cu_seqlens_padded`` from the emit by marking it
+                # identical to ``cu_seqlens``; the emit gate below then
+                # skips it, which skips the ``pad_between_seqs=True``
+                # branch in attention/utils.py.
+                cu_seqlens_padded = cu_seqlens.clone()
         # CP case (cu_seqlens differs from cu_seqlens_padded in multiple
         # entries) falls through unchanged — both tensors are emitted and TE
         # uses pad_between_seqs=True correctly.
+
+        # Compute max_seqlen from the FINAL cu_seqlens so TE's contract
+        # (max_seqlen_q >= max(cu_seqlens[i+1] - cu_seqlens[i])) is satisfied.
+        # The absorption above can grow cu_seqlens[-1] to total_tokens;
+        # max_seqlen must reflect that growth or the cuDNN-fused-attn-bwd
+        # kernel writes OOB.
+        if cu_seqlens is not None and cu_seqlens.numel() > 1:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
 
     # Emit cu_seqlens (unpadded — real sequence lengths) and cu_seqlens_padded
     # (with intra-pack padding included) as SEPARATE keys, plus max_seqlen.

@@ -540,25 +540,28 @@ class TestProcessInputForTHDWithChunks:
 
 
 class TestTrailingPadAbsorption:
-    """Tests for the trailing-pack-pad absorption gate in process_input_for_thd.
+    """Tests for the trailing-pack-pad absorption in process_input_for_thd.
 
-    The bug captured in /opt/Automodel/te_bug_report/ was: a "short" microbatch
-    (fewer real sub-sequences than the pack capacity) had its trailing
-    pack-padding unconditionally absorbed into the last cu_seqlens entry,
-    producing a 576-token sub-seq in a batch with ``max_seqlen=112``. TE's
-    cuDNN-fused-attn-bwd then wrote OOB. These tests pin the corrected
-    behaviour: absorb only when the trailing pad fits within a single
-    max-length sub-sequence.
+    The original captured bug: a "short" microbatch (5 sub-seqs of 112 in a
+    1024-pack) had its trailing 464-token pad absorbed into the last
+    cu_seqlens slot (576 wide), while the collator told TE ``max_seqlen=112``
+    — a documented TE-contract violation (``max_seqlen_q`` MUST be >= the
+    actual max slot width per ``fused_attn.h:548-551``). cuDNN-fused-attn-bwd
+    then wrote OOB.
+
+    The fix: compute ``max_seqlen`` from the FINAL cu_seqlens (after
+    absorption), so the value handed to TE always reflects the true max slot
+    width. With this in place, absorption is contract-clean for any trailing
+    pad size, and the previous dummy-slot extension workaround is no longer
+    needed. Verified safe via
+    ``/opt/Automodel/te_bug_report/te_thd_repro_MINIMAL.py``: TE handles
+    a 576-wide slot cleanly when given truthful ``max_seqlen=576``.
     """
 
-    def test_short_microbatch_extends_with_dummy_slots(self):
-        """Captured failing case: 5 sub-seqs of 112 in a 1024-pack.
-
-        Trailing pad is 1024 - 5*112 = 464 > max_seqlen=112. Neither
-        absorbing into the last slot (creates a 576-token slot the kernel
-        can't handle) nor ``pad_between_seqs=True`` (cuDNN OOB) is safe.
-        Instead, EXTEND ``cu_seqlens`` with dummy max_seqlen-sized slots
-        that span the trailing pack-pad region.
+    def test_short_microbatch_absorbs_with_truthful_max_seqlen(self):
+        """Captured failing case (5×112 + 464 trailing pad): the absorbed
+        cu_seqlens last slot is 576 wide. ``max_seqlen`` must reflect that
+        post-absorption width, not the pre-absorption 112.
         """
         packed = 1024
         sub = 112
@@ -574,37 +577,30 @@ class TestTrailingPadAbsorption:
         }
         result = process_input_for_thd(batch)
 
-        # cu_seqlens is extended with dummy slots. Trailing pad = 464:
-        # 4 full dummy slots of 112 (4*112=448), then a 16-token remainder slot.
-        # Original 5 real sub-seqs cover [0..560]; extension adds [672, 784,
-        # 896, 1008, 1024]. Total 10 sub-seqs, each ≤ max_seqlen=112.
-        expected_cu = torch.tensor(
-            [0, 112, 224, 336, 448, 560, 672, 784, 896, 1008, 1024],
-            dtype=torch.int32,
-        )
+        # Absorption fires → cu_seqlens = [0,112,224,336,448,1024];
+        # last slot is 576 (real 112 + trailing pad 464).
+        expected_cu = torch.tensor([0, 112, 224, 336, 448, 1024], dtype=torch.int32)
         assert torch.equal(result["cu_seqlens"], expected_cu), (
-            f"cu_seqlens should be extended with dummy slots; "
+            f"cu_seqlens should be absorbed: expected {expected_cu.tolist()}, "
             f"got {result['cu_seqlens'].tolist()}"
         )
-        # All slot widths ≤ max_seqlen (kernel-safe).
-        widths = result["cu_seqlens"][1:] - result["cu_seqlens"][:-1]
-        assert widths.max().item() <= 112, f"slot widths exceed max_seqlen: {widths.tolist()}"
-        # No pad_between_seqs path needed.
-        assert "cu_seqlens_padded" not in result, (
-            "cu_seqlens_padded should be dropped after dummy-slot extension"
+        # cu_seqlens_padded is dropped (equal to cu_seqlens, gated out).
+        assert "cu_seqlens_padded" not in result
+        # CRITICAL: max_seqlen reflects the absorbed slot width (576), not
+        # the pre-absorption max real sub-seq length (112). This is what
+        # makes the layout TE-contract-clean.
+        assert int(result["max_seqlen"].item()) == 576, (
+            f"max_seqlen should reflect post-absorption slot width 576; "
+            f"got {int(result['max_seqlen'].item())}"
         )
-        # max_seqlen unchanged.
-        assert int(result["max_seqlen"].item()) == 112
 
-    def test_full_microbatch_still_absorbs(self):
-        """Common-case smoke (steps 0-4): pack is nearly full, trailing pad
-        small. Absorption must still fire to keep TE on its faster code
-        path (no pad_between_seqs=True).
+    def test_full_microbatch_absorbs_with_bumped_max_seqlen(self):
+        """Common-case (9×112 + 16 trailing pad): absorption fires and
+        ``max_seqlen`` reflects the absorbed last slot (128), not the
+        pre-absorption max (112). The full-pack perf path is preserved.
         """
         packed = 1024
         sub = 112
-        # 9 real sub-seqs, last one inflated by 16 trailing pack pad.
-        # cumsum(real)=1008; cumsum(padded)=1024; trailing_pad=16 <= max_seqlen=112.
         seq_lens = torch.tensor([[sub] * 9])
         seq_lens_padded = torch.tensor([[sub] * 8 + [sub + 16]])
         batch = {
@@ -618,17 +614,20 @@ class TestTrailingPadAbsorption:
 
         # Absorption fires → cu_seqlens[-1] == packed_size.
         assert int(result["cu_seqlens"][-1].item()) == packed
-        # cu_seqlens_padded is NOT emitted (it's equal to cu_seqlens, gated
-        # out by the emit check).
+        # cu_seqlens_padded dropped.
         assert "cu_seqlens_padded" not in result, (
             "cu_seqlens_padded should be omitted when absorption fired"
         )
+        # max_seqlen reflects the absorbed last slot width = 112 + 16 = 128.
+        assert int(result["max_seqlen"].item()) == 128, (
+            f"max_seqlen should reflect post-absorption slot 128; "
+            f"got {int(result['max_seqlen'].item())}"
+        )
 
     def test_split_into_chunks_mixed_short_and_full(self):
-        """Two-chunk batch where chunk 0 is a full pack (absorbs) and chunk 1
-        is short (gets extended with dummy slots). Both chunks should end at
-        packed_size and have all slot widths ≤ max_seqlen so the kernel is
-        safe per microbatch.
+        """Two-chunk batch where chunk 0 is a near-full pack (16 trailing
+        pad) and chunk 1 is short (464 trailing pad). Both absorb; their
+        max_seqlen values differ because the absorbed last-slot widths differ.
         """
         packed = 1024
         sub = 112
@@ -650,25 +649,28 @@ class TestTrailingPadAbsorption:
         result = split_batch_into_thd_chunks(batch, num_chunks=2)
 
         assert "cu_seqlens" in result
-        # Both chunks took the absorbed-or-extended path so cu_seqlens_padded
-        # equals cu_seqlens for both — split_batch_into_thd_chunks therefore
-        # omits the padded key (no chunk emits it).
+        # Both chunks absorbed (cu_seqlens_padded == cu_seqlens for both),
+        # so split_batch_into_thd_chunks omits the padded key.
         assert "cu_seqlens_padded" not in result
 
-        # Chunk 0 (absorbed) — last non-sentinel value == packed_size.
+        # Chunk 0 (full pack, absorbed) — last non-sentinel value == packed_size.
         c0_cu = result["cu_seqlens"][0]
         c0_real = c0_cu[c0_cu != -1000]
         assert int(c0_real[-1].item()) == packed
         c0_widths = c0_real[1:] - c0_real[:-1]
-        assert c0_widths.max().item() <= sub + 16  # last absorbed slot = 128
+        assert int(c0_widths.max().item()) == 128  # absorbed last slot
 
-        # Chunk 1 (extended with dummies) — last non-sentinel value == packed_size,
-        # and the cu_seqlens now has MORE entries than just the 5 real sub-seqs.
+        # Chunk 1 (short, absorbed) — last non-sentinel value == packed_size,
+        # absorbed last slot is wider (576).
         c1_cu = result["cu_seqlens"][1]
         c1_real = c1_cu[c1_cu != -1000]
         assert int(c1_real[-1].item()) == packed
-        assert c1_real.numel() > 6, "short microbatch should be extended with dummy slots"
         c1_widths = c1_real[1:] - c1_real[:-1]
-        assert c1_widths.max().item() <= sub, (
-            f"all slot widths must be ≤ max_seqlen={sub}; got {c1_widths.tolist()}"
-        )
+        assert int(c1_widths.max().item()) == 576  # absorbed last slot
+
+        # Per-chunk max_seqlen reflects each chunk's max slot width.
+        # split_batch_into_thd_chunks stacks them, so result["max_seqlen"]
+        # is a tensor of shape (2,).
+        assert result["max_seqlen"].shape == (2,)
+        assert int(result["max_seqlen"][0].item()) == 128
+        assert int(result["max_seqlen"][1].item()) == 576
