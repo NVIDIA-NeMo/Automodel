@@ -186,7 +186,7 @@ def build_model(
     pipeline_config=None,
     cfg_qat=None,
     cfg_moe=None,
-    activation_checkpointing=False,
+    activation_checkpointing: bool | None = None,
     unfreeze_modules: list[str] | None = None,
     sdpa_method: list[str] | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
@@ -206,7 +206,8 @@ def build_model(
         pipeline_config: Pipeline parallelism config.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
         cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
-        activation_checkpointing: Whether to enable activation checkpointing.
+        activation_checkpointing: Whether to enable activation checkpointing. If ``None``,
+            model infrastructure infers from ``distributed_config``.
         unfreeze_modules: List of module names/substrings to unfreeze.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
@@ -222,6 +223,8 @@ def build_model(
             "pipeline_config": pipeline_config,
             "sdpa_method": sdpa_method,
         }
+        if activation_checkpointing is not None:
+            kwargs["activation_checkpointing"] = activation_checkpointing
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
@@ -246,7 +249,6 @@ def build_model(
                 moe_dict.pop("activation_checkpointing", None)
                 moe_dict.pop("_target_", None)
                 kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
-            kwargs["activation_checkpointing"] = activation_checkpointing
 
         if cfg_fp8 is not None:
             kwargs["fp8_config"] = build_fp8_config(cfg_fp8)
@@ -286,7 +288,7 @@ def build_model(
                 pipeline_config=pipeline_config,
                 qat_config=kwargs.get("qat_config"),
                 moe_config=kwargs.get("moe_config"),
-                activation_checkpointing=kwargs.get("activation_checkpointing", False),
+                activation_checkpointing=activation_checkpointing,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
             )
@@ -905,6 +907,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.moe_mesh = self.mesh_context.moe_mesh
         self.pp_enabled = self.mesh_context.pp_enabled
         self.pipeline_config = self.mesh_context.pipeline_config
+        self.activation_checkpointing = self.cfg.get("distributed.activation_checkpointing", False)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -1016,7 +1019,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pipeline_config=self.pipeline_config,
             cfg_qat=self.cfg.get("qat", None),
             cfg_moe=self.mesh_context.moe_config,
-            activation_checkpointing=self.mesh_context.activation_checkpointing,
+            activation_checkpointing=self.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)

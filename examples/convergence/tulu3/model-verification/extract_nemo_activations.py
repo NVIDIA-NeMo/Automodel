@@ -96,6 +96,7 @@ def main():
     apply_cache_compatibility_patches()
     apply_te_patches()
     mesh_context = create_mesh_context_from_config(cfg, world_size=dist_env.world_size)
+    activation_checkpointing = cfg.get("distributed.activation_checkpointing", False)
 
     if mesh_context.cp_size > 1 and cfg.get("model.backend.rope_fusion", False):
         cfg.model.backend.rope_fusion = False
@@ -110,7 +111,7 @@ def main():
         distributed_config=mesh_context.strategy_config,
         pipeline_config=mesh_context.pipeline_config,
         cfg_moe=mesh_context.moe_config,
-        activation_checkpointing=mesh_context.activation_checkpointing,
+        activation_checkpointing=activation_checkpointing,
     )
     model.eval()
 

@@ -64,7 +64,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     - ``strategy_config`` – instantiated strategy dataclass
     - ``pipeline_config`` – :class:`PipelineConfig` or ``None``
     - ``moe_config`` – :class:`MoEParallelizerConfig` or ``None``
-    - ``activation_checkpointing`` – bool
     - ``tp_size``, ``pp_size``, ``cp_size``, ``ep_size``, ``dp_size``,
       ``dp_replicate_size`` – parallelism sizes
     - ``pp_enabled`` – ``True`` when ``pp_size > 1``
@@ -94,7 +93,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
     moe_dict: Optional[dict] = cfg.pop("moe", None)
-    activation_checkpointing: bool = cfg.pop("activation_checkpointing", False)
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
     # ``_convert_``) that may leak from YAML configs.  They have no meaning
@@ -150,9 +148,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     _validate_strategy_kwargs(strategy_name, strategy_cls, strategy_kwargs)
 
-    # Route activation_checkpointing: for non-EP configs it goes on the
-    # strategy config; for EP configs it stays only on MeshContext
-    # (the MoE infra reads it from there).
     ep_size: int = parallelism.get("ep_size") or 1
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
@@ -163,8 +158,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
         moe_dict = None
-    if ep_size <= 1:
-        strategy_kwargs["activation_checkpointing"] = activation_checkpointing
 
     strategy_config = strategy_cls(**strategy_kwargs)
 
@@ -195,7 +188,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         "strategy_config": strategy_config,
         "pipeline_config": pipeline_config,
         "moe_config": moe_config,
-        "activation_checkpointing": activation_checkpointing,
         "pp_enabled": parallelism["pp_size"] > 1,
         **parallelism,
     }
@@ -222,7 +214,6 @@ def create_mesh_context_from_config(
     pp_size: int | None = None,
     cp_size: int | None = None,
     ep_size: int | None = None,
-    activation_checkpointing: bool | None = None,
     pipeline: dict | None = None,
     moe: dict | None = None,
     **strategy_kwargs: Any,
@@ -250,7 +241,6 @@ def create_mesh_context_from_config(
         pp_size: Pipeline-parallel size.
         cp_size: Context-parallel size.
         ep_size: Expert-parallel size.
-        activation_checkpointing: Enable activation checkpointing.
         pipeline: Optional pipeline sub-config.
         moe: Optional MoE parallelizer sub-config.
         **strategy_kwargs: Additional strategy-specific options.
@@ -274,7 +264,6 @@ def create_mesh_context_from_config(
         "pp_size": pp_size,
         "cp_size": cp_size,
         "ep_size": ep_size,
-        "activation_checkpointing": activation_checkpointing,
         "pipeline": pipeline,
         "moe": moe,
     }
@@ -298,5 +287,4 @@ def create_mesh_context_from_config(
         world_size=world_size,
         pipeline_config=parsed["pipeline_config"],
         moe_config=parsed["moe_config"],
-        activation_checkpointing=parsed["activation_checkpointing"],
     )

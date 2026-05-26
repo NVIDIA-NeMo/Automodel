@@ -260,7 +260,7 @@ def instantiate_infrastructure(
     pipeline_config: Optional[PipelineConfig] = None,
     qat_config: Optional[QATConfig] = None,
     moe_config: Optional[MoEParallelizerConfig] = None,
-    activation_checkpointing: bool = False,
+    activation_checkpointing: Optional[bool] = None,
     device: Optional[torch.device] = None,
     mesh: Optional[MeshContext] = None,
     # Deprecated -- prefer passing ``mesh`` directly
@@ -281,7 +281,7 @@ def instantiate_infrastructure(
         qat_config: Quantization-aware training config.
         moe_config: MoE parallelizer config (for expert parallel models).
         activation_checkpointing: Enable activation checkpointing for transformer blocks.
-            Defaults to False.
+            If ``None``, inferred from ``distributed_config.activation_checkpointing``.
         device: Target device for model.
         mesh: MeshContext holding device meshes, sizes, and axis names.
             If None, built from the legacy ``device_mesh`` / ``moe_mesh`` params.
@@ -299,6 +299,9 @@ def instantiate_infrastructure(
     """
     if mesh is None:
         mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+
+    if activation_checkpointing is None:
+        activation_checkpointing = bool(getattr(distributed_config, "activation_checkpointing", False))
 
     ep_size = mesh.ep_size if mesh.ep_size > 1 else ep_size
 

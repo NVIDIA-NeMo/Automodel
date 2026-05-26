@@ -63,7 +63,7 @@ def test_create_mesh_context_accepts_ddp_strategy_name(captured_raw_mesh_call):
     assert isinstance(ctx.strategy_config, DDPConfig)
     assert ctx.strategy_config.backend == "gloo"
     assert ctx.strategy_config.activation_checkpointing is True
-    assert ctx.activation_checkpointing is True
+    assert not hasattr(ctx, "activation_checkpointing")
     assert captured_raw_mesh_call["world_size"] == 4
 
 
@@ -153,7 +153,7 @@ def test_create_mesh_context_defaults_parallel_subconfigs(monkeypatch):
     assert isinstance(ctx.moe_config, MoEParallelizerConfig)
 
 
-def test_create_mesh_context_keeps_ep_activation_checkpointing_on_context(monkeypatch):
+def test_create_mesh_context_keeps_activation_checkpointing_on_strategy_config(monkeypatch):
     device_mesh = _FakeMesh(
         {
             MeshAxisName.PP: 1,
@@ -175,5 +175,5 @@ def test_create_mesh_context_keeps_ep_activation_checkpointing_on_context(monkey
 
     ctx = create_mesh_context("fsdp2", ep_size=2, activation_checkpointing=True, world_size=2)
 
-    assert ctx.activation_checkpointing is True
-    assert ctx.strategy_config.activation_checkpointing is False
+    assert not hasattr(ctx, "activation_checkpointing")
+    assert ctx.strategy_config.activation_checkpointing is True

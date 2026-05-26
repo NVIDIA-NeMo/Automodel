@@ -66,6 +66,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.moe_mesh = self.mesh_context.moe_mesh
         self.pp_enabled = self.mesh_context.pp_enabled
         self.pipeline_config = self.mesh_context.pipeline_config
+        self.activation_checkpointing = self.cfg.get("distributed.activation_checkpointing", False)
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -118,6 +119,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
+            activation_checkpointing=self.activation_checkpointing,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)

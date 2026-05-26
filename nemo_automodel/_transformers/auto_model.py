@@ -114,6 +114,15 @@ _MAX_BUILD_RETRIES = 5
 _remote_code_compat_applied = False
 
 
+def _resolve_activation_checkpointing(
+    distributed_config: Optional[DistributedConfig],
+    activation_checkpointing: Optional[bool],
+) -> bool:
+    if activation_checkpointing is not None:
+        return activation_checkpointing
+    return bool(getattr(distributed_config, "activation_checkpointing", False))
+
+
 def _resolve_mesh_context(
     *,
     device_mesh: Optional[Union["DeviceMesh", MeshContext]],
@@ -139,14 +148,14 @@ def _resolve_mesh_context(
         )
         resolved_pipeline_config = pipeline_config if pipeline_config is not None else device_mesh.pipeline_config
         resolved_moe_config = moe_config if moe_config is not None else device_mesh.moe_config
-        resolved_activation_checkpointing = (
-            device_mesh.activation_checkpointing if activation_checkpointing is None else activation_checkpointing
+        resolved_activation_checkpointing = _resolve_activation_checkpointing(
+            resolved_distributed_config,
+            activation_checkpointing,
         )
         mesh = MeshContext(
             strategy_config=resolved_distributed_config,
             pipeline_config=resolved_pipeline_config,
             moe_config=resolved_moe_config,
-            activation_checkpointing=resolved_activation_checkpointing,
             device_mesh=device_mesh.device_mesh,
             moe_mesh=device_mesh.moe_mesh,
         )
@@ -158,7 +167,7 @@ def _resolve_mesh_context(
             resolved_activation_checkpointing,
         )
 
-    resolved_activation_checkpointing = False if activation_checkpointing is None else activation_checkpointing
+    resolved_activation_checkpointing = _resolve_activation_checkpointing(distributed_config, activation_checkpointing)
     return (
         MeshContext.from_meshes(
             device_mesh,
@@ -166,7 +175,6 @@ def _resolve_mesh_context(
             strategy_config=distributed_config,
             pipeline_config=pipeline_config,
             moe_config=moe_config,
-            activation_checkpointing=resolved_activation_checkpointing,
         ),
         distributed_config,
         pipeline_config,
@@ -698,8 +706,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
                 configuration. Default: None.
             activation_checkpointing (bool | None, default=None): Enable activation checkpointing
-                for transformer blocks to reduce memory usage. If ``None`` and ``device_mesh``
-                is a ``MeshContext``, uses the context value; otherwise defaults to ``False``.
+                for transformer blocks to reduce memory usage. If ``None``, uses
+                ``distributed_config.activation_checkpointing`` when present; otherwise
+                defaults to ``False``.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.

@@ -152,6 +152,7 @@ def _build_teacher_model_with_pp(
     distributed_config,
     pipeline_config: PipelineConfig,
     mesh_context,
+    activation_checkpointing: bool,
 ) -> Any:
     """Build teacher model with same parallelization as student (TP/EP/SP/PP).
 
@@ -170,7 +171,8 @@ def _build_teacher_model_with_pp(
         moe_mesh: MOE mesh for expert parallelism.
         distributed_config: Strategy-specific distributed config.
         pipeline_config: PipelineConfig from the student, used as a template.
-        mesh_context: Mesh context object (provides moe_config, activation_checkpointing).
+        mesh_context: Mesh context object (provides MoE config and meshes).
+        activation_checkpointing: Whether to enable activation checkpointing.
 
     Returns:
         The frozen teacher AutoPipeline with a ``_teacher_logits_capture`` attribute.
@@ -218,7 +220,7 @@ def _build_teacher_model_with_pp(
             pipeline_config=teacher_pipeline_config,
             cfg_qat=None,
             cfg_moe=mesh_context.moe_config,
-            activation_checkpointing=mesh_context.activation_checkpointing,
+            activation_checkpointing=activation_checkpointing,
         )
 
     # Freeze all teacher parameters.
@@ -281,6 +283,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
                 mesh_context=self.mesh_context,
+                activation_checkpointing=self.activation_checkpointing,
             )
             self.teacher_pp = self.teacher_model
             if self.pipeline_config.pp_microbatch_size != self.pipeline_config.pp_batch_size:

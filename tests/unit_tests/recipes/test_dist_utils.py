@@ -228,27 +228,27 @@ class TestMoE:
 
 
 # ---------------------------------------------------------------------------
-# activation_checkpointing routing (EP-aware)
+# activation_checkpointing remains a strategy config field
 # ---------------------------------------------------------------------------
 
 
-class TestActivationCheckpointingRouting:
-    def test_routes_to_strategy_when_no_ep(self):
+class TestActivationCheckpointingParsing:
+    def test_passes_to_strategy_when_no_ep(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": 1})
         assert result["strategy_config"].activation_checkpointing is True
-        assert result["activation_checkpointing"] is True
+        assert "activation_checkpointing" not in result
 
-    def test_not_on_strategy_when_ep_gt_1(self):
+    def test_passes_to_strategy_when_ep_gt_1(self):
         result = parse_distributed_section(
             {"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": 2, "moe": {}}
         )
-        assert result["strategy_config"].activation_checkpointing is False
-        assert result["activation_checkpointing"] is True
+        assert result["strategy_config"].activation_checkpointing is True
+        assert "activation_checkpointing" not in result
 
     def test_defaults_to_false(self):
         result = parse_distributed_section({"strategy": "fsdp2"})
         assert result["strategy_config"].activation_checkpointing is False
-        assert result["activation_checkpointing"] is False
+        assert "activation_checkpointing" not in result
 
     def test_works_with_ddp(self):
         result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": True})
@@ -468,7 +468,7 @@ class TestCreateMeshContextFromConfigWorldSizeAutoDetect:
         assert patched_mesh["ep_size"] == 2
         assert isinstance(result["strategy_config"], FSDP2Config)
         assert isinstance(result["moe_config"], MoEParallelizerConfig)
-        assert result["activation_checkpointing"] is True
+        assert result["strategy_config"].activation_checkpointing is True
 
     def test_programmatic_strategy_alias(self, patched_mesh):
         result = create_mesh_context_from_config(strategy="mfsdp", world_size=1)
