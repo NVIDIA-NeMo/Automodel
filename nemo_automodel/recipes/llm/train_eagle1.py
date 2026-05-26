@@ -44,6 +44,7 @@ from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerMod
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -94,12 +95,34 @@ class TrainEagle1Recipe(BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
+
+        # Optional ``distributed:`` YAML section. Required for targets that
+        # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). Absent =>
+        # original single-GPU-per-rank behavior, preserved for 8B-class dense.
+        target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=True,
-        ).to(self.device)
+        )
+        self.dist_setup = None
+        self.distributed_config = None
+        self.device_mesh = None
+        self.moe_mesh = None
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if self.dist_setup is None:
+            self.target_model = self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagleTargetModel(self.target_model)
 
