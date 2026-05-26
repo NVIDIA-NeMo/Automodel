@@ -1,0 +1,143 @@
+recipe: EmbeddingDistillRecipe
+
+seed: 42
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 4
+  ckpt_every_steps: 500
+  num_epochs: 1
+
+model:
+  _target_: nemo_automodel.components.models.biencoder.student_with_projection.StudentWithProjection.build
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/viraman/ministral3/2B_pruned_model_rank
+  teacher_hidden_size: 3072
+  pooling: last
+  l2_normalize: false
+  capture_layers: [5, 11, 21]
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+teacher_model:
+  _target_: nemo_automodel.components.models.biencoder.student_with_projection.TeacherEmbeddingEncoder.build
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints/best_models/ministral3_3B_bidirectional_instruct_release_lr_2e-6_last_pooling_03-04-150645/LATEST/model/consolidated
+  pooling: last
+  l2_normalize: false
+  capture_layers: [8, 16, 31]
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints/best_models/ministral3_3B_bidirectional_instruct_release_lr_2e-6_last_pooling_03-04-150645/LATEST/model/consolidated
+  add_eos_token: false
+  padding_side: left
+  force_hf: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: bi_encoder
+    data_dir_list:
+      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/nqsh_shuffled_50k.json
+    data_type: train
+    n_passages: 5
+    seed: 42
+    do_shuffle: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderDistillCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    pad_to_multiple_of: 8
+  shuffle: true
+  num_workers: 2
+
+distill_loss:
+  _target_: nemo_automodel.components.loss.embedding_distill.EmbeddingDistillLoss
+  reduction: mean
+
+mse_loss:
+  _target_: nemo_automodel.components.loss.embedding_distill.EmbeddingMSELoss
+  normalize: false
+  reduction: mean
+
+score_loss:
+  _target_: nemo_automodel.components.loss.embedding_distill.ScoreDistillLoss
+  temperature: 0.02
+
+intermediate_loss:
+  _target_: nemo_automodel.components.loss.intermediate_distill.IntermediateDistillLoss
+  layer_pairs:
+    - [5, 8]
+    - [11, 16]
+    - [21, 31]
+  loss_type: mse
+  normalize: false
+
+infonce_loss:
+  _target_: nemo_automodel.components.loss.infonce.InfoNCELoss
+  temperature: 0.05
+  learnable_temperature: false
+  direction: q2d
+  use_in_batch_negatives: true
+  normalize: true
+  cross_device_negatives: true
+
+infonce_distill_loss:
+  _target_: nemo_automodel.components.loss.infonce.InfoNCEDistillLoss
+  temperature: 0.05
+  direction: q2d
+  use_in_batch_negatives: true
+  normalize: true
+  divergence: kl
+  cross_device_negatives: true
+
+distill_loss_weight: 1.0
+mse_loss_weight: 0.1
+score_loss_weight: 1.0
+intermediate_loss_weight: 0.1
+nce_loss_weight: 1.0
+nce_distill_loss_weight: 1.0
+
+layer_pairs:
+  - [5, 8]
+  - [11, 16]
+  - [21, 31]
+projection_lr: null
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1.0e-4
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_warmup_steps: 200
+  lr_decay_style: cosine
+
+clip_grad_norm:
+  max_norm: 1.0
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/portfolios/llmservice/users/viraman/Automodel/runs/retrieval_distill_automodel_full/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true
