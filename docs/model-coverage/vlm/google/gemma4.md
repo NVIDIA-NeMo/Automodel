@@ -13,15 +13,15 @@
 
 ## Available Models
 
-- **Gemma 4 E2B IT** (VL, dense)
-- **Gemma 4 E4B IT** (VL, dense, kv-shared layers)
+- **Gemma 4 E2B IT** (VL, dense, kv-shared layers)
+- **Gemma 4 E4B IT** (VL, dense, kv-shared layers), **Gemma 4 E4B IT Assistant** (Assistant/drafter model for MTP)
 - **Gemma 4 31B IT** (VL, dense)
 - **Gemma 4 26B-A4B IT** (VL, MoE)
 
 ## Architecture
 
 - `Gemma4ForConditionalGeneration`
-- `Gemma4AssistantForCausalLM` (MTP drafter / assistant head for speculative decoding; co-trainable with the target Gemma 4 base via `Gemma4WithDrafter`)
+- `Gemma4AssistantForCausalLM` (MTP drafter / assistant for speculative decoding; co-trainable with the target Gemma 4 base via `Gemma4WithDrafter`)
 
 ## Example HF Models
 
