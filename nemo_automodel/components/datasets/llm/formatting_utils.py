@@ -639,7 +639,9 @@ def format_chat_template(
             seq_length=seq_length,
         )
         # _build_reasoning_mask also computes from unpadded lengths.
-        reasoning_mask = _maybe_shift_mask_for_left_padding(reasoning_mask, tokenizer, tokenized_chat.get("attention_mask"))
+        reasoning_mask = _maybe_shift_mask_for_left_padding(
+            reasoning_mask, tokenizer, tokenized_chat.get("attention_mask")
+        )
         mask = [assistant if not reasoning else 0 for assistant, reasoning in zip(mask, reasoning_mask)]
 
     return _package_tokenized_example(
