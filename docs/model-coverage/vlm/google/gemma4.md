@@ -21,6 +21,7 @@
 ## Architecture
 
 - `Gemma4ForConditionalGeneration`
+- `Gemma4AssistantForCausalLM` (MTP drafter / assistant head for speculative decoding; co-trainable with the target Gemma 4 base via `Gemma4WithDrafter`)
 
 ## Example HF Models
 
