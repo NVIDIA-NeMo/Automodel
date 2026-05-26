@@ -167,9 +167,6 @@ class NemotronV3Model(nn.Module):
         # attention layers pick the THD branch. Other attention backends
         # (sdpa, flex) only support 4D BSHD, so leave hidden_states as
         # [B, S, H] and rely on cu_seqlens for mamba's seq_idx alone.
-        # NB: TE attention + packing under PP is currently broken on this
-        # container's cuDNN (err 700 in fused_attn_arbitrary_seqlen_bwd);
-        # see the smoke YAML for the workaround.
         _attn_impl = getattr(getattr(self, "backend", None), "attn", None)
         squeezed_for_thd = False
         if (
@@ -186,12 +183,10 @@ class NemotronV3Model(nn.Module):
         # ``seq_idx`` is what Mamba consumes for per-token segment boundaries.
         # Under neat packing it's derived in the outer ``NemotronHForCausalLM``
         # forward from ``_packed_seq_ids`` and threaded down via kwargs.
-        # PP+packing (THD path): cu_seqlens is per-batch and its leading dim
-        # is ``num_seqs+1`` (not batch), so PyTorch's PP schedule cannot chunk
-        # it as a kwarg. The first stage receives cu_seqlens via packed-
-        # collate; subsequent stages do not. Rebuild it from a 2D indexed
-        # attention_mask when missing. Skip this when attention_mask is the
-        # neat 4D mask (seq_idx is already built upstream from _packed_seq_ids).
+        # Non-THD path (no THD collator) doesn't emit ``cu_seqlens`` — recover
+        # it from a 2D indexed attention_mask so mamba's seq_idx derivation
+        # has something to work with. Skipped when attention_mask is the neat
+        # 4D bool mask (seq_idx is already built upstream from _packed_seq_ids).
         if (
             "cu_seqlens" not in kwargs
             and attention_mask is not None
@@ -202,18 +197,16 @@ class NemotronV3Model(nn.Module):
             kwargs["cu_seqlens"] = F.pad(seq_lens.cumsum(0).to(torch.int32), (1, 0))
 
         # Normalize cu_seqlens / cu_seqlens_padded / max_seqlen to 1D / 0D.
-        # PyTorch PP chunks positional args along dim 0 but broadcasts kwargs
-        # unchunked, so non-first stages receive these tensors with an extra
-        # leading dim. Downstream ``torch.searchsorted`` and TE both require
-        # 1D here. Clone to a contiguous fresh tensor so the values survive
-        # the TE backward (PP may free view-backed kwarg storage).
-        # THD collator right-pads per-microbatch cu_seqlens rows with the
-        # sentinel ``-1000`` so the 2D tensor is rectangular across chunks
-        # (see ``thd_utils.split_batch_into_thd_chunks.pad_and_stack``).
-        # After PP/CP chunking, a per-microbatch row reaches us as ``[1, K]``
-        # and must be (a) squeezed to 1D and (b) stripped of any trailing
-        # sentinels before being handed to TE attention or to mamba's
-        # ``torch.searchsorted`` in ``layers.py``. Otherwise the kernel sees
+        # The THD collator emits per-microbatch rows stacked as
+        # ``[num_microbatches, max_K]`` (cu_seqlens / _padded) and
+        # ``[num_microbatches]`` (max_seqlen), with ``-1000`` right-padding on
+        # cu_seqlens rows so they're rectangular across chunks with differing
+        # sub-seq counts (see ``thd_utils.split_batch_into_thd_chunks.pad_and_stack``).
+        # PyTorch PP then ``tensor_split``-chunks along dim 0, so each stage
+        # forward receives ``[1, max_K]`` (cu_seqlens) and ``[1]`` (max_seqlen).
+        # Squeeze to 1D / 0D, strip any sentinel right-pad, and clone to a
+        # fresh contiguous tensor so the values survive the TE backward (PP
+        # may free view-backed kwarg storage). Otherwise the kernel sees
         # ``-1000`` boundaries and either writes OOB (TE cuDNN-fused-attn-bwd
         # on a 576-token "phantom" sub-seq) or computes garbage seq_idx
         # (mamba).
@@ -231,8 +224,6 @@ class NemotronV3Model(nn.Module):
         _ms = kwargs.get("max_seqlen")
         if isinstance(_ms, torch.Tensor) and _ms.dim() >= 1 and _ms.numel() == 1:
             kwargs["max_seqlen"] = _ms.flatten()[0].clone()
-
-        # TODO: attention mask currently does not work. A default causal mask is applied.
 
         # Get 4D causal mask for attention layers (from precomputed masks).
         causal_mask = causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else None
@@ -791,10 +782,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             ):
                 if _k in kwargs:
                     _v = kwargs[_k]
-                    # TE THD path expects 1D ``[num_seqs+1]`` cu_seqlens. PP
-                    # may broadcast our kwarg unchunked as ``[1, num_seqs+1]``;
-                    # the inner backbone forward already normalizes for its
-                    # own use, but we re-normalize for the MTP call chain.
+                    # TE THD path expects 1D ``[num_seqs+1]`` cu_seqlens. The
+                    # THD collator emits stacked ``[num_microbatches, K]``
+                    # rows that PP ``tensor_split``s along dim 0, so each
+                    # per-microbatch row reaches us as ``[1, K]``. The inner
+                    # backbone forward already normalizes for its own use,
+                    # but we re-normalize for the MTP call chain.
                     if _k in ("cu_seqlens", "cu_seqlens_padded", "seq_idx") and isinstance(_v, torch.Tensor):
                         if _v.dim() == 2 and _v.shape[0] == 1:
                             _v = _v.squeeze(0)
