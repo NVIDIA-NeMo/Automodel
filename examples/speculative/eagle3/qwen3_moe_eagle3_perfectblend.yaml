@@ -6,17 +6,19 @@ dist_env:
 
 # FSDP2 sharding for the target. Qwen3-30B-A3B is ~60GB in bf16, which
 # does not fit on a single 80GB GPU once the draft, activations, and
-# optimizer state are added. With ``strategy: fsdp2`` and the default
-# ``dp_size`` (= world_size), each rank holds 1/N of the target weights;
-# the forward pass gathers per layer and immediately reshards.
-# ``activation_checkpointing: true`` keeps memory headroom for the
-# TTT-unrolled draft forwards on top of the target forward.
+# optimizer state are added. ``ep_size: 8`` splits the 128 experts across
+# 8 ranks (16 experts per rank), and ``dp_size`` defaults to
+# ``world_size // ep_size`` -- each DP rank holds 1/dp_size of the
+# non-expert target weights, gathered per layer and immediately reshared
+# in the forward pass. ``activation_checkpointing: true`` keeps memory
+# headroom for the TTT-unrolled draft forwards on top of the target
+# forward. EP8 was validated end-to-end on an 8xH100 node.
 distributed:
   strategy: fsdp2
   tp_size: 1
   pp_size: 1
   cp_size: 1
-  ep_size: 1
+  ep_size: 8
   activation_checkpointing: true
 
 recipe_args:

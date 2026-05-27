@@ -6,12 +6,15 @@ dist_env:
 
 # FSDP2 sharding for the target. Qwen3-30B-A3B is ~60GB in bf16; without
 # sharding every rank would replicate the full target and OOM on 80GB.
+# ``ep_size: 8`` splits the 128 experts across 8 ranks (16 experts each);
+# the remaining non-expert weights are FSDP-sharded across the
+# ``world_size // ep_size`` DP ranks.
 distributed:
   strategy: fsdp2
   tp_size: 1
   pp_size: 1
   cp_size: 1
-  ep_size: 1
+  ep_size: 8
   activation_checkpointing: true
 
 recipe_args:
