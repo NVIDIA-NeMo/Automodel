@@ -301,10 +301,13 @@ class LinearLoRA(nn.Linear):
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
 
+            print(f"forward: use_memory_efficient_lora={getattr(self, 'use_memory_efficient_lora', False)}")
+            _use_mem_efficient = self._should_use_memory_efficient_lora(x)
+            print(f"forward: _should_use_memory_efficient_lora={_use_mem_efficient}")
             # Apply scale before lora_B to keep lora_res as a Partial tensor.
             # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
             # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
-            if self._should_use_memory_efficient_lora(x):
+            if _use_mem_efficient:
                 lora_res = LoRATritonFunction.apply(
                     x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, False
                 )
