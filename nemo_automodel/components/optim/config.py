@@ -66,31 +66,6 @@ class OptimizerConfig:
         """Return the full kwargs dict for the optimizer constructor."""
         return {"lr": self.lr, "weight_decay": self.weight_decay, **self.extra_kwargs}
 
-    @classmethod
-    def from_name(cls, name: str, **kwargs: Any) -> OptimizerConfig:
-        """Create the appropriate typed config from an optimizer name string.
-
-        Looks up ``name`` in the optimizer registry.  Known optimizers
-        return a typed subclass (e.g. ``AdamWConfig``) with full field
-        validation.  Unknown optimizers return a base ``OptimizerConfig``
-        with extra fields in ``extra_kwargs``.
-
-        Args:
-            name: Dotted import path (e.g. ``"torch.optim.AdamW"``).
-            **kwargs: Optimizer hyper-parameters (``lr``, ``betas``, etc.).
-
-        Returns:
-            Typed ``OptimizerConfig`` subclass, or the generic base.
-        """
-        config_cls = _OPTIMIZER_REGISTRY.get(name, None)
-        if config_cls is None:
-            # Unknown optimizer — split known base fields from extra
-            base_fields = {"lr", "weight_decay"}
-            base_kwargs = {k: v for k, v in kwargs.items() if k in base_fields}
-            extra = {k: v for k, v in kwargs.items() if k not in base_fields}
-            return OptimizerConfig(name=name, extra_kwargs=extra, **base_kwargs)
-        return config_cls(name=name, **kwargs)
-
 
 @dataclass
 class AdamConfig(OptimizerConfig):
@@ -305,43 +280,6 @@ class LRSchedulerConfig:
     override_opt_param_scheduler: bool = False
     wsd_decay_steps: int | None = None
     lr_wsd_decay_style: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Registry — maps dotted name → typed config subclass
-# ---------------------------------------------------------------------------
-
-_OPTIMIZER_REGISTRY: dict[str, type[OptimizerConfig]] = {
-    "torch.optim.Adam": AdamConfig,
-    "torch.optim.AdamW": AdamWConfig,
-    "transformer_engine.pytorch.optimizers.FusedAdam": FusedAdamConfig,
-    "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam": FusedAdamConfig,
-    "flashoptim.FlashAdamW": FlashAdamWConfig,
-    "dion.Muon": MuonConfig,
-}
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-
-def _resolve_optimizer(name: str) -> Any:
-    """Resolve a dotted path to an optimizer class.
-
-    ``"torch.optim.AdamW"`` → ``torch.optim.AdamW``
-    """
-    import importlib
-
-    parts = name.rsplit(".", 1)
-    if len(parts) != 2:
-        raise ValueError(f"Expected a dotted path like 'torch.optim.AdamW', got '{name}'")
-    module_path, cls_name = parts
-    module = importlib.import_module(module_path)
-    cls = getattr(module, cls_name, None)
-    if cls is None:
-        raise ImportError(f"Cannot find '{cls_name}' in module '{module_path}'")
-    return cls
 
 
 __all__ = [

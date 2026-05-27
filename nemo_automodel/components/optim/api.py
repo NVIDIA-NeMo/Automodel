@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
-from nemo_automodel.components.optim.config import LRSchedulerConfig, OptimizerConfig, _resolve_optimizer
+from nemo_automodel.components.optim.config import LRSchedulerConfig, OptimizerConfig
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.shared.utils import dtype_from_str
@@ -73,7 +73,12 @@ def build_optimizer(
         List of optimizers, one per model part.
     """
     if config is not None:
-        optimizer_factory = _resolve_optimizer(config.name)
+        if optimizer_factory is None:
+            raise ValueError(
+                "When using OptimizerConfig, optimizer_factory must also be provided. "
+                "The component layer does not resolve dotted paths — "
+                "pass the optimizer class directly (e.g. torch.optim.AdamW)."
+            )
         optimizer_kwargs = config.to_kwargs()
     elif optimizer_factory is None:
         raise ValueError("Either config or optimizer_factory must be provided")

@@ -14,8 +14,6 @@
 
 """Tests for nemo_automodel.components.optim.config — OptimizerConfig hierarchy + LRSchedulerConfig."""
 
-import pytest
-
 from nemo_automodel.components.optim.config import (
     AdamConfig,
     AdamWConfig,
@@ -24,39 +22,7 @@ from nemo_automodel.components.optim.config import (
     LRSchedulerConfig,
     MuonConfig,
     OptimizerConfig,
-    _resolve_optimizer,
 )
-
-# ---------------------------------------------------------------------------
-# _resolve_optimizer
-# ---------------------------------------------------------------------------
-
-
-class TestResolveOptimizer:
-    def test_resolve_torch_adamw(self):
-        import torch
-
-        cls = _resolve_optimizer("torch.optim.AdamW")
-        assert cls is torch.optim.AdamW
-
-    def test_resolve_torch_sgd(self):
-        import torch
-
-        cls = _resolve_optimizer("torch.optim.SGD")
-        assert cls is torch.optim.SGD
-
-    def test_resolve_bad_path_no_dot(self):
-        with pytest.raises(ValueError, match="Expected a dotted path"):
-            _resolve_optimizer("AdamW")
-
-    def test_resolve_bad_module(self):
-        with pytest.raises(ImportError):
-            _resolve_optimizer("nonexistent.module.Foo")
-
-    def test_resolve_bad_class(self):
-        with pytest.raises(ImportError, match="Cannot find"):
-            _resolve_optimizer("torch.optim.NonExistentOptimizer")
-
 
 # ---------------------------------------------------------------------------
 # OptimizerConfig base
@@ -157,54 +123,6 @@ class TestMuonConfig:
         assert kwargs["mu"] == 0.9
         assert kwargs["scalar_betas"] == (0.8, 0.99)
         assert kwargs["adjust_lr"] == "spectral_norm"
-
-
-# ---------------------------------------------------------------------------
-# from_name registry dispatch
-# ---------------------------------------------------------------------------
-
-
-class TestFromName:
-    def test_known_adamw(self):
-        cfg = OptimizerConfig.from_name("torch.optim.AdamW", lr=1e-3, betas=(0.9, 0.95))
-        assert isinstance(cfg, AdamWConfig)
-        assert cfg.lr == 1e-3
-        assert cfg.betas == (0.9, 0.95)
-
-    def test_known_adam(self):
-        cfg = OptimizerConfig.from_name("torch.optim.Adam", lr=2e-4)
-        assert isinstance(cfg, AdamConfig)
-        assert cfg.lr == 2e-4
-
-    def test_known_fused_adam_long_path(self):
-        cfg = OptimizerConfig.from_name("transformer_engine.pytorch.optimizers.fused_adam.FusedAdam")
-        assert isinstance(cfg, FusedAdamConfig)
-
-    def test_known_fused_adam_short_path(self):
-        cfg = OptimizerConfig.from_name("transformer_engine.pytorch.optimizers.FusedAdam")
-        assert isinstance(cfg, FusedAdamConfig)
-
-    def test_known_muon(self):
-        cfg = OptimizerConfig.from_name("dion.Muon", lr=5e-4, mu=0.9)
-        assert isinstance(cfg, MuonConfig)
-        assert cfg.mu == 0.9
-
-    def test_known_flash_adamw(self):
-        cfg = OptimizerConfig.from_name("flashoptim.FlashAdamW", master_weight_bits=16)
-        assert isinstance(cfg, FlashAdamWConfig)
-        assert cfg.master_weight_bits == 16
-
-    def test_unknown_optimizer_fallback(self):
-        cfg = OptimizerConfig.from_name("some.custom.Optimizer", lr=1e-4, momentum=0.9, nesterov=True)
-        assert type(cfg) is OptimizerConfig
-        assert cfg.name == "some.custom.Optimizer"
-        assert cfg.lr == 1e-4
-        assert cfg.extra_kwargs == {"momentum": 0.9, "nesterov": True}
-
-    def test_unknown_optimizer_weight_decay(self):
-        cfg = OptimizerConfig.from_name("some.custom.Optimizer", lr=1e-4, weight_decay=0.05)
-        assert cfg.weight_decay == 0.05
-        assert "weight_decay" not in cfg.extra_kwargs
 
 
 # ---------------------------------------------------------------------------
