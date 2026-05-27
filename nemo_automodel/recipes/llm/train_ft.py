@@ -184,6 +184,7 @@ def build_model(
     cfg_qat=None,
     unfreeze_modules: list[str] | None = None,
     sdpa_method: list[str] | None = None,
+    device_mesh=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -201,6 +202,7 @@ def build_model(
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
+        device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
@@ -210,6 +212,8 @@ def build_model(
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
+        elif device_mesh is not None:
+            kwargs["device_mesh"] = device_mesh
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
