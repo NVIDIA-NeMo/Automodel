@@ -473,7 +473,7 @@ YAML parsing:
 ```
 recipes/_dist_utils.py
     parse_distributed_section()  -- YAML dict -> typed configs + sizes
-    create_mesh_context_from_config()          -- recipe adapter: parse + create MeshContext; does not init process group
+    create_distributed_setup_from_config()  -- recipe adapter: parse + create DistributedSetup; does not init process group
 ```
 
 MoE config:
