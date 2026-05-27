@@ -236,17 +236,24 @@ class LinearLoRA(nn.Linear):
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
         if not getattr(self, "use_memory_efficient_lora", False):
+            print("_should_use_memory_efficient_lora=False: use_memory_efficient_lora is not set")
             return False
         if isinstance(x, DTensor):
+            print("_should_use_memory_efficient_lora=False: input x is a DTensor")
             return False
         if isinstance(getattr(self.lora_A, "weight", None), DTensor):
+            print("_should_use_memory_efficient_lora=False: lora_A.weight is a DTensor")
             return False
         if isinstance(getattr(self.lora_B, "weight", None), DTensor):
+            print("_should_use_memory_efficient_lora=False: lora_B.weight is a DTensor")
             return False
         if torch.compiler.is_compiling():
+            print("_should_use_memory_efficient_lora=False: torch.compiler is currently compiling")
             return False
         if HAS_TE and isinstance(getattr(self, "lora_A", None), transformer_engine.pytorch.Linear):
+            print("_should_use_memory_efficient_lora=False: lora_A is a TransformerEngine Linear")
             return False
+        print("_should_use_memory_efficient_lora=True: all conditions passed")
         return True
 
     def forward(self, x):
