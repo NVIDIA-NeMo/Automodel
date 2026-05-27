@@ -786,7 +786,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                         _cu1d = _cu.squeeze(0) if (_cu.dim() == 2 and _cu.shape[0] == 1) else _cu
                         if _cu1d.dim() == 1:
                             _positions = torch.arange(_S, device=_cu1d.device)
-                            _seq_idx_1d = torch.searchsorted(_cu1d[1:].contiguous(), _positions).to(torch.int32)
+                            # ``right=True`` so a position equal to a boundary
+                            # (first token of sub-seq k, position == cu_seqlens[k])
+                            # maps to k, not k-1 — matches mtp.py and layers.py.
+                            _seq_idx_1d = torch.searchsorted(_cu1d[1:].contiguous(), _positions, right=True).to(
+                                torch.int32
+                            )
                             _seq_idx_tail = _seq_idx_1d.unsqueeze(0).expand(_B, _S).contiguous()
                 if not isinstance(_seq_idx_tail, torch.Tensor):
                     _seq_idx_tail = torch.ones((_B, _S), dtype=torch.int32, device=logits.device)
