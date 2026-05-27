@@ -54,7 +54,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yam
 
 Refer to the [NeMo AutoModel Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
-## Fine-Tuning
+## Fine-Tune the Model
 
 See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
 
