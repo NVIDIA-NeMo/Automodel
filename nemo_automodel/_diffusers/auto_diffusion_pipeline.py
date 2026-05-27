@@ -272,7 +272,7 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
 
         distributed_setup = DistributedSetup.build(
             strategy=FSDP2Config(
-                mp_policy=args.get("mp_policy", None),
+                mp_policy=args["mp_policy"] if "mp_policy" in args else None,
                 sequence_parallel=args.get("sequence_parallel", False),
                 tp_plan=args.get("tp_plan", None),
                 patch_is_packed_sequence=args.get("patch_is_packed_sequence", False),
