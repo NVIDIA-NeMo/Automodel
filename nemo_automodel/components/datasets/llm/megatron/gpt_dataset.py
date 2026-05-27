@@ -29,7 +29,7 @@ import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _get_right_trailing_pad_mask
-from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import IndexedDataset
+from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import IndexedDataset, ObjectStorageConfig
 
 # taken and modified from https://github.com/NVIDIA/Megatron-LM/blob/5e798111e60f45e82c336ef7b89d8d793c93208f/megatron/core/datasets/gpt_dataset.py
 logger = logging.getLogger(__name__)
@@ -102,6 +102,11 @@ class BlendedMegatronDatasetConfig:
        if the top level dataset oversamples the mid level dataset(s). This value may be set to 0.0
        in future if the top level dataset is constrained to not oversample the mid level
        datasets(s).
+    """
+
+    object_storage_config: Optional[ObjectStorageConfig] = None
+    """When set, the .idx files are downloaded to path_to_idx_cache and .bin files are streamed
+       from S3/MSC via chunked GETs. mmap_bin_files is automatically overridden to False.
     """
 
     def __post_init__(self) -> None:
@@ -360,7 +365,13 @@ class GPTDataset(torch.utils.data.Dataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
-        return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
+        use_mmap = config.mmap_bin_files and config.object_storage_config is None
+        return IndexedDataset(
+            dataset_path,
+            multimodal=False,
+            mmap=use_mmap,
+            object_storage_config=config.object_storage_config,
+        )
 
     def __len__(self) -> int:
         """Abstract method implementation

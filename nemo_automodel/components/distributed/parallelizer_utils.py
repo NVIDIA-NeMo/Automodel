@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Iterator, List, Optional, Set, Tuple, Union
+from copy import copy
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
+    MixedPrecisionPolicy,
+    OffloadPolicy,
     fully_shard,
 )
 
@@ -86,8 +90,8 @@ def iter_maximal_uniform_dtype_subtrees(
         yield it
 
 
-def _group_params_by_dtype(layer):
-    ans = {}
+def _group_params_by_dtype(layer: nn.Module) -> Dict[torch.dtype, List[nn.Parameter]]:
+    ans: Dict[torch.dtype, List[nn.Parameter]] = {}
     for name, param in layer.named_parameters():
         if param.dtype not in ans:
             ans[param.dtype] = []
@@ -95,13 +99,18 @@ def _group_params_by_dtype(layer):
     return ans
 
 
-def _get_module_from_path(layer, path):
+def _get_module_from_path(layer: nn.Module, path: str) -> nn.Module:
     for name in path.split("."):
         layer = getattr(layer, name)
     return layer
 
 
-def _fully_shard(module, mesh, mp_policy, offload_policy):
+def _fully_shard(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    mp_policy: Optional[MixedPrecisionPolicy],
+    offload_policy: Optional[OffloadPolicy],
+) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
             _fully_shard(layer, mesh, mp_policy, offload_policy)
@@ -109,7 +118,23 @@ def _fully_shard(module, mesh, mp_policy, offload_policy):
         fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
 
 
-def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
+def _mp_policy_with_param_dtype(
+    mp_policy: Optional[MixedPrecisionPolicy],
+    param_dtype: torch.dtype,
+) -> Optional[MixedPrecisionPolicy]:
+    if mp_policy is None:
+        return None
+    mp_policy_copy = copy(mp_policy)
+    object.__setattr__(mp_policy_copy, "param_dtype", param_dtype)
+    return mp_policy_copy
+
+
+def fully_shard_by_dtype(
+    module: nn.Module,
+    mesh: DeviceMesh,
+    mp_policy: Optional[MixedPrecisionPolicy],
+    offload_policy: Optional[OffloadPolicy],
+) -> None:
     """Fully shard a module, splitting mixed-dtype subtrees when needed."""
     # calling _group_params_by_dtype is not optimal here, because we may
     # end up with two traversals over the module, but this code is not in the hot path.
@@ -117,7 +142,13 @@ def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
     if len(grouped_params) == 0:
         return
     elif len(grouped_params) == 1:
-        fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+        dtype = next(iter(grouped_params))
+        fully_shard(
+            module,
+            mesh=mesh,
+            mp_policy=_mp_policy_with_param_dtype(mp_policy, dtype),
+            offload_policy=offload_policy,
+        )
     else:
         least_items_dtype = min(grouped_params.items(), key=lambda x: len(x[1]))[0]
         for path, mod, dtype in iter_maximal_uniform_dtype_subtrees(
@@ -129,8 +160,14 @@ def fully_shard_by_dtype(module, mesh, mp_policy, offload_policy):
                 _fully_shard(
                     _get_module_from_path(module, path),
                     mesh=mesh,
-                    mp_policy=mp_policy,
+                    mp_policy=_mp_policy_with_param_dtype(mp_policy, dtype),
                     offload_policy=offload_policy,
                 )
         if len(grouped_params) == 2:
-            fully_shard(module, mesh=mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+            parent_dtype = next(dtype for dtype in grouped_params if dtype != least_items_dtype)
+            fully_shard(
+                module,
+                mesh=mesh,
+                mp_policy=_mp_policy_with_param_dtype(mp_policy, parent_dtype),
+                offload_policy=offload_policy,
+            )

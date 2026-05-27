@@ -39,6 +39,42 @@ _DSV4_FP32_MODULE_SUFFIXES = (
 )
 
 
+def _hca_param_sync_group_from_1d_mesh(mesh):
+    """Return the 1D PyTorch FSDP2 group used for HCA graph alignment.
+
+    HCA graph alignment is an FSDP/FSDP2 parameter-sync invariant: ranks that
+    synchronize the same sharded HCA parameters must agree on whether the HCA
+    compressor path participates in backward. This DeepSeek-V4 wrapper gets
+    that domain from its 1D PyTorch FSDP2 mesh. The mesh may be named or
+    unnamed; multi-dimensional meshes need an explicit owner dimension to avoid
+    reducing across unrelated parallel groups. Until that is available, disable
+    HCA graph alignment instead of using a broader or wrong group.
+    """
+    if mesh is None:
+        return None
+
+    mesh_ndim = getattr(mesh, "ndim", None)
+    mesh_shape = getattr(mesh, "shape", None)
+    mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+    if mesh_ndim is not None:
+        is_1d_mesh = mesh_ndim == 1
+    elif mesh_shape is not None:
+        is_1d_mesh = len(mesh_shape) == 1
+    elif mesh_dim_names is not None:
+        is_1d_mesh = len(mesh_dim_names) == 1
+    else:
+        return None
+    if not is_1d_mesh:
+        return None
+
+    try:
+        if mesh.size() <= 1:
+            return None
+        return mesh.get_group()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _matches_suffix(name: str, suffix: str) -> bool:
     return name == suffix or name.endswith(f".{suffix}")
 
@@ -131,6 +167,17 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
         yield submodule
 
 
+def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
+    process_group = _hca_param_sync_group_from_1d_mesh(mesh)
+    for submodule in module.modules():
+        setter = getattr(submodule, "_set_hca_param_sync_group", None)
+        if submodule.__class__.__name__ == "DeepseekV4Compressor" and setter is not None:
+            # The FSDP2 mesh is only known while wrapping. Bind its parameter
+            # sync group narrowly to the DeepSeek-V4 HCA compressor instead of
+            # adding public config.
+            setter(process_group)
+
+
 def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
     """Apply FSDP2 to DeepSeek-V4 without mixing fp32 and bf16 params in one unit.
 
@@ -138,6 +185,10 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     reference-sensitive tensors in fp32, while the existing DeepEP path expects
     the transformer block itself to remain the main FSDP unit.
     """
+    is_dsv4 = _is_deepseek_v4_module(module)
+    if is_dsv4:
+        _attach_hca_param_sync_group(module, mesh)
+
     if _floating_param_dtypes(module) == {torch.float32}:
         return _fully_shard_once(
             module,
@@ -148,7 +199,7 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
             **fsdp_kwargs,
         )
 
-    if not _is_deepseek_v4_module(module):
+    if not is_dsv4:
         return _fully_shard_once(
             module,
             mesh=mesh,

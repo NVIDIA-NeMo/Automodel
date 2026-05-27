@@ -1,0 +1,51 @@
+---
+title: "Vision Language Models (VLMs)"
+description: ""
+position: 4
+---
+## Introduction
+
+Vision Language Models (VLMs) integrate vision and language processing capabilities, enabling models to understand images and generate text descriptions, answer visual questions, and perform multimodal reasoning.
+
+NeMo AutoModel LLM APIs can be easily extended to support VLM tasks. While most of the training setup is the same as for LLMs, some additional steps are required to prepare the data and model for VLM training.
+
+## Run VLMs with NeMo AutoModel
+
+To run VLMs with NeMo AutoModel, use NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you want to fine-tune requires a newer version of Transformers, you may need to upgrade:
+
+```bash
+pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
+```
+
+For other installation options, see our [Installation Guide](/get-started/installation).
+
+## Supported Models
+
+NeMo AutoModel supports [AutoModelForImageTextToText](https://huggingface.co/docs/transformers/main/model_doc/auto#transformers.AutoModelForImageTextToText) in the [Image-Text-to-Text](https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending) category.
+
+| Owner | Model | Architectures |
+|---|---|---|
+| Moonshot AI | [Kimi-VL](/model-coverage/vision-language-models/kimi-vl) | `KimiVLForConditionalGeneration` |
+| Google | [Gemma 3 VL / Gemma 3n](/model-coverage/vision-language-models/gemma-3-vl-gemma-3n) | `Gemma3ForConditionalGeneration` |
+| Google | [Gemma 4](/model-coverage/vision-language-models/gemma-4) | `Gemma4ForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen2.5-VL](/model-coverage/vision-language-models/qwen2-5-vl) | `Qwen2VLForConditionalGeneration`, `Qwen2_5VLForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen3-VL / Qwen3-VL-MoE](/model-coverage/vision-language-models/qwen3-vl-qwen3-vl-moe) | `Qwen3VLForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen3.5-VL](/model-coverage/vision-language-models/qwen3-5-vl) | `Qwen3_5VLForConditionalGeneration`, `Qwen3_5MoeVLForConditionalGeneration` |
+| NVIDIA | [Nemotron-Parse](/model-coverage/vision-language-models/nemotron-parse) | `NemotronParseForConditionalGeneration` |
+| Mistral AI | [Ministral3 VL](/model-coverage/vision-language-models/ministral3-vl) | `Mistral3ForConditionalGeneration` |
+| Mistral AI | [Mistral-Small-4](/model-coverage/vision-language-models/mistral-small-4) | `MistralForConditionalGeneration` |
+| Mistral AI | [Mistral Medium 3.5](/model-coverage/vision-language-models/mistral-medium-3-5) | `Mistral3ForConditionalGeneration` (FP8) |
+| InternLM / Shanghai AI Lab | [InternVL](/model-coverage/vision-language-models/internvl) | `InternVLForConditionalGeneration` |
+| Meta | [Llama 4](/model-coverage/vision-language-models/llama-4) | `Llama4ForConditionalGeneration` |
+| HuggingFace | [SmolVLM](/model-coverage/vision-language-models/smolvlm) | `SmolVLMForConditionalGeneration` |
+| LLaVA | [LLaVA](/model-coverage/vision-language-models/llava) | `LlavaForConditionalGeneration`, `LlavaNextForConditionalGeneration`, `LlavaNextVideoForConditionalGeneration`, `LlavaOnevisionForConditionalGeneration` |
+| lmms-lab | [LLaVA-OneVision 1.5](/model-coverage/vision-language-models/llava-onevision) | `LlavaOneVisionForConditionalGeneration` |
+
+## Fine-Tuning
+
+All supported models can be fine-tuned using either full SFT or PEFT (LoRA) approaches. See the [Gemma 3 Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) for a complete walkthrough covering dataset preparation, configuration, and multi-GPU training.
+
+<Tip>
+In these guides, we use the `quintend/rdr-items` and `naver-clova-ix/cord-v2` datasets for demonstration purposes. Update the recipe YAML `dataset` section to use your own data. See [VLM datasets](/datasets/multi-modal-dataset) and [dataset overview](/datasets/overview).
+
+</Tip>

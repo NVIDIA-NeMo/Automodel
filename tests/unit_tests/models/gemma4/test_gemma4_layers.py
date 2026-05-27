@@ -233,8 +233,8 @@ class TestIsGatedActivation:
 # ---------------------------------------------------------------------------
 class TestGetExpertActivation:
     def test_geglu_returns_weighted_bias_geglu_impl(self):
-        from nemo_automodel.components.moe.experts import get_expert_activation_for_deepep
         from nemo_automodel.components.moe.config import MoEConfig
+        from nemo_automodel.components.moe.experts import get_expert_activation_for_deepep
 
         cfg = MoEConfig(
             dim=64,
@@ -258,8 +258,8 @@ class TestGetExpertActivation:
         assert fn is weighted_bias_geglu_impl
 
     def test_invalid_activation_raises(self):
-        from nemo_automodel.components.moe.experts import get_expert_activation_for_deepep
         from nemo_automodel.components.moe.config import MoEConfig
+        from nemo_automodel.components.moe.experts import get_expert_activation_for_deepep
 
         cfg = MoEConfig(
             dim=64, inter_dim=128, moe_inter_dim=32,

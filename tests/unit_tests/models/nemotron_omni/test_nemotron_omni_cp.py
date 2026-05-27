@@ -39,7 +39,6 @@ from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
 )
 
-
 IMG_TOKEN_ID = 18
 SOUND_TOKEN_ID = 27
 HIDDEN = 8

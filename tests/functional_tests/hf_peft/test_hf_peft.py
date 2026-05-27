@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.utils.test_utils import run_test_script
 import shutil
+
+from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "hf_peft"
 HF_PEFT_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_FSDP2_Checkpoint.sh"

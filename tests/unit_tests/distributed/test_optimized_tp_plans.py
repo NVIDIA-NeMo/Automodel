@@ -537,6 +537,7 @@ class TestParallelizeMistral3Vlm:
 
     def test_attention_and_mlp_styles(self):
         from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
         from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
         plan = _parallelize_mistral3_vlm(model=None)
         prefix = "model.language_model.layers.*"
@@ -557,6 +558,7 @@ class TestParallelizeMistral3Vlm:
 
     def test_lm_head_is_top_level_colwise(self):
         from torch.distributed.tensor.parallel import ColwiseParallel
+
         from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
         plan = _parallelize_mistral3_vlm(model=None)
         # lm_head sits at the top level (not nested under model.language_model)
@@ -571,13 +573,14 @@ class TestParallelizeMistral3Vlm:
         through to the default plan (whose paths don't match) and weights
         stay unsharded."""
         from transformers.models.mistral3.modeling_mistral3 import Mistral3ForConditionalGeneration
-        from nemo_automodel.components.models.mistral3_vlm.model import (
-            Mistral3FP8VLMForConditionalGeneration,
-        )
+
         from nemo_automodel.components.distributed.optimized_tp_plans import (
             PARALLELIZE_FUNCTIONS,
             _get_class_qualname,
             _parallelize_mistral3_vlm,
+        )
+        from nemo_automodel.components.models.mistral3_vlm.model import (
+            Mistral3FP8VLMForConditionalGeneration,
         )
         for cls in (Mistral3ForConditionalGeneration, Mistral3FP8VLMForConditionalGeneration):
             qn = _get_class_qualname(cls)

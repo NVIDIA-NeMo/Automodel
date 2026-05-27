@@ -36,6 +36,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
         ),
         (
+            "BailingMoeV2ForCausalLM",
+            ("nemo_automodel.components.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
+        ),
+        (
             "DeepseekV3ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v3.model", "DeepseekV3ForCausalLM"),
         ),
@@ -200,6 +204,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),

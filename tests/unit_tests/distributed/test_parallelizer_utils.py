@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 from typing import List, Tuple
 
-import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.parallelizer_utils import (
-    iter_maximal_uniform_dtype_subtrees,
-    _group_params_by_dtype,
-    _get_module_from_path,
     _fully_shard,
+    _get_module_from_path,
+    _group_params_by_dtype,
+    _mp_policy_with_param_dtype,
     fully_shard_by_dtype,
+    iter_maximal_uniform_dtype_subtrees,
 )
 
 
@@ -67,16 +67,20 @@ class ToyModel(nn.Module):
             self.c = nn.Linear(4, 4, bias=False).to(c_dtype)
 
 
-def _collect_return_paths_items(
-    items: List[Tuple[str, nn.Module, torch.dtype]]
-) -> dict[str, torch.dtype]:
+def _collect_return_paths_items(items: List[Tuple[str, nn.Module, torch.dtype]]) -> dict[str, torch.dtype]:
     return {path: dtype for path, _mod, dtype in items}
 
 
-def _collect_return_modules_items(
-    items: List[Tuple[nn.Module, torch.dtype]]
-) -> dict[int, torch.dtype]:
+def _collect_return_modules_items(items: List[Tuple[nn.Module, torch.dtype]]) -> dict[int, torch.dtype]:
     return {id(mod): dtype for mod, dtype in items}
+
+
+def _make_mp_policy() -> MixedPrecisionPolicy:
+    return MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
 
 
 def test_iter_maximal_uniform_dtype_subtrees_basic_paths():
@@ -204,6 +208,18 @@ def test__fully_shard_calls_for_modulelist(monkeypatch):
     assert calls[1] is ml[1]
 
 
+def test_mp_policy_with_param_dtype_copies_policy():
+    mp_policy = _make_mp_policy()
+
+    copied_policy = _mp_policy_with_param_dtype(mp_policy, torch.float32)
+
+    assert copied_policy is not mp_policy
+    assert copied_policy.param_dtype == torch.float32
+    assert copied_policy.reduce_dtype == mp_policy.reduce_dtype
+    assert copied_policy.output_dtype == mp_policy.output_dtype
+    assert mp_policy.param_dtype == torch.bfloat16
+
+
 def test_fully_shard_by_dtype_no_params(monkeypatch):
     fully_calls: list[nn.Module] = []
     sub_calls: list[nn.Module] = []
@@ -227,16 +243,15 @@ def test_fully_shard_by_dtype_no_params(monkeypatch):
     assert sub_calls == []
 
 
-
 def test_fully_shard_by_dtype_single_dtype(monkeypatch):
-    fully_calls: list[nn.Module] = []
-    sub_calls: list[nn.Module] = []
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
 
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
-        fully_calls.append(mod)
+        fully_calls.append((mod, mp_policy))
 
     def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
-        sub_calls.append(mod)
+        sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
@@ -247,21 +262,27 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
 
     # All parameters are float32
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float32, b_dtype_l2=torch.float32)
-    fully_shard_by_dtype(model, mesh=object(), mp_policy=object(), offload_policy=object())
+    mp_policy = _make_mp_policy()
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=mp_policy, offload_policy=object())
 
-    assert fully_calls == [model]  # whole module sharded once
+    assert [mod for mod, _ in fully_calls] == [model]  # whole module sharded once
+    assert fully_calls[0][1] is not mp_policy
+    assert fully_calls[0][1].param_dtype == torch.float32
+    assert fully_calls[0][1].reduce_dtype == mp_policy.reduce_dtype
+    assert fully_calls[0][1].output_dtype == mp_policy.output_dtype
+    assert mp_policy.param_dtype == torch.bfloat16
     assert sub_calls == []  # no subtree calls
 
 
 def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
-    fully_calls: list[nn.Module] = []
-    sub_calls: list[nn.Module] = []
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
 
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
-        fully_calls.append(mod)
+        fully_calls.append((mod, mp_policy))
 
     def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
-        sub_calls.append(mod)
+        sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
@@ -272,23 +293,25 @@ def test_fully_shard_by_dtype_two_dtypes(monkeypatch):
 
     # Make float32 the least common (1 param) vs float16 (2 params)
     model = ToyModel(a_dtype=torch.float32, b_dtype_l1=torch.float16, b_dtype_l2=torch.float16)
-    fully_shard_by_dtype(model, mesh=object(), mp_policy=object(), offload_policy=object())
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=object())
 
     # Expect subtree sharding for the least common dtype subtree(s) and full sharding once
-    assert fully_calls == [model]
+    assert [mod for mod, _ in fully_calls] == [model]
+    assert fully_calls[0][1].param_dtype == torch.float16
     # The least common dtype is float32 ('a'), so only 'a' subtree should be sharded individually
-    assert sub_calls == [model.a]
+    assert [mod for mod, _ in sub_calls] == [model.a]
+    assert sub_calls[0][1].param_dtype == torch.float32
 
 
 def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
-    fully_calls: list[nn.Module] = []
-    sub_calls: list[nn.Module] = []
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
 
     def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
-        fully_calls.append(mod)
+        fully_calls.append((mod, mp_policy))
 
     def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy):
-        sub_calls.append(mod)
+        sub_calls.append((mod, mp_policy))
 
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
@@ -304,10 +327,15 @@ def test_fully_shard_by_dtype_three_dtypes(monkeypatch):
         b_dtype_l2=torch.float16,
         c_dtype=torch.bfloat16,
     )
-    fully_shard_by_dtype(model, mesh=object(), mp_policy=object(), offload_policy=object())
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=object())
 
     # For >2 dtypes: only subtree sharding, no whole-module sharding
     assert fully_calls == []
     # Expect all three subtrees to be individually sharded
     # Note: the 'b' subtree should be sharded as a whole since it is uniform float16
-    assert set(sub_calls) == {model.a, model.b, model.c}
+    assert {mod for mod, _ in sub_calls} == {model.a, model.b, model.c}
+    assert {mod: policy.param_dtype for mod, policy in sub_calls} == {
+        model.a: torch.float32,
+        model.b: torch.float16,
+        model.c: torch.bfloat16,
+    }

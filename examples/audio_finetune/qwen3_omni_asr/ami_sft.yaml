@@ -1,0 +1,137 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-FT English ASR of Qwen3-Omni-30B-A3B-Instruct on edinburghcstr/ami.
+#
+# Companion to wenetspeech_wu_sft.yaml that demonstrates swapping the dataset
+# only via the `dataset:` block. Everything else (model, distributed, freeze,
+# optimizer, wandb) matches the Wu recipe.
+#
+# AMI has two mutually exclusive configurations (passed via the builder's
+# explicit ``name=`` parameter); ``ihm`` (Individual Headset Microphone) is the
+# standard near-field setup. Override to ``sdm`` for far-field training.
+#
+# Measured profile on 8x H100 80GB at the settings below:
+#   ~1.4 step/s steady-state, ~7500 tps, peak ~36-40 GB / GPU
+#   AMI IHM train ~108k raw -> ~69k post-1.0s filter -> ~1080 steps / epoch
+#   One epoch wall ~22 min (vs ~2 h at local_batch_size=1)
+#   End-of-epoch WER on AMI IHM test: 8.31% (base Qwen3-Omni: 15.81%)
+#
+# To run (AMI is a public dataset, so any stub satisfies the legacy
+# WENETSPEECH_WU_PATH precondition baked into train.sh):
+#   export WENETSPEECH_WU_PATH=unused
+#   CONFIG=examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml \
+#       examples/vlm_finetune/qwen3_omni_asr/train.sh
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  # GBS=64 (local_bs=8 x 8 GPUs) is the validated throughput sweet spot for
+  # Qwen3-Omni-30B-A3B on 8x H100: peak memory is dominated by FSDP/expert
+  # all-gather (~36 GB), so larger batches only push activation memory
+  # marginally while linearly scaling tps. Bigger than 8/GPU yields little
+  # extra speedup (per-step overhead is already amortised).
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 200       # ~5-6 intermediate ckpts over one epoch (~1080 steps)
+  num_epochs: 1
+  max_steps: 2000             # safety cap; epoch exhausts first (~1080 steps)
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: te
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: te
+    enable_deepep: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: result/checkpoints/qwen3_omni_asr_ami
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+
+# Full fine-tune: audio tower + language model trainable; only the vision tower
+# stays frozen (we never feed images). No PEFT adapters.
+freeze_config:
+  freeze_embeddings: false
+  freeze_vision_tower: true
+  freeze_audio_tower: false
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Conversation shape (per sample):
+#   user(  text=user_prompt + audio=<waveform>  )
+#   assistant(  text=<transcript>  )
+# No system turn (system_prompt: null).
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
+  path_or_dataset: edinburghcstr/ami
+  name: ihm
+  split: train
+  sampling_rate: 16000
+  system_prompt: null
+  user_prompt: "Transcribe the English audio into text."
+  # AMI IHM contains many sub-second utterances (~8 % of samples < 0.3 s).
+  # Qwen3-Omni's Whisper feature extractor has an off-by-one between
+  # input_features (ceil(N/hop)) and feature_attention_mask for sub-second
+  # clips that crashes get_audio_features. 1.0 s is the safe floor.
+  min_audio_duration_seconds: 1.0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 2
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.qwen3_omni_asr_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 2.0e-5
+  weight_decay: 0.0
+
+wandb:
+  project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-ami}
+  name: ${oc.env:WANDB_NAME,qwen3_omni_asr_ami_fullft}
+  dir: ${oc.env:WANDB_DIR,result/wandb}
+
+ci:
+  recipe_owner: yuekaiz
+  time: "00:30:00"

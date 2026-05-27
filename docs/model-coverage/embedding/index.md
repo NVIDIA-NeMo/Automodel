@@ -1,0 +1,54 @@
+(embedding-models)=
+
+# Embedding Models
+
+## Introduction
+
+Text embedding models transform text into dense vector representations that power semantic search, dense retrieval, retrieval-augmented generation (RAG), and classification tasks. NeMo AutoModel includes a training recipe for converting Llama decoder-only models into encoder architectures with bidirectional attention, and falls back to Hugging Face AutoModel for other encoder backbones.
+
+For cross-encoder pairwise scoring, see [Reranking Models](../reranker/index.md).
+
+Embedding models use bi-encoders to produce dense representations for queries and documents independently. They are the standard path for embedding generation and first-stage dense retrieval.
+
+### Optimized Backbones (Bidirectional Attention)
+
+| Owner | Model | Architecture | Auto Class | Tasks |
+|---|---|---|---|---|
+| NVIDIA | [Llama (Bidirectional)](nvidia/llama-bidirectional.md) | `LlamaBidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+| Mistral AI | [Ministral3 (Bidirectional)](mistralai/ministral3-bidirectional.md) | `Ministral3BidirectionalModel` | [`NeMoAutoModelBiEncoder`](https://github.com/NVIDIA-NeMo/Automodel/blob/8dc00dcb4a35c2413c52c6e7eb7ac8f1c24836aa/nemo_automodel/_transformers/auto_model.py#L991) | Embedding, Dense Retrieval |
+
+### Hugging Face Auto Backbones
+
+Any Hugging Face model that can be loaded with `AutoModel` can be used as an embedding backbone. This fallback path uses the model's native attention; no bidirectional conversion is applied.
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| {download}`llama3_2_1b.yaml <../../../examples/retrieval/bi_encoder/llama3_2_1b.yaml>` | Bi-encoder — Llama 3.2 1B embedding model |
+| {download}`llama_embed_nemotron_8b.yaml <../../../examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml>` | Bi-encoder — Llama-Embed-Nemotron-8B reproduction recipe |
+[ [download}`ministral3_3b_instruct.yaml <../../../examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml>` | Bi-encoder — Ministral3-3B recipe |
+
+## Supported Workflows
+
+- **Fine-tuning (Bi-Encoder):** Contrastive learning on query-document pairs to produce embedding models
+- **LoRA/PEFT:** Parameter-efficient fine-tuning for embedding backbones
+- **ONNX Export:** Export trained embedding models for deployment (case by case, model dependent)
+
+## Dataset
+
+Retrieval fine-tuning requires query-document pairs: each example is a query paired with one positive document and one or more negative documents. Both inline JSONL and corpus ID-based JSON formats are supported. See the [Retrieval Dataset](../../guides/llm/retrieval-dataset.md) guide.
+
+<!--
+@akoumpa: uncomment this when finetune guide is published.
+## Train Embedding Models
+
+For a complete walkthrough of training configuration, model-specific settings, and launch commands, see the [Embedding and Reranking Fine-Tuning Guide](../../guides/retrieval/finetune.md).
+-->
+
+```{toctree}
+:hidden:
+
+nvidia/llama-bidirectional
+mistralai/ministral3-bidirectional
+```

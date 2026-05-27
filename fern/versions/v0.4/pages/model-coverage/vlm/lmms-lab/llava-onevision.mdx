@@ -1,0 +1,96 @@
+---
+title: "LLaVA-OneVision 1.5"
+description: ""
+---
+[LLaVA-OneVision 1.5](https://github.com/LLaVA-VL/LLaVA-OneVision-1.5) is a vision-language model combining a **Rice ViT** encoder with a **Qwen3** language backbone, capable of handling both image and video understanding. NeMo AutoModel ships a custom NVIDIA implementation (`LlavaOneVisionForConditionalGeneration`) with FSDP2/HSDP support, LoRA fine-tuning and distributed training.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `LlavaOneVisionForConditionalGeneration` |
+| **Parameters** | 4B · 8B |
+| **HF Org** | [lmms-lab](https://huggingface.co/lmms-lab) |
+
+</Info>
+
+## Available Models
+
+- **LLaVA-OneVision 1.5 4B**: Qwen3 4B text backbone + Rice ViT (1024 hidden, 24 layers)
+- **LLaVA-OneVision 1.5 8B**: Qwen3 8B text backbone + Rice ViT (1024 hidden, 24 layers)
+
+## Architecture
+
+- `LlavaOneVisionForConditionalGeneration`
+
+Vision tower is the **Rice Transformer**: 14×14 patch embed with 2D RoPE, standard Transformer blocks (LayerNorm + Attention + MLP), and a 2×2 spatial Patch Merger that projects to the language-model hidden size.
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| LLaVA-OneVision-1.5 4B Instruct | [`lmms-lab/LLaVA-OneVision-1.5-4B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct) |
+| LLaVA-OneVision-1.5 8B Instruct | [`lmms-lab/LLaVA-OneVision-1.5-8B-Instruct`](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct) |
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [llava_ov_1_5_4b_finetune.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml) | SFT — LLaVA-OneVision-1.5 4B on LLaVA-Instruct-150K |
+| [llava_ov_1_5_8b_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/llava_onevision/llava_ov_1_5_8b_lora.yaml) | LoRA — LLaVA-OneVision-1.5 8B on LLaVA-Instruct-150K |
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](/get-started/installation)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml
+```
+
+<Accordion title="Run with Docker">
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/llava_onevision/llava_ov_1_5_4b_finetune.yaml
+```
+</Accordion>
+
+See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+## Fine-Tuning
+
+See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+## Hugging Face Model Cards
+
+- [lmms-lab/LLaVA-OneVision-1.5-4B-Instruct](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-4B-Instruct)
+- [lmms-lab/LLaVA-OneVision-1.5-8B-Instruct](https://huggingface.co/lmms-lab/LLaVA-OneVision-1.5-8B-Instruct)

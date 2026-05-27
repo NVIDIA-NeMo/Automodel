@@ -179,6 +179,9 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     #   layers.{i}.hc_ffn_{fn,base,scale}   ->  model.layers.{i}.ffn_hc.{fn,base,scale}
     (re.compile(r"^layers\.(\d+)\.hc_attn_(base|fn|scale)$"), r"model.layers.\1.attn_hc.\2"),
     (re.compile(r"^layers\.(\d+)\.hc_ffn_(base|fn|scale)$"), r"model.layers.\1.ffn_hc.\2"),
+    # MTP-local HC head.  Native MTP keys are normalized to temporary
+    # ``layers.{k}.*`` keys before the rename table is applied.
+    (re.compile(r"^layers\.(\d+)\.hc_head_(fn|base|scale)$"), r"model.layers.\1.hc_head.hc_\2"),
     # Final HC-head collapse module:
     #   hc_head_{fn,base,scale}  ->  model.hc_head.hc_{fn,base,scale}
     # (HF uses ``hc_fn`` / ``hc_base`` / ``hc_scale`` inside HyperHead, in
@@ -242,13 +245,81 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         """Convert HF checkpoint to internal format.
 
         Steps:
-          1. Dequantize FP8 weights (scale suffix is either `.scale` or `_scale_inv`).
-          2. Aggregate per-expert routed weights into stacked tensors.
-          3. Rename remaining keys using the HF -> internal mapping table.
+          1. Split native ``mtp.{k}.*`` keys (and legacy
+             ``layers.{num_hidden_layers+k}.*`` keys) from backbone keys and
+             renumber them as temporary ``layers.{k}.*`` keys so the standard
+             pipeline (dequantize / aggregate-experts / rename) handles them too.
+          2. Dequantize FP8 / FP4 weights for both backbone and MTP.
+          3. Aggregate per-expert routed weights into stacked tensors.
+          4. Rename keys using the HF -> internal mapping table.
+          5. Re-prefix MTP keys: ``model.layers.{k}.*`` -> ``mtp.layers.{k}.*``.
         """
+        N = self.config.num_hidden_layers
+        num_mtp = int(getattr(self.config, "num_nextn_predict_layers", 0) or 0)
+        # HF V4 emits both prefixed (``model.layers.{N+k}.*`` for self_attn /
+        # mlp / norms) and unprefixed (``layers.{N+k}.*`` for V4 fusion-only
+        # modules eh_proj / enorm / hnorm / final_layernorm) MTP keys, so the
+        # split regex must accept either form.
+        _layer_re = re.compile(r"^(model\.)?layers\.(\d+)\.")
+
+        # Split MTP keys from backbone keys.  Current DSV4-Flash stores MTP as
+        # ``mtp.{k}.*``; HF/intermediate exports can also use
+        # ``[model.]layers.{N+k}.*``.  Normalize either format to temporary
+        # ``layers.{k}.*`` keys so the standard dequantize / aggregate / rename
+        # pipeline can handle FP4 routed experts and FP8 projections uniformly.
+        mtp_hf: dict[str, Any] = {}
+        backbone_hf: dict[str, Any] = {}
+        native_mtp_re = re.compile(r"^mtp\.(\d+)\.")
+        for key in list(hf_state_dict.keys()):
+            val = hf_state_dict[key]
+            native_m = native_mtp_re.match(key)
+            if native_m is not None:
+                mtp_depth = int(native_m.group(1))
+                if mtp_depth < num_mtp:
+                    renumbered = f"layers.{mtp_depth}." + key[native_m.end() :]
+                    mtp_hf[renumbered] = val
+                # Drop checkpoint MTP tensors when the runtime config disables
+                # MTP.  Otherwise loading DSV4-Flash with
+                # num_nextn_predict_layers=0 produces a large set of dangling
+                # ``mtp.0.*`` keys.
+                continue
+
+            m = _layer_re.match(key)
+            if m and int(m.group(2)) >= N and num_mtp > 0:
+                orig_idx = int(m.group(2))
+                mtp_depth = orig_idx - N
+                if mtp_depth < num_mtp:
+                    renumbered = f"layers.{mtp_depth}." + key[m.end() :]
+                    mtp_hf[renumbered] = val
+                continue
+
+            backbone_hf[key] = val
+        hf_state_dict = backbone_hf
+
         hf_state_dict = self._dequantize(hf_state_dict)
         hf_state_dict = self._aggregate_experts(hf_state_dict, device_mesh)
-        return self._rename_all(hf_state_dict)
+        state_dict = self._rename_all(hf_state_dict)
+
+        if mtp_hf:
+            mtp_hf = self._dequantize(mtp_hf)
+            mtp_hf = self._aggregate_experts(mtp_hf, device_mesh)
+            mtp_renamed = self._rename_all(mtp_hf)
+            for key, val in mtp_renamed.items():
+                # After _rename_all, layer-indexed keys are in one of two forms:
+                #   - ``model.layers.{k}.*`` if a rename rule matched (norms,
+                #     attn, mlp, experts, hc), or
+                #   - ``layers.{k}.*`` if no rule matched — V4 MTP-only
+                #     modules (``e_proj`` / ``h_proj`` / ``enorm`` / ``hnorm`` /
+                #     ``norm``) have no backbone rename rule.
+                # Re-prefix both forms into the ``mtp.layers.{k}.*`` namespace.
+                if key.startswith("model.layers."):
+                    state_dict["mtp" + key[len("model") :]] = val
+                elif key.startswith("layers."):
+                    state_dict["mtp." + key] = val
+                else:
+                    state_dict[key] = val
+
+        return state_dict
 
     def _dequantize(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Dequantize FP8 weights.  Handles both `.scale` and `_scale_inv` suffixes."""
@@ -528,6 +599,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # Reverse of the HC submodule renames above.
         (re.compile(r"^model\.layers\.(\d+)\.attn_hc\.(fn|base|scale)$"), r"layers.\1.hc_attn_\2"),
         (re.compile(r"^model\.layers\.(\d+)\.ffn_hc\.(fn|base|scale)$"), r"layers.\1.hc_ffn_\2"),
+        (re.compile(r"^model\.layers\.(\d+)\.hc_head\.hc_(fn|base|scale)$"), r"layers.\1.hc_head_\2"),
         (re.compile(r"^model\.hc_head\.hc_(fn|base|scale)$"), r"hc_head_\1"),
     ]
 
@@ -539,6 +611,20 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return key
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        # MTP keys (``mtp.layers.{k}.*``) share the same per-block layout as
+        # backbone layers, but current DSV4-Flash stores them under native
+        # ``mtp.{k}.*`` keys.  Rewrite to an equivalent temporary
+        # ``model.layers.{k}.*`` form for splitting / renaming / quantization,
+        # then replace the emitted ``layers.{k}.`` prefix with ``mtp.{k}.``.
+        mtp_depth: int | None = None
+        if fqn.startswith("mtp."):
+            rest = fqn[len("mtp.") :]
+            m = re.match(r"^layers\.(\d+)\.", rest)
+            if m is None:
+                return [(fqn, tensor)]
+            mtp_depth = int(m.group(1))
+            fqn = f"model.layers.{mtp_depth}." + rest[m.end() :]
+
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
@@ -550,6 +636,26 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
 
         # Rename internal keys to HF keys
         result = [(self._internal_key_to_hf(k), v) for k, v in result]
+
+        if mtp_depth is not None:
+            # MTP-only modules (``e_proj`` / ``h_proj`` / ``enorm`` /
+            # ``hnorm`` / ``norm``) have no generic backbone rename rule, so
+            # they can still carry ``model.layers.{k}.`` here.  Normalize both
+            # possible temporary prefixes to the checkpoint's native MTP prefix.
+            internal_prefix = f"model.layers.{mtp_depth}."
+            layer_prefix = f"layers.{mtp_depth}."
+            mtp_prefix = f"mtp.{mtp_depth}."
+            result = [
+                (
+                    mtp_prefix + k[len(internal_prefix) :]
+                    if k.startswith(internal_prefix)
+                    else mtp_prefix + k[len(layer_prefix) :]
+                    if k.startswith(layer_prefix)
+                    else k,
+                    v,
+                )
+                for k, v in result
+            ]
 
         if quantization:
             quantized = []

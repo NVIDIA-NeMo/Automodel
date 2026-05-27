@@ -1,6 +1,6 @@
 # Model Coverage Overview
 
-NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that can be instantiated through `transformers` can also be used via NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
+NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that can be instantiated through `transformers` can also be used using NeMo AutoModel, subject to runtime, third-party software dependencies, and feature compatibility.
 
 ## Supported Hugging Face Auto Classes
 
@@ -10,6 +10,8 @@ NeMo AutoModel integrates with Hugging Face `transformers`. Any LLM or VLM that 
 | `AutoModelForImageTextToText` | Image-Text-to-Text (VLM) | Supported | See [VLM model list](vlm/index.md). |
 | `AutoModelForSequenceClassification` | Sequence Classification | WIP | Early support; interfaces may change. |
 | Diffusers Pipelines | Diffusion Generation (T2I, T2V) | Supported | See [Diffusion model list](diffusion/index.md). |
+| `NeMoAutoModelBiEncoder` | Embedding Models | Supported | See [Embedding model list](embedding/index.md). |
+| `NeMoAutoModelCrossEncoder` | Reranking Models | Supported | See [Reranking model list](reranker/index.md). |
 
 ## Release Log
 
@@ -29,7 +31,6 @@ The table below tracks when model support and key features were added across NeM
 - New models released on the Hugging Face Hub may require the latest `transformers` version, necessitating a package upgrade.
 - We are working on a CI pipeline that automatically bumps the supported `transformers` version when a new release is detected, enabling even faster day-0 support.
 
-**Note:** To use newly released models, you may need to upgrade your NeMo AutoModel installation — just as you would upgrade `transformers` to access the latest models. AutoModel mirrors the familiar `transformers` `Auto*` APIs while adding optional performance accelerations and distributed training features.
 
 ## Custom Model Registry
 
@@ -40,4 +41,4 @@ NeMo AutoModel includes a custom model registry that allows teams to:
 
 ## Having Issues?
 
-If a model from the Hub doesn't work as expected, see the [Troubleshooting](troubleshooting.md) guide for common issues and solutions.
+If a model from the Hub doesn't work as expected, see the [Troubleshooting Guide](troubleshooting.md) for common issues and solutions.

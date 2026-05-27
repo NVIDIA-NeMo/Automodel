@@ -746,8 +746,12 @@ class TestGroupedExpertsDeepEP:
         mock_mesh.get_local_rank.return_value = 0
         mock_mesh.get_group.return_value = Mock()
 
-        # Patch the MoEFlexTokenDispatcher to avoid the TPxEP assertion
-        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher:
+        # Patch the MoEFlexTokenDispatcher to avoid the TPxEP assertion and the
+        # DeepEP buffer allocation, which requires the optional runtime.
+        with (
+            patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher,
+            patch.object(experts, "_init_deepep_buffer") as mock_init_buffer,
+        ):
             mock_dispatcher.return_value = Mock()
 
             experts.init_token_dispatcher(mock_mesh)
@@ -755,6 +759,7 @@ class TestGroupedExpertsDeepEP:
             assert hasattr(experts, "token_dispatcher")
             assert experts.ep_size == 2
             assert experts.ep_rank == 0
+            mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
@@ -800,15 +805,29 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
         """Test GroupedExpertsDeepEP initialization with hybridep backend."""
-        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+        experts = GroupedExpertsDeepEP(
+            moe_config,
+            dispatcher_backend="hybridep",
+            dispatcher_num_sms=24,
+            dispatcher_share_token_dispatcher=False,
+            dispatcher_async_dispatch=True,
+        )
 
         assert experts.dispatcher_backend == "hybridep"
         assert experts.dispatcher_num_sms == 24
+        assert experts.dispatcher_share_token_dispatcher is False
+        assert experts.dispatcher_async_dispatch is True
         assert experts.config == moe_config
 
     def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
         """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
-        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+        experts = GroupedExpertsDeepEP(
+            moe_config,
+            dispatcher_backend="hybridep",
+            dispatcher_num_sms=24,
+            dispatcher_share_token_dispatcher=False,
+            dispatcher_async_dispatch=True,
+        )
 
         mock_mesh = Mock()
         mock_mesh.size.return_value = 2
@@ -828,6 +847,8 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_flex_dispatcher_backend == "hybridep"
             assert config_arg.moe_hybridep_num_sms == 24
             assert config_arg.moe_deepep_num_sms == 24
+            assert config_arg.moe_share_token_dispatcher is False
+            assert config_arg.moe_deepep_async_dispatch is True
 
 
 class TestNonGatedActivations:

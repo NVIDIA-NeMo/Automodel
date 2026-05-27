@@ -26,7 +26,7 @@ content_type: index
 
 # NeMo AutoModel Documentation
 
-PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
+PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
 **Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md)
 
 ::::{grid} 2 2 2 2
@@ -76,6 +76,10 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 | Date | Modality | Model |
 |------|----------|-------|
+| 2026-05-19 | LLM | Ling 2.0 ([recipes](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/ling)) |
+| 2026-05-18 | Audio | Qwen3-Omni ASR ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml)) |
+| 2026-05-17 | LLM | ERNIE 4.5 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml)) |
+| 2026-05-17 | LLM | MiMo-V2-Flash ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml)) |
 | 2026-04-07 | LLM | [GLM-5.1](https://github.com/NVIDIA-NeMo/Automodel/discussions/1719) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)) |
 | 2026-04-02 | VLM | Gemma 4 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml)) |
 | 2026-03-16 | VLM | [Mistral Small 4](https://github.com/NVIDIA-NeMo/Automodel/discussions/1558) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml)) |
@@ -84,18 +88,19 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 ## Recipes & Guides
 
-Find the right guide for your task -- fine-tuning, pretraining, distillation, diffusion, and more.
+Find the right guide for your task: fine-tuning, pretraining, distillation, diffusion, and more.
 
 | I want to...                | Choose this when...                                                                 | Input Data                                        | Model     | Guide                                                     |
 | --------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------- | --------- | --------------------------------------------------------- |
 | **SFT (full fine-tune)**    | You need maximum accuracy and have the GPU budget to update all weights             | Instruction / chat dataset                        | LLM       | [Start fine-tuning](guides/llm/finetune.md)               |
-| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)        |
+| **PEFT (LoRA)**             | You want to fine-tune on limited GPU memory; updates <1 % of parameters             | Instruction / chat dataset                        | LLM       | [Start LoRA](guides/llm/finetune.md)     |
 | **Tool / function calling** | Your model needs to call APIs or tools with structured arguments                    | Function-calling dataset (queries + tool schemas) | LLM       | [Add tool calling](guides/llm/toolcalling.md)             |
 | **Fine-tune VLM**           | Your task involves both images and text (e.g., visual QA, captioning)               | Image + text dataset                              | VLM       | [Fine-tune VLM](guides/omni/gemma3-3n.md)                 |
 | **Fine-tune Gemma 4**       | You want to fine-tune Gemma 4 for structured extraction from images (e.g., receipts) | Image + text dataset                              | VLM       | [Fine-tune Gemma 4](guides/vlm/gemma4.md)                 |
 | **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](guides/dllm/finetune.md)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](guides/diffusion/finetune.md)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](guides/vlm/qwen3-5.md)                |
+| **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](guides/audio/qwen3-omni-asr.md) |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | {bdg-info}`Coming Soon`                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](guides/llm/large-moe-finetune.md)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](guides/llm/dsv4-flash.md)   |
@@ -237,6 +242,8 @@ Large Language Models <model-coverage/llm/index.md>
 Vision Language Models <model-coverage/vlm/index.md>
 Omni <model-coverage/omni/index.md>
 Diffusion <model-coverage/diffusion/index.md>
+Embedding Models <model-coverage/embedding/index.md>
+Reranking Models <model-coverage/reranker/index.md>
 ::::
 
 ::::{toctree}
@@ -257,10 +264,12 @@ Gemma 4 <guides/vlm/gemma4.md>
 Qwen3.5-VL <guides/vlm/qwen3-5.md>
 Nemotron-Omni <guides/vlm/nemotron-omni.md>
 Mistral Medium 3.5 VL <guides/vlm/mistral-medium-3-5.md>
+Qwen3-Omni ASR <guides/audio/qwen3-omni-asr.md>
 Diffusion Fine-Tuning <guides/diffusion/finetune.md>
 dLLM Fine-Tuning <guides/dllm/finetune.md>
 QAT <guides/quantization-aware-training.md>
 Databricks <guides/llm/databricks.md>
+SGLang EAGLE Serving <guides/speculative/serve_with_sglang.md>
 ::::
 
 ::::{toctree}

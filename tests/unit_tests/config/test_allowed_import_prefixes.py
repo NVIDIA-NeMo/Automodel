@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import types
 import sys
-import builtins
+import types
+
 import pytest
 
 from nemo_automodel.components.config import loader

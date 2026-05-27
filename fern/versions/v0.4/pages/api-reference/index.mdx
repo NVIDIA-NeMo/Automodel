@@ -1,0 +1,23 @@
+---
+title: "API Reference"
+description: "Auto-generated Python API reference for the nemo_automodel library."
+---
+
+Auto-generated reference documentation for the `nemo_automodel` Python package.
+
+This reference is built from docstrings in the [source code](https://github.com/NVIDIA-NeMo/Automodel/tree/main/nemo_automodel). Browse the sidebar to explore modules, classes, and functions.
+
+## Key Modules
+
+| Module | Description |
+|--------|-------------|
+| `nemo_automodel._transformers` | HuggingFace bridge — `NeMoAutoModelForCausalLM`, `NeMoAutoModelForImageTextToText`, model registry, capability flags, device-mesh infrastructure |
+| `nemo_automodel._diffusers` | Diffusion pipeline wrapper (`NeMoAutoDiffusionPipeline`) |
+| `nemo_automodel.components.models` | 27+ model families (LLM, VLM, MoE, retrieval) and their state-dict adapters |
+| `nemo_automodel.components.datasets` | LLM, VLM, and diffusion data pipelines |
+| `nemo_automodel.components.distributed` | FSDP2, HSDP, DDP utilities and device-mesh helpers |
+| `nemo_automodel.components.checkpoint` | Async DCP and SafeTensors checkpointing |
+| `nemo_automodel.components.quantization` | FP8, QAT, calibration |
+| `nemo_automodel.components._peft` | LoRA, QLoRA adapters |
+| `nemo_automodel.components.launcher` | Slurm and SkyPilot job submission |
+| `nemo_automodel.cli` | `automodel <command> <domain> -c <config.yaml>` entry point |

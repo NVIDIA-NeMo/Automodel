@@ -116,7 +116,7 @@ class StepScheduler(Stateful):
         # Throws with IterableDataset.
         try:
             self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
-        except (NotImplementedError, TypeError):
+        except (NotImplementedError, TypeError, RuntimeError):
             self.epoch_len = None
 
         # This is for backward compatibility in the sense that num_epochs's default value was 10

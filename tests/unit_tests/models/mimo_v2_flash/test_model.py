@@ -299,6 +299,18 @@ class TestMiMoV2FlashForCausalLM:
         # gate weight is no longer kept in fp32 (Pattern A uses gate_precision instead).
         assert "mlp.gate.weight" not in MiMoV2FlashForCausalLM._keep_in_fp32_modules_strict
 
+    def test_customize_pipeline_stage_modules_keeps_swa_rotary(self, tiny_config, backend_config):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        stages = [
+            ["model.embed_tokens", "model.layers.0", "model.rotary_emb"],
+            ["model.layers.1", "model.norm", "lm_head", "model.rotary_emb"],
+        ]
+
+        out = model.customize_pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
+
+        for stage_modules in out:
+            assert "model.swa_rotary_emb" in stage_modules
+
 
 # ---------------------------------------------------------------------------
 # Forward-pass smoke tests (CPU)

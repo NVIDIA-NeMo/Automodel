@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import io
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
 
 import nemo_automodel.components.datasets.vlm.utils as vlm_utils
-
 
 # ---------------------------------------------------------------------------
 # _resolve_lmdb_image

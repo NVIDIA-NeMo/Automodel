@@ -12,54 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Test variables
-CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
-        --checkpoint.checkpoint_dir $PIPELINE_DIR/$TEST_NAME/checkpoint"
+# Finetune launcher. Config resolution happens in config_resolver.py.
+#
+# Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
+#   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, HAS_ROBUSTNESS
+# Env optional: EXEC_CMD, RDZV_TIMEOUT, MAX_STEPS, LOCAL_BATCH_SIZE,
+#   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME
 
-# Configure local batch size
-if [[ -n "$LOCAL_BATCH_SIZE" ]]; then
-  CONFIG="${CONFIG} \
-         --step_scheduler.local_batch_size ${LOCAL_BATCH_SIZE}"
-fi
+cd /opt/Automodel
 
-# For convergence runs
+CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.py"
+TEST_DIR="$PIPELINE_DIR/$TEST_NAME"
+mkdir -p "$TEST_DIR"
+
+# --- Resolve finetune config ---
+RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
+  --base "/opt/Automodel/${CONFIG_PATH}" \
+  --phase "${TEST_LEVEL}" \
+  --output "$TEST_DIR/finetune_config.yaml")
+
+# WANDB_API_KEY is a runtime secret, not a config key.
 if [ "$TEST_LEVEL" = "convergence" ]; then
   export WANDB_API_KEY="${WANDB_AUTOMODEL_API_KEY}"
-  export TEST_DATE=$(date +%Y%m%d)
-  CONFIG="${CONFIG} \
-         --step_scheduler.ckpt_every_steps 200 \
-         --step_scheduler.max_steps 200 \
-         --step_scheduler.val_every_steps 200 \
-         --wandb.project automodel-nemo-ci-convergence-test-${TEST_DATE} \
-         --wandb.entity Nemo-automodel \
-         --wandb.name ${TEST_NAME} \
-         --wandb.dir /tmp/wandb/"
-elif [ "$TEST_LEVEL" = "performance" ]; then
-  CONFIG="${CONFIG}"
-else
-  CONFIG="${CONFIG} \
-        --step_scheduler.ckpt_every_steps 50 \
-        --step_scheduler.max_steps ${MAX_STEPS:-50} \
-        --step_scheduler.val_every_steps 50"
 fi
 
-# Per-config nproc override (set via ci.nproc_per_node in recipe YAML)
+# --- Pick executor ---
 NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
-
-# Customizer contract test dataset overrides
-if [[ "${CONFIG_PATH}" == *customizer_* ]]; then
-  CUSTOMIZER_DATA="${NEMO_CI_PATH}/datasets/customizer/sample-datasets"
-  if [[ "${CONFIG_PATH}" == *chat* ]]; then
-    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/train.jsonl \
-      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/chat/validation.jsonl"
-  else
-    CUSTOMIZER_DATASET_ARGS="--dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/train.jsonl \
-      --validation_dataset.path_or_dataset_id ${CUSTOMIZER_DATA}/prompt_completion/validation.jsonl"
-  fi
-  CONFIG="${CONFIG} ${CUSTOMIZER_DATASET_ARGS}"
-fi
-
-# Command to execute, defaults to torchrun
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
@@ -69,30 +47,8 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
 
-# Checkpoint robustness variables
-ROBUSTNESS_COMMON="--config /opt/Automodel/${CONFIG_PATH} \
-  --checkpoint.checkpoint_dir $PIPELINE_DIR/$TEST_NAME/robustness_checkpoint \
-  --checkpoint.enabled true \
-  --checkpoint.model_save_format safetensors \
-  --checkpoint.save_consolidated true \
-  --step_scheduler.max_steps 5 \
-  --step_scheduler.ckpt_every_steps 5 \
-  --step_scheduler.val_every_steps 5 \
-  --step_scheduler.global_batch_size 32 \
-  --step_scheduler.local_batch_size 2 \
-  ${CUSTOMIZER_DATASET_ARGS:-}"
-
-if [[ "${CONFIG_PATH}" == *peft* ]] || [[ "${CONFIG_PATH}" == *lora* ]]; then
-  ROBUSTNESS_COMMON="${ROBUSTNESS_COMMON} --peft.use_triton false"
-fi
-
-ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $PIPELINE_DIR/$TEST_NAME/robustness_logs \
-  -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
-  ${ROBUSTNESS_COMMON}"
-
 # --- Finetune ---
-cd /opt/Automodel
-RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} ${CONFIG} ${FINETUNE_ARGS}"
+RUN_CMD="${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
 echo "============================================"
 echo "[finetune] Running finetune..."
 echo "============================================"
@@ -102,16 +58,16 @@ eval $RUN_CMD
 FINETUNE_EXIT_CODE=$?
 
 FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
-echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $TEST_DIR/timing.jsonl
 echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
 
-# Collect benchmark artifact for performance tests
+# Performance benchmark artifact
 if [ "$TEST_LEVEL" = "performance" ]; then
   echo "[benchmark] Collecting benchmark artifact..."
   python3 /opt/Automodel/tests/ci_tests/scripts/collect_benchmark_artifact.py \
     --config /opt/Automodel/${CONFIG_PATH} \
     --log $PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out \
-    --output $PIPELINE_DIR/$TEST_NAME/benchmark_results.json || true
+    --output $TEST_DIR/benchmark_results.json || true
 fi
 
 if [[ "$FINETUNE_EXIT_CODE" -ne 0 ]]; then
@@ -121,6 +77,15 @@ fi
 
 # --- Checkpoint Robustness ---
 if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
+  RESOLVED_ROBUSTNESS_CONFIG=$($CONFIG_RESOLVER \
+    --base "/opt/Automodel/${CONFIG_PATH}" \
+    --phase checkpoint_robustness \
+    --output "$TEST_DIR/robustness_config.yaml")
+
+  ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
+    -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+    --config ${RESOLVED_ROBUSTNESS_CONFIG}"
+
   echo "============================================"
   echo "[checkpoint_robustness] Running robustness test..."
   echo "============================================"
@@ -130,8 +95,8 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   ROBUSTNESS_EXIT_CODE=$?
 
   ROBUSTNESS_ELAPSED=$((SECONDS - ROBUSTNESS_START))
-  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"robustness\",\"seconds\":${ROBUSTNESS_ELAPSED}}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
-  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"total\",\"seconds\":$((SECONDS)),\"allocated\":\"${TIME}\"}" >> $PIPELINE_DIR/$TEST_NAME/timing.jsonl
+  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"robustness\",\"seconds\":${ROBUSTNESS_ELAPSED}}" >> $TEST_DIR/timing.jsonl
+  echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"total\",\"seconds\":$((SECONDS)),\"allocated\":\"${TIME}\"}" >> $TEST_DIR/timing.jsonl
   echo "[timing] Robustness completed in ${ROBUSTNESS_ELAPSED}s (total: ${SECONDS}s)"
 
   if [[ "$ROBUSTNESS_EXIT_CODE" -ne 0 ]]; then

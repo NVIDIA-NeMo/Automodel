@@ -223,10 +223,10 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
                 pass
 
     def __len__(self) -> int:
-        raise RuntimeError("__len__ is not supported in streaming mode.")
+        raise TypeError("__len__ is not supported in streaming mode.")
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        raise RuntimeError("__getitem__ is not supported in streaming mode.")
+        raise TypeError("__getitem__ is not supported in streaming mode.")
 
     def set_epoch(self, epoch: int) -> None:
         if self.dataset is not None and hasattr(self.dataset, "set_epoch"):

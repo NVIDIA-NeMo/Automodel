@@ -65,6 +65,18 @@ Simple generation script and configurations for VLMs.
 
 - Folder: [examples/vlm_generate](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_generate)
 
+## Audio Models (ASR)
+
+This section provides recipes for fine-tuning omni / audio-capable models on automatic speech recognition (ASR) tasks. The recipes reuse the VLM training stack but operate on `{audio, text}` HuggingFace datasets (AMI, LibriSpeech, GigaSpeech, CommonVoice, etc.).
+
+### Fine-Tuning
+
+End-to-end ASR fine-tuning of `Qwen3-Omni-30B-A3B-Instruct` on any HuggingFace audio dataset, including a thinker-only checkpoint export step for downstream `transformers` / vLLM loading.
+
+- Folder: [examples/audio_finetune/qwen3_omni_asr](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/audio_finetune/qwen3_omni_asr)
+- Representative model: Qwen3-Omni-30B-A3B-Instruct
+- How-to guide: [Fine-tune Qwen3-Omni for ASR](audio/qwen3-omni-asr.md)
+
 ## Diffusion Models (Text-to-Image & Text-to-Video)
 
 Text-to-image and text-to-video diffusion models can generate visual content from natural language descriptions. Fine-tuning lets you adapt these models to a specific style, domain, or dataset — for example, generating product videos in your brand's aesthetic. Pretraining gives you full control when no existing model fits your needs.

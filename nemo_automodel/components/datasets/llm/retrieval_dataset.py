@@ -15,15 +15,18 @@
 import json
 import logging
 import os
+import random
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 
 EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
+
+_OVERSAMPLING_WARNED_CORPORA: set[str] = set()
 
 
 class AbstractDataset(ABC):
@@ -139,7 +142,8 @@ def load_corpus_metadata(path: str):
     if not os.path.isfile(path_metadata):
         raise ValueError("Metadata File for Corpus does not exist: " + path_metadata)
 
-    metadata = json.load(open(path_metadata, "r"))
+    with open(path_metadata, "r") as f:
+        metadata = json.load(f)
     return metadata
 
 
@@ -177,21 +181,93 @@ def add_corpus(qa_corpus_paths: Union[dict, list], corpus_dict: dict):
             corpus_dict[corpus_id] = CorpusInfo(corpus_metadata, corpus)
 
 
-def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
+DataEntry = Union[str, dict[str, Any]]
+
+
+def _parse_data_entry(entry: DataEntry) -> Tuple[Optional[int], str]:
+    """
+    Parse a data entry.
+
+    Supported forms:
+    - "path_or_hf_uri": use all samples
+    - {"path": "path_or_hf_uri", "num_samples": N}: sample N examples once from that source
+    """
+    if isinstance(entry, str):
+        return None, entry
+
+    if isinstance(entry, dict):
+        allowed_keys = {"path", "num_samples"}
+        unknown_keys = set(entry) - allowed_keys
+        if unknown_keys:
+            raise ValueError(f"Unsupported data entry field(s): {sorted(unknown_keys)}")
+        if "path" not in entry:
+            raise ValueError("data entry dictionary must contain a 'path' field")
+
+        path = entry["path"]
+        num_samples = entry.get("num_samples")
+        if num_samples is not None:
+            if isinstance(num_samples, bool) or not isinstance(num_samples, int):
+                raise ValueError(f"num_samples must be an integer or None, got {type(num_samples)}")
+            if num_samples < 0:
+                raise ValueError(f"num_samples must be non-negative, got {num_samples}")
+        if not isinstance(path, str):
+            raise ValueError(f"path must be a string, got {type(path)}")
+        return num_samples, path
+
+    raise ValueError(f"Invalid data entry format: {entry}. Expected a string path or a dictionary with 'path'")
+
+
+def _normalize_data_entries(data_dir_list: Union[List[DataEntry], DataEntry]) -> List[Tuple[Optional[int], str]]:
+    """Normalize a single source or list of sources into parsed entries."""
+    if isinstance(data_dir_list, (str, dict)):
+        entries = [data_dir_list]
+    elif isinstance(data_dir_list, list):
+        entries = data_dir_list
+    else:
+        raise ValueError(
+            f"Invalid data_dir_list format: {data_dir_list}. Expected a string path, a dictionary entry, "
+            "or a list of those entries."
+        )
+
+    return [entry if isinstance(entry, tuple) else _parse_data_entry(entry) for entry in entries]
+
+
+def _sample_data_items(data_items: List[dict], num_samples: Optional[int], source: str, seed: int) -> List[dict]:
+    if num_samples is None:
+        return data_items
+    if num_samples >= len(data_items):
+        logging.warning(
+            f"Requested {num_samples} samples but source {source} only has {len(data_items)} examples. Using all."
+        )
+        return data_items
+
+    rng = random.Random(seed)
+    sampled_items = rng.sample(data_items, num_samples)
+    logging.info(f"Randomly sampled {num_samples} examples from {source} (total: {len(data_items)})")
+    return sampled_items
+
+
+def load_datasets(
+    data_dir_list: Union[List[DataEntry], DataEntry],
+    concatenate: bool = True,
+    seed: int = 42,
+):
     """
     Load datasets from JSON files.
 
-    Copied from nemo-retriever-research/src/data/datasets.py
+    Entries can be strings (use all samples) or dictionaries with path and optional
+    num_samples fields (sample a fixed subset once while loading).
 
     Returns:
         Tuple of (dataset, corpus_dict)
     """
     REQUIRED_FIELDS = ["question_id", "question", "corpus_id", "pos_doc", "neg_doc"]
-    if not isinstance(data_dir_list, list):
-        data_dir_list = [data_dir_list]
+    data_entries = _normalize_data_entries(data_dir_list)
+    if not data_entries:
+        raise ValueError("data_dir_list must contain at least one source")
     corpus_dict = {}
     datasets = []
-    for data_dir in data_dir_list:
+    for num_samples, data_dir in data_entries:
         with open(data_dir, "r") as f:
             train_data = json.load(f)
         qa_corpus_paths = train_data["corpus"]
@@ -208,9 +284,11 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
 
         add_corpus(qa_corpus_paths, corpus_dict)
 
+        data_items = _sample_data_items(train_data["data"], num_samples, data_dir, seed)
+
         # Extract only the required fields for training, ignoring extra fields
         normalized_data = []
-        for item in train_data["data"]:
+        for item in data_items:
             # Extract only the essential fields we need
             missing = [f for f in REQUIRED_FIELDS if f not in item]
             if missing:
@@ -221,10 +299,12 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
                 "corpus_id": item["corpus_id"],
             }
             # Extract pos_doc with only id field
+            if not item["pos_doc"]:
+                raise ValueError(f"pos_doc cannot be empty in train_data item: {item}")
             normalized_item["pos_doc"] = []
             for doc in item["pos_doc"]:
                 if isinstance(doc, dict) and "id" in doc:
-                    normalized_item["pos_doc"].append({"id": doc["id"]})
+                    normalized_item["pos_doc"].append({"id": str(doc["id"])})
                 else:
                     # Handle case where doc might be just a string ID
                     doc_id = doc if isinstance(doc, str) else str(doc)
@@ -233,7 +313,7 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
             normalized_item["neg_doc"] = []
             for doc in item["neg_doc"]:
                 if isinstance(doc, dict) and "id" in doc:
-                    normalized_item["neg_doc"].append({"id": doc["id"]})
+                    normalized_item["neg_doc"].append({"id": str(doc["id"])})
                 else:
                     # Handle case where doc might be just a string ID
                     doc_id = doc if isinstance(doc, str) else str(doc)
@@ -393,19 +473,20 @@ def _load_hf_subset(repo_id: str, subset: str):
     return normalized_data, corpus_info
 
 
-def _load_hf_sources(hf_uris: List[str]):
+def _load_hf_sources(hf_entries: List[Tuple[Optional[int], str]], seed: int = 42):
     """Load one or more ``hf://`` URIs and return ``(Dataset, corpus_dict)``."""
     hf_data: List[dict] = []
     corpus_dict: dict = {}
 
-    for uri in hf_uris:
+    for num_samples, uri in hf_entries:
         repo_id, subset = _parse_hf_uri(uri)
         subsets = [subset] if subset is not None else _list_hf_subsets(repo_id)
+        source_data: List[dict] = []
 
         for sub in subsets:
             logging.info(f"Loading HF subset: {repo_id}/{sub}")
             data_list, corpus_info = _load_hf_subset(repo_id, sub)
-            hf_data.extend(data_list)
+            source_data.extend(data_list)
             if corpus_info.corpus_id in corpus_dict:
                 existing = corpus_dict[corpus_info.corpus_id]
                 if existing.path != corpus_info.path:
@@ -415,6 +496,8 @@ def _load_hf_sources(hf_uris: List[str]):
                     )
             else:
                 corpus_dict[corpus_info.corpus_id] = corpus_info
+
+        hf_data.extend(_sample_data_items(source_data, num_samples, uri, seed))
 
     return Dataset.from_list(hf_data), corpus_dict
 
@@ -461,6 +544,14 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
                 f"neg_doc is empty for example {i_example} but {num_neg_docs} negative(s) requested "
                 f"(n_passages > 1). Provide negatives."
             )
+        cur_corpus_id = corpus_ids[i_example]
+        if num_neg_docs > 0 and len(negatives) < num_neg_docs and cur_corpus_id not in _OVERSAMPLING_WARNED_CORPORA:
+            _OVERSAMPLING_WARNED_CORPORA.add(cur_corpus_id)
+            logging.warning(
+                f"corpus_id={cur_corpus_id}: a sample has only {len(negatives)} negatives "
+                f"(< num_neg_docs={num_neg_docs}). Oversampling will repeat negatives. "
+                "This warning is logged once per corpus."
+            )
         if num_neg_docs > 0:
             neg_ids = [i for i in range(len(negatives))]
             cur_neg_ids = [neg_ids[idx % len(neg_ids)] for idx in range(num_neg_docs)]
@@ -479,6 +570,11 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_pos_neg_text = []
         cur_pos_neg_image = []
         cur_corpus_id = corpus_ids[idx_doc]
+        if cur_corpus_id not in corpus_dict:
+            raise ValueError(
+                f"Unknown corpus_id '{cur_corpus_id}' in retrieval example. "
+                f"Available corpus ids: {sorted(corpus_dict.keys())}"
+            )
 
         for doc in docs:
             cur_id = doc["id"]
@@ -565,7 +661,7 @@ def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_
 
 
 def make_retrieval_dataset(
-    data_dir_list: Union[List[str], str] = None,
+    data_dir_list: Union[List[DataEntry], DataEntry] = None,
     model_type: str = "bi_encoder",
     data_type: str = "train",
     n_passages: int = 5,
@@ -581,17 +677,22 @@ def make_retrieval_dataset(
 
     Entries in *data_dir_list* can be local JSON file paths **or** ``hf://`` URIs
     pointing to a HuggingFace dataset repository (e.g.
-    ``hf://nvidia/embed-nemotron-dataset-v1/SciFact``).  Uses ``set_transform()``
-    for lazy evaluation — tokenization is handled by the collator.
+    ``hf://nvidia/embed-nemotron-dataset-v1/SciFact``). A source can also be
+    provided as ``{"path": path_or_uri, "num_samples": N}`` to sample a fixed
+    subset once while loading. Uses ``set_transform()`` for lazy evaluation —
+    tokenization is handled by the collator.
 
     Args:
-        data_dir_list: Path(s) to JSON file(s) or ``hf://`` URIs.
+        data_dir_list: Path(s) to JSON file(s), ``hf://`` URIs, or dictionary entries with path and
+            num_samples.
         model_type: "bi_encoder" (default) or "cross_encoder"
         data_type: Type of data ("train" or "eval")
         n_passages: Number of passages (1 positive + n-1 negatives)
         eval_negative_size: Number of negative documents for evaluation
         seed: Random seed for reproducibility (for shuffling if needed)
-        do_shuffle: Whether to shuffle the dataset
+        do_shuffle: Shuffle dataset rows before subset selection. Only applied when
+            ``max_train_samples`` is set; otherwise iteration order is controlled by
+            the dataloader's sampler (e.g. ``StatefulDistributedSampler``).
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
         use_dataset_instruction: Whether to use instruction from dataset's metadata
@@ -619,24 +720,25 @@ def make_retrieval_dataset(
 
     if data_dir_list is None:
         raise ValueError("data_dir_list is required")
-    if not isinstance(data_dir_list, list):
-        data_dir_list = [data_dir_list]
+    data_entries = _normalize_data_entries(data_dir_list)
+    if not data_entries:
+        raise ValueError("data_dir_list must contain at least one source")
 
-    hf_uris = [p for p in data_dir_list if p.startswith(_HF_PREFIX)]
-    local_paths = [p for p in data_dir_list if not p.startswith(_HF_PREFIX)]
+    hf_entries = [(num_samples, path) for num_samples, path in data_entries if path.startswith(_HF_PREFIX)]
+    local_entries = [(num_samples, path) for num_samples, path in data_entries if not path.startswith(_HF_PREFIX)]
 
-    logging.info(f"Loading data from {len(data_dir_list)} source(s) ({len(hf_uris)} HF, {len(local_paths)} local)")
+    logging.info(f"Loading data from {len(data_entries)} source(s) ({len(hf_entries)} HF, {len(local_entries)} local)")
 
     datasets_list = []
     corpus_dict: dict = {}
 
-    if hf_uris:
-        hf_dataset, hf_corpus = _load_hf_sources(hf_uris)
+    if hf_entries:
+        hf_dataset, hf_corpus = _load_hf_sources(hf_entries, seed=seed)
         datasets_list.append(hf_dataset)
         corpus_dict.update(hf_corpus)
 
-    if local_paths:
-        local_dataset, local_corpus = load_datasets(local_paths, concatenate=True)
+    if local_entries:
+        local_dataset, local_corpus = load_datasets(local_entries, concatenate=True, seed=seed)
         datasets_list.append(local_dataset)
         for cid, cinfo in local_corpus.items():
             if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:

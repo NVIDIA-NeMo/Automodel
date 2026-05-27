@@ -20,6 +20,7 @@ on:
       - 'tests/ci_tests/configs/**'
       - 'examples/**/*.yaml'
       - 'tests/ci_tests/utils/validate_nightly_recipes.py'
+      - 'tests/ci_tests/utils/validate_generate_ci.py'
       - 'tests/ci_tests/utils/generate_ci_tests.py'
       - 'tools/lint_example_yamls.py'
 
@@ -50,3 +51,6 @@ jobs:
 
       - name: Validate nightly recipe references
         run: .venv-validator/bin/python tests/ci_tests/utils/validate_nightly_recipes.py --automodel-dir .
+
+      - name: Validate generate_ci_tests across all (folder, scope) combos
+        run: .venv-validator/bin/python tests/ci_tests/utils/validate_generate_ci.py --automodel-dir .

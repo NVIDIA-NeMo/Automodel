@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
 from nemo_automodel.components.moe.state_dict_utils import (
-    is_dtensor,
-    get_expert_slice_for_rank,
-    split_experts_weights_dtensor_aware,
-    validate_dtensor_expert_sharding,
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
+    get_expert_slice_for_rank,
+    is_dtensor,
     should_load_expert_for_rank,
+    split_experts_weights_dtensor_aware,
+    validate_dtensor_expert_sharding,
 )
 
 

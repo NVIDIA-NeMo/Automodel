@@ -36,7 +36,6 @@ from nemo_automodel.components.models.hy_v3.state_dict_adapter import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

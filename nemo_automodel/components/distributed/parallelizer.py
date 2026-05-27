@@ -1501,6 +1501,17 @@ def _get_parallel_plan(
             logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
+    # Fallback: match by bare class __name__ for trust_remote_code models whose
+    # qualified module path contains a snapshot hash and so cannot be stably
+    # registered via _get_class_qualname().
+    elif (func := PARALLELIZE_FUNCTIONS.get(model_cls.__name__)) is not None:
+        try:
+            model_parallel_plan = func(model, sequence_parallel)
+            logger.info(f"Using optimized parallel plan for {model_cls.__name__} (matched by class name).")
+        except Exception as e:
+            logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
+            model_parallel_plan = get_hf_tp_shard_plan(model)
+
     else:
         # Try HF's per-model _tp_plan first — it correctly handles multimodal
         # architectures like Mistral3ForConditionalGeneration whose text layers

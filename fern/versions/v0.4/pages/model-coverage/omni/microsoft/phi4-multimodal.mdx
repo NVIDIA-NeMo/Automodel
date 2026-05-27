@@ -1,0 +1,90 @@
+---
+title: "Phi-4-multimodal"
+description: ""
+---
+[Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) is Microsoft's multimodal extension of Phi-4, supporting text, image, and audio inputs — making it suitable for speech, vision, and combined multimodal tasks.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Omnimodal (Text·Image·Audio) |
+| **Architecture** | `Phi4MultimodalForCausalLM` |
+| **Parameters** | 5.6B |
+| **HF Org** | [microsoft](https://huggingface.co/microsoft) |
+
+</Info>
+
+## Available Models
+
+- **Phi-4-multimodal-instruct**: 5.6B
+
+## Architecture
+
+- `Phi4MultimodalForCausalLM`
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Phi-4-multimodal-instruct | [`microsoft/Phi-4-multimodal-instruct`](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) |
+
+## Example Recipes
+
+| Recipe | Dataset | Description |
+|---|---|---|
+| [phi4_mm_cv17.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/phi4/phi4_mm_cv17.yaml) | CommonVoice 17 | SFT — Phi-4-multimodal on CommonVoice (audio-text) |
+
+## Try with NeMo AutoModel
+
+**1. Install** ([full instructions](/get-started/installation)):
+
+```bash
+pip install nemo-automodel
+```
+
+**2. Clone the repo** to get the example recipes:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+```
+
+**3. Run the recipe** from inside the repo:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
+```
+
+<Accordion title="Run with Docker">
+**1. Pull the container** and mount a checkpoint directory:
+
+```bash
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
+  nvcr.io/nvidia/nemo-automodel:26.02.00
+```
+
+**2.** Navigate to the AutoModel directory (where the recipes are):
+
+```bash
+cd /opt/Automodel
+```
+
+**3. Run the recipe**:
+
+```bash
+automodel --nproc-per-node=8 examples/vlm_finetune/phi4/phi4_mm_cv17.yaml
+```
+</Accordion>
+
+See the [Installation Guide](/get-started/installation) and [Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+## Fine-Tuning
+
+See the [VLM / Omni Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+## Hugging Face Model Cards
+
+- [microsoft/Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct)

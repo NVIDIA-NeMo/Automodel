@@ -40,6 +40,18 @@ from transformers.modeling_utils import PreTrainedModel
 if not hasattr(PretrainedConfig, "pad_token_id"):
     PretrainedConfig.pad_token_id = None
 
+# Shim: some trust_remote_code dLLM model code (e.g. Nemotron-Labs-Diffusion)
+# imports check_model_inputs from transformers.utils.generic, which is not
+# present in released transformers versions. Install a no-op fallback.
+import transformers.utils.generic as _generic_utils
+
+if not hasattr(_generic_utils, "check_model_inputs"):
+
+    def _check_model_inputs(func):
+        return func
+
+    _generic_utils.check_model_inputs = _check_model_inputs
+
 from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
@@ -668,6 +680,12 @@ def __init_model(
     *model_args,
     **kwargs,
 ):
+    # Private recipe-level toggle: when False, skip ``_restore_loaded_model_dtype``
+    # so the caller's explicit ``torch_dtype`` is preserved as the master-weight
+    # dtype (needed for mixed-precision training that wants an fp32 master copy).
+    # Default ``True`` keeps existing behavior for every recipe that doesn't set
+    # it. Pop here so the flag never reaches HF's ``from_pretrained``.
+    restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     hf_config = (
@@ -731,7 +749,10 @@ def __init_model(
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
-            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
+            if restore_loaded_dtype:
+                _restore_loaded_model_dtype(
+                    model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs
+                )
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -787,6 +808,22 @@ def __init_model(
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         _setup_bnb_loading_kwargs(kwargs)
+    # For trust_remote_code custom configs, pre-resolve the model class so we
+    # can strip yaml-level config-attr kwargs (e.g. ``dlm_paradigm``) that the
+    # custom ``__init__`` may not accept. Without this, HF forwards them as
+    # model __init__ kwargs and the call fails if the remote class tightened
+    # its signature. ``_consume_config_overrides`` applies these to hf_config
+    # and removes them from kwargs. ``getattr`` guards against test mocks
+    # where ``cls`` may not expose ``__name__``.
+    cls_name = getattr(cls, "__name__", None)
+    if isinstance(cls_name, str):
+        target_auto_class_name = cls_name[4:] if cls_name.startswith("NeMo") else cls_name
+        remote_model_cls = _try_get_remote_code_model_cls(
+            hf_config, pretrained_model_name_or_path, target_auto_class_name, kwargs
+        )
+        if remote_model_cls is not None:
+            init_param_names = _get_init_param_names(remote_model_cls)
+            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
     if is_pretrained_init:
         with skip_random_init():
             model = cls._from_pretrained_parent_class(
@@ -796,7 +833,8 @@ def __init_model(
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
-        _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
+        if restore_loaded_dtype:
+            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
     else:
         model = cls._from_config_parent_class(
             hf_config,
@@ -889,6 +927,40 @@ def _get_init_param_names(model_cls) -> set[str]:
     except (TypeError, ValueError):
         return set()
     return {k for k in sig.parameters.keys() if k != "self"}
+
+
+def _try_get_remote_code_model_cls(hf_config, pretrained_model_name_or_path, target_auto_class_name, kwargs):
+    """Resolve the model class for a ``trust_remote_code`` custom config.
+
+    Looks up ``hf_config.auto_map`` for ``target_auto_class_name`` (falling back
+    to ``AutoModel``) and loads the referenced class via HF's dynamic-module
+    loader. Returns ``None`` if the lookup or load fails for any reason — the
+    caller should treat that as "no pre-resolution available" and fall through
+    to HF's standard handling.
+    """
+    if not kwargs.get("trust_remote_code"):
+        return None
+    if hf_config is None or pretrained_model_name_or_path is None:
+        return None
+    auto_map = getattr(hf_config, "auto_map", None)
+    if not auto_map:
+        return None
+    class_ref = auto_map.get(target_auto_class_name) or auto_map.get("AutoModel")
+    if class_ref is None:
+        return None
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        return get_class_from_dynamic_module(
+            class_ref,
+            pretrained_model_name_or_path,
+            revision=kwargs.get("revision"),
+            code_revision=kwargs.get("code_revision"),
+            cache_dir=kwargs.get("cache_dir"),
+            local_files_only=kwargs.get("local_files_only", False),
+        )
+    except Exception:
+        return None
 
 
 def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> None:

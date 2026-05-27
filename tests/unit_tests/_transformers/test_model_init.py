@@ -31,6 +31,7 @@ from nemo_automodel._transformers.model_init import (
     _setup_bnb_loading_kwargs,
     _stream_load_bnb_weights,
     _streaming_bnb_supported,
+    _try_get_remote_code_model_cls,
     get_hf_config,
 )
 from nemo_automodel.components.models.common.utils import BackendConfig
@@ -607,3 +608,27 @@ class TestGetHfConfigLayerTypesRetry:
         with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
             get_hf_config("fake/model", "sdpa")
         mock_fix.assert_not_called()
+
+
+class TestTryGetRemoteCodeModelCls:
+    """Tests for the pre-resolution helper used to consume config-attr kwargs
+    on the trust-remote-code HF-fallback path.
+    """
+
+    def test_loads_class_via_target_key(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModelForCausalLM": "modeling.MyModel"}
+        fake_cls = object()
+        with patch("transformers.dynamic_module_utils.get_class_from_dynamic_module") as mock_load:
+            mock_load.return_value = fake_cls
+            result = _try_get_remote_code_model_cls(
+                cfg, "/some/path", "AutoModelForCausalLM", {"trust_remote_code": True}
+            )
+        assert result is fake_cls
+        assert mock_load.call_args.args[0] == "modeling.MyModel"
+
+    def test_returns_none_when_trust_remote_code_not_set(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModelForCausalLM": "modeling.MyModel"}
+        result = _try_get_remote_code_model_cls(cfg, "/some/path", "AutoModelForCausalLM", {})
+        assert result is None

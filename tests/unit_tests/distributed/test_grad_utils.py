@@ -12,26 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import queue
+import sys
+import threading
+from functools import partial, wraps
 from typing import Iterable, List
 from unittest.mock import Mock
 
-import types
-import functools
-import sys
-import threading
-from functools import wraps, partial
-
-import queue
-
-import math
-
 import pytest
 import torch
+import torch.distributed as c10d
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.distributed import grad_utils
-import torch.distributed as c10d
-
 
 TIMEOUT_DEFAULT = 5
 DEFAULT_WORLD_SIZE = 1

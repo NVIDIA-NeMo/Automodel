@@ -14,13 +14,9 @@
 
 import os
 
-import pytest
-
 from nemo_automodel.components.launcher.nemo_run.config import (
-    DEFAULT_EXECUTORS_FILE,
     NemoRunConfig,
 )
-
 
 # ---------------------------------------------------------------------------
 # Default values
@@ -40,6 +36,7 @@ def test_defaults():
 def test_executors_file_defaults_to_nemorun_home(monkeypatch):
     monkeypatch.delenv("NEMORUN_HOME", raising=False)
     import importlib
+
     import nemo_automodel.components.launcher.nemo_run.config as cfg_mod
     importlib.reload(cfg_mod)
 
@@ -51,6 +48,7 @@ def test_executors_file_defaults_to_nemorun_home(monkeypatch):
 def test_executors_file_respects_nemorun_home_env(monkeypatch, tmp_path):
     monkeypatch.setenv("NEMORUN_HOME", str(tmp_path))
     import importlib
+
     import nemo_automodel.components.launcher.nemo_run.config as cfg_mod
     importlib.reload(cfg_mod)
 

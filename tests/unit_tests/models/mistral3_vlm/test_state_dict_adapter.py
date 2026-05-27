@@ -18,8 +18,8 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
-    Mistral3FP8StateDictAdapter,
     _NON_QUANTIZED_SUFFIXES,
+    Mistral3FP8StateDictAdapter,
     _dequantize_from_fp8,
     _is_fp8_weight_key,
 )

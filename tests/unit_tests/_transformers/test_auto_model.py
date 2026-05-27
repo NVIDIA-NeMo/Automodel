@@ -23,6 +23,7 @@ import torch
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
     NeMoAutoModelForCausalLM,
+    _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
     _consume_config_overrides,
     _get_next_fallback_attn,
@@ -680,6 +681,28 @@ class TestConsumeConfigOverrides:
         assert "explicit_param" in kwargs
 
 
+class TestAliasRemoteAutoMapForTarget:
+    """Tests for the auto_map alias fallback used when a trust-remote-code config
+    ships only ``auto_map[AutoModel]`` and HF's ``AutoModelFor*`` resolution
+    can't find the right class.
+    """
+
+    def test_aliases_automodel_to_target_when_conditions_met(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModel": "modeling.MyModel"}
+        result = _alias_remote_auto_map_for_target(
+            ("/some/path",), {"trust_remote_code": True, "config": cfg}, "AutoModelForCausalLM"
+        )
+        assert result is cfg
+        assert result.auto_map["AutoModelForCausalLM"] == "modeling.MyModel"
+
+    def test_returns_none_when_trust_remote_code_not_set(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModel": "modeling.MyModel"}
+        result = _alias_remote_auto_map_for_target(("/some/path",), {"config": cfg}, "AutoModelForCausalLM")
+        assert result is None
+
+
 class TestGetCheckpointTensorDtypes:
     def test_uses_provided_state_dict_dtypes(self):
         state_dict = {
@@ -1136,6 +1159,23 @@ class TestFromPretrainedSafetensorsFallback:
                 )
         assert NeMoAutoModelForCausalLM.__name__ == original_name
 
+    def test_aliases_and_retries_on_unrecognized_config_error(self):
+        """Unrecognized-config-class ValueError triggers auto_map alias + retry."""
+        patched_cfg = MagicMock()
+        sentinel = MagicMock()
+        error = ValueError("Unrecognized configuration class <class 'Foo'> for AutoModelForCausalLM")
+        with self._patch_parent_fp([error, sentinel]) as calls:
+            with patch(
+                "nemo_automodel._transformers.auto_model._alias_remote_auto_map_for_target",
+                return_value=patched_cfg,
+            ) as mock_alias:
+                result = NeMoAutoModelForCausalLM._from_pretrained_parent_class("test-model", trust_remote_code=True)
+        assert result is sentinel
+        assert len(calls) == 2
+        # Retry passes the patched config.
+        assert calls[1].get("config") is patched_cfg
+        mock_alias.assert_called_once()
+
 
 class TestBuildModelRetryDepth:
     """Tests for _build_model retry depth limiting (issue #1510)."""
@@ -1240,10 +1280,15 @@ class TestBuildModelRetryDepth:
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)),
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
-            patch("nemo_automodel._transformers.auto_model.apply_model_runtime_patches", side_effect=fake_runtime_patches),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_runtime_patches", side_effect=fake_runtime_patches
+            ),
             patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
             patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
-            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", side_effect=fake_apply_infrastructure),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+                side_effect=fake_apply_infrastructure,
+            ),
             patch("torch.cuda.current_device", return_value=0),
         ):
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)

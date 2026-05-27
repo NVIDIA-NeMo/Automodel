@@ -30,7 +30,6 @@ import pytest
 
 from nemo_automodel.components.utils import flops_utils
 
-
 # ---------------------------------------------------------------------------
 # Config factories
 # ---------------------------------------------------------------------------
