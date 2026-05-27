@@ -40,7 +40,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -368,18 +367,17 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         if self.lm_head is None:
             logits = hidden
-        elif self._enable_lm_head_fp32 and hidden.dtype != torch.float32:
-            # Upcast input to fp32 for the lm_head matmul, then cast logits
-            # back to the model dtype so downstream loss / sampling code is
-            # not surprised by an fp32 tensor. Matches the HF reference's
-            # ``enable_lm_head_fp32`` behavior.
+        elif self._enable_lm_head_fp32 and self.lm_head.weight.dtype == torch.float32 and hidden.dtype != torch.float32:
+            # The MoE parallelizer (``distributed.moe.lm_head_precision:
+            # float32`` in the YAML) has already promoted ``lm_head.weight`` to
+            # fp32. Feed it fp32 input via ``nn.Linear`` -- which is
+            # DTensor-aware under FSDP2 -- and cast logits back to the input
+            # dtype. We must NOT use ``F.linear`` directly with a manually
+            # ``.float()``-ed weight here, because that bypasses nn.Linear's
+            # DTensor redistribution and crashes with
+            # "got mixed torch.Tensor and DTensor".
             original_dtype = hidden.dtype
-            lm_head_bias = self.lm_head.bias if getattr(self.lm_head, "bias", None) is not None else None
-            logits = F.linear(
-                hidden.float(),
-                self.lm_head.weight.float(),
-                lm_head_bias.float() if lm_head_bias is not None else None,
-            ).to(original_dtype)
+            logits = self.lm_head(hidden.float()).to(original_dtype)
         else:
             logits = self.lm_head(hidden)
 

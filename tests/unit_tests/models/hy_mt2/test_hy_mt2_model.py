@@ -250,14 +250,35 @@ class TestHyMT2ForCausalLM:
         model = HyMT2ForCausalLM(_Cfg(), backend=backend_config)
         assert model._enable_lm_head_fp32 is False
 
-    def test_lm_head_fp32_casts_back_to_input_dtype(self, config, backend_config, device):
+    def test_lm_head_fp32_upcast_when_weight_promoted(self, config, backend_config, device):
+        """When the parallelizer has promoted lm_head.weight to fp32 (the
+        ``distributed.moe.lm_head_precision: float32`` path), the in-model
+        fallback feeds the bf16 hidden state up to fp32, runs lm_head, and
+        casts logits back to bf16."""
         model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
-        # Mock the inner backbone so we can control the dtype of its output.
+        # Simulate the parallelizer's promotion of lm_head.weight to fp32.
+        model.lm_head = model.lm_head.to(torch.float32)
         bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
         with patch.object(model.model, "forward", return_value=bf16_hidden):
             input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
             logits = model(input_ids)
-        # Output logits dtype must match the input hidden dtype, not fp32.
+        # Output dtype must be the input dtype (bf16), not fp32.
+        assert logits.dtype == torch.bfloat16
+
+    def test_lm_head_no_upcast_when_weight_is_bf16(self, config, backend_config, device):
+        """If the parallelizer did NOT promote lm_head.weight, the model must
+        fall through to ``self.lm_head(hidden)`` without trying to upcast,
+        to avoid the dtype mismatch (fp32 input vs bf16 weight) and the
+        ``F.linear`` DTensor mixing crash that the prior implementation hit."""
+        model = HyMT2ForCausalLM(config, backend=backend_config).to(device).to(torch.bfloat16)
+        # lm_head.weight is bf16 (no promotion). Even though enable_lm_head_fp32
+        # is True on the config, the in-model path must NOT activate.
+        assert model.lm_head.weight.dtype == torch.bfloat16
+        assert model._enable_lm_head_fp32 is True
+        bf16_hidden = torch.randn(1, 4, HIDDEN, device=device, dtype=torch.bfloat16)
+        with patch.object(model.model, "forward", return_value=bf16_hidden):
+            input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
+            logits = model(input_ids)
         assert logits.dtype == torch.bfloat16
 
     def test_lm_head_no_upcast_when_disabled(self, config, backend_config, device):
