@@ -88,8 +88,8 @@ class DistributedSetup:
         if parallelism_sizes is None:
             parallelism_sizes = ParallelismSizes()
 
-        pp_size = parallelism_sizes.pp_size or 1
-        ep_size = parallelism_sizes.ep_size or 1
+        pp_size = parallelism_sizes.pp_size
+        ep_size = parallelism_sizes.ep_size
         if pipeline_config is not None and pp_size <= 1:
             raise ValueError("pipeline_config requires pp_size > 1")
         if moe_parallel_config is not None and ep_size <= 1:
