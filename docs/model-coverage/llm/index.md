@@ -87,7 +87,7 @@ The models listed above can be fine-tuned using NeMo AutoModel. We support two p
 See the [Fine-Tuning Guide](../../guides/llm/finetune.md) to learn how to apply both methods to your data.
 
 :::{tip}
-In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
+In these guides, the examples use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. Refer to [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
 :::
 
 ```{toctree}
