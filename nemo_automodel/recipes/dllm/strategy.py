@@ -262,6 +262,7 @@ class DFlashStrategy(DLLMStrategy):
         self.attention_backend: str = "sdpa"
         self.overlap_anchors: bool = True
         self.use_fused_linear_ce: bool = True
+        self.fixed_ctx_len: int = 0
 
     @property
     def loss_log_key(self) -> str:
@@ -382,6 +383,15 @@ class DFlashStrategy(DLLMStrategy):
         # --- Multi-block ---
         self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
         self.overlap_anchors = bool(dflash_cfg.get("overlap_anchors", True))
+
+        # Fixed context length for static FlexAttention shapes. The collator pads
+        # each batch to its own block-aligned max, so KV_LEN would still vary
+        # batch-to-batch and force recompiles. Padding the target context up to a
+        # single fixed length (dataset.seq_length) makes Q_LEN/KV_LEN constant
+        # across every step → the kernel compiles once. The block-diagonal mask
+        # (kv_idx < anchor) never reads the padded tail, so it is loss-neutral.
+        ds_cfg = recipe.cfg.get("dataset", None)
+        self.fixed_ctx_len = int(ds_cfg.get("seq_length", 0)) if ds_cfg is not None else 0
 
         # --- Attention backend (sdpa | flex_attention) ---
         backend = str(dflash_cfg.get("attention_backend", "sdpa")).lower()
@@ -607,9 +617,17 @@ class DFlashStrategy(DLLMStrategy):
 
         B = block_output_ids.size(0)
         n = len(starts)
-        # ctx_len comes from the pre-computed target_hidden (full sequence length
-        # for the multi-block path), so Q_LEN/KV_LEN are constant across steps
-        # and FlexAttention compiles once instead of recompiling per step.
+        # Pad the target context up to the fixed sequence length so Q_LEN/KV_LEN
+        # are constant across every step (the collator pads each batch to its own
+        # max, which would otherwise keep changing KV_LEN and recompile the
+        # FlexAttention kernel each step). The block-diagonal mask only attends to
+        # kv_idx < anchor < valid_len, so the zero-padded tail is never read —
+        # loss-neutral, purely a shape stabiliser.
+        if self.fixed_ctx_len and target_hidden.shape[1] < self.fixed_ctx_len:
+            pad_n = self.fixed_ctx_len - target_hidden.shape[1]
+            pad = target_hidden.new_zeros(target_hidden.shape[0], pad_n, target_hidden.shape[2])
+            target_hidden = torch.cat([target_hidden, pad], dim=1)
+        # ctx_len is now the fixed sequence length → FlexAttention compiles once.
         ctx_len = target_hidden.shape[1]
         noise_embedding = self.target_embed(block_output_ids)  # [B, n*block_size, dim]
 
