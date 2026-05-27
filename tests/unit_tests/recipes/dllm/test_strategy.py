@@ -394,7 +394,12 @@ class TestDFlashStrategy:
 
 
 class TestDFlashSampleAnchorBlocks:
-    """Tests for _sample_anchor_blocks (CPU, no GPU required)."""
+    """Tests for the non-overlapping (legacy) _sample_anchor_blocks path.
+
+    Returns the per-sample 5-tuple
+    ``(anchor_positions [B,N], block_keep_mask [B,N], block_output_ids,
+    block_targets, block_mask)``.
+    """
 
     def _make_inputs(self, seq_len, batch_size=2):
         torch.manual_seed(42)
@@ -402,43 +407,28 @@ class TestDFlashSampleAnchorBlocks:
         attn = torch.ones(batch_size, seq_len, dtype=torch.long)
         return input_ids, attn
 
-    def test_single_block_shapes(self):
+    def test_shapes(self):
         s = _make_strategy(block_size=8)
         recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(64)
-        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=1)
-        assert len(starts) == 1
-        assert boi.shape == (2, 8)
-        assert bt.shape == (2, 7)
-        assert bm.shape == (2, 7)
-
-    def test_multi_block_shapes(self):
-        s = _make_strategy(block_size=8)
-        recipe = _make_recipe()
-        n = 4
-        input_ids, attn = self._make_inputs(128)
-        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=n)
-        assert len(starts) == n
-        assert boi.shape == (2, n * 8)
-        assert bt.shape == (2, n * 7)
-        assert bm.shape == (2, n * 7)
-
-    def test_starts_are_sorted(self):
-        s = _make_strategy(block_size=8)
-        recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(128)
-        for _ in range(10):
-            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
-            assert starts == sorted(starts)
+        for n in (1, 4):
+            input_ids, attn = self._make_inputs(128)
+            ap, keep, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=n)
+            assert ap.shape == (2, n)
+            assert keep.shape == (2, n)
+            assert boi.shape == (2, n * 8)
+            assert bt.shape == (2, n * 7)
+            assert bm.shape == (2, n * 7)
 
     def test_blocks_are_non_overlapping(self):
         s = _make_strategy(block_size=8)
         recipe = _make_recipe()
         input_ids, attn = self._make_inputs(128)
         for _ in range(10):
-            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            starts = ap[0].tolist()  # batch-shared in non-overlap mode
+            assert starts == sorted(starts)
             for i in range(len(starts) - 1):
-                assert starts[i + 1] >= starts[i] + s.block_size, f"blocks overlap: starts={starts}"
+                assert starts[i + 1] >= starts[i] + s.block_size, f"blocks overlap: {starts}"
 
     def test_blocks_fit_in_sequence(self):
         seq_len = 64
@@ -446,37 +436,28 @@ class TestDFlashSampleAnchorBlocks:
         recipe = _make_recipe()
         input_ids, attn = self._make_inputs(seq_len)
         for _ in range(10):
-            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
-            for start in starts:
-                assert start >= 1
-                assert start + s.block_size <= seq_len
-
-    def test_fallback_when_sequence_too_short(self):
-        """If sequence can't fit N blocks, gracefully returns fewer."""
-        s = _make_strategy(block_size=16)
-        recipe = _make_recipe()
-        # seq_len=20 → only 1 block of size 16 fits (start ∈ [1,4])
-        input_ids, attn = self._make_inputs(20)
-        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
-        assert len(starts) == 1
-        assert boi.shape[1] == 16
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            assert (ap >= 1).all() and (ap + s.block_size <= seq_len).all()
 
     def test_anchor_token_is_clean(self):
-        """First token of each block in block_output_ids should be the real token."""
+        """First token of each kept block must be the real token at its anchor."""
         s = _make_strategy(block_size=8)
         recipe = _make_recipe()
         input_ids, attn = self._make_inputs(128)
-        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
-        for i, start in enumerate(starts):
-            assert (boi[:, i * s.block_size] == input_ids[:, start]).all()
+        ap, keep, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        B, n = ap.shape
+        for b in range(B):
+            for i in range(n):
+                if keep[b, i]:
+                    assert boi[b, i * s.block_size] == input_ids[b, ap[b, i]]
 
     def test_non_anchor_tokens_are_mask(self):
         """All positions after the anchor in each block should be MASK_ID."""
         s = _make_strategy(block_size=8)
         recipe = _make_recipe()
         input_ids, attn = self._make_inputs(128)
-        starts, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
-        n = len(starts)
+        ap, _, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        n = ap.shape[1]
         for b in range(n):
             noise_slice = boi[:, b * s.block_size + 1 : (b + 1) * s.block_size]
             assert (noise_slice == MASK_ID).all()
@@ -491,16 +472,15 @@ class TestDFlashSampleAnchorBlocks:
         attn = torch.ones(B, L, dtype=torch.long)
         # Zero the entire loss_mask — every predicted position should be masked out.
         loss_mask = torch.zeros(B, L, dtype=torch.long)
-        _, _, _, bm = s._sample_anchor_block(recipe, input_ids, attn, loss_mask=loss_mask)
+        _, _, _, _, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3, loss_mask=loss_mask)
         assert bm.sum().item() == 0
 
 
 class TestDFlashSampleAnchorBlocksOverlapping:
-    """Tests for the paper-default overlap_anchors=True sampler (CPU, no GPU required).
+    """Tests for the paper-default per-sample overlap_anchors=True sampler.
 
-    The non-overlapping path is exercised by :class:`TestDFlashSampleAnchorBlocks`
-    above. This class covers the independent-sampling path used to reach the
-    paper's N=512 anchors per sequence (Appendix A.1).
+    Each sample draws ``num_blocks`` anchors independently (Appendix A.1), so
+    anchor_positions is ``[B, N]`` with potentially different rows.
     """
 
     def _make_inputs(self, seq_len, batch_size=2):
@@ -510,33 +490,22 @@ class TestDFlashSampleAnchorBlocksOverlapping:
         return input_ids, attn
 
     def test_returns_requested_count(self):
-        """Overlap mode returns exactly num_blocks anchors (no max_n clamp)."""
+        """Overlap mode returns exactly num_blocks anchors per sample."""
         s = _make_strategy(block_size=8, overlap_anchors=True)
         recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(64)
-        # 64 / 8 = 8 non-overlapping max, but overlap mode allows more.
-        starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
-        assert len(starts) == 16
+        input_ids, attn = self._make_inputs(64)  # non-overlap cap = 8, overlap allows more
+        ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+        assert ap.shape == (2, 16)
 
-    def test_starts_in_valid_range(self):
-        """Every anchor must satisfy 1 <= start <= valid_len - block_size."""
+    def test_anchors_in_valid_range(self):
+        """Every anchor must satisfy 1 <= a <= valid_len - block_size."""
         seq_len, bs = 64, 8
         s = _make_strategy(block_size=bs, overlap_anchors=True)
         recipe = _make_recipe()
         input_ids, attn = self._make_inputs(seq_len)
         for _ in range(10):
-            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
-            for start in starts:
-                assert 1 <= start <= seq_len - bs
-
-    def test_starts_are_sorted(self):
-        """Overlap mode also returns sorted starts (mask construction relies on it)."""
-        s = _make_strategy(block_size=8, overlap_anchors=True)
-        recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(128)
-        for _ in range(10):
-            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
-            assert starts == sorted(starts)
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+            assert (ap >= 1).all() and (ap <= seq_len - bs).all()
 
     def test_can_exceed_non_overlapping_cap(self):
         """N > seq_len // block_size succeeds (impossible in non-overlap mode)."""
@@ -544,55 +513,44 @@ class TestDFlashSampleAnchorBlocksOverlapping:
         s = _make_strategy(block_size=bs, overlap_anchors=True)
         recipe = _make_recipe()
         input_ids, attn = self._make_inputs(seq_len)
-        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=20)
-        assert len(starts) == 20
+        ap, keep, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=20)
+        assert ap.shape == (2, 20)
         assert boi.shape == (2, 20 * bs)
 
-    def test_shape_consistency(self):
-        """Returned tensors must have the standard concatenated shapes."""
-        s = _make_strategy(block_size=8, overlap_anchors=True)
-        recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(128)
-        n = 12
-        starts, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=n)
-        assert boi.shape == (2, n * 8)
-        assert bt.shape == (2, n * 7)
-        assert bm.shape == (2, n * 7)
-
-    def test_anchor_token_is_clean(self):
-        """First token of each block must be the original (non-mask) token at start."""
-        s = _make_strategy(block_size=8, overlap_anchors=True)
-        recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(128)
-        starts, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=10)
-        for i, start in enumerate(starts):
-            assert (boi[:, i * s.block_size] == input_ids[:, start]).all()
-
-    def test_overlap_actually_possible(self):
-        """With N >> non-overlap cap, at least one pair of anchors should overlap."""
+    def test_per_sample_diversity(self):
+        """Different samples should (with high probability) get different anchors."""
         torch.manual_seed(0)
-        seq_len, bs = 24, 8  # non-overlap cap = 3
+        s = _make_strategy(block_size=8, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(256, batch_size=2)
+        ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+        # Two independently-sampled rows of 16 anchors should not be identical.
+        assert not torch.equal(ap[0], ap[1])
+
+    def test_anchor_token_is_clean_per_sample(self):
+        """Each kept block's first token is the real token at that sample's anchor."""
+        s = _make_strategy(block_size=8, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, keep, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=10)
+        B, n = ap.shape
+        for b in range(B):
+            for i in range(n):
+                if keep[b, i]:
+                    assert boi[b, i * s.block_size] == input_ids[b, ap[b, i]]
+
+    def test_min_token_filter_drops_short_samples(self):
+        """Samples with < 2*block_size supervised tokens get block_keep_mask=False."""
+        bs = 8
         s = _make_strategy(block_size=bs, overlap_anchors=True)
         recipe = _make_recipe()
-        input_ids, attn = self._make_inputs(seq_len)
-        # Across a few draws, expect some overlapping anchor pairs (gap < block_size).
-        any_overlap = False
-        for _ in range(10):
-            starts, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=10)
-            for i in range(len(starts) - 1):
-                if starts[i + 1] < starts[i] + bs:
-                    any_overlap = True
-                    break
-            if any_overlap:
-                break
-        assert any_overlap, "overlap_anchors=True should allow anchor blocks to overlap"
-
-    def test_fallback_when_sequence_too_short(self):
-        """Sequence too short for even one block falls back gracefully."""
-        s = _make_strategy(block_size=16, overlap_anchors=True)
-        recipe = _make_recipe()
-        # valid_len - block_size < 1 → fall back to single-anchor path.
-        input_ids, attn = self._make_inputs(seq_len=16)
-        starts, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
-        assert len(starts) == 1
-        assert boi.shape[1] == 16
+        torch.manual_seed(1)
+        B, L = 2, 128
+        input_ids = torch.randint(0, 100, (B, L))
+        attn = torch.ones(B, L, dtype=torch.long)
+        # Sample 0 long enough, sample 1 too short (< 2*bs valid tokens).
+        attn[1, 2 * bs - 1 :] = 0
+        ap, keep, _, _, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+        assert keep[0].all()  # long sample kept
+        assert (~keep[1]).all()  # short sample fully dropped
+        assert bm[1].sum().item() == 0  # short sample contributes no loss

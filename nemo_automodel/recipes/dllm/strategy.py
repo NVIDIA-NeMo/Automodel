@@ -466,72 +466,89 @@ class DFlashStrategy(DLLMStrategy):
         attn: torch.Tensor,
         num_blocks: int,
         loss_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample ``num_blocks`` anchor positions and return concatenated tensors.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample ``num_blocks`` anchors **per sample** and gather block tensors.
 
-        Two sampling modes (controlled by ``self.overlap_anchors``):
+        Each sequence in the batch independently draws ``N = num_blocks`` anchor
+        positions from its own ``[1, valid_len_b - block_size]`` range (paper
+        §4.2 "randomly sample anchor tokens"; matches SpecForge/speculators
+        ``select_anchors``). This gives more position diversity per step than
+        sharing one anchor set across the batch.
 
-        * **Overlapping (paper default, ``overlap_anchors=True``)**: each anchor
-          is drawn independently from ``[1, valid_len - block_size]``. Multiple
-          anchors may land at the same position; downstream blocks live in
-          separate KV slots, so "overlap" only means two blocks share a context
-          tail in the original sequence — they are still attention-isolated.
-          Required for paper-default ``num_blocks_per_sample=512``.
-
-        * **Non-overlapping (``overlap_anchors=False``)**: stars-and-bars
-          construction places ``n = min(num_blocks, (valid_len-1)//block_size)``
-          anchors with at least ``block_size`` gap between consecutive starts.
-          Use this only with the SDPA backend at small N — caps at
-          ``seq_len // block_size`` (e.g. 255 for seq_len=4096, block_size=16).
+        Samples with fewer than ``2 * block_size`` supervised tokens are dropped
+        via ``block_keep_mask`` (SpecForge's min-loss-token filter) so degenerate
+        short sequences contribute no loss.
 
         Returns:
-            starts: sorted list of ``n`` anchor positions (ints, batch-shared).
-            block_output_ids: ``[B, n*block_size]`` — anchor+mask tokens.
-            block_targets:    ``[B, n*(block_size-1)]`` — ground-truth tokens.
-            block_mask:       ``[B, n*(block_size-1)]`` — float valid-position mask.
+            anchor_positions: ``[B, N]`` long — per-sample anchor positions.
+            block_keep_mask:  ``[B, N]`` bool — False for dropped/short samples.
+            block_output_ids: ``[B, N*block_size]`` — anchor token at each block
+                start, ``mask_token_id`` elsewhere.
+            block_targets:    ``[B, N*(block_size-1)]`` — gathered target tokens.
+            block_mask:       ``[B, N*(block_size-1)]`` — float mask: supervised
+                AND in-bounds AND kept.
         """
-        B = input_ids.size(0)
+        B, L = input_ids.shape
         device = input_ids.device
-        valid_len = int(attn.sum(dim=1).min().item())
-        max_anchor = valid_len - self.block_size  # latest valid anchor position
+        bs = self.block_size
+        N = max(1, num_blocks)
 
-        if max_anchor < 1:
-            # Sequence too short for any block — fall through to single-anchor path.
-            start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn, loss_mask)
-            return [start], boi, bt, bm
+        effective = (attn if loss_mask is None else attn * loss_mask).float()  # [B, L]
+        valid_lens = attn.sum(dim=1)  # [B] attended length per sample
+        supervised_lens = effective.sum(dim=1)  # [B] supervised tokens per sample
+        max_anchor = (valid_lens - bs).clamp(min=1)  # [B] latest valid anchor (>=1 for safe sampling)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, N)  # [B, N]
 
+        n_valid = N  # number of real (non-padding) blocks; only < N in non-overlap mode
         if self.overlap_anchors:
-            # Independent sampling — paper's "randomly sample anchor tokens" (§4.2).
-            n = max(1, num_blocks)
-            anchors = torch.randint(1, max_anchor + 1, (n,), device=device)
-            starts = anchors.sort().values.tolist()
+            # Per-sample independent anchors in [1, valid_len_b - block_size].
+            rand = torch.rand(B, N, device=device)
+            anchor_positions = (1 + (rand * (max_anchor - 1).unsqueeze(1).float()).round().long()).clamp(min=1)
+            anchor_positions = torch.minimum(anchor_positions, max_anchor.unsqueeze(1))
         else:
-            max_n = max(1, (valid_len - 1) // self.block_size)
-            n = min(num_blocks, max_n)
-            avail = valid_len - n * self.block_size
-            if n == 1 or avail < 1:
-                start, boi, bt, bm = self._sample_anchor_block(recipe, input_ids, attn, loss_mask)
-                return [start], boi, bt, bm
-            perm = torch.randperm(avail, device=device)[:n].sort().values
-            starts = (perm + torch.arange(n, device=device) * self.block_size + 1).tolist()
+            # Legacy batch-shared non-overlapping (stars-and-bars), broadcast to
+            # [B, N]; padding blocks (when fewer than N fit) get keep=False below.
+            vmin = int(valid_lens.min().item())
+            n_valid = min(N, max(1, (vmin - 1) // bs))
+            avail = vmin - n_valid * bs
+            if avail < 1:
+                starts = torch.arange(1, n_valid + 1, device=device)
+            else:
+                perm = torch.randperm(avail, device=device)[:n_valid].sort().values
+                starts = perm + torch.arange(n_valid, device=device) * bs + 1
+            if n_valid < N:  # pad to fixed N (keep=False masks the padding)
+                starts = torch.cat([starts, starts.new_full((N - n_valid,), int(starts[-1]))])
+            anchor_positions = starts.unsqueeze(0).expand(B, N).contiguous()
 
-        starts = [int(s) for s in starts]
+        # Min-loss-token filter (SpecForge): a sample must hold a block and have
+        # at least 2*block_size supervised tokens, else all its blocks are dropped.
+        # Padding blocks beyond n_valid (non-overlap mode) are also dropped.
+        sample_ok = (supervised_lens >= 2 * bs) & (valid_lens > bs)  # [B]
+        block_keep_mask = sample_ok.unsqueeze(1) & (torch.arange(N, device=device).unsqueeze(0) < n_valid)
+        block_keep_mask = block_keep_mask.contiguous()  # [B, N]
 
-        effective = attn if loss_mask is None else attn * loss_mask
-        boi_list, bt_list, bm_list = [], [], []
-        for start in starts:
-            boi = input_ids.new_full((B, self.block_size), recipe.mask_token_id)
-            boi[:, 0] = input_ids[:, start]
-            boi_list.append(boi)
-            bt_list.append(input_ids[:, start + 1 : start + self.block_size])
-            bm_list.append(effective[:, start + 1 : start + self.block_size].float())
-
-        return (
-            starts,
-            torch.cat(boi_list, dim=1),
-            torch.cat(bt_list, dim=1),
-            torch.cat(bm_list, dim=1),
+        # block_output_ids: anchor token at each block start, mask elsewhere.
+        block_output_ids = input_ids.new_full((B, N * bs), recipe.mask_token_id)
+        anchor_tokens = input_ids[batch_idx, anchor_positions.clamp(max=L - 1)]  # [B, N]
+        block_starts = (torch.arange(N, device=device) * bs).unsqueeze(0).expand(B, N)  # [B, N]
+        block_output_ids[batch_idx, block_starts] = torch.where(
+            block_keep_mask, anchor_tokens, anchor_tokens.new_full(anchor_tokens.shape, recipe.mask_token_id)
         )
+
+        # Targets + mask for predicted positions anchor+1 .. anchor+block_size-1.
+        tgt_off = torch.arange(1, bs, device=device).view(1, 1, -1)  # [1, 1, bs-1]
+        tgt_idx = anchor_positions.unsqueeze(-1) + tgt_off  # [B, N, bs-1]
+        in_bounds = tgt_idx < valid_lens.view(B, 1, 1)  # within attended region
+        safe_idx = tgt_idx.clamp(max=L - 1)  # [B, N, bs-1]
+        block_targets = torch.gather(input_ids.unsqueeze(1).expand(B, N, L), 2, safe_idx).reshape(B, N * (bs - 1))
+        bm = (
+            torch.gather(effective.unsqueeze(1).expand(B, N, L), 2, safe_idx)
+            * in_bounds.float()
+            * block_keep_mask.unsqueeze(-1).float()
+        )
+        block_mask = bm.reshape(B, N * (bs - 1))
+
+        return anchor_positions, block_keep_mask, block_output_ids, block_targets, block_mask
 
     def pre_step(self, recipe, batches) -> tuple[int, int]:
         """Sample anchor blocks and run frozen target forwards for all microbatches."""
@@ -543,27 +560,19 @@ class DFlashStrategy(DLLMStrategy):
             loss_mask = batch.get("loss_mask")
             if loss_mask is not None:
                 loss_mask = loss_mask.to(device)
-            if self.num_blocks_per_sample > 1:
-                starts, block_output_ids, block_targets, block_mask = self._sample_anchor_blocks(
-                    recipe, input_ids, attn, self.num_blocks_per_sample, loss_mask
-                )
-                # Use the full (constant) sequence length as the context, NOT
-                # starts[-1]. The deepest anchor varies every step, which would
-                # make KV_LEN vary and force FlexAttention to recompile each
-                # step. With a fixed ctx_len the kernel compiles once; the
-                # block-diagonal mask (kv_idx < anchor) still prevents any block
-                # from attending past its own anchor, so padding context beyond
-                # the valid region is never read.
-                ctx_len = int(input_ids.shape[1])
-                target_hidden = self._run_target_forward(input_ids, attn, ctx_len)
-                batch["_dflash_starts"] = starts
-            else:
-                start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(
-                    recipe, input_ids, attn, loss_mask
-                )
-                target_hidden = self._run_target_forward(input_ids, attn, start)
-                batch["_dflash_start"] = start
+            anchor_positions, block_keep_mask, block_output_ids, block_targets, block_mask = self._sample_anchor_blocks(
+                recipe, input_ids, attn, self.num_blocks_per_sample, loss_mask
+            )
+            # Run the target over the FULL (constant) sequence length, not up to
+            # the deepest anchor. A varying context length would make KV_LEN vary
+            # and force FlexAttention to recompile each step; a fixed length lets
+            # the kernel compile once. The block-diagonal mask (kv_idx < anchor)
+            # still stops any block from reading past its own anchor.
+            ctx_len = int(input_ids.shape[1])
+            target_hidden = self._run_target_forward(input_ids, attn, ctx_len)
             # Offload to CPU so draft backward has the full VRAM budget.
+            batch["_dflash_anchor_positions"] = anchor_positions
+            batch["_dflash_block_keep"] = block_keep_mask
             batch["_dflash_target_hidden"] = target_hidden.cpu()
             batch["_dflash_block_output_ids"] = block_output_ids
             batch["_dflash_block_targets"] = block_targets
@@ -592,31 +601,31 @@ class DFlashStrategy(DLLMStrategy):
         batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         # Retrieve pre-computed DFlash tensors (set by pre_step).
-        multi_block = "_dflash_starts" in batch
-        if multi_block:
-            starts = batch.pop("_dflash_starts")
-        elif "_dflash_start" in batch:
-            starts = [batch.pop("_dflash_start")]
+        if "_dflash_anchor_positions" in batch:
+            anchor_positions = batch.pop("_dflash_anchor_positions")
+            block_keep_mask = batch.pop("_dflash_block_keep")
         else:
             # Fallback: compute on the fly (e.g. when called outside pre_step).
             input_ids = batch["input_ids"]
             attn = batch.get("attention_mask", torch.ones_like(input_ids))
-            start, block_output_ids, block_targets, block_mask = self._sample_anchor_block(recipe, input_ids, attn)
-            target_hidden = self._run_target_forward(input_ids, attn, start)
-            starts = [start]
+            anchor_positions, block_keep_mask, boi, bt, bm = self._sample_anchor_blocks(
+                recipe, input_ids, attn, self.num_blocks_per_sample, batch.get("loss_mask")
+            )
+            target_hidden = self._run_target_forward(input_ids, attn, int(input_ids.shape[1]))
             batch["_dflash_target_hidden"] = target_hidden
-            batch["_dflash_block_output_ids"] = block_output_ids
-            batch["_dflash_block_targets"] = block_targets
-            batch["_dflash_block_mask"] = block_mask
-            multi_block = False
+            batch["_dflash_block_output_ids"] = boi
+            batch["_dflash_block_targets"] = bt
+            batch["_dflash_block_mask"] = bm
 
         target_hidden = batch.pop("_dflash_target_hidden").to(device)
+        anchor_positions = anchor_positions.to(device)
+        block_keep_mask = block_keep_mask.to(device)
         block_output_ids = batch.pop("_dflash_block_output_ids")
         block_targets = batch.pop("_dflash_block_targets")
         block_mask = batch.pop("_dflash_block_mask")
 
         B = block_output_ids.size(0)
-        n = len(starts)
+        N = anchor_positions.shape[1]
         # Pad the target context up to the fixed sequence length so Q_LEN/KV_LEN
         # are constant across every step (the collator pads each batch to its own
         # max, which would otherwise keep changing KV_LEN and recompile the
@@ -629,27 +638,29 @@ class DFlashStrategy(DLLMStrategy):
             target_hidden = torch.cat([target_hidden, pad], dim=1)
         # ctx_len is now the fixed sequence length → FlexAttention compiles once.
         ctx_len = target_hidden.shape[1]
-        noise_embedding = self.target_embed(block_output_ids)  # [B, n*block_size, dim]
+        noise_embedding = self.target_embed(block_output_ids)  # [B, N*block_size, dim]
 
-        # Position IDs: actual sequence positions for RoPE correctness.
-        ctx_pos = torch.arange(ctx_len, device=device)
-        block_pos = torch.cat([torch.arange(s, s + self.block_size, device=device) for s in starts])
-        position_ids = torch.cat([ctx_pos, block_pos]).unsqueeze(0).expand(B, -1)
+        # Per-sample position IDs: shared context positions then each block's own
+        # anchor range (RoPE correctness). anchor_positions is [B, N], so block
+        # positions differ per sample — no broadcast.
+        ctx_pos = torch.arange(ctx_len, device=device).unsqueeze(0).expand(B, -1)  # [B, ctx_len]
+        blk_off = torch.arange(self.block_size, device=device).view(1, 1, -1)  # [1, 1, block_size]
+        block_pos = (anchor_positions.unsqueeze(-1) + blk_off).reshape(B, N * self.block_size)  # [B, N*block_size]
+        position_ids = torch.cat([ctx_pos, block_pos], dim=1)  # [B, ctx_len + N*block_size]
 
         # Sparse block-diagonal attention mask. For N=1 with the SDPA backend
         # we can skip the mask — the context-prefix slicing in
         # _run_target_forward already prevents post-anchor context leakage. For
         # FlexAttention we always build a BlockMask so the dispatcher gets the
-        # expected type.
+        # expected type. anchor_positions/block_keep_mask are already per-sample
+        # [B, N], so the mask is per-sample with no broadcast.
         attn_mask = None
-        if n > 1 or self.attention_backend == "flex_attention":
+        if N > 1 or self.attention_backend == "flex_attention":
             from nemo_automodel.components.attention.dflash_mask import (
                 create_dflash_block_mask,
                 create_dflash_sdpa_mask,
             )
 
-            anchor_positions = torch.tensor(starts, dtype=torch.long, device=device).view(1, n).expand(B, -1)
-            block_keep_mask = torch.ones(B, n, dtype=torch.bool, device=device)
             if self.attention_backend == "flex_attention":
                 attn_mask = create_dflash_block_mask(
                     anchor_positions=anchor_positions,
@@ -700,19 +711,9 @@ class DFlashStrategy(DLLMStrategy):
             if not torch.is_tensor(draft_hidden):
                 draft_hidden = getattr(draft_hidden, "last_hidden_state", draft_hidden[0])
 
-            # Extract predicted positions (skip anchor token per block).
-            # draft_hidden: [B, n*block_size, dim] — noise positions only.
-            pred = torch.cat(
-                [
-                    draft_hidden[
-                        :,
-                        b * self.block_size + 1 : (b + 1) * self.block_size,
-                        :,
-                    ]
-                    for b in range(n)
-                ],
-                dim=1,
-            )
+            # Extract predicted positions (skip the anchor token at index 0 of
+            # each block). draft_hidden: [B, N*block_size, dim] → [B, N*(block_size-1), dim].
+            pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :].reshape(B, N * (self.block_size - 1), -1)
             if self.use_fused_linear_ce:
                 # Fuse the LM-head projection into the CE — avoids materialising
                 # the [B, N*(block_size-1), vocab] logits tensor (the main OOM
@@ -723,7 +724,7 @@ class DFlashStrategy(DLLMStrategy):
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
-                    block_size=self.block_size if n > 1 else None,
+                    block_size=self.block_size if N > 1 else None,
                     lm_head_bias=getattr(self.target_head, "bias", None),
                 )
             else:
@@ -733,7 +734,7 @@ class DFlashStrategy(DLLMStrategy):
                     target_ids=block_targets,
                     block_mask=block_mask,
                     num_tokens=num_diffusion_tokens,
-                    block_size=self.block_size if n > 1 else None,
+                    block_size=self.block_size if N > 1 else None,
                 )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
