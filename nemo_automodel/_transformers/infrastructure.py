@@ -60,6 +60,7 @@ from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     apply_parameter_freezing,
     count_model_parameters,
+    enable_radio_vit_fused_attn,
     freeze_deepseek_v4_indexer_params,
     freeze_unused_kv_sharing_params,
     init_empty_weights,
@@ -497,6 +498,9 @@ def apply_model_infrastructure(
     # so the optimizer never tracks them and checkpoint save/resume stay consistent.
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
+
+    # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
+    enable_radio_vit_fused_attn(model)
 
     # Loss function check
     if not _supports_logits_to_keep(model) and not isinstance(loss_fn, MaskedCrossEntropy):
