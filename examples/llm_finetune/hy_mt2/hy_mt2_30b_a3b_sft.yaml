@@ -26,13 +26,14 @@
 # Other valid EP sizes: 1, 2, 4, 16, 32, 64, 128.
 #
 # Note: the on-disk checkpoint declares ``architectures: ["HYV3ForCausalLM"]``
-# and ``model_type: "hy_v3"``, which NeMoAutoModel's string-keyed registry maps
-# to ``components/models/hy_v3`` (Hy3-preview). This recipe deliberately
-# bypasses the registry by instantiating ``HyMT2ForCausalLM`` via a
-# fully-qualified ``_target_`` -- this keeps the Hy-MT2-specific logic
-# (``moe_router_use_sigmoid`` dispatch, ``enable_lm_head_fp32`` in-forward
-# upcast, ``expert_hidden_dim`` preference) isolated from the existing
-# Hy3-preview support without registry surgery.
+# and ``model_type: "hy_v3"``. NeMoAutoModel's model resolver
+# (``_transformers/model_init.py``) detects the Hy-MT2-30B-A3B config
+# fingerprint (hidden=2048, 48 layers, 128 experts, ``enable_lm_head_fp32``)
+# and dispatches to ``HyMT2ForCausalLM`` instead of the default
+# ``HYV3ForCausalLM``. Going through ``NeMoAutoModelForCausalLM`` here is
+# important: it runs the full HF safetensors loader, while a fully-qualified
+# ``_target_: HyMT2ForCausalLM.from_pretrained`` would only construct the
+# architecture with random weights.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -54,7 +55,7 @@ rng:
   ranked: true
 
 model:
-  _target_: nemo_automodel.components.models.hy_mt2.model.HyMT2ForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: tencent/Hy-MT2-30B-A3B
   torch_dtype: bfloat16
   backend:
