@@ -77,7 +77,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Xiaomi MiMo | [MiMo-V2-Flash](xiaomimimo/mimo-v2-flash.md) | `MiMoV2FlashForCausalLM` |
 | inclusionAI | [Ling 2.0](inclusionai/ling-2.md) | `BailingMoeV2ForCausalLM` |
 
-## Fine-Tuning LLMs with NeMo AutoModel
+## Fine-Tune LLMs with NeMo AutoModel
 
 The models listed above can be fine-tuned using NeMo AutoModel. We support two primary fine-tuning approaches:
 
