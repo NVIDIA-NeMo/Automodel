@@ -14,14 +14,23 @@
 
 """Unit tests for the VLM-finetune recipe helpers added for the joint drafter path.
 
-Covers the two small additions in ``recipes/vlm/finetune.py``:
+Covers the small additions in ``recipes/vlm/finetune.py``:
   * ``_shift_labels_left`` -- builds drafter-step targets.
   * ``_is_gemma4_joint_target`` -- detects the composite's classmethod target.
+  * ``FinetuneRecipeForVLM._maybe_add_drafter_loss`` -- adds the
+    ``lambda * sum_k CE(drafter_logits[k], shifted_labels_k)`` term to the
+    base loss when the model returns a non-empty ``drafter_logits``.
 """
+
+import types
+from dataclasses import dataclass
+from typing import Optional
+from unittest.mock import MagicMock
 
 import torch
 
 from nemo_automodel.recipes.vlm.finetune import (
+    FinetuneRecipeForVLM,
     _is_gemma4_joint_target,
     _shift_labels_left,
 )
@@ -153,3 +162,184 @@ class TestIsGemma4JointTarget:
         from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 
         assert _is_gemma4_joint_target(NeMoAutoModelForCausalLM.from_pretrained) is False
+
+
+@dataclass
+class _FakeJointOut:
+    """Stand-in for ``Gemma4JointOutput`` -- just the attributes
+    ``_maybe_add_drafter_loss`` reads."""
+
+    drafter_logits: Optional[list]
+    drafter_loss_weight: float = 0.1
+
+
+def _identity_loss(*, logits, labels, num_label_tokens):  # noqa: ARG001
+    """Toy loss that returns ``logits.sum() / num_label_tokens`` so every
+    call's contribution is independent of the labels but still touches the
+    autograd graph. The drafter total is then the simple sum of per-step
+    sums, which is what ``_maybe_add_drafter_loss`` should produce."""
+    return logits.float().sum() / max(int(num_label_tokens), 1)
+
+
+class TestMaybeAddDrafterLoss:
+    """``_maybe_add_drafter_loss`` is the recipe's only joint-loss assembly
+    site; it is responsible for:
+
+      * returning ``base_loss`` unchanged when the model is not a joint
+        composite (``drafter_logits`` missing OR empty);
+      * summing per-step drafter losses with ``shift = k`` against the
+        recipe's ``loss_fn`` and weighting by ``drafter_loss_weight``;
+      * emitting the rank-0 ``[joint-drafter]`` log line when ``log=True``.
+    """
+
+    def _make_recipe(self):
+        """Build the smallest object that satisfies the method's attribute
+        reads (``self.loss_fn``, ``self.dist_env``)."""
+        recipe = types.SimpleNamespace()
+        recipe.loss_fn = _identity_loss
+        recipe.dist_env = types.SimpleNamespace(is_main=True)
+        return recipe
+
+    def test_drafter_logits_missing_returns_base_loss_unchanged(self):
+        recipe = self._make_recipe()
+        base = torch.tensor(1.5)
+        out = types.SimpleNamespace()  # no ``drafter_logits`` attribute
+        labels = torch.tensor([[1, 2, 3]])
+        result = FinetuneRecipeForVLM._maybe_add_drafter_loss(
+            recipe,
+            out=out,
+            base_loss=base,
+            labels=labels,
+            model=MagicMock(),
+            num_label_tokens=3,
+        )
+        assert result is base
+
+    def test_drafter_logits_empty_returns_base_loss_unchanged(self):
+        recipe = self._make_recipe()
+        base = torch.tensor(1.5)
+        out = _FakeJointOut(drafter_logits=[])
+        labels = torch.tensor([[1, 2, 3]])
+        result = FinetuneRecipeForVLM._maybe_add_drafter_loss(
+            recipe,
+            out=out,
+            base_loss=base,
+            labels=labels,
+            model=MagicMock(),
+            num_label_tokens=3,
+        )
+        assert result is base
+
+    def test_drafter_logits_attribute_set_to_none_returns_base(self):
+        """Defensive: a composite output may explicitly set
+        ``drafter_logits=None``; this must also short-circuit."""
+        recipe = self._make_recipe()
+        base = torch.tensor(0.0)
+        out = _FakeJointOut(drafter_logits=None)
+        result = FinetuneRecipeForVLM._maybe_add_drafter_loss(
+            recipe,
+            out=out,
+            base_loss=base,
+            labels=torch.tensor([[1]]),
+            model=MagicMock(),
+            num_label_tokens=1,
+        )
+        assert result is base
+
+    def test_adds_weighted_sum_of_per_step_drafter_losses(self):
+        """``L_total = L_base + lambda * sum_k L_drafter_k``.
+
+        With the toy ``_identity_loss = logits.sum() / num_label_tokens`` the
+        per-step contribution is independent of the labels, so we can predict
+        the total in closed form and pin both the magnitude and the
+        ``drafter_loss_weight`` plumbing.
+        """
+        recipe = self._make_recipe()
+        base_loss = torch.tensor(2.0)
+        # Two drafter steps; logits sums = 6 and 10 -> drafter_total = 16.
+        dl_0 = torch.full((1, 4, 3), 0.5)  # sum = 6.0
+        dl_1 = torch.full((1, 4, 5), 0.5)  # sum = 10.0
+        labels = torch.tensor([[1, 2, 3, 4]])
+        out = _FakeJointOut(drafter_logits=[dl_0, dl_1], drafter_loss_weight=0.25)
+        result = FinetuneRecipeForVLM._maybe_add_drafter_loss(
+            recipe,
+            out=out,
+            base_loss=base_loss,
+            labels=labels,
+            model=MagicMock(),
+            num_label_tokens=4,
+        )
+        # Per-step losses: 6/4 = 1.5 and 10/4 = 2.5. Sum = 4.0.
+        # Total = 2.0 + 0.25 * 4.0 = 3.0.
+        torch.testing.assert_close(result, torch.tensor(3.0))
+
+    def test_uses_shift_labels_left_with_k_index(self):
+        """The k-th drafter step must be scored against labels shifted left
+        by ``k``. We pin this by capturing the ``labels`` kwarg passed into
+        the loss function on every call."""
+        recipe = self._make_recipe()
+        seen_labels: list = []
+
+        def _capturing_loss(*, logits, labels, num_label_tokens):  # noqa: ARG001
+            seen_labels.append(labels.clone())
+            return logits.float().sum() / num_label_tokens
+
+        recipe.loss_fn = _capturing_loss
+        labels = torch.tensor([[10, 20, 30, 40, 50]])
+        dl_0 = torch.zeros((1, 5, 2))
+        dl_1 = torch.zeros((1, 5, 2))
+        out = _FakeJointOut(drafter_logits=[dl_0, dl_1], drafter_loss_weight=1.0)
+
+        FinetuneRecipeForVLM._maybe_add_drafter_loss(
+            recipe,
+            out=out,
+            base_loss=torch.tensor(0.0),
+            labels=labels,
+            model=MagicMock(),
+            num_label_tokens=5,
+        )
+        # k=0: identity; k=1: shifted left by 1, last position becomes -100.
+        torch.testing.assert_close(seen_labels[0], labels)
+        torch.testing.assert_close(seen_labels[1], torch.tensor([[20, 30, 40, 50, -100]]))
+
+    def test_log_main_rank_does_not_raise(self, caplog):
+        """``log=True`` on the main rank emits a single ``[joint-drafter]``
+        log line. The test pins that the path runs without raising and
+        produces the expected breakdown."""
+        import logging
+
+        recipe = self._make_recipe()
+        out = _FakeJointOut(drafter_logits=[torch.zeros((1, 2, 3))], drafter_loss_weight=0.01)
+        with caplog.at_level(logging.INFO, logger="nemo_automodel.recipes.vlm.finetune"):
+            FinetuneRecipeForVLM._maybe_add_drafter_loss(
+                recipe,
+                out=out,
+                base_loss=torch.tensor(0.5),
+                labels=torch.tensor([[1, 2]]),
+                model=MagicMock(),
+                num_label_tokens=2,
+                log=True,
+            )
+        # The log message must include the joint-drafter prefix; we don't
+        # pin the exact floats since they depend on the toy loss arithmetic.
+        assert any("[joint-drafter]" in r.getMessage() for r in caplog.records)
+
+    def test_log_off_main_rank_emits_nothing(self, caplog):
+        """``log=True`` but ``dist_env.is_main=False`` (off-main rank): no
+        log record from the joint-drafter path."""
+        import logging
+
+        recipe = self._make_recipe()
+        recipe.dist_env = types.SimpleNamespace(is_main=False)
+        out = _FakeJointOut(drafter_logits=[torch.zeros((1, 2, 3))])
+        with caplog.at_level(logging.INFO, logger="nemo_automodel.recipes.vlm.finetune"):
+            FinetuneRecipeForVLM._maybe_add_drafter_loss(
+                recipe,
+                out=out,
+                base_loss=torch.tensor(0.5),
+                labels=torch.tensor([[1, 2]]),
+                model=MagicMock(),
+                num_label_tokens=2,
+                log=True,
+            )
+        assert not any("[joint-drafter]" in r.getMessage() for r in caplog.records)
