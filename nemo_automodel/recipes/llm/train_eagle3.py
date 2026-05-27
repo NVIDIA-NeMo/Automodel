@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3)."""
+"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ from nemo_automodel.components.speculative.eagle import (
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -81,7 +82,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle3Recipe(BaseRecipe):
-    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3)."""
+    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -113,12 +114,44 @@ class TrainEagle3Recipe(BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
+
+        # Optional ``distributed:`` YAML section. Required for targets that
+        # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE): without it,
+        # ``from_pretrained`` loads the full target on every rank and OOMs.
+        # When absent, the recipe keeps the original single-GPU-per-rank
+        # behavior so existing 8B-class dense recipes are unaffected.
+        # ``force_hf`` is opt-in. Default ``False`` so HF architectures
+        # with an AutoModel custom impl (e.g. ``Qwen3MoeForCausalLM``,
+        # ``LlamaForCausalLM``) take the custom path, which unlocks the
+        # MoE infra (EP, ``GroupedExperts``, DeepEP). Set
+        # ``recipe_args.target_force_hf: true`` in YAML to force the
+        # plain HF implementation.
+        target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
-            force_hf=True,
-        ).to(self.device)
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        self.dist_setup = None
+        self.distributed_config = None
+        self.device_mesh = None
+        self.moe_mesh = None
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        # FSDP2 / EP sharding placed the model on the right devices already;
+        # only do the brute-force ``.to(device)`` for the unsharded path.
+        if self.dist_setup is None:
+            self.target_model = self.target_model.to(self.device)
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
