@@ -20,8 +20,7 @@
 # vocab=120832, 256K context, rope_theta=11158840, qk_norm.
 #
 # Hardware target: 8 GPUs (80 GB+ each) for full SFT with EP8 + FSDP2.
-#   automodel finetune llm -c examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml \
-#     --nproc-per-node 8
+#   automodel examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml --nproc-per-node 8
 #
 # EP size must divide num_experts (128). ep_size=8 -> 16 experts per rank.
 # Other valid EP sizes: 1, 2, 4, 16, 32, 64, 128.
