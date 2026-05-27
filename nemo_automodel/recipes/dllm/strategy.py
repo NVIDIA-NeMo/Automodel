@@ -261,6 +261,7 @@ class DFlashStrategy(DLLMStrategy):
         self.dflash_loss_fn = None
         self.attention_backend: str = "sdpa"
         self.overlap_anchors: bool = True
+        self.use_fused_linear_ce: bool = True
 
     @property
     def loss_log_key(self) -> str:
@@ -363,7 +364,12 @@ class DFlashStrategy(DLLMStrategy):
             if gamma_cfg > 0.0
             else {16: 7.0, 10: 5.0, 8: 4.0}.get(self.block_size, max(2.0, self.block_size / 2.0))
         )
-        self.dflash_loss_fn = DFlashDecayLoss(loss_gamma=loss_gamma)
+        # Fused linear cross-entropy (Liger) fuses the LM-head projection with CE
+        # so the [B, N*(block_size-1), vocab] logits tensor is never materialised
+        # — required to fit paper-default num_blocks_per_sample=512 on a full-vocab
+        # target. Default on; set dflash.use_fused_linear_ce: false to disable.
+        self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
+        self.dflash_loss_fn = DFlashDecayLoss(loss_gamma=loss_gamma, use_fused_linear_ce=self.use_fused_linear_ce)
 
         # --- Multi-block ---
         self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
@@ -671,15 +677,28 @@ class DFlashStrategy(DLLMStrategy):
                 ],
                 dim=1,
             )
-            logits = self.target_head(pred)
-
-            loss_result = self.dflash_loss_fn(
-                logits=logits,
-                target_ids=block_targets,
-                block_mask=block_mask,
-                num_tokens=num_diffusion_tokens,
-                block_size=self.block_size if n > 1 else None,
-            )
+            if self.use_fused_linear_ce:
+                # Fuse the LM-head projection into the CE — avoids materialising
+                # the [B, N*(block_size-1), vocab] logits tensor (the main OOM
+                # source at large N on a full-vocab target).
+                loss_result = self.dflash_loss_fn.forward_fused(
+                    hidden=pred,
+                    lm_head_weight=self.target_head.weight,
+                    target_ids=block_targets,
+                    block_mask=block_mask,
+                    num_tokens=num_diffusion_tokens,
+                    block_size=self.block_size if n > 1 else None,
+                    lm_head_bias=getattr(self.target_head, "bias", None),
+                )
+            else:
+                logits = self.target_head(pred)
+                loss_result = self.dflash_loss_fn(
+                    logits=logits,
+                    target_ids=block_targets,
+                    block_mask=block_mask,
+                    num_tokens=num_diffusion_tokens,
+                    block_size=self.block_size if n > 1 else None,
+                )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
             recipe._dllm_loss_buffer.append(loss_result.dllm_loss)

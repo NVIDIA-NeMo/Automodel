@@ -14,7 +14,7 @@
 
 """DFlash sparse-attention masks (SDPA + FlexAttention).
 
-Ports the mask builders from SpecForge (``specforge/core/dflash.py``) so that
+Builds the DFlash block-diagonal attention masks (paper §4.2) so that
 multi-anchor DFlash training (up to ~512 anchors per sequence — paper
 Appendix A.1) is tractable in memory.
 
@@ -55,7 +55,6 @@ def flex_attention_available() -> bool:
 # changes per step (new anchor positions), but the create_block_mask machinery
 # itself is identical — compiling once and reusing avoids per-step Python
 # overhead of evaluating mask_mod across the BlockMask grid.
-# Mirrors SpecForge's WrappedCreateBlockMask (specforge/modeling/draft/flex_attention.py).
 #
 # Mirrors the graceful-fallback pattern used by
 # nemo_automodel.components.utils.compile_utils.compile_model: if torch.compile

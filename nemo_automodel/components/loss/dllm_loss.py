@@ -245,11 +245,55 @@ class DFlashDecayLoss(nn.Module):
 
     Args:
         loss_gamma: Decay parameter γ.
+        use_fused_linear_ce: When True, compute the per-token NLL with the
+            chunked linear-CE path (:meth:`forward_fused`) — projects the
+            LM head and runs cross-entropy in position chunks, each wrapped in
+            :func:`torch.utils.checkpoint` so the full ``[B, T, vocab]`` logits
+            tensor is never materialised (peak is one chunk). Keeps large
+            ``num_blocks_per_sample`` (e.g. paper-default 512) within memory on
+            full-vocab targets.
+
+            We deliberately do NOT use ``liger_kernel``'s
+            ``LigerFusedLinearCrossEntropyLoss`` here: its custom autograd
+            Function computes ``grad_input`` eagerly in forward and only
+            integrates with FSDP via the model-patching redirection
+            (``apply_liger_kernel_to_*``). Used standalone under FSDP2 the
+            gradient does not reach the sharded model params (grad_norm 0).
+            The chunked path is plain autograd, so FSDP2 handles it correctly.
+        chunk_size: Number of predicted positions per chunk in the chunked
+            linear-CE path. Smaller = lower peak memory, more recompute.
     """
 
-    def __init__(self, loss_gamma: float = 7.0):
+    def __init__(self, loss_gamma: float = 7.0, use_fused_linear_ce: bool = False, chunk_size: int = 1024):
         super().__init__()
         self.loss_gamma = float(loss_gamma)
+        self.use_fused_linear_ce = bool(use_fused_linear_ce)
+        self.chunk_size = int(chunk_size)
+
+    def _decay_weights(self, T: int, block_size: Optional[int], device, dtype) -> torch.Tensor:
+        """Eq. 4 weights for ``T`` predicted positions, resetting per block."""
+        if block_size is not None:
+            T_per = block_size - 1
+            n_blocks = T // T_per if T_per > 0 else 1
+            w_single = torch.exp(-torch.arange(T_per, device=device, dtype=dtype) / self.loss_gamma)
+            return w_single.repeat(n_blocks)
+        return torch.exp(-torch.arange(T, device=device, dtype=dtype) / self.loss_gamma)
+
+    def _reduce(
+        self,
+        token_nll: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_tokens: Optional[int],
+        block_size: Optional[int],
+    ) -> DLLMLossOutput:
+        """Apply decay weights + block mask, sum, and normalise."""
+        _, T = token_nll.shape
+        w = self._decay_weights(T, block_size, token_nll.device, token_nll.dtype)
+        weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
+        loss = (token_nll * weights).sum()
+        if num_tokens is not None:
+            loss = loss / max(float(num_tokens), 1.0)
+        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
 
     def forward(
         self,
@@ -259,7 +303,7 @@ class DFlashDecayLoss(nn.Module):
         num_tokens: Optional[int] = None,
         block_size: Optional[int] = None,
     ) -> DLLMLossOutput:
-        """Compute the DFlash decay-weighted loss.
+        """Compute the DFlash decay-weighted loss from pre-computed logits.
 
         Args:
             logits: Draft model logits for the predicted block positions,
@@ -277,22 +321,70 @@ class DFlashDecayLoss(nn.Module):
         """
         token_nll = _compute_per_token_nll(logits, target_ids)  # [B, T]
         del logits
-        _, T = token_nll.shape
+        return self._reduce(token_nll, block_mask, num_tokens, block_size)
 
-        if block_size is not None:
-            # Multi-block: replicate per-block decay so weights reset at each boundary.
-            T_per = block_size - 1
-            n_blocks = T // T_per if T_per > 0 else 1
-            w_single = torch.exp(-torch.arange(T_per, device=token_nll.device, dtype=token_nll.dtype) / self.loss_gamma)
-            w = w_single.repeat(n_blocks)
-        else:
-            # Single-block or legacy: monotone decay over the full T.
-            w = torch.exp(-torch.arange(T, device=token_nll.device, dtype=token_nll.dtype) / self.loss_gamma)
+    @staticmethod
+    def _chunk_nll(
+        hidden_chunk: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        lm_head_bias: Optional[torch.Tensor],
+        target_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project one position chunk and return its per-token NLL.
 
-        weights = w.unsqueeze(0) * block_mask.to(token_nll.dtype)  # [B, T]
+        Wrapped in :func:`torch.utils.checkpoint` by the caller, so the
+        ``[chunk, vocab]`` logits are recomputed in backward rather than held.
+        """
+        logits = F.linear(hidden_chunk, lm_head_weight, lm_head_bias)  # [chunk, V]
+        return F.cross_entropy(logits.float(), target_chunk, reduction="none")  # [chunk]
 
-        loss = (token_nll * weights).sum()
-        if num_tokens is not None:
-            loss = loss / max(float(num_tokens), 1.0)
+    def forward_fused(
+        self,
+        hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        target_ids: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_tokens: Optional[int] = None,
+        block_size: Optional[int] = None,
+        lm_head_bias: Optional[torch.Tensor] = None,
+    ) -> DLLMLossOutput:
+        """Chunked linear-CE: never materialises the full logits tensor.
 
-        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
+        Projects the LM head + cross-entropy in chunks of ``chunk_size``
+        predicted positions, each wrapped in :func:`torch.utils.checkpoint` so
+        the ``[chunk, vocab]`` logits are recomputed in backward instead of
+        held — peak logit memory is one chunk, not ``[B*T, vocab]``. Pure
+        autograd, so the gradient flows correctly through FSDP2 (unlike a
+        standalone liger fused-CE Function).
+
+        Args:
+            hidden: Draft hidden states for the predicted positions,
+                shape ``[B, T, D]`` (``D`` = model dim, NOT vocab).
+            lm_head_weight: LM-head projection weight, shape ``[V, D]``.
+            target_ids: Ground-truth token IDs, shape ``[B, T]``.
+            block_mask: Valid-position mask, shape ``[B, T]``.
+            num_tokens / block_size: as in :meth:`forward`.
+            lm_head_bias: Optional LM-head bias, shape ``[V]``.
+
+        Returns:
+            :class:`DLLMLossOutput`.
+        """
+        B, T, D = hidden.shape
+        flat_hidden = hidden.reshape(-1, D)  # [B*T, D]
+        flat_target = target_ids.reshape(-1)  # [B*T]
+
+        nll_parts = []
+        for start in range(0, flat_hidden.size(0), self.chunk_size):
+            end = start + self.chunk_size
+            nll_parts.append(
+                torch.utils.checkpoint.checkpoint(
+                    self._chunk_nll,
+                    flat_hidden[start:end],
+                    lm_head_weight,
+                    lm_head_bias,
+                    flat_target[start:end],
+                    use_reentrant=False,
+                )
+            )
+        token_nll = torch.cat(nll_parts).reshape(B, T)
+        return self._reduce(token_nll, block_mask, num_tokens, block_size)

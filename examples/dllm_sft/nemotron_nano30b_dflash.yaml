@@ -92,6 +92,9 @@ dllm:
 # supervised block. Requires attention_backend=flex_attention; SDPA OOMs at this N.
 # overlap_anchors=True samples anchors independently (paper behaviour); set to
 # False for the legacy non-overlapping stars-and-bars sampler.
+# use_fused_linear_ce: chunked linear-CE (LM-head projection + cross-entropy in
+# torch.utils.checkpoint position chunks) keeps the [B, N*(bs-1), vocab] logits
+# off the peak — required to fit N=512 on the full-vocab target. On by default.
 dflash:
   target_model_id: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   target_torch_dtype: bfloat16
@@ -100,6 +103,7 @@ dflash:
   num_blocks_per_sample: 512
   attention_backend: flex_attention
   overlap_anchors: true
+  use_fused_linear_ce: true
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

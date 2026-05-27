@@ -186,11 +186,16 @@ python -m nemo_automodel.components.speculative.regenerate \
     --input-data nvidia/Nemotron-Post-Training-Dataset-v2 \
     --output-dir /data/dflash-train-regen \
     --model nemotron-30b \
-    --temperature 0.0 \
+    --temperature 0.8 \
     --shard-size 1000 \
-    --concurrency 32 \
+    --concurrency 64 \
     --resume
 ```
+
+`--temperature 0.8` (vs the script's EAGLE-oriented `0.0` default) follows the
+DFlash paper: sampling diversity in the supervised tokens teaches the draft to
+handle a wider target distribution, improving acceptance length.
+`--concurrency 64` better saturates one vLLM/SGLang server.
 
 Then point the recipe's `dataset.path_or_dataset_id` at the regenerated
 parquet shards (`/data/dflash-train-regen`) instead of the raw HF dataset.
