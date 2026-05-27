@@ -221,7 +221,7 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
         self.transform = transform
         self.vit_transform = vit_transform
         self.tokenizer = tokenizer
-        self.data_status = data_status
+        self.set_data_status(data_status)
         self.data_paths = self.get_data_paths(data_dir_list, num_used_data, parquet_info)
         self.set_epoch()
 
@@ -245,9 +245,10 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
         import pyarrow.parquet as pq
 
         file_paths_per_worker, worker_id = self.get_data_paths_per_worker()
-        if self.data_status is not None:
-            global_row_group_start_id = self.data_status[worker_id][0]
-            row_start_id = self.data_status[worker_id][1] + 1
+        worker_data_status = self._get_worker_data_status(worker_id)
+        if worker_data_status is not None:
+            global_row_group_start_id = worker_data_status[0]
+            row_start_id = worker_data_status[1] + 1
         else:
             global_row_group_start_id = 0
             row_start_id = 0
@@ -289,6 +290,7 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
                         except Exception as e:
                             logger.warning("Error %s in rg#%s, %s", e, row_group_id, parquet_file_path)
                             continue
+                        self._set_worker_resume_data_status(worker_id, [global_row_group_idx, row_idx])
                         yield data
 
                     row_start_id = 0

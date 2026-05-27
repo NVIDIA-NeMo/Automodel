@@ -312,6 +312,95 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self._last_tokens_per_sec = 0.0
         self._last_train_steps_per_sec = 0.0
         self._last_tokens_per_step = 0.0
+        self.vae_encode_micro_batch_size = int(cfg.get("model.vae_encode_micro_batch_size", 0) or 0)
+        if self.vae_encode_micro_batch_size < 0:
+            raise ValueError("model.vae_encode_micro_batch_size must be >= 0")
+
+    def _encode_vae_images(self, padded_images: torch.Tensor) -> torch.Tensor:
+        """Encode VAE images in chunks to cap frozen-VAE activation peaks."""
+        micro_batch = self.vae_encode_micro_batch_size
+        if micro_batch <= 0 or micro_batch >= int(padded_images.shape[0]):
+            return self.vae_model.encode(padded_images)
+
+        chunks = []
+        for start in range(0, int(padded_images.shape[0]), micro_batch):
+            end = min(start + micro_batch, int(padded_images.shape[0]))
+            chunks.append(self.vae_model.encode(padded_images[start:end]))
+        return torch.cat(chunks, dim=0)
+
+    def _build_hf_backbone_bagel_model(
+        self,
+        *,
+        artifact_path: str | None,
+        stage: int,
+        rank_seed: int,
+        freeze_before_infrastructure: bool = False,
+    ):
+        """Build BAGEL from HF backbones and apply the configured infrastructure."""
+        logger.info("Building BAGEL from HF backbones (artifact_source=%s, stage=%d)", artifact_path, stage)
+        with ScopedRNG(seed=rank_seed, ranked=False):
+            model = build_bagel_from_hf_backbones(
+                model_cfg=self.cfg.model,
+                stage=stage,
+                vae_config=self.cfg.get("model.vae_config", None),
+                meta_init=True,
+                load_backbone_weights=False,
+            )
+            if freeze_before_infrastructure:
+                model.eval()
+                for p in model.parameters():
+                    p.requires_grad_(False)
+
+            from nemo_automodel._transformers.infrastructure import (
+                apply_model_infrastructure,
+                instantiate_infrastructure,
+            )
+            from nemo_automodel.components.quantization.fp8 import build_fp8_config
+            from nemo_automodel.components.utils.compile_utils import build_compile_config
+
+            model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+                distributed_config=self.distributed_config,
+                pipeline_config=self.pipeline_config,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+                device=self.dist_env.device,
+                mesh=self.dist_setup,
+            )
+            fp8_config = build_fp8_config(self.cfg.fp8) if self.cfg.get("fp8", None) is not None else None
+            compile_config = (
+                build_compile_config(self.cfg.compile) if self.cfg.get("compile", None) is not None else None
+            )
+            freeze_cfg = self.cfg.get("freeze_config", None)
+            model = apply_model_infrastructure(
+                model=model,
+                pretrained_model_name_or_path="",
+                mesh=self.dist_setup,
+                peft_config=self.cfg.get("peft", None),
+                fp8_config=fp8_config,
+                qat_quantizer=qat_quantizer,
+                compile_config=compile_config,
+                parallelize_fn=parallelize_fn,
+                model_wrapper=model_wrapper,
+                is_meta_device=True,
+                device=self.dist_env.device,
+                load_base_model=False,
+                freeze_config=freeze_cfg.to_dict() if freeze_cfg is not None else None,
+            )
+            initialize_bagel_non_backbone_weights(model)
+            load_bagel_hf_backbone_weights(model, self.cfg.model)
+        return model
+
+    def _use_sharded_model_ema(self, *, ema_impl: str, model_init_mode: str) -> bool:
+        """Resolve the EMA implementation choice."""
+        if ema_impl == "shadow":
+            return False
+        if ema_impl == "sharded_model":
+            return True
+        if ema_impl != "auto":
+            raise ValueError(
+                f"Unsupported ema.implementation={ema_impl!r}; expected 'auto', 'sharded_model', or 'shadow'."
+            )
+        return model_init_mode == "hf_backbones" and self.distributed_config.__class__.__name__ == "FSDP2Config"
 
     # ------------------------------------------------------------------
     # Setup
@@ -407,53 +496,11 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             )
 
         if model_init_mode == "hf_backbones":
-            logger.info("Building BAGEL from HF backbones (artifact_source=%s, stage=%d)", artifact_path, stage)
-            with ScopedRNG(seed=rank_seed, ranked=False):
-                model = build_bagel_from_hf_backbones(
-                    model_cfg=self.cfg.model,
-                    stage=stage,
-                    vae_config=self.cfg.get("model.vae_config", None),
-                    meta_init=True,
-                    load_backbone_weights=False,
-                )
-
-                from nemo_automodel._transformers.infrastructure import (
-                    apply_model_infrastructure,
-                    instantiate_infrastructure,
-                )
-                from nemo_automodel.components.quantization.fp8 import build_fp8_config
-                from nemo_automodel.components.utils.compile_utils import build_compile_config
-
-                model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
-                    distributed_config=self.distributed_config,
-                    pipeline_config=self.pipeline_config,
-                    moe_config=self.dist_setup.moe_config,
-                    activation_checkpointing=self.dist_setup.activation_checkpointing,
-                    device=self.dist_env.device,
-                    mesh=self.dist_setup,
-                )
-                fp8_config = build_fp8_config(self.cfg.fp8) if self.cfg.get("fp8", None) is not None else None
-                compile_config = (
-                    build_compile_config(self.cfg.compile) if self.cfg.get("compile", None) is not None else None
-                )
-                freeze_cfg = self.cfg.get("freeze_config", None)
-                model = apply_model_infrastructure(
-                    model=model,
-                    pretrained_model_name_or_path="",
-                    mesh=self.dist_setup,
-                    peft_config=self.cfg.get("peft", None),
-                    fp8_config=fp8_config,
-                    qat_quantizer=qat_quantizer,
-                    compile_config=compile_config,
-                    parallelize_fn=parallelize_fn,
-                    model_wrapper=model_wrapper,
-                    is_meta_device=True,
-                    device=self.dist_env.device,
-                    load_base_model=False,
-                    freeze_config=freeze_cfg.to_dict() if freeze_cfg is not None else None,
-                )
-                initialize_bagel_non_backbone_weights(model)
-                load_bagel_hf_backbone_weights(model, self.cfg.model)
+            model = self._build_hf_backbone_bagel_model(
+                artifact_path=artifact_path,
+                stage=stage,
+                rank_seed=rank_seed,
+            )
         elif model_init_mode == "auto":
             from nemo_automodel.recipes.vlm.finetune import build_model as build_vlm_model
 
@@ -487,11 +534,42 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         ema_cfg = self.cfg.get("ema", None)
         ema_decay = None if ema_cfg is None else ema_cfg.get("decay", 0.9999)
         if ema_decay is not None:
-            from nemo_automodel.components.training.ema import EMAManager
+            ema_impl = ema_cfg.get("implementation", "auto")
+            if self._use_sharded_model_ema(ema_impl=str(ema_impl), model_init_mode=model_init_mode):
+                if model_init_mode != "hf_backbones":
+                    raise ValueError(
+                        "ema.implementation='sharded_model' currently requires model.init_mode='hf_backbones'."
+                    )
+                from nemo_automodel.components.training.ema import ShardedModelEMAManager
 
-            self.ema = EMAManager(self.model, decay=float(ema_decay))
+                ema_model = self._build_hf_backbone_bagel_model(
+                    artifact_path=artifact_path,
+                    stage=stage,
+                    rank_seed=rank_seed,
+                    freeze_before_infrastructure=True,
+                )
+                _maybe_resize_bagel_vocab(
+                    ema_model,
+                    tokenizer_vocab_size=len(self.tokenizer),
+                    num_new_tokens=self.num_new_tokens,
+                )
+                self.ema = ShardedModelEMAManager(ema_model=ema_model, train_model=self.model, decay=float(ema_decay))
+                logger.info(
+                    "EMA enabled with sharded_model implementation, decay=%s, %d params tracked",
+                    ema_decay,
+                    len(self.ema),
+                )
+            else:
+                from nemo_automodel.components.training.ema import EMAManager
+
+                self.ema = EMAManager(self.model, decay=float(ema_decay))
+                logger.info(
+                    "EMA enabled with shadow implementation, decay=%s, %d params tracked",
+                    ema_decay,
+                    len(self.ema),
+                )
             if self.dist_env.is_main:
-                logger.info("EMA enabled with decay=%s, %d params tracked", ema_decay, len(self.ema))
+                logger.info("EMA implementation ready.")
         else:
             self.ema = None
 
@@ -655,6 +733,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         train_dataset.set_epoch(self.data_seed)
 
         self._train_dataset = train_dataset
+        self.untrack_state("_train_dataset")
 
         nw = int(cfg_dl.get("num_workers", 1))
         dl_kwargs = dict(
@@ -732,7 +811,8 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
                 with torch.no_grad():
                     padded_images = data.pop("padded_images")
-                    data["padded_latent"] = self.vae_model.encode(padded_images)
+                    data["padded_latent"] = self._encode_vae_images(padded_images)
+                    del padded_images
 
         # Filter dict to what BAGEL forward accepts. Stage 1 keeps only the
         # CE-side kwargs (gen-side tensors absent from the pack); Stage 2

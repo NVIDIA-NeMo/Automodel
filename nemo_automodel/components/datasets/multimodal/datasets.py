@@ -83,7 +83,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
         self.transform = transform
         self.tokenizer = tokenizer
         self.frame_sampler = frame_sampler
-        self.data_status = data_status
+        self.set_data_status(data_status)
         self.data_paths = self.get_data_paths(
             jsonl_path_list,
             data_dir_list,
@@ -131,8 +131,9 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
 
     def __iter__(self):
         data_paths_per_worker, worker_id = self.get_data_paths_per_worker()
-        if self.data_status is not None:
-            row_start_id = self.data_status[worker_id] + 1
+        worker_data_status = self._get_worker_data_status(worker_id)
+        if worker_data_status is not None:
+            row_start_id = worker_data_status + 1
         else:
             row_start_id = 0
         transform_stride = self.transform.stride
@@ -215,6 +216,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                     logger.warning("Skipping sample without loss labels in dataset %s", self.dataset_name)
                     continue
 
+                self._set_worker_resume_data_status(worker_id, row_idx)
                 yield dict(
                     image_tensor_list=image_tensor_list,
                     text_ids_list=text_ids_list,
@@ -265,7 +267,7 @@ class T2IIterableDataset(DistributedIterableDataset):
         super().__init__(dataset_name, local_rank, world_size, num_workers)
         self.transform = transform
         self.tokenizer = tokenizer
-        self.data_status = data_status
+        self.set_data_status(data_status)
         self.data_paths = self.get_data_paths(data_dir_list, num_used_data)
         self.set_epoch()
 
@@ -277,10 +279,11 @@ class T2IIterableDataset(DistributedIterableDataset):
         import pyarrow.parquet as pq
 
         data_paths_per_worker, worker_id = self.get_data_paths_per_worker()
-        if self.data_status is not None:
-            parquet_start_id = self.data_status[worker_id][0]
-            row_group_start_id = self.data_status[worker_id][1]
-            row_start_id = self.data_status[worker_id][2] + 1
+        worker_data_status = self._get_worker_data_status(worker_id)
+        if worker_data_status is not None:
+            parquet_start_id = worker_data_status[0]
+            row_group_start_id = worker_data_status[1]
+            row_start_id = worker_data_status[2] + 1
         else:
             parquet_start_id = 0
             row_group_start_id = 0
@@ -371,6 +374,7 @@ class T2IIterableDataset(DistributedIterableDataset):
                                     "dataset_name": self.dataset_name,
                                 },
                             )
+                            self._set_worker_resume_data_status(worker_id, [parquet_idx, row_group_id, row_idx])
                             yield sample
 
                         row_start_id = 0
