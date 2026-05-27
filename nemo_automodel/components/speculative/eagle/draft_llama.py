@@ -480,9 +480,19 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
-        """Initialize draft embeddings from the target model embeddings."""
+        """Initialize draft embeddings from the target model embeddings.
+
+        When the target model is wrapped with FSDP2, ``target_embedding.weight``
+        is a ``DTensor`` sharded across ranks.  The draft embedding is a plain
+        ``nn.Parameter`` (the draft is not FSDP-wrapped), so a direct
+        ``copy_`` of a DTensor into a regular tensor raises a mixed-type
+        distributed-operator error.  Gather to a full local tensor first.
+        """
+        target_weight = target_embedding.weight
+        if hasattr(target_weight, "full_tensor"):
+            target_weight = target_weight.full_tensor()
         with torch.no_grad():
-            self.model.embed_tokens.weight.copy_(target_embedding.weight)
+            self.model.embed_tokens.weight.copy_(target_weight)
 
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""

@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -95,18 +96,31 @@ class HFEagle3TargetModel:
                 raise ValueError(f"aux layer id {layer_id} is out of bounds for model with {num_layers} layers")
         return aux_layer_ids
 
-    def _get_transformer_layers(self) -> Iterable[nn.Module]:
+    def _get_transformer_layers(self) -> list[nn.Module]:
+        """Return decoder layers as an ordered list indexable by integer.
+
+        Supports both the HuggingFace layouts (where ``layers`` is a
+        ``ModuleList``) and AutoModel's custom-impl layouts (where
+        ``layers`` is a ``ModuleDict`` keyed by ``str(i)``). Returning a
+        plain list normalizes the access pattern for downstream
+        ``register_forward_hook`` calls.
+        """
         # Common HF causal-LM layouts:
         #   model.model.layers              (Llama, Qwen, Mistral, Gemma, Phi, ...)
         #   model.layers                    (some VLM text backbones exposed directly)
         #   model.transformer.h             (GPT2 / Falcon-style)
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model.layers
-        if hasattr(self.model, "layers"):
-            return self.model.layers
-        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
-            return self.model.transformer.h
-        raise ValueError("Unsupported model structure for EAGLE-3 aux-layer capture")
+            container = self.model.model.layers
+        elif hasattr(self.model, "layers"):
+            container = self.model.layers
+        elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+            container = self.model.transformer.h
+        else:
+            raise ValueError("Unsupported model structure for EAGLE-3 aux-layer capture")
+        if isinstance(container, nn.ModuleDict):
+            # AutoModel custom impls use ModuleDict keyed by ``str(i)``.
+            return [container[str(i)] for i in range(len(container))]
+        return list(container)
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the target model input embeddings."""
@@ -135,13 +149,20 @@ class HFEagle3TargetModel:
                 raise ValueError(f"aux layer id {layer_id} is out of bounds for model with {len(layers)} layers")
             handles.append(layers[layer_id].register_forward_hook(_make_hook(layer_id)))
 
+        # AutoModel's custom causal LMs only declare ``input_ids``,
+        # ``attention_mask``, ``position_ids``, ``padding_mask`` and a
+        # ``**attn_kwargs`` catch-all; the HF flags below mean nothing to
+        # them and are dropped to keep the call site honest.
+        forward_params = inspect.signature(self.model.forward).parameters
+        extra_kwargs = {
+            name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
+        }
+
         try:
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=False,
-                output_attentions=False,
-                use_cache=False,
+                **extra_kwargs,
             )
         finally:
             for handle in handles:
@@ -153,7 +174,10 @@ class HFEagle3TargetModel:
             )
 
         aux_hidden_states = torch.cat([captured[layer_id] for layer_id in self.aux_layer_ids], dim=-1)
-        shifted_logits = _shift_left_with_zero(outputs.logits)
+        # HF causal LM outputs wrap logits in a dataclass; AutoModel's
+        # custom causal LM returns the logits tensor directly.
+        target_logits = outputs.logits if hasattr(outputs, "logits") else outputs
+        shifted_logits = _shift_left_with_zero(target_logits)
         shifted_input_ids = _shift_left_with_zero(input_ids)
         shifted_loss_mask = _shift_left_with_zero(loss_mask)
         return Eagle3TargetBatch(
