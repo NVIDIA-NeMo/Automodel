@@ -68,7 +68,10 @@ class HFCheckpointingMixin:
             save_directory: Output path
             checkpointer: Checkpointer instance. Uses self._checkpointer if not provided.
             tokenizer: Optional tokenizer to save alongside model
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments, including ``peft_config`` and
+                ``is_final_checkpoint``. Direct callers that do not have recipe
+                step-scheduler context default ``is_final_checkpoint`` to
+                ``False``.
         """
         if checkpointer is None:
             raise ValueError("No checkpointer provided. Please pass the `checkpointer` argument.")

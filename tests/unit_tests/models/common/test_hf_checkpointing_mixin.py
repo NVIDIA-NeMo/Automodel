@@ -90,6 +90,21 @@ class TestHFCheckpointingMixinSavePretrained:
             is_final_checkpoint=False,
         )
 
+    def test_save_pretrained_passes_is_final_checkpoint(self):
+        """Test that save_pretrained() forwards explicit final checkpoint state."""
+        model = SimpleModelWithMixin()
+        mock_checkpointer = MagicMock()
+
+        model.save_pretrained("/tmp/test", checkpointer=mock_checkpointer, is_final_checkpoint=True)
+
+        mock_checkpointer.save_model.assert_called_once_with(
+            model=model,
+            weights_path="/tmp/test",
+            peft_config=None,
+            tokenizer=None,
+            is_final_checkpoint=True,
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

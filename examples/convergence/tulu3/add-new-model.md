@@ -183,7 +183,7 @@ Compare against baselines (step 3). Check all 4 failure modes:
 - **Missing EOS** — should be 0%
 - **Empty response** — should be 0%
 
-## 11. Write the Model README
+## Write the Model README
 
 Create `models/<model-name>/README.md` with:
 - Model details (size, architecture, parallelism)
