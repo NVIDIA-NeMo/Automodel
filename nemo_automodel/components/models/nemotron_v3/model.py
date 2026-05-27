@@ -567,17 +567,17 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         """Forward pass with optional loss computation.
 
         Supports both BSHD format (``input_ids`` shape ``[B, S]``) and THD format
-        (``input_ids`` shape ``[T]`` after ``squeeze_input_for_thd``).  When
-        ``kwargs["qkv_format"] == "thd"``, inputs are squeezed to THD before the
-        base-model forward and logits are unsqueezed back to ``[1, T, V]`` on exit.
+        (``input_ids`` shape ``[T]`` after ``squeeze_input_for_thd``). When
+        ``kwargs["qkv_format"] == "thd"`` AND the attention backend is TE,
+        inputs are squeezed to THD before the base-model forward and logits
+        are unsqueezed back to ``[1, T, V]`` on exit. SDPA / flex stay in BSHD.
 
         Pipeline-parallel awareness: when run as a PP stage, ``input_ids`` is
         the upstream stage's hidden-state tensor on non-first stages, and
         ``*mtp_embed_inputs`` carries ``num_nextn_predict_layers`` future-token
-        embeddings produced by the first stage. Non-final stages return
-        ``(hidden_states, *mtp_embed_inputs)`` (tuple of arity ``1 + D``); the
-        final stage returns ``(logits, *mtp_per_depth_h)``. The single-rank
-        (no-PP) path returns :class:`NemotronHCausalLMOutputWithPast` unchanged.
+        embeddings produced by the first stage. See the Returns section below
+        for the per-stage tuple contract. The single-rank (no-PP) path returns
+        :class:`NemotronHCausalLMOutputWithPast` unchanged.
 
         Args:
             input_ids: Input token IDs. BSHD: ``[B, S]``; THD: ``[1, T]``
