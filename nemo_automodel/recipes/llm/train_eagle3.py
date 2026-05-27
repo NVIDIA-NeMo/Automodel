@@ -166,6 +166,14 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = target_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
+        # The draft owns an independent ``lm_head`` whose vocab can differ
+        # from ``embed_tokens`` (vocab shrinking, ``draft_vocab_size <
+        # target_vocab_size``). The target's ``tie_word_embeddings`` flag
+        # does not apply here -- the two tables have different shapes by
+        # design -- and would otherwise cause the checkpoint wrappers to
+        # drop ``lm_head.weight`` on save and resurrect a shape-mismatched
+        # tensor on load.
+        draft_config["tie_word_embeddings"] = False
         # Draft attention backend. Defaults to ``eager`` to preserve the
         # pre-FA2 numerics. Set ``recipe_args.draft_attn_implementation:
         # flash_attention_2`` in YAML to opt into FlashAttention for the
