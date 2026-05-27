@@ -27,6 +27,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers import initialization as init
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
@@ -197,33 +198,18 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    # TODO: remove this once we upgrade to transformers 5.9.x
+    @torch.no_grad()
     def _init_weights(self, module):
-        # transformers v5 PreTrainedModel._init_weights for nn.Linear is
-        # `init.normal_(module.weight.float(), ...)`: when `module.weight` is
-        # bfloat16, `.float()` returns a *new* fp32 tensor and the init writes
-        # into that copy, leaving the original weight whatever uninitialized
-        # garbage `to_empty()` left behind. For `score` (the only missing key
-        # when loading a backbone-only checkpoint into the seq-cls head), this
-        # produced NaNs and broke L2_Retrieval / cross-encoder training. Bypass
-        # the buggy base by initializing `score` in-place here, then defer to
-        # super() for everything else.
-        #
-        # IMPORTANT: only run our direct in-place init when the weight has not
-        # already been initialized (e.g. by a checkpoint loader). The base
-        # class's `init.normal_` is guarded by `_is_hf_initialized`, so its
-        # double-call when reloading a fine-tuned checkpoint is a no-op; our
-        # raw `.normal_` is not, and would overwrite trained values with fresh
-        # random samples — silently regressing eval quality after reload.
         if module is self.score:
-            if getattr(module.weight, "_is_hf_initialized", False):
-                return
+            # Backport huggingface/transformers#46030 for transformers 5.8.x:
+            # initialize the actual dtype tensor, not a float() copy.
             std = getattr(self.config, "initializer_range", 0.02) or 0.02
-            with torch.no_grad():
-                module.weight.normal_(mean=0.0, std=std)
-                if module.bias is not None:
-                    module.bias.zero_()
-            module.weight._is_hf_initialized = True
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
             return
+
         super()._init_weights(module)
 
     def forward(
