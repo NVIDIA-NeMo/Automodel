@@ -360,11 +360,6 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     # "Padding mask not supported with context parallelism!".
     _model._cp_enabled = True
 
-    # Iterate BACKBONE layers AND MTP sublayers — both contain attention
-    # modules that need ``set_context_parallel_group`` called on them under
-    # cp_size > 1. Without that on MTP sublayers, TE attention computes with
-    # uninitialized CP state and trips illegal-memory-access during backward.
-    # ``_iter_transformer_and_mtp_blocks`` already covers both groups.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
