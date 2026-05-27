@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-only EAGLE-3 training recipe."""
+"""EAGLE-3 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig, LlamaConfig
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -46,9 +46,10 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
-    LlamaEagle3DraftModel,
 )
+from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -81,7 +82,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle3Recipe(BaseRecipe):
-    """Recipe for the minimal Llama-only EAGLE-3 training MVP."""
+    """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -102,22 +103,55 @@ class TrainEagle3Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        if "LlamaForCausalLM" not in architectures:
-            raise ValueError(f"TrainEagle3Recipe currently supports only LlamaForCausalLM, got {architectures}")
-        if not isinstance(target_config, LlamaConfig):
-            raise ValueError(f"Expected LlamaConfig for MVP EAGLE-3 training, got {type(target_config).__name__}")
+        # Dispatch via the eagle registry. New architectures are added by
+        # appending to ``_DENSE_ARCHITECTURES`` (or registering a custom
+        # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
+        # no recipe change required.
+        draft_spec = resolve_eagle3_draft_spec(architectures)
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
+
+        # Optional ``distributed:`` YAML section. Required for targets that
+        # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE): without it,
+        # ``from_pretrained`` loads the full target on every rank and OOMs.
+        # When absent, the recipe keeps the original single-GPU-per-rank
+        # behavior so existing 8B-class dense recipes are unaffected.
+        # ``force_hf`` is opt-in. Default ``False`` so HF architectures
+        # with an AutoModel custom impl (e.g. ``Qwen3MoeForCausalLM``,
+        # ``LlamaForCausalLM``) take the custom path, which unlocks the
+        # MoE infra (EP, ``GroupedExperts``, DeepEP). Set
+        # ``recipe_args.target_force_hf: true`` in YAML to force the
+        # plain HF implementation.
+        target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
-            force_hf=True,
-        ).to(self.device)
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        self.dist_setup = None
+        self.distributed_config = None
+        self.device_mesh = None
+        self.moe_mesh = None
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        # FSDP2 / EP sharding placed the model on the right devices already;
+        # only do the brute-force ``.to(device)`` for the unsharded path.
+        if self.dist_setup is None:
+            self.target_model = self.target_model.to(self.device)
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
@@ -165,6 +199,14 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = target_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
+        # The draft owns an independent ``lm_head`` whose vocab can differ
+        # from ``embed_tokens`` (vocab shrinking, ``draft_vocab_size <
+        # target_vocab_size``). The target's ``tie_word_embeddings`` flag
+        # does not apply here -- the two tables have different shapes by
+        # design -- and would otherwise cause the checkpoint wrappers to
+        # drop ``lm_head.weight`` on save and resurrect a shape-mismatched
+        # tensor on load.
+        draft_config["tie_word_embeddings"] = False
         # Draft attention backend. Defaults to ``eager`` to preserve the
         # pre-FA2 numerics. Set ``recipe_args.draft_attn_implementation:
         # flash_attention_2`` in YAML to opt into FlashAttention for the
@@ -176,9 +218,11 @@ class TrainEagle3Recipe(BaseRecipe):
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
-        self.draft_model = LlamaEagle3DraftModel(LlamaConfig.from_dict(draft_config)).to(
-            device=self.device, dtype=self.compute_dtype
-        )
+        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
+        # so architecture-specific defaults like attention_bias and head_dim
+        # flow into the draft.
+        draft_config_obj = type(target_config).from_dict(draft_config)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
@@ -263,6 +307,12 @@ class TrainEagle3Recipe(BaseRecipe):
         """Build the checkpointer using the same plumbing as the standard recipes."""
         ckpt_cfg = self.cfg.get("checkpoint", None)
         default_dir = str(self.output_dir / "checkpoints")
+        # EAGLE recipes construct the draft model directly and bypass
+        # `apply_model_infrastructure`, which is where `_pre_shard_hf_state_dict_keys`
+        # would normally be attached. Capture the pre-shard keys here so the
+        # consolidated-safetensors path in `_maybe_build_consolidated_index`
+        # has something to diff against instead of `None`.
+        draft_state_dict_keys = list(self.draft_model.state_dict().keys())
         ckpt_kwargs = dict(
             enabled=True,
             checkpoint_dir=default_dir,
@@ -271,11 +321,14 @@ class TrainEagle3Recipe(BaseRecipe):
             model_cache_dir=hf_constants.HF_HUB_CACHE,
             save_consolidated=True,
             is_peft=False,
+            model_state_dict_keys=draft_state_dict_keys,
         )
         if ckpt_cfg is not None:
             user_cfg = ckpt_cfg.to_dict() if hasattr(ckpt_cfg, "to_dict") else dict(ckpt_cfg)
             user_cfg.pop("restore_from", None)
             ckpt_kwargs.update(user_cfg)
+        if ckpt_kwargs.get("model_state_dict_keys") is None:
+            ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
@@ -672,8 +725,6 @@ class TrainEagle3Recipe(BaseRecipe):
 
 def main(config_path=None):
     """Main entry point for the EAGLE-3 recipe."""
-    if config_path is None:
-        raise ValueError("config_path is required for TrainEagle3Recipe")
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainEagle3Recipe(cfg)
     trainer.setup()

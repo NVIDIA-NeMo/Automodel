@@ -12,12 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-based draft model for EAGLE-3 training.
+"""Llama-style dense LLM draft model for EAGLE-3 training.
 
-Module naming is aligned to ``sglang/srt/models/llama_eagle3.py`` so that a
-checkpoint produced by this trainer can be loaded directly by SGLang's
-``LlamaForCausalLMEagle3.load_weights`` without any key remapping. The state
-dict layout is:
+The implementation is config-driven and supports any HuggingFace dense
+decoder-only architecture whose layout matches Llama: GQA attention with
+optional Q/K/V/O bias (`config.attention_bias`), SwiGLU MLP with optional
+bias (`config.mlp_bias`), RMSNorm, and rotary position embeddings parameterized
+by `config.rope_theta` / `config.rope_scaling`. This currently covers Llama,
+Phi-3, and Qwen3 dense (Phi-3 omits `attention_bias` / `mlp_bias`, which
+the attention and MLP layers already read via
+`getattr(config, "<field>", False)`; Qwen3 decouples `head_dim` from
+`hidden_size / num_attention_heads`, which the attention layer reads via
+`getattr(config, "head_dim", ...)`).
+
+Class names and the public `architectures` string remain ``LlamaEagle3*`` for
+backward compatibility with already-trained checkpoints and with SGLang's
+``LlamaForCausalLMEagle3.load_weights`` (the saved state dict layout is
+unchanged):
 
     model.embed_tokens.weight
     model.fc.weight
@@ -41,7 +52,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import LlamaConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
@@ -131,7 +142,7 @@ class Eagle3LlamaAttention(nn.Module):
     batch.
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -158,10 +169,18 @@ class Eagle3LlamaAttention(nn.Module):
         self.attn_implementation = attn_impl
 
         in_features = config.hidden_size * 2
-        self.q_proj = nn.Linear(in_features, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(in_features, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(in_features, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.q_proj = nn.Linear(
+            in_features, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
+        self.k_proj = nn.Linear(
+            in_features, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
+        self.v_proj = nn.Linear(
+            in_features, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
     def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -330,15 +349,19 @@ class Eagle3LlamaAttention(nn.Module):
 
 
 class Eagle3LlamaMLP(nn.Module):
-    """Standard Llama SwiGLU MLP on hidden-size activations."""
+    """Standard Llama-style SwiGLU MLP on hidden-size activations."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         from transformers.activations import ACT2FN
 
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False)
+        )
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False))
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=getattr(config, "mlp_bias", False)
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -356,7 +379,7 @@ class Eagle3LlamaDecoderLayer(nn.Module):
     hidden]`` concatenation (always true for our single-layer draft).
     """
 
-    def __init__(self, config: LlamaConfig, layer_id: int = 0):
+    def __init__(self, config: PretrainedConfig, layer_id: int = 0):
         super().__init__()
         self.layer_id = layer_id
         self.is_input_layer = layer_id == 0
@@ -405,7 +428,7 @@ class Eagle3LlamaModel(nn.Module):
     training-facing public API.
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
@@ -421,7 +444,7 @@ class Eagle3LlamaModel(nn.Module):
 
 
 class LlamaEagle3DraftModel(PreTrainedModel):
-    """Minimal Llama-only EAGLE-3 draft model.
+    """Llama-style dense EAGLE-3 draft model (Llama, Phi-3, Qwen3).
 
     State dict keys match SGLang's ``LlamaForCausalLMEagle3`` so the saved
     checkpoint can be loaded by SGLang's inference engine without any
@@ -429,17 +452,23 @@ class LlamaEagle3DraftModel(PreTrainedModel):
     ``qkv_proj`` and ``gate/up_proj`` into ``gate_up_proj`` via its
     standard ``stacked_params_mapping``).
 
-    This intentionally starts narrow:
-    - Llama config only
+    The class name is retained for checkpoint-architectures compatibility; the
+    implementation is config-driven and works for any HF dense decoder-only
+    config that exposes ``hidden_size``, ``num_attention_heads``,
+    ``num_key_value_heads``, ``attention_bias``, ``mlp_bias``, ``rope_theta``,
+    and ``rms_norm_eps``. A decoupled ``head_dim`` is read via
+    ``getattr(config, "head_dim", ...)`` in the attention layer.
+
+    Scope:
     - single draft decoder layer
     - no KV-cache optimization
     - no speculative runtime integration
     """
 
-    config_class = LlamaConfig
+    config_class = PretrainedConfig
     base_model_prefix = "model"
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self.config = config
         self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
@@ -451,9 +480,19 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
-        """Initialize draft embeddings from the target model embeddings."""
+        """Initialize draft embeddings from the target model embeddings.
+
+        When the target model is wrapped with FSDP2, ``target_embedding.weight``
+        is a ``DTensor`` sharded across ranks.  The draft embedding is a plain
+        ``nn.Parameter`` (the draft is not FSDP-wrapped), so a direct
+        ``copy_`` of a DTensor into a regular tensor raises a mixed-type
+        distributed-operator error.  Gather to a full local tensor first.
+        """
+        target_weight = target_embedding.weight
+        if hasattr(target_weight, "full_tensor"):
+            target_weight = target_weight.full_tensor()
         with torch.no_grad():
-            self.model.embed_tokens.weight.copy_(target_embedding.weight)
+            self.model.embed_tokens.weight.copy_(target_weight)
 
     def freeze_embeddings(self) -> None:
         """Freeze draft input embeddings."""
