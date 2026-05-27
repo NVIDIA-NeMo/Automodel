@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import random
@@ -122,15 +123,66 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
         grouped_datasets, is_mandatory, grouped_weights = self.build_datasets(data_config.grouped_datasets, data_status)
         self.grouped_datasets = grouped_datasets
-        self.dataset_iters = [iter(dataset) for dataset in grouped_datasets]
         self.is_mandatory = is_mandatory
         self.grouped_weights = grouped_weights
         self.data_config = data_config
         self.interpolate_pos = interpolate_pos
+        self._loaded_state = None
+        self._resume_buffer = []
+        self._resume_sequence_status = self.set_sequence_status()
+        self._yielded_batches = 0
         if self.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
         else:
             self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
+
+    def _rng_state_dict(self):
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+
+    def _load_rng_state_dict(self, state):
+        if not state:
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+
+    def _grouped_dataset_state_dicts(self):
+        states = []
+        for dataset in self.grouped_datasets:
+            if hasattr(dataset, "state_dict"):
+                states.append(dataset.state_dict())
+            else:
+                states.append(None)
+        return states
+
+    def _load_grouped_dataset_state_dicts(self, states):
+        if states is None:
+            return
+        for dataset, state in zip(self.grouped_datasets, states):
+            if hasattr(dataset, "load_state_dict"):
+                dataset.load_state_dict(state)
+
+    def _set_resume_point(self, buffer, yielded_batches):
+        self._resume_buffer = copy.deepcopy(buffer)
+        self._resume_sequence_status = self.set_sequence_status()
+        self._yielded_batches = yielded_batches
+
+    def state_dict(self):
+        return {
+            "version": 1,
+            "yielded_batches": int(self._yielded_batches),
+            "buffer": copy.deepcopy(self._resume_buffer),
+            "sequence_status": copy.deepcopy(self._resume_sequence_status),
+            "rng": self._rng_state_dict(),
+            "grouped_dataset_states": self._grouped_dataset_state_dicts(),
+        }
+
+    def load_state_dict(self, state_dict):
+        self._loaded_state = copy.deepcopy(state_dict)
 
     def build_datasets(self, datasets_metainfo, data_status):
         from .datasets import DATASET_REGISTRY
@@ -303,24 +355,34 @@ class PackedDataset(torch.utils.data.IterableDataset):
         # using _data_seed (whatever was passed to PackedDataset.set_epoch),
         # matching BAGEL's pretrain_unified_navit.py:641 which calls
         # set_epoch(data_seed) but seeds rank_seed with global_seed.
-        base_seed = int(getattr(self, "_global_seed", None) or getattr(self, "_data_seed", 0))
-        rank_seed = base_seed * max(1, self.world_size) + int(self.local_rank)
-        rank_seed = rank_seed * max(1, self.num_workers) + int(worker_id)
-        rank_seed = rank_seed & 0xFFFFFFFF
-        random.seed(rank_seed)
-        np.random.seed(rank_seed)
-        torch.manual_seed(rank_seed)
+        loaded_state = self._loaded_state
+        if loaded_state is not None:
+            self._load_grouped_dataset_state_dicts(loaded_state.get("grouped_dataset_states"))
+            buffer = loaded_state.get("buffer") or []
+            sequence_status = loaded_state.get("sequence_status") or self.set_sequence_status()
+            batch_data_indexes = []
+            self._yielded_batches = int(loaded_state.get("yielded_batches", 0))
+            self._load_rng_state_dict(loaded_state.get("rng"))
+            self._loaded_state = None
+        else:
+            base_seed = int(getattr(self, "_global_seed", None) or getattr(self, "_data_seed", 0))
+            rank_seed = base_seed * max(1, self.world_size) + int(self.local_rank)
+            rank_seed = rank_seed * max(1, self.num_workers) + int(worker_id)
+            rank_seed = rank_seed & 0xFFFFFFFF
+            random.seed(rank_seed)
+            np.random.seed(rank_seed)
+            torch.manual_seed(rank_seed)
+            sequence_status = self.set_sequence_status()
+            batch_data_indexes = []
+            buffer = []
 
         total_weights = sum(self.grouped_weights)
         assert total_weights > 0.0
         group_cumprobs = [sum(self.grouped_weights[: i + 1]) / total_weights for i in range(len(self.grouped_weights))]
-        sequence_status = self.set_sequence_status()
-        batch_data_indexes = []
-
-        buffer = []
+        dataset_iters = [iter(dataset) for dataset in self.grouped_datasets]
         while True:
             if sequence_status["curr"] == 0:
-                for group_index, group_iter in enumerate(self.dataset_iters):
+                for group_index, group_iter in enumerate(dataset_iters):
                     if self.is_mandatory[group_index]:
                         while True:
                             sample = next(group_iter)
@@ -343,7 +405,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                     if n < cumprob:
                         group_index = i
                         break
-                sample = next(self.dataset_iters[group_index])
+                sample = next(dataset_iters[group_index])
                 sample_from_buffer = False
 
             num_tokens = sample["num_tokens"] + 2 * len(sample["sequence_plan"])
@@ -358,6 +420,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                     logger.info("Yielding data with length %s", sum(sequence_status["sample_lens"]))
                     data = self.to_tensor(sequence_status)
                     data["batch_data_indexes"] = batch_data_indexes
+                    self._set_resume_point(buffer, self._yielded_batches + 1)
                     yield data
                     sequence_status = self.set_sequence_status()
                     batch_data_indexes = []
@@ -369,6 +432,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
             if sequence_status["curr"] >= self.expected_num_tokens:
                 data = self.to_tensor(sequence_status)
                 data["batch_data_indexes"] = batch_data_indexes
+                self._set_resume_point(buffer, self._yielded_batches + 1)
                 yield data
                 sequence_status = self.set_sequence_status()
                 batch_data_indexes = []

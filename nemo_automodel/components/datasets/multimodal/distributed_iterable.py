@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import copy
 import random
 
 import torch
@@ -43,6 +44,33 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
         self.num_workers = num_workers
         self.rng = random.Random()
         self.data_paths = None
+        self.data_status = None
+        self._resume_data_status = None
+
+    def set_data_status(self, data_status):
+        self.data_status = copy.deepcopy(data_status)
+        self._resume_data_status = copy.deepcopy(data_status)
+
+    def _get_worker_data_status(self, worker_id):
+        if self.data_status is None:
+            return None
+        return self.data_status[worker_id]
+
+    def _set_worker_resume_data_status(self, worker_id, status):
+        if self._resume_data_status is None:
+            self._resume_data_status = [None] * max(int(self.num_workers), worker_id + 1)
+        while len(self._resume_data_status) <= worker_id:
+            self._resume_data_status.append(None)
+        self._resume_data_status[worker_id] = copy.deepcopy(status)
+
+    def state_dict(self):
+        return {"data_status": copy.deepcopy(self._resume_data_status)}
+
+    def load_state_dict(self, state_dict):
+        if state_dict is None:
+            self.set_data_status(None)
+            return
+        self.set_data_status(state_dict.get("data_status"))
 
     def get_data_paths(self, *args, **kwargs):
         raise NotImplementedError

@@ -36,6 +36,8 @@ model:
   copy_init_moe: true
   torch_dtype: float32
   max_latent_size: 64
+  # Set to 0 to encode the whole image batch at once.
+  vae_encode_micro_batch_size: 1
 
 checkpoint:
   enabled: false
@@ -161,6 +163,7 @@ freeze_config:
 
 ema:
   decay: 0.9999
+  implementation: auto
 
 wandb:
   project: bagel-pretraining

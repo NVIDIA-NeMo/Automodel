@@ -58,6 +58,7 @@ except (ImportError, ModuleNotFoundError):
 
         pass
 
+
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
 
@@ -118,6 +119,55 @@ import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+_BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS = (
+    "model.language_model.model.layers",
+    "model.vit_model.vision_model.encoder.layers",
+)
+
+
+def _get_module_by_fqn(module: nn.Module, fqn: str) -> Optional[nn.Module]:
+    obj = module
+    for part in fqn.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _is_checkpoint_wrapped(module: nn.Module) -> bool:
+    return hasattr(module, "_checkpoint_wrapped_module")
+
+
+def _apply_bagel_full_layer_activation_checkpointing(model: nn.Module) -> bool:
+    """Apply native BAGEL-style activation checkpointing to whole logical layers."""
+    if type(model).__name__ != "BagelForUnifiedMultimodal":
+        return False
+
+    wrapped_count = 0
+    for fqn in _BAGEL_FULL_LAYER_CHECKPOINT_MODULE_LISTS:
+        container = _get_module_by_fqn(model, fqn)
+        if container is None:
+            logger.warning("BAGEL activation checkpointing skipped missing module list %s", fqn)
+            continue
+        if not isinstance(container, (nn.ModuleList, nn.ModuleDict)):
+            logger.warning(
+                "BAGEL activation checkpointing expected %s to be a module list, got %s",
+                fqn,
+                type(container),
+            )
+            continue
+
+        items = container.items() if isinstance(container, nn.ModuleDict) else enumerate(container)
+        for key, layer in list(items):
+            if _is_checkpoint_wrapped(layer):
+                continue
+            container[key] = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            wrapped_count += 1
+
+    logger.info("Applied BAGEL full-layer activation checkpointing to %d layers", wrapped_count)
+    return wrapped_count > 0
 
 
 class ParallelizationStrategy(ABC):
@@ -242,7 +292,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception:
                         pass
 
-            if enable_compile:
+            if _apply_bagel_full_layer_activation_checkpointing(model):
+                logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
+            elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
