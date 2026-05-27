@@ -384,14 +384,20 @@ class BiEncoderModel(nn.Module):
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
-        if output_embedding_quantization is not None and output_embedding_quantization not in ("int8",):
+        resolved_output_embedding_quantization = output_embedding_quantization
+        if resolved_output_embedding_quantization is None:
+            resolved_output_embedding_quantization = getattr(self.config, "output_embedding_quantization", None)
+
+        if resolved_output_embedding_quantization is not None and resolved_output_embedding_quantization not in (
+            "int8",
+        ):
             raise ValueError(
-                f"Unsupported output_embedding_quantization {output_embedding_quantization!r}. "
+                f"Unsupported output_embedding_quantization {resolved_output_embedding_quantization!r}. "
                 f"Supported: None, 'int8'."
             )
 
-        self.output_embedding_quantization = output_embedding_quantization
-        self.config.output_embedding_quantization = output_embedding_quantization
+        self.output_embedding_quantization = resolved_output_embedding_quantization
+        self.config.output_embedding_quantization = resolved_output_embedding_quantization
 
     @classmethod
     def build(
