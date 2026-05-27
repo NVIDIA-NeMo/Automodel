@@ -40,6 +40,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -373,7 +374,12 @@ class HyMT2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # not surprised by an fp32 tensor. Matches the HF reference's
             # ``enable_lm_head_fp32`` behavior.
             original_dtype = hidden.dtype
-            logits = self.lm_head(hidden.float()).to(original_dtype)
+            lm_head_bias = self.lm_head.bias if getattr(self.lm_head, "bias", None) is not None else None
+            logits = F.linear(
+                hidden.float(),
+                self.lm_head.weight.float(),
+                lm_head_bias.float() if lm_head_bias is not None else None,
+            ).to(original_dtype)
         else:
             logits = self.lm_head(hidden)
 

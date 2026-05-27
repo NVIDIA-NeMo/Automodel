@@ -214,6 +214,19 @@ def _is_config_compatible_with_custom_model(arch_name: str, config) -> bool:
     return True
 
 
+def _is_hy_mt2_config(config) -> bool:
+    """Return whether a ``hy_v3`` config describes Tencent Hy-MT2-30B-A3B."""
+    return (
+        getattr(config, "model_type", None) == "hy_v3"
+        and getattr(config, "hidden_size", None) == 2048
+        and getattr(config, "num_hidden_layers", None) == 48
+        and getattr(config, "num_experts", None) == 128
+        and getattr(config, "expert_hidden_dim", None) == 768
+        and getattr(config, "moe_intermediate_size", None) == 768
+        and hasattr(config, "enable_lm_head_fp32")
+    )
+
+
 def _resolve_custom_model_cls_for_config(config):
     """Resolve the custom model class for *config*, if the config is compatible."""
     architectures = get_architectures(config)
@@ -221,6 +234,11 @@ def _resolve_custom_model_cls_for_config(config):
         return None
 
     arch_name = architectures[0]
+    if arch_name == "HYV3ForCausalLM" and _is_hy_mt2_config(config):
+        from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
+
+        return HyMT2ForCausalLM
+
     if not ModelRegistry.has_custom_model(arch_name):
         return None
 

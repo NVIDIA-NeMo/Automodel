@@ -26,12 +26,14 @@
 # EP size must divide num_experts (128). ep_size=8 -> 16 experts per rank.
 # Other valid EP sizes: 1, 2, 4, 16, 32, 64, 128.
 #
-# Note: the on-disk checkpoint declares ``architectures: ["HYV3ForCausalLM"]``,
-# so NeMoAutoModel's registry would dispatch to ``components/models/hy_v3``.
-# This recipe deliberately bypasses the registry and instantiates the new
-# ``HyMT2ForCausalLM`` directly via ``_target_``, isolating Hy-MT2 logic
-# (sigmoid-routing flag, ``enable_lm_head_fp32``, expert_hidden_dim) from
-# the existing Hy3-preview support.
+# Note: the on-disk checkpoint declares ``architectures: ["HYV3ForCausalLM"]``
+# and ``model_type: "hy_v3"``, which NeMoAutoModel's string-keyed registry maps
+# to ``components/models/hy_v3`` (Hy3-preview). This recipe deliberately
+# bypasses the registry by instantiating ``HyMT2ForCausalLM`` via a
+# fully-qualified ``_target_`` -- this keeps the Hy-MT2-specific logic
+# (``moe_router_use_sigmoid`` dispatch, ``enable_lm_head_fp32`` in-forward
+# upcast, ``expert_hidden_dim`` preference) isolated from the existing
+# Hy3-preview support without registry surgery.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
