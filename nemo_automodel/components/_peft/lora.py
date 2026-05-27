@@ -236,24 +236,17 @@ class LinearLoRA(nn.Linear):
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
         if not getattr(self, "use_memory_efficient_lora", False):
-            print("_should_use_memory_efficient_lora=False: use_memory_efficient_lora is not set")
             return False
         if isinstance(x, DTensor):
-            print("_should_use_memory_efficient_lora=False: input x is a DTensor")
             return False
         if isinstance(getattr(self.lora_A, "weight", None), DTensor):
-            print("_should_use_memory_efficient_lora=False: lora_A.weight is a DTensor")
             return False
         if isinstance(getattr(self.lora_B, "weight", None), DTensor):
-            print("_should_use_memory_efficient_lora=False: lora_B.weight is a DTensor")
             return False
         if torch.compiler.is_compiling():
-            print("_should_use_memory_efficient_lora=False: torch.compiler is currently compiling")
             return False
         if HAS_TE and isinstance(getattr(self, "lora_A", None), transformer_engine.pytorch.Linear):
-            print("_should_use_memory_efficient_lora=False: lora_A is a TransformerEngine Linear")
             return False
-        print("_should_use_memory_efficient_lora=True: all conditions passed")
         return True
 
     def forward(self, x):
@@ -301,13 +294,10 @@ class LinearLoRA(nn.Linear):
             if self.dropout_position == "pre":
                 x = F.dropout(x, p=self.dropout_p, training=self.training)
 
-            print(f"forward: use_memory_efficient_lora={getattr(self, 'use_memory_efficient_lora', False)}")
-            _use_mem_efficient = self._should_use_memory_efficient_lora(x)
-            print(f"forward: _should_use_memory_efficient_lora={_use_mem_efficient}")
             # Apply scale before lora_B to keep lora_res as a Partial tensor.
             # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
             # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
-            if _use_mem_efficient:
+            if self._should_use_memory_efficient_lora(x):
                 lora_res = LoRATritonFunction.apply(
                     x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, False
                 )
