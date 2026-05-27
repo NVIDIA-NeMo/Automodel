@@ -578,6 +578,45 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         ``(hidden_states, *mtp_embed_inputs)`` (tuple of arity ``1 + D``); the
         final stage returns ``(logits, *mtp_per_depth_h)``. The single-rank
         (no-PP) path returns :class:`NemotronHCausalLMOutputWithPast` unchanged.
+
+        Args:
+            input_ids: Input token IDs. BSHD: ``[B, S]``; THD: ``[1, T]``
+                (squeezed internally). On non-first PP stages this slot
+                instead carries the upstream stage's hidden-state tensor.
+            *mtp_embed_inputs: Pre-computed future-token embeddings produced
+                by the first PP stage and forwarded between stages as
+                positional args. Empty on the single-rank (no-PP) path.
+            attention_mask: 2D padding mask ``[B, S]``.
+            causal_mask_mapping: Dict with precomputed 4D causal masks
+                (key ``"full_attention"`` is consumed).
+            inputs_embeds: Pre-computed input embeddings (optional).
+            labels: Token IDs for loss computation ``[B, S]`` (optional;
+                under PP, loss is computed by ``PipelineCausalLMLoss``).
+            past_key_values: Optional ``NemotronHybridCache`` for incremental decoding.
+            use_cache: Whether to return ``past_key_values`` for subsequent steps.
+            cache_position: Token position indices for cache updates.
+            position_ids: Position IDs (forwarded into MTP sublayer kwargs).
+            padding_mask: Padding mask ``[B, S]`` used by the THD squeeze helper
+                and as the MoE / mamba 2D mask source.
+            logits_to_keep: If > 0, only compute logits for the last
+                ``logits_to_keep`` token positions.
+            output_hidden_states: Whether to return hidden states.
+            return_dict: Accepted for API compatibility (always returns a
+                ``NemotronHCausalLMOutputWithPast`` off-PP).
+            **kwargs: Additional arguments forwarded to the base model
+                (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
+                ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
+                ``_packed_seq_ids``).
+
+        Returns:
+            Off-PP: :class:`NemotronHCausalLMOutputWithPast` with ``logits``,
+            optional ``loss``, ``past_key_values``, ``hidden_states``, and the
+            MTP per-depth hidden states / loss-scaling factor when MTP is on.
+
+            Under PP, returns a positional tuple instead:
+              * mid stages: ``(hidden_states, *mtp_embed_inputs)`` arity ``1 + D``.
+              * last stage: ``(logits, *mtp_per_depth_h, seq_idx)`` arity
+                ``1 + D + 1`` when MTP is enabled, else ``logits`` alone.
         """
         is_pp_stage = self._is_pipeline_parallel_stage()
         is_first_stage = getattr(self.model, "embed_tokens", None) is not None
