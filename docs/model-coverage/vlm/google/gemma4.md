@@ -1,6 +1,6 @@
 # Gemma 4
 
-[Gemma 4](https://ai.google.dev/gemma) is Google's next-generation multimodal Gemma family, supporting image-text inputs with a Mixture-of-Experts (MoE) language backbone at larger scales. NeMo AutoModel replaces the HF-native dense matmul over experts with the NeMo `GroupedExperts` backend, enabling Expert Parallelism (EP) via the standard MoE parallelizer.
+[Gemma 4](https://ai.google.dev/gemma) is Google's next-generation multimodal Gemma family, supporting image-text inputs with a Mixture-of-Experts (MoE) language backbone at larger scales. NeMo AutoModel replaces the HF-native dense matmul over experts with the NeMo `GroupedExperts` backend, enabling Expert Parallelism (EP) through the standard MoE parallelizer.
 
 :::{card}
 | | |
@@ -21,7 +21,7 @@
 ## Architecture
 
 - `Gemma4ForConditionalGeneration`
-- `Gemma4AssistantForCausalLM` (MTP drafter / assistant for speculative decoding; co-trainable with the target Gemma 4 base via `Gemma4WithDrafter`)
+- `Gemma4AssistantForCausalLM` (MTP drafter / assistant head for speculative decoding; co-trainable with the target Gemma 4 base using `Gemma4WithDrafter`)
 
 ## Example HF Models
 
@@ -80,7 +80,7 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/nemo-automodel:26.02.00
 ```
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
+**2. Navigate to the AutoModel directory** (where the recipes are):
 
 ```bash
 cd /opt/Automodel
