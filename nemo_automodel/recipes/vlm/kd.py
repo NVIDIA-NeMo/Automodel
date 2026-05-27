@@ -199,7 +199,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             cfg_teacher=self.cfg.get("teacher_model", None),
             cfg_freeze=self.cfg.get("teacher_freeze_config", None),
             seed=self.cfg.get("seed", 42),
-            distributed_setup=self.distributed_setup,
+            distributed_setup=getattr(self, "distributed_setup", None),
             device=teacher_device,
         )
 

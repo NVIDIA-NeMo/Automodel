@@ -26,7 +26,7 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
-from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes
+from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.recipes._dist_utils import (
     create_distributed_setup_from_config,
@@ -440,10 +440,11 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
 
     @pytest.fixture
     def patched_mesh(self, monkeypatch):
-        """Stub raw mesh creation to capture the world_size it receives."""
+        """Stub mesh context creation to capture the world_size it receives."""
         captured: dict = {}
 
-        def fake_create_device_meshes(strategy_config, parallelism, **kwargs):
+        def fake_build(cls, strategy_config, parallelism_sizes=None, **kwargs):
+            parallelism = parallelism_sizes or ParallelismSizes()
             captured["strategy_config"] = strategy_config
             captured["parallelism"] = parallelism
             captured.update(kwargs)
@@ -459,12 +460,9 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
             moe_mesh = None
             if (parallelism.ep_size or 1) > 1:
                 moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: parallelism.ep_size})
-            return device_mesh, moe_mesh
+            return cls.from_meshes(device_mesh, moe_mesh)
 
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.mesh_utils._create_device_meshes",
-            fake_create_device_meshes,
-        )
+        monkeypatch.setattr(MeshContext, "build", classmethod(fake_build))
         return captured
 
     def test_explicit_world_size_used(self, patched_mesh):
