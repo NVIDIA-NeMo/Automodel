@@ -12,29 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device mesh access utilities for distributed training.
+"""Device mesh construction and access utilities for distributed training."""
 
-Mesh context creation and raw device mesh construction live in
-:mod:`nemo_automodel.components.distributed.device_mesh`. This module keeps
-mesh lookup helpers and re-exports the creation functions for older imports.
-"""
+from dataclasses import dataclass, field
 
-from typing import TYPE_CHECKING
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
-from nemo_automodel.components.distributed.device_mesh import (
-    _create_device_meshes,
-    _create_fsdp2_device_mesh,
-    _create_megatron_fsdp_device_mesh,
-    _unflatten_compat,
-    create_mesh_context,
+from nemo_automodel.components.distributed.config import (
+    DDPConfig,
+    DistributedStrategyConfig,
+    FSDP2Config,
+    MegatronFSDPConfig,
 )
-from nemo_automodel.components.distributed.mesh import MeshAxisName
-
-if TYPE_CHECKING:
-    from torch.distributed.device_mesh import DeviceMesh
+from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes
 
 __all__ = [
-    "create_mesh_context",
     "_create_device_meshes",
     "_create_fsdp2_device_mesh",
     "_create_megatron_fsdp_device_mesh",
@@ -43,6 +37,219 @@ __all__ = [
     "get_submesh",
     "get_fsdp_dp_mesh",
 ]
+
+
+def _degree(value: int | None) -> int:
+    return value if isinstance(value, int) and value > 0 else 1
+
+
+def _require_size_one(strategy_name: str, size: int | None, feature_name: str) -> None:
+    if _degree(size) > 1:
+        raise ValueError(f"{strategy_name} does not support {feature_name}")
+
+
+@dataclass(frozen=True)
+class _MeshSpec:
+    """Named mesh shape plus derived flattened axes."""
+
+    shape: tuple[int, ...]
+    axes: tuple[MeshAxisName, ...]
+    flattened_axes: dict[MeshAxisName, tuple[MeshAxisName, ...]] = field(default_factory=dict)
+
+
+def _create_device_meshes(
+    strategy_config: DistributedStrategyConfig,
+    parallelism: ParallelismSizes,
+    *,
+    world_size: int,
+) -> tuple[DeviceMesh | None, DeviceMesh | None]:
+    """Create raw device meshes based on distributed config type."""
+    if (
+        parallelism.dp_replicate_size is not None
+        and parallelism.dp_replicate_size > 1
+        and not isinstance(strategy_config, FSDP2Config)
+    ):
+        raise ValueError("dp_replicate_size is only supported with FSDP2Config")
+
+    if isinstance(strategy_config, FSDP2Config):
+        return _create_fsdp2_device_mesh(
+            parallelism,
+            world_size=world_size,
+        )
+    elif isinstance(strategy_config, MegatronFSDPConfig):
+        _require_size_one("megatron_fsdp", parallelism.pp_size, "pipeline parallelism")
+        _require_size_one("megatron_fsdp", parallelism.ep_size, "expert parallelism")
+        mesh = _create_megatron_fsdp_device_mesh(
+            parallelism,
+            world_size=world_size,
+        )
+        return mesh, None
+    elif isinstance(strategy_config, DDPConfig):
+        _require_size_one("ddp", parallelism.tp_size, "tensor parallelism")
+        _require_size_one("ddp", parallelism.pp_size, "pipeline parallelism")
+        _require_size_one("ddp", parallelism.cp_size, "context parallelism")
+        _require_size_one("ddp", parallelism.ep_size, "expert parallelism")
+        return None, None
+    else:
+        raise ValueError(f"Unknown distributed strategy config type: {type(strategy_config)}")
+
+
+def _infer_dp_size(
+    dp_size: int | None,
+    *,
+    world_size: int,
+    non_dp_size: int,
+    expression: str,
+    factors: tuple[int, ...],
+) -> int:
+    if dp_size is not None and dp_size > 0:
+        return dp_size
+
+    if world_size % non_dp_size != 0:
+        factors_str = " * ".join(str(factor) for factor in factors)
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by ({expression}) ({factors_str} = {non_dp_size})"
+        )
+    return world_size // non_dp_size
+
+
+def _mesh_device_type() -> str:
+    if dist.is_available() and dist.is_initialized():
+        backend = str(dist.get_backend()).lower()
+        return "cuda" if "nccl" in backend and torch.cuda.is_available() else "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _init_named_mesh(spec: _MeshSpec) -> DeviceMesh:
+    _validate_mesh_spec(spec)
+    device_mesh = init_device_mesh(
+        device_type=_mesh_device_type(),
+        mesh_shape=spec.shape,
+        mesh_dim_names=spec.axes,
+    )
+    _register_flattened_axes(device_mesh, spec.flattened_axes)
+    return device_mesh
+
+
+def _validate_mesh_spec(spec: _MeshSpec) -> None:
+    for shape, axis in zip(spec.shape, spec.axes):
+        assert isinstance(shape, int), f"Expected {axis} to be an int, but got {type(shape)}"
+        assert shape > 0, f"Expected {axis} > 0, got {shape}"
+
+
+def _register_flattened_axes(
+    device_mesh: DeviceMesh, flattened_axes: dict[MeshAxisName, tuple[MeshAxisName, ...]]
+) -> None:
+    if not flattened_axes:
+        return
+    if not hasattr(device_mesh, "_flatten_mapping"):
+        device_mesh._flatten_mapping = {}
+    for flattened_axis, source_axes in flattened_axes.items():
+        flattened_mesh = device_mesh[source_axes]._flatten(mesh_dim_name=flattened_axis)
+        device_mesh._flatten_mapping.setdefault(flattened_axis, flattened_mesh)
+
+
+def _create_fsdp2_device_mesh(
+    parallelism: ParallelismSizes,
+    *,
+    world_size: int,
+) -> tuple[DeviceMesh, DeviceMesh | None]:
+    """Create the FSDP2 root mesh and optional MoE mesh."""
+    tp_size = _degree(parallelism.tp_size)
+    cp_size = _degree(parallelism.cp_size)
+    pp_size = _degree(parallelism.pp_size)
+    ep_size = _degree(parallelism.ep_size)
+    dp_replicate_size = _degree(parallelism.dp_replicate_size)
+    dp_size = _infer_dp_size(
+        parallelism.dp_size,
+        world_size=world_size,
+        non_dp_size=tp_size * cp_size * pp_size,
+        expression="tp_size * cp_size * pp_size",
+        factors=(tp_size, cp_size, pp_size),
+    )
+
+    if dp_size % dp_replicate_size != 0:
+        raise ValueError("dp_size must be a multiple of dp_replicate_size")
+    if dp_replicate_size >= dp_size and dp_replicate_size != 1:
+        raise ValueError(
+            f"dp_replicate_size={dp_replicate_size} must be less than dp_size={dp_size} "
+            "since DDP usecase is not supported by FSDP2"
+        )
+
+    non_pp_size = dp_size * cp_size * tp_size
+    if non_pp_size % ep_size != 0:
+        raise ValueError(f"{non_pp_size=} must be a multiple of {ep_size=}")
+    ep_shard_size = non_pp_size // ep_size if ep_size < non_pp_size else 1
+    dp_shard_size = dp_size // dp_replicate_size
+
+    device_mesh = _init_named_mesh(
+        _MeshSpec(
+            shape=(pp_size, dp_replicate_size, dp_shard_size, cp_size, tp_size),
+            axes=(
+                MeshAxisName.PP,
+                MeshAxisName.DP_REPLICATE,
+                MeshAxisName.DP_SHARD,
+                MeshAxisName.CP,
+                MeshAxisName.TP,
+            ),
+            flattened_axes={
+                MeshAxisName.DP: (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD),
+                MeshAxisName.DP_SHARD_CP: (MeshAxisName.DP_SHARD, MeshAxisName.CP),
+                MeshAxisName.DP_CP: (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP),
+            },
+        ),
+    )
+
+    moe_mesh = None
+    if ep_size > 1:
+        moe_mesh = _create_moe_mesh(device_mesh, ep_shard_size=ep_shard_size, ep_size=ep_size)
+
+    return device_mesh, moe_mesh
+
+
+def _create_megatron_fsdp_device_mesh(
+    parallelism: ParallelismSizes,
+    *,
+    world_size: int,
+) -> DeviceMesh:
+    """Create the Megatron FSDP mesh."""
+    tp_size = _degree(parallelism.tp_size)
+    cp_size = _degree(parallelism.cp_size)
+    dp_size = _infer_dp_size(
+        parallelism.dp_size,
+        world_size=world_size,
+        non_dp_size=tp_size * cp_size,
+        expression="tp_size * cp_size",
+        factors=(tp_size, cp_size),
+    )
+
+    return _init_named_mesh(
+        _MeshSpec(
+            shape=(dp_size, cp_size, tp_size),
+            axes=(MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP),
+            flattened_axes={MeshAxisName.DP_CP: (MeshAxisName.DP, MeshAxisName.CP)} if cp_size > 1 else {},
+        ),
+    )
+
+
+def _create_moe_mesh(device_mesh: DeviceMesh, *, ep_shard_size: int, ep_size: int) -> DeviceMesh:
+    non_pp_axes = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
+    return _unflatten_compat(
+        device_mesh[non_pp_axes]._flatten(),
+        0,
+        (ep_shard_size, ep_size),
+        (MeshAxisName.EP_SHARD, MeshAxisName.EP),
+    )
+
+
+def _unflatten_compat(flat_mesh: DeviceMesh, axis: int, sizes: tuple, names: tuple) -> DeviceMesh:
+    """Compatibility shim for DeviceMesh._unflatten(), added in PyTorch 2.10."""
+    if hasattr(flat_mesh, "_unflatten"):
+        return flat_mesh._unflatten(axis, sizes, names)
+    new_mesh_tensor = flat_mesh.mesh.reshape(sizes)
+    from torch.distributed.device_mesh import DeviceMesh as _DeviceMesh
+
+    return _DeviceMesh(flat_mesh.device_type, new_mesh_tensor, mesh_dim_names=names)
 
 
 def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":

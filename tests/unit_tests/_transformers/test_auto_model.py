@@ -30,7 +30,7 @@ from nemo_automodel._transformers.auto_model import (
     _init_model,
     _patch_attention,
     _patch_remote_code_compat,
-    _resolve_mesh_context,
+    _resolve_distributed_setup,
 )
 from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
 from nemo_automodel._transformers.model_init import (
@@ -42,10 +42,9 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
 )
 from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
-from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MoEParallelizerConfig
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
 
 class _FakeMesh:
@@ -58,98 +57,73 @@ class _FakeMesh:
 
 
 class TestResolveMeshContext:
-    def test_device_mesh_inputs_create_mesh_context_with_configs(self):
+    def test_device_mesh_input_builds_topology_only_setup(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
-        moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
-        distributed_config = FSDP2Config()
-        moe_config = MoEParallelizerConfig()
 
-        mesh, resolved_distributed_config, resolved_pipeline_config, resolved_moe_config, activation_checkpointing = (
-            _resolve_mesh_context(
-                device_mesh=device_mesh,
-                moe_mesh=moe_mesh,
-                distributed_config=distributed_config,
-                pipeline_config=None,
-                moe_config=moe_config,
-                activation_checkpointing=True,
-            )
+        setup = _resolve_distributed_setup(
+            distributed_setup=None,
+            device_mesh=device_mesh,
         )
 
-        assert mesh.device_mesh is device_mesh
-        assert mesh.moe_mesh is moe_mesh
-        assert mesh.strategy_config is distributed_config
-        assert mesh.pipeline_config is None
-        assert mesh.moe_config is moe_config
-        assert resolved_distributed_config is distributed_config
-        assert resolved_pipeline_config is None
-        assert resolved_moe_config is moe_config
-        assert activation_checkpointing is True
+        assert setup.mesh_context.device_mesh is device_mesh
+        assert setup.mesh_context.moe_mesh is None
+        assert setup.strategy_config is None
+        assert setup.pipeline_config is None
+        assert setup.moe_parallel_config is None
+        assert setup.activation_checkpointing is False
 
-    def test_mesh_context_input_supplies_default_configs(self):
+    def test_device_mesh_rejects_mesh_context(self):
+        mesh_context = MeshContext()
+
+        with pytest.raises(TypeError, match="DeviceMesh"):
+            _resolve_distributed_setup(
+                distributed_setup=None,
+                device_mesh=mesh_context,
+            )
+
+    def test_distributed_setup_and_device_mesh_are_mutually_exclusive(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        distributed_setup = DistributedSetup(mesh_context=MeshContext())
+
+        with pytest.raises(ValueError, match="either distributed_setup or device_mesh"):
+            _resolve_distributed_setup(
+                distributed_setup=distributed_setup,
+                device_mesh=device_mesh,
+            )
+
+    def test_distributed_setup_input_supplies_configs(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
         distributed_config = FSDP2Config(activation_checkpointing=True)
         moe_config = MoEParallelizerConfig()
-        source_mesh = MeshContext.from_meshes(
-            device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
+        source_setup = DistributedSetup(
+            mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
             strategy_config=distributed_config,
-            moe_config=moe_config,
+            moe_parallel_config=moe_config,
+            activation_checkpointing=True,
         )
 
-        mesh, resolved_distributed_config, _, resolved_moe_config, activation_checkpointing = _resolve_mesh_context(
-            device_mesh=source_mesh,
-            moe_mesh=None,
-            distributed_config=None,
-            pipeline_config=None,
-            moe_config=None,
-            activation_checkpointing=None,
+        setup = _resolve_distributed_setup(
+            distributed_setup=source_setup,
         )
 
-        assert mesh.device_mesh is device_mesh
-        assert mesh.moe_mesh is moe_mesh
-        assert mesh.strategy_config is distributed_config
-        assert mesh.moe_config is moe_config
-        assert resolved_distributed_config is distributed_config
-        assert resolved_moe_config is moe_config
-        assert activation_checkpointing is True
+        assert setup.mesh_context.device_mesh is device_mesh
+        assert setup.mesh_context.moe_mesh is moe_mesh
+        assert setup.strategy_config is distributed_config
+        assert setup.moe_parallel_config is moe_config
+        assert setup.activation_checkpointing is True
 
-    def test_explicit_configs_override_mesh_context_defaults(self):
-        source_config = FSDP2Config(sequence_parallel=False, activation_checkpointing=True)
-        override_config = FSDP2Config(sequence_parallel=True)
-        source_mesh = MeshContext(strategy_config=source_config)
+    def test_missing_distributed_setup_returns_empty_setup(self):
+        setup = _resolve_distributed_setup(distributed_setup=None)
 
-        mesh, resolved_distributed_config, _, _, activation_checkpointing = _resolve_mesh_context(
-            device_mesh=source_mesh,
-            moe_mesh=None,
-            distributed_config=override_config,
-            pipeline_config=None,
-            moe_config=None,
-            activation_checkpointing=False,
-        )
-
-        assert mesh.strategy_config is override_config
-        assert resolved_distributed_config is override_config
-        assert activation_checkpointing is False
-
-    def test_mesh_context_rejects_separate_moe_mesh(self):
-        with pytest.raises(ValueError, match="Pass moe_mesh only with a raw DeviceMesh"):
-            _resolve_mesh_context(
-                device_mesh=MeshContext(),
-                moe_mesh=object(),
-                distributed_config=None,
-                pipeline_config=None,
-                moe_config=None,
-                activation_checkpointing=None,
-            )
+        assert isinstance(setup.mesh_context, MeshContext)
+        assert setup.strategy_config is None
+        assert setup.activation_checkpointing is False
 
 
 class TestFromPretrainedDeviceMesh:
-    def test_from_pretrained_wraps_device_mesh_into_mesh_context(self):
+    def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
-        moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
-        distributed_config = FSDP2Config()
-        moe_config = MoEParallelizerConfig()
         sentinel_model = object()
 
         with (
@@ -162,36 +136,27 @@ class TestFromPretrainedDeviceMesh:
         ):
             mock_infra.return_value = (None, None, None, None)
 
-            result = NeMoAutoModelForCausalLM.from_pretrained(
-                "test-model",
-                device_mesh=device_mesh,
-                moe_mesh=moe_mesh,
-                distributed_config=distributed_config,
-                moe_config=moe_config,
-                activation_checkpointing=True,
-            )
+            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", device_mesh=device_mesh)
 
         assert result is sentinel_model
-        mock_infra.assert_called_once()
-        assert mock_infra.call_args.kwargs["distributed_config"] is distributed_config
-        assert mock_infra.call_args.kwargs["moe_config"] is moe_config
-        assert mock_infra.call_args.kwargs["activation_checkpointing"] is True
+        assert mock_infra.call_args.kwargs["distributed_config"] is None
+        assert mock_infra.call_args.kwargs["moe_parallel_config"] is None
+        assert mock_infra.call_args.kwargs["activation_checkpointing"] is False
         assert mock_infra.call_args.kwargs["mesh"].device_mesh is device_mesh
-        assert mock_infra.call_args.kwargs["mesh"].strategy_config is distributed_config
-        assert mock_infra.call_args.kwargs["mesh"].moe_config is moe_config
-        mock_sdpa.assert_called_once_with(None, device_mesh, True)
-        assert mock_build.call_args.kwargs["mesh"].moe_mesh is moe_mesh
+        assert mock_infra.call_args.kwargs["mesh"].moe_mesh is None
+        mock_sdpa.assert_called_once_with(None, device_mesh, False)
+        assert mock_build.call_args.kwargs["mesh"].device_mesh is device_mesh
 
-    def test_from_pretrained_accepts_mesh_context_as_device_mesh(self):
+    def test_from_pretrained_accepts_distributed_setup(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
         moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 8})
         distributed_config = FSDP2Config(activation_checkpointing=True)
         moe_config = MoEParallelizerConfig()
-        mesh_context = MeshContext.from_meshes(
-            device_mesh,
-            moe_mesh,
+        distributed_setup = DistributedSetup(
+            mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
             strategy_config=distributed_config,
-            moe_config=moe_config,
+            moe_parallel_config=moe_config,
+            activation_checkpointing=True,
         )
         sentinel_model = object()
 
@@ -205,15 +170,40 @@ class TestFromPretrainedDeviceMesh:
         ):
             mock_infra.return_value = (None, None, None, None)
 
-            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", device_mesh=mesh_context)
+            result = NeMoAutoModelForCausalLM.from_pretrained("test-model", distributed_setup=distributed_setup)
 
         assert result is sentinel_model
         assert mock_infra.call_args.kwargs["distributed_config"] is distributed_config
-        assert mock_infra.call_args.kwargs["moe_config"] is moe_config
+        assert mock_infra.call_args.kwargs["moe_parallel_config"] is moe_config
         assert mock_infra.call_args.kwargs["activation_checkpointing"] is True
         assert mock_infra.call_args.kwargs["mesh"].device_mesh is device_mesh
         mock_sdpa.assert_called_once_with(None, device_mesh, True)
         assert mock_build.call_args.kwargs["mesh"].moe_mesh is moe_mesh
+
+    def test_from_pretrained_rejects_distributed_setup_with_device_mesh(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        distributed_setup = DistributedSetup(mesh_context=MeshContext())
+
+        with pytest.raises(ValueError, match="either distributed_setup or device_mesh"):
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                distributed_setup=distributed_setup,
+                device_mesh=device_mesh,
+            )
+
+    def test_from_pretrained_rejects_separate_distributed_kwargs(self):
+        with pytest.raises(TypeError, match="distributed_setup"):
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                distributed_config=FSDP2Config(),
+            )
+
+    def test_from_pretrained_rejects_moe_mesh_kwarg(self):
+        with pytest.raises(TypeError, match="distributed_setup"):
+            NeMoAutoModelForCausalLM.from_pretrained(
+                "test-model",
+                moe_mesh=object(),
+            )
 
 
 class TestPatchAttention:

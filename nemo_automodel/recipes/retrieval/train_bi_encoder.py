@@ -34,7 +34,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     build_checkpoint_config,
@@ -153,12 +153,14 @@ class TrainBiEncoderRecipe(BaseRecipe):
         apply_te_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.mesh_context = create_mesh_context_from_config(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.mesh_context.strategy_config
+        self.distributed_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        self.mesh_context = self.distributed_setup.mesh_context
+        self.distributed_config = self.distributed_setup.strategy_config
         self.device_mesh = self.mesh_context.device_mesh
         self.moe_mesh = self.mesh_context.moe_mesh
         self.pp_enabled = self.mesh_context.pp_enabled
-        self.pipeline_config = self.mesh_context.pipeline_config
+        self.pipeline_config = self.distributed_setup.pipeline_config
+        self.moe_parallel_config = self.distributed_setup.moe_parallel_config
 
         if self.pp_enabled:
             raise NotImplementedError("Encoder does not support pipeline parallelism")
@@ -198,9 +200,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             model = self.cfg.model.instantiate(
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
+                distributed_setup=self.distributed_setup,
                 peft_config=self.peft_config,
             )
 

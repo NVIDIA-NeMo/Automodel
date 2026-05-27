@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the high-level mesh context factory."""
+"""Tests for the high-level mesh context builder."""
 
 import pytest
 
-from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.device_mesh import create_mesh_context
-from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
+from nemo_automodel.components.distributed.config import (
+    DDPConfig,
+    DistributedSetup,
+    FSDP2Config,
+    MegatronFSDPConfig,
+    MoEParallelizerConfig,
+)
+from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
 
 class _FakeAxis:
@@ -44,90 +48,77 @@ class _FakeMesh:
 def captured_raw_mesh_call(monkeypatch):
     captured: dict = {}
 
-    def fake_create_device_meshes(strategy_config, **kwargs):
+    def fake_create_device_meshes(strategy_config, parallelism, **kwargs):
         captured["strategy_config"] = strategy_config
+        captured["parallelism"] = parallelism
         captured.update(kwargs)
         return None, None
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.device_mesh._create_device_meshes",
+        "nemo_automodel.components.distributed.mesh_utils._create_device_meshes",
         fake_create_device_meshes,
     )
     return captured
 
 
-def test_create_mesh_context_accepts_ddp_strategy_name(captured_raw_mesh_call):
-    ctx = create_mesh_context("ddp", world_size=4, activation_checkpointing=True, backend="gloo")
+def test_mesh_context_build_accepts_ddp_config(captured_raw_mesh_call):
+    config = DDPConfig()
+
+    ctx = MeshContext.build(config, world_size=4)
 
     assert isinstance(ctx, MeshContext)
-    assert isinstance(ctx.strategy_config, DDPConfig)
-    assert ctx.strategy_config.backend == "gloo"
-    assert ctx.strategy_config.activation_checkpointing is True
+    assert not hasattr(ctx, "strategy_config")
+    assert captured_raw_mesh_call["strategy_config"] is config
     assert not hasattr(ctx, "activation_checkpointing")
     assert captured_raw_mesh_call["world_size"] == 4
 
 
-def test_create_mesh_context_accepts_mfsdp_alias(captured_raw_mesh_call):
-    ctx = create_mesh_context("mfsdp", world_size=4, backend="gloo")
+@pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
+def test_distributed_setup_config_accepts_megatron_fsdp_names(strategy, captured_raw_mesh_call):
+    setup = DistributedSetup.build(strategy=strategy, world_size=4)
 
-    assert isinstance(ctx.strategy_config, MegatronFSDPConfig)
-    assert ctx.strategy_config.backend == "gloo"
-    assert captured_raw_mesh_call["strategy_config"] is ctx.strategy_config
+    assert isinstance(setup.mesh_context, MeshContext)
+    assert isinstance(captured_raw_mesh_call["strategy_config"], MegatronFSDPConfig)
+    assert captured_raw_mesh_call["world_size"] == 4
 
 
-def test_create_mesh_context_accepts_existing_config(captured_raw_mesh_call):
-    config = FSDP2Config(backend="gloo")
+def test_mesh_context_build_accepts_existing_config(captured_raw_mesh_call):
+    config = FSDP2Config()
 
-    ctx = create_mesh_context(config, world_size=8)
+    ctx = MeshContext.build(config, world_size=8)
 
-    assert ctx.strategy_config is config
+    assert isinstance(ctx, MeshContext)
     assert captured_raw_mesh_call["strategy_config"] is config
     assert captured_raw_mesh_call["world_size"] == 8
 
 
-def test_create_mesh_context_accepts_distributed_config_keyword(captured_raw_mesh_call):
-    config = FSDP2Config(backend="gloo")
-
-    ctx = create_mesh_context(distributed_config=config, world_size=8)
-
-    assert ctx.strategy_config is config
-    assert captured_raw_mesh_call["strategy_config"] is config
-
-
-def test_create_mesh_context_passes_parallelism_to_raw_mesh_builder(captured_raw_mesh_call):
-    create_mesh_context(
-        "fsdp2",
-        dp_size=4,
-        dp_replicate_size=2,
-        tp_size=2,
-        cp_size=2,
+def test_mesh_context_build_passes_parallelism_to_raw_mesh_builder(captured_raw_mesh_call):
+    MeshContext.build(
+        FSDP2Config(),
+        parallelism_sizes=ParallelismSizes(dp_size=4, dp_replicate_size=2, tp_size=2, cp_size=2),
         world_size=16,
     )
 
-    assert captured_raw_mesh_call["dp_size"] == 4
-    assert captured_raw_mesh_call["dp_replicate_size"] == 2
-    assert captured_raw_mesh_call["tp_size"] == 2
-    assert captured_raw_mesh_call["pp_size"] == 1
-    assert captured_raw_mesh_call["cp_size"] == 2
-    assert captured_raw_mesh_call["ep_size"] == 1
+    parallelism = captured_raw_mesh_call["parallelism"]
+    assert parallelism.dp_size == 4
+    assert parallelism.dp_replicate_size == 2
+    assert parallelism.tp_size == 2
+    assert parallelism.pp_size == 1
+    assert parallelism.cp_size == 2
+    assert parallelism.ep_size == 1
 
 
-def test_create_mesh_context_rejects_unknown_strategy():
+def test_mesh_context_build_requires_strategy_config():
+    with pytest.raises(ValueError, match="Unknown distributed strategy config type"):
+        MeshContext.build("ddp", world_size=1)  # type: ignore[arg-type]
+
+
+def test_distributed_setup_config_rejects_unknown_strategy():
     with pytest.raises(ValueError, match="Unknown strategy"):
-        create_mesh_context("unknown", world_size=1)
+        DistributedSetup.build(strategy="unknown", world_size=1)
 
 
-def test_create_mesh_context_rejects_unknown_strategy_kwarg(captured_raw_mesh_call):
-    with pytest.raises(ValueError, match="Unknown options for strategy 'fsdp2'"):
-        create_mesh_context("fsdp2", world_size=1, does_not_exist=True)
-
-
-def test_create_mesh_context_rejects_strategy_kwargs_with_config_object(captured_raw_mesh_call):
-    with pytest.raises(ValueError, match="keyword arguments require strategy to be a string"):
-        create_mesh_context(FSDP2Config(), world_size=1, sequence_parallel=True)
-
-
-def test_create_mesh_context_defaults_parallel_subconfigs(monkeypatch):
+def test_distributed_setup_config_defaults_parallel_subconfigs(monkeypatch):
     device_mesh = _FakeMesh(
         {
             MeshAxisName.PP: 2,
@@ -139,21 +130,26 @@ def test_create_mesh_context_defaults_parallel_subconfigs(monkeypatch):
     )
     moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 2})
 
-    def fake_create_device_meshes(strategy_config, **kwargs):
+    def fake_create_device_meshes(strategy_config, parallelism, **kwargs):
         return device_mesh, moe_mesh
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.device_mesh._create_device_meshes",
+        "nemo_automodel.components.distributed.mesh_utils._create_device_meshes",
         fake_create_device_meshes,
     )
 
-    ctx = create_mesh_context("fsdp2", pp_size=2, ep_size=2, world_size=4)
+    setup = DistributedSetup.build(
+        strategy="fsdp2",
+        parallelism_sizes=ParallelismSizes(pp_size=2, ep_size=2),
+        world_size=4,
+    )
 
-    assert isinstance(ctx.pipeline_config, PipelineConfig)
-    assert isinstance(ctx.moe_config, MoEParallelizerConfig)
+    assert isinstance(setup, DistributedSetup)
+    assert isinstance(setup.pipeline_config, PipelineConfig)
+    assert isinstance(setup.moe_parallel_config, MoEParallelizerConfig)
 
 
-def test_create_mesh_context_keeps_activation_checkpointing_on_strategy_config(monkeypatch):
+def test_distributed_setup_config_keeps_activation_checkpointing_separate(monkeypatch):
     device_mesh = _FakeMesh(
         {
             MeshAxisName.PP: 1,
@@ -165,15 +161,77 @@ def test_create_mesh_context_keeps_activation_checkpointing_on_strategy_config(m
     )
     moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: 2})
 
-    def fake_create_device_meshes(strategy_config, **kwargs):
+    def fake_create_device_meshes(strategy_config, parallelism, **kwargs):
         return device_mesh, moe_mesh
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.device_mesh._create_device_meshes",
+        "nemo_automodel.components.distributed.mesh_utils._create_device_meshes",
         fake_create_device_meshes,
     )
 
-    ctx = create_mesh_context("fsdp2", ep_size=2, activation_checkpointing=True, world_size=2)
+    setup = DistributedSetup.build(
+        strategy="fsdp2",
+        parallelism_sizes=ParallelismSizes(ep_size=2),
+        activation_checkpointing=True,
+        world_size=2,
+    )
 
-    assert not hasattr(ctx, "activation_checkpointing")
-    assert ctx.strategy_config.activation_checkpointing is True
+    assert not hasattr(setup.mesh_context, "activation_checkpointing")
+    assert setup.activation_checkpointing is True
+    assert setup.strategy_config.activation_checkpointing is False
+
+
+def test_distributed_setup_config_does_not_infer_activation_checkpointing_from_strategy_config(captured_raw_mesh_call):
+    setup = DistributedSetup.build(
+        strategy=FSDP2Config(activation_checkpointing=True),
+        world_size=1,
+    )
+
+    assert setup.activation_checkpointing is False
+    assert captured_raw_mesh_call["strategy_config"].activation_checkpointing is True
+
+
+def test_distributed_setup_config_activation_checkpointing_override(captured_raw_mesh_call):
+    setup = DistributedSetup.build(
+        strategy=FSDP2Config(activation_checkpointing=True),
+        activation_checkpointing=False,
+        world_size=1,
+    )
+
+    assert setup.activation_checkpointing is False
+    assert setup.strategy_config.activation_checkpointing is True
+
+
+def test_distributed_setup_config_rejects_pipeline_config_without_pipeline_parallelism(captured_raw_mesh_call):
+    with pytest.raises(ValueError, match="pipeline_config requires pp_size > 1"):
+        DistributedSetup.build(
+            strategy=FSDP2Config(),
+            pipeline_config=PipelineConfig(),
+            parallelism_sizes=ParallelismSizes(pp_size=1),
+            world_size=1,
+        )
+
+
+def test_distributed_setup_config_rejects_moe_config_without_expert_parallelism(captured_raw_mesh_call):
+    with pytest.raises(ValueError, match="moe_parallel_config requires ep_size > 1"):
+        DistributedSetup.build(
+            strategy=FSDP2Config(),
+            moe_parallel_config=MoEParallelizerConfig(),
+            parallelism_sizes=ParallelismSizes(ep_size=1),
+            world_size=1,
+        )
+
+
+def test_distributed_setup_config_builds_runtime_setup(captured_raw_mesh_call):
+    setup = DistributedSetup.build(
+        strategy=FSDP2Config(sequence_parallel=True),
+        parallelism_sizes=ParallelismSizes(tp_size=2),
+        activation_checkpointing=True,
+        world_size=4,
+    )
+
+    assert isinstance(setup, DistributedSetup)
+    assert setup.strategy_config.sequence_parallel is True
+    assert setup.activation_checkpointing is True
+    assert captured_raw_mesh_call["parallelism"].tp_size == 2
+    assert captured_raw_mesh_call["world_size"] == 4

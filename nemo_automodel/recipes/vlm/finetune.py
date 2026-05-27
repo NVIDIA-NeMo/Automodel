@@ -55,7 +55,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
-from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
@@ -84,7 +84,7 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -117,12 +117,7 @@ def build_model(
     seed,
     cfg_fp8=None,
     cfg_compile=None,
-    device_mesh=None,
-    moe_mesh=None,
-    distributed_config=None,
-    pipeline_config=None,
-    cfg_moe=None,
-    activation_checkpointing: bool | None = None,
+    distributed_setup: DistributedSetup | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -133,26 +128,10 @@ def build_model(
         # Build infrastructure kwargs
         kwargs = {
             "peft_config": cfg_peft,
-            "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
-            "distributed_config": distributed_config,
-            "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
-        if activation_checkpointing is not None:
-            kwargs["activation_checkpointing"] = activation_checkpointing
-
-        if cfg_moe is not None:
-            from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-            if isinstance(cfg_moe, MoEParallelizerConfig):
-                kwargs["moe_config"] = cfg_moe
-            else:
-                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
-                # activation_checkpointing is handled separately; strip config keys
-                moe_dict.pop("activation_checkpointing", None)
-                moe_dict.pop("_target_", None)
-                kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
+        if distributed_setup is not None:
+            kwargs["distributed_setup"] = distributed_setup
 
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
@@ -681,13 +660,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.mesh_context = create_mesh_context_from_config(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.mesh_context.strategy_config
+        self.distributed_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        self.mesh_context = self.distributed_setup.mesh_context
+        self.distributed_config = self.distributed_setup.strategy_config
         self.device_mesh = self.mesh_context.device_mesh
         self.moe_mesh = self.mesh_context.moe_mesh
         self.pp_enabled = self.mesh_context.pp_enabled
-        self.pipeline_config = self.mesh_context.pipeline_config
-        self.activation_checkpointing = self.cfg.get("distributed.activation_checkpointing", False)
+        self.pipeline_config = self.distributed_setup.pipeline_config
+        self.moe_parallel_config = self.distributed_setup.moe_parallel_config
+        self.activation_checkpointing = self.distributed_setup.activation_checkpointing
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -766,12 +747,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            pipeline_config=self.pipeline_config,
-            cfg_moe=self.mesh_context.moe_config,
-            activation_checkpointing=self.activation_checkpointing,
+            distributed_setup=self.distributed_setup,
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 

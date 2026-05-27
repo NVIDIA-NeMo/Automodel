@@ -51,6 +51,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -82,9 +83,7 @@ def _build_teacher_model(
     cfg_teacher,
     cfg_freeze,
     seed: int,
-    device_mesh=None,
-    moe_mesh=None,
-    distributed_config=None,
+    distributed_setup: DistributedSetup | None = None,
     device=None,
 ) -> torch.nn.Module:
     """Build and initialize the teacher VLM for knowledge distillation.
@@ -96,9 +95,7 @@ def _build_teacher_model(
         cfg_teacher: Configuration for teacher model instantiation.
         cfg_freeze: Freeze configuration for the teacher model.
         seed: Random seed for reproducibility.
-        device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
-        distributed_config: Strategy-specific distributed config.
+        distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
 
     Returns:
@@ -114,12 +111,7 @@ def _build_teacher_model(
         seed=seed,
         cfg_fp8=None,
         cfg_compile=None,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=distributed_config,
-        pipeline_config=None,
-        cfg_moe=None,
-        activation_checkpointing=False,
+        distributed_setup=distributed_setup,
     )
 
     if device is not None:
@@ -207,9 +199,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             cfg_teacher=self.cfg.get("teacher_model", None),
             cfg_freeze=self.cfg.get("teacher_freeze_config", None),
             seed=self.cfg.get("seed", 42),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
+            distributed_setup=self.distributed_setup,
             device=teacher_device,
         )
 

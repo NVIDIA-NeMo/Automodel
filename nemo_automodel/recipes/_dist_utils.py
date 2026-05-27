@@ -15,23 +15,21 @@
 """Recipe-level helpers for parsing YAML distributed configs.
 
 This module bridges the gap between raw YAML / :class:`ConfigNode` dicts
-and the typed :class:`MeshContext` used by the component layer.
+and the typed :class:`DistributedSetup` used by the component layer.
 All dict handling lives here; the component layer stays typed. This module does
 not initialize ``torch.distributed``. Recipes call ``initialize_distributed``
 first, then pass the resulting world size here.
 """
 
-import dataclasses
 from typing import Any, Dict, Optional
 
-from nemo_automodel.components.distributed.mesh import (
-    STRATEGY_ALIASES,
-    STRATEGY_MAP,
-    MeshContext,
-    normalize_strategy_name,
+from nemo_automodel.components.distributed.config import (
+    DistributedSetup,
+    MoEParallelizerConfig,
+    _resolve_strategy_config,
 )
+from nemo_automodel.components.distributed.mesh import ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from nemo_automodel.shared.utils import dtype_from_str
 
 _PARALLELISM_DEFAULTS: Dict[str, Any] = {
@@ -44,18 +42,6 @@ _PARALLELISM_DEFAULTS: Dict[str, Any] = {
 }
 
 
-def _validate_strategy_kwargs(
-    strategy_name: str,
-    strategy_cls: type,
-    strategy_kwargs: Dict[str, Any],
-) -> None:
-    """Check that *strategy_kwargs* only contains fields recognised by *strategy_cls*."""
-    valid_fields = {f.name for f in dataclasses.fields(strategy_cls)}
-    unknown = set(strategy_kwargs) - valid_fields
-    if unknown:
-        raise ValueError(f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}")
-
-
 def parse_distributed_section(cfg_dict: dict) -> dict:
     """Parse a flat distributed config dict into components for mesh creation.
 
@@ -63,22 +49,20 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
     - ``strategy_config`` – instantiated strategy dataclass
     - ``pipeline_config`` – :class:`PipelineConfig` or ``None``
-    - ``moe_config`` – :class:`MoEParallelizerConfig` or ``None``
+    - ``moe_parallel_config`` – :class:`MoEParallelizerConfig` or ``None``
+    - ``activation_checkpointing`` – bool
+    - ``parallelism_sizes`` – :class:`ParallelismSizes`
     - ``tp_size``, ``pp_size``, ``cp_size``, ``ep_size``, ``dp_size``,
       ``dp_replicate_size`` – parallelism sizes
     - ``pp_enabled`` – ``True`` when ``pp_size > 1``
 
     Device meshes are **not** created here; that is done by
-    :func:`create_mesh_context_from_config`.
+    :meth:`DistributedSetup.build`.
     """
     cfg = cfg_dict.copy()  # shallow copy — never mutate the caller's dict
 
     # -- strategy -----------------------------------------------------------
-    strategy_name: str = normalize_strategy_name(cfg.pop("strategy", "fsdp2"))
-    if strategy_name not in STRATEGY_MAP:
-        valid = sorted(set(STRATEGY_MAP) | set(STRATEGY_ALIASES))
-        raise ValueError(f"Unknown strategy: {strategy_name}. Valid strategies: {valid}")
-    strategy_cls = STRATEGY_MAP[strategy_name]
+    strategy_name: str = cfg.pop("strategy", "fsdp2").lower()
 
     # -- parallelism sizes --------------------------------------------------
     # Use `val if val is not None` so that explicit YAML nulls (``ep_size:``
@@ -93,6 +77,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
     moe_dict: Optional[dict] = cfg.pop("moe", None)
+    activation_checkpointing: bool = cfg.pop("activation_checkpointing", False)
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
     # ``_convert_``) that may leak from YAML configs.  They have no meaning
@@ -146,8 +131,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         if isinstance(val, str):
             strategy_kwargs["autocast_dtype"] = dtype_from_str(val)
 
-    _validate_strategy_kwargs(strategy_name, strategy_cls, strategy_kwargs)
-
     ep_size: int = parallelism.get("ep_size") or 1
 
     # YAML-level sanity: silently discard sub-configs that don't apply to the
@@ -159,7 +142,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     if moe_dict is not None and ep_size <= 1:
         moe_dict = None
 
-    strategy_config = strategy_cls(**strategy_kwargs)
+    strategy_config = _resolve_strategy_config(strategy_name, **strategy_kwargs)
 
     if pipeline_dict is not None:
         pipeline_config = PipelineConfig(**pipeline_dict)
@@ -179,17 +162,28 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
                     mp_raw[key] = dtype_from_str(mp_raw[key])
             moe_dict["mp_policy"] = target(**mp_raw)
 
-    moe_config = MoEParallelizerConfig(**(moe_dict or {})) if ep_size > 1 else None
-
-    # Full cross-field validation is deferred to MeshContext.__post_init__
-    # (called automatically when create_mesh_context_from_config constructs the context).
+    moe_parallel_config = MoEParallelizerConfig(**(moe_dict or {})) if ep_size > 1 else None
 
     return {
         "strategy_config": strategy_config,
         "pipeline_config": pipeline_config,
-        "moe_config": moe_config,
+        "moe_parallel_config": moe_parallel_config,
+        "activation_checkpointing": activation_checkpointing,
+        "parallelism_sizes": ParallelismSizes(**parallelism),
         "pp_enabled": parallelism["pp_size"] > 1,
         **parallelism,
+    }
+
+
+def parse_distributed_setup_config(cfg_dict: dict) -> dict:
+    """Parse a distributed config dict into durable setup intent."""
+    parsed = parse_distributed_section(cfg_dict)
+    return {
+        "strategy": parsed["strategy_config"],
+        "parallelism_sizes": parsed["parallelism_sizes"],
+        "pipeline_config": parsed["pipeline_config"],
+        "moe_parallel_config": parsed["moe_parallel_config"],
+        "activation_checkpointing": parsed["activation_checkpointing"],
     }
 
 
@@ -203,7 +197,7 @@ def _distributed_cfg_to_dict(cfg: Any | None) -> dict:
     return distributed_cfg.to_dict() if hasattr(distributed_cfg, "to_dict") else dict(distributed_cfg)
 
 
-def create_mesh_context_from_config(
+def create_distributed_setup_from_config(
     cfg: Any | None = None,
     world_size: Optional[int] = None,
     *,
@@ -217,15 +211,15 @@ def create_mesh_context_from_config(
     pipeline: dict | None = None,
     moe: dict | None = None,
     **strategy_kwargs: Any,
-) -> MeshContext:
-    """Parse recipe distributed settings and create a mesh context.
+) -> DistributedSetup:
+    """Parse recipe distributed settings and create a distributed setup.
 
-    This is the recipe-level adapter around
-    :func:`nemo_automodel.components.distributed.device_mesh.create_mesh_context`.
+    This is the recipe-level adapter around :meth:`DistributedSetup.build`.
     It converts a YAML/config section or programmatic keyword arguments into a
-    fully initialized :class:`MeshContext` (including ``device_mesh`` and
-    ``moe_mesh``). It does not initialize the process group; call
-    ``initialize_distributed`` before this in distributed recipes.
+    fully initialized :class:`DistributedSetup` (including ``device_mesh`` and
+    ``moe_mesh`` through ``setup.mesh_context``). It does not initialize the
+    process group; call ``initialize_distributed`` before this in distributed
+    recipes.
 
     Args:
         cfg: Optional distributed config dict or top-level config with a
@@ -234,7 +228,8 @@ def create_mesh_context_from_config(
         world_size: Total number of processes in the job. If ``None`` (default),
             the value is auto-detected from ``torch.distributed`` if initialized,
             or from the ``WORLD_SIZE`` environment variable, falling back to ``1``.
-        strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``/``mfsdp``, or ``ddp``).
+        strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``,
+            ``megatron-fsdp``, ``mfsdp``, or ``ddp``).
         dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
         dp_replicate_size: HSDP replicate size for FSDP2.
         tp_size: Tensor-parallel size.
@@ -246,9 +241,8 @@ def create_mesh_context_from_config(
         **strategy_kwargs: Additional strategy-specific options.
 
     Returns:
-        A :class:`MeshContext` with device meshes attached.
+        A :class:`DistributedSetup` with device meshes and policy configs attached.
     """
-    from nemo_automodel.components.distributed import device_mesh
     from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
     if world_size is None:
@@ -274,17 +268,5 @@ def create_mesh_context_from_config(
         if value is not None:
             cfg_dict[key] = value
 
-    parsed = parse_distributed_section(cfg_dict)
-
-    return device_mesh.create_mesh_context(
-        parsed["strategy_config"],
-        dp_size=parsed["dp_size"],
-        dp_replicate_size=parsed["dp_replicate_size"],
-        tp_size=parsed["tp_size"],
-        pp_size=parsed["pp_size"],
-        cp_size=parsed["cp_size"],
-        ep_size=parsed["ep_size"],
-        world_size=world_size,
-        pipeline_config=parsed["pipeline_config"],
-        moe_config=parsed["moe_config"],
-    )
+    setup_kwargs = parse_distributed_setup_config(cfg_dict)
+    return DistributedSetup.build(**setup_kwargs, world_size=world_size)

@@ -87,7 +87,7 @@ def main():
     # --- Distributed environment and mesh context ---
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
     from nemo_automodel.components.loggers.log_utils import setup_logging
-    from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
+    from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
     from nemo_automodel.recipes.llm.train_ft import build_distributed, build_model
     from nemo_automodel.shared.te_patches import apply_te_patches
 
@@ -95,8 +95,8 @@ def main():
     setup_logging()
     apply_cache_compatibility_patches()
     apply_te_patches()
-    mesh_context = create_mesh_context_from_config(cfg, world_size=dist_env.world_size)
-    activation_checkpointing = cfg.get("distributed.activation_checkpointing", False)
+    distributed_setup = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size)
+    mesh_context = distributed_setup.mesh_context
 
     if mesh_context.cp_size > 1 and cfg.get("model.backend.rope_fusion", False):
         cfg.model.backend.rope_fusion = False
@@ -106,12 +106,7 @@ def main():
         cfg.model,
         cfg_peft=None,
         seed=cfg.get("seed", 42),
-        device_mesh=mesh_context.device_mesh,
-        moe_mesh=mesh_context.moe_mesh,
-        distributed_config=mesh_context.strategy_config,
-        pipeline_config=mesh_context.pipeline_config,
-        cfg_moe=mesh_context.moe_config,
-        activation_checkpointing=activation_checkpointing,
+        distributed_setup=distributed_setup,
     )
     model.eval()
 
