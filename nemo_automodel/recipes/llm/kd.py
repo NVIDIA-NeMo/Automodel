@@ -53,6 +53,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
@@ -91,9 +92,7 @@ def _build_teacher_model(
     cfg_teacher,
     seed,
     has_packed_sequence,
-    device_mesh=None,
-    moe_mesh=None,
-    distributed_config=None,
+    distributed_setup: DistributedSetup | None = None,
     device=None,
 ):
     """Build and initialize the teacher model for knowledge distillation.
@@ -105,9 +104,7 @@ def _build_teacher_model(
         cfg_teacher: Configuration for teacher model instantiation.
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
-        device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
-        distributed_config: Strategy-specific distributed config.
+        distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
 
     Returns:
@@ -125,9 +122,7 @@ def _build_teacher_model(
     with ScopedRNG(seed=seed, ranked=True):
         kwargs: Dict[str, Any] = {
             "has_packed_sequence": has_packed_sequence,
-            "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
-            "distributed_config": distributed_config,
+            "distributed_setup": distributed_setup,
         }
 
         teacher_model = cfg_teacher.instantiate(**kwargs)
@@ -147,11 +142,8 @@ def _build_teacher_model_with_pp(
     cfg_teacher,
     seed: int,
     has_packed_sequence: bool,
-    device_mesh,
-    moe_mesh,
-    distributed_config,
     pipeline_config: PipelineConfig,
-    mesh_context,
+    distributed_setup: DistributedSetup,
     activation_checkpointing: bool,
 ) -> Any:
     """Build teacher model with same parallelization as student (TP/EP/SP/PP).
@@ -167,11 +159,8 @@ def _build_teacher_model_with_pp(
         cfg_teacher: Configuration for teacher model instantiation.
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
-        device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
-        distributed_config: Strategy-specific distributed config.
         pipeline_config: PipelineConfig from the student, used as a template.
-        mesh_context: Mesh context object (provides MoE config and meshes).
+        distributed_setup: Student distributed setup, used as a template.
         activation_checkpointing: Whether to enable activation checkpointing.
 
     Returns:
@@ -204,6 +193,13 @@ def _build_teacher_model_with_pp(
         scale_grads_in_schedule=pipeline_config.scale_grads_in_schedule,
         loss_fn=_teacher_capture_loss_fn,
     )
+    teacher_distributed_setup = DistributedSetup(
+        mesh_context=distributed_setup.mesh_context,
+        strategy_config=distributed_setup.strategy_config,
+        pipeline_config=teacher_pipeline_config,
+        moe_parallel_config=distributed_setup.moe_parallel_config,
+        activation_checkpointing=activation_checkpointing,
+    )
 
     with ScopedRNG(seed=seed, ranked=True):
         teacher_model = build_model(
@@ -214,13 +210,8 @@ def _build_teacher_model_with_pp(
             cfg_fp8=None,
             cfg_compile=None,
             cfg_quantization=None,
-            device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=teacher_pipeline_config,
+            distributed_setup=teacher_distributed_setup,
             cfg_qat=None,
-            cfg_moe=mesh_context.moe_config,
-            activation_checkpointing=activation_checkpointing,
         )
 
     # Freeze all teacher parameters.
@@ -278,11 +269,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
-                mesh_context=self.mesh_context,
+                distributed_setup=self.distributed_setup,
                 activation_checkpointing=self.activation_checkpointing,
             )
             self.teacher_pp = self.teacher_model
@@ -297,9 +285,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 cfg_teacher=self.cfg.get("teacher_model", None),
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
+                distributed_setup=self.distributed_setup,
                 device=teacher_device,
             )
             self.teacher_pp = None

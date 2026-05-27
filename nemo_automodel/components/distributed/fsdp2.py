@@ -73,7 +73,7 @@ class FSDP2Manager:
         from nemo_automodel.components.distributed.config import FSDP2Config
 
         config = FSDP2Config(sequence_parallel=True, activation_checkpointing=True)
-        # device_mesh created externally via create_mesh_context()
+        # device_mesh created externally via MeshContext.build()
         manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
         model = manager.parallelize(model)
     """
@@ -95,7 +95,6 @@ class FSDP2Manager:
         self.offload_policy = config.offload_policy
         self.activation_checkpointing = config.activation_checkpointing
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
-        self.backend = config.backend
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
         self.enable_compile = config.enable_compile
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch

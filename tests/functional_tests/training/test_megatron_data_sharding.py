@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes._dist_utils import create_mesh_context_from_config
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
 
 """
@@ -36,7 +36,7 @@ def test_megatron_data_sharding():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
     dist_env = build_distributed(cfg.get("dist_env", {}))
-    mesh_context = create_mesh_context_from_config(cfg, world_size=dist_env.world_size)
+    mesh_context = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size).mesh_context
     device_mesh = mesh_context.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()

@@ -140,6 +140,14 @@ Torch-native pipelining composable with FSDP2 and DTensor.
 {bdg-secondary}`3d-parallelism`
 :::
 
+:::{grid-item-card} {octicon}`server;1.5em;sd-mr-1` Distributed Setup
+:link: guides/distributed-setup
+:link-type: doc
+Configure topology and distributed runtime policies for model loading and recipes.
++++
+{bdg-secondary}`FSDP2` {bdg-secondary}`TP` {bdg-secondary}`EP`
+:::
+
 :::{grid-item-card} {octicon}`zap;1.5em;sd-mr-1` FP8 Training
 :link: guides/fp8-training
 :link-type: doc

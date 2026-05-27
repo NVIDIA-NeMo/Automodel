@@ -145,7 +145,7 @@ def test_build_diffusion_parallel_manager_args_keeps_lora_param_dtype_uncast():
 def test_build_diffusion_parallel_manager_args_parses_ddp_config():
     manager_args = _build_diffusion_parallel_manager_args(
         fsdp_cfg=None,
-        ddp_cfg={"backend": "gloo", "activation_checkpointing": True},
+        ddp_cfg={"activation_checkpointing": True},
         world_size=4,
         dtype=torch.bfloat16,
         lora_enabled=False,
@@ -155,7 +155,6 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": True,
-        "backend": "gloo",
     }
 
 

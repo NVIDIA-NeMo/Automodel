@@ -57,7 +57,7 @@ class MegatronFSDPManager:
         from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
         config = MegatronFSDPConfig(zero_dp_strategy=3, overlap_grad_reduce=True)
-        # device_mesh created externally via create_mesh_context()
+        # device_mesh created externally via MeshContext.build()
         manager = MegatronFSDPManager(config, device_mesh=device_mesh)
         model, optimizer = manager.parallelize(model, optimizer)
     """
@@ -71,7 +71,6 @@ class MegatronFSDPManager:
         self.device_mesh = device_mesh
 
         # Extract config fields for easy access
-        self.sequence_parallel = config.sequence_parallel
         self.megatron_fsdp_unit_modules = config.megatron_fsdp_unit_modules
         self.zero_dp_strategy = config.zero_dp_strategy
         self.init_fsdp_with_meta_device = config.init_fsdp_with_meta_device
@@ -87,7 +86,6 @@ class MegatronFSDPManager:
         self.nccl_ub = config.nccl_ub
         self.fsdp_double_buffer = config.fsdp_double_buffer
         self.activation_checkpointing = config.activation_checkpointing
-        self.backend = config.backend
 
     def parallelize(self, model, optimizer=None):
         """

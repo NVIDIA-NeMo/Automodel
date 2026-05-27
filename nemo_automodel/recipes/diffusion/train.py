@@ -107,6 +107,7 @@ def _build_diffusion_parallel_manager_args(
             "_manager_type": "ddp",
             "world_size": world_size,
             **parsed["strategy_config"].to_dict(),
+            "activation_checkpointing": parsed["activation_checkpointing"],
         }
 
     fsdp_options = dict(fsdp_cfg or {})
@@ -138,6 +139,7 @@ def _build_diffusion_parallel_manager_args(
         "pp_size": parsed["pp_size"],
         "ep_size": parsed["ep_size"],
         **parsed["strategy_config"].to_dict(),
+        "activation_checkpointing": parsed["activation_checkpointing"],
         **ignored_options,
     }
 

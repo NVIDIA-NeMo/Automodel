@@ -51,15 +51,11 @@ from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import (  # noqa: E402
-    DistributedConfig,
-)
+from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
 from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
-from nemo_automodel.components.distributed.pipelining.config import PipelineConfig  # noqa: E402
-from nemo_automodel.components.moe.config import MoEParallelizerConfig  # noqa: E402
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
@@ -112,75 +108,40 @@ logger = logging.getLogger(__name__)
 _MAX_BUILD_RETRIES = 5
 
 _remote_code_compat_applied = False
+_DISTRIBUTED_SETUP_ONLY_KWARGS = {
+    "moe_mesh",
+    "distributed_config",
+    "pipeline_config",
+    "moe_config",
+    "activation_checkpointing",
+    "tp_plan",
+}
 
 
-def _resolve_activation_checkpointing(
-    distributed_config: Optional[DistributedConfig],
-    activation_checkpointing: Optional[bool],
-) -> bool:
-    if activation_checkpointing is not None:
-        return activation_checkpointing
-    return bool(getattr(distributed_config, "activation_checkpointing", False))
+def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
+    provided = sorted(_DISTRIBUTED_SETUP_ONLY_KWARGS & set(kwargs))
+    if provided:
+        raise TypeError(
+            "Distributed settings must be passed with distributed_setup; "
+            f"separate distributed kwargs are not accepted: {provided}"
+        )
 
 
-def _resolve_mesh_context(
+def _resolve_distributed_setup(
     *,
-    device_mesh: Optional[Union["DeviceMesh", MeshContext]],
-    moe_mesh: Optional["DeviceMesh"],
-    distributed_config: Optional[DistributedConfig],
-    pipeline_config: Optional[PipelineConfig],
-    moe_config: Optional[MoEParallelizerConfig],
-    activation_checkpointing: Optional[bool],
-) -> tuple[
-    MeshContext,
-    Optional[DistributedConfig],
-    Optional[PipelineConfig],
-    Optional[MoEParallelizerConfig],
-    bool,
-]:
-    """Resolve raw ``DeviceMesh`` or ``MeshContext`` input into effective configs."""
+    distributed_setup: Optional[DistributedSetup],
+    device_mesh: Optional["DeviceMesh"] = None,
+) -> DistributedSetup:
+    """Return a setup, upcasting raw mesh inputs into topology-only setup."""
+    if distributed_setup is not None:
+        if device_mesh is not None:
+            raise ValueError("Pass either distributed_setup or device_mesh, not both")
+        return distributed_setup
+
     if isinstance(device_mesh, MeshContext):
-        if moe_mesh is not None:
-            raise ValueError("Pass moe_mesh only with a raw DeviceMesh")
+        raise TypeError("device_mesh expects a DeviceMesh; pass DistributedSetup for MeshContext or MoE topology")
 
-        resolved_distributed_config = (
-            distributed_config if distributed_config is not None else device_mesh.strategy_config
-        )
-        resolved_pipeline_config = pipeline_config if pipeline_config is not None else device_mesh.pipeline_config
-        resolved_moe_config = moe_config if moe_config is not None else device_mesh.moe_config
-        resolved_activation_checkpointing = _resolve_activation_checkpointing(
-            resolved_distributed_config,
-            activation_checkpointing,
-        )
-        mesh = MeshContext(
-            strategy_config=resolved_distributed_config,
-            pipeline_config=resolved_pipeline_config,
-            moe_config=resolved_moe_config,
-            device_mesh=device_mesh.device_mesh,
-            moe_mesh=device_mesh.moe_mesh,
-        )
-        return (
-            mesh,
-            resolved_distributed_config,
-            resolved_pipeline_config,
-            resolved_moe_config,
-            resolved_activation_checkpointing,
-        )
-
-    resolved_activation_checkpointing = _resolve_activation_checkpointing(distributed_config, activation_checkpointing)
-    return (
-        MeshContext.from_meshes(
-            device_mesh,
-            moe_mesh,
-            strategy_config=distributed_config,
-            pipeline_config=pipeline_config,
-            moe_config=moe_config,
-        ),
-        distributed_config,
-        pipeline_config,
-        moe_config,
-        resolved_activation_checkpointing,
-    )
+    return DistributedSetup(mesh_context=MeshContext.from_meshes(device_mesh))
 
 
 def _patch_remote_code_compat():
@@ -641,14 +602,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        device_mesh: Optional[Union["DeviceMesh", MeshContext]] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
-        tp_plan: Optional[dict] = None,
-        distributed_config: Optional[DistributedConfig] = None,
-        pipeline_config: Optional[PipelineConfig] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        device_mesh: Optional["DeviceMesh"] = None,
         qat_config: Optional[QATConfig] = None,
-        moe_config: Optional[MoEParallelizerConfig] = None,
-        activation_checkpointing: Optional[bool] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -690,25 +646,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
-            device_mesh (DeviceMesh | MeshContext | None, optional): Pre-created device mesh
-                or complete mesh context for distributed training. Raw ``DeviceMesh`` inputs
-                are wrapped into a ``MeshContext`` internally. Default: None.
-            moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
-                parallelism. ep_size is inferred from this. Default: None.
-            tp_plan (dict | None, optional): Custom tensor parallel plan. If provided,
-                overrides the tp_plan on distributed_config. Default: None.
-            distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
-                Strategy-specific distributed training configuration. Default: None.
-            pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
-                configuration including loss_fn. Default: None.
+            distributed_setup (DistributedSetup | None, optional): Resolved distributed
+                topology and policy object. Default: None.
+            device_mesh (DeviceMesh | None, optional): Pre-created Hugging Face-style
+                device mesh. NeMo wraps it in a topology-only ``DistributedSetup``
+                internally. Use ``distributed_setup`` when passing NeMo-specific
+                policies such as strategy, pipeline, MoE, or activation checkpointing.
+                Default: None.
             qat_config (QATConfig | None, optional): Quantization-Aware Training
                 configuration. Default: None.
-            moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
-                configuration. Default: None.
-            activation_checkpointing (bool | None, default=None): Enable activation checkpointing
-                for transformer blocks to reduce memory usage. If ``None``, uses
-                ``distributed_config.activation_checkpointing`` when present; otherwise
-                defaults to ``False``.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -723,23 +669,22 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             transformers.PreTrainedModel: The loaded (and possibly patched)
             model instance with all infrastructure applied.
         """
-        mesh, distributed_config, pipeline_config, moe_config, activation_checkpointing = _resolve_mesh_context(
+        _reject_separate_distributed_kwargs(kwargs)
+        setup = _resolve_distributed_setup(
+            distributed_setup=distributed_setup,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=pipeline_config,
-            moe_config=moe_config,
-            activation_checkpointing=activation_checkpointing,
         )
-
-        if tp_plan is not None and distributed_config is not None:
-            distributed_config.tp_plan = tp_plan
+        mesh = setup.mesh_context
+        distributed_config = setup.strategy_config
+        pipeline_config = setup.pipeline_config
+        moe_parallel_config = setup.moe_parallel_config
+        activation_checkpointing = setup.activation_checkpointing
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
             pipeline_config=pipeline_config,
             qat_config=qat_config,
-            moe_config=moe_config,
+            moe_parallel_config=moe_parallel_config,
             activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
@@ -795,14 +740,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
-        device_mesh: Optional[Union["DeviceMesh", MeshContext]] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
-        tp_plan: Optional[dict] = None,
-        distributed_config: Optional[DistributedConfig] = None,
-        pipeline_config: Optional[PipelineConfig] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        device_mesh: Optional["DeviceMesh"] = None,
         qat_config: Optional[QATConfig] = None,
-        moe_config: Optional[MoEParallelizerConfig] = None,
-        activation_checkpointing: Optional[bool] = None,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -822,17 +762,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             torch_dtype (str | torch.dtype, default="auto"):
                 Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
         """
-        mesh, distributed_config, pipeline_config, moe_config, activation_checkpointing = _resolve_mesh_context(
+        _reject_separate_distributed_kwargs(kwargs)
+        setup = _resolve_distributed_setup(
+            distributed_setup=distributed_setup,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=pipeline_config,
-            moe_config=moe_config,
-            activation_checkpointing=activation_checkpointing,
         )
-
-        if tp_plan is not None and distributed_config is not None:
-            distributed_config.tp_plan = tp_plan
+        mesh = setup.mesh_context
+        distributed_config = setup.strategy_config
+        pipeline_config = setup.pipeline_config
+        moe_parallel_config = setup.moe_parallel_config
+        activation_checkpointing = setup.activation_checkpointing
 
         # Only instantiate infrastructure when distributed_config is provided
         model_wrapper = autopipeline = parallelize_fn = qat_quantizer = None
@@ -842,7 +781,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
-                moe_config=moe_config,
+                moe_parallel_config=moe_parallel_config,
                 activation_checkpointing=activation_checkpointing,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
@@ -1064,11 +1003,8 @@ class _NeMoAutoModelForRetrievalBase:
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
-        device_mesh: Optional[Union["DeviceMesh", MeshContext]] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
-        tp_plan: Optional[dict] = None,
-        distributed_config: Optional[DistributedConfig] = None,
-        moe_config: Optional[MoEParallelizerConfig] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
         peft_config: Optional[dict] = None,
         **kwargs,
@@ -1089,11 +1025,9 @@ class _NeMoAutoModelForRetrievalBase:
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
             torch_dtype: Data type passed to the underlying model initialization.
-            device_mesh: Pre-created device mesh or complete mesh context for distributed training.
-            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
-            tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
-            distributed_config: Strategy-specific distributed training configuration.
-            moe_config: MoE parallelizer configuration.
+            distributed_setup: Resolved distributed topology and policy object.
+            device_mesh: Pre-created Hugging Face-style device mesh. NeMo wraps it
+                in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
@@ -1104,6 +1038,7 @@ class _NeMoAutoModelForRetrievalBase:
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
         """
+        _reject_separate_distributed_kwargs(kwargs)
         from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
@@ -1118,11 +1053,8 @@ class _NeMoAutoModelForRetrievalBase:
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 torch_dtype=torch_dtype,
+                distributed_setup=distributed_setup,
                 device_mesh=device_mesh,
-                moe_mesh=moe_mesh,
-                tp_plan=tp_plan,
-                distributed_config=distributed_config,
-                moe_config=moe_config,
                 compile_config=compile_config,
                 peft_config=peft_config,
                 **kwargs,
@@ -1133,23 +1065,20 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
 
-        mesh, distributed_config, _, moe_config, activation_checkpointing = _resolve_mesh_context(
+        setup = _resolve_distributed_setup(
+            distributed_setup=distributed_setup,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
-            distributed_config=distributed_config,
-            pipeline_config=None,
-            moe_config=moe_config,
-            activation_checkpointing=None,
         )
-
-        if tp_plan is not None and distributed_config is not None:
-            distributed_config.tp_plan = tp_plan
+        mesh = setup.mesh_context
+        distributed_config = setup.strategy_config
+        moe_parallel_config = setup.moe_parallel_config
+        activation_checkpointing = setup.activation_checkpointing
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
             pipeline_config=None,
             qat_config=None,
-            moe_config=moe_config,
+            moe_parallel_config=moe_parallel_config,
             activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
@@ -1219,7 +1148,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     ...     "meta-llama/Llama-3.2-1B",
     ...     pooling="cls",
     ...     l2_normalize=False,
-    ...     distributed_config=FSDP2Config(),
+    ...     distributed_setup=distributed_setup,
     ... )
     """
 
@@ -1266,7 +1195,7 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     >>> model = NeMoAutoModelCrossEncoder.from_pretrained("meta-llama/Llama-3.2-1B")
     >>> model = NeMoAutoModelCrossEncoder.from_pretrained(
     ...     "meta-llama/Llama-3.2-1B",
-    ...     distributed_config=FSDP2Config(),
+    ...     distributed_setup=distributed_setup,
     ... )
     """
 
