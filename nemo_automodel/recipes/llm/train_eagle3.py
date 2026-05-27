@@ -213,6 +213,22 @@ class TrainEagle3Recipe(BaseRecipe):
         # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
         # with the diagonal-extension columns in log space).
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
+        # EAGLE-3.1 drafter toggles. Both default to False so an EAGLE-3
+        # YAML keeps producing an EAGLE-3 drafter. Setting them on the
+        # Llama-style draft applies the EAGLE-3.1 architectural changes
+        # described in https://github.com/vllm-project/vllm/pull/42764; the
+        # MLA-backbone Kimi K2.6 draft is a separate architecture and is
+        # not produced by this recipe.
+        #
+        # * ``fc_norm``: per-chunk RMSNorm on aux hidden states before the
+        #   ``model.fc`` projection. Adds ``num_aux_hidden_states``
+        #   independent RMSNorm parameters
+        #   (``model.fc_norm.0.weight``, ``model.fc_norm.1.weight``, ...).
+        # * ``norm_output``: feed the post-``model.norm`` hidden state back
+        #   into the next TTT step (and into ``lm_head``) instead of the
+        #   raw decoder output. Adds no parameters.
+        draft_config["fc_norm"] = bool(recipe_cfg.get("fc_norm", False))
+        draft_config["norm_output"] = bool(recipe_cfg.get("norm_output", False))
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
