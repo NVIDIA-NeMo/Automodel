@@ -56,25 +56,6 @@ class LossConfig:
         """Return the full kwargs dict for the loss constructor."""
         return {**self.extra_kwargs}
 
-    @classmethod
-    def from_name(cls, name: str, **kwargs: Any) -> LossConfig:
-        """Create the appropriate typed config from a loss name string.
-
-        Known losses return a typed subclass with full field validation.
-        Unknown losses return a base ``LossConfig`` with ``extra_kwargs``.
-
-        Args:
-            name: Dotted import path (e.g. ``"nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy"``).
-            **kwargs: Loss hyper-parameters.
-
-        Returns:
-            Typed ``LossConfig`` subclass, or the generic base.
-        """
-        config_cls = _LOSS_REGISTRY.get(name, None)
-        if config_cls is None:
-            return LossConfig(name=name, extra_kwargs=kwargs)
-        return config_cls(name=name, **kwargs)
-
 
 @dataclass
 class MaskedCrossEntropyConfig(LossConfig):
@@ -167,40 +148,6 @@ class KDLossConfig(LossConfig):
             "fp32_upcast": self.fp32_upcast,
             **self.extra_kwargs,
         }
-
-
-# ---------------------------------------------------------------------------
-# Registry — maps dotted name → typed config subclass
-# ---------------------------------------------------------------------------
-
-_LOSS_REGISTRY: dict[str, type[LossConfig]] = {
-    "nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy": MaskedCrossEntropyConfig,
-    "nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy": FusedLinearCEConfig,
-    "nemo_automodel.components.loss.te_parallel_ce.TEParallelCrossEntropy": TEParallelCEConfig,
-    "nemo_automodel.components.loss.kd_loss.KDLoss": KDLossConfig,
-}
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-
-def _resolve_loss(name: str) -> Any:
-    """Resolve a dotted path to a loss class."""
-    import importlib
-
-    parts = name.rsplit(".", 1)
-    if len(parts) != 2:
-        raise ValueError(
-            f"Expected a dotted path like 'nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy', got '{name}'"
-        )
-    module_path, cls_name = parts
-    module = importlib.import_module(module_path)
-    cls = getattr(module, cls_name, None)
-    if cls is None:
-        raise ImportError(f"Cannot find '{cls_name}' in module '{module_path}'")
-    return cls
 
 
 __all__ = [

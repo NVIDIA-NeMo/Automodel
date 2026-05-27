@@ -17,10 +17,37 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loss.config import LossConfig, _resolve_loss
+from nemo_automodel.components.loss.config import (
+    FusedLinearCEConfig,
+    KDLossConfig,
+    LossConfig,
+    MaskedCrossEntropyConfig,
+    TEParallelCEConfig,
+)
 
 if TYPE_CHECKING:
     from torch import nn
+
+
+def _get_loss_class(config: LossConfig) -> type:
+    """Map a typed config to its loss class (lazy imports to avoid heavy deps at module level)."""
+    if isinstance(config, MaskedCrossEntropyConfig):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        return MaskedCrossEntropy
+    if isinstance(config, FusedLinearCEConfig):
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        return FusedLinearCrossEntropy
+    if isinstance(config, TEParallelCEConfig):
+        from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy
+
+        return TEParallelCrossEntropy
+    if isinstance(config, KDLossConfig):
+        from nemo_automodel.components.loss.kd_loss import KDLoss
+
+        return KDLoss
+    raise ValueError(f"Unknown loss config type: {type(config).__name__}. Use loss_factory for custom losses.")
 
 
 def build_loss_fn(
@@ -47,7 +74,7 @@ def build_loss_fn(
         Instantiated loss function.
     """
     if config is not None:
-        loss_factory = _resolve_loss(config.name)
+        loss_factory = _get_loss_class(config)
         loss_kwargs = config.to_kwargs()
     elif loss_factory is None:
         raise ValueError("Either config or loss_factory must be provided")
