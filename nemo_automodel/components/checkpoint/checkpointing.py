@@ -61,11 +61,11 @@ from nemo_automodel.components.checkpoint.utils import (
     format_output_file_count,
     get_safetensors_index_total_size,
     get_tied_lm_head_source_names,
+    get_world_size_safe,
     is_rank_0,
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
-from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
     from peft import PeftConfig

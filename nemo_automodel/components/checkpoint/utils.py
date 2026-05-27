@@ -22,7 +22,19 @@ import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
 
-from nemo_automodel.components.distributed.init_utils import get_rank_safe
+
+def get_rank_safe() -> int:
+    """Return the current distributed rank, defaulting to 0 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_world_size_safe() -> int:
+    """Return the current distributed world size, defaulting to 1 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
 
 
 def is_rank_0() -> bool:
