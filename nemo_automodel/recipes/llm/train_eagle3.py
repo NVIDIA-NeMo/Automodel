@@ -147,11 +147,16 @@ class TrainEagle3Recipe(BaseRecipe):
                 moe_config=self.dist_setup.moe_config,
                 activation_checkpointing=self.dist_setup.activation_checkpointing,
             )
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        # Build through a local variable and assign once: BaseRecipe.__setattr__
+        # rejects re-assignment of an already-tracked state key, so the
+        # unsharded ``.to(device)`` branch below cannot write back through
+        # ``self.target_model`` directly.
+        target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # FSDP2 / EP sharding placed the model on the right devices already;
         # only do the brute-force ``.to(device)`` for the unsharded path.
         if self.dist_setup is None:
-            self.target_model = self.target_model.to(self.device)
+            target_model = target_model.to(self.device)
+        self.target_model = target_model
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
