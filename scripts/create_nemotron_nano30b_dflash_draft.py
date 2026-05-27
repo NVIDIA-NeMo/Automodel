@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+#!/usr/bin/env python3
 """Initialise a DFlash draft model for nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.
 
 Target architecture:
@@ -37,7 +38,6 @@ import shutil
 import sys
 from pathlib import Path
 
-
 TARGET_MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 DFLASH_CODE_SOURCE = "z-lab/Qwen3-8B-DFlash-b16"
 
@@ -48,18 +48,18 @@ DRAFT_CONFIG = {
     "model_type": "qwen3",
     # Dimensions matching target hidden_size=2688, head_dim=128
     "hidden_size": 2688,
-    "num_attention_heads": 21,       # 21 * 128 = 2688
-    "num_key_value_heads": 3,        # 7 queries per KV head
+    "num_attention_heads": 21,  # 21 * 128 = 2688
+    "num_key_value_heads": 3,  # 7 queries per KV head
     "head_dim": 128,
-    "intermediate_size": 8064,       # 3x hidden_size
+    "intermediate_size": 8064,  # 3x hidden_size
     "num_hidden_layers": 7,
     "layer_types": ["full_attention"] * 7,
     # Target conditioning
-    "num_target_layers": 52,         # Nano-30B has 52 layers
+    "num_target_layers": 52,  # Nano-30B has 52 layers
     "dflash_config": {
         # 5 layers uniformly from layer 1 to layer 49 (second to third-to-last)
         "target_layer_ids": [1, 13, 25, 37, 49],
-        "mask_token_id": 18,         # <SPECIAL_18> — safe unused special token
+        "mask_token_id": 18,  # <SPECIAL_18> — safe unused special token
     },
     "block_size": 16,
     "dtype": "bfloat16",
@@ -90,6 +90,7 @@ DFLASH_CODE_FILES = ["dflash.py", "modeling_dflash.py", "utils.py"]
 
 
 def get_dflash_code_dir() -> Path:
+    """Download the remote DFlash model code and return its local cache path."""
     from huggingface_hub import snapshot_download
 
     print(f"Downloading DFlash model code from {DFLASH_CODE_SOURCE} ...")
@@ -98,6 +99,7 @@ def get_dflash_code_dir() -> Path:
 
 
 def init_draft_model(output_dir: Path) -> None:
+    """Initialise and save a draft model, optionally warm-started from target embeddings."""
     import torch
     from transformers import AutoConfig, AutoModel
 
@@ -121,10 +123,7 @@ def init_draft_model(output_dir: Path) -> None:
             low_cpu_mem_usage=True,
         )
         # Nemotron-H uses backbone.embed_tokens; fall back to model.embed_tokens
-        src_embed = (
-            getattr(getattr(target, "backbone", None), "embed_tokens", None)
-            or target.get_input_embeddings()
-        )
+        src_embed = getattr(getattr(target, "backbone", None), "embed_tokens", None) or target.get_input_embeddings()
         src_head = target.get_output_embeddings()
 
         if src_embed is not None and src_embed.weight.shape == model.model.embed_tokens.weight.shape:
@@ -150,6 +149,7 @@ def init_draft_model(output_dir: Path) -> None:
 
 
 def main() -> None:
+    """Create a local initialised Nemotron Nano dFlash draft checkpoint."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output_dir",

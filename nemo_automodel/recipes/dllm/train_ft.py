@@ -157,8 +157,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         self.dllm_strategy.setup_extra(self)
         if self.mask_token_id is None:
             raise ValueError(
-                "dllm.mask_token_id must be set in config, resolved by the tokenizer, "
-                "or set by strategy.setup_extra()."
+                "dllm.mask_token_id must be set in config, resolved by the tokenizer, or set by strategy.setup_extra()."
             )
         self.mask_token_id = int(self.mask_token_id)
 
@@ -324,12 +323,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         """
         # Pre-process all microbatches (corruption for MDLM, target forwards for DFlash).
         num_noise_tokens_raw, num_supervised_tokens_raw = self.dllm_strategy.pre_step(self, batches)
-        num_noise_tokens = self._dp_allreduce(
-            torch.tensor(num_noise_tokens_raw, dtype=torch.long)
-        ).item()
-        num_supervised_tokens = self._dp_allreduce(
-            torch.tensor(num_supervised_tokens_raw, dtype=torch.long)
-        ).item()
+        num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens_raw, dtype=torch.long)).item()
+        num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens_raw, dtype=torch.long)).item()
 
         # Select diffusion-loss denominator based on strategy:
         # - MDLM (LLaDA) -> supervised
@@ -475,12 +470,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             for batch in val_dataloader:
                 # Pre-process this val batch via the strategy (mirrors training pre_step).
                 num_noise_raw, num_supervised_raw = self.dllm_strategy.pre_step(self, [batch])
-                num_noise = self._dp_allreduce(
-                    torch.tensor(num_noise_raw, dtype=torch.long)
-                ).item()
-                num_supervised = self._dp_allreduce(
-                    torch.tensor(num_supervised_raw, dtype=torch.long)
-                ).item()
+                num_noise = self._dp_allreduce(torch.tensor(num_noise_raw, dtype=torch.long)).item()
+                num_supervised = self._dp_allreduce(torch.tensor(num_supervised_raw, dtype=torch.long)).item()
                 num_norm = num_noise if use_noise else num_supervised
 
                 loss_buffer = []
