@@ -648,28 +648,31 @@ class RetrievalTransform:
         corpus_dict: dict,
         use_dataset_instruction: bool = False,
         model_type: str = "bi_encoder",
+        cycle_positive_docs: bool = True,
     ):
         self.num_neg_docs = num_neg_docs
         self.corpus_dict = corpus_dict
         self.use_dataset_instruction = use_dataset_instruction
         self.model_type = model_type
+        self.cycle_positive_docs = cycle_positive_docs
         self.epoch = 0
 
     def __call__(self, examples):
+        epoch = self.epoch if self.cycle_positive_docs else 0
         if self.model_type == "cross_encoder":
             return _cross_encoder_transform_func(
                 examples,
                 num_neg_docs=self.num_neg_docs,
                 corpus_dict=self.corpus_dict,
                 use_dataset_instruction=self.use_dataset_instruction,
-                epoch=self.epoch,
+                epoch=epoch,
             )
         return _transform_func(
             examples,
             num_neg_docs=self.num_neg_docs,
             corpus_dict=self.corpus_dict,
             use_dataset_instruction=self.use_dataset_instruction,
-            epoch=self.epoch,
+            epoch=epoch,
         )
 
     def set_epoch(self, epoch: int):
@@ -688,6 +691,7 @@ def make_retrieval_dataset(
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
+    cycle_positive_docs: bool = True,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -713,6 +717,7 @@ def make_retrieval_dataset(
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
         use_dataset_instruction: Whether to use instruction from dataset's metadata
+        cycle_positive_docs: Whether training should cycle through positive documents across epochs.
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -777,14 +782,19 @@ def make_retrieval_dataset(
             )
 
         negative_size = n_passages - 1
-        transform = RetrievalTransform(negative_size, corpus_dict, use_dataset_instruction, model_type)
+        transform = RetrievalTransform(
+            negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+        )
         dataset.set_transform(transform)
-        dataset.set_epoch = transform.set_epoch
+        if cycle_positive_docs:
+            dataset.set_epoch = transform.set_epoch
 
     elif data_type == "eval":
         if eval_negative_size is None:
             eval_negative_size = n_passages - 1
-        transform = RetrievalTransform(eval_negative_size, corpus_dict, use_dataset_instruction, model_type)
+        transform = RetrievalTransform(
+            eval_negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+        )
         dataset.set_transform(transform)
 
     else:
