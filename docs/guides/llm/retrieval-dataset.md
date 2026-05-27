@@ -52,6 +52,7 @@ Minimal example:
 
 :::{note}
 - `pos_doc` and `neg_doc` can be lists of `{"id": ...}` dicts or raw IDs (they are normalized internally).
+- When a training record has multiple positive documents, `cycle_positive_docs` defaults to `true` and selects them deterministically by epoch order (`epoch % len(pos_doc)`). Set `cycle_positive_docs: false` to keep first-positive-only behavior.
 - If you set `use_dataset_instruction: true`, optional fields like `query_instruction` and `passage_instruction` in `merlin_metadata.json` are surfaced to the collator.
 :::
 
