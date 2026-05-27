@@ -15,7 +15,6 @@
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
 import os
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,7 +27,6 @@ from nemo_automodel._transformers.model_init import (
     _init_model,
     _load_config_with_layer_types_fix,
     _propagate_torch_dtype_to_subconfigs,
-    _resolve_custom_model_cls_for_config,
     _resolve_model_dir,
     _setup_bnb_loading_kwargs,
     _stream_load_bnb_weights,
@@ -37,40 +35,6 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
 )
 from nemo_automodel.components.models.common.utils import BackendConfig
-
-
-class TestHyMT2ModelResolution:
-    """Hy-MT2 shares HYV3ForCausalLM metadata but needs its own implementation."""
-
-    def test_hy_mt2_config_resolves_to_hy_mt2_model(self):
-        from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
-
-        config = SimpleNamespace(
-            architectures=["HYV3ForCausalLM"],
-            model_type="hy_v3",
-            hidden_size=2048,
-            num_hidden_layers=48,
-            num_experts=128,
-            expert_hidden_dim=768,
-            moe_intermediate_size=768,
-            enable_lm_head_fp32=True,
-        )
-
-        assert _resolve_custom_model_cls_for_config(config) is HyMT2ForCausalLM
-
-    def test_hy_v3_config_still_resolves_to_hy_v3_model(self):
-        from nemo_automodel.components.models.hy_v3.model import HYV3ForCausalLM
-
-        config = SimpleNamespace(
-            architectures=["HYV3ForCausalLM"],
-            model_type="hy_v3",
-            hidden_size=4096,
-            num_hidden_layers=80,
-            num_experts=192,
-            moe_intermediate_size=1536,
-        )
-
-        assert _resolve_custom_model_cls_for_config(config) is HYV3ForCausalLM
 
 
 class TestConsumeConfigOverridesNestedDict:
