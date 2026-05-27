@@ -364,12 +364,20 @@ class DFlashStrategy(DLLMStrategy):
             if gamma_cfg > 0.0
             else {16: 7.0, 10: 5.0, 8: 4.0}.get(self.block_size, max(2.0, self.block_size / 2.0))
         )
-        # Fused linear cross-entropy (Liger) fuses the LM-head projection with CE
-        # so the [B, N*(block_size-1), vocab] logits tensor is never materialised
-        # — required to fit paper-default num_blocks_per_sample=512 on a full-vocab
-        # target. Default on; set dflash.use_fused_linear_ce: false to disable.
+        # Chunked linear cross-entropy: projects the LM head + CE in
+        # torch.utils.checkpoint position chunks so the [B, N*(block_size-1), vocab]
+        # logits tensor is never materialised — required to fit paper-default
+        # num_blocks_per_sample=512 on a full-vocab target. Plain autograd, so it
+        # trains correctly under FSDP2. Default on; set
+        # dflash.use_fused_linear_ce: false to fall back to dense logits + CE.
+        # ce_chunk_size trades peak memory (smaller = lower) against recompute.
         self.use_fused_linear_ce = bool(dflash_cfg.get("use_fused_linear_ce", True))
-        self.dflash_loss_fn = DFlashDecayLoss(loss_gamma=loss_gamma, use_fused_linear_ce=self.use_fused_linear_ce)
+        ce_chunk_size = int(dflash_cfg.get("ce_chunk_size", 1024))
+        self.dflash_loss_fn = DFlashDecayLoss(
+            loss_gamma=loss_gamma,
+            use_fused_linear_ce=self.use_fused_linear_ce,
+            chunk_size=ce_chunk_size,
+        )
 
         # --- Multi-block ---
         self.num_blocks_per_sample = int(dflash_cfg.get("num_blocks_per_sample", 1))
