@@ -152,6 +152,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Buffers for dLLM-specific metrics
         self._dllm_loss_buffer = []
+        self._dflash_acc_buffer = []
 
         # --- Strategy post-setup hook (e.g. loads frozen target for DFlash) ---
         self.dllm_strategy.setup_extra(self)
@@ -430,6 +431,14 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
         self._dllm_loss_buffer.clear()
 
+        # DFlash draft top-1 accuracy: per-rank (correct / global_tokens) summed
+        # over microbatches, SUM-allreduced across DP/CP -> global accuracy.
+        # None for non-DFlash modes (buffer stays empty).
+        draft_acc = None
+        if self._dflash_acc_buffer:
+            draft_acc = self._dp_allreduce(torch.stack(self._dflash_acc_buffer).sum(), include_cp=True).item()
+        self._dflash_acc_buffer.clear()
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
@@ -447,6 +456,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 "Train/mfu": mfu,
                 "Train/tokens_per_step": num_tokens_in_batch,
                 "Train/supervised_tokens": num_supervised_tokens,
+                "Train/draft_acc": draft_acc,
                 "Train/mode": self.dllm_mode,
             },
         )
@@ -500,6 +510,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Clear dLLM loss buffer from validation
         self._dllm_loss_buffer.clear()
+        self._dflash_acc_buffer.clear()
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -529,9 +540,11 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 self.comet_logger.log_metrics(remote_metrics, step=log_data.step)
 
         self.metric_logger_train.log(log_data)
+        draft_acc = log_data.metrics.get("Train/draft_acc")
+        acc_str = "" if draft_acc is None else " | draft_acc {:.4f}".format(draft_acc)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | dllm_loss {:.4f} | grad_norm {:.4f} | "
-            "lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | mode {}".format(
+            "lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu){} | mode {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["Loss/Train_Total"],
@@ -541,6 +554,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 log_data.metrics["Train/mem"],
                 log_data.metrics["Train/tps"],
                 log_data.metrics["Train/tps_per_gpu"],
+                acc_str,
                 log_data.metrics["Train/mode"],
             )
         )

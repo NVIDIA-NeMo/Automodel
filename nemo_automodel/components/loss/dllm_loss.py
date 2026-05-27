@@ -20,7 +20,7 @@ uniformly without branching on model type.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,10 +50,16 @@ class DLLMLossOutput(NamedTuple):
     Attributes:
         total_loss: Loss used for backward (may include AR component).
         dllm_loss: Pure diffusion loss for logging/metrics.
+        draft_acc_sum: Per-rank draft top-1 accuracy contribution
+            ``(sum of correct predictions over valid positions) / num_tokens``,
+            where ``num_tokens`` is the global token count. SUM-reducing this
+            across DP/CP replicas yields the global draft accuracy (same
+            reduction shape as ``dllm_loss``). ``None`` when not computed.
     """
 
     total_loss: torch.Tensor
     dllm_loss: torch.Tensor
+    draft_acc_sum: Optional[torch.Tensor] = None
 
 
 class MDLMCrossEntropyLoss(nn.Module):
@@ -285,6 +291,7 @@ class DFlashDecayLoss(nn.Module):
         block_mask: torch.Tensor,
         num_tokens: Optional[int],
         block_size: Optional[int],
+        draft_acc_sum: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Apply decay weights + block mask, sum, and normalise."""
         _, T = token_nll.shape
@@ -293,7 +300,26 @@ class DFlashDecayLoss(nn.Module):
         loss = (token_nll * weights).sum()
         if num_tokens is not None:
             loss = loss / max(float(num_tokens), 1.0)
-        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone())
+        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone(), draft_acc_sum=draft_acc_sum)
+
+    @staticmethod
+    def _draft_acc_sum(
+        correct: torch.Tensor,
+        block_mask: torch.Tensor,
+        num_tokens: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        """Per-rank draft top-1 accuracy contribution, normalised by the global token count.
+
+        ``correct`` is a boolean/float ``[B, T]`` tensor of argmax-matches and
+        ``block_mask`` excludes padding. Dividing by the same global
+        ``num_tokens`` used for the loss makes a plain SUM all-reduce over
+        replicas yield the global accuracy (mirrors ``dllm_loss``). Returns
+        ``None`` when ``num_tokens`` is unknown.
+        """
+        if num_tokens is None:
+            return None
+        valid = (correct.to(block_mask.dtype) * block_mask).sum()
+        return valid / max(float(num_tokens), 1.0)
 
     def forward(
         self,
@@ -320,8 +346,10 @@ class DFlashDecayLoss(nn.Module):
             :class:`DLLMLossOutput`.
         """
         token_nll = _compute_per_token_nll(logits, target_ids)  # [B, T]
+        correct = logits.argmax(dim=-1) == target_ids  # [B, T]
         del logits
-        return self._reduce(token_nll, block_mask, num_tokens, block_size)
+        acc_sum = self._draft_acc_sum(correct, block_mask, num_tokens)
+        return self._reduce(token_nll, block_mask, num_tokens, block_size, draft_acc_sum=acc_sum)
 
     @staticmethod
     def _chunk_nll(
@@ -329,14 +357,18 @@ class DFlashDecayLoss(nn.Module):
         lm_head_weight: torch.Tensor,
         lm_head_bias: Optional[torch.Tensor],
         target_chunk: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project one position chunk and return its per-token NLL.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project one position chunk; return its per-token NLL and argmax-matches.
 
         Wrapped in :func:`torch.utils.checkpoint` by the caller, so the
         ``[chunk, vocab]`` logits are recomputed in backward rather than held.
+        The argmax-match is read off the same forward logits (no extra matmul)
+        and is non-differentiable, so it adds no backward cost.
         """
         logits = F.linear(hidden_chunk, lm_head_weight, lm_head_bias)  # [chunk, V]
-        return F.cross_entropy(logits.float(), target_chunk, reduction="none")  # [chunk]
+        nll = F.cross_entropy(logits.float(), target_chunk, reduction="none")  # [chunk]
+        correct = logits.argmax(dim=-1) == target_chunk  # [chunk]
+        return nll, correct
 
     def forward_fused(
         self,
@@ -374,17 +406,20 @@ class DFlashDecayLoss(nn.Module):
         flat_target = target_ids.reshape(-1)  # [B*T]
 
         nll_parts = []
+        correct_parts = []
         for start in range(0, flat_hidden.size(0), self.chunk_size):
             end = start + self.chunk_size
-            nll_parts.append(
-                torch.utils.checkpoint.checkpoint(
-                    self._chunk_nll,
-                    flat_hidden[start:end],
-                    lm_head_weight,
-                    lm_head_bias,
-                    flat_target[start:end],
-                    use_reentrant=False,
-                )
+            nll_chunk, correct_chunk = torch.utils.checkpoint.checkpoint(
+                self._chunk_nll,
+                flat_hidden[start:end],
+                lm_head_weight,
+                lm_head_bias,
+                flat_target[start:end],
+                use_reentrant=False,
             )
+            nll_parts.append(nll_chunk)
+            correct_parts.append(correct_chunk)
         token_nll = torch.cat(nll_parts).reshape(B, T)
-        return self._reduce(token_nll, block_mask, num_tokens, block_size)
+        correct = torch.cat(correct_parts).reshape(B, T)
+        acc_sum = self._draft_acc_sum(correct, block_mask, num_tokens)
+        return self._reduce(token_nll, block_mask, num_tokens, block_size, draft_acc_sum=acc_sum)

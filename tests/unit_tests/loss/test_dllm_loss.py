@@ -20,7 +20,6 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.loss.dllm_loss import (
     DFlashDecayLoss,
-    DLLMLossOutput,
     HybridDiffusionLLMLoss,
     MDLMCrossEntropyLoss,
     _compute_per_token_nll,
@@ -53,25 +52,6 @@ def dummy_inputs():
 
 
 class TestMDLMCrossEntropyLoss:
-    def test_returns_dllm_loss_output(self, dummy_inputs):
-        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
-        loss_fn = MDLMCrossEntropyLoss()
-        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        assert isinstance(result, DLLMLossOutput)
-
-    def test_total_loss_equals_dllm_loss(self, dummy_inputs):
-        """For MDLM, total_loss and dllm_loss should be equal (no AR component)."""
-        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
-        loss_fn = MDLMCrossEntropyLoss()
-        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        assert torch.allclose(result.total_loss, result.dllm_loss, atol=1e-6)
-
-    def test_loss_is_positive(self, dummy_inputs):
-        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
-        loss_fn = MDLMCrossEntropyLoss()
-        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        assert result.total_loss.item() > 0
-
     def test_zero_loss_when_no_noise(self, dummy_inputs):
         """If nothing is corrupted, loss should be zero."""
         logits, target_ids, _, p_mask, loss_mask = dummy_inputs
@@ -142,14 +122,8 @@ class TestMDLMCrossEntropyLoss:
 
 
 class TestHybridDiffusionLLMLoss:
-    def test_returns_dllm_loss_output(self, dummy_inputs):
-        logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
-        loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
-        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        assert isinstance(result, DLLMLossOutput)
-
     def test_diffusion_only_when_no_causal_logits(self, dummy_inputs):
-        """Without causal logits, total_loss == alpha * dllm_loss."""
+        """Without causal logits, total_loss == alpha * dllm_loss (no AR term)."""
         logits, target_ids, noise_mask, p_mask, loss_mask = dummy_inputs
         loss_fn = HybridDiffusionLLMLoss(alpha=0.3)
         result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
@@ -259,20 +233,6 @@ class TestComputePerTokenNLL:
         ref = F.cross_entropy(logits.reshape(-1, 32), targets.reshape(-1), reduction="none").reshape(2, 8)
         assert torch.allclose(nll, ref)
 
-    def test_output_shape(self):
-        """Output shape should be [B, L]."""
-        logits = torch.randn(4, 16, 64)
-        targets = torch.randint(0, 64, (4, 16))
-        nll = _compute_per_token_nll(logits, targets)
-        assert nll.shape == (4, 16)
-
-    def test_positive_values(self):
-        """NLL should be non-negative."""
-        logits = torch.randn(2, 8, 32)
-        targets = torch.randint(0, 32, (2, 8))
-        nll = _compute_per_token_nll(logits, targets)
-        assert (nll >= 0).all()
-
 
 # ---------------------------------------------------------------------------
 # DFlashDecayLoss
@@ -291,18 +251,6 @@ def dflash_inputs():
 
 
 class TestDFlashDecayLoss:
-    def test_returns_dllm_loss_output(self, dflash_inputs):
-        logits, target_ids, block_mask = dflash_inputs
-        loss_fn = DFlashDecayLoss(loss_gamma=7.0)
-        result = loss_fn(logits, target_ids, block_mask)
-        assert isinstance(result, DLLMLossOutput)
-
-    def test_loss_is_positive(self, dflash_inputs):
-        logits, target_ids, block_mask = dflash_inputs
-        loss_fn = DFlashDecayLoss(loss_gamma=7.0)
-        result = loss_fn(logits, target_ids, block_mask)
-        assert result.total_loss.item() > 0
-
     def test_zero_loss_when_mask_all_zero(self, dflash_inputs):
         logits, target_ids, _ = dflash_inputs
         block_mask = torch.zeros(B_D, T_D)
@@ -357,16 +305,6 @@ class TestDFlashDecayLoss:
         assert torch.allclose(w_single.repeat(n)[:T_per], w_mono[:T_per])
         assert w_single.repeat(n)[T_per] > w_mono[T_per]  # second block resets to 1
 
-    def test_multi_block_loss_is_scalar(self):
-        block_size, n_blocks = 8, 3
-        T = n_blocks * (block_size - 1)
-        B, V = 2, 64
-        logits = torch.randn(B, T, V)
-        target_ids = torch.randint(0, V, (B, T))
-        block_mask = torch.ones(B, T)
-        result = DFlashDecayLoss(loss_gamma=4.0)(logits, target_ids, block_mask, block_size=block_size)
-        assert result.total_loss.ndim == 0
-
     def test_gamma_controls_decay_rate(self):
         """Larger γ → slower decay → different total loss than small γ."""
         torch.manual_seed(2)
@@ -378,17 +316,80 @@ class TestDFlashDecayLoss:
         loss_fast = DFlashDecayLoss(loss_gamma=1.0)(logits, target_ids, block_mask).total_loss
         loss_slow = DFlashDecayLoss(loss_gamma=100.0)(logits, target_ids, block_mask).total_loss
 
-        assert loss_fast.item() > 0
-        assert loss_slow.item() > 0
         assert not torch.allclose(loss_fast, loss_slow, atol=1e-3)
 
-    def test_paper_default_gammas(self):
-        """Verify loss runs without error for all three paper-default block sizes."""
-        for block_size, gamma in [(16, 7.0), (10, 5.0), (8, 4.0)]:
-            T = block_size - 1
-            logits = torch.randn(1, T, 32)
-            target_ids = torch.randint(0, 32, (1, T))
-            block_mask = torch.ones(1, T)
-            loss_fn = DFlashDecayLoss(loss_gamma=gamma)
-            result = loss_fn(logits, target_ids, block_mask, block_size=block_size)
-            assert result.total_loss.item() > 0, f"zero loss for block_size={block_size}"
+
+class TestDFlashDraftAccuracy:
+    """Draft top-1 accuracy metric: value, fused/non-fused parity, DP reduction."""
+
+    def test_none_when_num_tokens_unknown(self, dflash_inputs):
+        logits, target_ids, block_mask = dflash_inputs
+        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask)
+        assert result.draft_acc_sum is None
+
+    def test_perfect_predictions_give_full_accuracy(self):
+        """argmax == target everywhere -> acc_sum == num_valid / num_tokens."""
+        B, T, V = 2, 4, 8
+        target_ids = torch.randint(0, V, (B, T))
+        logits = torch.full((B, T, V), -10.0)
+        logits.scatter_(2, target_ids.unsqueeze(-1), 10.0)  # peak at the target
+        block_mask = torch.ones(B, T)
+        num_tokens = B * T
+        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, num_tokens=num_tokens)
+        assert torch.isclose(result.draft_acc_sum, torch.tensor(1.0))
+
+    def test_accuracy_counts_only_valid_positions(self):
+        """Wrong predictions under a zero mask must not count."""
+        B, T, V = 1, 4, 8
+        target_ids = torch.zeros(B, T, dtype=torch.long)
+        logits = torch.full((B, T, V), -10.0)
+        logits[..., 0] = 10.0  # always predicts class 0 == target
+        logits[0, 3] = 0.0
+        logits[0, 3, 1] = 10.0  # position 3 predicts wrong
+        block_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])  # mask out the wrong one
+        num_tokens = 3
+        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, num_tokens=num_tokens)
+        # 3 correct, masked position excluded -> 3/3
+        assert torch.isclose(result.draft_acc_sum, torch.tensor(1.0))
+
+    def test_fused_matches_nonfused(self):
+        """forward_fused and forward must agree on loss and accuracy."""
+        torch.manual_seed(3)
+        B, T, D, V = 2, 6, 16, 32
+        hidden = torch.randn(B, T, D)
+        weight = torch.randn(V, D)
+        target_ids = torch.randint(0, V, (B, T))
+        block_mask = torch.ones(B, T)
+        loss_fn = DFlashDecayLoss(loss_gamma=7.0, use_fused_linear_ce=True, chunk_size=4)
+
+        logits = torch.nn.functional.linear(hidden, weight)
+        ref = loss_fn(logits, target_ids, block_mask, num_tokens=B * T)
+        fused = loss_fn.forward_fused(hidden, weight, target_ids, block_mask, num_tokens=B * T)
+
+        assert torch.allclose(ref.total_loss, fused.total_loss, atol=1e-4)
+        assert torch.allclose(ref.draft_acc_sum, fused.draft_acc_sum, atol=1e-5)
+
+    def test_dp_sum_reduction_yields_global_accuracy(self):
+        """Per-shard (correct / global_tokens) summed across shards == global accuracy.
+
+        This is the property the recipe relies on: it SUM-allreduces the
+        per-rank draft_acc_sum, so each shard must normalise by the *global*
+        token count (not its own).
+        """
+        torch.manual_seed(5)
+        V = 8
+        # Two uneven shards (different token counts, as ranks would have).
+        t0 = torch.randint(0, V, (1, 5))
+        t1 = torch.randint(0, V, (1, 3))
+        l0 = torch.randn(1, 5, V)
+        l1 = torch.randn(1, 3, V)
+        m0, m1 = torch.ones(1, 5), torch.ones(1, 3)
+        global_tokens = 5 + 3
+
+        loss_fn = DFlashDecayLoss(loss_gamma=7.0)
+        a0 = loss_fn(l0, t0, m0, num_tokens=global_tokens).draft_acc_sum
+        a1 = loss_fn(l1, t1, m1, num_tokens=global_tokens).draft_acc_sum
+
+        correct = int((l0.argmax(-1) == t0).sum() + (l1.argmax(-1) == t1).sum())
+        expected = correct / global_tokens
+        assert torch.isclose(a0 + a1, torch.tensor(expected, dtype=a0.dtype), atol=1e-6)

@@ -739,6 +739,8 @@ class DFlashStrategy(DLLMStrategy):
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
             recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
+            if loss_result.draft_acc_sum is not None:
+                recipe._dflash_acc_buffer.append(loss_result.draft_acc_sum.detach())
 
             if is_train:
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
