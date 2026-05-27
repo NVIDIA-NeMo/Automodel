@@ -537,7 +537,14 @@ class DFlashStrategy(DLLMStrategy):
                 starts, block_output_ids, block_targets, block_mask = self._sample_anchor_blocks(
                     recipe, input_ids, attn, self.num_blocks_per_sample, loss_mask
                 )
-                ctx_len = starts[-1]
+                # Use the full (constant) sequence length as the context, NOT
+                # starts[-1]. The deepest anchor varies every step, which would
+                # make KV_LEN vary and force FlexAttention to recompile each
+                # step. With a fixed ctx_len the kernel compiles once; the
+                # block-diagonal mask (kv_idx < anchor) still prevents any block
+                # from attending past its own anchor, so padding context beyond
+                # the valid region is never read.
+                ctx_len = int(input_ids.shape[1])
                 target_hidden = self._run_target_forward(input_ids, attn, ctx_len)
                 batch["_dflash_starts"] = starts
             else:
@@ -600,7 +607,10 @@ class DFlashStrategy(DLLMStrategy):
 
         B = block_output_ids.size(0)
         n = len(starts)
-        ctx_len = starts[-1]  # context = positions 0..ctx_len-1
+        # ctx_len comes from the pre-computed target_hidden (full sequence length
+        # for the multi-block path), so Q_LEN/KV_LEN are constant across steps
+        # and FlexAttention compiles once instead of recompiling per step.
+        ctx_len = target_hidden.shape[1]
         noise_embedding = self.target_embed(block_output_ids)  # [B, n*block_size, dim]
 
         # Position IDs: actual sequence positions for RoPE correctness.
