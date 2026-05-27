@@ -1,0 +1,150 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SFT recipe for tencent/Hy-MT2-30B-A3B (translation MoE, 30B total / 3B activated).
+#
+# Architecture (from config.json): 48 layers (layer 0 dense), 128 experts top-8
+# + 1 shared expert, sigmoid routing with bias, GQA 32/4, hidden=2048,
+# moe_intermediate=expert_hidden=768, dense intermediate=6912,
+# vocab=120832, 256K context, rope_theta=11158840, qk_norm.
+#
+# Hardware target: 8 GPUs (80 GB+ each) for full SFT with EP8 + FSDP2.
+#   automodel finetune llm -c examples/llm_finetune/hy_mt2/hy_mt2_30b_a3b_sft.yaml \
+#     --nproc-per-node 8
+#
+# EP size must divide num_experts (128). ep_size=8 -> 16 experts per rank.
+# Other valid EP sizes: 1, 2, 4, 16, 32, 64, 128.
+#
+# Note: the on-disk checkpoint declares ``architectures: ["HYV3ForCausalLM"]``,
+# so NeMoAutoModel's registry would dispatch to ``components/models/hy_v3``.
+# This recipe deliberately bypasses the registry and instantiates the new
+# ``HyMT2ForCausalLM`` directly via ``_target_``, isolating Hy-MT2 logic
+# (sigmoid-routing flag, ``enable_lm_head_fp32``, expert_hidden_dim) from
+# the existing Hy3-preview support.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.components.models.hy_mt2.model.HyMT2ForCausalLM.from_pretrained
+  pretrained_model_name_or_path: tencent/Hy-MT2-30B-A3B
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+    fake_balanced_gate: false
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /tmp/checkpoints/hy_mt2_30b_a3b/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  # Expert parallelism: 128 experts / 8 ranks = 16 experts per rank.
+  # dp_size is derived as ``world_size // (tp_size * cp_size * pp_size * ep_size)``
+  # i.e. 1 with ep_size=8 on an 8-GPU node -- experts shard across the
+  # full node and the remaining (non-expert) weights replicate.
+  ep_size: 8
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+    # HF reference upcasts the lm_head to fp32 (``enable_lm_head_fp32: true``).
+    # The MoE parallelizer handles this via MixedPrecisionPolicy when set
+    # here; HyMT2ForCausalLM also has an in-model fp32 fallback if this is
+    # left unset.
+    lm_head_precision: float32
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: tencent/Hy-MT2-30B-A3B
+    trust_remote_code: true
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: tencent/Hy-MT2-30B-A3B
+    trust_remote_code: true
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 64
+  shuffle: false
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1e-5
+  weight_decay: 0.0
+
+# Uncomment for W&B logging
+# wandb:
+#   project: hy_mt2-30b-a3b-sft
+#   name: hy_mt2_30b_a3b_sft
