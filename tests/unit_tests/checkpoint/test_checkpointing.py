@@ -43,7 +43,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _model_has_dtensors,
     _normalize_dtype_mapping_to_state_dict_keys,
     _reinit_non_persistent_buffers,
+    _should_write_consolidated_safetensors,
     _summarize_state_dict_key_diff,
+    _warn_if_large_inline_consolidation,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
 from nemo_automodel.components.checkpoint.utils import (
@@ -339,7 +341,9 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
     model_state = SimpleNamespace(model=[SimpleNamespace()])
     caplog.set_level(logging.INFO)
 
-    with patch("nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path", return_value=None):
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path", return_value=None
+    ):
         mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
         dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
 
@@ -349,7 +353,7 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
         "c.weight": 2,
     }
     assert dtype_mapping is None
-    assert "No original HF safetensors shard index found for config-only/model" in caplog.text
+    assert "No original HF safetensors reference path found for config-only/model" in caplog.text
     assert "2 output shard(s)" in caplog.text
 
 
@@ -404,7 +408,7 @@ def test_original_dtype_mapping_is_keyed_by_export_state_dict(tmp_path):
     }
 
     with patch(
-        "nemo_automodel.components.checkpoint.checkpointing.get_safetensors_index_path",
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
         return_value=str(reference_dir),
     ):
         dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
@@ -1134,8 +1138,6 @@ class TestCheckpointerSaveModelDiffusersRename:
             checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
 
         # Mock internals to isolate the consolidation + rename logic
-        checkpointer._should_write_consolidated_safetensors = MagicMock(return_value=True)
-        checkpointer._should_write_hf_metadata = MagicMock(return_value=True)
         checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"w": 1})
         checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
         checkpointer._do_save = MagicMock(return_value=None)
@@ -1338,8 +1340,8 @@ class TestOfflineConsolidationScriptAndWarnings:
     def test_final_consolidation_only_exports_on_final_checkpoint(self, tmp_path):
         checkpointer = self._make_checkpointer(tmp_path, save_consolidated="final")
 
-        assert checkpointer._should_write_consolidated_safetensors(is_final_checkpoint=False) is False
-        assert checkpointer._should_write_consolidated_safetensors(is_final_checkpoint=True) is True
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=False) is False
+        assert _should_write_consolidated_safetensors(checkpointer.config, is_final_checkpoint=True) is True
 
     def test_setup_warns_for_inline_consolidation(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setenv("WORLD_SIZE", "1")
@@ -1368,7 +1370,7 @@ class TestOfflineConsolidationScriptAndWarnings:
             def element_size(self):
                 return 2
 
-        checkpointer._warn_if_large_inline_consolidation({"w": FakeLargeTensor()}, {"w": 1})
+        _warn_if_large_inline_consolidation(checkpointer.config, {"w": FakeLargeTensor()}, {"w": 1})
 
         assert "may be exporting a large HF checkpoint" in caplog.text
         assert "this rank's local estimate is ~50.0 GiB" in caplog.text
@@ -1405,7 +1407,7 @@ class TestOfflineConsolidationScriptAndWarnings:
             patch("torch.distributed.get_world_size", return_value=64),
             patch("torch.distributed.all_reduce") as mock_all_reduce,
         ):
-            checkpointer._warn_if_large_inline_consolidation({"w": FakeSmallLocalTensor()}, {"w": 1})
+            _warn_if_large_inline_consolidation(checkpointer.config, {"w": FakeSmallLocalTensor()}, {"w": 1})
 
         mock_all_reduce.assert_not_called()
         assert "checkpoint.save_consolidated=every is exporting ~64.0 GiB of HF safetensors" in caplog.text
@@ -1750,8 +1752,8 @@ class TestConsolidatedIndexUnderPPWithoutSourceIndex:
     """_maybe_build_consolidated_index else-branch (NVIDIA-NeMo/Automodel#1512)."""
 
     def _make_checkpointer(self, tmp_path):
-        # empty_cache is created but contains no model.safetensors.index.json so
-        # get_safetensors_index_path returns None.
+        # empty_cache is created but contains no HF snapshot directory, so
+        # _get_hf_safetensors_reference_path returns None.
         config = CheckpointingConfig(
             enabled=True,
             checkpoint_dir=str(tmp_path),
@@ -1795,9 +1797,7 @@ class TestConsolidatedIndexUnderPPWithoutSourceIndex:
     @pytest.mark.run_only_on("CPU")
     def test_global_pre_shard_keys_yield_consistent_mapping_across_pp_ranks(self, tmp_path):
         """Disjoint per-rank PP state dicts but the same global pre-shard key set →
-        every rank produces the identical mapping covering every FQN, so
-        consolidate_safetensors_files_on_every_rank's output-shard partitioning
-        cannot drop any keys.
+        every rank produces the identical mapping covering every FQN.
         """
         checkpointer = self._make_checkpointer(tmp_path)
         os.makedirs(checkpointer.config.model_cache_dir, exist_ok=True)
@@ -1835,15 +1835,8 @@ class TestConsolidatedIndexUnderPPWithoutSourceIndex:
 
         first = per_rank_mappings[0]
         assert sorted(first.keys()) == global_pre_shard_keys
+        assert set(first.values()) == {1}
         assert "backbone.norm_f.weight" in first  # every rank sees rank-7's norm_f
         for r, m in enumerate(per_rank_mappings[1:], start=1):
             assert sorted(m.keys()) == global_pre_shard_keys, f"rank {r} mapping diverges"
-
-        # Round-robin: any rank consolidating idx 1 covers every global FQN.
-        consolidated_keys: set[str] = set()
-        for r, mapping in enumerate(per_rank_mappings):
-            indices_for_this_rank = {idx for idx in set(mapping.values()) if idx % world_size == r}
-            for fqn, idx in mapping.items():
-                if idx in indices_for_this_rank:
-                    consolidated_keys.add(fqn)
-        assert consolidated_keys == set(global_pre_shard_keys)
+            assert set(m.values()) == {1}

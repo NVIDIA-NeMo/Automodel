@@ -14,7 +14,6 @@
 
 import gc
 import glob
-import json
 import logging
 import os
 import time
@@ -56,10 +55,17 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
+    estimate_state_dict_bytes,
+    estimate_tensor_bytes,
+    format_bytes,
+    format_output_file_count,
+    get_safetensors_index_total_size,
     get_tied_lm_head_source_names,
+    is_rank_0,
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -180,68 +186,6 @@ def _get_checkpoint_metadata_keys(
     return set(metadata.state_dict_metadata.keys())
 
 
-def _get_rank_safe() -> int:
-    """Return the current distributed rank, defaulting to 0 when not initialized."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    return int(os.environ.get("RANK", "0"))
-
-
-def _get_world_size_safe() -> int:
-    """Return the current distributed world size, defaulting to 1 when not initialized."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    return int(os.environ.get("WORLD_SIZE", "1"))
-
-
-def _is_rank_0() -> bool:
-    """Return True on the main rank."""
-    return _get_rank_safe() == 0
-
-
-def _estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | None:
-    """Estimate logical bytes in a state dict without materializing tensors."""
-    total = 0
-    try:
-        for tensor in state_dict.values():
-            total += _estimate_tensor_bytes(tensor)
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return None
-    return total
-
-
-def _get_safetensors_index_total_size(index_path: str | None) -> int | None:
-    """Return the total checkpoint size recorded in a HuggingFace safetensors index."""
-    if index_path is None:
-        return None
-    index_file = Path(index_path)
-    if index_file.is_dir():
-        index_file = index_file / "model.safetensors.index.json"
-    try:
-        with open(index_file) as f:
-            index = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-    total_size = index.get("metadata", {}).get("total_size")
-    return total_size if isinstance(total_size, int) else None
-
-
-def _estimate_tensor_bytes(tensor: torch.Tensor) -> int:
-    """Estimate logical bytes in a tensor without materializing it."""
-    return int(tensor.numel()) * int(tensor.element_size())
-
-
-def _format_bytes(num_bytes: int) -> str:
-    """Format bytes as a human-readable GiB value."""
-    return f"{num_bytes / 1024**3:.1f} GiB"
-
-
-def _format_output_file_count(count: int) -> str:
-    """Format the output shard count for user-facing log messages."""
-    return f"{count} output {'file' if count == 1 else 'files'}"
-
-
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -322,6 +266,90 @@ class CheckpointingConfig:
             self.is_async = False
 
 
+def _should_write_hf_metadata(config: CheckpointingConfig) -> bool:
+    """Whether to write HF metadata/artifacts for a checkpoint."""
+    return config.model_save_format == SerializationFormat.SAFETENSORS and not config.is_peft
+
+
+def _should_write_consolidated_safetensors(config: CheckpointingConfig, is_final_checkpoint: bool = False) -> bool:
+    """Whether to output consolidated HF weights along with sharded weights."""
+    if not _should_write_hf_metadata(config):
+        return False
+    if config.save_consolidated == SaveConsolidatedMode.EVERY:
+        return True
+    return config.save_consolidated == SaveConsolidatedMode.FINAL and is_final_checkpoint
+
+
+def _get_original_hf_index_total_size(config: CheckpointingConfig) -> int | None:
+    """Return the original HF safetensors index total size, if available."""
+    try:
+        reference_path = _get_hf_safetensors_reference_path(
+            config.model_cache_dir,
+            config.model_repo_id,
+        )
+    except (FileNotFoundError, ValueError):
+        return None
+    return get_safetensors_index_total_size(reference_path)
+
+
+def _warn_if_inline_consolidation_enabled(config: CheckpointingConfig) -> None:
+    """Educate users about the cost of inline HF consolidation."""
+    if config.save_consolidated != SaveConsolidatedMode.EVERY or not _should_write_hf_metadata(config):
+        return
+    if not is_rank_0():
+        return
+    logger.warning(
+        "checkpoint.save_consolidated=every exports HuggingFace safetensors during every checkpoint save "
+        "and can leave GPUs idle during consolidation and filesystem writes. Recommended: "
+        "checkpoint.save_consolidated=final, or checkpoint.save_consolidated=false and run "
+        "bash <checkpoint>/model/consolidate.sh after training.",
+    )
+
+
+def _warn_if_large_inline_consolidation(
+    config: CheckpointingConfig,
+    state_dict: dict[str, torch.Tensor],
+    fqn_to_index_mapping: Optional[dict[str, int]],
+    is_final_checkpoint: bool = False,
+) -> None:
+    """Warn when inline consolidated export is large enough to waste GPU allocation time."""
+    if not _should_write_consolidated_safetensors(config, is_final_checkpoint):
+        return
+    if config.save_consolidated != SaveConsolidatedMode.EVERY:
+        return
+    estimated_bytes = _get_original_hf_index_total_size(config)
+    is_hf_index_estimate = estimated_bytes is not None
+    if estimated_bytes is None:
+        estimated_bytes = estimate_state_dict_bytes(state_dict)
+    if not is_rank_0():
+        return
+    if estimated_bytes is None or estimated_bytes < _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES:
+        return
+    world_size = get_world_size_safe()
+    output_file_count = len(set(fqn_to_index_mapping.values())) if fqn_to_index_mapping else 1
+    output_file_summary = format_output_file_count(output_file_count)
+    if is_hf_index_estimate:
+        logger.warning(
+            "checkpoint.save_consolidated=every is exporting ~%s of HF safetensors during checkpoint save "
+            "(size from HF index; %s, world_size=%d). This can idle GPU ranks; prefer "
+            "save_consolidated=final, or save_consolidated=false and run "
+            "bash <checkpoint>/model/consolidate.sh after training.",
+            format_bytes(estimated_bytes),
+            output_file_summary,
+            world_size,
+        )
+    else:
+        logger.warning(
+            "checkpoint.save_consolidated=every may be exporting a large HF checkpoint; this rank's local "
+            "estimate is ~%s (full size may differ under distributed parallelism; %s, world_size=%d). Prefer "
+            "save_consolidated=final, or save_consolidated=false and run "
+            "bash <checkpoint>/model/consolidate.sh after training.",
+            format_bytes(estimated_bytes),
+            output_file_summary,
+            world_size,
+        )
+
+
 class Checkpointer:
     """
     High-level checkpoint manager built on torch.distributed.checkpoint (DCP).
@@ -370,11 +398,11 @@ class Checkpointer:
             self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
 
         self._addons = []
-        if self._should_write_hf_metadata():
+        if _should_write_hf_metadata(self.config):
             self._addons.append(ConsolidatedHFAddon())
         if self.config.is_peft:
             self._addons.append(PeftAddon())
-        self._warn_if_inline_consolidation_enabled()
+        _warn_if_inline_consolidation_enabled(self.config)
 
     @torch.no_grad()
     def save_model(
@@ -403,9 +431,9 @@ class Checkpointer:
         """
         # Create the model directories
         model_dir = os.path.join(weights_path, "model")
-        should_write_consolidated = self._should_write_consolidated_safetensors(is_final_checkpoint)
+        should_write_consolidated = _should_write_consolidated_safetensors(self.config, is_final_checkpoint)
         consolidated_dir = os.path.join(model_dir, "consolidated") if should_write_consolidated else None
-        hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if self._should_write_hf_metadata() else None
+        hf_metadata_dir = os.path.join(model_dir, ".hf_metadata") if _should_write_hf_metadata(self.config) else None
         _ensure_dirs(model_dir, consolidated_dir, hf_metadata_dir)
 
         # Because this call lies outside of the dcp save call, we need to consolidate on all ranks on the main process
@@ -430,7 +458,12 @@ class Checkpointer:
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
-        self._warn_if_large_inline_consolidation(state_dict, fqn_to_file_index_mapping, is_final_checkpoint)
+        _warn_if_large_inline_consolidation(
+            self.config,
+            state_dict,
+            fqn_to_file_index_mapping,
+            is_final_checkpoint,
+        )
 
         # Run pre-saves for addons e.g., PEFT or consolidated HF safetensors
         for addon in self._addons:
@@ -469,7 +502,7 @@ class Checkpointer:
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                     _maybe_rename_index_for_diffusers(consolidated_dir)
-            if _is_rank_0():
+            if is_rank_0():
                 logger.info("Successfully exported consolidated HF safetensors to %s.", consolidated_dir)
         self._maybe_log_final_offline_consolidation_hint(model_dir, is_final_checkpoint)
 
@@ -839,7 +872,7 @@ class Checkpointer:
                 model,
                 model_path=model_name
                 if os.path.exists(model_name)
-                else get_safetensors_index_path(root_dir, model_name),
+                else _get_hf_safetensors_reference_path(root_dir, model_name),
                 is_init_step=True,
                 key_mapping=key_mapping,
             )
@@ -994,80 +1027,9 @@ class Checkpointer:
             dcp.save(state_dict, checkpoint_id=path, storage_writer=storage_writer, planner=planner)
         return ret
 
-    def _warn_if_inline_consolidation_enabled(self) -> None:
-        """Educate users about the cost of inline HF consolidation."""
-        if self.config.save_consolidated != SaveConsolidatedMode.EVERY or not self._should_write_hf_metadata():
-            return
-        if not _is_rank_0():
-            return
-        logger.warning(
-            "checkpoint.save_consolidated=every exports HuggingFace safetensors during every checkpoint save "
-            "and can leave GPUs idle during consolidation and filesystem writes. Recommended: "
-            "checkpoint.save_consolidated=final, or checkpoint.save_consolidated=false and run "
-            "bash <checkpoint>/model/consolidate.sh after training.",
-        )
-
-    def _warn_if_large_inline_consolidation(
-        self,
-        state_dict: dict[str, torch.Tensor],
-        fqn_to_index_mapping: Optional[dict[str, int]],
-        is_final_checkpoint: bool = False,
-    ) -> None:
-        """Warn when inline consolidated export is large enough to waste GPU allocation time."""
-        if not self._should_write_consolidated_safetensors(is_final_checkpoint):
-            return
-        if self.config.save_consolidated != SaveConsolidatedMode.EVERY:
-            return
-        estimated_bytes = self._get_original_hf_index_total_size()
-        is_hf_index_estimate = estimated_bytes is not None
-        if estimated_bytes is None:
-            estimated_bytes = _estimate_state_dict_bytes(state_dict)
-        if not _is_rank_0():
-            return
-        if estimated_bytes is None or estimated_bytes < _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES:
-            return
-        world_size = _get_world_size_safe()
-        output_file_count = len(set(fqn_to_index_mapping.values())) if fqn_to_index_mapping else 1
-        output_file_summary = _format_output_file_count(output_file_count)
-        if is_hf_index_estimate:
-            logger.warning(
-                "checkpoint.save_consolidated=every is exporting ~%s of HF safetensors during checkpoint save "
-                "(size from HF index; %s, world_size=%d). This can idle GPU ranks; prefer "
-                "save_consolidated=final, or save_consolidated=false and run "
-                "bash <checkpoint>/model/consolidate.sh after training.",
-                _format_bytes(estimated_bytes),
-                output_file_summary,
-                world_size,
-            )
-        else:
-            logger.warning(
-                "checkpoint.save_consolidated=every may be exporting a large HF checkpoint; this rank's local "
-                "estimate is ~%s (full size may differ under distributed parallelism; %s, world_size=%d). Prefer "
-                "save_consolidated=final, or save_consolidated=false and run "
-                "bash <checkpoint>/model/consolidate.sh after training.",
-                _format_bytes(estimated_bytes),
-                output_file_summary,
-                world_size,
-            )
-
-    def _get_original_hf_index_total_size(self) -> int | None:
-        """Return the original HF safetensors index total size, if available."""
-        try:
-            index_path = get_safetensors_index_path(
-                self.config.model_cache_dir,
-                self.config.model_repo_id,
-            )
-        except (FileNotFoundError, ValueError):
-            return None
-        return _get_safetensors_index_total_size(index_path)
-
-    def get_offline_consolidation_script_path(self, weights_path: str) -> str:
-        """Return the offline consolidation helper script path for a checkpoint root."""
-        return os.path.join(weights_path, "model", "consolidate.sh")
-
     def _maybe_write_offline_consolidation_script(self, model_dir: str) -> None:
         """Write a conservative helper script for offline HF safetensors consolidation."""
-        if not self._should_write_hf_metadata() or not _is_rank_0():
+        if not _should_write_hf_metadata(self.config) or not is_rank_0():
             return
 
         script_path = os.path.join(model_dir, "consolidate.sh")
@@ -1128,8 +1090,8 @@ fi
         if (
             not is_final_checkpoint
             or self.config.save_consolidated != SaveConsolidatedMode.FALSE
-            or not self._should_write_hf_metadata()
-            or not _is_rank_0()
+            or not _should_write_hf_metadata(self.config)
+            or not is_rank_0()
         ):
             return
 
@@ -1138,24 +1100,6 @@ fi
             "To export Hugging Face consolidated weights if needed, run bash %s.",
             os.path.join(model_dir, "consolidate.sh"),
         )
-
-    def _should_write_consolidated_safetensors(self, is_final_checkpoint: bool = False) -> bool:
-        """
-        Whether to output consolidated HF weights along with sharded weights.
-
-        Returns True only for non-PEFT safetensors when consolidation is enabled.
-        """
-        if not self._should_write_hf_metadata():
-            return False
-        if self.config.save_consolidated == SaveConsolidatedMode.EVERY:
-            return True
-        return self.config.save_consolidated == SaveConsolidatedMode.FINAL and is_final_checkpoint
-
-    def _should_write_hf_metadata(self) -> bool:
-        """
-        Whether to write the HF artifacts.
-        """
-        return self.config.model_save_format == SerializationFormat.SAFETENSORS and not self.config.is_peft
 
     def _maybe_build_consolidated_index(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
@@ -1173,18 +1117,18 @@ fi
         Returns:
             Mapping from FQN to shard index, or None when not consolidating.
         """
-        if not self._should_write_hf_metadata():
+        if not _should_write_hf_metadata(self.config):
             return None
         model = model_state.model[0]
         # we first need to find the FQN -> .safetensors mapping
-        index_path = get_safetensors_index_path(
+        reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
             self.config.model_repo_id,
         )
-        if index_path:
+        if reference_path:
             # HF VLM models may contain a special checkpoint mapping attribute
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
-                index_path, getattr(model, "_checkpoint_conversion_mapping", None)
+                reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
             )
             model_part = model_state.model[0]
             config = getattr(model_part, "config", None)
@@ -1210,9 +1154,9 @@ fi
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
         else:
-            pre_shard_hf_state_dict_keys = (
-                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
-            )
+            pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
+            if pre_shard_hf_state_dict_keys is None:
+                pre_shard_hf_state_dict_keys = self.config.model_state_dict_keys
             fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
             fqn_to_file_index_mapping = _divide_keys_by_size(
                 fallback_keys,
@@ -1220,12 +1164,12 @@ fi
                 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
             )
             num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
-            if _is_rank_0():
+            if is_rank_0():
                 logger.info(
-                    "No original HF safetensors shard index found for %s; using size-based fallback with "
-                    "target shard size %s and %d output shard(s).",
+                    "No original HF safetensors reference path found for %s; using size-based consolidated shard "
+                    "mapping with target shard size %s and %d output shard(s).",
                     self.config.model_repo_id,
-                    _format_bytes(_DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES),
+                    format_bytes(_DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES),
                     num_shards,
                 )
 
@@ -1250,18 +1194,18 @@ fi
         saved checkpoint dtype unless the user explicitly passes CAST_DTYPE to the
         offline helper.
         """
-        if not self._should_write_hf_metadata():
+        if not _should_write_hf_metadata(self.config):
             return None
 
-        index_path = get_safetensors_index_path(
+        reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
             self.config.model_repo_id,
         )
-        if not index_path:
+        if not reference_path:
             return None
 
         model = model_state.model[0]
-        dtype_mapping = get_fqn_to_dtype_mapping(index_path, getattr(model, "_checkpoint_conversion_mapping", None))
+        dtype_mapping = get_fqn_to_dtype_mapping(reference_path, getattr(model, "_checkpoint_conversion_mapping", None))
         if not dtype_mapping:
             return None
 
@@ -1365,16 +1309,18 @@ fi
         # `original_model_root_dir` exists on the config but may be None. In that case,
         # fall back to the standard HF hub cache root.
         cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
-        return get_safetensors_index_path(cache_dir, pretrained_model_name_or_path)
+        return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
 
 
-def get_safetensors_index_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
-    """
-    Return the directory containing the first `model.safetensors.index.json` found for given model.
+def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
+    """Return the local HF safetensors reference directory for a model.
 
-    If no `model.safetensors.index.json` is found then it returns None.
+    Prefer the snapshot directory containing `model.safetensors.index.json` for
+    sharded checkpoints. If no index exists but a snapshot directory is present,
+    return that directory as the single-file safetensors reference path. Return
+    None when `repo_id` is None or the repo has no cached snapshot directory.
 
-    For example, if the file located is
+    For example, if the located file is
 
         /opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe.../model.safetensors.index.json
 
@@ -1389,10 +1335,8 @@ def get_safetensors_index_path(cache_dir: str | Path | None, repo_id: str | None
         repo_id: Hugging Face repository ID
 
     Returns:
-        Path to the directory containing the index file.
-
-    Raises:
-        FileNotFoundError: If the index file is not found.
+        Path to the snapshot/model directory containing safetensors weights, or
+        None when no Hugging Face repo ID or cached snapshot is available.
     """
     # repo_id can be None if the model is not Hugging Face Hub yet
     if repo_id is None:
@@ -1423,6 +1367,7 @@ def get_safetensors_index_path(cache_dir: str | Path | None, repo_id: str | None
             return snapshot_dirs[0]
         except IndexError:
             raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
+    return None
 
 
 def to_empty_parameters_only(
@@ -1941,7 +1886,7 @@ def _divide_keys_by_size(
 
     for key in keys:
         tensor = state_dict.get(key)
-        tensor_bytes = _estimate_tensor_bytes(tensor) if tensor is not None else 0
+        tensor_bytes = estimate_tensor_bytes(tensor) if tensor is not None else 0
         if current_shard_bytes > 0 and current_shard_bytes + tensor_bytes > target_shard_bytes:
             current_shard += 1
             current_shard_bytes = 0

@@ -8,29 +8,29 @@ In practice, compatibility comes in two layers:
 
 This page summarizes what "HF compatibility" means in NeMo AutoModel, calls out differences you should be aware of, and provides side-by-side examples.
 
-## Transformers Version Compatibility: v4 and v5
+## Transformers Version Compatibility
 
-### Transformers v4 (Current Default)
+### Transformers v5 (Current Default)
 
-NeMo AutoModel currently pins Hugging Face Transformers to the **v4** major line (see `pyproject.toml`, currently `transformers<=4.57.5`).
+NeMo AutoModel currently pins Hugging Face Transformers to the **v5** major line (see `pyproject.toml`, currently `transformers==5.5.0`).
 
 This means:
 
-- NeMo AutoModel is primarily tested and released against **Transformers v4.x**.
+- NeMo AutoModel is primarily tested and released against **Transformers v5.x**.
 - New model releases on the Hugging Face Hub that require a newer Transformers may require upgrading NeMo AutoModel as well (similar to upgrading `transformers` directly).
 
-### Transformers v5 (Forward-Compatibility and Checkpoint Interoperability)
+### Transformers v4 Interoperability
 
-Transformers **v5** introduces breaking changes across some internal utilities (e.g., cache APIs) and adds/reshapes tokenizer backends for some model families.
+Some downstream environments may still run Transformers **v4**, while NeMo AutoModel development and tests now target Transformers **v5**.
 
-NeMo AutoModel addresses this in two complementary ways:
+NeMo AutoModel keeps v4 interoperability where practical:
 
-- **Forward-compatibility shims**: NeMo AutoModel includes small compatibility patches to smooth over known API differences across Transformers releases (for example, cache utility method names). The built-in recipes apply these patches automatically.
-- **Backports where needed**: for some model families, NeMo AutoModel may vendor/backport Hugging Face code that originated in the v5 development line so users can run those models while staying on a pinned v4 dependency.
-- **Stable artifact format**: NeMo AutoModel checkpoints are written in Hugging Face-compatible `save_pretrained` layouts (config + tokenizer + safetensors). These artifacts are designed to be loadable by both Transformers **v4** and **v5** (and non-Transformers tools that consume HF-style model repos).
+- **Compatibility shims**: NeMo AutoModel includes small compatibility patches to smooth over known API differences across Transformers releases (for example, cache utility method names). The built-in recipes apply these patches automatically.
+- **Backports where needed**: for some model families, NeMo AutoModel may vendor/backport Hugging Face code so users can run models whose upstream integration has moved between major Transformers releases.
+- **Stable artifact format**: NeMo AutoModel checkpoints are written in Hugging Face-compatible `save_pretrained` layouts (config + tokenizer + safetensors). These artifacts are intended for standard HF loading APIs and non-Transformers tools that consume HF-style model repos.
 
 :::{note}
-If you are running Transformers v5 in another environment, you can still use NeMo AutoModel-produced consolidated checkpoints with Transformers' standard loading APIs. For details on the checkpoint layouts, see [checkpointing](checkpointing.md).
+If you need to consume NeMo AutoModel-produced consolidated checkpoints in a Transformers v4 environment, validate that specific model family and downstream tool path. For details on the checkpoint layouts, see [checkpointing](checkpointing.md).
 :::
 
 ## Drop-In Compatibility and Key Differences
@@ -107,7 +107,7 @@ If you are running Transformers v5 in another environment, you can still use NeM
 
 ## Side-by-Side Examples
 
-### Load a Model and Tokenizer (Transformers v4)
+### Load a Model and Tokenizer (Transformers)
 
 :::{raw} html
 <table>
