@@ -180,6 +180,46 @@ class _StubTokenizerChatWithReasoning(_StubTokenizerPlain):  # noqa: D401
         return ids
 
 
+def test_format_prompt_completion_forces_right_padding_and_restores():
+    """Covers the padding_side save/restore branch added for transformers v5.8.
+
+    The function temporarily flips ``tokenizer.padding_side`` to ``"right"`` for
+    the duration of the tokenize call (so the label-masking / attention-mask
+    logic below it sees right-padded ids) and must restore the original side
+    after — including when the original is ``"left"`` (the v5.8 LlamaTokenizer
+    class default).
+    """
+
+    class _LeftPaddingStubTokenizer(_StubTokenizerPlain):
+        padding_side = "left"
+
+        def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
+            # Record what padding_side was during the tokenize call.
+            self.padding_side_during_call = self.padding_side
+            return super().__call__(
+                text,
+                add_special_tokens=add_special_tokens,
+                padding=padding,
+                truncation=truncation,
+                max_length=max_length,
+            )
+
+    tok = _LeftPaddingStubTokenizer()
+    out = format_prompt_completion(
+        tok,
+        "Context Q?",
+        "A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    # Right-padding was set during the call; original "left" was restored after.
+    assert tok.padding_side_during_call == "right"
+    assert tok.padding_side == "left"
+    # Sanity: the function still returns a usable dict.
+    assert "input_ids" in out and "labels" in out
+
+
 def testformat_prompt_completion_answer_only_mask():
     tok = _StubTokenizerPlain()
     context = "Context"
