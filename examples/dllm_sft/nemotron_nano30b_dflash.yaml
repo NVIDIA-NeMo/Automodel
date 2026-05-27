@@ -37,7 +37,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 500
   max_steps: null
-  num_epochs: 3
+  num_epochs: 6        # paper Appendix A.1 (≈97K steps at global_batch_size 64 on ~1M samples)
 
 dist_env:
   backend: nccl
