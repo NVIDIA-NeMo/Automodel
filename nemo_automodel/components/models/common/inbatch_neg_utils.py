@@ -45,6 +45,34 @@ def dist_gather_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return torch.cat(gathered, dim=0)
 
 
+def dist_gather_tensor_with_dim1_padding(
+    t: Optional[torch.Tensor],
+    padding_value: int | float | bool = 0,
+) -> Optional[torch.Tensor]:
+    """All-gather ``t`` after padding dim 1 to the maximum length across ranks."""
+    if t is None:
+        return None
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
+        return t
+    local_shape = torch.tensor(t.shape, device=t.device, dtype=torch.long)
+    shapes = [torch.empty_like(local_shape) for _ in range(dist.get_world_size())]
+    dist.all_gather(shapes, local_shape)
+    max_dim1 = max(int(shape[1].item()) for shape in shapes)
+    if t.shape[1] < max_dim1:
+        padded_shape = list(t.shape)
+        padded_shape[1] = max_dim1
+        padded = t.new_full(padded_shape, padding_value)
+        slices = [slice(None)] * t.ndim
+        slices[1] = slice(0, t.shape[1])
+        padded[tuple(slices)] = t
+        t = padded
+    t = t.contiguous()
+    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, t)
+    gathered[dist.get_rank()] = t
+    return torch.cat(gathered, dim=0)
+
+
 def mask_gathered_passages_same_doc_as_positive(
     scores: torch.Tensor,
     passage_doc_ids: torch.Tensor,

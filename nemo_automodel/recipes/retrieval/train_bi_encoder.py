@@ -95,6 +95,27 @@ def colbert_scores_and_labels(
     return scores, labels
 
 
+def distributed_colbert_scores_and_labels(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    current_train_n_passages: int,
+    key_attention_mask: torch.Tensor,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute local-query ColBERT MaxSim scores against globally gathered passages."""
+    assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(
+        key.shape[0], current_train_n_passages
+    )
+    assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
+
+    token_scores = torch.einsum("bqd,kpd->bkqp", query, key)
+    token_scores.masked_fill_(~key_attention_mask[None, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
+    scores = token_scores.max(dim=3).values.sum(dim=2)
+    labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device) + rank * query.shape[0]
+    labels = labels * current_train_n_passages
+    return scores, labels
+
+
 def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     """Unpack query and passage inputs from batch dictionary.
 
@@ -371,10 +392,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
             n_passages = self.train_n_passages
             if is_train and getattr(model, "do_distributed_inbatch_negative", False):
-                if getattr(model, "pooling", None) == "colbert":
-                    raise NotImplementedError("Distributed in-batch negatives are not implemented for ColBERT pooling.")
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
+                    dist_gather_tensor_with_dim1_padding,
                     mask_gathered_passages_same_doc_as_positive,
                 )
 
@@ -382,11 +402,28 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                all_p = dist_gather_tensor(p_reps)
-                expected_p = world_size * local_bs * n_passages
-                assert all_p.shape[0] == expected_p, f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                scores = torch.mm(q_reps, all_p.t())
-                labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
+                if getattr(model, "pooling", None) == "colbert":
+                    all_p = dist_gather_tensor_with_dim1_padding(p_reps)
+                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
+                    expected_p = world_size * local_bs * n_passages
+                    assert (
+                        all_p.shape[0] == expected_p
+                    ), f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    scores, labels = distributed_colbert_scores_and_labels(
+                        q_reps,
+                        all_p,
+                        n_passages,
+                        all_p_mask,
+                        rank,
+                    )
+                else:
+                    all_p = dist_gather_tensor(p_reps)
+                    expected_p = world_size * local_bs * n_passages
+                    assert (
+                        all_p.shape[0] == expected_p
+                    ), f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    scores = torch.mm(q_reps, all_p.t())
+                    labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
                 if model.l2_normalize:
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")

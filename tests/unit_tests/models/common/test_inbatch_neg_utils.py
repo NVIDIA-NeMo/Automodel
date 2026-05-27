@@ -19,6 +19,7 @@ import torch
 
 from nemo_automodel.components.models.common.inbatch_neg_utils import (
     dist_gather_tensor,
+    dist_gather_tensor_with_dim1_padding,
     mask_gathered_passages_same_doc_as_positive,
 )
 
@@ -45,6 +46,15 @@ def test_dist_gather_tensor_single_rank_is_noop():
 
 def test_dist_gather_tensor_none_returns_none():
     assert dist_gather_tensor(None) is None
+
+
+def test_dist_gather_tensor_with_dim1_padding_single_rank_is_noop():
+    t = torch.randn(4, 3, 8)
+    assert dist_gather_tensor_with_dim1_padding(t) is t
+
+
+def test_dist_gather_tensor_with_dim1_padding_none_returns_none():
+    assert dist_gather_tensor_with_dim1_padding(None) is None
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

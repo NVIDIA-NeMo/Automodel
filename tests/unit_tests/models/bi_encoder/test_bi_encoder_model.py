@@ -18,7 +18,11 @@ import torch
 
 import nemo_automodel._transformers.auto_model as am
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, colbert_scores_and_labels
+from nemo_automodel.recipes.retrieval.train_bi_encoder import (
+    TrainBiEncoderRecipe,
+    colbert_scores_and_labels,
+    distributed_colbert_scores_and_labels,
+)
 
 
 class DummyModel:
@@ -206,7 +210,6 @@ def test_colbert_scores_and_labels_masks_padding_before_maxsim():
             [[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
         ]
     )
-    query_attention_mask = torch.tensor([[1, 1], [1, 0]])
     key = torch.tensor(
         [
             [[-0.4, -0.4, 0.0, 0.0], [-0.6, -0.6, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
@@ -223,12 +226,39 @@ def test_colbert_scores_and_labels_masks_padding_before_maxsim():
         query,
         key,
         current_train_n_passages=3,
-        query_attention_mask=query_attention_mask,
         key_attention_mask=key_attention_mask,
     )
 
     assert torch.allclose(scores, torch.tensor([[-0.8, 1.5, 0.3], [-0.2, 0.6, -0.4]]))
     assert torch.equal(labels, torch.tensor([0, 0]))
+
+
+def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
+    query = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+    key = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[0.0, 1.0]],
+            [[0.5, 0.0]],
+            [[0.0, 0.5]],
+            [[0.8, 0.0]],
+            [[0.0, 0.8]],
+            [[0.2, 0.0]],
+            [[0.0, 0.2]],
+        ]
+    )
+    key_attention_mask = torch.ones(key.shape[:2], dtype=torch.long)
+
+    scores, labels = distributed_colbert_scores_and_labels(
+        query,
+        key,
+        current_train_n_passages=2,
+        key_attention_mask=key_attention_mask,
+        rank=1,
+    )
+
+    assert scores.shape == (2, 8)
+    assert torch.equal(labels, torch.tensor([4, 6]))
 
 
 def test_forward_backward_step_supports_local_colbert_pooling():
