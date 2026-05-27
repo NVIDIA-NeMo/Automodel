@@ -175,6 +175,24 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
+def _ste_floor(y: torch.Tensor) -> torch.Tensor:
+    """Straight-through floor: forward = floor(y), backward = identity."""
+    return (y.floor() - y).detach() + y
+
+
+def tanh_int8_quantize(x: torch.Tensor) -> torch.Tensor:
+    """PPLX-style INT8 quantization with straight-through floor.
+
+    Forward: floor(127 * tanh(x) + 0.5), values in {-127, ..., 127}.
+    Backward: gradient flows through tanh as if floor were the identity.
+
+    The output is float-dtype with integer-valued entries; downstream cosine
+    similarity (via L2 normalization) works as usual.
+    """
+    y = 127.0 * torch.tanh(x) + 0.5
+    return _ste_floor(y)
+
+
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
@@ -359,12 +377,21 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        output_embedding_quantization: Optional[str] = None,
     ):
         super().__init__()
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
+        if output_embedding_quantization is not None and output_embedding_quantization not in ("int8",):
+            raise ValueError(
+                f"Unsupported output_embedding_quantization {output_embedding_quantization!r}. "
+                f"Supported: None, 'int8'."
+            )
+
+        self.output_embedding_quantization = output_embedding_quantization
+        self.config.output_embedding_quantization = output_embedding_quantization
 
     @classmethod
     def build(
@@ -374,6 +401,7 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        output_embedding_quantization: Optional[str] = None,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -393,6 +421,7 @@ class BiEncoderModel(nn.Module):
             pooling=pooling,
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+            output_embedding_quantization=output_embedding_quantization,
         )
 
     def save_pretrained(self, save_directory: str, **kwargs):
@@ -429,6 +458,9 @@ class BiEncoderModel(nn.Module):
             attention_mask=input_dict["attention_mask"],
             pool_type=self.pooling,
         )
+
+        if self.output_embedding_quantization == "int8":
+            embeds = tanh_int8_quantize(embeds.float()).to(embeds.dtype)
         if self.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
 

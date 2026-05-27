@@ -1142,6 +1142,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         pretrained_model_name_or_path: str,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        output_embedding_quantization: Optional[str] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
@@ -1153,6 +1154,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
             l2_normalize: Whether to L2-normalize embeddings.
+            output_embedding_quantization: Optional quantization-aware training mode applied to emitted embeddings
+                after pooling and before L2 normalization. Currently supports ``None`` or ``"int8"``.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1162,6 +1165,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            output_embedding_quantization=output_embedding_quantization,
             **kwargs,
         )
 
