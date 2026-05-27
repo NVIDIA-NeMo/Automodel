@@ -175,18 +175,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     }
 
 
-def parse_distributed_setup_config(cfg_dict: dict) -> dict:
-    """Parse a distributed config dict into durable setup intent."""
-    parsed = parse_distributed_section(cfg_dict)
-    return {
-        "strategy": parsed["strategy_config"],
-        "parallelism_sizes": parsed["parallelism_sizes"],
-        "pipeline_config": parsed["pipeline_config"],
-        "moe_parallel_config": parsed["moe_parallel_config"],
-        "activation_checkpointing": parsed["activation_checkpointing"],
-    }
-
-
 def _distributed_cfg_to_dict(cfg: Any | None) -> dict:
     """Return a distributed config dict from ``cfg`` or an empty fallback."""
     if cfg is None:
@@ -268,5 +256,12 @@ def create_distributed_setup_from_config(
         if value is not None:
             cfg_dict[key] = value
 
-    setup_kwargs = parse_distributed_setup_config(cfg_dict)
-    return DistributedSetup.build(**setup_kwargs, world_size=world_size)
+    parsed = parse_distributed_section(cfg_dict)
+    return DistributedSetup.build(
+        strategy=parsed["strategy_config"],
+        parallelism_sizes=parsed["parallelism_sizes"],
+        pipeline_config=parsed["pipeline_config"],
+        moe_parallel_config=parsed["moe_parallel_config"],
+        activation_checkpointing=parsed["activation_checkpointing"],
+        world_size=world_size,
+    )

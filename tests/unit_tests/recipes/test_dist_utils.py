@@ -31,7 +31,6 @@ from nemo_automodel.components.distributed.pipelining.config import PipelineConf
 from nemo_automodel.recipes._dist_utils import (
     create_distributed_setup_from_config,
     parse_distributed_section,
-    parse_distributed_setup_config,
 )
 
 
@@ -124,17 +123,6 @@ class TestParsing:
         copy = original.copy()
         parse_distributed_section(original)
         assert original == copy
-
-    def test_parse_distributed_setup_config_returns_build_kwargs(self):
-        result = parse_distributed_setup_config(
-            {"strategy": "fsdp2", "tp_size": 2, "ep_size": 2, "activation_checkpointing": True}
-        )
-
-        assert isinstance(result["strategy"], FSDP2Config)
-        assert result["parallelism_sizes"].tp_size == 2
-        assert result["parallelism_sizes"].ep_size == 2
-        assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
-        assert result["activation_checkpointing"] is True
 
 
 # ---------------------------------------------------------------------------
