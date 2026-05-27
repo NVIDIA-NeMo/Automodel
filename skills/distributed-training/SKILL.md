@@ -73,8 +73,8 @@ initialize_distributed()                       [components/distributed/init_util
     -> initializes torch.distributed process group and returns DistInfo
 YAML distributed section + DistInfo.world_size
     -> parse_distributed_section()          [recipes/_dist_utils.py]
-    -> create_mesh_context_from_config()                  [recipes/_dist_utils.py]
-        -> create_mesh_context()            [components/distributed/device_mesh.py]
+    -> create_distributed_setup_from_config()              [recipes/_dist_utils.py]
+        -> DistributedSetup.build()         [components/distributed/config.py]
     -> instantiate_infrastructure()         [_transformers/infrastructure.py]
         -> _instantiate_distributed()       -> FSDP2Manager / MegatronFSDPManager / DDPManager
         -> _instantiate_pipeline()          -> AutoPipeline (if pp_size > 1)
