@@ -56,7 +56,7 @@ Refer to the [NeMo AutoModel Installation Guide](../../../guides/installation.md
 
 ## Fine-Tune the Model
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
+Refer to the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md) and the [Large MoE Fine-Tuning Guide](../../../guides/llm/large-moe-finetune.md).
 
 ## Hugging Face Model Cards
 
