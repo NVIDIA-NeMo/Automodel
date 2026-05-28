@@ -398,13 +398,6 @@ class DFlashStrategy(DLLMStrategy):
         if backend not in ("sdpa", "flex_attention"):
             raise ValueError(f"dflash.attention_backend must be 'sdpa' or 'flex_attention', got {backend!r}")
         if backend == "flex_attention":
-            from nemo_automodel.components.attention.dflash_mask import flex_attention_available
-
-            if not flex_attention_available():
-                raise RuntimeError(
-                    "attention_backend='flex_attention' requires torch.nn.attention.flex_attention; "
-                    "upgrade PyTorch or set attention_backend='sdpa'."
-                )
             # Route the draft model's per-layer attention through transformers'
             # flex_attention dispatcher. The draft model reads
             # ``self.config._attn_implementation`` at runtime via ALL_ATTENTION_FUNCTIONS.

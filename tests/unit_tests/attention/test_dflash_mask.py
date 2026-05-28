@@ -19,10 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.attention.dflash_mask import (
-    create_dflash_sdpa_mask,
-    flex_attention_available,
-)
+from nemo_automodel.components.attention.dflash_mask import create_dflash_sdpa_mask
 
 
 def _reference_dflash_mask(anchor_positions, block_keep_mask, ctx_len, block_size):
@@ -120,10 +117,6 @@ def test_sdpa_mask_overlapping_anchors():
     assert torch.equal(attended, ref)
 
 
-@pytest.mark.skipif(
-    not flex_attention_available(),
-    reason="FlexAttention requires PyTorch >= 2.5 with torch.nn.attention.flex_attention",
-)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
 def test_flex_block_mask_matches_reference():
     """FlexAttention BlockMask materialised back to dense matches the reference."""

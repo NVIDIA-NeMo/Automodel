@@ -9,7 +9,7 @@ This approach enables **parallel token generation** and **bidirectional attentio
 
 NeMo AutoModel currently supports the following dLLM model families:
 
-- **LLaDA / LLaDA2 (MDLM)** — Bidirectional masked diffusion. The model receives corrupted tokens and predicts the clean token at each masked position.
+- **LLaDA / LLaDA2 (MDLM)** — Bidirectional masked diffusion. The model receives corrupted tokens and predicts the clean token at each masked position (see [LLaDA2 paper](https://arxiv.org/abs/2602.08676)).
 - **Nemotron-Labs-Diffusion (Hybrid)** — Combines diffusion with an autoregressive loss. During training, the model processes clean tokens plus a `masked_indices` sidecar and learns both a diffusion objective and an AR objective simultaneously.
 - **DFlash** — Speculative block diffusion. A small draft model proposes tokens for a block conditioned on frozen target LM hidden states; a decay-weighted loss trains it to predict the target's distribution (see [DFlash paper](https://arxiv.org/abs/2602.17270)).
 
@@ -161,6 +161,22 @@ dflash:
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
 | `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, OOMs above ~64). Default `sdpa` for backward compat — set to `flex_attention` for production runs |
 | `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
+
+#### DFlash Training Metrics
+
+In addition to the shared metrics (`loss`, `grad_norm`, `lr`, `mem`, `tps`,
+`mfu`), DFlash runs log a draft top-1 accuracy proxy for acceptance length:
+
+| Metric | Meaning |
+|--------|---------|
+| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` |
+| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`) — the acceptance-length curve |
+
+Both are computed for free inside the chunked linear-CE path (same logits used
+for the loss) and DP/CP-reduced via per-rank raw `(correct, count)` sums that
+are SUM-allreduced and then divided post-reduction, so the values are correct
+across arbitrary per-rank token distributions under any of AutoModel's
+distributed modes.
 
 #### Prepare DFlash Training Data
 
