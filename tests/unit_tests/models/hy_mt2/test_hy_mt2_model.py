@@ -238,6 +238,10 @@ class TestHyMT2ForCausalLM:
             first_k_dense_replace = 1
             max_position_embeddings = 128
             rope_theta = 10000.0
+            # PretrainedConfig populates ``rope_parameters`` from ``rope_theta``
+            # in its ``__init__``; this bare mock skips that, so declare it
+            # explicitly to match what ``get_rope_config`` reads.
+            rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}
             rms_norm_eps = 1e-5
             torch_dtype = "bfloat16"
             attention_bias = False
