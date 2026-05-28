@@ -12,6 +12,8 @@ metadata:
 
 # Adding Model Support to NeMo AutoModel
 
+## Purpose
+
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
 
 ## Instructions
@@ -26,6 +28,13 @@ When answering an onboarding question, keep the response in this order:
 For conceptual onboarding questions, answer from this skill without opening the
 pattern files unless the user asks you to edit code. Mention pattern filenames
 as references, then give the direct checklist.
+
+Use direct action verbs: classify the model, name the files, map the weights,
+register the class, and add tests. Do not discuss distributed strategy,
+launcher configuration, or general recipe authoring unless the user explicitly
+connects it to onboarding a new architecture.
+
+## Examples
 
 Use these compact answer patterns for common questions:
 
