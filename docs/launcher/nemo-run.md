@@ -1,6 +1,6 @@
 # Run with NeMo-Run
 
-In this guide, you will learn how to launch NeMo AutoModel training jobs using [NeMo-Run](https://github.com/NVIDIA/NeMo-Run). NeMo-Run supports multiple backends including Slurm, Kubernetes, Docker, and local execution. For cloud-based training, see [Run on Any Cloud with SkyPilot](./skypilot.md). For direct sbatch usage, see [Run on a Cluster (Slurm)](./slurm.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
+In this guide, you will learn how to launch NeMo AutoModel training jobs using [NeMo-Run](https://github.com/NVIDIA-NeMo/Run). NeMo-Run supports multiple backends including Slurm, Kubernetes, Docker, and local execution. For cloud-based training, see [Run on Any Cloud with SkyPilot](./skypilot.md). For direct sbatch usage, see [Run on a Cluster (Slurm)](./slurm.md). For single-node workstation usage, see [Run on Your Local Workstation](./local-workstation.md).
 
 NeMo-Run is an open-source tool from NVIDIA that manages job submission across different execution backends. You define your compute configuration once in a Python file and reuse it across all your training jobs.
 
