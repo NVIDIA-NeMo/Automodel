@@ -165,6 +165,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
         (
+            "HyMT2ForCausalLM",
+            ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
+        ),
+        (
             "Qwen2ForCausalLM",
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
         ),

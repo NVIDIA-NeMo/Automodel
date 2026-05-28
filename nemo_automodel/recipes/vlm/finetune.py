@@ -75,6 +75,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScale
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -182,7 +183,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -190,6 +191,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
@@ -208,6 +210,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             if isinstance(part, MegatronFSDP):
                 fully_shard_optimizer(tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="vlm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -773,7 +783,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
