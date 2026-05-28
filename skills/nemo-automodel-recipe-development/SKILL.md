@@ -22,6 +22,27 @@ For recipe questions, answer with the smallest complete path to action:
    configure something.
 4. End with a local validation command or tiny CPU-compatible test.
 
+For conceptual recipe questions, answer from this skill without inspecting the
+repository or loading other AutoModel skills unless the user asks you to edit
+files. Keep the response focused on recipe YAML, builders, CLI routing, tests,
+and local validation.
+
+Use these compact answer patterns for common questions:
+
+- New finetuning recipe variant: start from the closest file under
+  `nemo_automodel/recipes/`, update the model, dataset or dataloader,
+  optimizer, loss, LR scheduler, step scheduler, and checkpoint builders,
+  register a CLI route only if adding a command or domain alias, add example
+  YAML under `examples/`, then add a tiny CPU-compatible unit test and run
+  `automodel finetune llm -c <config.yaml>`.
+- `_target_` fields: describe `_target_` as the fully qualified Python callable,
+  explain that sibling keys become keyword arguments, show optimizer and dataset
+  examples, and mention nested CLI overrides such as `--optimizer.lr`.
+- Validation and checkpointing: name `step_scheduler.val_check_interval`,
+  `step_scheduler.checkpoint_interval`, `validation_dataset`,
+  `restore_from.path`, and consolidated safetensors; include the minimal YAML
+  snippet from this skill.
+
 For validation and checkpointing, always name:
 
 - `step_scheduler.val_check_interval` for validation cadence.
@@ -195,25 +216,6 @@ validation_dataset:
 restore_from:
   path: /checkpoints/step-500
 ```
-
-New finetuning recipe variant:
-
-1. Copy the closest recipe under `nemo_automodel/recipes/`.
-2. Update model, dataset, optimizer, loss, scheduler, and checkpoint builders.
-3. Register a CLI route if adding a command or domain alias.
-4. Add an example YAML under `examples/`.
-5. Add a tiny CPU-compatible unit test and run
-   `automodel finetune llm -c <config.yaml>`.
-
-## Adding a New Recipe Variant
-
-1. **Find the closest existing recipe** in `nemo_automodel/recipes/` (llm/, vlm/, diffusion/, retrieval/).
-2. **Copy it** and rename for your variant.
-3. **Modify** the model, dataset, and loss sections to match your use case.
-4. **Register the CLI route** if adding a new command or domain alias.
-5. **Add a YAML config** in `examples/` with sensible defaults.
-6. **Write a unit test** with a tiny config (small hidden dims, 1-2 layers, CPU-compatible).
-7. **Test locally**: `automodel finetune llm -c your_new_config.yaml`.
 
 ## Domain-Specific Notes
 

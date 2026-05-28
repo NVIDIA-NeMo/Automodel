@@ -252,29 +252,6 @@ model = NeMoAutoModelForCausalLM.from_pretrained("<org>/<model-name>")
 
 Before using full-size models, verify with a tiny config (1-2 layers, small hidden dim) to catch shape mismatches early.
 
-## Examples
-
-MoE state-dict answer outline:
-
-1. Inspect `config.json` for expert fields such as `num_local_experts`,
-   `n_routed_experts`, or `num_experts_per_tok`.
-2. Start from [moe-patterns.md](./moe-patterns.md) and the closest existing MoE
-   implementation.
-3. In `state_dict_adapter.py`, map router, routed experts, shared experts, and
-   gate/up/down projections explicitly.
-4. Add tests that compare expected key names and run tiny-config numerical
-   equivalence before loading full checkpoints.
-
-VLM answer outline:
-
-1. Classify as VLM only when the config has `vision_config`, `text_config`, and
-   a conditional-generation architecture.
-2. Check text backbone, vision tower, projector, processor assumptions, state
-   dict mappings for text and vision weights, registry registration, and tiny
-   image-text tests.
-
----
-
 ## Phase 4: Tests
 
 ### General testing rules
