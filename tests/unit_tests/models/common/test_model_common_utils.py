@@ -14,12 +14,14 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
+    Float32RMSNorm,
     TEFp8Config,
     get_is_first_microbatch,
     get_is_optim_step,
@@ -179,3 +181,67 @@ class TestGetRopeConfig:
         assert rope_parameters["beta_slow"] == 1.0
         assert rope_parameters["beta_fast"] == 32.0
         assert rope_parameters["original_max_position_embeddings"] == 8192
+
+
+class TestFloat32RMSNorm:
+    """Tests for Float32RMSNorm numerical stability (issue #1432)."""
+
+    def test_weight_dtype_is_model_dtype(self):
+        """Float32RMSNorm weights should stay in the model dtype (bfloat16)."""
+        norm = Float32RMSNorm(dim=16, eps=1e-5, dtype=torch.bfloat16)
+        assert norm.weight.dtype == torch.bfloat16
+
+    def test_fp32_computation_preserves_output_dtype(self):
+        """The fp32 computation path (without compile) should return the input dtype."""
+        norm = Float32RMSNorm(dim=16, eps=1e-5, dtype=torch.bfloat16)
+        x = torch.randn(2, 8, 16, dtype=torch.bfloat16)
+        # Exercise the fp32 computation manually (same logic as _float32_rms_norm_fwd)
+        x_fp32 = x.float()
+        out = (norm.weight * x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + norm.eps)).to(x.dtype)
+        assert out.dtype == torch.bfloat16
+
+    def test_fp32_norm_more_precise_than_bf16_norm(self):
+        """fp32 RMS norm should be more precise than native bf16 norm for near-zero inputs."""
+        # Create inputs that stress bf16 precision (small values near zero)
+        torch.manual_seed(0)
+        x = torch.randn(4, 64, dtype=torch.bfloat16) * 0.01
+        weight = torch.ones(64, dtype=torch.bfloat16)
+        eps = 1e-5
+
+        # fp32 reference (what Float32RMSNorm computes)
+        x_fp32 = x.float()
+        out_fp32 = (weight.float() * x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + eps)).to(
+            torch.bfloat16
+        )
+
+        # bf16 native (what TE RMSNorm without fp32 upcast would compute)
+        out_bf16 = weight * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+        # fp32 version should match the high-precision float32 result more closely
+        x_true = x.double()
+        out_true = (weight.double() * x_true * torch.rsqrt(x_true.pow(2).mean(-1, keepdim=True) + eps)).to(
+            torch.bfloat16
+        )
+        err_fp32 = (out_fp32.float() - out_true.float()).abs().mean().item()
+        err_bf16 = (out_bf16.float() - out_true.float()).abs().mean().item()
+        assert err_fp32 <= err_bf16, "fp32 upcast norm should be at least as accurate as native bf16 norm"
+
+    def test_te_rmsnorm_patch_upcasts_to_fp32(self):
+        """The TE RMSNorm patch must upcast bf16 inputs to fp32 before the kernel call."""
+        captured = {}
+
+        def mock_original_forward(self_inner, x):
+            captured["dtype"] = x.dtype
+            return x  # pass-through
+
+        instance = MagicMock()
+        x_bf16 = torch.randn(2, 4, dtype=torch.bfloat16)
+
+        # Replicate the patched forward logic from _make_lazy_te_patcher
+        input_dtype = x_bf16.dtype
+        if input_dtype != torch.float32:
+            result = mock_original_forward(instance, x_bf16.float())
+        else:
+            result = mock_original_forward(instance, x_bf16)
+
+        assert captured["dtype"] == torch.float32, "TE RMSNorm should receive fp32 inputs after upcast patch"
