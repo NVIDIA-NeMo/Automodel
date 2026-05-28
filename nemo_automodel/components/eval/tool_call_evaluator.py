@@ -29,6 +29,7 @@ sharding and all-reduce of metrics are left to the caller (the training
 recipe), which already has the dist environment in hand.
 """
 
+import gc
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -98,6 +99,8 @@ class ToolCallAccuracyEvaluator:
         do_sample: bool = False,
         metric_prefix: str = "tool_call",
         sample_shard: Optional[tuple] = None,
+        raise_on_cuda_oom: bool = True,
+        run_on_fsdp2: bool = False,
     ) -> None:
         if (dataset_name is None) == (path is None):
             raise ValueError("Exactly one of `dataset_name` or `path` must be provided")
@@ -112,8 +115,15 @@ class ToolCallAccuracyEvaluator:
         self._do_sample = do_sample
         self.metric_prefix = metric_prefix.rstrip("/")
         self._sample_shard = sample_shard
+        self._raise_on_cuda_oom = raise_on_cuda_oom
+        self.run_on_fsdp2 = run_on_fsdp2
 
         self._samples_cache: Optional[List[Dict[str, Any]]] = None
+
+    def _cleanup_cuda(self) -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _load_samples(self) -> List[Dict[str, Any]]:
         if self._samples_cache is None:
@@ -214,7 +224,7 @@ class ToolCallAccuracyEvaluator:
             return None
         return list(ids)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(self, model, tokenizer) -> Dict[str, float]:
         """Run generation-based tool-call evaluation against ``model``.
 
@@ -272,7 +282,19 @@ class ToolCallAccuracyEvaluator:
                     attention_mask=attention_mask,
                     **gen_kwargs,
                 )
+            except torch.OutOfMemoryError:
+                skip_reasons["generate_cuda_oom"] = skip_reasons.get("generate_cuda_oom", 0) + 1
+                self._cleanup_cuda()
+                if self._raise_on_cuda_oom:
+                    raise
+                continue
             except Exception as exc:
+                if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+                    skip_reasons["generate_cuda_oom"] = skip_reasons.get("generate_cuda_oom", 0) + 1
+                    self._cleanup_cuda()
+                    if self._raise_on_cuda_oom:
+                        raise
+                    continue
                 skip_reasons["generate_raised"] = skip_reasons.get("generate_raised", 0) + 1
                 logger.warning(
                     "model.generate failed on sample id=%s turn=%s: %s",
@@ -289,6 +311,7 @@ class ToolCallAccuracyEvaluator:
             for k in _METRIC_KEYS:
                 sums[k] += metrics[k]
             n_scored += 1
+            del input_ids, attention_mask, output
 
         n_considered = len(samples)
         n_skipped = n_considered - n_scored
@@ -313,10 +336,12 @@ class ToolCallAccuracyEvaluator:
             for k in _METRIC_KEYS:
                 result[f"{self.metric_prefix}/{k}"] = 0.0
         result[f"{self.metric_prefix}/_count"] = float(n_scored)
+        result[f"{self.metric_prefix}/_skipped"] = float(n_skipped)
+        for reason, count in skip_reasons.items():
+            result[f"{self.metric_prefix}/_skip_{reason}"] = float(count)
 
         # generate() under FSDP unshards parameters and caches large
         # intermediate buffers; release them so the next training step
         # does not OOM on its own logits.
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._cleanup_cuda()
         return result
