@@ -1,15 +1,16 @@
-# Skills
+# Public Skills
 
-Reusable task guides for AI coding agents working in this repo.
+Customer-facing task guides for AI coding agents using NeMo AutoModel.
 
-Skills are defined centrally here and symlinked into the agentic directories
-that need them, keeping a single source of truth without polluting personal
-`.claude/skills/` setups.
+Only skills intended for the public catalog live under `skills/`. Contributor
+workflow skills live under `.agents/contributor-skills/` so they remain
+available in this repository without being synced externally.
 
 ## Usage
 
-Skills are synced to the global Claude Code skill registry via CI and are
-available to AI agents as invocable slash commands without any extra flags.
+These public skills are synced to the global Claude Code skill registry via CI
+and are available to AI agents as invocable slash commands without any extra
+flags.
 
 To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 
@@ -19,11 +20,5 @@ To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 |---|---|
 | `model-onboarding` | Onboard a new model family (LLM, VLM, MoE, etc.) |
 | `recipe-development` | Create and modify training/eval recipes |
-| `parity-testing` | Verify numerical correctness against references |
 | `distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
 | `launcher-config` | Slurm and SkyPilot job submission |
-| `linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
-| `cicd` | Commit/PR workflow, CI trigger mechanism, failure investigation |
-| `build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
-| `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
-| `fern-docs` | Maintain the Fern docs site under `fern/` — pages, slugs, redirects, version aliases, library reference |

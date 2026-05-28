@@ -310,10 +310,17 @@ After implementation and unit tests are complete, run the full parity-testing
 workflow to verify that the new model produces numerically equivalent results to
 the reference HuggingFace implementation.
 
-**Read and follow the parity-testing skill** at
-`.claude/skills/parity-testing/SKILL.md`. It walks through three levels of
-comparison (state-dict round-trip, component-level parity, end-to-end forward
-pass) and provides debugging steps when a level fails.
+Run three levels of comparison:
+
+1. State-dict round-trip: load a reference HuggingFace checkpoint, convert it
+   into the NeMo AutoModel layout, export it back, and verify that all mapped
+   tensors match the reference names, shapes, dtypes, and values within the
+   expected tolerance.
+2. Component-level parity: compare rewritten attention, MLP, normalization,
+   RoPE, and MoE components against the HuggingFace implementation with fixed
+   seeds and identical dtype.
+3. End-to-end forward pass: run the full NeMo AutoModel and HuggingFace model
+   on the same tokenized input and compare logits, hidden states, and loss.
 
 Do not skip this phase. A model that passes unit tests can still diverge from HF
 due to subtle weight-conversion bugs, backend differences, or RoPE mismatches
@@ -359,5 +366,5 @@ that only surface in a full parity comparison.
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page
-- [ ] Ran parity-testing skill (state-dict round-trip, component parity, E2E forward pass)
+- [ ] Ran state-dict round-trip, component parity, and E2E forward-pass parity checks
 - [ ] Set `ModelClass = <Name>ForCausalLM` at module bottom
