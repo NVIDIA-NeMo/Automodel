@@ -154,11 +154,19 @@ def _uses_te_dot_product_attention(model_or_cfg):
 def _uses_thd_collater(cfg_dataloader):
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-    return (
-        True
-        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
-        else False
-    )
+    if not hasattr(cfg_dataloader, "collate_fn"):
+        return False
+    cf = cfg_dataloader.collate_fn
+    if cf == packed_sequence_thd_collater:
+        return True
+    # Fallback: match by qualified name (handles wrapper/partial cases).
+    name = getattr(cf, "__name__", None)
+    module = getattr(cf, "__module__", None)
+    if name == "packed_sequence_thd_collater" and module == "nemo_automodel.components.datasets.utils":
+        return True
+    if isinstance(cf, str) and cf == "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater":
+        return True
+    return False
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -1334,15 +1342,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        _model_or_cfg = self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+        _te_attn = _uses_te_dot_product_attention(_model_or_cfg)
+        _thd_collater = _uses_thd_collater(self.cfg.dataloader)
+        # Use the THD/cu_seqlens batch processing whenever the dataset is
+        # THD-packed — required by both TE attention AND nemotron-h mamba
+        # (mamba consumes cu_seqlens for seq_idx in layers.py:282-291). The
+        # original gate required TE attention to be present in THIS rank's
+        # modules, which spuriously dropped stage 0 (mamba+moe only, no
+        # attention layers) under PP and left cu_seqlens unbuilt downstream.
+        _use_te_value = _thd_collater
+        _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
-            )
-            and _uses_thd_collater(self.cfg.dataloader),
+            use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+            num_chunks=_num_chunks_value,
         )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
@@ -1366,7 +1382,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-
+                # Hand legacy THD-pack ``cu_seqlens`` to the pipeline loss
+                # for models that don't emit a seq_idx tail in their output
+                # tuple. The neat-packing path under PP is now handled by
+                # the model itself: the last-stage forward appends a
+                # per-microbatch ``[B, S] int32 seq_idx`` to its output
+                # tuple, and ``PipelineCausalLMLoss._extract_seq_idx_tail``
+                # picks it up by dtype detection. No per-microbatch state
+                # is plumbed through the recipe.
+                _cu = batch_filtered.get("cu_seqlens")
+                if isinstance(_cu, torch.Tensor) and _cu.dim() == 2 and _cu.shape[0] == 1:
+                    _cu = _cu.squeeze(0)
+                if self.pp.info.has_last_stage and getattr(self.pp.info.schedule, "_loss_fn", None) is not None:
+                    _loss_fn_obj = self.pp.info.schedule._loss_fn
+                    if hasattr(_loss_fn_obj, "cu_seqlens"):
+                        _loss_fn_obj.cu_seqlens = _cu
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:

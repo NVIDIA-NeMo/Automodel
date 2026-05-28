@@ -44,6 +44,8 @@ class NemotronV3Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.attention_bias = getattr(config, "attention_bias", False)
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
+        # Cached for debug-print role disambiguation (backbone vs mtp sublayer).
+        self.num_hidden_layers = int(getattr(config, "num_hidden_layers", 0))
 
         self.q_proj = initialize_linear_module(
             self.backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, self.attention_bias
@@ -286,9 +288,23 @@ class NemotronV3Mamba2Mixer(nn.Module):
             # (after all-to-all gather).  Scale total_len by cp_size so that
             # seq_idx has the correct global length.
             cp_size = self.cp.cp_size if self.cp is not None else 1
-            total_len = (hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]) * cp_size
-            positions = torch.arange(total_len, device=hidden_states.device)
-            seq_idx = (torch.searchsorted(cu_seqlens[1:], positions)).unsqueeze(0).to(torch.int32)
+            if hidden_states.dim() == 3 and batch_size > 1:
+                # BSHD with B > 1 (e.g. default-collater validation): the
+                # cu_seqlens derived in model.py from a 2D attention_mask is
+                # global (cumsum across rows), not per-row. mamba_ssm asserts
+                # seq_idx.shape == (B, S) and processes each row independently,
+                # so treat each row as a single sub-sequence (intra-row neat
+                # packing is handled separately via _packed_seq_ids upstream).
+                seq_idx = torch.zeros(batch_size, seq_len, device=hidden_states.device, dtype=torch.int32)
+            else:
+                total_len = (hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]) * cp_size
+                positions = torch.arange(total_len, device=hidden_states.device)
+                # ``right=True`` so a position equal to a boundary (the first token of
+                # a new sub-seq, position == cu_seqlens[k]) maps to ``k``, not ``k-1``.
+                # Without this mamba's SSD scan resets state one token late at every
+                # sub-seq boundary — the first token of a new sub-seq sees the
+                # previous sub-seq's accumulated state.
+                seq_idx = torch.searchsorted(cu_seqlens[1:], positions, right=True).unsqueeze(0).to(torch.int32)
 
         # --- Path A: Training (no cache) → fused kernel ---
         if not use_cache:
