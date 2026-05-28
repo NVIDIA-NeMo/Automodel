@@ -124,6 +124,35 @@ Key components:
   training, with exponentially decaying loss weights (`0.8^i`). This teaches the
   drafter to make multi-step predictions — exactly what speculative decoding needs.
 
+### EAGLE-3.1 Drafter Toggles
+
+The same `train_eagle3` recipe supports the EAGLE-3.1 drafter variant via two
+optional flags in `recipe_args`. Both default to `false`, so existing EAGLE-3
+configs and checkpoints behave identically. Setting them applies the EAGLE-3.1
+architectural changes from
+[vllm-project/vllm#42764](https://github.com/vllm-project/vllm/pull/42764) to
+the Llama-style draft. The MLA-backbone community release
+[`lightseekorg/kimi-k2.6-eagle3.1-mla`](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3.1-mla)
+is a separate architecture (`Eagle3DeepseekV2ForCausalLM`) and is **not**
+produced by this recipe.
+
+| Flag | Effect |
+|------|--------|
+| `fc_norm` | Apply an independent RMSNorm to each of the `num_aux_hidden_states` (3 by default) auxiliary hidden-state chunks before they are concatenated and projected by `model.fc`. Stored as an `nn.ModuleList` with on-disk keys `model.fc_norm.0.weight`, `model.fc_norm.1.weight`, ... matching vLLM's layout so checkpoints load directly. |
+| `norm_output` | Route the existing final RMSNorm (`model.norm`) over the per-step hidden state returned by the drafter so the next TTT step (and `lm_head`) consume the post-norm state instead of the raw decoder output. Adds no parameters. |
+
+Together they remove the "attention drift" pattern (loss of focus on sink
+tokens at deeper speculation depths) reported by the EAGLE-3.1 paper and let
+the drafter behave more like a recurrently applied module than a stack of
+extra layers bolted onto the target.
+
+```yaml
+recipe_args:
+  # ... standard EAGLE-3 fields ...
+  fc_norm: true
+  norm_output: true
+```
+
 ### How EAGLE-1 Differs
 
 EAGLE-1 is simpler: it uses a single transformer layer, predicts the full
@@ -324,6 +353,8 @@ checkpoint:
 | `ttt_steps` | TTT unroll depth; 4 is the default, cost is linear per step |
 | `draft_vocab_size` | Draft output vocabulary size; smaller = faster inference |
 | `freeze_embeddings` | Freeze the embedding table copied from the target so only draft layers train (recommended `true`) |
+| `fc_norm` | EAGLE-3.1: per-chunk independent RMSNorm (`ModuleList`) on auxiliary hidden states before the `fc` projection (default `false`) |
+| `norm_output` | EAGLE-3.1: feed the post-`model.norm` hidden state into the next TTT step and `lm_head` (default `false`) |
 | `warmup_ratio` | Fraction of total steps for LR warmup |
 
 ### Launch training
@@ -613,6 +644,7 @@ python -m nemo_automodel.components.speculative.serve_sglang \
 | [llama_eagle3_mvp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_mvp.yaml) | Llama 3.2 1B | EAGLE-3 | Quick test, single GPU |
 | [llama_eagle3_mvp_flash_attn.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_mvp_flash_attn.yaml) | Llama 3.2 1B | EAGLE-3 | With FlashAttention-2 |
 | [llama_eagle3_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_perfectblend.yaml) | Llama 3.1 8B | EAGLE-3 | Production config, 200k samples |
+| [llama_eagle3_1_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3_1/llama_eagle3_1_perfectblend.yaml) | Llama 3.1 8B | EAGLE-3.1 | Production config with `fc_norm` + `norm_output` enabled |
 | [llama_eagle1_mvp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle1/llama_eagle1_mvp.yaml) | Llama 3.2 1B | EAGLE-1 | Quick test, single GPU |
 | [llama_eagle2_mvp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle2/llama_eagle2_mvp.yaml) | Llama 3.2 1B | EAGLE-2 | Same as EAGLE-1 (alias) |
 
