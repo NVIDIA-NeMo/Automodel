@@ -30,16 +30,18 @@
     ]
   },
   {
-    "id": "distributed-training-003-negative-launcher",
-    "question": "How do I submit a NeMo AutoModel job to a Slurm cluster and set the container image?",
-    "expected_skill": null,
+    "id": "distributed-training-003-context-packing",
+    "question": "For long-context NeMo AutoModel training with sequence packing, how should I set context parallelism and packed_sequence_size?",
+    "expected_skill": "distributed-training",
     "expected_script": null,
-    "should_trigger": false,
-    "ground_truth": "The agent should not route to distributed-training because this is a launcher and job submission question. It should say this is outside distributed strategy selection and belongs to launcher configuration.",
+    "ground_truth": "The agent routes to distributed-training, recommends fsdp2 with cp_size greater than 1 for long sequences, explains that context parallelism shards Q/K/V on the sequence dimension, and states that packed_sequence_size must be divisible by cp_size. It should mention that local_batch_size must be 1 when packed sequences are enabled, that the dataset collator packs sequences up to packed_sequence_size, and that CP uses make_cp_batch_and_ctx or equivalent context-parallel hooks before the forward pass.",
     "expected_behavior": [
-      "Does not route to distributed-training",
-      "Recognizes this as a Slurm launcher configuration task",
-      "Does not answer by changing tensor, pipeline, context, or expert parallelism settings"
+      "Routes to distributed-training",
+      "Recommends fsdp2 with cp_size > 1 for long sequences",
+      "Explains that CP shards sequence-dimension tensors such as Q/K/V",
+      "States packed_sequence_size must be divisible by cp_size",
+      "Mentions local_batch_size must be 1 for packed sequences",
+      "Mentions make_cp_batch_and_ctx or context-parallel hooks before forward"
     ]
   }
 ]

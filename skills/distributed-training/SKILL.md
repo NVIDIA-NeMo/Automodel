@@ -30,6 +30,14 @@ Decision tree:
 - Large models (70B+): `fsdp2` with PP + TP.
 - Long sequences (8K+): add CP (`cp_size > 1`).
 
+Quick TP + PP answer:
+
+- Use `strategy: fsdp2`; do not use `megatron_fsdp` when pipeline parallelism is required.
+- Set `tp_size` for tensor parallelism and `pp_size` for pipeline parallelism.
+- Add a `pipeline:` sub-config with `pp_schedule` and `pp_microbatch_size`.
+- Leave `dp_size` unset or `none`; it is inferred as `world_size / (tp_size * pp_size * cp_size)`.
+- Keep TP inside a fast intra-node domain when possible, and use PP across model depth for 70B+ models.
+
 Quick MoE expert-parallel answer:
 
 - Start with `strategy: fsdp2` and `ep_size > 1`.
