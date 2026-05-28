@@ -180,6 +180,75 @@ class _StubTokenizerChatWithReasoning(_StubTokenizerPlain):  # noqa: D401
         return ids
 
 
+class _RecordingPaddingTokenizer(_StubTokenizerPlain):
+    """Stub tokenizer that records ``padding_side`` during ``__call__``.
+
+    Used to assert that ``format_prompt_completion`` flips the side to
+    ``"right"`` for the duration of the tokenize call and restores the
+    original value after — including when the original is ``"left"`` (the
+    transformers v5.8 ``LlamaTokenizer`` class default).
+    """
+
+    padding_side = "right"
+
+    def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
+        self.padding_side_during_call = self.padding_side
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+        )
+
+
+@pytest.mark.parametrize("initial_side", ["left", "right"])
+def test_format_prompt_completion_forces_right_padding_and_restores(initial_side):
+    """Covers the padding_side save/restore wrapper for both initial sides.
+
+    Each call goes through every line of the wrapper (save, set, try, finally,
+    restore), so the parametrize ensures the inner ``if _saved_padding_side
+    is not None`` branches are exercised regardless of which session codecov
+    looks at.
+    """
+    tok = _RecordingPaddingTokenizer()
+    tok.padding_side = initial_side
+    out = format_prompt_completion(
+        tok,
+        "Context Q?",
+        "A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    assert tok.padding_side_during_call == "right"
+    assert tok.padding_side == initial_side
+    assert "input_ids" in out and "labels" in out
+
+
+def test_format_prompt_completion_without_padding_side_attr_is_a_noop_for_the_wrapper():
+    """Covers the False branches of the padding_side wrapper.
+
+    When the tokenizer has no ``padding_side`` attribute (e.g.
+    ``_StubTokenizerPlain``), ``getattr`` returns ``None`` and the
+    ``if _saved_padding_side is not None`` set/restore branches must
+    short-circuit without touching the tokenizer.
+    """
+    tok = _StubTokenizerPlain()
+    assert not hasattr(tok, "padding_side")
+    out = format_prompt_completion(
+        tok,
+        "Context Q?",
+        "A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    # No attribute was created on the tokenizer as a side effect.
+    assert not hasattr(tok, "padding_side")
+    assert "input_ids" in out and "labels" in out
+
+
 def testformat_prompt_completion_answer_only_mask():
     tok = _StubTokenizerPlain()
     context = "Context"
