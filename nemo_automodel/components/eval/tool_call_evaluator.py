@@ -192,6 +192,13 @@ class ToolCallAccuracyEvaluator:
             return None
 
         if self._max_prompt_tokens is not None and len(ids) > self._max_prompt_tokens:
+            logger.warning(
+                "skipping eval sample id=%s turn=%s: prompt length %d > max_prompt_tokens=%d",
+                sample.get("example_id"),
+                sample.get("turn_index"),
+                len(ids),
+                self._max_prompt_tokens,
+            )
             return None
         return list(ids)
 
@@ -271,4 +278,10 @@ class ToolCallAccuracyEvaluator:
             for k in _METRIC_KEYS:
                 result[f"{self.metric_prefix}/{k}"] = 0.0
         result[f"{self.metric_prefix}/_count"] = float(n_scored)
+
+        # generate() under FSDP unshards parameters and caches large
+        # intermediate buffers; release them so the next training step
+        # does not OOM on its own logits.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return result
