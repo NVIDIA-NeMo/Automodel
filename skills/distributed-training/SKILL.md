@@ -11,6 +11,26 @@ NeMo AutoModel uses PyTorch-native distributed training.
 All parallelism is orchestrated through a single `MeshContext` object that
 holds device meshes, strategy configs, and axis names.
 
+## Response Rules
+
+For strategy-selection answers, give the decision first and then the fields:
+
+- If the user needs TP plus PP, start with `strategy: fsdp2`.
+- List `tp_size`, `pp_size`, `cp_size`, `ep_size`, and the `pipeline:` sub-config.
+- State that `dp_size` is inferred from `world_size / (tp_size * pp_size * cp_size)`.
+- Do not recommend `megatron_fsdp` when PP, EP, or `sequence_parallel` is required.
+
+For MoE expert-parallel answers, use this checklist:
+
+- Start with `strategy: fsdp2` and `ep_size > 1`.
+- Mention the separate `moe_mesh`.
+- Mention the optional `moe:` sub-config and `MoEParallelizerConfig`.
+- State that `ep_size` must divide `dp_size * cp_size`.
+- State that `megatron_fsdp` and `ddp` do not support expert parallelism.
+
+For `megatron_fsdp` limitation questions, answer directly: it does not support
+PP, EP, or `sequence_parallel`; use `fsdp2` for those requirements.
+
 ## Strategy Selection
 
 Three strategies are available, selected via the `distributed.strategy` YAML key:
