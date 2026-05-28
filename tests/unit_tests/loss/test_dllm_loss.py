@@ -320,42 +320,56 @@ class TestDFlashDecayLoss:
 
 
 class TestDFlashDraftAccuracy:
-    """Draft top-1 accuracy metric: value, fused/non-fused parity, DP reduction."""
+    """Per-position draft top-1 accuracy (correct, count) sums.
 
-    def test_none_when_num_tokens_unknown(self, dflash_inputs):
+    The loss returns per-rank raw (correct, count) sums per block offset;
+    the recipe SUM-allreduces both and divides post-reduction, so the
+    reduction works for arbitrary per-rank token distributions without
+    smuggling a per-rank denominator into the numerator.
+    """
+
+    def test_none_when_block_size_unknown(self, dflash_inputs):
+        """Without block_size the per-position split is undefined -> both fields None."""
         logits, target_ids, block_mask = dflash_inputs
         result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask)
-        assert result.draft_acc_sum is None
+        assert result.draft_correct_per_pos is None
+        assert result.draft_count_per_pos is None
 
-    def test_perfect_predictions_give_full_accuracy(self):
-        """argmax == target everywhere -> acc_sum == num_valid / num_tokens."""
-        B, T, V = 2, 4, 8
+    def test_perfect_predictions_give_full_counts(self):
+        """argmax == target everywhere -> per-pos correct equals per-pos count."""
+        B, N, bs, V = 2, 3, 5, 8  # T = N * (bs - 1) = 12
+        T_per = bs - 1
+        T = N * T_per
         target_ids = torch.randint(0, V, (B, T))
         logits = torch.full((B, T, V), -10.0)
         logits.scatter_(2, target_ids.unsqueeze(-1), 10.0)  # peak at the target
         block_mask = torch.ones(B, T)
-        num_tokens = B * T
-        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, num_tokens=num_tokens)
-        assert torch.isclose(result.draft_acc_sum, torch.tensor(1.0))
+        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, block_size=bs)
+        assert result.draft_correct_per_pos.shape == (T_per,)
+        assert torch.equal(result.draft_correct_per_pos, result.draft_count_per_pos)
+        # Each of the T_per offsets has B * N valid positions.
+        assert torch.all(result.draft_count_per_pos == B * N)
 
-    def test_accuracy_counts_only_valid_positions(self):
-        """Wrong predictions under a zero mask must not count."""
-        B, T, V = 1, 4, 8
+    def test_counts_exclude_masked_positions(self):
+        """Positions with block_mask=0 must not contribute to correct OR count."""
+        B, N, bs, V = 1, 1, 5, 8  # T = 4
+        T = N * (bs - 1)
         target_ids = torch.zeros(B, T, dtype=torch.long)
         logits = torch.full((B, T, V), -10.0)
         logits[..., 0] = 10.0  # always predicts class 0 == target
         logits[0, 3] = 0.0
-        logits[0, 3, 1] = 10.0  # position 3 predicts wrong
-        block_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])  # mask out the wrong one
-        num_tokens = 3
-        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, num_tokens=num_tokens)
-        # 3 correct, masked position excluded -> 3/3
-        assert torch.isclose(result.draft_acc_sum, torch.tensor(1.0))
+        logits[0, 3, 1] = 10.0  # offset k=4 predicts wrong
+        block_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+        result = DFlashDecayLoss(loss_gamma=7.0)(logits, target_ids, block_mask, block_size=bs)
+        # k=1,2,3 are correct + counted; k=4 is masked -> zero count, zero correct
+        assert result.draft_correct_per_pos.tolist() == [1.0, 1.0, 1.0, 0.0]
+        assert result.draft_count_per_pos.tolist() == [1.0, 1.0, 1.0, 0.0]
 
     def test_fused_matches_nonfused(self):
-        """forward_fused and forward must agree on loss and accuracy."""
+        """forward_fused and forward must agree on loss and per-position sums."""
         torch.manual_seed(3)
-        B, T, D, V = 2, 6, 16, 32
+        B, N, bs, D, V = 2, 2, 4, 16, 32
+        T = N * (bs - 1)
         hidden = torch.randn(B, T, D)
         weight = torch.randn(V, D)
         target_ids = torch.randint(0, V, (B, T))
@@ -363,33 +377,46 @@ class TestDFlashDraftAccuracy:
         loss_fn = DFlashDecayLoss(loss_gamma=7.0, use_fused_linear_ce=True, chunk_size=4)
 
         logits = torch.nn.functional.linear(hidden, weight)
-        ref = loss_fn(logits, target_ids, block_mask, num_tokens=B * T)
-        fused = loss_fn.forward_fused(hidden, weight, target_ids, block_mask, num_tokens=B * T)
+        ref = loss_fn(logits, target_ids, block_mask, num_tokens=B * T, block_size=bs)
+        fused = loss_fn.forward_fused(hidden, weight, target_ids, block_mask, num_tokens=B * T, block_size=bs)
 
         assert torch.allclose(ref.total_loss, fused.total_loss, atol=1e-4)
-        assert torch.allclose(ref.draft_acc_sum, fused.draft_acc_sum, atol=1e-5)
+        assert torch.equal(ref.draft_correct_per_pos, fused.draft_correct_per_pos)
+        assert torch.equal(ref.draft_count_per_pos, fused.draft_count_per_pos)
 
     def test_dp_sum_reduction_yields_global_accuracy(self):
-        """Per-shard (correct / global_tokens) summed across shards == global accuracy.
-
-        This is the property the recipe relies on: it SUM-allreduces the
-        per-rank draft_acc_sum, so each shard must normalise by the *global*
-        token count (not its own).
+        """SUM-allreduce of per-rank (correct, count) per position, then divide
+        post-reduction, yields the correct global per-position accuracy and
+        overall accuracy. This is the property the recipe relies on for
+        distributed-correct logging under FSDP2.
         """
         torch.manual_seed(5)
-        V = 8
-        # Two uneven shards (different token counts, as ranks would have).
-        t0 = torch.randint(0, V, (1, 5))
-        t1 = torch.randint(0, V, (1, 3))
-        l0 = torch.randn(1, 5, V)
-        l1 = torch.randn(1, 3, V)
-        m0, m1 = torch.ones(1, 5), torch.ones(1, 3)
-        global_tokens = 5 + 3
+        B, N, bs, V = 1, 2, 4, 8  # T = 6 (3 offsets x 2 blocks)
+        T = N * (bs - 1)
+        # Two uneven "shards" with the same shape but different content.
+        t0 = torch.randint(0, V, (B, T))
+        t1 = torch.randint(0, V, (B, T))
+        l0 = torch.randn(B, T, V)
+        l1 = torch.randn(B, T, V)
+        m0 = torch.ones(B, T)
+        m1 = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0]])  # one position masked
 
         loss_fn = DFlashDecayLoss(loss_gamma=7.0)
-        a0 = loss_fn(l0, t0, m0, num_tokens=global_tokens).draft_acc_sum
-        a1 = loss_fn(l1, t1, m1, num_tokens=global_tokens).draft_acc_sum
+        r0 = loss_fn(l0, t0, m0, block_size=bs)
+        r1 = loss_fn(l1, t1, m1, block_size=bs)
 
-        correct = int((l0.argmax(-1) == t0).sum() + (l1.argmax(-1) == t1).sum())
-        expected = correct / global_tokens
-        assert torch.isclose(a0 + a1, torch.tensor(expected, dtype=a0.dtype), atol=1e-6)
+        # Recipe pattern: SUM-allreduce across shards, then divide.
+        correct_global = r0.draft_correct_per_pos + r1.draft_correct_per_pos
+        count_global = r0.draft_count_per_pos + r1.draft_count_per_pos
+        per_pos_acc = correct_global / count_global.clamp_min(1.0)
+        overall_acc = correct_global.sum() / count_global.sum()
+
+        # Hand-computed reference
+        c0 = ((l0.argmax(-1) == t0).float() * m0).view(B, N, bs - 1).sum(dim=(0, 1))
+        c1 = ((l1.argmax(-1) == t1).float() * m1).view(B, N, bs - 1).sum(dim=(0, 1))
+        n0 = m0.view(B, N, bs - 1).sum(dim=(0, 1))
+        n1 = m1.view(B, N, bs - 1).sum(dim=(0, 1))
+        expected_per_pos = (c0 + c1) / (n0 + n1).clamp_min(1.0)
+        expected_overall = (c0 + c1).sum() / (n0 + n1).sum()
+        assert torch.allclose(per_pos_acc, expected_per_pos, atol=1e-6)
+        assert torch.isclose(overall_acc, expected_overall, atol=1e-6)

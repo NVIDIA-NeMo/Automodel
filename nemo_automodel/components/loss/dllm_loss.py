@@ -50,16 +50,21 @@ class DLLMLossOutput(NamedTuple):
     Attributes:
         total_loss: Loss used for backward (may include AR component).
         dllm_loss: Pure diffusion loss for logging/metrics.
-        draft_acc_sum: Per-rank draft top-1 accuracy contribution
-            ``(sum of correct predictions over valid positions) / num_tokens``,
-            where ``num_tokens`` is the global token count. SUM-reducing this
-            across DP/CP replicas yields the global draft accuracy (same
-            reduction shape as ``dllm_loss``). ``None`` when not computed.
+        draft_correct_per_pos: Per-rank raw count of argmax-correct predictions
+            at each block offset k=1..block_size-1, shape ``[block_size-1]``.
+            ``None`` when not computed (e.g. block_size unknown).
+        draft_count_per_pos: Per-rank raw count of valid predicted positions
+            at each block offset, shape ``[block_size-1]``. SUM-allreducing
+            ``draft_correct_per_pos`` and ``draft_count_per_pos`` across
+            DP/CP replicas and dividing post-reduction yields per-position
+            global accuracy; summing across positions before dividing gives
+            the overall draft top-1 accuracy.
     """
 
     total_loss: torch.Tensor
     dllm_loss: torch.Tensor
-    draft_acc_sum: Optional[torch.Tensor] = None
+    draft_correct_per_pos: Optional[torch.Tensor] = None
+    draft_count_per_pos: Optional[torch.Tensor] = None
 
 
 class MDLMCrossEntropyLoss(nn.Module):
@@ -291,7 +296,8 @@ class DFlashDecayLoss(nn.Module):
         block_mask: torch.Tensor,
         num_tokens: Optional[int],
         block_size: Optional[int],
-        draft_acc_sum: Optional[torch.Tensor] = None,
+        draft_correct_per_pos: Optional[torch.Tensor] = None,
+        draft_count_per_pos: Optional[torch.Tensor] = None,
     ) -> DLLMLossOutput:
         """Apply decay weights + block mask, sum, and normalise."""
         _, T = token_nll.shape
@@ -300,26 +306,40 @@ class DFlashDecayLoss(nn.Module):
         loss = (token_nll * weights).sum()
         if num_tokens is not None:
             loss = loss / max(float(num_tokens), 1.0)
-        return DLLMLossOutput(total_loss=loss, dllm_loss=loss.detach().clone(), draft_acc_sum=draft_acc_sum)
+        return DLLMLossOutput(
+            total_loss=loss,
+            dllm_loss=loss.detach().clone(),
+            draft_correct_per_pos=draft_correct_per_pos,
+            draft_count_per_pos=draft_count_per_pos,
+        )
 
     @staticmethod
-    def _draft_acc_sum(
+    def _draft_acc_per_pos(
         correct: torch.Tensor,
         block_mask: torch.Tensor,
-        num_tokens: Optional[int],
-    ) -> Optional[torch.Tensor]:
-        """Per-rank draft top-1 accuracy contribution, normalised by the global token count.
+        block_size: Optional[int],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Per-rank (correct, count) sums per block offset k=1..block_size-1.
 
-        ``correct`` is a boolean/float ``[B, T]`` tensor of argmax-matches and
-        ``block_mask`` excludes padding. Dividing by the same global
-        ``num_tokens`` used for the loss makes a plain SUM all-reduce over
-        replicas yield the global accuracy (mirrors ``dllm_loss``). Returns
-        ``None`` when ``num_tokens`` is unknown.
+        ``correct`` is a ``[B, T]`` bool/float tensor of argmax matches and
+        ``block_mask`` excludes padding (T = N * (block_size - 1) when
+        ``block_size`` is provided). Reshape to ``[B, N, block_size-1]`` and
+        sum over ``(B, N)`` to get per-offset counts of shape
+        ``[block_size-1]``. Returns ``(None, None)`` when ``block_size`` is
+        unknown (single-block / legacy path).
         """
-        if num_tokens is None:
-            return None
-        valid = (correct.to(block_mask.dtype) * block_mask).sum()
-        return valid / max(float(num_tokens), 1.0)
+        if block_size is None or block_size <= 1:
+            return None, None
+        T_per = block_size - 1
+        B, T = correct.shape
+        if T % T_per != 0:
+            return None, None
+        N = T // T_per
+        c = correct.to(block_mask.dtype).view(B, N, T_per)
+        m = block_mask.view(B, N, T_per)
+        correct_per_pos = (c * m).sum(dim=(0, 1))  # [block_size-1]
+        count_per_pos = m.sum(dim=(0, 1))  # [block_size-1]
+        return correct_per_pos, count_per_pos
 
     def forward(
         self,
@@ -348,8 +368,15 @@ class DFlashDecayLoss(nn.Module):
         token_nll = _compute_per_token_nll(logits, target_ids)  # [B, T]
         correct = logits.argmax(dim=-1) == target_ids  # [B, T]
         del logits
-        acc_sum = self._draft_acc_sum(correct, block_mask, num_tokens)
-        return self._reduce(token_nll, block_mask, num_tokens, block_size, draft_acc_sum=acc_sum)
+        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask, block_size)
+        return self._reduce(
+            token_nll,
+            block_mask,
+            num_tokens,
+            block_size,
+            draft_correct_per_pos=c_per_pos,
+            draft_count_per_pos=n_per_pos,
+        )
 
     @staticmethod
     def _chunk_nll(
@@ -362,8 +389,7 @@ class DFlashDecayLoss(nn.Module):
 
         Wrapped in :func:`torch.utils.checkpoint` by the caller, so the
         ``[chunk, vocab]`` logits are recomputed in backward rather than held.
-        The argmax-match is read off the same forward logits (no extra matmul)
-        and is non-differentiable, so it adds no backward cost.
+        The argmax is non-differentiable, so it adds no backward cost.
         """
         logits = F.linear(hidden_chunk, lm_head_weight, lm_head_bias)  # [chunk, V]
         nll = F.cross_entropy(logits.float(), target_chunk, reduction="none")  # [chunk]
@@ -421,5 +447,12 @@ class DFlashDecayLoss(nn.Module):
             correct_parts.append(correct_chunk)
         token_nll = torch.cat(nll_parts).reshape(B, T)
         correct = torch.cat(correct_parts).reshape(B, T)
-        acc_sum = self._draft_acc_sum(correct, block_mask, num_tokens)
-        return self._reduce(token_nll, block_mask, num_tokens, block_size, draft_acc_sum=acc_sum)
+        c_per_pos, n_per_pos = self._draft_acc_per_pos(correct, block_mask, block_size)
+        return self._reduce(
+            token_nll,
+            block_mask,
+            num_tokens,
+            block_size,
+            draft_correct_per_pos=c_per_pos,
+            draft_count_per_pos=n_per_pos,
+        )

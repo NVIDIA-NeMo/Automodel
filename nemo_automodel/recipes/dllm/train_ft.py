@@ -152,7 +152,11 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Buffers for dLLM-specific metrics
         self._dllm_loss_buffer = []
-        self._dflash_acc_buffer = []
+        # Per-rank raw (correct, count) sums per block offset for DFlash draft
+        # accuracy — SUM-allreduced across DP/CP, then divided to give global
+        # per-position acceptance-length proxy plus the overall mean.
+        self._dflash_correct_per_pos_buffer = []
+        self._dflash_count_per_pos_buffer = []
 
         # --- Strategy post-setup hook (e.g. loads frozen target for DFlash) ---
         self.dllm_strategy.setup_extra(self)
@@ -431,34 +435,50 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         dllm_loss = self._dp_allreduce(torch.stack(self._dllm_loss_buffer).sum(), include_cp=True).item()
         self._dllm_loss_buffer.clear()
 
-        # DFlash draft top-1 accuracy: per-rank (correct / global_tokens) summed
-        # over microbatches, SUM-allreduced across DP/CP -> global accuracy.
-        # None for non-DFlash modes (buffer stays empty).
+        # DFlash draft top-1 accuracy. Per-rank raw (correct, count) per block
+        # offset are summed over grad-accum microbatches, SUM-allreduced across
+        # DP+CP (same primitive as dllm_loss), then divided post-reduction to
+        # give per-position acceptance-length proxy and the overall mean.
+        # Buffers stay empty for non-DFlash modes, so draft_acc(_k) stays None.
         draft_acc = None
-        if self._dflash_acc_buffer:
-            draft_acc = self._dp_allreduce(torch.stack(self._dflash_acc_buffer).sum(), include_cp=True).item()
-        self._dflash_acc_buffer.clear()
+        draft_acc_per_pos = None
+        if self._dflash_correct_per_pos_buffer:
+            correct_per_pos = self._dp_allreduce(
+                torch.stack(self._dflash_correct_per_pos_buffer).sum(dim=0), include_cp=True
+            )
+            count_per_pos = self._dp_allreduce(
+                torch.stack(self._dflash_count_per_pos_buffer).sum(dim=0), include_cp=True
+            )
+            total_correct = correct_per_pos.sum().item()
+            total_count = count_per_pos.sum().item()
+            if total_count > 0:
+                draft_acc = total_correct / total_count
+            count_safe = count_per_pos.clamp_min(1.0)
+            draft_acc_per_pos = (correct_per_pos / count_safe).tolist()
+        self._dflash_correct_per_pos_buffer.clear()
+        self._dflash_count_per_pos_buffer.clear()
 
+        metrics = {
+            "loss": total_loss,
+            "dllm_loss": dllm_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "mfu": mfu,
+            "tokens_per_step": num_tokens_in_batch,
+            "supervised_tokens": num_supervised_tokens,
+            "draft_acc": draft_acc,
+            "mode": self.dllm_mode,
+        }
+        if draft_acc_per_pos is not None:
+            for k, v in enumerate(draft_acc_per_pos, start=1):
+                metrics[f"draft_acc_k{k}"] = v
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": total_loss,
-                "Loss/Train_Total": total_loss,
-                self.dllm_strategy.loss_log_key: dllm_loss,
-                "grad_norm": grad_norm,
-                "Train/grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "Train/lr": self.optimizer[0].param_groups[0]["lr"],
-                "Train/mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "Train/tps": tps,
-                "Train/tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-                "Train/mfu": mfu,
-                "Train/tokens_per_step": num_tokens_in_batch,
-                "Train/supervised_tokens": num_supervised_tokens,
-                "Train/draft_acc": draft_acc,
-                "Train/mode": self.dllm_mode,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
@@ -510,7 +530,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
         # Clear dLLM loss buffer from validation
         self._dllm_loss_buffer.clear()
-        self._dflash_acc_buffer.clear()
+        self._dflash_correct_per_pos_buffer.clear()
+        self._dflash_count_per_pos_buffer.clear()
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -540,22 +561,22 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 self.comet_logger.log_metrics(remote_metrics, step=log_data.step)
 
         self.metric_logger_train.log(log_data)
-        draft_acc = log_data.metrics.get("Train/draft_acc")
+        draft_acc = log_data.metrics.get("draft_acc")
         acc_str = "" if draft_acc is None else " | draft_acc {:.4f}".format(draft_acc)
         logging.info(
             "step {} | epoch {} | loss {:.4f} | dllm_loss {:.4f} | grad_norm {:.4f} | "
             "lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu){} | mode {}".format(
                 log_data.step,
                 log_data.epoch,
-                log_data.metrics["Loss/Train_Total"],
-                log_data.metrics[self.dllm_strategy.loss_log_key],
-                log_data.metrics["Train/grad_norm"],
-                log_data.metrics["Train/lr"],
-                log_data.metrics["Train/mem"],
-                log_data.metrics["Train/tps"],
-                log_data.metrics["Train/tps_per_gpu"],
+                log_data.metrics["loss"],
+                log_data.metrics["dllm_loss"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
                 acc_str,
-                log_data.metrics["Train/mode"],
+                log_data.metrics["mode"],
             )
         )
         torch.cuda.reset_peak_memory_stats()

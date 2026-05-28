@@ -75,7 +75,7 @@ class DLLMStrategy(ABC):
     @property
     def loss_log_key(self) -> str:
         """Metric key used for dLLM loss in MetricsSample and console log lines."""
-        return "Loss/Train_DLLM"
+        return "dllm_loss"
 
     @abstractmethod
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
@@ -266,7 +266,7 @@ class DFlashStrategy(DLLMStrategy):
 
     @property
     def loss_log_key(self) -> str:
-        return "Loss/Train_DFlash"
+        return "dllm_loss"
 
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
         return MDLMCrossEntropyLoss()  # placeholder; real loss is self.dflash_loss_fn
@@ -471,13 +471,11 @@ class DFlashStrategy(DLLMStrategy):
 
         Each sequence in the batch independently draws ``N = num_blocks`` anchor
         positions from its own ``[1, valid_len_b - block_size]`` range (paper
-        §4.2 "randomly sample anchor tokens"; matches SpecForge/speculators
-        ``select_anchors``). This gives more position diversity per step than
-        sharing one anchor set across the batch.
+        §4.2 "randomly sample anchor tokens"). Per-sample sampling gives more
+        position diversity per step than sharing one anchor set across the batch.
 
         Samples with fewer than ``2 * block_size`` supervised tokens are dropped
-        via ``block_keep_mask`` (SpecForge's min-loss-token filter) so degenerate
-        short sequences contribute no loss.
+        via ``block_keep_mask`` so degenerate short sequences contribute no loss.
 
         Returns:
             anchor_positions: ``[B, N]`` long — per-sample anchor positions.
@@ -520,8 +518,8 @@ class DFlashStrategy(DLLMStrategy):
                 starts = torch.cat([starts, starts.new_full((N - n_valid,), int(starts[-1]))])
             anchor_positions = starts.unsqueeze(0).expand(B, N).contiguous()
 
-        # Min-loss-token filter (SpecForge): a sample must hold a block and have
-        # at least 2*block_size supervised tokens, else all its blocks are dropped.
+        # Min-loss-token filter: a sample must hold a block and have at least
+        # 2*block_size supervised tokens, else all its blocks are dropped.
         # Padding blocks beyond n_valid (non-overlap mode) are also dropped.
         sample_ok = (supervised_lens >= 2 * bs) & (valid_lens > bs)  # [B]
         block_keep_mask = sample_ok.unsqueeze(1) & (torch.arange(N, device=device).unsqueeze(0) < n_valid)
@@ -739,8 +737,9 @@ class DFlashStrategy(DLLMStrategy):
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
             recipe._dllm_loss_buffer.append(loss_result.dllm_loss)
-            if loss_result.draft_acc_sum is not None:
-                recipe._dflash_acc_buffer.append(loss_result.draft_acc_sum.detach())
+            if loss_result.draft_correct_per_pos is not None:
+                recipe._dflash_correct_per_pos_buffer.append(loss_result.draft_correct_per_pos.detach())
+                recipe._dflash_count_per_pos_buffer.append(loss_result.draft_count_per_pos.detach())
 
             if is_train:
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
