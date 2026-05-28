@@ -221,6 +221,154 @@ def _format_example(
     )
 
 
+def _extract_eval_samples_from_example(
+    example: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Extract one eval sample per assistant tool-call position.
+
+    For each assistant turn in ``example`` that issues tool_calls, emit
+    a sample whose ``prompt_messages`` are all messages strictly before
+    that turn and whose ``gt_tool_calls`` are the tool_calls from that
+    turn. This lets the evaluator measure tool-call accuracy at every
+    position the model is expected to act, not just the first one.
+
+    Tool-call arguments are normalized from JSON-encoded strings (as
+    produced by :func:`_convert_messages`) back to dicts so callers can
+    compare against parser output directly.
+
+    Args:
+        example: a raw row from the agent SFT dataset (chatml ``messages``
+            or ShareGPT ``conversations`` schema, with a ``tools`` field).
+
+    Returns:
+        A list of eval samples, each with keys ``prompt_messages``,
+        ``tools``, ``gt_tool_calls``, ``example_id``, ``turn_index``.
+        Returns ``[]`` if the example contains no tool-call turns.
+    """
+    raw_tools = example.get("tools")
+    if isinstance(raw_tools, str) and not raw_tools.strip():
+        raw_tools = None
+    tools = _json_load_if_str(raw_tools)
+    if tools is not None and not isinstance(tools, list):
+        raise ValueError(f"`tools` must be a list or JSON-encoded list, got {type(tools).__name__}")
+    if tools is not None and len(tools) == 0:
+        tools = None
+
+    raw_messages = example.get("messages")
+    if raw_messages is None:
+        sharegpt = example.get("conversations")
+        if sharegpt is None:
+            return []
+        if not isinstance(sharegpt, list):
+            raise ValueError(f"`conversations` must be a list, got {type(sharegpt).__name__}")
+        raw_messages = _sharegpt_to_chatml(sharegpt)
+    elif not isinstance(raw_messages, list):
+        raise ValueError(f"`messages` must be a list, got {type(raw_messages).__name__}")
+
+    example_id = example.get("id")
+    formatted = _convert_messages(raw_messages, example_id=example_id)
+
+    samples: List[Dict[str, Any]] = []
+    turn_index = 0
+    for idx, msg in enumerate(formatted):
+        tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+        if not tool_calls:
+            continue
+
+        gt_tool_calls: List[Dict[str, Any]] = []
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            args_raw = fn.get("arguments", "")
+            if isinstance(args_raw, str):
+                try:
+                    args = json.loads(args_raw) if args_raw else {}
+                except json.JSONDecodeError:
+                    args = {}
+            elif isinstance(args_raw, dict):
+                args = args_raw
+            else:
+                args = {}
+            gt_tool_calls.append({"name": fn.get("name"), "arguments": args})
+
+        # ``prompt_messages`` is everything strictly before this assistant
+        # turn. If that turn also carries text content, the evaluator will
+        # ask the model to generate from the point right before this turn,
+        # which is the natural inference contract.
+        prompt_messages = formatted[:idx]
+        samples.append(
+            {
+                "prompt_messages": prompt_messages,
+                "tools": tools,
+                "gt_tool_calls": gt_tool_calls,
+                "example_id": example_id,
+                "turn_index": turn_index,
+            }
+        )
+        turn_index += 1
+
+    return samples
+
+
+def make_agent_chat_eval_samples(
+    *,
+    dataset_name: Optional[str] = None,
+    path: Optional[Union[str, List[str]]] = None,
+    split: str = "train",
+    limit_dataset_samples: Optional[int] = None,
+    max_eval_samples: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Build a flat list of tool-call eval samples from an agent SFT dataset.
+
+    Each dialogue is expanded into one sample per assistant tool-call
+    position via :func:`_extract_eval_samples_from_example`. The result
+    is a plain list (not a HuggingFace ``Dataset``) because evaluation
+    iterates linearly and needs the raw structured fields, not tokenized
+    tensors.
+
+    Exactly one of ``dataset_name`` or ``path`` must be provided.
+
+    Args:
+        dataset_name: HF Hub dataset id, e.g. ``llamafactory/glaive_toolcall_en``.
+        path: Local JSON/JSONL file path or list of paths.
+        split: Dataset split (only used with ``dataset_name``).
+        limit_dataset_samples: If set, read only the first N dialogues
+            before expansion. Useful to bound evaluation cost.
+        max_eval_samples: If set, cap the total expanded sample count.
+
+    Returns:
+        A list of dicts with keys ``prompt_messages``, ``tools``,
+        ``gt_tool_calls``, ``example_id``, ``turn_index``.
+    """
+    if (dataset_name is None) == (path is None):
+        raise ValueError("Exactly one of `dataset_name` or `path` must be provided")
+
+    if dataset_name is not None:
+        if limit_dataset_samples is not None:
+            assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
+            if "[" not in split:
+                split = f"{split}[:{limit_dataset_samples}]"
+            else:
+                logger.warning(
+                    "Dataset split %s already contains slice, skipping limit_dataset_samples",
+                    split,
+                )
+        dataset = load_dataset(dataset_name, split=split)
+    else:
+        data_files = [str(p) for p in (path if isinstance(path, list) else [path])]
+        dataset = load_dataset("json", data_files=data_files, split="train")
+        if limit_dataset_samples is not None:
+            assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
+            dataset = dataset.select(range(min(limit_dataset_samples, len(dataset))))
+
+    samples: List[Dict[str, Any]] = []
+    for example in dataset:
+        samples.extend(_extract_eval_samples_from_example(example))
+        if max_eval_samples is not None and len(samples) >= max_eval_samples:
+            samples = samples[:max_eval_samples]
+            break
+    return samples
+
+
 def make_agent_chat_dataset(
     tokenizer,
     *,

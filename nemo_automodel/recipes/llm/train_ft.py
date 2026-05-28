@@ -1088,6 +1088,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp_enabled,
             model=self.model_parts[0],
         )
+        # Optional tool-call accuracy evaluator for agent SFT runs.
+        # Presence of the ``tool_call_eval`` block enables it; absence skips it.
+        self.tool_call_evaluator = None
+        tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
+        if tool_call_eval_cfg is not None:
+            self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
@@ -1641,15 +1647,50 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        # Tool-call accuracy is the only signal that catches "loss going
+        # down because format was learned but the model picks wrong tools".
+        # Runs under the same eval-mode context as the loss pass; FSDP-safe
+        # because every rank participates in generate() in lockstep.
+        if self.tool_call_evaluator is not None:
+            try:
+                tool_metrics = self.tool_call_evaluator.evaluate(
+                    self.model_parts[0], self.tokenizer
+                )
+                # The evaluator returns per-rank means and a ``_count`` of
+                # samples actually scored locally. To get the corpus mean
+                # across DP ranks, all-reduce ``mean * count`` and ``count``
+                # separately and divide. When all ranks process the same
+                # samples (the default; no sample_shard) this still yields
+                # the correct mean because mean*count and count scale by the
+                # same world_size factor.
+                count_key = f"{self.tool_call_evaluator.metric_prefix}/_count"
+                local_count = float(tool_metrics.pop(count_key, 0.0))
+                device = self.dist_env.device
+                count_t = torch.tensor(local_count, dtype=torch.float32, device=device)
+                total_count = self._dp_allreduce(count_t).item()
+                if total_count > 0:
+                    for k, v in list(tool_metrics.items()):
+                        local_sum = torch.tensor(
+                            float(v) * local_count, dtype=torch.float32, device=device
+                        )
+                        total_sum = self._dp_allreduce(local_sum).item()
+                        tool_metrics[k] = total_sum / total_count
+                tool_metrics[count_key] = total_count
+                metrics.update(tool_metrics)
+            except Exception as exc:
+                logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
+            metrics=metrics,
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
