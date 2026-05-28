@@ -113,6 +113,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  recipe_owner: champion1.chen@gmail.com
+  recipe_owner: nemo-automodel-maintainers@nvidia.com
   time: "00:30:00"
   nodes: 1
