@@ -20,6 +20,11 @@ Reference implementations:
 | Parallelism | FSDP + TP + PP | FSDP + TP + PP + Expert Parallelism (EP) |
 | Forward signature | Standard HF-compatible | Custom (no `CausalLMOutputWithPast`, returns raw tensors) |
 
+MoE implementations also need explicit `initialize_weights()` handling,
+`initialize_linear_module()` for `lm_head`, gate bias updates via
+`update_moe_gate_bias()`, and variable-length `thd` sequence packing through
+`squeeze_input_for_thd`.
+
 ---
 
 ## MoEFSDPSyncMixin (Required)
@@ -304,18 +309,6 @@ class NewMoEForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 ModelClass = NewMoEForCausalLM
 ```
 
-### Key differences from dense LLM
-
-1. **Inherits `nn.Module`** (not `PreTrainedModel`) -- MoE models use custom weight init and don't need HF's `post_init()`
-2. **Inherits `MoEFSDPSyncMixin`** -- required for distributed expert handling
-3. **Returns raw tensors** -- not `CausalLMOutputWithPast`
-4. **Has `initialize_weights()`** -- explicit weight initialization
-5. **Uses `initialize_linear_module()`** for `lm_head` -- respects backend config
-6. **Has `update_moe_gate_bias()`** -- for auxiliary gate bias updates
-7. **Handles `thd` format** -- variable-length sequence packing via `squeeze_input_for_thd`
-
----
-
 ## Expert Parallelism
 
 Expert parallelism (EP) distributes experts across devices. The MoE layer handles this internally via `moe_mesh`:
@@ -419,10 +412,6 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-
-# State dict
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
-from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
 # Utilities
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
