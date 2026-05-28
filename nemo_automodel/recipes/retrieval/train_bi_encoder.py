@@ -77,11 +77,21 @@ def contrastive_scores_and_labels(
     return qk, labels
 
 
+def _maxsim_score_mini_batch_size(query: torch.Tensor, score_mini_batch_size: int | None) -> int:
+    if score_mini_batch_size is None:
+        return query.shape[0]
+    score_mini_batch_size = int(score_mini_batch_size)
+    if score_mini_batch_size <= 0:
+        raise ValueError(f"score_mini_batch_size must be positive, got {score_mini_batch_size}")
+    return score_mini_batch_size
+
+
 def maxsim_scores_and_labels(
     query: torch.Tensor,
     key: torch.Tensor,
     current_train_n_passages: int,
     key_attention_mask: torch.Tensor,
+    score_mini_batch_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local ColBERT-style MaxSim scores and labels without in-batch negatives."""
     assert key.shape[0] == query.shape[0] * current_train_n_passages, "{} != {} * {}".format(
@@ -92,10 +102,24 @@ def maxsim_scores_and_labels(
     key = key.reshape(query.shape[0], current_train_n_passages, key.shape[1], key.shape[2])
     key_attention_mask = key_attention_mask.reshape(query.shape[0], current_train_n_passages, key.shape[2])
 
-    token_scores = torch.einsum("bqd,bnpd->bnqp", query, key)
-    token_scores.masked_fill_(~key_attention_mask[:, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
-    maxsim = token_scores.max(dim=3).values
-    scores = maxsim.sum(dim=2)
+    step = _maxsim_score_mini_batch_size(query, score_mini_batch_size)
+    score_chunks = []
+    for begin in range(0, query.shape[0], step):
+        end = begin + step
+        query_chunk = query[begin:end]
+        key_chunk = key[begin:end]
+        mask_chunk = key_attention_mask[begin:end]
+        passage_score_chunks = []
+        for passage_idx in range(current_train_n_passages):
+            token_scores = torch.einsum("bqd,bpd->bqp", query_chunk, key_chunk[:, passage_idx])
+            token_scores.masked_fill_(
+                ~mask_chunk[:, passage_idx, None, :].bool(),
+                torch.finfo(token_scores.dtype).min,
+            )
+            passage_score_chunks.append(token_scores.max(dim=2).values.sum(dim=1))
+        score_chunks.append(torch.stack(passage_score_chunks, dim=1))
+
+    scores = torch.cat(score_chunks, dim=0)
     labels = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
     return scores, labels
 
@@ -106,6 +130,7 @@ def distributed_maxsim_scores_and_labels(
     current_train_n_passages: int,
     key_attention_mask: torch.Tensor,
     rank: int,
+    score_mini_batch_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local-query ColBERT-style MaxSim scores against globally gathered passages."""
     assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(
@@ -113,9 +138,28 @@ def distributed_maxsim_scores_and_labels(
     )
     assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
 
-    token_scores = torch.einsum("bqd,kpd->bkqp", query, key)
-    token_scores.masked_fill_(~key_attention_mask[None, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
-    scores = token_scores.max(dim=3).values.sum(dim=2)
+    global_batch_size = key.shape[0] // current_train_n_passages
+    key = key.reshape(global_batch_size, current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(global_batch_size, current_train_n_passages, key.shape[2])
+
+    step = _maxsim_score_mini_batch_size(query, score_mini_batch_size)
+    score_chunks = []
+    for begin in range(0, query.shape[0], step):
+        end = begin + step
+        query_chunk = query[begin:end]
+        passage_score_chunks = []
+        for passage_idx in range(current_train_n_passages):
+            # Score one passage slot at a time to avoid materializing
+            # [local_B, global_B * n_passages, q_len, p_len].
+            token_scores = torch.einsum("bqd,gpd->bgqp", query_chunk, key[:, passage_idx])
+            token_scores.masked_fill_(
+                ~key_attention_mask[None, :, passage_idx, None, :].bool(),
+                torch.finfo(token_scores.dtype).min,
+            )
+            passage_score_chunks.append(token_scores.max(dim=3).values.sum(dim=2))
+        score_chunks.append(torch.stack(passage_score_chunks, dim=2).reshape(query_chunk.shape[0], -1))
+
+    scores = torch.cat(score_chunks, dim=0)
     labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device) + rank * query.shape[0]
     labels = labels * current_train_n_passages
     return scores, labels
@@ -195,6 +239,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.cfg = cfg
 
         self.temperature = self.cfg.get("temperature", 1.0)
+        self.score_mini_batch_size = self.cfg.get("score_mini_batch_size", None)
 
     def setup(self):
         """Build all components needed for training/validation/logging/checkpointing."""
@@ -400,6 +445,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             p_reps = model(passage)
 
             n_passages = self.train_n_passages
+            score_mini_batch_size = getattr(self, "score_mini_batch_size", None)
             if is_train and getattr(model, "do_distributed_inbatch_negative", False):
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
@@ -424,6 +470,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         n_passages,
                         all_p_mask,
                         rank,
+                        score_mini_batch_size,
                     )
                 else:
                     all_p = dist_gather_tensor(p_reps)
@@ -452,6 +499,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         p_reps,
                         n_passages,
                         passage["attention_mask"],
+                        score_mini_batch_size,
                     )
                 else:
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -548,6 +596,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             p_reps,
                             self.val_n_passages,
                             passage["attention_mask"],
+                            getattr(self, "score_mini_batch_size", None),
                         )
                     else:
                         scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
