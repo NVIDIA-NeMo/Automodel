@@ -360,7 +360,18 @@ class ChatDataset(Dataset):
 
         normalized = _normalize_messages(messages)
         tools = row.get("tools")
+        if isinstance(tools, str):
+            # JSONL-stored datasets often serialize the `tools` field as a JSON
+            # string. Parse it so the chat template receives the tool defs;
+            # silently dropping them would leave the assistant tool_calls
+            # without a matching schema and corrupt the training signal.
+            try:
+                tools = json.loads(tools)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"`tools` is a string but not valid JSON: {e}") from e
         if tools is not None and not isinstance(tools, list):
+            raise ValueError(f"`tools` must be a list or JSON-encoded list, got {type(tools).__name__}")
+        if isinstance(tools, list) and len(tools) == 0:
             tools = None
 
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)

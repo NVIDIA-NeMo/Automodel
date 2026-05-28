@@ -17,7 +17,7 @@
 
 NOT a pytest test — meant to be run by hand inside a GPU container against
 the real ``inclusionAI/Ling-mini-2.0`` checkpoint.  Implements the three
-levels from ``skills/parity-testing/SKILL.md``:
+levels from ``.agents/contributor-skills/parity-testing/SKILL.md``:
 
     Level 1  state-dict round-trip                       CPU / fp32
     Level 2  per-component (RoPE, gate) parity           CPU / fp32

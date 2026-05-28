@@ -150,8 +150,11 @@ class TrainEagle3Recipe(BaseRecipe):
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         # FSDP2 / EP sharding placed the model on the right devices already;
         # only do the brute-force ``.to(device)`` for the unsharded path.
+        # ``nn.Module.to`` is in-place; reassigning ``self.target_model``
+        # would re-trigger ``BaseRecipe.__setattr__`` state-tracking and
+        # raise ``RuntimeError: State key 'target_model' is already tracked``.
         if self.dist_setup is None:
-            self.target_model = self.target_model.to(self.device)
+            self.target_model.to(self.device)
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
