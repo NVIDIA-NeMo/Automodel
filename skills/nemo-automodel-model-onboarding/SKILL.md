@@ -3,11 +3,39 @@ name: nemo-automodel-model-onboarding
 description: Guide for onboarding new model architectures into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
 when_to_use: Adding or modifying model architecture support in NeMo AutoModel, such as LLM/VLM/MoE model files, custom layers, state-dict adapters, registry entries, Hugging Face config mapping, or capability flags.
 license: Apache-2.0
+metadata:
+  author: NVIDIA
+  tags:
+    - nemo-automodel
+    - model-onboarding
 ---
 
 # Adding Model Support to NeMo AutoModel
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
+
+## Instructions
+
+When answering an onboarding question, keep the response in this order:
+
+1. Classify the architecture from `config.json`.
+2. Name the exact implementation files under `components/models/<name>/`.
+3. Identify registry and optional custom-config updates.
+4. State the validation tests that must be added before full checkpoint use.
+
+For MoE state-dict questions, always include the safety checklist:
+
+- Map router tensors separately from expert tensors.
+- Preserve routed-expert index order; never sort, drop, merge, or silently
+  reshape expert weights to make loading pass.
+- Map gate, up, and down projections explicitly, including combined projection
+  layouts and shared experts when present.
+- Add adapter key-map tests and tiny-config numerical equivalence tests before
+  relying on full checkpoint loading.
+
+For VLM questions, explicitly check `vision_config`, `text_config`, the
+conditional-generation architecture, text backbone, vision tower, projector,
+processor assumptions, registry entry, and tiny image-text tests.
 
 ## Routing Boundary
 
@@ -138,6 +166,14 @@ For MoE models, do not stop at generic loading. The adapter must explicitly map:
 
 Add tests that assert expected key mappings and run numerical equivalence with tiny configs before trying full checkpoints.
 
+Do not use these shortcuts:
+
+- Do not validate the adapter only by calling `from_pretrained()`.
+- Do not accept missing or extra expert keys without an explicit mapping reason.
+- Do not change dtype, transpose dimensions, or reshape tensors unless the HF
+  and NeMo layouts require it and a test proves the conversion is reversible.
+- Do not skip router or shared-expert tests because dense-layer tests pass.
+
 ### 2.4 VLM onboarding checklist
 
 For VLMs, confirm the Hugging Face config has `vision_config` and `text_config`
@@ -215,6 +251,27 @@ model = NeMoAutoModelForCausalLM.from_pretrained("<org>/<model-name>")
 ### 3.3 Test with tiny config first
 
 Before using full-size models, verify with a tiny config (1-2 layers, small hidden dim) to catch shape mismatches early.
+
+## Examples
+
+MoE state-dict answer outline:
+
+1. Inspect `config.json` for expert fields such as `num_local_experts`,
+   `n_routed_experts`, or `num_experts_per_tok`.
+2. Start from [moe-patterns.md](./moe-patterns.md) and the closest existing MoE
+   implementation.
+3. In `state_dict_adapter.py`, map router, routed experts, shared experts, and
+   gate/up/down projections explicitly.
+4. Add tests that compare expected key names and run tiny-config numerical
+   equivalence before loading full checkpoints.
+
+VLM answer outline:
+
+1. Classify as VLM only when the config has `vision_config`, `text_config`, and
+   a conditional-generation architecture.
+2. Check text backbone, vision tower, projector, processor assumptions, state
+   dict mappings for text and vision weights, registry registration, and tiny
+   image-text tests.
 
 ---
 

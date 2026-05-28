@@ -3,9 +3,33 @@ name: nemo-automodel-recipe-development
 description: Create and modify NeMo AutoModel training and evaluation recipes, including YAML structure, builders, and execution flow.
 when_to_use: Creating or modifying training, SFT, or eval recipes, adding new YAML config fields, debugging recipe construction or trainer issues, or understanding the recipe execution flow.
 license: Apache-2.0
+metadata:
+  author: NVIDIA
+  tags:
+    - nemo-automodel
+    - recipe-development
 ---
 
 # NeMo AutoModel Recipe Development
+
+## Instructions
+
+For recipe questions, answer with the smallest complete path to action:
+
+1. Name the relevant recipe file or YAML section.
+2. List the builder functions or config keys involved.
+3. Include a minimal YAML or command example when the question asks how to
+   configure something.
+4. End with a local validation command or tiny CPU-compatible test.
+
+For validation and checkpointing, always name:
+
+- `step_scheduler.val_check_interval` for validation cadence.
+- `step_scheduler.checkpoint_interval` for save cadence.
+- `validation_dataset` as the validation dataloader source.
+- `restore_from.path` for resume.
+- Consolidated safetensors as the default checkpoint format for HF ecosystem
+  compatibility.
 
 ## Routing Boundary
 
@@ -154,6 +178,32 @@ automodel finetune llm -c config.yaml \
   --step_scheduler.max_steps 500 \
   --distributed.tp_size 2
 ```
+
+## Examples
+
+Validation and checkpointing:
+
+```yaml
+step_scheduler:
+  val_check_interval: 100
+  checkpoint_interval: 500
+
+validation_dataset:
+  _target_: nemo_automodel.datasets.squad.SquadDataset
+  split: validation
+
+restore_from:
+  path: /checkpoints/step-500
+```
+
+New finetuning recipe variant:
+
+1. Copy the closest recipe under `nemo_automodel/recipes/`.
+2. Update model, dataset, optimizer, loss, scheduler, and checkpoint builders.
+3. Register a CLI route if adding a command or domain alias.
+4. Add an example YAML under `examples/`.
+5. Add a tiny CPU-compatible unit test and run
+   `automodel finetune llm -c <config.yaml>`.
 
 ## Adding a New Recipe Variant
 
