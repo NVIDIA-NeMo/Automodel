@@ -132,7 +132,7 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
         def __init__(self, items):
             self.items = items
             self.map_calls = []
-        
+
         def __getitem__(self, idx):
             return self.items[idx]
 
@@ -154,7 +154,7 @@ def test_make_xlam_dataset_respects_limit_and_maps(monkeypatch):
     monkeypatch.setattr(xlam, "_add_pad_token", lambda tok: 13)
 
     fmt_calls = []
-    
+
     def fake_format_example(example, tokenizer, eos_token_id, pad_token_id, seq_length, padding, truncation):
         fmt_calls.append(
             {

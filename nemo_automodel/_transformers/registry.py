@@ -48,6 +48,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
+            "FalconH1ForCausalLM",
+            ("nemo_automodel.components.models.falcon_h1.model", "FalconH1ForCausalLM"),
+        ),
+        (
             "Glm4MoeForCausalLM",
             ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
