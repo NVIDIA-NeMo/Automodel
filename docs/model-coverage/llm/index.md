@@ -64,7 +64,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | InternLM | [InternLM](internlm/internlm.md) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
 | Inception AI | [Jais](inceptionai/jais.md) | `JAISLMHeadModel` |
 | MiniMax | [MiniMax-M2](minimax/minimax-m2.md) | `MiniMaxM2ForCausalLM` |
-| OpenBMB | [MiniCPM](openbmb/minicpm.md) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM` |
+| OpenBMB | [MiniCPM](openbmb/minicpm.md) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
 | Moonshot AI | [Moonlight](moonshotai/moonlight.md) | `DeepseekV3ForCausalLM` |
 | ByteDance Seed | [Seed](bytedance-seed/seed.md) | `Qwen2ForCausalLM` |
 | Upstage | [Solar](upstage/solar.md) | `SolarForCausalLM` |
