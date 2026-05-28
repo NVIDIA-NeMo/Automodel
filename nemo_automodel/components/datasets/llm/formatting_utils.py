@@ -104,6 +104,31 @@ def _tokenize_chat(
     return tokenized_chat.get("input_ids", [])
 
 
+def _maybe_shift_mask_for_left_padding(
+    mask: List[int],
+    tokenizer: "PreTrainedTokenizer",
+    attention_mask: Optional[List[int]],
+) -> List[int]:
+    """Shift a token-level mask right when the tokenizer uses left padding.
+
+    ``_build_multiturn_assistant_mask`` and ``_build_reasoning_mask`` compute
+    span indices from **unpadded** (left-aligned) tokenizations.  When the
+    tokenizer pads on the left, actual content is right-aligned in
+    ``input_ids``, so the mask must be shifted right by the padding offset to
+    keep positions aligned.
+
+    For right-padding tokenizers (the majority) this is a no-op.
+    """
+    if getattr(tokenizer, "padding_side", "right") != "left":
+        return mask
+    if attention_mask is None:
+        return mask
+    pad_len = len(mask) - sum(attention_mask)
+    if pad_len <= 0:
+        return mask
+    return [0] * pad_len + mask[: len(mask) - pad_len]
+
+
 def _build_multiturn_assistant_mask(
     tokenizer: "PreTrainedTokenizer",
     formatted_text: List[Dict[str, Any]],
@@ -590,6 +615,9 @@ def format_chat_template(
             truncation=truncation,
             seq_length=seq_length,
         )
+        # _build_multiturn_assistant_mask computes indices from unpadded
+        # lengths — shift for left-padding tokenizers.
+        mask = _maybe_shift_mask_for_left_padding(mask, tokenizer, tokenized_chat.get("attention_mask"))
     else:
         mask = [1] * len(input_ids)
 
@@ -609,6 +637,10 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+        )
+        # _build_reasoning_mask also computes from unpadded lengths.
+        reasoning_mask = _maybe_shift_mask_for_left_padding(
+            reasoning_mask, tokenizer, tokenized_chat.get("attention_mask")
         )
         mask = [assistant if not reasoning else 0 for assistant, reasoning in zip(mask, reasoning_mask)]
 

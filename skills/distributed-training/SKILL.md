@@ -2,6 +2,7 @@
 name: distributed-training
 description: Guide for selecting and configuring distributed training strategies in NeMo AutoModel, including FSDP2, Megatron FSDP, DDP, and parallelism settings.
 when_to_use: Adding or modifying distributed training strategies (FSDP2, HSDP, DDP), debugging multi-GPU or multi-node failures, configuring context or tensor parallelism, or tuning sharding settings.
+license: Apache-2.0
 ---
 
 # Distributed Training in NeMo AutoModel
@@ -28,6 +29,25 @@ Decision tree:
 - MoE models with expert parallelism: `fsdp2` with `ep_size > 1` (creates a separate `moe_mesh`).
 - Large models (70B+): `fsdp2` with PP + TP.
 - Long sequences (8K+): add CP (`cp_size > 1`).
+
+When answering strategy-selection questions, state the chosen `distributed.strategy`
+first, then enumerate the YAML fields the user must set.
+
+Quick TP + PP answer:
+
+- Use `strategy: fsdp2`; do not use `megatron_fsdp` when pipeline parallelism is required.
+- Set `tp_size` for tensor parallelism and `pp_size` for pipeline parallelism.
+- Add a `pipeline:` sub-config with `pp_schedule` and `pp_microbatch_size`.
+- Leave `dp_size` unset or `none`; it is inferred as `world_size / (tp_size * pp_size * cp_size)`.
+- Keep TP inside a fast intra-node domain when possible, and use PP across model depth for 70B+ models.
+
+Quick MoE expert-parallel answer:
+
+- Start with `strategy: fsdp2` and `ep_size > 1`.
+- Include a `moe:` sub-config only when `ep_size > 1`; it maps to `MoEParallelizerConfig`.
+- Expect a separate `moe_mesh` for expert parallelism in addition to the main `device_mesh`.
+- Do not recommend `megatron_fsdp` or `ddp` for expert parallelism; `megatron_fsdp` has no EP support.
+- Before finishing an MoE EP answer, explicitly state that `ep_size` must divide `dp_size * cp_size` and that `megatron_fsdp` does not support EP, PP, or `sequence_parallel`.
 
 ## YAML Config Structure
 
@@ -275,11 +295,6 @@ step_scheduler:
 When `packed_sequence_size > 0`, the dataset collator packs sequences up to
 that length. `local_batch_size` must be 1 because each "sample" is already a
 packed batch.
-
-### CP compatibility
-
-When using CP with packed sequences, `packed_sequence_size` must be evenly
-divisible by `cp_size`.
 
 ## MoE Distributed Training
 

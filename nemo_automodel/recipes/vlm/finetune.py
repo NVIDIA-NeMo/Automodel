@@ -73,10 +73,12 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
@@ -177,7 +179,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -185,6 +187,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
@@ -203,6 +206,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             if isinstance(part, MegatronFSDP):
                 fully_shard_optimizer(tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="vlm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -766,7 +777,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -780,11 +797,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.pp = None
 
         # Extract mRoPE position-id builder from the model so VLM neat packing can
-        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
-        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        # produce 3D position_ids per sample. Without this, packed multimodal
+        # training silently degrades mRoPE to plain 1D positions.
         get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
         pp_n_microbatches = None
-        if self.pp_enabled:
+        pp_cp_preembed = (
+            self.pp_enabled
+            and self.dist_setup.cp_size > 1
+            and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
+        )
+        if self.pp_enabled and not pp_cp_preembed:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         self.dataloader, self.processor = build_dataloader(
@@ -903,6 +925,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
+    def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
+        if (
+            not self.pp_enabled
+            or not getattr(self.pp.info, "has_first_stage", False)
+            or not model_input.dtype.is_floating_point
+            or model_input.ndim != 3
+        ):
+            return
+
+        for stage in self.pp.info.stages:
+            if stage.is_first:
+                stage.inputs_meta = (
+                    torch.empty(
+                        self.pp.pp_microbatch_size,
+                        model_input.shape[1],
+                        model_input.shape[2],
+                        device="meta",
+                        dtype=model_input.dtype,
+                    ),
+                )
+
     def _forward_backward_step(
         self,
         idx,
@@ -922,15 +965,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
         )
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
+            if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
+                mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                with torch.no_grad():
+                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                for k in VLM_INPUT_KEYS:
+                    batch.pop(k, None)
+                batch.update(prepared)
+            else:
+                for k in VLM_INPUT_KEYS:
+                    if k != "input_ids":
+                        batch.pop(k, None)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
@@ -948,12 +995,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else:
                     targets = None
 
-                input_ids = batch.pop("input_ids")
-                self.pp.update_seq_len(input_ids.shape[1])
+                model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+                model_input = batch.pop(model_input_key)
+                self.pp.update_seq_len(model_input.shape[1])
+                self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
                     if self.pp.info.has_first_stage:
-                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
+                        self.pp.info.schedule.step(model_input, target=targets, losses=losses, **batch)
                     else:
                         self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
@@ -1050,6 +1099,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if i == 0:
+                prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,

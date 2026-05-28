@@ -2,9 +2,20 @@
 name: recipe-development
 description: Create and modify NeMo AutoModel training and evaluation recipes, including YAML structure, builders, and execution flow.
 when_to_use: Creating or modifying training, SFT, or eval recipes, adding new YAML config fields, debugging recipe construction or trainer issues, or understanding the recipe execution flow.
+license: Apache-2.0
 ---
 
 # NeMo AutoModel Recipe Development
+
+## Routing Boundary
+
+Use this skill for recipe construction and execution-flow questions: YAML
+structure, `_target_` callables, builder functions, validation datasets,
+checkpoint configuration, CLI route registration, and recipe-specific tests.
+
+Do not use this skill for standalone distributed strategy selection, cluster
+launcher configuration, or model architecture onboarding unless the user is
+asking how those choices appear inside an AutoModel recipe YAML.
 
 ## Recipe Architecture
 

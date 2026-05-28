@@ -87,6 +87,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -159,6 +160,11 @@ def _uses_thd_collater(cfg_dataloader):
         if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
         else False
     )
+
+
+def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
+    """Return whether the recipe should attach PP causal-mask precomputation."""
+    return getattr(model_config, "model_type", None) != "deepseek_v4"
 
 
 def _get_num_thd_chunks(pp_enabled, cfg):
@@ -313,7 +319,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -321,6 +327,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
     # optimizers like TE FusedAdam that accept dtype kwargs.
@@ -330,8 +337,16 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             setattr(cfg_opt, attr, dtype_from_str(val))
 
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
+        # TP does not support foreach for torch optimizers. Do not add this kwarg
+        # to optimizer classes that do not declare it, such as TE FusedAdam.
+        target = getattr(cfg_opt, "_target_", None)
+        if isinstance(target, str):
+            target_name = target
+        else:
+            target_module = getattr(target, "__module__", "")
+            target_name = f"{target_module}.{getattr(target, '__qualname__', '')}"
+        if target_name.startswith("torch.optim.") or hasattr(cfg_opt, "foreach"):
+            cfg_opt.foreach = False
 
     optimizer = []
     has_dion_optimizer = is_dion_optimizer(cfg_opt)
@@ -351,6 +366,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
             tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="llm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -658,7 +681,12 @@ def build_dataloader(
                     "Pipeline parallel mask precomputation will be skipped."
                 )
             else:
-                if "collate_fn" in dl_kwargs:
+                if not _should_precompute_pp_causal_masks(hf_model_config):
+                    logger.info(
+                        "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
+                        getattr(hf_model_config, "model_type", None),
+                    )
+                elif "collate_fn" in dl_kwargs:
                     # Case 1: PP enabled + collate_fn exists -> chain them
                     # base_collate_fn -> add_causal_masks_to_batch
                     base_collate_fn = dl_kwargs["collate_fn"]
@@ -739,15 +767,22 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if cfg is None:
         return None
 
-    # Calculate total steps for the training run
+    # Calculate total steps for the training run.
+    # `step_scheduler.epoch_len` is already in optimizer-step units
+    # (microbatches // grad_acc_steps) and is None for IterableDataset, in which
+    # case `max_steps` governs the total step count.
     total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+    if step_scheduler.epoch_len is not None:
+        total_steps = total_epochs * step_scheduler.epoch_len
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+    else:
+        if step_scheduler.max_steps is None:
+            raise ValueError(
+                "build_lr_scheduler: dataloader has no __len__ (iterable dataset) and "
+                "step_scheduler.max_steps is not set. Set step_scheduler.max_steps in your config."
+            )
+        total_steps = step_scheduler.max_steps
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
@@ -1004,7 +1039,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -1416,6 +1457,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
+    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
+        pp_group = self.device_mesh["pp"].get_group()
+        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
+        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
+        return tensor
+
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
 
@@ -1550,12 +1598,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
             reporting_loss = reporting_loss.to(self.dist_env.device)
-            # Send loss to first rank if pp group rank is 0
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(reporting_loss, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(reporting_loss, src=src_rank)
+            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
 
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
@@ -1617,13 +1660,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             val_loss = val_loss.to(self.dist_env.device)
             # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
             pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
-            src_rank = self.device_mesh.mesh.reshape(-1)[-1].item()
-            if self.dist_env.rank == src_rank:
-                torch.distributed.send(val_loss, dst=0)
-                torch.distributed.send(pp_num_tokens, dst=0)
-            elif self.dist_env.is_main:
-                torch.distributed.recv(val_loss, src=src_rank)
-                torch.distributed.recv(pp_num_tokens, src=src_rank)
+            val_loss = self._broadcast_from_last_pp_stage(val_loss)
+            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
+            if self.dist_env.is_main:
                 total_num_label_tokens = pp_num_tokens.item()
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
