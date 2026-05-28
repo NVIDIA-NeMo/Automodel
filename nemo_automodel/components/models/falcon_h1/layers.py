@@ -21,6 +21,50 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.models.falcon_h1.modeling_falcon_h1 import apply_rotary_pos_emb
 
 
+class FalconH1RMSNormGated(nn.Module):
+    """RMSNorm followed by a SiLU gate.
+
+    Mirrors HuggingFace's ``FalconH1RMSNormGated``. Used inside the Mamba-2
+    mixer when ``config.mamba_rms_norm`` is true. Supports both pre-gate and
+    post-gate normalization via ``norm_before_gate`` and grouped normalization
+    along the last dimension via ``n_groups``.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        n_groups: int = 1,
+        norm_before_gate: bool = False,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.n_groups = n_groups
+        self.norm_before_gate = norm_before_gate
+
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if self.norm_before_gate:
+            x = self._rms(hidden_states) * self.weight
+            return x * F.silu(gate)
+        x = hidden_states * F.silu(gate)
+        return self._rms(x) * self.weight
+
+    def _rms(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.float()
+        if self.n_groups > 1:
+            shape = x.shape
+            x = x.view(*shape[:-1], self.n_groups, shape[-1] // self.n_groups)
+            var = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.variance_epsilon)
+            x = x.view(*shape)
+        else:
+            var = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.variance_epsilon)
+        return x.to(in_dtype)
+
+
 class FalconH1MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -171,6 +215,20 @@ class FalconH1Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.num_heads))
         self.D._no_weight_decay = True
 
+        # Optional gated RMSNorm before out_proj. Some Falcon-H1 checkpoints
+        # ship with mamba_rms_norm=True; the kernel applies the norm inline
+        # when given rmsnorm_weight/eps. When the flag is False, no extra
+        # parameters are created and the kernel receives None.
+        self.rms_norm = getattr(config, "mamba_rms_norm", False)
+        self.norm_before_gate = getattr(config, "mamba_norm_before_gate", False)
+        if self.rms_norm:
+            self.norm = FalconH1RMSNormGated(
+                self.intermediate_size,
+                eps=config.rms_norm_eps,
+                n_groups=self.n_groups,
+                norm_before_gate=self.norm_before_gate,
+            )
+
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.projectors_bias)
 
         self.ssm_in_multiplier = config.ssm_in_multiplier
@@ -196,21 +254,17 @@ class FalconH1Mamba(nn.Module):
             chunk_size=self.chunk_size,
             seq_idx=None,
             activation=self.activation,
-            rmsnorm_weight=None,
-            rmsnorm_eps=None,
+            rmsnorm_weight=self.norm.weight if self.rms_norm else None,
+            rmsnorm_eps=self.norm.variance_epsilon if self.rms_norm else None,
             outproj_weight=self.out_proj.weight,
             outproj_bias=self.out_proj.bias,
             headdim=self.head_dim,
             ngroups=self.n_groups,
-            norm_before_gate=False,
+            norm_before_gate=self.norm_before_gate,
             return_final_states=False,
             **dt_limit_kwargs,
         )
         return out
-
-
-# Add to imports at top of layers.py:
-from transformers.modeling_layers import GradientCheckpointingLayer
 
 
 class FalconH1DecoderLayer(GradientCheckpointingLayer):

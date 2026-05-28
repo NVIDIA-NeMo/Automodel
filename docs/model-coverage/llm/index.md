@@ -59,6 +59,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Baichuan Inc | [Baichuan](baichuan-inc/baichuan.md) | `BaiChuanForCausalLM` |
 | Cohere | [Command-R](cohere/command-r.md) | `CohereForCausalLM`, `Cohere2ForCausalLM` |
 | TII | [Falcon](tiiuae/falcon.md) | `FalconForCausalLM` |
+| TII | [Falcon-H1](tiiuae/falcon-h1.md) | `FalconH1ForCausalLM` |
 | LG AI Research | [EXAONE](lgai-exaone/exaone.md) | `ExaoneForCausalLM` |
 | InternLM | [InternLM](internlm/internlm.md) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
 | Inception AI | [Jais](inceptionai/jais.md) | `JAISLMHeadModel` |
@@ -129,6 +130,7 @@ baai/aquila
 baichuan-inc/baichuan
 cohere/command-r
 tiiuae/falcon
+tiiuae/falcon-h1
 lgai-exaone/exaone
 internlm/internlm
 inceptionai/jais

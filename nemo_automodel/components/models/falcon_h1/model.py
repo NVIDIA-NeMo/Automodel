@@ -118,6 +118,8 @@ class FalconH1ForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module):
 
         # LM head — independent of embed_tokens because tie_word_embeddings=False
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if getattr(config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
         self.lm_head_multiplier = config.lm_head_multiplier
 
         # Required by GenerationMixin

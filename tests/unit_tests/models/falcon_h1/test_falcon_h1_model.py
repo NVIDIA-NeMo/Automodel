@@ -185,10 +185,6 @@ def test_gated_norm_key_present_iff_configured(tiny_config):
 # Tied embeddings
 # --------------------------------------------------------------------------- #
 @requires_falcon_h1
-@pytest.mark.xfail(
-    strict=True,
-    reason="model ignores tie_word_embeddings: lm_head is built independently",
-)
 def test_tied_embeddings_share_storage(tied_config):
     """With tie_word_embeddings=True, lm_head must reuse embed_tokens weight."""
     model = FalconH1ForCausalLM(tied_config)
