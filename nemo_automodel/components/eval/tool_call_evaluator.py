@@ -125,6 +125,42 @@ class ToolCallAccuracyEvaluator:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _greedy_generate_manual(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_tokens: int,
+        eos_token_id: Optional[int],
+    ) -> torch.Tensor:
+        """Greedy decode using only ``model.forward()``.
+
+        Several Automodel custom model classes (notably ``Qwen2ForCausalLM``)
+        inherit from ``HFCheckpointingMixin + Qwen2PreTrainedModel`` but not
+        from ``transformers.generation.GenerationMixin``, so the FSDP-wrapped
+        instance has no ``.generate()`` method. We fall back to a minimal
+        token-by-token greedy decode that only requires the forward pass to
+        return logits. No KV cache, so cost is ``O(L * (P + L))`` per sample
+        where ``P`` is prompt length and ``L`` is ``max_new_tokens`` — fine
+        for the small eval budgets used here (default 256 tokens).
+        """
+        for _ in range(max_new_tokens):
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            if hasattr(outputs, "logits"):
+                logits = outputs.logits
+            elif isinstance(outputs, (tuple, list)):
+                logits = outputs[0]
+            else:
+                logits = outputs
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones_like(next_token)], dim=1
+            )
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+        return input_ids
+
     def _load_samples(self) -> List[Dict[str, Any]]:
         if self._samples_cache is None:
             self._samples_cache = make_agent_chat_eval_samples(
@@ -277,11 +313,22 @@ class ToolCallAccuracyEvaluator:
                 ),
             }
             try:
-                output = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **gen_kwargs,
-                )
+                if hasattr(model, "generate"):
+                    output = model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        **gen_kwargs,
+                    )
+                else:
+                    # Custom model classes without GenerationMixin (e.g. the
+                    # FSDP-wrapped Automodel Qwen2) need a manual decode.
+                    output = self._greedy_generate_manual(
+                        model,
+                        input_ids,
+                        attention_mask,
+                        max_new_tokens=self._max_new_tokens,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
             except torch.OutOfMemoryError:
                 skip_reasons["generate_cuda_oom"] = skip_reasons.get("generate_cuda_oom", 0) + 1
                 self._cleanup_cuda()
