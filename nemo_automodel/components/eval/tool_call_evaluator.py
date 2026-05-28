@@ -140,7 +140,10 @@ class ToolCallAccuracyEvaluator:
         return [s for i, s in enumerate(all_samples) if i % world_size == rank]
 
     def _render_prompt_ids(
-        self, tokenizer, sample: Dict[str, Any]
+        self,
+        tokenizer,
+        sample: Dict[str, Any],
+        skip_reasons: Optional[Dict[str, int]] = None,
     ) -> Optional[List[int]]:
         """Render one eval sample's prompt through ``apply_chat_template``.
 
@@ -163,6 +166,8 @@ class ToolCallAccuracyEvaluator:
         try:
             text = tokenizer.apply_chat_template(sample["prompt_messages"], **kwargs)
         except Exception as exc:
+            if skip_reasons is not None:
+                skip_reasons["chat_template_raised"] = skip_reasons.get("chat_template_raised", 0) + 1
             logger.warning(
                 "apply_chat_template failed on sample id=%s turn=%s: %s",
                 sample.get("example_id"),
@@ -172,6 +177,9 @@ class ToolCallAccuracyEvaluator:
             return None
 
         if not isinstance(text, str):
+            if skip_reasons is not None:
+                key = f"chat_template_returned_{type(text).__name__}"
+                skip_reasons[key] = skip_reasons.get(key, 0) + 1
             logger.warning(
                 "apply_chat_template returned %s, expected str (sample id=%s)",
                 type(text).__name__,
@@ -183,6 +191,8 @@ class ToolCallAccuracyEvaluator:
             encoded = tokenizer(text, add_special_tokens=False)
             ids = encoded["input_ids"]
         except Exception as exc:
+            if skip_reasons is not None:
+                skip_reasons["encode_raised"] = skip_reasons.get("encode_raised", 0) + 1
             logger.warning(
                 "tokenizer encode failed on sample id=%s turn=%s: %s",
                 sample.get("example_id"),
@@ -192,6 +202,8 @@ class ToolCallAccuracyEvaluator:
             return None
 
         if self._max_prompt_tokens is not None and len(ids) > self._max_prompt_tokens:
+            if skip_reasons is not None:
+                skip_reasons["prompt_too_long"] = skip_reasons.get("prompt_too_long", 0) + 1
             logger.warning(
                 "skipping eval sample id=%s turn=%s: prompt length %d > max_prompt_tokens=%d",
                 sample.get("example_id"),
@@ -224,14 +236,21 @@ class ToolCallAccuracyEvaluator:
         samples = self._iter_my_samples()
         sums = {k: 0.0 for k in _METRIC_KEYS}
         n_scored = 0
+        skip_reasons: Dict[str, int] = {}
 
         try:
             device = next(model.parameters()).device
         except StopIteration:
             device = torch.device("cpu")
 
+        logger.info(
+            "tool_call_evaluator: starting eval on %d samples, tokenizer=%s",
+            len(samples),
+            type(tokenizer).__name__,
+        )
+
         for sample in samples:
-            prompt_ids = self._render_prompt_ids(tokenizer, sample)
+            prompt_ids = self._render_prompt_ids(tokenizer, sample, skip_reasons=skip_reasons)
             if prompt_ids is None:
                 continue
 
@@ -254,6 +273,7 @@ class ToolCallAccuracyEvaluator:
                     **gen_kwargs,
                 )
             except Exception as exc:
+                skip_reasons["generate_raised"] = skip_reasons.get("generate_raised", 0) + 1
                 logger.warning(
                     "model.generate failed on sample id=%s turn=%s: %s",
                     sample.get("example_id"),
@@ -269,6 +289,21 @@ class ToolCallAccuracyEvaluator:
             for k in _METRIC_KEYS:
                 sums[k] += metrics[k]
             n_scored += 1
+
+        n_considered = len(samples)
+        n_skipped = n_considered - n_scored
+        if n_skipped > 0:
+            logger.warning(
+                "tool_call_evaluator scored %d/%d samples; skipped %d (reasons: %s)",
+                n_scored,
+                n_considered,
+                n_skipped,
+                skip_reasons if skip_reasons else "unknown",
+            )
+        else:
+            logger.info(
+                "tool_call_evaluator scored %d/%d samples", n_scored, n_considered
+            )
 
         result: Dict[str, float] = {}
         if n_scored > 0:
