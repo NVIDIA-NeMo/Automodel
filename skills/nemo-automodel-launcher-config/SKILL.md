@@ -14,6 +14,29 @@ metadata:
 
 NeMo AutoModel supports three launch methods: interactive (torchrun), Slurm (HPC clusters), and SkyPilot (cloud-agnostic).
 
+## Instructions
+
+For launcher questions, answer directly from this skill without inspecting the
+repository unless the user asks you to edit files. Keep the answer focused on
+the relevant launch YAML, required fields, and the expected runtime behavior.
+
+Use these compact answer patterns for common questions:
+
+- Slurm multi-node: show a `slurm:` YAML block with `job_name`, `nodes`,
+  `ntasks_per_node`, `time`, `account` or `partition`, `container_image`,
+  `hf_home`, optional `extra_mounts`, `env_vars`, and `master_port`; explain
+  that the launcher derives `WORLD_SIZE = nodes * ntasks_per_node` and sets
+  `MASTER_ADDR` and `MASTER_PORT`.
+- SkyPilot spot: show a `skypilot:` YAML block with `cloud`, `accelerators`,
+  `num_nodes`, `use_spot: true`, `disk_size`, `region`, `setup`, and
+  `env_vars`; warn that spot instances can be preempted and recommend short
+  recipe checkpoint intervals.
+- Nsight Systems on Slurm: show `slurm.nsys_enabled: true` alongside normal
+  Slurm fields, say the launcher wraps the training command with
+  `nsys profile`, and state that it produces a `.nsys-rep` report file.
+  Treat profiling as diagnostic-only: use short profiling runs and disable it
+  for normal production training because it adds overhead and large artifacts.
+
 ## Routing Boundary
 
 Use this skill only for launch mechanics: interactive execution, Slurm, SkyPilot, containers, mounts, environment variables, rendezvous settings, and profiling.
@@ -130,10 +153,24 @@ Enable Nsight Systems profiling in Slurm jobs:
 
 ```yaml
 slurm:
+  job_name: llm_profile
+  nodes: 1
+  ntasks_per_node: 8
+  time: "00:30:00"
+  account: my_account
+  partition: batch
+  container_image: nvcr.io/nvidia/nemo:dev
   nsys_enabled: true
 ```
 
-This wraps the training command with `nsys profile`, producing a `.nsys-rep` file for performance analysis.
+This is a Slurm launcher setting. Normal Slurm fields such as `job_name`,
+`nodes`, `ntasks_per_node`, `time`, `account` or `partition`, and
+`container_image` still apply.
+
+When `nsys_enabled: true`, the launcher wraps the training command with
+`nsys profile` and writes a `.nsys-rep` report file for performance analysis.
+Profiling is diagnostic-only: run it for a short investigation, expect overhead
+and large artifacts, and turn it off for normal production training.
 
 ## Code Anchors
 

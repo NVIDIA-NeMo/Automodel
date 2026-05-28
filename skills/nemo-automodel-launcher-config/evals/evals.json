@@ -34,14 +34,15 @@
     "question": "How do I enable Nsight Systems profiling for a NeMo AutoModel Slurm launch, and what output should I expect?",
     "expected_skill": "nemo-automodel-launcher-config",
     "expected_script": null,
-    "ground_truth": "The agent routes to nemo-automodel-launcher-config and explains that Nsight Systems profiling is enabled in the slurm YAML section with nsys_enabled: true. It should say the launcher wraps the training command with nsys profile and produces an .nsys-rep report file. It should also mention this is a Slurm launcher setting and that normal Slurm fields such as job_name, nodes, ntasks_per_node, time, account or partition, and container_image still apply.",
+    "ground_truth": "The agent routes to nemo-automodel-launcher-config and explains that Nsight Systems profiling is enabled in the slurm YAML section with nsys_enabled: true. It should say the launcher wraps the training command with nsys profile and produces an .nsys-rep report file. It should also mention this is a Slurm launcher setting and that normal Slurm fields such as job_name, nodes, ntasks_per_node, time, account or partition, and container_image still apply. It should warn that profiling is diagnostic-only, adds overhead and artifacts, should be used for short profiling runs, and should be disabled for normal production training.",
     "expected_behavior": [
       "Routes to nemo-automodel-launcher-config",
       "Mentions slurm.nsys_enabled: true",
       "Explains that the launcher wraps the command with nsys profile",
       "Mentions .nsys-rep output",
       "Recognizes this as a Slurm launcher setting",
-      "Mentions normal Slurm job fields still apply"
+      "Mentions normal Slurm job fields still apply",
+      "Warns profiling is diagnostic-only and should be disabled for normal production training"
     ]
   }
 ]
