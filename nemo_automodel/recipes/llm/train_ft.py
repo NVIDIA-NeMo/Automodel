@@ -1043,6 +1043,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
+        if self.cfg.get("peft.mlp_activation_recompute", False):
+            from nemo_automodel.components._peft.mlp_recompute import apply_mlp_activation_recompute
+
+            for part in self.model_parts:
+                apply_mlp_activation_recompute(part)
+
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
 
