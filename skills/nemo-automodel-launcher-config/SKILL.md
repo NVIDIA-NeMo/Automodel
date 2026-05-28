@@ -29,8 +29,8 @@ Use these compact answer patterns for common questions:
   `MASTER_ADDR` and `MASTER_PORT`.
 - SkyPilot spot: show a `skypilot:` YAML block with `cloud`, `accelerators`,
   `num_nodes`, `use_spot: true`, `disk_size`, `region`, `setup`, and
-  `env_vars`; warn that spot instances can be preempted and recommend short
-  recipe checkpoint intervals.
+  `env_vars`; warn that spot instances can be preempted, set a short
+  `step_scheduler.checkpoint_interval`, and resume with `restore_from.path`.
 - Nsight Systems on Slurm: show `slurm.nsys_enabled: true` alongside normal
   Slurm fields, say the launcher wraps the training command with
   `nsys profile`, and state that it produces a `.nsys-rep` report file.
@@ -138,6 +138,16 @@ When using spot or preemptible instances:
 - Include `accelerators`, `num_nodes`, `disk_size`, `region`, `setup`, and required `env_vars`.
 - Use short checkpoint intervals in the recipe, for example `step_scheduler.checkpoint_interval`, because spot instances can be preempted.
 - Resume from the most recent checkpoint after preemption with the recipe's `restore_from` setting.
+
+Minimal spot-resume recipe keys:
+
+```yaml
+step_scheduler:
+  checkpoint_interval: 100
+
+restore_from:
+  path: /checkpoints/latest
+```
 
 ## Multi-Node Environment
 

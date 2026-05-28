@@ -23,6 +23,33 @@ When answering an onboarding question, keep the response in this order:
 3. Identify registry and optional custom-config updates.
 4. State the validation tests that must be added before full checkpoint use.
 
+For conceptual onboarding questions, answer from this skill without opening the
+pattern files unless the user asks you to edit code. Mention pattern filenames
+as references, then give the direct checklist.
+
+Use these compact answer patterns for common questions:
+
+- Dense causal LM: classify as dense only when `architectures` contains a
+  `ForCausalLM` class and expert fields such as `num_local_experts`,
+  `n_routed_experts`, or `num_experts_per_tok` are absent. Create
+  `components/models/<name>/model.py`, `state_dict_adapter.py`, `__init__.py`,
+  and optional `config.py`, register `MODEL_ARCH_MAPPING` in
+  `_transformers/registry.py`, add example YAML, and add tiny-config unit tests
+  plus layer-equivalence tests for rewritten layers.
+- MoE state dict: identify expert fields in `config.json`, reference
+  `moe-patterns.md`, map router tensors separately, preserve routed-expert
+  index order, map routed experts, shared experts, and gate/up/down projections,
+  add adapter key-map tests and tiny-config numerical equivalence tests, and do
+  not rely only on `from_pretrained()` or silent tensor reshapes.
+- VLM onboarding: classify as VLM only when `vision_config`, `text_config`, and
+  a `ForConditionalGeneration` architecture are present. Reference
+  `vlm-patterns.md` and existing VLM implementations such as `mistral4`,
+  `kimivl`, or `kimi_k25_vl`; check text backbone, vision tower, projector,
+  processor assumptions, text and vision `state_dict_adapter.py` mappings,
+  registry registration, and tiny image-text tests before full checkpoints.
+  Do not treat VLM onboarding as a pure causal-LM path or skip processor/image
+  tests.
+
 For MoE state-dict questions, always include the safety checklist:
 
 - Map router tensors separately from expert tensors.

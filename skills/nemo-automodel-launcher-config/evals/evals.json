@@ -19,14 +19,15 @@
     "question": "How do I configure NeMo AutoModel to launch on SkyPilot with H100 GPUs and spot instances?",
     "expected_skill": "nemo-automodel-launcher-config",
     "expected_script": null,
-    "ground_truth": "The agent routes to nemo-automodel-launcher-config and shows a skypilot YAML section with cloud, accelerators such as H100:8, num_nodes, use_spot: true, disk_size, region, setup, and env_vars. It warns that spot instances can be preempted and recommends checkpointing with short intervals.",
+    "ground_truth": "The agent routes to nemo-automodel-launcher-config and shows a skypilot YAML section with cloud, accelerators such as H100:8, num_nodes, use_spot: true, disk_size, region, setup, and env_vars. It warns that spot instances can be preempted, recommends checkpointing with short intervals using step_scheduler.checkpoint_interval, and says to resume from the latest checkpoint with restore_from.path.",
     "expected_behavior": [
       "Routes to nemo-automodel-launcher-config",
       "Provides a skypilot YAML section",
       "Includes accelerators and num_nodes",
       "Sets use_spot: true",
       "Mentions setup and env_vars",
-      "Warns about spot preemption and checkpointing"
+      "Warns about spot preemption and checkpointing",
+      "Mentions step_scheduler.checkpoint_interval and restore_from.path"
     ]
   },
   {
