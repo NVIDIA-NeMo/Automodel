@@ -202,7 +202,6 @@ def _is_gemma4_joint_target(target) -> bool:
     return target == Gemma4WithDrafter.from_pretrained
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
