@@ -103,6 +103,8 @@ def _profiler_memory_bytes(prof: torch.profiler.profile) -> int:
 def _profile_model(
     *, use_memory_efficient_lora: bool, use_triton: bool, device: torch.device, use_fsdp: bool
 ) -> ProfileResult:
+    torch.cuda.set_device(device)
+    torch.cuda.init()
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
@@ -193,6 +195,7 @@ def _dump_memory_gain(result: dict[str, int], *, mode: str, dist_rank: int | Non
 def _assert_profile_memory_gain(result: dict[str, int]) -> None:
     assert result["before_profiler_memory_bytes"] > 0
     assert result["after_profiler_memory_bytes"] > 0
+    assert result["before_profiler_memory_bytes"] > result["after_profiler_memory_bytes"], result
     assert result["saved_bytes"] >= _MIN_SAVED_BYTES, result
 
 

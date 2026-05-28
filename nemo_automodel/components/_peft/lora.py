@@ -297,7 +297,12 @@ class LinearLoRA(nn.Linear):
             # Apply scale before lora_B to keep lora_res as a Partial tensor.
             # This allows both res and lora_res to remain Partial, so only one reduce-scatter is needed after addition.
             # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
-            if self._should_use_memory_efficient_lora(x):
+            use_memory_efficient_lora = self._should_use_memory_efficient_lora(x)
+            if use_memory_efficient_lora:
+                if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
+                    return LoRATritonFunction.apply(
+                        x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, False, res
+                    )
                 lora_res = LoRATritonFunction.apply(
                     x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, False
                 )
@@ -305,6 +310,8 @@ class LinearLoRA(nn.Linear):
                 lora_res = self.lora_B(self.lora_A(x) * self.scale)
             if self.dropout_position == "post":
                 lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
+            if use_memory_efficient_lora:
+                return lora_res.add_(res)
             return res + lora_res
 
         if getattr(self, "lora_magnitude", None) is None:
@@ -385,11 +392,17 @@ class TritonLinearLoRA(LinearLoRA):
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:
+            if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
+                return LoRATritonFunction.apply(
+                    x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, True, res
+                )
             lora_res = LoRATritonFunction.apply(x, self.lora_A.weight, self.lora_B.weight, self.scale, x.dtype, True)
         else:
             lora_res = self.lora_B(self.lora_A(x) * self.scale)
         if self.dropout_position == "post":
             lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
+        if self.use_memory_efficient_lora:
+            return lora_res.add_(res)
 
         return res + lora_res
 
@@ -666,24 +679,31 @@ class LoRATritonFunction(torch.autograd.Function):
         ctx.scale = scale
         ctx.dtype = dtype
         ctx.use_triton_kernel = bool(rest[0]) if rest else True
+        ctx.has_residual = len(rest) > 1 and rest[1] is not None
         ctx.num_inputs = len(inputs)
 
     @staticmethod
-    def forward(x, lora_A, lora_B, scale, dtype, use_triton_kernel=True):
+    def forward(x, lora_A, lora_B, scale, dtype, use_triton_kernel=True, res=None):
         """
         Forward method for memory-efficient LoRA.
 
-        Reshapes 3D tensors into 2D and then calls either Triton kernels or PyTorch matmuls.
+        Reshapes 3D tensors into 2D and then calls either Triton kernels or PyTorch matmuls. When ``res`` is
+        provided, the residual is added in-place into the LoRA output to avoid allocating a separate add result.
         """
         reshape = x.dim() == 3
         if reshape:
             bs, seq_len, d = x.shape
             x = x.reshape(-1, d)
+            if res is not None:
+                res = res.reshape(-1, res.shape[-1])
 
         if use_triton_kernel:
             lora_res = lora_forward_wrapper(x, lora_A.t(), lora_B.t(), res=None, scale=scale, dtype=dtype)
         else:
             lora_res = F.linear(F.linear(x, lora_A) * scale, lora_B)
+
+        if res is not None:
+            lora_res.add_(res)
 
         if reshape:
             return lora_res.view(bs, seq_len, -1)
@@ -699,6 +719,7 @@ class LoRATritonFunction(torch.autograd.Function):
         """
         x, lora_A, lora_B = ctx.saved_tensors
         scale = ctx.scale
+        d_res = d_y if ctx.has_residual and ctx.needs_input_grad[6] else None
 
         reshape = x.dim() == 3
         if reshape:
@@ -729,6 +750,8 @@ class LoRATritonFunction(torch.autograd.Function):
             d_x = d_x.view(bs, seq_len, d)
 
         gradients = (d_x, d_lora_A, d_lora_B, None, None)
+        if ctx.num_inputs == 7:
+            return gradients + (None, d_res)
         if ctx.num_inputs == 6:
             return gradients + (None,)
         return gradients

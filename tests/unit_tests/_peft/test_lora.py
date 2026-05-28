@@ -186,6 +186,38 @@ def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
     assert torch.allclose(lora_B.grad, lora_B_ref.grad)
 
 
+@pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
+def test_memory_efficient_lora_with_residual_matches_legacy_forward_and_backward(input_shape):
+    """Custom autograd LoRA should fold residual addition without changing gradients."""
+    torch.manual_seed(1234)
+    scale = 2.0
+    lora_dim = 4
+    out_features = 12
+    output_shape = (*input_shape[:-1], out_features)
+
+    x = torch.randn(*input_shape, requires_grad=True)
+    lora_A = torch.randn(lora_dim, input_shape[-1], requires_grad=True)
+    lora_B = torch.randn(out_features, lora_dim, requires_grad=True)
+    res = torch.randn(*output_shape, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    lora_A_ref = lora_A.detach().clone().requires_grad_(True)
+    lora_B_ref = lora_B.detach().clone().requires_grad_(True)
+    res_ref = res.detach().clone().requires_grad_(True)
+
+    efficient = LoRATritonFunction.apply(x, lora_A, lora_B, scale, x.dtype, False, res)
+    legacy = res_ref + F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref)
+
+    grad = torch.randn_like(legacy)
+    efficient.backward(grad)
+    legacy.backward(grad)
+
+    assert torch.allclose(efficient, legacy)
+    assert torch.allclose(x.grad, x_ref.grad)
+    assert torch.allclose(lora_A.grad, lora_A_ref.grad)
+    assert torch.allclose(lora_B.grad, lora_B_ref.grad)
+    assert torch.allclose(res.grad, res_ref.grad)
+
+
 def test_memory_efficient_lora_saves_less_forward_state():
     """The custom autograd path should not save the intermediate x @ lora_A.T activation."""
     torch.manual_seed(1234)
@@ -239,6 +271,33 @@ def test_linear_lora_memory_efficient_flag_controls_saved_state():
 
     assert (8, 4) in legacy_saved
     assert (8, 4) not in efficient_saved
+
+
+def test_linear_lora_memory_efficient_matches_legacy_module_forward_and_backward():
+    """LinearLoRA should preserve legacy module behavior when folding the residual add."""
+    torch.manual_seed(1234)
+    base = nn.Linear(16, 12, bias=False)
+    x = torch.randn(8, 16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    legacy = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=False)
+    efficient = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=True)
+
+    with torch.no_grad():
+        legacy.lora_A.weight.normal_()
+        legacy.lora_B.weight.normal_()
+        efficient.lora_A.weight.copy_(legacy.lora_A.weight)
+        efficient.lora_B.weight.copy_(legacy.lora_B.weight)
+
+    efficient_out = efficient(x)
+    legacy_out = legacy(x_ref)
+    grad = torch.randn_like(legacy_out)
+    efficient_out.backward(grad)
+    legacy_out.backward(grad)
+
+    assert torch.allclose(efficient_out, legacy_out)
+    assert torch.allclose(x.grad, x_ref.grad)
+    assert torch.allclose(efficient.lora_A.weight.grad, legacy.lora_A.weight.grad)
+    assert torch.allclose(efficient.lora_B.weight.grad, legacy.lora_B.weight.grad)
 
 
 def test_lora_layers_are_trainable():
