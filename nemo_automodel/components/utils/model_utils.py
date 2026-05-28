@@ -301,6 +301,40 @@ def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_pattern
                 param.requires_grad = False
 
 
+def enable_radio_vit_fused_attn(model):
+    """Route RADIO ViT attention through ``F.scaled_dot_product_attention``.
+
+    RADIO's timm Attention blocks default to ``fused_attn=False``, which
+    materializes the full ``(B, H, seq, seq)`` attention tensor (~5 GiB per
+    block at RADIO-v2-H + dynamic-resolution patch counts). Flipping
+    ``fused_attn=True`` matches the Megatron-Bridge path which sets
+    ``vision_config.use_flash_attn=True`` via
+    ``attn_implementation="flash_attention_2"``.
+
+    No-op when the model has no RADIO vision tower.
+
+    Args:
+        model: The model to patch in place.
+    """
+    vision_model = getattr(model, "vision_model", None) or getattr(getattr(model, "model", None), "vision_model", None)
+    vit_blocks = getattr(
+        getattr(getattr(vision_model, "radio_model", None), "model", None),
+        "blocks",
+        None,
+    )
+    if vit_blocks is None:
+        return
+
+    flipped = 0
+    for block in vit_blocks:
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            attn.fused_attn = True
+            flipped += 1
+    if flipped:
+        logger.info("Enabled fused_attn on %d RADIO ViT blocks", flipped)
+
+
 def apply_parameter_freezing(model, freeze_config):
     """Apply parameter freezing based on configuration.
 
@@ -312,10 +346,12 @@ def apply_parameter_freezing(model, freeze_config):
         - freeze_vision_tower: bool (default True)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - freeze_video_embedder: bool (default False)
     """
     freeze_vision_tower = freeze_config.get("freeze_vision_tower", True)
     freeze_audio_tower = freeze_config.get("freeze_audio_tower", False)
     freeze_language_model = freeze_config.get("freeze_language_model", False)
+    freeze_video_embedder = freeze_config.get("freeze_video_embedder", False)
 
     # Freeze vision tower
     if freeze_vision_tower:
@@ -328,6 +364,21 @@ def apply_parameter_freezing(model, freeze_config):
     # Freeze language model backbone
     if freeze_language_model:
         _freeze_module_by_attribute_and_patterns(model, "language_model", ["language", "text", "llm"])
+
+    # NemotronOmni RADIO: patch_generator.video_embedder is only exercised on
+    # video inputs; on image-only training it sits in the optimizer without
+    # state (no grad → no lazy init), so dcp.load on resume raises
+    # "Missing key in checkpoint state_dict: optim.state.<...>.video_embedder.weight.step".
+    # Independent of freeze_vision_tower so the image encoder can stay trainable
+    # while the video branch is frozen out.
+    if freeze_video_embedder:
+        frozen = 0
+        for name, param in model.named_parameters():
+            if "patch_generator.video_embedder" in name:
+                param.requires_grad_(False)
+                frozen += 1
+        if frozen:
+            logger.info("Froze %d patch_generator.video_embedder params", frozen)
 
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache
