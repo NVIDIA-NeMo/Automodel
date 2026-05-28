@@ -302,6 +302,26 @@ class ToolCallAccuracyEvaluator:
                     sample.get("turn_index"),
                     exc,
                 )
+                # First failure on this rank: persist the full traceback to a
+                # per-rank file so multi-rank log filtering does not eat it.
+                if skip_reasons["generate_raised"] == 1:
+                    import os
+                    import traceback as _tb
+
+                    rank = os.environ.get("RANK", "0")
+                    dump_path = f"/tmp/tool_call_eval_generate_error_rank{rank}.log"
+                    try:
+                        with open(dump_path, "w") as _f:
+                            _f.write(f"sample id={sample.get('example_id')} turn={sample.get('turn_index')}\n")
+                            _f.write(f"exception type: {type(exc).__name__}\n")
+                            _f.write(f"exception repr: {exc!r}\n")
+                            _f.write("traceback:\n")
+                            _f.write(_tb.format_exc())
+                        logger.warning(
+                            "wrote generate() traceback to %s", dump_path
+                        )
+                    except OSError:
+                        pass
                 continue
 
             new_tokens = output[0, input_ids.shape[1] :].tolist()
