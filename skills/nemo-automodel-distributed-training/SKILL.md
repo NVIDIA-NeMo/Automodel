@@ -16,6 +16,13 @@ NeMo AutoModel uses PyTorch-native distributed training.
 All parallelism is orchestrated through a single `MeshContext` object that
 holds device meshes, strategy configs, and axis names.
 
+## Instructions
+
+For conceptual distributed-training questions, answer directly from the quick
+patterns in this skill without inspecting the repository. Start with the
+strategy choice, then list only the YAML fields and constraints relevant to the
+question.
+
 ## Strategy Selection
 
 Three strategies are available, selected via the `distributed.strategy` YAML key:
