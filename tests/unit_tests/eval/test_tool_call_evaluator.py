@@ -25,8 +25,10 @@ from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyE
 
 
 class FakeTokenizer:
-    """Minimal tokenizer that renders prompts as their string repr and
-    decodes by looking up a per-sample response from a script."""
+    """Minimal tokenizer that renders prompts to text via apply_chat_template
+    (matching real HF tokenizers under ``tokenize=False``), tokenizes via
+    ``__call__`` to ids, and decodes by looking up a per-sample response
+    from a script."""
 
     def __init__(self):
         self.eos_token_id = 0
@@ -40,10 +42,12 @@ class FakeTokenizer:
         # Record what we were asked to render.
         self.prompts_seen.append(messages)
         self.tools_seen.append(tools)
-        # Encode prompt as 1-byte-per-char ASCII ids; values >= 1 so they
-        # don't collide with the eos pad.
-        text = repr((messages, tools))
-        return [(ord(c) % 250) + 1 for c in text]
+        # Real tokenizers return text when ``tokenize=False``; mimic that.
+        return repr((messages, tools))
+
+    def __call__(self, text, *, add_special_tokens=False):
+        ids = [(ord(c) % 250) + 1 for c in text]
+        return {"input_ids": ids}
 
     def decode(self, ids, *, skip_special_tokens=False):
         # Pop the next scripted response. Index by the order generate()
@@ -252,6 +256,22 @@ def test_evaluate_empty_eval_set(monkeypatch):
     assert metrics["tool_call/_count"] == 0.0
     # All metrics default to 0 when nothing scored.
     assert metrics["tool_call/name_correct"] == 0.0
+
+
+def test_evaluate_skips_when_chat_template_returns_non_string(monkeypatch):
+    """Regression: some templates return list[int] or list[str] under
+    ``tokenize=True``; we use ``tokenize=False`` and require a string."""
+    evaluator = _make_evaluator(monkeypatch)
+
+    class BadTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            return [101, 102, 103]  # ints, not a string
+
+    tok = BadTokenizer()
+    tok.responses = ["unused", "unused"]
+    metrics = evaluator.evaluate(FakeModel(), tok)
+
+    assert metrics["tool_call/_count"] == 0.0
 
 
 def test_metric_prefix_is_applied(monkeypatch):

@@ -144,20 +144,47 @@ class ToolCallAccuracyEvaluator:
     ) -> Optional[List[int]]:
         """Render one eval sample's prompt through ``apply_chat_template``.
 
+        We deliberately split the chat-template render (``tokenize=False``)
+        from the tokenization step: some templates / transformers versions
+        return a list of token *strings* under ``tokenize=True``, which
+        then crashes ``torch.tensor(..., dtype=long)`` downstream. Going
+        through text first sidesteps that and matches the canonical HF
+        usage shown in the model cards.
+
         Returns ``None`` if the template raises (e.g. doesn't accept the
         ``tools`` kwarg) or if the prompt exceeds ``max_prompt_tokens``.
         """
         kwargs: Dict[str, Any] = {
             "add_generation_prompt": True,
-            "tokenize": True,
+            "tokenize": False,
         }
         if sample.get("tools") is not None:
             kwargs["tools"] = sample["tools"]
         try:
-            ids = tokenizer.apply_chat_template(sample["prompt_messages"], **kwargs)
+            text = tokenizer.apply_chat_template(sample["prompt_messages"], **kwargs)
         except Exception as exc:
             logger.warning(
                 "apply_chat_template failed on sample id=%s turn=%s: %s",
+                sample.get("example_id"),
+                sample.get("turn_index"),
+                exc,
+            )
+            return None
+
+        if not isinstance(text, str):
+            logger.warning(
+                "apply_chat_template returned %s, expected str (sample id=%s)",
+                type(text).__name__,
+                sample.get("example_id"),
+            )
+            return None
+
+        try:
+            encoded = tokenizer(text, add_special_tokens=False)
+            ids = encoded["input_ids"]
+        except Exception as exc:
+            logger.warning(
+                "tokenizer encode failed on sample id=%s turn=%s: %s",
                 sample.get("example_id"),
                 sample.get("turn_index"),
                 exc,
