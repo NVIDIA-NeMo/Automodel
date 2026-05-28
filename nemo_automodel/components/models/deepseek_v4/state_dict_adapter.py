@@ -59,7 +59,10 @@ from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
     BLOCK_SIZE,
     dequantize_from_fp8,
 )
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.config import (
+    DeepseekV4Config,
+    deepseek_v4_hash_layer_indices,
+)
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
@@ -475,52 +478,50 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         hf_state_dict = self._drop_hash_layer_gate_bias(hf_state_dict, _HashBiasScope.HF)
         return hf_state_dict
 
-    def _checkpoint_num_hash_layers(self) -> int:
-        """Read ``num_hash_layers`` directly from the checkpoint's config.json.
+    def _checkpoint_hash_layer_ids(self) -> set[str]:
+        """Read hash-routing layer ids directly from the checkpoint config.
 
-        We cannot rely on ``self.config.num_hash_layers`` alone: a YAML can
-        legitimately override the model's hash-layer count to 0 (e.g. to
-        disable hash routing in the forward path), but the on-disk checkpoint
-        still has its original value and therefore still omits gate.bias for
-        the first ``num_hash_layers`` layers.  To decide what to drop at load
-        time we must know the checkpoint's own value.
+        We cannot rely on the runtime config alone: a YAML can legitimately
+        override the model's hash-routing layout, but the on-disk checkpoint
+        still has its original layout and therefore omits gate.bias for hash
+        routing layers.  To decide what to drop at load time we must know the
+        checkpoint's own value.
         """
         import json as _json
         import os as _os
 
         ckpt_path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
         if not ckpt_path:
-            return 0
+            return set()
         cfg_json = _os.path.join(ckpt_path, "config.json")
         if not _os.path.isfile(cfg_json):
-            return 0
+            return set()
         try:
             with open(cfg_json) as f:
                 data = _json.load(f)
         except Exception:
-            return 0
-        return int(data.get("num_hash_layers", 0) or 0)
+            return set()
+        return {str(idx) for idx in deepseek_v4_hash_layer_indices(data)}
 
     def _drop_hash_layer_gate_bias(self, state_dict: dict[str, Any], scope: "_HashBiasScope") -> dict[str, Any]:
-        """The first ``num_hash_layers`` layers use hash-clustering routing and
-        their HF checkpoint has no ``ffn.gate.bias`` / ``e_score_correction_bias``
-        tensor.  The model side, however, creates the bias parameter uniformly
-        for every layer (Automodel's generic Gate always materializes it when
-        ``gate_bias_update_factor > 0``).  Drop those bias keys before load so
-        DCP does not raise ``Missing key in checkpoint state_dict`` for them.
+        """Hash-routing layers have no ``ffn.gate.bias`` /
+        ``e_score_correction_bias`` tensor in the HF checkpoint.  Drop those
+        bias keys before load so DCP does not raise ``Missing key in checkpoint
+        state_dict`` for them.
 
         ``scope`` selects which key format to match — the pre-rename internal
         form (``model.layers.{i}.mlp.gate.e_score_correction_bias``) or the
         post-rename HF form (``layers.{i}.ffn.gate.bias``).
         """
-        # Prefer the checkpoint's own num_hash_layers over the (possibly YAML
-        # overridden) model config — we need to match the on-disk layout.
-        num_hash_layers = self._checkpoint_num_hash_layers()
-        if num_hash_layers <= 0:
-            num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
-        if num_hash_layers <= 0:
+        # Prefer the checkpoint's own hash-routing layout over the (possibly
+        # YAML-overridden) model config — we need to match the on-disk layout.
+        hash_layer_ids = self._checkpoint_hash_layer_ids()
+        if not hash_layer_ids:
+            hash_layer_ids = {
+                str(idx) for idx in deepseek_v4_hash_layer_indices(self.config)
+            }
+        if not hash_layer_ids:
             return state_dict
-        hash_layer_ids = {str(i) for i in range(num_hash_layers)}
         pat = scope.value
         filtered: dict[str, Any] = {}
         for key, value in state_dict.items():

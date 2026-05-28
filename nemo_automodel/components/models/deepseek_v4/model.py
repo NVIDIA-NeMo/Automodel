@@ -32,9 +32,10 @@ HC parameters (ALL layers, stored in float32):
   hc_ffn_base   : [mix_hc]
   hc_ffn_scale  : [3]
 
-Gate hash layers (layer_idx < num_hash_layers):
-  Instead of score-based routing, the gate uses a fixed token-id -> expert-id
-  lookup table (tid2eid: [vocab_size, n_activated_experts]).
+Gate hash layers:
+  Layers whose ``mlp_layer_types`` entry is ``hash_moe`` use a fixed token-id
+  -> expert-id lookup table (tid2eid: [vocab_size, n_activated_experts]).
+  Older configs without ``mlp_layer_types`` fall back to ``num_hash_layers``.
 
 All layers use MoE FFN (no dense layers).
 Compress-ratio sliding-window attention is not yet implemented.
@@ -55,7 +56,10 @@ from nemo_automodel.components.models.common import (
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import _has_dtensor_params, cast_model_to_dtype
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.config import (
+    DeepseekV4Config,
+    deepseek_v4_is_hash_routing_layer,
+)
 from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4Attention,
     DeepseekV4HyperConnection,
@@ -112,11 +116,11 @@ class DeepseekV4Block(nn.Module):
         model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV4Attention(config, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
-        # Hash routing: the first ``num_hash_layers`` layers use a fixed
-        # tid2eid lookup table instead of the score-based generic Gate.
+        # Hash routing uses a fixed tid2eid lookup table instead of the
+        # score-based generic Gate.
         # Swap after MoE construction so the rest of MoE (experts, shared
         # experts, etc.) keeps its standard layout.
-        self.is_hash_routing_layer = layer_idx < int(getattr(config, "num_hash_layers", 0) or 0)
+        self.is_hash_routing_layer = deepseek_v4_is_hash_routing_layer(config, layer_idx)
         if self.is_hash_routing_layer:
             self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(

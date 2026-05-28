@@ -17,6 +17,37 @@ from __future__ import annotations
 from transformers import PretrainedConfig
 
 
+def _config_get(config, key: str, default=None):
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def deepseek_v4_hash_layer_indices(config) -> set[int]:
+    """Return layer ids that use DeepSeek V4 hash-MoE routing.
+
+    Transformers native DeepSeek V4 configs express this per layer via
+    ``mlp_layer_types == "hash_moe"``.  Older Automodel configs express the
+    same layout as the leading ``num_hash_layers`` count.
+    """
+    mlp_layer_types = _config_get(config, "mlp_layer_types")
+    if isinstance(mlp_layer_types, (list, tuple)):
+        return {
+            idx
+            for idx, layer_type in enumerate(mlp_layer_types)
+            if layer_type == "hash_moe"
+        }
+
+    num_hash_layers = int(_config_get(config, "num_hash_layers", 0) or 0)
+    if num_hash_layers <= 0:
+        return set()
+    return set(range(num_hash_layers))
+
+
+def deepseek_v4_is_hash_routing_layer(config, layer_idx: int) -> bool:
+    return layer_idx in deepseek_v4_hash_layer_indices(config)
+
+
 class DeepseekV4Config(PretrainedConfig):
     """Configuration class for DeepSeek V4.
 
