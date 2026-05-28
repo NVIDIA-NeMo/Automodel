@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch.distributed.nn.functional import all_gather as _dist_all_gather_with_grad
 
 
 def dist_gather_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -48,8 +49,14 @@ def dist_gather_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 def dist_gather_tensor_with_dim1_padding(
     t: Optional[torch.Tensor],
     padding_value: int | float | bool = 0,
+    keep_gradients: bool = False,
 ) -> Optional[torch.Tensor]:
-    """All-gather ``t`` after padding dim 1 to the maximum length across ranks."""
+    """All-gather ``t`` after padding dim 1 to the maximum length across ranks.
+
+    When ``keep_gradients`` is ``False``, only the local-rank slice keeps an
+    autograd edge, matching :func:`dist_gather_tensor`. When it is ``True``,
+    all gathered slices participate in autograd via ``torch.distributed.nn``.
+    """
     if t is None:
         return None
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
@@ -67,6 +74,8 @@ def dist_gather_tensor_with_dim1_padding(
         padded[tuple(slices)] = t
         t = padded
     t = t.contiguous()
+    if keep_gradients:
+        return torch.cat(_dist_all_gather_with_grad(t), dim=0)
     gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
     gathered[dist.get_rank()] = t

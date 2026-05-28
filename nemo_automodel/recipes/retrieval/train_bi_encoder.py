@@ -458,7 +458,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
                 if _uses_maxsim_pooling(model):
-                    all_p = dist_gather_tensor_with_dim1_padding(p_reps)
+                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, keep_gradients=True)
                     all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
                     expected_p = world_size * local_bs * n_passages
                     assert (
