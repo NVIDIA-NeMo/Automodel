@@ -106,8 +106,13 @@ def _convert_messages(
     """Convert chatml-style agent messages to OpenAI chat-completions format.
 
     Consecutive ``tool_call`` entries collapse into one assistant message
-    with parallel ``tool_calls``. ``tool_response`` (or ``tool``) entries
-    that follow are paired with those tool_call ids in order.
+    with parallel ``tool_calls``. When the preceding emitted turn is an
+    assistant message without tool_calls (e.g. an assistant ``content``
+    that reasons before calling tools), the tool_calls attach to that
+    message instead of creating a second consecutive assistant turn —
+    this preserves the natural single-turn shape the model produces at
+    inference. ``tool_response`` (or ``tool``) entries that follow are
+    paired with those tool_call ids in order.
 
     Args:
         messages: chatml-style turns with roles in ``_VALID_MESSAGE_ROLES``.
@@ -149,7 +154,13 @@ def _convert_messages(
                     }
                 )
                 i += 1
-            out.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+            if out and out[-1].get("role") == "assistant" and "tool_calls" not in out[-1]:
+                # Attach tool_calls to the prior assistant text turn so the
+                # rendered chat keeps a single assistant message (matching
+                # what the model emits at inference: think/text + tool_call).
+                out[-1]["tool_calls"] = tool_calls
+            else:
+                out.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
         elif role in ("tool_response", "tool"):
             local_idx = 0
             while i < len(messages) and messages[i].get("role") in ("tool_response", "tool"):

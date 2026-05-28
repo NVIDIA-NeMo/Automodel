@@ -49,6 +49,9 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-3B
   attn_implementation: sdpa
+  # Required by FusedLinearCrossEntropy below, which consumes hidden states
+  # directly instead of materializing the full [bsz, seq_len, vocab] logits.
+  output_hidden_states: true
 
 compile:
   enabled: false
@@ -67,7 +70,13 @@ distributed:
   sequence_parallel: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # FusedLinearCrossEntropy avoids materializing the full
+  # [bsz, seq_len, vocab_size] logits tensor (~2.5 GiB / rank for Qwen2.5
+  # at seq_length=4096 in fp32). The naive ``MaskedCrossEntropy`` peaks at
+  # roughly 5-7 GiB per forward and, combined with grad_accum and FSDP2
+  # unshard, OOMs around step 20 on 8x80GB A100. The fused linear path
+  # consumes hidden states directly and stays well under the budget.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.agent_chat.make_agent_chat_dataset

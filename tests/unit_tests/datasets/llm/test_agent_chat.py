@@ -82,6 +82,48 @@ def test_convert_messages_passes_string_arguments_through_unchanged():
     assert out[1]["tool_calls"][0]["function"]["arguments"] == raw_args
 
 
+def test_convert_messages_merges_tool_calls_into_prior_assistant_turn():
+    # Datasets like Swift's agent traces emit an assistant "think/text" turn
+    # immediately followed by tool_call turns. Logically they are one
+    # assistant message; emitting two consecutive assistant turns would
+    # diverge from what the model produces at inference and may render as
+    # two separate `<|im_start|>assistant` blocks under some chat templates.
+    messages = [
+        {"role": "user", "content": "click button"},
+        {"role": "assistant", "content": "<think>I should click at (1, 2).</think>"},
+        {"role": "tool_call", "content": '{"name":"click","arguments":{"x":1,"y":2}}'},
+        {"role": "tool_response", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+    out = agent_chat._convert_messages(messages, example_id="abc")
+
+    # user / assistant(think + tool_calls) / tool / assistant — not 5 turns
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
+
+    merged = out[1]
+    assert merged["content"] == "<think>I should click at (1, 2).</think>"
+    assert len(merged["tool_calls"]) == 1
+    assert merged["tool_calls"][0]["function"]["name"] == "click"
+    assert merged["tool_calls"][0]["id"] == "call_abc_0"
+    assert out[2]["tool_call_id"] == "call_abc_0"
+
+
+def test_convert_messages_does_not_merge_when_prior_assistant_already_has_tool_calls():
+    # Two distinct rounds of tool calls separated by a tool_response must
+    # stay as two assistant turns; merging would conflate independent calls.
+    messages = [
+        {"role": "user", "content": "?"},
+        {"role": "tool_call", "content": '{"name":"a","arguments":{}}'},
+        {"role": "tool_response", "content": "ra"},
+        {"role": "tool_call", "content": '{"name":"b","arguments":{}}'},
+        {"role": "tool_response", "content": "rb"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert out[1]["tool_calls"][0]["function"]["name"] == "a"
+    assert out[3]["tool_calls"][0]["function"]["name"] == "b"
+
+
 def test_convert_messages_rejects_unknown_role():
     with pytest.raises(ValueError, match="Unsupported role"):
         agent_chat._convert_messages([{"role": "narrator", "content": "x"}])
