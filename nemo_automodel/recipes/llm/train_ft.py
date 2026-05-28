@@ -1722,14 +1722,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not metric_logger is None:
             metric_logger.log(log_data)
 
+        tool_call_suffix = ""
+        if "tool_call/_count" in log_data.metrics:
+            tool_call_suffix = (
+                " | tool_name_acc {:.3f} | args_json_valid {:.3f}"
+                " | args_exact_match {:.3f} (n={})".format(
+                    log_data.metrics.get("tool_call/name_correct", 0.0),
+                    log_data.metrics.get("tool_call/args_json_valid", 0.0),
+                    log_data.metrics.get("tool_call/args_exact_match", 0.0),
+                    int(log_data.metrics.get("tool_call/_count", 0)),
+                )
+            )
         logging.info(
-            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}'.format(
+            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}{}'.format(
                 val_name,
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
                 log_data.metrics["lr"],
                 log_data.metrics["num_label_tokens"],
+                tool_call_suffix,
             )
         )
 
