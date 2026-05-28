@@ -133,9 +133,7 @@ def distributed_maxsim_scores_and_labels(
     score_mini_batch_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute local-query ColBERT-style MaxSim scores against globally gathered passages."""
-    assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(
-        key.shape[0], current_train_n_passages
-    )
+    assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(key.shape[0], current_train_n_passages)
     assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
 
     global_batch_size = key.shape[0] // current_train_n_passages
@@ -461,9 +459,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, keep_gradients=True)
                     all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
                     expected_p = world_size * local_bs * n_passages
-                    assert (
-                        all_p.shape[0] == expected_p
-                    ), f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    assert all_p.shape[0] == expected_p, (
+                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    )
                     scores, labels = distributed_maxsim_scores_and_labels(
                         q_reps,
                         all_p,
@@ -475,9 +473,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 else:
                     all_p = dist_gather_tensor(p_reps)
                     expected_p = world_size * local_bs * n_passages
-                    assert (
-                        all_p.shape[0] == expected_p
-                    ), f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    assert all_p.shape[0] == expected_p, (
+                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                    )
                     scores = torch.mm(q_reps, all_p.t())
                     labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
                 if model.l2_normalize:

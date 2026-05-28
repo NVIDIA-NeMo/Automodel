@@ -17,11 +17,13 @@
 import pytest
 import torch
 
+import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
 from nemo_automodel.components.models.common.inbatch_neg_utils import (
     dist_gather_tensor,
     dist_gather_tensor_with_dim1_padding,
     mask_gathered_passages_same_doc_as_positive,
 )
+
 
 def _is_masked(x: torch.Tensor) -> bool:
     """True when ``x`` is the dtype's ``-inf`` marker or its ``finfo.min``.
@@ -55,6 +57,28 @@ def test_dist_gather_tensor_with_dim1_padding_single_rank_is_noop():
 
 def test_dist_gather_tensor_with_dim1_padding_none_returns_none():
     assert dist_gather_tensor_with_dim1_padding(None) is None
+
+
+def test_dist_gather_tensor_with_dim1_padding_keep_gradients_uses_differentiable_gather(monkeypatch):
+    t = torch.arange(6.0).reshape(2, 3).requires_grad_()
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+
+    def fake_all_gather(output_tensors, input_tensor):
+        assert input_tensor.shape == torch.Size([2])
+        output_tensors[0].copy_(torch.tensor([2, 3], device=input_tensor.device))
+        output_tensors[1].copy_(torch.tensor([2, 5], device=input_tensor.device))
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils, "_dist_all_gather_with_grad", lambda tensor: (tensor, tensor * 2))
+
+    gathered = dist_gather_tensor_with_dim1_padding(t, keep_gradients=True)
+    gathered.sum().backward()
+
+    assert gathered.shape == (4, 5)
+    torch.testing.assert_close(t.grad, torch.full_like(t, 3.0))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

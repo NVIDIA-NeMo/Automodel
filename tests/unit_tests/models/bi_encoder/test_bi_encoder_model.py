@@ -51,7 +51,9 @@ class _ToyColbertBiEncoder(torch.nn.Module):
 def _apply_common_mocks(monkeypatch):
     """Mock CUDA-dependent infrastructure so tests run without a GPU."""
     monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
-    monkeypatch.setattr(am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())}))
+    monkeypatch.setattr(
+        am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())})
+    )
     monkeypatch.setattr(am.torch.cuda, "current_device", lambda: 0)
 
 
@@ -259,6 +261,66 @@ def test_distributed_maxsim_scores_and_labels_uses_global_positive_labels():
 
     assert scores.shape == (2, 8)
     assert torch.equal(labels, torch.tensor([4, 6]))
+
+
+def test_maxsim_scores_and_labels_chunking_matches_full_reference():
+    torch.manual_seed(0)
+    batch_size, n_passages, query_len, passage_len, hidden_size = 3, 2, 4, 5, 6
+    query = torch.randn(batch_size, query_len, hidden_size)
+    key = torch.randn(batch_size * n_passages, passage_len, hidden_size)
+    key_attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0],
+            [1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1],
+            [1, 1, 0, 0, 0],
+        ]
+    )
+
+    scores, labels = maxsim_scores_and_labels(
+        query,
+        key,
+        current_train_n_passages=n_passages,
+        key_attention_mask=key_attention_mask,
+        score_mini_batch_size=1,
+    )
+
+    ref_key = key.reshape(batch_size, n_passages, passage_len, hidden_size)
+    ref_mask = key_attention_mask.reshape(batch_size, n_passages, passage_len)
+    token_scores = torch.einsum("bqd,bnpd->bnqp", query, ref_key)
+    token_scores.masked_fill_(~ref_mask[:, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
+    expected_scores = token_scores.max(dim=3).values.sum(dim=2)
+
+    torch.testing.assert_close(scores, expected_scores)
+    assert torch.equal(labels, torch.zeros(batch_size, dtype=torch.long))
+
+
+def test_distributed_maxsim_scores_and_labels_chunking_matches_full_reference():
+    torch.manual_seed(0)
+    local_batch_size, global_batch_size, n_passages, query_len, passage_len, hidden_size = 3, 6, 2, 4, 5, 6
+    query = torch.randn(local_batch_size, query_len, hidden_size)
+    key = torch.randn(global_batch_size * n_passages, passage_len, hidden_size)
+    key_attention_mask = torch.ones(key.shape[:2], dtype=torch.long)
+    key_attention_mask[1, -2:] = 0
+    key_attention_mask[6, -3:] = 0
+
+    scores, labels = distributed_maxsim_scores_and_labels(
+        query,
+        key,
+        current_train_n_passages=n_passages,
+        key_attention_mask=key_attention_mask,
+        rank=1,
+        score_mini_batch_size=2,
+    )
+
+    token_scores = torch.einsum("bqd,kpd->bkqp", query, key)
+    token_scores.masked_fill_(~key_attention_mask[None, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
+    expected_scores = token_scores.max(dim=3).values.sum(dim=2)
+
+    torch.testing.assert_close(scores, expected_scores)
+    assert torch.equal(labels, torch.tensor([6, 8, 10]))
 
 
 def test_forward_backward_step_supports_local_maxsim_pooling():
