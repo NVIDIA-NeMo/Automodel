@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.nemotron_v3.layers import (
     NemotronV3Attention,
     NemotronV3Block,
 )
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")

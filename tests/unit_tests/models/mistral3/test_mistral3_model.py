@@ -12,21 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.mistral3 import model as mistral_mod
 from nemo_automodel.components.models.mistral3.model import (
     Ministral3Config,
     Ministral3ForCausalLM,
     Ministral3Model,
-    Mistral3ForConditionalGeneration,
 )
 
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from contextlib import nullcontext
 from functools import partial
 from typing import Optional
 
@@ -141,6 +142,7 @@ class FakeBalancedGate(nn.Module):
         self.n_activated_experts = config.n_activated_experts
         self.skip_first_n_experts = skip_first_n_experts
         self.noise = noise
+        self.bias_update_factor = 0.0
 
     def forward(
         self,
@@ -218,7 +220,8 @@ class Gate(nn.Module):
         topk (int): Number of top experts activated for each input.
         n_groups (int): Number of groups for routing.
         topk_groups (int): Number of groups to route inputs to.
-        score_func (str): Scoring function ('softmax', 'sigmoid', 'softmax_with_bias', or 'sqrtsoftplus').
+        score_func (str): Scoring function ('softmax', 'sigmoid', 'sigmoid_with_bias',
+            'softmax_with_bias', or 'sqrtsoftplus').
         route_scale (float): Scaling factor for routing weights.
         weight (torch.nn.Parameter): Learnable weights for the gate.
         bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
@@ -362,6 +365,26 @@ class Gate(nn.Module):
                 scores = scores + self.e_score_correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.score_func == "sigmoid_with_bias":
+            scores = scores.sigmoid()
+            original_scores = scores
+            scores_for_choice = scores
+
+            if self.e_score_correction_bias is not None:
+                scores_for_choice = scores_for_choice + self.e_score_correction_bias
+
+            if self.n_groups > 1:
+                scores_for_choice = scores_for_choice.view(x.size(0), self.n_groups, -1)
+                group_scores = scores_for_choice.topk(2, dim=-1)[0].sum(dim=-1)
+                group_idx = torch.topk(group_scores, k=self.topk_groups, dim=-1, sorted=False)[1]
+                group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+                score_mask = group_mask.unsqueeze(-1).expand_as(scores_for_choice).reshape(x.size(0), -1)
+                scores_for_choice = scores_for_choice.reshape(x.size(0), -1).masked_fill(
+                    ~score_mask.bool(), float("-inf")
+                )
+
+            indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
@@ -616,6 +639,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
                 # experts == "te"
@@ -624,6 +649,8 @@ class MoE(nn.Module):
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,
                     dispatcher_num_sms=backend.dispatcher_num_sms,
+                    dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                    dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
         else:
             # Default to torch experts
@@ -662,6 +689,8 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
+        self._disable_shared_expert_overlap = backend.disable_shared_expert_overlap
+
     def forward(
         self,
         x: torch.Tensor,
@@ -698,37 +727,33 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        if self.shared_experts is None:
-            y = self.experts(x_latent, token_mask, weights, indices)
-            # Apply latent projection after MoE if enabled
-            if self.fc2_latent_proj is not None:
-                y = self.fc2_latent_proj(y)
-            return y.view(shape)
-
-        # Execute shared experts in a separate stream to overlap compute with the
-        # communication for grouped experts.
-        global _shared_experts_stream
-        if _shared_experts_stream is None:
-            _shared_experts_stream = torch.cuda.Stream()
-
-        _shared_experts_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(_shared_experts_stream):
-            z = self.shared_experts(x)
-            if self.shared_expert_gate is not None:
-                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+        # Shared-expert output (optionally gated).  Run on a side CUDA stream
+        # to overlap with the grouped-expert dispatch comm, unless overlap is
+        # disabled (in which case run sequentially on the current stream).
+        z = None
+        side_stream = None
+        if self.shared_experts is not None:
+            if not self._disable_shared_expert_overlap:
+                global _shared_experts_stream
+                if _shared_experts_stream is None:
+                    _shared_experts_stream = torch.cuda.Stream()
+                side_stream = _shared_experts_stream
+                side_stream.wait_stream(torch.cuda.current_stream())
+            stream_ctx = torch.cuda.stream(side_stream) if side_stream is not None else nullcontext()
+            with stream_ctx:
+                z = self.shared_experts(x)
+                if self.shared_expert_gate is not None:
+                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
         y = self.experts(x_latent, token_mask, weights, indices)
+        if side_stream is not None:
+            torch.cuda.current_stream().wait_stream(side_stream)
 
-        # Apply latent projection after MoE if enabled
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)
-
-        # Wait for the shared experts stream to complete all operations before
-        # adding together the outputs of grouped experts and shared experts.
-        torch.cuda.current_stream().wait_stream(_shared_experts_stream)
-
-        # Reshape the outputs back to 3-D.
-        return (y + z).view(shape)
+        if z is not None:
+            y = y + z
+        return y.view(shape)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)

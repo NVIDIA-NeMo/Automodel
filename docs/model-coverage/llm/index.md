@@ -11,7 +11,7 @@ To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
 ```
 
-For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](../../guides/installation.md).
+For other installation options (for example, uv), refer to the [NeMo AutoModel Installation Guide](../../guides/installation.md).
 
 ## Supported Models
 
@@ -26,6 +26,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Qwen / Alibaba Cloud | [Qwen3](qwen/qwen3.md) | `Qwen3ForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen3 MoE](qwen/qwen3-moe.md) | `Qwen3MoeForCausalLM` |
 | Qwen / Alibaba Cloud | [Qwen3-Next](qwen/qwen3-next.md) | `Qwen3NextForCausalLM` |
+| Baidu | [ERNIE 4.5](baidu/ernie4-5.md) | `Ernie4_5ForCausalLM`, `Ernie4_5_MoeForCausalLM` |
 | DeepSeek | [DeepSeek](deepseek-ai/deepseek.md) | `DeepseekForCausalLM` |
 | DeepSeek | [DeepSeek-V3](deepseek-ai/deepseek-v3.md) | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` |
 | DeepSeek | [DeepSeek V4 Flash](deepseek-ai/dsv4-flash.md) | `DeepseekV4ForCausalLM` |
@@ -72,18 +73,21 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Stepfun AI | [Step-3.5](stepfun-ai/step-3-5.md) | `Step3p5ForCausalLM` |
 | Parasail AI | [GritLM](parasail-ai/gritlm.md) | `GritLM` |
 | Tencent | [Hy3-preview](tencent/hy3.md) | `HYV3ForCausalLM` |
+| Tencent | [Hy-MT2](tencent/hy-mt2.md) | `HyMT2ForCausalLM` |
+| Xiaomi MiMo | [MiMo-V2-Flash](xiaomimimo/mimo-v2-flash.md) | `MiMoV2FlashForCausalLM` |
+| inclusionAI | [Ling 2.0](inclusionai/ling-2.md) | `BailingMoeV2ForCausalLM` |
 
-## Fine-Tuning LLMs with NeMo AutoModel
+## Fine-Tune LLMs with NeMo AutoModel
 
 The models listed above can be fine-tuned using NeMo AutoModel. We support two primary fine-tuning approaches:
 
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
 
-See the [Fine-Tuning Guide](../../guides/llm/finetune.md) to learn how to apply both methods to your data.
+Refer to the [Fine-Tuning Guide](../../guides/llm/finetune.md) to learn how to apply both methods to your data.
 
 :::{tip}
-In these guides, we use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. See [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
+In these guides, the examples use the `SQuAD v1.1` dataset for demonstration purposes, but you can use your own data. Update the recipe YAML `dataset` / `validation_dataset` sections accordingly. Refer to [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
 :::
 
 ```{toctree}
@@ -96,6 +100,7 @@ qwen/qwen2-moe
 qwen/qwen3
 qwen/qwen3-moe
 qwen/qwen3-next
+baidu/ernie4-5
 deepseek-ai/deepseek
 deepseek-ai/deepseek-v3
 deepseek-ai/dsv4-flash
@@ -142,4 +147,7 @@ stabilityai/stablelm
 stepfun-ai/step-3-5
 parasail-ai/gritlm
 tencent/hy3
+tencent/hy-mt2
+xiaomimimo/mimo-v2-flash
+inclusionai/ling-2
 ```

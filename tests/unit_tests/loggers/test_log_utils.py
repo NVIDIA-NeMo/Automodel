@@ -77,18 +77,6 @@ def test_rank_filter_blocks_nonzero_rank(monkeypatch):
     assert disabled == [logging.CRITICAL]
 
 
-# warning_filter
-def test_warning_filter_blocks_only_warning():
-    """warning_filter returns False only for WARNING level."""
-    from nemo_automodel.components.loggers.log_utils import warning_filter
-
-    warn_rec = make_log_record(level=logging.WARNING)
-    info_rec = make_log_record(level=logging.INFO)
-
-    assert warning_filter(warn_rec) is False
-    assert warning_filter(info_rec) is True
-
-
 # module_filter
 def test_module_filter_name_prefix_matching():
     """module_filter suppresses loggers whose names start with prefix."""
@@ -109,7 +97,7 @@ def test_setup_logging_full(monkeypatch, caplog):
     End-to-end test of setup_logging:
 
     * env var overrides function arg
-    * WARNING messages are filtered
+    * WARNING messages are allowed
     * module prefix suppression works
     * RankFilter still lets rank 0 log
     """
@@ -142,26 +130,26 @@ def test_setup_logging_full(monkeypatch, caplog):
     monkeypatch.setenv("RANK", "0")  # keep logging on
 
     try:
-        # Configure logging
+        # Configure logging.
         caplog.set_level(logging.DEBUG)
+        log_ok = logging.getLogger("public.module")
+        log_secret = logging.getLogger("secret.module")
         mod.setup_logging(
             logging_level=logging.INFO,  # should be overridden by env
-            filter_warning=True,
             modules_to_filter=["secret"],
             set_level_for_all_loggers=True,
         )
 
-        # Logger for allowed module
-        log_ok = logging.getLogger("public.module")
-
-        # Emit records
         with caplog.at_level(logging.DEBUG):
             log_ok.debug("visible-debug")
-            log_ok.warning("hidden-warning")  # should be suppressed via warning_filter
+            log_ok.warning("visible-warning")
+            log_secret.info("hidden-secret")
 
         messages = {rec.message for rec in caplog.records}
 
         assert "visible-debug" in messages
+        assert "visible-warning" in messages
+        assert "hidden-secret" not in messages
 
         # Confirm root level got set from env override
         assert logging.getLogger().level == logging.DEBUG
