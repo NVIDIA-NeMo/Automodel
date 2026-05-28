@@ -2,6 +2,7 @@
 name: model-onboarding
 description: Guide for onboarding new model families into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
 when_to_use: Adding a new model architecture (LLM, VLM, MoE, diffusion, retrieval, etc.) to NeMo AutoModel, implementing combined projections, registering a model, or adding capability flags.
+license: Apache-2.0
 ---
 
 # Adding Model Support to NeMo AutoModel
@@ -295,12 +296,6 @@ Edit the appropriate file in `docs/model-coverage/`:
 - VLM: `docs/model-coverage/vlm/index.md`
 
 Add a row with the model name, supported features (TP, PP, FSDP, LoRA, QLoRA), and any limitations.
-
-### 5.2 Add example configs
-
-Add fully commented example configs under `examples/`:
-- `examples/llm_finetune/<name>/sft.yaml` for LLMs
-- `examples/vlm_finetune/<name>/sft.yaml` for VLMs
 
 ---
 
