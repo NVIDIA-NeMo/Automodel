@@ -66,6 +66,16 @@ def calculate_mtp_loss(
         Scalar MTP loss with autograd graph.
     """
     D = len(mtp_per_depth_h)
+
+    # Reconcile per-depth hidden-state and label dims for the THD-packed
+    # non-PP path: the model unsqueezes mtp_per_depth_h from ``[T, H]`` back
+    # to ``[1, T, H]`` (model.py post-MTP-forward), while labels arrive as
+    # 1D ``[T]`` from ``process_input_for_thd``. ``FusedLinearCrossEntropy``
+    # / ``cut_cross_entropy`` asserts ``hidden_states.shape[:-1] == labels.shape``
+    # so squeeze the synthetic batch axis when labels are flat.
+    if labels.dim() == 1:
+        mtp_per_depth_h = [h.squeeze(0) if (h.dim() == 3 and h.shape[0] == 1) else h for h in mtp_per_depth_h]
+
     cur_labels = labels
     total = mtp_per_depth_h[0].new_zeros(())
 

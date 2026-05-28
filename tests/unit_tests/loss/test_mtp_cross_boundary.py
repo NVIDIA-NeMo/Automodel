@@ -35,7 +35,6 @@ import torch
 
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 
-
 IGNORE = -100
 
 
@@ -228,3 +227,75 @@ def test_depth_beyond_subseq_length_fully_masked():
     # Position 0 rolls to position 3 (sub-seq 1) ≠ sub-seq 0 → IGNORE.
     # So all 4 positions are IGNORE.
     assert captured[2].tolist() == [IGNORE, IGNORE, IGNORE, IGNORE]
+
+
+def test_thd_flat_labels_squeeze_3d_hidden_states():
+    """Regression: under THD packing the model unsqueezes ``mtp_per_depth_h``
+    back to ``[1, T, H]`` (model.py post-MTP-forward), but the recipe pops 1D
+    ``[T]`` labels from the THD-flattened batch. ``cut_cross_entropy`` asserts
+    ``hidden_states.shape[:-1] == labels.shape``, so calculate_mtp_loss must
+    squeeze the synthetic batch axis when labels are 1D.
+    """
+    T, H = 8, 4
+    labels = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.long)  # (T,)
+    # Mimic model.py:790: per-depth hidden states are unsqueezed to (1, T, H).
+    mtp_per_depth_h = [torch.zeros((1, T, H), dtype=torch.float32, requires_grad=True) for _ in range(2)]
+
+    captured_hidden: list[torch.Tensor] = []
+    captured_labels: list[torch.Tensor] = []
+
+    def _capture(loss_fn, **kw):
+        captured_hidden.append(kw["hidden_states"])
+        captured_labels.append(kw["labels"])
+        return torch.zeros((), requires_grad=True)
+
+    with mock.patch("nemo_automodel.components.loss.mtp.calculate_loss", side_effect=_capture):
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        # Pass a FusedLinearCrossEntropy instance so calculate_mtp_loss takes
+        # the hidden_states branch (the bug only manifests there).
+        calculate_mtp_loss(
+            loss_fn=FusedLinearCrossEntropy(),
+            mtp_per_depth_h=mtp_per_depth_h,
+            labels=labels,
+            model=mock.MagicMock(),
+            scaling_factor=1.0,
+            ignore_index=IGNORE,
+        )
+
+    assert len(captured_hidden) == 2
+    for d, (h, lab) in enumerate(zip(captured_hidden, captured_labels)):
+        # After the fix, the synthetic batch axis must be squeezed so
+        # h.shape[:-1] == lab.shape (cce's invariant).
+        assert h.shape == (T, H), f"depth {d}: expected hidden_states (T, H), got {tuple(h.shape)}"
+        assert lab.shape == (T,), f"depth {d}: expected labels (T,), got {tuple(lab.shape)}"
+        assert h.shape[:-1] == lab.shape
+
+
+def test_2d_labels_and_3d_hidden_states_unchanged():
+    """Sanity: when labels are already 2D ``[B, S]`` and hidden states are
+    ``[B, S, H]`` (the BSHD path), the reconciliation must be a no-op."""
+    B, S, H = 2, 8, 4
+    labels = torch.arange(1, B * S + 1, dtype=torch.long).view(B, S)
+    mtp_per_depth_h = [torch.zeros((B, S, H), dtype=torch.float32, requires_grad=True) for _ in range(2)]
+
+    captured_hidden: list[torch.Tensor] = []
+
+    def _capture(loss_fn, **kw):
+        captured_hidden.append(kw["hidden_states"])
+        return torch.zeros((), requires_grad=True)
+
+    with mock.patch("nemo_automodel.components.loss.mtp.calculate_loss", side_effect=_capture):
+        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+
+        calculate_mtp_loss(
+            loss_fn=FusedLinearCrossEntropy(),
+            mtp_per_depth_h=mtp_per_depth_h,
+            labels=labels,
+            model=mock.MagicMock(),
+            scaling_factor=1.0,
+            ignore_index=IGNORE,
+        )
+
+    for d, h in enumerate(captured_hidden):
+        assert h.shape == (B, S, H), f"depth {d}: BSHD path should be unchanged, got {tuple(h.shape)}"
