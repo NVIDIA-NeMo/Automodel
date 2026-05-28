@@ -18,24 +18,26 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
 """
 
+
 def gather_helper(input_tensor):
     tensor_list = [torch.zeros_like(input_tensor) for _ in range(2)]
     dist.all_gather(tensor_list, input_tensor)
     return tensor_list
 
+
 def test_megatron_data_sharding():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
     dist_env = build_distributed(cfg.get("dist_env", {}))
-    dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
-    device_mesh = dist_setup.device_mesh
+    mesh_context = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size).mesh_context
+    device_mesh = mesh_context.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_world_size = device_mesh["tp"].size()
@@ -64,7 +66,9 @@ def test_megatron_data_sharding():
     batch_to_test = {k: v.to(dist.get_rank()) for k, v in batch_to_test.items()}
 
     # ensure that labels are inputs left shifted by 1
-    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), "Labels are not inputs left shifted by 1"
+    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), (
+        "Labels are not inputs left shifted by 1"
+    )
 
     dist.barrier()
     del dataset

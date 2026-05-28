@@ -60,7 +60,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
@@ -106,7 +106,7 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 from nemo_automodel.shared.utils import dtype_from_str
@@ -180,15 +180,11 @@ def build_model(
     cfg_fp8=None,
     cfg_compile=None,
     cfg_quantization=None,
-    device_mesh=None,
-    moe_mesh=None,
-    distributed_config=None,
-    pipeline_config=None,
+    distributed_setup: DistributedSetup | None = None,
     cfg_qat=None,
-    cfg_moe=None,
-    activation_checkpointing=False,
     unfreeze_modules: list[str] | None = None,
     sdpa_method: list[str] | None = None,
+    device_mesh=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -200,28 +196,24 @@ def build_model(
         cfg_fp8: Configuration for FP8.
         cfg_compile: Configuration for torch.compile.
         cfg_quantization: Configuration for BitsAndBytes quantization.
-        device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
-        distributed_config: Strategy-specific distributed config (FSDP2Config, etc.).
-        pipeline_config: Pipeline parallelism config.
+        distributed_setup: Resolved distributed topology and policy object.
         cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
-        cfg_moe: MoEParallelizerConfig instance, or ConfigNode to be converted.
-        activation_checkpointing: Whether to enable activation checkpointing.
         unfreeze_modules: List of module names/substrings to unfreeze.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
+        device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
             "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
-            "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
-            "distributed_config": distributed_config,
-            "pipeline_config": pipeline_config,
             "sdpa_method": sdpa_method,
         }
+        if distributed_setup is not None:
+            kwargs["distributed_setup"] = distributed_setup
+        elif device_mesh is not None:
+            kwargs["device_mesh"] = device_mesh
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
             if cfg_peft is not None:
@@ -234,19 +226,6 @@ def build_model(
                 quantizer_attr = getattr(cfg_qat, "quantizer", None)
                 if quantizer_attr is not None:
                     kwargs["qat_config"] = quantizer_attr.instantiate()
-
-        if cfg_moe is not None:
-            from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-            if isinstance(cfg_moe, MoEParallelizerConfig):
-                kwargs["moe_config"] = cfg_moe
-            else:
-                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
-                # activation_checkpointing is handled separately; strip config keys
-                moe_dict.pop("activation_checkpointing", None)
-                moe_dict.pop("_target_", None)
-                kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
-            kwargs["activation_checkpointing"] = activation_checkpointing
 
         if cfg_fp8 is not None:
             kwargs["fp8_config"] = build_fp8_config(cfg_fp8)
@@ -280,13 +259,15 @@ def build_model(
             # exactly as from_pretrained/from_config do internally.
             model = cfg_model.instantiate()
 
-            mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+            setup = distributed_setup or DistributedSetup(mesh_context=MeshContext())
+            mesh = setup.mesh_context
+            pipeline_config = setup.pipeline_config
             model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
-                distributed_config=distributed_config,
+                distributed_config=setup.strategy_config,
                 pipeline_config=pipeline_config,
                 qat_config=kwargs.get("qat_config"),
-                moe_config=kwargs.get("moe_config"),
-                activation_checkpointing=kwargs.get("activation_checkpointing", False),
+                moe_parallel_config=setup.moe_parallel_config,
+                activation_checkpointing=setup.activation_checkpointing,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
             )
@@ -899,12 +880,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Enable NVTX patching only when explicitly requested in config
         self.enable_nvtx = bool(self.cfg.get("nvtx", False))
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(
+            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        )
 
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
@@ -933,13 +921,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_batch_size = self.cfg.step_scheduler.local_batch_size
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
+            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
             )
 
             # THD override logic
             if (
-                self.dist_setup.cp_size > 1
+                self.mesh_context.cp_size > 1
                 and _uses_te_dot_product_attention(self.cfg.model)
                 and _uses_thd_collater(self.cfg.dataloader)
             ):
@@ -998,8 +986,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
-        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
-            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+        if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
         model = build_model(
@@ -1010,13 +998,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
             cfg_quantization=self.cfg.get("quantization", None),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            pipeline_config=self.pipeline_config,
+            distributed_setup=self.distributed_setup,
             cfg_qat=self.cfg.get("qat", None),
-            cfg_moe=self.dist_setup.moe_config,
-            activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
@@ -1050,11 +1033,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self._configure_pipeline_loss_fn()
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
-        if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
+        if self.mesh_context.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
             if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing:
                 raise ValueError(
-                    f"Context parallelism (cp_size={self.dist_setup.cp_size}) with packed sequences "
+                    f"Context parallelism (cp_size={self.mesh_context.cp_size}) with packed sequences "
                     f"is not supported for {type(_m).__name__}.\n"
                     f"Either disable sequence packing:\n"
                     f"  packed_sequence:\n"

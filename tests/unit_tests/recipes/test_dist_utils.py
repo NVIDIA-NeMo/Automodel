@@ -12,17 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the **recipe-layer** YAML / dict parsing (``_dist_setup``).
+"""Tests for the **recipe-layer** YAML / dict parsing (``_dist_utils``).
 
 Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 """
 
 import pytest
 
-from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import (
+    DDPConfig,
+    DistributedSetup,
+    FSDP2Config,
+    MegatronFSDPConfig,
+    MoEParallelizerConfig,
+)
+from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
-from nemo_automodel.recipes._dist_setup import parse_distributed_section, setup_distributed
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    parse_distributed_section,
+)
+
+
+class _FakeAxis:
+    def __init__(self, size: int):
+        self._size = size
+
+    def size(self) -> int:
+        return self._size
+
+
+class _FakeMesh:
+    def __init__(self, sizes: dict[MeshAxisName, int]):
+        self.mesh_dim_names = tuple(sizes)
+        self._sizes = sizes
+
+    def __getitem__(self, axis: MeshAxisName):
+        return _FakeAxis(self._sizes[axis])
+
 
 # ---------------------------------------------------------------------------
 # Basic dict parsing
@@ -45,21 +72,23 @@ class TestParsing:
         assert result["dp_replicate_size"] is None
         assert result["pp_enabled"] is False
         assert result["pipeline_config"] is None
-        assert result["moe_config"] is None
+        assert result["moe_parallel_config"] is None
+        assert result["activation_checkpointing"] is False
 
     def test_default_strategy_is_fsdp2(self):
         result = parse_distributed_section({})
         assert isinstance(result["strategy_config"], FSDP2Config)
 
-    def test_megatron_fsdp(self):
-        result = parse_distributed_section({"strategy": "megatron_fsdp"})
+    @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
+    def test_megatron_fsdp_names(self, strategy):
+        result = parse_distributed_section({"strategy": strategy})
         assert isinstance(result["strategy_config"], MegatronFSDPConfig)
         assert result["strategy_config"].zero_dp_strategy == 3
 
     def test_ddp(self):
         result = parse_distributed_section({"strategy": "ddp"})
         assert isinstance(result["strategy_config"], DDPConfig)
-        assert result["strategy_config"].backend == "nccl"
+        assert result["strategy_config"].activation_checkpointing is False
 
     def test_all_parallelism_keys(self):
         cfg = {
@@ -148,8 +177,8 @@ class TestMoE:
     def test_moe_config_created(self):
         cfg = {"ep_size": 2, "moe": {"ignore_router_for_ac": True}}
         result = parse_distributed_section(cfg)
-        assert isinstance(result["moe_config"], MoEParallelizerConfig)
-        assert result["moe_config"].ignore_router_for_ac is True
+        assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
+        assert result["moe_parallel_config"].ignore_router_for_ac is True
 
     def test_moe_fields_pass_through(self):
         cfg = {
@@ -157,17 +186,17 @@ class TestMoE:
             "moe": {"ignore_router_for_ac": True, "reshard_after_forward": True, "wrap_outer_model": False},
         }
         result = parse_distributed_section(cfg)
-        assert result["moe_config"].reshard_after_forward is True
-        assert result["moe_config"].wrap_outer_model is False
+        assert result["moe_parallel_config"].reshard_after_forward is True
+        assert result["moe_parallel_config"].wrap_outer_model is False
 
     def test_empty_moe_dict_uses_defaults(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
-        assert isinstance(result["moe_config"], MoEParallelizerConfig)
-        assert result["moe_config"].ignore_router_for_ac is False
+        assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
+        assert result["moe_parallel_config"].ignore_router_for_ac is False
 
     def test_mp_policy_none_when_omitted(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})
-        assert result["moe_config"].mp_policy is None
+        assert result["moe_parallel_config"].mp_policy is None
 
     def test_mp_policy_target_instantiated(self):
         """mp_policy with resolved _target_ callable is instantiated to MixedPrecisionPolicy."""
@@ -187,7 +216,7 @@ class TestMoE:
             },
         }
         result = parse_distributed_section(cfg)
-        mp = result["moe_config"].mp_policy
+        mp = result["moe_parallel_config"].mp_policy
         assert isinstance(mp, MixedPrecisionPolicy)
         assert mp.param_dtype == torch.bfloat16
         assert mp.reduce_dtype == torch.float32
@@ -208,7 +237,7 @@ class TestMoE:
             },
         }
         result = parse_distributed_section(cfg)
-        d = result["moe_config"].to_dict()
+        d = result["moe_parallel_config"].to_dict()
         assert "mp_policy" in d
         assert isinstance(d["mp_policy"], MixedPrecisionPolicy)
 
@@ -220,21 +249,21 @@ class TestMoE:
         policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32)
         cfg = {"ep_size": 2, "moe": {"mp_policy": policy}}
         result = parse_distributed_section(cfg)
-        assert result["moe_config"].mp_policy is policy
+        assert result["moe_parallel_config"].mp_policy is policy
 
 
 # ---------------------------------------------------------------------------
-# activation_checkpointing routing (EP-aware)
+# activation_checkpointing is parsed separately from topology
 # ---------------------------------------------------------------------------
 
 
-class TestActivationCheckpointingRouting:
-    def test_routes_to_strategy_when_no_ep(self):
+class TestActivationCheckpointingParsing:
+    def test_parses_when_no_ep(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": 1})
-        assert result["strategy_config"].activation_checkpointing is True
+        assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
 
-    def test_not_on_strategy_when_ep_gt_1(self):
+    def test_parses_when_ep_gt_1(self):
         result = parse_distributed_section(
             {"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": 2, "moe": {}}
         )
@@ -248,7 +277,8 @@ class TestActivationCheckpointingRouting:
 
     def test_works_with_ddp(self):
         result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": True})
-        assert result["strategy_config"].activation_checkpointing is True
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +310,12 @@ class TestValidation:
         """MoE section is silently discarded when ep_size <= 1
         (common when a YAML template is overridden via CLI)."""
         result = parse_distributed_section({"ep_size": 1, "moe": {"ignore_router_for_ac": True}})
-        assert result["moe_config"] is None
+        assert result["moe_parallel_config"] is None
 
     def test_moe_rejects_default_ep_size(self):
         """MoE section is silently discarded when ep_size defaults to 1."""
         result = parse_distributed_section({"moe": {"ignore_router_for_ac": True}})
-        assert result["moe_config"] is None
+        assert result["moe_parallel_config"] is None
 
     def test_unknown_field_for_strategy(self):
         with pytest.raises(ValueError, match="Unknown options"):
@@ -322,7 +352,8 @@ class TestIntegration:
         result = parse_distributed_section(cfg)
         assert result["strategy_config"].zero_dp_strategy == 2
         assert result["strategy_config"].overlap_grad_reduce is False
-        assert result["strategy_config"].activation_checkpointing is True
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] is True
         assert result["tp_size"] == 2
 
     def test_fsdp2_full_config(self):
@@ -339,7 +370,8 @@ class TestIntegration:
         }
         result = parse_distributed_section(cfg)
         assert result["strategy_config"].sequence_parallel is True
-        assert result["strategy_config"].activation_checkpointing is True
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] is True
         assert result["pp_enabled"] is True
         assert isinstance(result["pipeline_config"], PipelineConfig)
 
@@ -354,13 +386,13 @@ class TestIntegration:
         result = parse_distributed_section(cfg)
         assert result["pp_enabled"] is True
         assert isinstance(result["pipeline_config"], PipelineConfig)
-        assert isinstance(result["moe_config"], MoEParallelizerConfig)
-        assert result["moe_config"].ignore_router_for_ac is True
+        assert isinstance(result["moe_parallel_config"], MoEParallelizerConfig)
+        assert result["moe_parallel_config"].ignore_router_for_ac is True
 
-    @pytest.mark.parametrize("strategy", ["fsdp2", "megatron_fsdp", "ddp"])
-    def test_backend_configuration(self, strategy):
-        result = parse_distributed_section({"strategy": strategy, "backend": "gloo"})
-        assert result["strategy_config"].backend == "gloo"
+    @pytest.mark.parametrize("strategy", ["fsdp2", "megatron_fsdp", "megatron-fsdp", "mfsdp", "ddp"])
+    def test_process_group_backend_is_not_a_strategy_option(self, strategy):
+        with pytest.raises(ValueError, match="Unknown options"):
+            parse_distributed_section({"strategy": strategy, "backend": "gloo"})
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +407,7 @@ class TestNoneParallelismValues:
     def test_ep_size_none_defaults_to_1(self):
         result = parse_distributed_section({"strategy": "fsdp2", "ep_size": None})
         assert result["ep_size"] == 1
-        assert result["moe_config"] is None
+        assert result["moe_parallel_config"] is None
 
     def test_pp_size_none_defaults_to_1(self):
         result = parse_distributed_section({"strategy": "fsdp2", "pp_size": None})
@@ -385,7 +417,8 @@ class TestNoneParallelismValues:
 
     def test_ep_size_none_routes_ac_to_strategy(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": True, "ep_size": None})
-        assert result["strategy_config"].activation_checkpointing is True
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] is True
 
     def test_pp_size_none_discards_pipeline_dict(self):
         result = parse_distributed_section({"pp_size": None, "pipeline": {"pp_schedule": "1f1b"}})
@@ -393,40 +426,47 @@ class TestNoneParallelismValues:
 
     def test_ep_size_none_discards_moe_dict(self):
         result = parse_distributed_section({"ep_size": None, "moe": {"ignore_router_for_ac": True}})
-        assert result["moe_config"] is None
+        assert result["moe_parallel_config"] is None
 
 
 # ---------------------------------------------------------------------------
-# setup_distributed: world_size auto-detection
+# create_distributed_setup_from_config: world_size auto-detection
 # ---------------------------------------------------------------------------
 
 
-class TestSetupDistributedWorldSizeAutoDetect:
-    """``setup_distributed`` accepts an optional ``world_size`` and auto-detects
+class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
+    """``create_distributed_setup_from_config`` accepts an optional ``world_size`` and auto-detects
     it from ``torch.distributed`` / ``WORLD_SIZE`` when not provided."""
 
     @pytest.fixture
     def patched_mesh(self, monkeypatch):
-        """Stub create_device_mesh to capture the world_size it receives."""
+        """Stub mesh context creation to capture the world_size it receives."""
         captured: dict = {}
 
-        def fake_create_device_mesh(strategy_config, **kwargs):
+        def fake_build(cls, strategy_config, parallelism_sizes=None, **kwargs):
+            parallelism = parallelism_sizes or ParallelismSizes()
+            captured["strategy_config"] = strategy_config
+            captured["parallelism"] = parallelism
             captured.update(kwargs)
-            return ("device_mesh_sentinel", None)
+            device_mesh = _FakeMesh(
+                {
+                    MeshAxisName.PP: parallelism.pp_size or 1,
+                    MeshAxisName.DP_REPLICATE: parallelism.dp_replicate_size or 1,
+                    MeshAxisName.DP_SHARD: parallelism.dp_size or 1,
+                    MeshAxisName.CP: parallelism.cp_size or 1,
+                    MeshAxisName.TP: parallelism.tp_size or 1,
+                }
+            )
+            moe_mesh = None
+            if (parallelism.ep_size or 1) > 1:
+                moe_mesh = _FakeMesh({MeshAxisName.EP_SHARD: 1, MeshAxisName.EP: parallelism.ep_size})
+            return cls.from_meshes(device_mesh, moe_mesh)
 
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.mesh_utils.create_device_mesh",
-            fake_create_device_mesh,
-        )
-        # MeshContext.__post_init__ runs full validation against real meshes; bypass it.
-        monkeypatch.setattr(
-            "nemo_automodel.recipes._dist_setup.MeshContext",
-            lambda **kw: kw,
-        )
+        monkeypatch.setattr(MeshContext, "build", classmethod(fake_build))
         return captured
 
     def test_explicit_world_size_used(self, patched_mesh):
-        setup_distributed({"strategy": "fsdp2"}, world_size=4)
+        create_distributed_setup_from_config({"strategy": "fsdp2"}, world_size=4)
         assert patched_mesh["world_size"] == 4
 
     def test_auto_detect_from_env(self, monkeypatch, patched_mesh):
@@ -435,7 +475,7 @@ class TestSetupDistributedWorldSizeAutoDetect:
 
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
         monkeypatch.setenv("WORLD_SIZE", "8")
-        setup_distributed({"strategy": "fsdp2"})
+        create_distributed_setup_from_config({"strategy": "fsdp2"})
         assert patched_mesh["world_size"] == 8
 
     def test_auto_detect_defaults_to_one(self, monkeypatch, patched_mesh):
@@ -444,7 +484,7 @@ class TestSetupDistributedWorldSizeAutoDetect:
 
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
         monkeypatch.delenv("WORLD_SIZE", raising=False)
-        setup_distributed({"strategy": "fsdp2"})
+        create_distributed_setup_from_config({"strategy": "fsdp2"})
         assert patched_mesh["world_size"] == 1
 
     def test_auto_detect_from_torch_distributed(self, monkeypatch, patched_mesh):
@@ -453,5 +493,48 @@ class TestSetupDistributedWorldSizeAutoDetect:
 
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 16)
-        setup_distributed({"strategy": "fsdp2"})
+        create_distributed_setup_from_config({"strategy": "fsdp2"})
         assert patched_mesh["world_size"] == 16
+
+    def test_programmatic_args_without_cfg(self, patched_mesh):
+        result = create_distributed_setup_from_config(
+            strategy="fsdp2",
+            tp_size=2,
+            ep_size=2,
+            activation_checkpointing=True,
+            world_size=4,
+        )
+
+        assert patched_mesh["parallelism"] == ParallelismSizes(tp_size=2, ep_size=2)
+        assert isinstance(result, DistributedSetup)
+        assert isinstance(result.strategy_config, FSDP2Config)
+        assert isinstance(result.moe_parallel_config, MoEParallelizerConfig)
+        assert result.strategy_config.activation_checkpointing is False
+        assert result.activation_checkpointing is True
+
+    @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
+    def test_programmatic_megatron_fsdp_names(self, strategy, patched_mesh):
+        result = create_distributed_setup_from_config(strategy=strategy, world_size=1)
+
+        assert isinstance(result.strategy_config, MegatronFSDPConfig)
+
+    def test_programmatic_args_override_cfg_fallback(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {"strategy": "fsdp2", "tp_size": 1, "ep_size": 1},
+            tp_size=2,
+            ep_size=2,
+            world_size=4,
+        )
+
+        assert patched_mesh["parallelism"] == ParallelismSizes(tp_size=2, ep_size=2)
+
+    def test_strategy_kwargs_are_forwarded_to_strategy_config(self, patched_mesh):
+        result = create_distributed_setup_from_config(
+            strategy="fsdp2",
+            sequence_parallel=True,
+            defer_fsdp_grad_sync=False,
+            world_size=1,
+        )
+
+        assert result.strategy_config.sequence_parallel is True
+        assert result.strategy_config.defer_fsdp_grad_sync is False

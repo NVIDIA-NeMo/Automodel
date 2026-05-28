@@ -25,13 +25,18 @@ distributed:
 
 ### Configure Programmatically
 ```python
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.distributed.config import DistributedSetup
 
-config = FSDP2Config(activation_checkpointing=True)
-# device_mesh is created elsewhere (e.g. by the recipe via setup_distributed)
-manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
-model = manager.parallelize(model)
+distributed_setup = DistributedSetup.build(
+    strategy="fsdp2",
+    activation_checkpointing=True,
+)
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    distributed_setup=distributed_setup,
+)
 ```
 
 ## Combine with Linear-Cut Cross-Entropy (LC-CE)
