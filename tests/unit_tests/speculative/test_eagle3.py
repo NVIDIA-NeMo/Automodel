@@ -883,3 +883,325 @@ def test_eagle3_flash_attention_2_rejects_non_monotonic_attention_mask():
             projected_hidden_states=draft.project_hidden_states(aux_hidden_states),
             attention_mask=attention_mask,
         )
+
+
+# ---------------------------------------------------------------------------
+# EAGLE-3.1 drafter toggles: ``fc_norm`` and ``norm_output``.
+#
+# Both flags default to False; EAGLE-3 behavior must be byte-for-byte
+# identical to the pre-3.1 path. Enabling either toggle re-routes a
+# specific tensor through an RMSNorm, so the unit tests below assert two
+# things per toggle:
+#
+# 1. The default-off path matches the legacy behavior (regression guard).
+# 2. The on path actually changes the tensor at the expected boundary
+#    (sanity that we did not accidentally no-op the flag).
+# ---------------------------------------------------------------------------
+
+
+def _build_tiny_eagle31_config(*, fc_norm: bool, norm_output: bool) -> LlamaConfig:
+    """Tiny Llama config with the two EAGLE-3.1 drafter toggles attached."""
+    config = LlamaConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+        max_position_embeddings=64,
+    )
+    config.torch_dtype = torch.float32
+    config.draft_vocab_size = 16
+    config.target_hidden_size = 32
+    config.fc_norm = fc_norm
+    config.norm_output = norm_output
+    return config
+
+
+def test_eagle3_1_default_flags_register_no_extra_parameters():
+    """With both flags off the state dict must be byte-identical to EAGLE-3.
+
+    Guards against accidentally registering any ``model.fc_norm.*`` key when
+    neither toggle is set: existing EAGLE-3 checkpoints would otherwise fail
+    to load with a "missing keys" error.
+    """
+    eagle3_config = _build_tiny_eagle31_config(fc_norm=False, norm_output=False)
+    eagle3_keys = set(LlamaEagle3DraftModel(eagle3_config).state_dict().keys())
+    assert not any(k.startswith("model.fc_norm") for k in eagle3_keys)
+
+    # Reference: a draft built with neither attribute present at all
+    # (legacy-shape config) must produce exactly the same key set.
+    legacy_config = LlamaConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+        max_position_embeddings=64,
+    )
+    legacy_config.torch_dtype = torch.float32
+    legacy_config.draft_vocab_size = 16
+    legacy_config.target_hidden_size = 32
+    legacy_keys = set(LlamaEagle3DraftModel(legacy_config).state_dict().keys())
+    assert legacy_keys == eagle3_keys
+
+
+def test_eagle3_1_fc_norm_registers_modulelist_and_changes_projection():
+    """``fc_norm=True`` adds one independent RMSNorm per aux chunk.
+
+    Pins the on-disk layout to vLLM's EAGLE-3.1 convention:
+    ``model.fc_norm.0.weight``, ``model.fc_norm.1.weight``,
+    ``model.fc_norm.2.weight`` (one per ``num_aux_hidden_states``). A single
+    shared ``model.fc_norm.weight`` would NOT load into vLLM / SGLang and
+    would silently produce a different architecture.
+    """
+    torch.manual_seed(0)
+    config_off = _build_tiny_eagle31_config(fc_norm=False, norm_output=False)
+    draft_off = LlamaEagle3DraftModel(config_off)
+
+    torch.manual_seed(0)
+    config_on = _build_tiny_eagle31_config(fc_norm=True, norm_output=False)
+    draft_on = LlamaEagle3DraftModel(config_on)
+
+    # Per-chunk ModuleList: exactly ``num_aux_hidden_states`` (3 here)
+    # independent RMSNorm modules, each registered as
+    # ``model.fc_norm.<i>.weight``. No single ``model.fc_norm.weight``.
+    keys_off = set(draft_off.state_dict().keys())
+    keys_on = set(draft_on.state_dict().keys())
+    num_aux = getattr(config_on, "num_aux_hidden_states", 3)
+    expected_norm_keys = {f"model.fc_norm.{i}.weight" for i in range(num_aux)}
+    assert keys_off.isdisjoint(expected_norm_keys)
+    assert expected_norm_keys.issubset(keys_on)
+    # Reject the wrong (single-shared) layout outright.
+    assert "model.fc_norm.weight" not in keys_on
+
+    assert isinstance(draft_on.model.fc_norm, torch.nn.ModuleList)
+    assert len(draft_on.model.fc_norm) == num_aux
+    for norm in draft_on.model.fc_norm:
+        assert norm.weight.shape == (config_on.target_hidden_size,)
+
+    # The per-chunk RMSNorm modules must be independent objects with
+    # independent ``Parameter`` storage; otherwise training would tie
+    # gradients across chunks and silently collapse to the shared-norm
+    # variant we just rejected.
+    storage_ids = {id(norm.weight) for norm in draft_on.model.fc_norm}
+    assert len(storage_ids) == num_aux
+
+    # Shared backbone weights round-trip between the two drafts; the
+    # ``model.fc_norm.*`` keys exist only on ``draft_on`` so we load with
+    # ``strict=False`` and then ensure the comparison is meaningful by
+    # also forcing per-chunk norm weights to canonical ones (the default,
+    # so this is mostly a guard against future init changes).
+    draft_on.load_state_dict(draft_off.state_dict(), strict=False)
+    with torch.no_grad():
+        for norm in draft_on.model.fc_norm:
+            norm.weight.fill_(1.0)
+
+    batch_size, seq_len = 2, 6
+    aux = torch.randn(batch_size, seq_len, config_on.hidden_size * 3)
+
+    with torch.no_grad():
+        proj_off = draft_off.project_hidden_states(aux)
+        proj_on = draft_on.project_hidden_states(aux)
+
+    # The default RMSNorm scale is ones, so ``fc_norm(x) != x`` in general
+    # (RMSNorm rescales by 1 / sqrt(mean(x^2))). The projections must
+    # therefore differ once the flag is on.
+    assert proj_off.shape == proj_on.shape
+    diff = (proj_off - proj_on).abs().max().item()
+    assert diff > 1e-4, (
+        f"fc_norm=True did not change the FC input (max_diff={diff}); the per-chunk RMSNorm path is not being applied."
+    )
+
+
+def test_eagle3_1_fc_norm_chunks_are_routed_per_index():
+    """``project_hidden_states`` routes chunk ``i`` through ``fc_norm[i]``.
+
+    Replaces each ``fc_norm[i]`` with a tag module that adds ``i`` to its
+    input, sets the FC weight to a block-diagonal identity so every chunk's
+    contribution is summed into the output unchanged, then verifies the
+    output is ``sum(range(num_aux))``. A bug where every chunk goes through
+    ``fc_norm[0]`` (or any other misindexing) yields a different sum --
+    catching the failure mode that motivated the ModuleList refactor and
+    that pure numerical tests would miss.
+    """
+    torch.manual_seed(0)
+    config = _build_tiny_eagle31_config(fc_norm=True, norm_output=False)
+    draft = LlamaEagle3DraftModel(config)
+    target_h = config.target_hidden_size
+    num_aux = len(draft.model.fc_norm)
+    assert config.hidden_size == target_h, "test assumes hidden_size == target_hidden_size"
+
+    class _TagNorm(torch.nn.Module):
+        def __init__(self, idx: int, hidden_size: int):
+            super().__init__()
+            self.idx = idx
+            # Keep a Parameter so ``draft.model.fc_norm[i].weight`` still
+            # resolves; the tag behaviour does not consult it.
+            self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + float(self.idx)
+
+    draft.model.fc_norm = torch.nn.ModuleList([_TagNorm(i, target_h) for i in range(num_aux)])
+    with torch.no_grad():
+        draft.model.fc.weight.zero_()
+        # Block-diagonal: column block ``i`` is identity, so the FC sums
+        # the tagged chunks unchanged into the output.
+        for i in range(num_aux):
+            draft.model.fc.weight[:, i * target_h : (i + 1) * target_h] = torch.eye(target_h)
+
+    aux = torch.zeros(1, 1, target_h * num_aux)
+    with torch.no_grad():
+        out = draft.project_hidden_states(aux)
+    expected_per_position = float(sum(range(num_aux)))  # 0 + 1 + 2 = 3 for num_aux=3
+    torch.testing.assert_close(out, torch.full_like(out, expected_per_position))
+
+
+def test_eagle3_1_norm_output_returns_post_norm_state():
+    """``norm_output=True`` makes ``forward`` return the post-``model.norm`` state."""
+    torch.manual_seed(0)
+    config_off = _build_tiny_eagle31_config(fc_norm=False, norm_output=False)
+    draft_off = LlamaEagle3DraftModel(config_off)
+
+    torch.manual_seed(0)
+    config_on = _build_tiny_eagle31_config(fc_norm=False, norm_output=True)
+    draft_on = LlamaEagle3DraftModel(config_on)
+    draft_on.load_state_dict(draft_off.state_dict())
+
+    batch_size, seq_len = 2, 6
+    input_ids = torch.randint(0, config_on.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux = torch.randn(batch_size, seq_len, config_on.hidden_size * 3)
+    projected = draft_off.project_hidden_states(aux)
+
+    with torch.no_grad():
+        h_off = draft_off(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+        )
+        h_on = draft_on(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+        )
+        expected = draft_off.model.norm(h_off)
+
+    # ``forward`` with the flag on must equal applying ``model.norm`` to the
+    # legacy output. Bf16 / fp32 RMSNorm are deterministic so an exact
+    # ``allclose`` with tight tolerance is appropriate.
+    torch.testing.assert_close(h_on, expected, atol=1e-6, rtol=1e-6)
+    # And it must NOT equal the raw legacy output (otherwise the flag
+    # silently degenerated to a no-op).
+    assert (h_off - h_on).abs().max().item() > 1e-4
+
+
+def test_eagle3_1_compute_logits_skips_double_norm_when_norm_output():
+    """compute_logits(norm_output=True, forward_out) must equal compute_logits(off, raw).
+
+    The pair (forward returns post-norm) + (compute_logits skips norm) is
+    designed to be observation-equivalent to the legacy path at the
+    logit boundary: only the *feedback* into the next TTT step changes.
+    This test pins that invariant so future refactors of either method
+    cannot silently introduce a double or missing normalization.
+    """
+    torch.manual_seed(0)
+    config_off = _build_tiny_eagle31_config(fc_norm=False, norm_output=False)
+    draft_off = LlamaEagle3DraftModel(config_off)
+
+    torch.manual_seed(0)
+    config_on = _build_tiny_eagle31_config(fc_norm=False, norm_output=True)
+    draft_on = LlamaEagle3DraftModel(config_on)
+    draft_on.load_state_dict(draft_off.state_dict())
+
+    batch_size, seq_len = 2, 6
+    input_ids = torch.randint(0, config_on.vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux = torch.randn(batch_size, seq_len, config_on.hidden_size * 3)
+    projected = draft_off.project_hidden_states(aux)
+
+    with torch.no_grad():
+        h_off = draft_off(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+        )
+        h_on = draft_on(
+            input_ids=input_ids,
+            projected_hidden_states=projected,
+            attention_mask=attention_mask,
+        )
+        logits_off = draft_off.compute_logits(h_off)
+        logits_on = draft_on.compute_logits(h_on)
+
+    torch.testing.assert_close(logits_on, logits_off, atol=1e-6, rtol=1e-6)
+
+
+def test_eagle3_1_full_forward_runs_end_to_end():
+    """Both flags on: ``project_hidden_states`` + ``forward`` + ``compute_logits`` produce finite logits."""
+    torch.manual_seed(0)
+    config = _build_tiny_eagle31_config(fc_norm=True, norm_output=True)
+    draft = LlamaEagle3DraftModel(config)
+
+    batch_size, seq_len = 2, 8
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
+    aux = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    hidden = draft(
+        input_ids=input_ids,
+        projected_hidden_states=draft.project_hidden_states(aux),
+        attention_mask=attention_mask,
+    )
+    logits = draft.compute_logits(hidden)
+
+    assert hidden.shape == (batch_size, seq_len, config.hidden_size)
+    assert logits.shape == (batch_size, seq_len, config.draft_vocab_size)
+    assert torch.isfinite(hidden).all()
+    assert torch.isfinite(logits).all()
+
+
+def test_eagle3_1_trainer_multi_step_runs_with_flags_enabled():
+    """Multi-step TTT training works end-to-end with both EAGLE-3.1 toggles on."""
+    torch.manual_seed(0)
+    config = _build_tiny_eagle31_config(fc_norm=True, norm_output=True)
+    draft = LlamaEagle3DraftModel(config).to(torch.float32)
+
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.ones(config.vocab_size, dtype=torch.bool)
+
+    trainer = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=3,
+    )
+
+    batch_size, seq_len = 2, 8
+    input_ids = torch.randint(0, config.draft_vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    loss_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    aux_hidden_states = torch.randn(batch_size, seq_len, config.hidden_size * 3)
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+
+    metrics = trainer(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        aux_hidden_states=aux_hidden_states,
+        target_logits=target_logits,
+    )
+
+    assert torch.isfinite(metrics.loss)
+    assert 0.0 <= metrics.accuracy.item() <= 1.0
+    metrics.loss.backward()
+    # Every per-chunk fc_norm parameter must receive a non-zero gradient;
+    # otherwise the chunk's normalization is not in the autograd graph.
+    for i, norm in enumerate(draft.model.fc_norm):
+        grad = norm.weight.grad
+        assert grad is not None and grad.abs().sum().item() > 0, (
+            f"fc_norm[{i}].weight did not receive a gradient -- the EAGLE-3.1 fc_norm path "
+            f"is not in the autograd graph for that chunk."
+        )
