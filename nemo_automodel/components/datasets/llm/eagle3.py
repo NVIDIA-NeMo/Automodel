@@ -88,6 +88,25 @@ def build_eagle3_token_mapping(
         - ``selected_token_ids`` has shape ``[draft_vocab_size]``
         - ``selected_token_mask`` has shape ``[target_vocab_size]``
     """
+    # Validate sizes up front. ``target_vocab_size`` must be positive (it
+    # sizes the dense count tensor + mask), and ``draft_vocab_size`` -- when
+    # supplied -- must be a positive integer. Without these guards a caller
+    # passing ``draft_vocab_size=0`` quietly gets an empty selection, and
+    # ``draft_vocab_size=-1`` interacts with the ``selected[:draft_vocab_size]``
+    # slice to drop the last special token instead of erroring -- both
+    # silently miscompile downstream rather than failing fast.
+    if not isinstance(target_vocab_size, int) or target_vocab_size <= 0:
+        raise ValueError(
+            f"build_eagle3_token_mapping requires target_vocab_size to be a "
+            f"positive integer, got target_vocab_size={target_vocab_size!r}."
+        )
+    if draft_vocab_size is not None and (not isinstance(draft_vocab_size, int) or draft_vocab_size <= 0):
+        raise ValueError(
+            f"build_eagle3_token_mapping requires draft_vocab_size to be a "
+            f"positive integer or None (= use the full target vocab), got "
+            f"draft_vocab_size={draft_vocab_size!r}."
+        )
+
     if draft_vocab_size is None or draft_vocab_size >= target_vocab_size:
         selected_token_ids = torch.arange(target_vocab_size, dtype=torch.long)
         selected_token_mask = torch.ones(target_vocab_size, dtype=torch.bool)
