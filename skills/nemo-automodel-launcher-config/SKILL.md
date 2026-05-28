@@ -37,6 +37,29 @@ Use these compact answer patterns for common questions:
   Treat profiling as diagnostic-only: use short profiling runs and disable it
   for normal production training because it adds overhead and large artifacts.
 
+For Slurm answers, start with this minimal template and then adjust only the
+fields the user asked about:
+
+```yaml
+slurm:
+  job_name: llm_finetune
+  nodes: 2
+  ntasks_per_node: 8
+  time: "04:00:00"
+  account: my_account
+  partition: batch
+  container_image: nvcr.io/nvidia/nemo:dev
+  hf_home: ~/.cache/huggingface
+  master_port: 13742
+  env_vars:
+    HF_TOKEN: "${HF_TOKEN}"
+```
+
+For Slurm-only questions, do not discuss SkyPilot or profiling unless the user
+asks. For profiling questions, say the `.nsys-rep` report is written in the
+Slurm job working or output directory, using the launcher's Nsys output setting
+when one is configured.
+
 ## Routing Boundary
 
 Use this skill only for launch mechanics: interactive execution, Slurm, SkyPilot, containers, mounts, environment variables, rendezvous settings, and profiling.
@@ -178,7 +201,8 @@ This is a Slurm launcher setting. Normal Slurm fields such as `job_name`,
 `container_image` still apply.
 
 When `nsys_enabled: true`, the launcher wraps the training command with
-`nsys profile` and writes a `.nsys-rep` report file for performance analysis.
+`nsys profile` and writes a `.nsys-rep` report file for performance analysis
+in the Slurm job working or output directory.
 Profiling is diagnostic-only: run it for a short investigation, expect overhead
 and large artifacts, and turn it off for normal production training.
 
