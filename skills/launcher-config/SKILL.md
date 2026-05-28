@@ -9,6 +9,12 @@ license: Apache-2.0
 
 NeMo AutoModel supports three launch methods: interactive (torchrun), Slurm (HPC clusters), and SkyPilot (cloud-agnostic).
 
+## Routing Boundary
+
+Use this skill only for launch mechanics: interactive execution, Slurm, SkyPilot, containers, mounts, environment variables, rendezvous settings, and profiling.
+
+Do not use this skill for implementing or registering new model architectures, Hugging Face state-dict adapters, model files, or capability flags. Those are model onboarding tasks, not launcher configuration tasks.
+
 ## Launch Methods
 
 1. **Interactive** (default): runs torchrun on the current node. Suitable for single-node development and debugging.
@@ -95,6 +101,15 @@ skypilot:
 - `region`: cloud region for instance placement
 - `setup`: shell commands to run before the training job (e.g., install dependencies)
 - `env_vars`: environment variables for the job
+
+### SkyPilot spot checklist
+
+When using spot or preemptible instances:
+
+- Set `use_spot: true` in the `skypilot:` section.
+- Include `accelerators`, `num_nodes`, `disk_size`, `region`, `setup`, and required `env_vars`.
+- Use short checkpoint intervals in the recipe, for example `step_scheduler.checkpoint_interval`, because spot instances can be preempted.
+- Resume from the most recent checkpoint after preemption with the recipe's `restore_from` setting.
 
 ## Multi-Node Environment
 
