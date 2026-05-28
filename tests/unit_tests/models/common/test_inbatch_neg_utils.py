@@ -22,6 +22,7 @@ from nemo_automodel.components.models.common.inbatch_neg_utils import (
     mask_gathered_passages_same_doc_as_positive,
 )
 
+
 def _is_masked(x: torch.Tensor) -> bool:
     """True when ``x`` is the dtype's ``-inf`` marker or its ``finfo.min``.
 

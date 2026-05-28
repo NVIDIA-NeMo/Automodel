@@ -60,6 +60,7 @@ from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
@@ -360,6 +361,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if i == 0:
+                prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,

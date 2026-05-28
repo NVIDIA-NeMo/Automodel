@@ -49,6 +49,7 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     """
     non_tied_lm_head_models = {
         "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
+        "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
     }
     model_class_name = type(model).__name__
     for m in non_tied_lm_head_models:
@@ -198,7 +199,19 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
         return False
     lm_head_weight, _ = get_lm_head_weight_and_name(model)
     input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    return lm_head_weight is not None and input_embeddings_weight is not None
+    if lm_head_weight is None or input_embeddings_weight is None:
+        return False
+    # Even when ``config.tie_word_embeddings`` is ``True``, refuse to treat
+    # the two as locally tied if their shapes disagree. This handles
+    # speculative-decoding draft models that intentionally keep a
+    # full-vocab ``embed_tokens`` but a shrunk-vocab ``lm_head`` (e.g.
+    # EAGLE-3 with ``draft_vocab_size < target_vocab_size``). Without this
+    # check the save path would drop ``lm_head.weight`` from the state
+    # dict and the load path would resurrect it from ``embed_tokens``,
+    # producing a strict-load shape mismatch on resume.
+    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+        return False
+    return True
 
 
 def materialize_missing_tied_lm_head(

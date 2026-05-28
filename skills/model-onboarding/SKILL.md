@@ -2,6 +2,7 @@
 name: model-onboarding
 description: Guide for onboarding new model families into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
 when_to_use: Adding a new model architecture (LLM, VLM, MoE, diffusion, retrieval, etc.) to NeMo AutoModel, implementing combined projections, registering a model, or adding capability flags.
+license: Apache-2.0
 ---
 
 # Adding Model Support to NeMo AutoModel
@@ -291,16 +292,10 @@ def test_training_loss_decreases(model, tiny_config):
 ### 5.1 Update model coverage page
 
 Edit the appropriate file in `docs/model-coverage/`:
-- LLM/MoE: `docs/model-coverage/llm.md`
-- VLM: `docs/model-coverage/vlm.md`
+- LLM/MoE: `docs/model-coverage/llm/index.md`
+- VLM: `docs/model-coverage/vlm/index.md`
 
 Add a row with the model name, supported features (TP, PP, FSDP, LoRA, QLoRA), and any limitations.
-
-### 5.2 Add example configs
-
-Add fully commented example configs under `examples/`:
-- `examples/llm_finetune/<name>/sft.yaml` for LLMs
-- `examples/vlm_finetune/<name>/sft.yaml` for VLMs
 
 ---
 
@@ -310,10 +305,17 @@ After implementation and unit tests are complete, run the full parity-testing
 workflow to verify that the new model produces numerically equivalent results to
 the reference HuggingFace implementation.
 
-**Read and follow the parity-testing skill** at
-`.claude/skills/parity-testing/SKILL.md`. It walks through three levels of
-comparison (state-dict round-trip, component-level parity, end-to-end forward
-pass) and provides debugging steps when a level fails.
+Run three levels of comparison:
+
+1. State-dict round-trip: load a reference HuggingFace checkpoint, convert it
+   into the NeMo AutoModel layout, export it back, and verify that all mapped
+   tensors match the reference names, shapes, dtypes, and values within the
+   expected tolerance.
+2. Component-level parity: compare rewritten attention, MLP, normalization,
+   RoPE, and MoE components against the HuggingFace implementation with fixed
+   seeds and identical dtype.
+3. End-to-end forward pass: run the full NeMo AutoModel and HuggingFace model
+   on the same tokenized input and compare logits, hidden states, and loss.
 
 Do not skip this phase. A model that passes unit tests can still diverge from HF
 due to subtle weight-conversion bugs, backend differences, or RoPE mismatches
@@ -359,5 +361,5 @@ that only surface in a full parity comparison.
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page
-- [ ] Ran parity-testing skill (state-dict round-trip, component parity, E2E forward pass)
+- [ ] Ran state-dict round-trip, component parity, and E2E forward-pass parity checks
 - [ ] Set `ModelClass = <Name>ForCausalLM` at module bottom
