@@ -1,5 +1,5 @@
 ---
-name: NeMo-automodel-model-onboarding
+name: nemo-automodel-model-onboarding
 description: Guide for onboarding new model architectures into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
 when_to_use: Adding or modifying model architecture support in NeMo AutoModel, such as LLM/VLM/MoE model files, custom layers, state-dict adapters, registry entries, Hugging Face config mapping, or capability flags.
 license: Apache-2.0
@@ -13,7 +13,7 @@ This skill guides implementation of new model architectures in NeMo AutoModel. F
 
 Use this skill only when the user is adding or modifying model architecture support: model files, custom layers, state-dict adapters, Hugging Face config mapping, registry entries, or model capability flags.
 
-Do not use this skill for standalone training recipe YAML questions about optimizers, datasets, schedulers, validation datasets, or trainer wiring unless they are explicitly part of onboarding a new model architecture. Those recipe questions belong to the NeMo-automodel-recipe-development skill.
+Do not use this skill for standalone training recipe YAML questions about optimizers, datasets, schedulers, validation datasets, or trainer wiring unless they are explicitly part of onboarding a new model architecture. Those recipe questions belong to the nemo-automodel-recipe-development skill.
 
 In-scope examples:
 
@@ -182,7 +182,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 ## Phase 3: Onboarding Example Config
 
 This phase is only for adding a minimal example config that proves the newly
-onboarded architecture can load and run. Use NeMo-automodel-recipe-development for general
+onboarded architecture can load and run. Use nemo-automodel-recipe-development for general
 recipe authoring or existing recipe modifications.
 
 ### 3.1 Create example YAML config

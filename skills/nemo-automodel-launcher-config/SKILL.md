@@ -1,5 +1,5 @@
 ---
-name: NeMo-automodel-launcher-config
+name: nemo-automodel-launcher-config
 description: Configure NeMo AutoModel job launches for interactive runs, Slurm clusters, and SkyPilot cloud execution.
 when_to_use: Configuring Slurm or SkyPilot job submission, setting up multi-node launch scripts, debugging job submission failures, or switching between interactive and cluster launch modes.
 license: Apache-2.0
