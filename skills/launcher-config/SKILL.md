@@ -102,6 +102,15 @@ skypilot:
 - `setup`: shell commands to run before the training job (e.g., install dependencies)
 - `env_vars`: environment variables for the job
 
+### SkyPilot spot checklist
+
+When using spot or preemptible instances:
+
+- Set `use_spot: true` in the `skypilot:` section.
+- Include `accelerators`, `num_nodes`, `disk_size`, `region`, `setup`, and required `env_vars`.
+- Use short checkpoint intervals in the recipe, for example `step_scheduler.checkpoint_interval`, because spot instances can be preempted.
+- Resume from the most recent checkpoint after preemption with the recipe's `restore_from` setting.
+
 ## Multi-Node Environment
 
 For multi-node training (both Slurm and SkyPilot), the launcher automatically configures:
