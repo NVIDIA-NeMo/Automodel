@@ -1,7 +1,7 @@
 ---
 name: model-onboarding
-description: Guide for onboarding new model families into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
-when_to_use: Adding a new model architecture (LLM, VLM, MoE, diffusion, retrieval, etc.) to NeMo AutoModel, implementing combined projections, registering a model, or adding capability flags.
+description: Guide for onboarding new model architectures into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
+when_to_use: Adding or modifying model architecture support in NeMo AutoModel, such as LLM/VLM/MoE model files, custom layers, state-dict adapters, registry entries, Hugging Face config mapping, or capability flags.
 license: Apache-2.0
 ---
 
@@ -14,6 +14,18 @@ This skill guides implementation of new model architectures in NeMo AutoModel. F
 Use this skill only when the user is adding or modifying model architecture support: model files, custom layers, state-dict adapters, Hugging Face config mapping, registry entries, or model capability flags.
 
 Do not use this skill for standalone training recipe YAML questions about optimizers, datasets, schedulers, validation datasets, or trainer wiring unless they are explicitly part of onboarding a new model architecture. Those recipe questions belong to the recipe-development skill.
+
+In-scope examples:
+
+- "Add support for a new Hugging Face causal LM architecture."
+- "Map MoE router and expert weights from a Hugging Face checkpoint."
+- "Register a new model class in NeMo AutoModel."
+
+Out-of-scope examples:
+
+- "Write a finetuning recipe YAML with optimizer and dataset sections."
+- "Choose FSDP2, DDP, tensor parallel, or context parallel settings."
+- "Configure Slurm, SkyPilot, containers, mounts, or launch dispatch."
 
 ## Phase 1: Discovery
 
@@ -152,7 +164,11 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 
 ---
 
-## Phase 3: Recipe & Config
+## Phase 3: Onboarding Example Config
+
+This phase is only for adding a minimal example config that proves the newly
+onboarded architecture can load and run. Use recipe-development for general
+recipe authoring or existing recipe modifications.
 
 ### 3.1 Create example YAML config
 
