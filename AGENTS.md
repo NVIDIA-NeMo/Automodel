@@ -23,10 +23,10 @@ two locations:
   (`build-and-dependency`, `cicd`, `fern-docs`, `linting-and-formatting`,
   `parity-testing`, `testing`)
 
-`.agents/skills` and `.claude/skills` point at the public `skills/` directory.
-Contributor skills are intentionally kept outside that catalog sync path.
-Always read the relevant `SKILL.md` before starting any task it covers; skills
-are mandatory context, not optional background reading.
+All skills are symlinked into `.claude/skills/` for unified discovery.
+Contributor skills are intentionally kept outside the public `skills/` catalog
+sync path. Always read the relevant `SKILL.md` before starting any task it
+covers; skills are mandatory context, not optional background reading.
 
 ---
 
