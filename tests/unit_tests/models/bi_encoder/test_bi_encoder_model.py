@@ -20,8 +20,8 @@ import nemo_automodel._transformers.auto_model as am
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
-    colbert_scores_and_labels,
-    distributed_colbert_scores_and_labels,
+    distributed_maxsim_scores_and_labels,
+    maxsim_scores_and_labels,
 )
 
 
@@ -38,7 +38,7 @@ class DummyMesh:
 class _ToyColbertBiEncoder(torch.nn.Module):
     do_distributed_inbatch_negative = False
     l2_normalize = False
-    pooling = "colbert"
+    pooling = "maxsim"
 
     def __init__(self):
         super().__init__()
@@ -203,7 +203,7 @@ def test_cross_encoder_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, CrossEncoderModel, am.NeMoAutoModelCrossEncoder)
 
 
-def test_colbert_scores_and_labels_masks_padding_before_maxsim():
+def test_maxsim_scores_and_labels_masks_padding_before_maxsim():
     query = torch.tensor(
         [
             [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
@@ -222,7 +222,7 @@ def test_colbert_scores_and_labels_masks_padding_before_maxsim():
     )
     key_attention_mask = torch.tensor([[1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0]])
 
-    scores, labels = colbert_scores_and_labels(
+    scores, labels = maxsim_scores_and_labels(
         query,
         key,
         current_train_n_passages=3,
@@ -233,7 +233,7 @@ def test_colbert_scores_and_labels_masks_padding_before_maxsim():
     assert torch.equal(labels, torch.tensor([0, 0]))
 
 
-def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
+def test_distributed_maxsim_scores_and_labels_uses_global_positive_labels():
     query = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
     key = torch.tensor(
         [
@@ -249,7 +249,7 @@ def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
     )
     key_attention_mask = torch.ones(key.shape[:2], dtype=torch.long)
 
-    scores, labels = distributed_colbert_scores_and_labels(
+    scores, labels = distributed_maxsim_scores_and_labels(
         query,
         key,
         current_train_n_passages=2,
@@ -261,7 +261,7 @@ def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
     assert torch.equal(labels, torch.tensor([4, 6]))
 
 
-def test_forward_backward_step_supports_local_colbert_pooling():
+def test_forward_backward_step_supports_local_maxsim_pooling():
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)

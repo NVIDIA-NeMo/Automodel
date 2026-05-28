@@ -167,7 +167,7 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
             sequence_lengths = attention_mask.sum(dim=1) - 1
             batch_size = last_hidden.shape[0]
             emb = last_hidden[torch.arange(batch_size, device=last_hidden.device), sequence_lengths]
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "maxsim", "late_interaction"}:
         emb = last_hidden
     else:
         raise ValueError(f"pool_type {pool_type} not supported")

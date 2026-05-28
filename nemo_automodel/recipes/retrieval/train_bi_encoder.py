@@ -48,6 +48,11 @@ from nemo_automodel.shared.te_patches import apply_te_patches
 logger = logging.getLogger(__name__)
 
 
+def _uses_maxsim_pooling(model) -> bool:
+    """Return True when the bi-encoder emits token embeddings for MaxSim scoring."""
+    return getattr(model, "pooling", None) in {"colbert", "maxsim", "late_interaction"}
+
+
 def contrastive_scores_and_labels(
     query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -72,13 +77,13 @@ def contrastive_scores_and_labels(
     return qk, labels
 
 
-def colbert_scores_and_labels(
+def maxsim_scores_and_labels(
     query: torch.Tensor,
     key: torch.Tensor,
     current_train_n_passages: int,
     key_attention_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local ColBERT MaxSim scores and labels without in-batch negatives."""
+    """Compute local ColBERT-style MaxSim scores and labels without in-batch negatives."""
     assert key.shape[0] == query.shape[0] * current_train_n_passages, "{} != {} * {}".format(
         key.shape[0], query.shape[0], current_train_n_passages
     )
@@ -95,14 +100,14 @@ def colbert_scores_and_labels(
     return scores, labels
 
 
-def distributed_colbert_scores_and_labels(
+def distributed_maxsim_scores_and_labels(
     query: torch.Tensor,
     key: torch.Tensor,
     current_train_n_passages: int,
     key_attention_mask: torch.Tensor,
     rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local-query ColBERT MaxSim scores against globally gathered passages."""
+    """Compute local-query ColBERT-style MaxSim scores against globally gathered passages."""
     assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(
         key.shape[0], current_train_n_passages
     )
@@ -114,6 +119,10 @@ def distributed_colbert_scores_and_labels(
     labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device) + rank * query.shape[0]
     labels = labels * current_train_n_passages
     return scores, labels
+
+
+colbert_scores_and_labels = maxsim_scores_and_labels
+distributed_colbert_scores_and_labels = distributed_maxsim_scores_and_labels
 
 
 def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
@@ -402,14 +411,14 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                if getattr(model, "pooling", None) == "colbert":
+                if _uses_maxsim_pooling(model):
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps)
                     all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
                     expected_p = world_size * local_bs * n_passages
                     assert (
                         all_p.shape[0] == expected_p
                     ), f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                    scores, labels = distributed_colbert_scores_and_labels(
+                    scores, labels = distributed_maxsim_scores_and_labels(
                         q_reps,
                         all_p,
                         n_passages,
@@ -437,8 +446,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         local_batch_size=local_bs,
                     )
             else:
-                if getattr(model, "pooling", None) == "colbert":
-                    scores, labels = colbert_scores_and_labels(
+                if _uses_maxsim_pooling(model):
+                    scores, labels = maxsim_scores_and_labels(
                         q_reps,
                         p_reps,
                         n_passages,
@@ -533,8 +542,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     q_reps = model(query)
                     p_reps = model(passage)
 
-                    if getattr(model, "pooling", None) == "colbert":
-                        scores, labels = colbert_scores_and_labels(
+                    if _uses_maxsim_pooling(model):
+                        scores, labels = maxsim_scores_and_labels(
                             q_reps,
                             p_reps,
                             self.val_n_passages,
