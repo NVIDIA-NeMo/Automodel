@@ -8,7 +8,7 @@ This skill is ready for commercial/non-commercial use. <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers creating or modifying NeMo AutoModel training, SFT, and evaluation recipes, adding new YAML config fields, debugging recipe construction or trainer issues, or understanding the recipe execution flow. <br>
+Developers and engineers creating or modifying NeMo AutoModel training, SFT, or evaluation recipes, adding new YAML config fields, debugging recipe construction or trainer issues, or understanding the recipe execution flow. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -19,19 +19,19 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [NeMo AutoModel Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) <br>
-- [YAML Configuration Guide](../../docs/guides/configuration.md) <br>
-- [Dataset Overview](../../docs/guides/dataset-overview.md) <br>
-- [Checkpointing Guide](../../docs/guides/checkpointing.md) <br>
+- [YAML Configuration Guide](docs/guides/configuration.md) <br>
+- [Dataset Overview](docs/guides/dataset-overview.md) <br>
+- [Checkpointing Guide](docs/guides/checkpointing.md) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Code, Configuration instructions, Shell commands] <br>
+**Output Type(s):** [Code, Configuration instructions] <br>
 **Output Format:** [Markdown with inline YAML and Python code blocks] <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
 
 ## Skill Version(s): <br>
-v0.3.0rc4-599-ga9985881 (source: git tag) <br>
+v0.3.0rc4-601-g42d7fe7d (source: git tag) <br>
 
 ## Ethical Considerations: <br>
 NVIDIA believes Trustworthy AI is a shared responsibility and we have established policies and practices to enable development for a wide array of AI applications. When downloaded or used in accordance with our terms of service, developers should work with their internal team to ensure this skill meets requirements for the relevant industry and use case and addresses unforeseen product misuse. <br>
