@@ -131,7 +131,7 @@ def _convert_messages(
             tool_calls: List[Dict[str, Any]] = []
             pending_call_ids = []
             while i < len(messages) and messages[i].get("role") == "tool_call":
-                call = _json_load_if_str(messages[i].get("content", "{}"))
+                call = _json_load_if_str(messages[i].get("content") or "{}")
                 name = call.get("name")
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"tool_call missing `name`: {messages[i]!r}")
@@ -164,6 +164,9 @@ def _convert_messages(
                 i += 1
                 local_idx += 1
         else:
+            # Reset pending_call_ids so a later orphan tool_response does not
+            # silently reuse stale IDs from the previous tool_call group.
+            pending_call_ids = []
             content = messages[i].get("content", "")
             if not isinstance(content, str):
                 content = "" if content is None else str(content)
@@ -183,7 +186,10 @@ def _format_example(
     truncation: Union[str, bool] = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
-    tools = _json_load_if_str(example.get("tools"))
+    raw_tools = example.get("tools")
+    if isinstance(raw_tools, str) and not raw_tools.strip():
+        raw_tools = None
+    tools = _json_load_if_str(raw_tools)
     if tools is not None and not isinstance(tools, list):
         raise ValueError(f"`tools` must be a list or JSON-encoded list, got {type(tools).__name__}")
     if tools is not None and len(tools) == 0:

@@ -238,3 +238,57 @@ def test_make_agent_chat_dataset_loads_hub_split_with_limit(monkeypatch):
     assert captured_load["name"] == "dummy/agent"
     assert captured_load["split"] == "train[:2]"
     assert [ds[i] for i in range(len(ds))] == [{"formatted": 0}, {"formatted": 1}]
+
+
+def test_convert_messages_orphan_tool_response_gets_synthetic_id():
+    # tool_response that does not follow a tool_call group must fall back to a
+    # synthetic tool_call_id rather than silently reusing IDs from an earlier
+    # tool_call group.
+    messages = [
+        {"role": "tool_call", "content": '{"name":"f","arguments":{}}'},
+        {"role": "tool_response", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+        {"role": "tool_response", "content": "orphan"},
+    ]
+    out = agent_chat._convert_messages(messages, example_id=7)
+
+    paired_id = out[1]["tool_call_id"]
+    orphan_id = out[3]["tool_call_id"]
+    assert paired_id == out[0]["tool_calls"][0]["id"]
+    assert orphan_id != paired_id
+    assert "response" in orphan_id
+
+
+def test_convert_messages_tool_call_with_none_content_is_rejected():
+    # A tool_call dict with ``content: None`` must surface as a clear
+    # ValueError about the missing ``name`` rather than an AttributeError.
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool_call", "content": None},
+    ]
+    with pytest.raises(ValueError, match="tool_call missing `name`"):
+        agent_chat._convert_messages(messages)
+
+
+def test_format_example_accepts_empty_tools_string(monkeypatch):
+    # ``tools: ""`` (used by some on-disk ShareGPT exports to mean "no tools")
+    # must be normalized to ``None`` rather than crashing ``json.loads("")``.
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 5
+        pad_token_id = 0
+
+    agent_chat._format_example(
+        {"tools": "", "messages": [{"role": "user", "content": "hi"}]},
+        Tok(),
+        eos_token_id=5,
+        pad_token_id=0,
+    )
+    assert captured["tools"] is None
