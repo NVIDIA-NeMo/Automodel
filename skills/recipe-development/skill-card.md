@@ -8,7 +8,7 @@ This skill is ready for commercial/non-commercial use. <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers creating or modifying training, SFT, or evaluation recipes for LLM, VLM, diffusion, and retrieval models using the NeMo AutoModel framework. <br>
+Developers and engineers creating or modifying NeMo AutoModel training, SFT, and evaluation recipes, adding new YAML config fields, debugging recipe construction or trainer issues, or understanding the recipe execution flow. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -21,7 +21,7 @@ Mitigation: Review and scan skill before deployment. <br>
 - [NeMo AutoModel Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) <br>
 - [YAML Configuration Guide](docs/guides/configuration.md) <br>
 - [Dataset Overview](docs/guides/dataset-overview.md) <br>
-- [Examples](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) <br>
+- [Checkpointing Guide](docs/guides/checkpointing.md) <br>
 
 
 ## Skill Output: <br>
@@ -31,7 +31,7 @@ Mitigation: Review and scan skill before deployment. <br>
 **Other Properties Related to Output:** [None] <br>
 
 ## Skill Version(s): <br>
-v0.3.0rc4-597-g67368388 (source: git tag) <br>
+v0.3.0rc4-599-ga9985881 (source: git tag) <br>
 
 ## Ethical Considerations: <br>
 NVIDIA believes Trustworthy AI is a shared responsibility and we have established policies and practices to enable development for a wide array of AI applications. When downloaded or used in accordance with our terms of service, developers should work with their internal team to ensure this skill meets requirements for the relevant industry and use case and addresses unforeseen product misuse. <br>
