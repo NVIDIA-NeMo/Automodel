@@ -25,8 +25,8 @@ try:
 except ImportError:
     pass
 
-import inspect
 import gc
+import inspect
 import logging
 import pathlib
 import time
@@ -1661,7 +1661,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Generation on an FSDP2 training model is intentionally opt-in:
         # generate() repeatedly unshards parameters and can leave enough
         # allocator pressure to OOM the next backward pass.
-        if self.tool_call_evaluator is not None:
+        if getattr(self, "tool_call_evaluator", None) is not None:
             count_key = f"{self.tool_call_evaluator.metric_prefix}/_count"
             if isinstance(self.distributed_config, FSDP2Config) and not getattr(
                 self.tool_call_evaluator, "run_on_fsdp2", False
@@ -1676,9 +1676,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 metrics[f"{self.tool_call_evaluator.metric_prefix}/_disabled_fsdp2"] = 1.0
             else:
                 try:
-                    tool_metrics = self.tool_call_evaluator.evaluate(
-                        self.model_parts[0], self.tokenizer
-                    )
+                    tool_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
                     # The evaluator returns per-rank means and count-like
                     # diagnostics. Weighted all-reduce the means by scored
                     # sample count, and sum diagnostics directly.
@@ -1697,9 +1695,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                     if total_count > 0:
                         for k, v in list(tool_metrics.items()):
-                            local_sum = torch.tensor(
-                                float(v) * local_count, dtype=torch.float32, device=device
-                            )
+                            local_sum = torch.tensor(float(v) * local_count, dtype=torch.float32, device=device)
                             total_sum = self._dp_allreduce(local_sum).item()
                             tool_metrics[k] = total_sum / total_count
 
@@ -1754,8 +1750,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         tool_call_suffix = ""
         if "tool_call/_count" in log_data.metrics:
             tool_call_suffix = (
-                " | tool_name_acc {:.3f} | args_json_valid {:.3f}"
-                " | args_exact_match {:.3f} (n={})".format(
+                " | tool_name_acc {:.3f} | args_json_valid {:.3f} | args_exact_match {:.3f} (n={})".format(
                     log_data.metrics.get("tool_call/name_correct", 0.0),
                     log_data.metrics.get("tool_call/args_json_valid", 0.0),
                     log_data.metrics.get("tool_call/args_exact_match", 0.0),
