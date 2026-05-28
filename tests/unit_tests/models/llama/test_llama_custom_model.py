@@ -20,6 +20,7 @@ from transformers import AutoModelForCausalLM, LlamaConfig, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import HAVE_TE
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 set_seed(42)
@@ -97,7 +98,13 @@ class TestLlamaModel:
         )
 
     @pytest.mark.parametrize("rope_type", ["default", "llama3"])
-    @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
+    @pytest.mark.parametrize(
+        "rms_norm",
+        [
+            "torch_fp32",
+            pytest.param("te", marks=pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not installed")),
+        ],
+    )
     def test_model_matches_hf_with_adapter_bidirectional(self, rope_type, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 

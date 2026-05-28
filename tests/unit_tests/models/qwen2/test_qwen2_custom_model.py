@@ -20,6 +20,7 @@ from transformers import AutoModelForCausalLM, Qwen2Config, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import HAVE_TE
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 
 set_seed(42)
@@ -70,7 +71,13 @@ class TestQwen2Model:
             TINY_DEFAULT_QWEN2_CONFIG, tmp_path_factory.mktemp("qwen2_ckpt")
         )
 
-    @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
+    @pytest.mark.parametrize(
+        "rms_norm",
+        [
+            "torch_fp32",
+            pytest.param("te", marks=pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not installed")),
+        ],
+    )
     def test_model_matches_hf_with_adapter_bidirectional(self, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 
