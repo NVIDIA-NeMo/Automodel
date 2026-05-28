@@ -16,32 +16,33 @@
   },
   {
     "id": "distributed-training-002-moe-expert-parallel",
-    "question": "I am onboarding an MoE model in NeMo AutoModel and want expert parallelism across GPUs. What distributed config should I start with?",
+    "question": "I am training an MoE model in NeMo AutoModel and want expert parallelism across GPUs. What distributed config should I start with?",
     "expected_skill": "distributed-training",
     "expected_script": null,
-    "ground_truth": "The agent routes to distributed-training, recommends FSDP2 with ep_size greater than 1 for MoE expert parallelism, and explains that this creates a separate moe_mesh. It should mention that MegatronFSDP does not support expert parallelism in this skill.",
+    "ground_truth": "The agent routes to distributed-training, recommends FSDP2 with ep_size greater than 1 for MoE expert parallelism, and explains that this creates a separate moe_mesh. It should mention that the moe sub-config maps to MoEParallelizerConfig, that ep_size must divide dp_size times cp_size, and that MegatronFSDP does not support expert parallelism.",
     "expected_behavior": [
       "Routes to distributed-training",
       "Recommends fsdp2 with ep_size > 1",
       "Mentions the separate moe_mesh for expert parallelism",
       "Mentions the moe sub-config when relevant",
+      "Mentions the ep_size divisibility constraint",
       "States that MegatronFSDP does not support EP",
       "Does not suggest DDP for expert parallelism"
     ]
   },
   {
-    "id": "distributed-training-003-context-packing",
-    "question": "For long-context NeMo AutoModel training with sequence packing, how should I set context parallelism and packed_sequence_size?",
+    "id": "distributed-training-003-megatron-limitations",
+    "question": "Can I use megatron_fsdp in NeMo AutoModel if I need pipeline parallelism, expert parallelism, or sequence_parallel?",
     "expected_skill": "distributed-training",
     "expected_script": null,
-    "ground_truth": "The agent routes to distributed-training, recommends fsdp2 with cp_size greater than 1 for long sequences, explains that context parallelism shards Q/K/V on the sequence dimension, and states that packed_sequence_size must be divisible by cp_size. It should mention that local_batch_size must be 1 when packed sequences are enabled, that the dataset collator packs sequences up to packed_sequence_size, and that CP uses make_cp_batch_and_ctx or equivalent context-parallel hooks before the forward pass.",
+    "ground_truth": "The agent routes to distributed-training and says no: megatron_fsdp does not support pipeline parallelism, expert parallelism, or sequence_parallel in NeMo AutoModel. It should recommend fsdp2 when PP, EP, TP plus PP, or sequence_parallel is required, and it should mention that DDP is only simple data parallelism.",
     "expected_behavior": [
       "Routes to distributed-training",
-      "Recommends fsdp2 with cp_size > 1 for long sequences",
-      "Explains that CP shards sequence-dimension tensors such as Q/K/V",
-      "States packed_sequence_size must be divisible by cp_size",
-      "Mentions local_batch_size must be 1 for packed sequences",
-      "Mentions make_cp_batch_and_ctx or context-parallel hooks before forward"
+      "States megatron_fsdp does not support pipeline parallelism",
+      "States megatron_fsdp does not support expert parallelism",
+      "States megatron_fsdp does not support sequence_parallel",
+      "Recommends fsdp2 for PP, EP, or sequence_parallel",
+      "Mentions DDP is simple data parallelism only"
     ]
   }
 ]

@@ -44,6 +44,7 @@ Quick MoE expert-parallel answer:
 - Include a `moe:` sub-config only when `ep_size > 1`; it maps to `MoEParallelizerConfig`.
 - Expect a separate `moe_mesh` for expert parallelism in addition to the main `device_mesh`.
 - Do not recommend `megatron_fsdp` or `ddp` for expert parallelism; `megatron_fsdp` has no EP support.
+- Before finishing an MoE EP answer, explicitly state that `ep_size` must divide `dp_size * cp_size` and that `megatron_fsdp` does not support EP, PP, or `sequence_parallel`.
 
 ## YAML Config Structure
 
