@@ -6,6 +6,9 @@ Only skills intended for the public catalog live under `skills/`. Contributor
 workflow skills live under `.agents/contributor-skills/` so they remain
 available in this repository without being synced externally.
 
+For repository development workflows, use the
+[contributor skills](../.agents/contributor-skills/README.md).
+
 ## Usage
 
 These public skills are synced to the global Claude Code skill registry via CI

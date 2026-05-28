@@ -11,6 +11,25 @@ hand.
 
 ---
 
+## Skills
+
+Coding guidelines and operational procedures are organized as agent skills in
+two locations:
+
+- `skills/` -- customer-facing operational skills for using NeMo AutoModel
+  (`distributed-training`, `launcher-config`, `model-onboarding`,
+  `recipe-development`)
+- `.agents/contributor-skills/` -- contributor-facing development guidelines
+  (`build-and-dependency`, `cicd`, `fern-docs`, `linting-and-formatting`,
+  `parity-testing`, `testing`)
+
+`.agents/skills` and `.claude/skills` point at the public `skills/` directory.
+Contributor skills are intentionally kept outside that catalog sync path.
+Always read the relevant `SKILL.md` before starting any task it covers; skills
+are mandatory context, not optional background reading.
+
+---
+
 ## Coding Style
 
 - **Explicit over implicit.** Inline logic where possible; avoid hiding behavior
