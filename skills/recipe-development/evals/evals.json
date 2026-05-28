@@ -30,16 +30,18 @@
     ]
   },
   {
-    "id": "recipe-development-003-negative-distributed-strategy",
-    "question": "For a long-context multi-node LLM run in NeMo AutoModel, should I use FSDP2, DDP, or Megatron FSDP and how do I set TP and CP?",
-    "expected_skill": null,
+    "id": "recipe-development-003-validation-checkpointing",
+    "question": "In a NeMo AutoModel recipe, where do I configure validation cadence, checkpoint save cadence, and restore_from?",
+    "expected_skill": "recipe-development",
     "expected_script": null,
-    "should_trigger": false,
-    "ground_truth": "The agent should not route to recipe-development because this is a distributed strategy selection question. It should say this is outside recipe construction and belongs to distributed training strategy guidance.",
+    "ground_truth": "The agent routes to recipe-development and explains that validation cadence is controlled by step_scheduler.val_check_interval, checkpoint save cadence is controlled by step_scheduler.checkpoint_interval, validation uses validation_dataset to build the validation dataloader, and resume uses restore_from.path pointing at a checkpoint directory. It should mention that checkpointing defaults to consolidated safetensors for HF ecosystem compatibility.",
     "expected_behavior": [
-      "Does not route to recipe-development",
-      "Recognizes this as distributed training strategy selection",
-      "Does not focus on builder functions or generic recipe YAML anatomy"
+      "Routes to recipe-development",
+      "Mentions step_scheduler.val_check_interval",
+      "Mentions step_scheduler.checkpoint_interval",
+      "Mentions validation_dataset for the validation dataloader",
+      "Mentions restore_from.path for resuming",
+      "Mentions consolidated safetensors checkpoint format"
     ]
   }
 ]

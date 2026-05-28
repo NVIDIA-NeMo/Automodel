@@ -30,16 +30,18 @@
     ]
   },
   {
-    "id": "model-onboarding-003-negative-launcher-config",
-    "question": "Where do I set Slurm account, partition, container_image, and extra_mounts for a NeMo AutoModel run?",
-    "expected_skill": null,
+    "id": "model-onboarding-003-vlm-onboarding",
+    "question": "I am adding a new Hugging Face VLM with vision_config and text_config to NeMo AutoModel. How should I classify it and what implementation pieces should I check?",
+    "expected_skill": "model-onboarding",
     "expected_script": null,
-    "should_trigger": false,
-    "ground_truth": "The agent should not route to model-onboarding because this is a launcher and job submission configuration question. It should say this is outside model architecture onboarding and belongs to launcher configuration.",
+    "ground_truth": "The agent routes to model-onboarding, classifies the model as a VLM because the config has vision_config and text_config and a ForConditionalGeneration-style architecture, points to vlm-patterns.md and existing VLM implementations such as mistral4, kimivl, or kimi_k25_vl, and checks the text backbone, vision tower, projector, processor assumptions, state_dict_adapter.py mappings for text and vision weights, registry registration, and tiny image-text tests.",
     "expected_behavior": [
-      "Does not route to model-onboarding",
-      "Recognizes this as launcher or job submission configuration",
-      "Does not focus on model architecture registration or state dict adapters"
+      "Routes to model-onboarding",
+      "Classifies VLMs using vision_config plus text_config and conditional-generation architecture",
+      "Mentions vlm-patterns.md or existing VLM implementations",
+      "Mentions text backbone, vision tower, projector, and processor assumptions",
+      "Mentions state_dict_adapter.py mappings for text and vision weights",
+      "Mentions registry registration and tiny image-text tests"
     ]
   }
 ]

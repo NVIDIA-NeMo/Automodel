@@ -138,7 +138,22 @@ For MoE models, do not stop at generic loading. The adapter must explicitly map:
 
 Add tests that assert expected key mappings and run numerical equivalence with tiny configs before trying full checkpoints.
 
-### 2.4 Register in registry
+### 2.4 VLM onboarding checklist
+
+For VLMs, confirm the Hugging Face config has `vision_config` and `text_config`
+and that `architectures` points to a conditional-generation class. Start from
+the closest VLM pattern file, usually [vlm-patterns.md](./vlm-patterns.md), and
+compare existing implementations such as `mistral4`, `kimivl`, or
+`kimi_k25_vl`.
+
+The implementation should explicitly cover:
+
+- Text backbone, vision tower, projector, and processor or image preprocessing assumptions.
+- Weight mapping for both text and vision modules in `state_dict_adapter.py`.
+- Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
+- Tiny tests that exercise image-text inputs and verify the adapter round-trip.
+
+### 2.5 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 
