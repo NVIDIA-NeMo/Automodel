@@ -1,0 +1,45 @@
+[
+  {
+    "id": "model-onboarding-001-new-dense-llm",
+    "question": "I want to add support for a new dense Hugging Face causal LM in NeMo AutoModel. What are the phases and files I should touch?",
+    "expected_skill": "model-onboarding",
+    "expected_script": null,
+    "ground_truth": "The agent routes to model-onboarding, starts with config discovery from Hugging Face config.json, identifies dense LLM indicators, creates components/models/<name>/ with model.py and state_dict_adapter.py plus optional config.py, registers the architecture in _transformers/registry.py, adds example YAML, and adds unit tests with tiny configs and layer equivalence tests when layers are rewritten.",
+    "expected_behavior": [
+      "Routes to model-onboarding",
+      "Starts with Hugging Face config.json discovery",
+      "Classifies dense LLMs using ForCausalLM and absence of expert fields",
+      "Names components/models/<name>/model.py and state_dict_adapter.py",
+      "Mentions MODEL_ARCH_MAPPING in _transformers/registry.py",
+      "Mentions example YAML and unit tests"
+    ]
+  },
+  {
+    "id": "model-onboarding-002-moe-state-dict",
+    "question": "For a new MoE model in NeMo AutoModel, what should I watch for when adapting the Hugging Face state dict?",
+    "expected_skill": "model-onboarding",
+    "expected_script": null,
+    "ground_truth": "The agent routes to model-onboarding, points to the MoE pattern guidance, and describes mapping router, expert, gate, and up/down projection weights carefully. It should recommend writing adapter tests that compare expected key mappings and numerical equivalence on tiny configs instead of relying only on model loading.",
+    "expected_behavior": [
+      "Routes to model-onboarding",
+      "Identifies MoE indicators such as expert fields in config",
+      "Mentions router and expert weight mapping",
+      "Mentions gate/up/down projection mapping where applicable",
+      "Recommends adapter tests for key mappings",
+      "Recommends tiny-config validation before full-size checkpoints"
+    ]
+  },
+  {
+    "id": "model-onboarding-003-negative-recipe-yaml",
+    "question": "How do I structure a NeMo AutoModel recipe YAML with optimizer, dataset, scheduler, and validation_dataset sections?",
+    "expected_skill": null,
+    "expected_script": null,
+    "ground_truth": "The agent should not route to model-onboarding because this is a recipe YAML construction question. It should prefer the recipe-development skill.",
+    "expected_behavior": [
+      "Does not route to model-onboarding",
+      "Recognizes this as recipe YAML development",
+      "Routes to recipe-development if available",
+      "Does not focus on model architecture registration or state dict adapters"
+    ]
+  }
+]

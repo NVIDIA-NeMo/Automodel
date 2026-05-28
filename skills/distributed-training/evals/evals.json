@@ -1,0 +1,45 @@
+[
+  {
+    "id": "distributed-training-001-strategy-selection",
+    "question": "I am training a 70B LLM on 8 nodes and want tensor plus pipeline parallelism in NeMo AutoModel. Which distributed strategy should I use and what YAML fields matter?",
+    "expected_skill": "distributed-training",
+    "expected_script": null,
+    "ground_truth": "The agent routes to distributed-training, recommends fsdp2 for large multi-node models that need TP and PP, and explains the distributed YAML keys strategy, tp_size, pp_size, cp_size, ep_size, and pipeline settings. It notes that dp_size is inferred from world_size divided by the product of TP, PP, and CP.",
+    "expected_behavior": [
+      "Routes to distributed-training",
+      "Recommends strategy: fsdp2 for TP plus PP",
+      "Mentions tp_size and pp_size as the key parallelism controls",
+      "Mentions pipeline sub-config fields such as pp_schedule or pp_microbatch_size",
+      "Explains that dp_size is inferred from world_size / (tp_size * pp_size * cp_size)",
+      "Does not recommend Megatron FSDP for pipeline parallelism"
+    ]
+  },
+  {
+    "id": "distributed-training-002-moe-expert-parallel",
+    "question": "I am onboarding an MoE model in NeMo AutoModel and want expert parallelism across GPUs. What distributed config should I start with?",
+    "expected_skill": "distributed-training",
+    "expected_script": null,
+    "ground_truth": "The agent routes to distributed-training, recommends FSDP2 with ep_size greater than 1 for MoE expert parallelism, and explains that this creates a separate moe_mesh. It should mention that MegatronFSDP does not support expert parallelism in this skill.",
+    "expected_behavior": [
+      "Routes to distributed-training",
+      "Recommends fsdp2 with ep_size > 1",
+      "Mentions the separate moe_mesh for expert parallelism",
+      "Mentions the moe sub-config when relevant",
+      "States that MegatronFSDP does not support EP",
+      "Does not suggest DDP for expert parallelism"
+    ]
+  },
+  {
+    "id": "distributed-training-003-negative-launcher",
+    "question": "How do I submit a NeMo AutoModel job to a Slurm cluster and set the container image?",
+    "expected_skill": null,
+    "expected_script": null,
+    "ground_truth": "The agent should not route to distributed-training because this is a launcher and job submission question. It should prefer the launcher-config skill.",
+    "expected_behavior": [
+      "Does not route to distributed-training",
+      "Recognizes this as a Slurm launcher configuration task",
+      "Routes to launcher-config if available",
+      "Does not answer by changing tensor, pipeline, context, or expert parallelism settings"
+    ]
+  }
+]
