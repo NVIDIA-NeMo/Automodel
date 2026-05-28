@@ -283,10 +283,10 @@ class LinearLoRA(nn.Linear):
                 and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
             )
             if torch.compiler.is_compiling() or _x_needs_bmm:
-                b = x.shape[0]
-                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
-                if bias is not None:
-                    res = res + bias
+                # ShardSafeLinear keeps the bmm forward (view-free, sharding-safe) but only
+                # saves the 2D frozen weight for backward, instead of the (b, d_in, d_out)
+                # broadcast that bmm.backward would otherwise hold across the forward->backward gap.
+                res = ShardSafeLinear.apply(x, self.weight, bias)
             else:
                 res = F.linear(x, self.weight, bias)
 
@@ -658,6 +658,56 @@ def apply_lora_to_linear_modules(
                 )
 
     return num_modules_matched
+
+
+class ShardSafeLinear(torch.autograd.Function):
+    """
+    Autograd function for the frozen base linear that avoids saving the bmm broadcast.
+
+    The forward uses ``bmm`` against the broadcast weight because ``F.linear`` calls
+    ``aten.view`` which cannot flatten a sharded (sequence-parallel) dimension and breaks
+    AOT-autograd tracing under ``torch.compile``. Letting ``bmm`` own autograd would save its
+    ``(b, d_in, d_out)`` second operand for backward and hold it across the whole
+    forward->backward gap, which accumulates with model depth. Here the base ``weight`` is frozen,
+    so backward only needs the 2D ``weight`` reference: ``grad_x = grad_out @ weight`` (also
+    view-free and sharding-safe), and ``weight`` receives no gradient.
+    """
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        """
+        Stores context for the frozen-base-linear backward pass.
+        """
+        _x, weight, bias = inputs
+        ctx.save_for_backward(weight)
+        ctx.has_bias = bias is not None
+
+    @staticmethod
+    def forward(x, weight, bias):
+        """
+        Forward for the frozen base linear using a sharding-safe ``bmm``.
+
+        The broadcast operand is transient: it is not saved for backward, so the forward may
+        burn whatever memory the broadcast needs without growing the saved-for-backward stack.
+        """
+        b = x.shape[0]
+        res = torch.bmm(x, weight.t().unsqueeze(0).expand(b, -1, -1))
+        if bias is not None:
+            res = res + bias
+        return res
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        """
+        Backward for the frozen base linear.
+
+        Computes ``grad_x`` against the 2D ``weight`` (no ``(b, d_in, d_out)`` allocation) and
+        returns ``None`` for the frozen ``weight``.
+        """
+        (weight,) = ctx.saved_tensors
+        grad_x = grad_out @ weight
+        grad_bias = grad_out.sum(dim=(0, 1)) if ctx.has_bias else None
+        return grad_x, None, grad_bias
 
 
 class LoRATritonFunction(torch.autograd.Function):
