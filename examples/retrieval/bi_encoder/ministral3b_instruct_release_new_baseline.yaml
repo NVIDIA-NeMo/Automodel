@@ -42,7 +42,7 @@ model:
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   trust_remote_code: true
   extract_submodel: language_model
-  pooling: last
+  pooling: avg
   l2_normalize: true
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -88,13 +88,12 @@ dataloader:
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/medquad_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/jaquad_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisql_sql_retrieval_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_synthetic_text2sql_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_cosqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_stackoverflow_qa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_codetrans_dl_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_codetrans_contest_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/swebench_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_fresh_20260520_112309_zenodo_gemma_sdg_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_eval_like_gptoss_1600_20260520_132700_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_eval_like_gptoss_3200_20260520_181200_qwen3_8B_0_95_perc.json
