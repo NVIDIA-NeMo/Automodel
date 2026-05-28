@@ -85,6 +85,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
+  limit_dataset_samples: 100
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -105,6 +106,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  recipe_owner: champion1.chen@gmail.com
+  recipe_owner: nemo-automodel-maintainers@nvidia.com
   time: "00:30:00"
   nodes: 1
