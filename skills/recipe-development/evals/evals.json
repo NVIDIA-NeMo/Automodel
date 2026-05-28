@@ -34,11 +34,11 @@
     "question": "For a long-context multi-node LLM run in NeMo AutoModel, should I use FSDP2, DDP, or Megatron FSDP and how do I set TP and CP?",
     "expected_skill": null,
     "expected_script": null,
-    "ground_truth": "The agent should not route to recipe-development because this is a distributed strategy selection question. It should prefer the distributed-training skill.",
+    "should_trigger": false,
+    "ground_truth": "The agent should not route to recipe-development because this is a distributed strategy selection question. It should say this is outside recipe construction and belongs to distributed training strategy guidance.",
     "expected_behavior": [
       "Does not route to recipe-development",
       "Recognizes this as distributed training strategy selection",
-      "Routes to distributed-training if available",
       "Does not focus on builder functions or generic recipe YAML anatomy"
     ]
   }

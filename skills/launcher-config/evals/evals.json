@@ -34,11 +34,11 @@
     "question": "I need to add a new Hugging Face causal LM architecture to NeMo AutoModel. Which registry and model files should I edit?",
     "expected_skill": null,
     "expected_script": null,
-    "ground_truth": "The agent should not route to launcher-config because this is a model implementation and registration task. It should prefer the model-onboarding skill.",
+    "should_trigger": false,
+    "ground_truth": "The agent should not route to launcher-config because this is a model implementation and registration task. It should say this is outside launcher configuration and belongs to model onboarding.",
     "expected_behavior": [
       "Does not route to launcher-config",
       "Recognizes this as model onboarding work",
-      "Routes to model-onboarding if available",
       "Does not focus on Slurm, SkyPilot, MASTER_ADDR, or job submission"
     ]
   }

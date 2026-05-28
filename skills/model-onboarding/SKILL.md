@@ -9,6 +9,12 @@ license: Apache-2.0
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
 
+## Routing Boundary
+
+Use this skill only when the user is adding or modifying model architecture support: model files, custom layers, state-dict adapters, Hugging Face config mapping, registry entries, or model capability flags.
+
+Do not use this skill for standalone training recipe YAML questions about optimizers, datasets, schedulers, validation datasets, or trainer wiring unless they are explicitly part of onboarding a new model architecture. Those recipe questions belong to the recipe-development skill.
+
 ## Phase 1: Discovery
 
 Before writing code, gather information about the target model.
@@ -109,7 +115,18 @@ See the pattern files for detailed implementation guidance:
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 
-### 2.3 Register in registry
+### 2.3 MoE state-dict adapter checklist
+
+For MoE models, do not stop at generic loading. The adapter must explicitly map:
+
+- Router weights, including gate bias or correction-bias tensors when the Hugging Face model has them.
+- Expert weights, preserving expert index order across local and routed experts.
+- Gate/up/down projections, including combined or split projection layouts.
+- Shared experts separately from routed experts when the architecture has both.
+
+Add tests that assert expected key mappings and run numerical equivalence with tiny configs before trying full checkpoints.
+
+### 2.4 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 

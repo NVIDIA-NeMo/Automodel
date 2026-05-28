@@ -34,11 +34,11 @@
     "question": "How do I structure a NeMo AutoModel recipe YAML with optimizer, dataset, scheduler, and validation_dataset sections?",
     "expected_skill": null,
     "expected_script": null,
-    "ground_truth": "The agent should not route to model-onboarding because this is a recipe YAML construction question. It should prefer the recipe-development skill.",
+    "should_trigger": false,
+    "ground_truth": "The agent should not route to model-onboarding because this is a recipe YAML construction question. It should say this is outside model architecture onboarding and belongs to recipe development.",
     "expected_behavior": [
       "Does not route to model-onboarding",
       "Recognizes this as recipe YAML development",
-      "Routes to recipe-development if available",
       "Does not focus on model architecture registration or state dict adapters"
     ]
   }

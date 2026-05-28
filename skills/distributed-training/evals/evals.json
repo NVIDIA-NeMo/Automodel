@@ -34,11 +34,11 @@
     "question": "How do I submit a NeMo AutoModel job to a Slurm cluster and set the container image?",
     "expected_skill": null,
     "expected_script": null,
-    "ground_truth": "The agent should not route to distributed-training because this is a launcher and job submission question. It should prefer the launcher-config skill.",
+    "should_trigger": false,
+    "ground_truth": "The agent should not route to distributed-training because this is a launcher and job submission question. It should say this is outside distributed strategy selection and belongs to launcher configuration.",
     "expected_behavior": [
       "Does not route to distributed-training",
       "Recognizes this as a Slurm launcher configuration task",
-      "Routes to launcher-config if available",
       "Does not answer by changing tensor, pipeline, context, or expert parallelism settings"
     ]
   }

@@ -19,9 +19,9 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [NeMo AutoModel Documentation](https://docs.nvidia.com/nemo/automodel/latest/index.html) <br>
-- [YAML Configuration Guide](docs/guides/configuration.md) <br>
-- [Dataset Overview](docs/guides/dataset-overview.md) <br>
-- [Checkpointing Guide](docs/guides/checkpointing.md) <br>
+- [YAML Configuration Guide](../../docs/guides/configuration.md) <br>
+- [Dataset Overview](../../docs/guides/dataset-overview.md) <br>
+- [Checkpointing Guide](../../docs/guides/checkpointing.md) <br>
 
 
 ## Skill Output: <br>

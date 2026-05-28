@@ -9,6 +9,12 @@ license: Apache-2.0
 
 NeMo AutoModel supports three launch methods: interactive (torchrun), Slurm (HPC clusters), and SkyPilot (cloud-agnostic).
 
+## Routing Boundary
+
+Use this skill only for launch mechanics: interactive execution, Slurm, SkyPilot, containers, mounts, environment variables, rendezvous settings, and profiling.
+
+Do not use this skill for implementing or registering new model architectures, Hugging Face state-dict adapters, model files, or capability flags. Those are model onboarding tasks, not launcher configuration tasks.
+
 ## Launch Methods
 
 1. **Interactive** (default): runs torchrun on the current node. Suitable for single-node development and debugging.
