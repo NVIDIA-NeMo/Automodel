@@ -493,9 +493,9 @@ class TestForwardShapes:
 class TestLayerEquivalence:
     """Numerical equivalence between the rewritten NeMo layers and HF references.
 
-    The model-onboarding skill requires every rewritten layer to be compared
-    against the original HF implementation. These tests run on CPU in fp32
-    with matched weights.
+    The NeMo-automodel-model-onboarding skill requires every rewritten layer
+    to be compared against the original HF implementation. These tests run on
+    CPU in fp32 with matched weights.
     """
 
     @pytest.fixture

@@ -19,10 +19,10 @@ To invoke a skill manually, use `/<skill-name>` in your Claude Code session.
 
 | Skill | Description |
 |---|---|
-| `model-onboarding` | Onboard a new model family (LLM, VLM, MoE, etc.) |
-| `recipe-development` | Create and modify training/eval recipes |
-| `distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
-| `launcher-config` | Slurm and SkyPilot job submission |
+| `NeMo-automodel-model-onboarding` | Onboard a new model family (LLM, VLM, MoE, etc.) |
+| `NeMo-automodel-recipe-development` | Create and modify training/eval recipes |
+| `NeMo-automodel-distributed-training` | FSDP2, HSDP, pipeline/context parallelism |
+| `NeMo-automodel-launcher-config` | Slurm and SkyPilot job submission |
 
 ## Contributor Skills
 

@@ -1,5 +1,5 @@
 ---
-name: recipe-development
+name: NeMo-automodel-recipe-development
 description: Create and modify NeMo AutoModel training and evaluation recipes, including YAML structure, builders, and execution flow.
 when_to_use: Creating or modifying training, SFT, or eval recipes, adding new YAML config fields, debugging recipe construction or trainer issues, or understanding the recipe execution flow.
 license: Apache-2.0

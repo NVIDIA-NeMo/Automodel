@@ -17,8 +17,8 @@ Coding guidelines and operational procedures are organized as agent skills in
 two locations:
 
 - `skills/` -- customer-facing operational skills for using NeMo AutoModel
-  (`distributed-training`, `launcher-config`, `model-onboarding`,
-  `recipe-development`)
+  (`NeMo-automodel-distributed-training`, `NeMo-automodel-launcher-config`,
+  `NeMo-automodel-model-onboarding`, `NeMo-automodel-recipe-development`)
 - `.agents/contributor-skills/` -- contributor-facing development guidelines
   (`build-and-dependency`, `cicd`, `fern-docs`, `linting-and-formatting`,
   `parity-testing`, `testing`)
@@ -227,12 +227,12 @@ Skill files give step-by-step instructions an AI agent can follow. Public
 catalog skills live in `skills/`; contributor workflow skills live in
 `.agents/contributor-skills/`.
 
-| # | Skill                    | Location                                      | Description                                      |
-|---|--------------------------|-----------------------------------------------|--------------------------------------------------|
-| 1 | model-onboarding         | `skills/model-onboarding`                     | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family |
-| 2 | recipe-development       | `skills/recipe-development`                   | Create and modify training/eval recipes           |
-| 3 | distributed-training     | `skills/distributed-training`                 | FSDP2, HSDP, pipeline parallelism, context parallelism |
-| 4 | launcher-config          | `skills/launcher-config`                      | Slurm and SkyPilot job submission setup           |
+| # | Skill | Location | Description |
+|---|---|---|---|
+| 1 | NeMo-automodel-model-onboarding | `skills/NeMo-automodel-model-onboarding` | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family |
+| 2 | NeMo-automodel-recipe-development | `skills/NeMo-automodel-recipe-development` | Create and modify training/eval recipes |
+| 3 | NeMo-automodel-distributed-training | `skills/NeMo-automodel-distributed-training` | FSDP2, HSDP, pipeline parallelism, context parallelism |
+| 4 | NeMo-automodel-launcher-config | `skills/NeMo-automodel-launcher-config` | Slurm and SkyPilot job submission setup |
 | 5 | parity-testing           | `.agents/contributor-skills/parity-testing`   | Verify numerical correctness against reference implementations |
 | 6 | linting-and-formatting   | `.agents/contributor-skills/linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
 | 7 | build-and-dependency     | `.agents/contributor-skills/build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
