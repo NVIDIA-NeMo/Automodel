@@ -296,7 +296,11 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
 
     monkeypatch.setattr(tcd, "format_chat_template", fake_format)
 
-    # Two rows: one with valid tools list, one with invalid tools type that should be nulled
+    # Three rows exercising the supported `tools` shapes:
+    #  - native list (passes through)
+    #  - JSON-encoded string (parsed back to a list — common JSONL layout)
+    #  - empty list (normalized to None)
+    tools_list = [{"type": "function", "function": {"name": "t"}}]
     dataset_rows = [
         {
             "messages": [
@@ -304,14 +308,21 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
                 {"role": "user", "content": "q"},
                 {"role": "assistant", "content": "a"},
             ],
-            "tools": [{"type": "function", "function": {"name": "t"}}],
+            "tools": tools_list,
         },
         {
             "messages": [
                 {"role": "user", "content": 7},
                 {"role": "assistant", "content": 8},
             ],
-            "tools": {"not": "alist"},
+            "tools": json.dumps(tools_list),
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "noop"},
+                {"role": "assistant", "content": "ok"},
+            ],
+            "tools": [],
         },
     ]
 
@@ -329,15 +340,21 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     # init effects
     assert ds.pad_token_id == 3  # from _add_pad_token
     assert tok.chat_template == "OVERRIDE"
-    assert len(ds) == 2
+    assert len(ds) == 3
 
     item0 = ds[0]
     item1 = ds[1]
+    item2 = ds[2]
     assert item0["input_ids"] == [1, 2] and item1["attention_mask"] == [1, 1]
+    assert item2["input_ids"] == [1, 2]
 
-    # Verify calls captured the tools argument behavior
-    assert calls[0]["kwargs"]["tools"] == dataset_rows[0]["tools"]
-    assert calls[1]["kwargs"]["tools"] is None
+    # tools shapes flow through correctly:
+    #  - row 0: list passed verbatim
+    #  - row 1: JSON string parsed back to the same list
+    #  - row 2: empty list normalized to None
+    assert calls[0]["kwargs"]["tools"] == tools_list
+    assert calls[1]["kwargs"]["tools"] == tools_list
+    assert calls[2]["kwargs"]["tools"] is None
     assert calls[0]["kwargs"]["mask_reasoning_content"] is True
 
     # Bad row: messages not a list → ValueError
@@ -345,6 +362,48 @@ def test_tool_calling_chat_dataset_happy_path_and_edge_cases(monkeypatch):
     ds_bad = tcd.ChatDataset("ignored", tok)
     with pytest.raises(ValueError):
         _ = ds_bad[0]
+
+
+def test_chat_dataset_rejects_invalid_tools_field(monkeypatch):
+    class Tok:
+        eos_token_id = 1
+        chat_template = "{{ default }}"
+
+    tok = Tok()
+    monkeypatch.setattr(tcd, "_has_chat_template", lambda _tok: True)
+    monkeypatch.setattr(tcd, "_add_pad_token", lambda _tok: 0)
+    monkeypatch.setattr(
+        tcd,
+        "format_chat_template",
+        lambda *a, **k: {"input_ids": [], "labels": [], "attention_mask": []},
+    )
+
+    base_messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+    ]
+
+    # Non-string, non-list `tools` (e.g. a dict) used to be silently nulled,
+    # which left tool_calls in messages without a matching schema. Now it
+    # surfaces a ValueError so misconfigured datasets fail loudly.
+    monkeypatch.setattr(
+        tcd,
+        "_load_openai_messages",
+        lambda *a, **k: [{"messages": base_messages, "tools": {"not": "alist"}}],
+    )
+    ds = tcd.ChatDataset("ignored", tok)
+    with pytest.raises(ValueError, match="`tools` must be a list"):
+        _ = ds[0]
+
+    # Malformed JSON string is also surfaced rather than dropped.
+    monkeypatch.setattr(
+        tcd,
+        "_load_openai_messages",
+        lambda *a, **k: [{"messages": base_messages, "tools": "[not json"}],
+    )
+    ds_bad_json = tcd.ChatDataset("ignored", tok)
+    with pytest.raises(ValueError, match="not valid JSON"):
+        _ = ds_bad_json[0]
 
 
 def test_chat_dataset_skip_invalid_samples_does_not_filter_structured_bad_rows(monkeypatch):
