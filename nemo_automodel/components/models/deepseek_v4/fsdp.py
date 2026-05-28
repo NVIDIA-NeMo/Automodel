@@ -36,6 +36,15 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "self_attn.compressor.indexer.wkv",
     "self_attn.compressor.indexer.wgate",
     "self_attn.compressor.indexer.ape_param",
+    "input_layernorm",
+    "post_attention_layernorm",
+    "norm",
+    "self_attn.q_norm",
+    "self_attn.kv_norm",
+    "self_attn.compressor.kv_norm",
+    "self_attn.compressor.indexer.kv_norm",
+    "enorm",
+    "hnorm",
     "mlp.gate",
 )
 
@@ -112,14 +121,14 @@ def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
     return {param.dtype for param in module.parameters() if torch.is_floating_point(param)}
 
 
-def _fp32_mp_policy(mp_policy):
+def _fp32_mp_policy(mp_policy, *, output_dtype=torch.float32):
     if not isinstance(mp_policy, MixedPrecisionPolicy):
         return mp_policy
 
     return MixedPrecisionPolicy(
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
+        output_dtype=output_dtype,
         cast_forward_inputs=mp_policy.cast_forward_inputs,
     )
 
@@ -142,6 +151,12 @@ def _fsdp_kwargs_for_module(module: nn.Module, fsdp_kwargs: dict) -> dict:
     return filtered_kwargs
 
 
+def _fp32_output_dtype(module: nn.Module, mp_policy):
+    if isinstance(mp_policy, MixedPrecisionPolicy) and module.__class__.__name__.endswith("RMSNorm"):
+        return mp_policy.output_dtype
+    return torch.float32
+
+
 def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp32_policy: bool = False, **fsdp_kwargs):
     if module is None or _has_fsdp_state(module):
         return module
@@ -149,7 +164,9 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
     return fully_shard(
         module,
         mesh=mesh,
-        mp_policy=_fp32_mp_policy(mp_policy) if fp32_policy else mp_policy,
+        mp_policy=_fp32_mp_policy(mp_policy, output_dtype=_fp32_output_dtype(module, mp_policy))
+        if fp32_policy
+        else mp_policy,
         offload_policy=offload_policy,
         **_fsdp_kwargs_for_module(module, fsdp_kwargs),
     )

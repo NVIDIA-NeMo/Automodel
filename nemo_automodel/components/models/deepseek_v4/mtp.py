@@ -73,8 +73,12 @@ class DeepseekV4MTPBlock(nn.Module):
 
         self.e_proj = initialize_linear_module(backend.linear, H, H, bias=False, dtype=dtype)
         self.h_proj = initialize_linear_module(backend.linear, H, H, bias=False, dtype=dtype)
-        self.enorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
-        self.hnorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
+        self.enorm = initialize_rms_norm_module(
+            backend.rms_norm, H, eps=eps, dtype=torch.float32
+        )
+        self.hnorm = initialize_rms_norm_module(
+            backend.rms_norm, H, eps=eps, dtype=torch.float32
+        )
 
         mtp_attn_cfg = copy.copy(config)
         layer_types = config.layer_types
@@ -87,8 +91,12 @@ class DeepseekV4MTPBlock(nn.Module):
             mtp_attn_cfg.layer_types = layer_types
         self.self_attn = DeepseekV4Attention(mtp_attn_cfg, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
-        self.post_attention_layernorm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, H, eps=eps, dtype=torch.float32
+        )
+        self.post_attention_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, H, eps=eps, dtype=torch.float32
+        )
 
         hc_kwargs = dict(
             hc_mult=config.hc_mult,
@@ -105,7 +113,9 @@ class DeepseekV4MTPBlock(nn.Module):
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(eps),
         )
-        self.norm = initialize_rms_norm_module(backend.rms_norm, H, eps=eps, dtype=dtype)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, H, eps=eps, dtype=torch.float32
+        )
 
         object.__setattr__(self, "_rotary_emb", rotary_emb)
         object.__setattr__(self, "_rotary_emb_compress", rotary_emb_compress)

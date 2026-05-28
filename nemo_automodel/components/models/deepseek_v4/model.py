@@ -113,7 +113,6 @@ class DeepseekV4Block(nn.Module):
         self.layer_idx = layer_idx
         self.hc_mult = config.hc_mult
 
-        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV4Attention(config, layer_idx=layer_idx, backend=backend)
         self.mlp = MoE(moe_config, backend)
         # Hash routing uses a fixed tid2eid lookup table instead of the
@@ -124,10 +123,10 @@ class DeepseekV4Block(nn.Module):
         if self.is_hash_routing_layer:
             self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=torch.float32
         )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=torch.float32
         )
 
         # HC (Hyper-Connection) mixers — one per sub-site (attention + FFN).
@@ -358,7 +357,7 @@ class DeepseekV4Model(nn.Module):
             backend.rms_norm,
             config.hidden_size,
             eps=config.rms_norm_eps,
-            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+            dtype=torch.float32,
         )
 
         self.max_seq_len = config.max_position_embeddings
@@ -528,6 +527,16 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         "self_attn.compressor.indexer.wkv",
         "self_attn.compressor.indexer.wgate",
         "self_attn.compressor.indexer.ape",
+        "norm",
+        "input_layernorm",
+        "post_attention_layernorm",
+        "self_attn.q_norm",
+        "self_attn.kv_norm",
+        "self_attn.compressor.kv_norm",
+        "self_attn.compressor.indexer.kv_norm",
+        "model.norm",
+        "enorm",
+        "hnorm",
         "e_score_correction_bias",
         "lm_head",
     ]
