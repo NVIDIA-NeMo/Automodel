@@ -1043,7 +1043,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.model_parts = [model]
             self.pp = None
 
-        if self.cfg.get("peft.mlp_activation_recompute", False):
+        if getattr(self.peft_config, "mlp_activation_recompute", False):
             from nemo_automodel.components._peft.mlp_recompute import apply_mlp_activation_recompute
 
             for part in self.model_parts:

@@ -56,6 +56,8 @@ class PeftConfig:
     use_memory_efficient_lora: bool = True
     use_triton: bool = False
     moe_rank_scaling: bool = False
+    # Recompute SwiGLU MLP activations in backward instead of saving them.
+    mlp_activation_recompute: bool = False
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -76,6 +78,7 @@ class PeftConfig:
             use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
+            mlp_activation_recompute=d.get("mlp_activation_recompute", False),
         )
 
 
