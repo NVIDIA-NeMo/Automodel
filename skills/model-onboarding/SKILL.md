@@ -1,13 +1,31 @@
 ---
 name: model-onboarding
-description: Guide for onboarding new model families into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
-when_to_use: Adding a new model architecture (LLM, VLM, MoE, diffusion, retrieval, etc.) to NeMo AutoModel, implementing combined projections, registering a model, or adding capability flags.
+description: Guide for onboarding new model architectures into NeMo AutoModel, including architecture discovery, implementation patterns, registration, and validation.
+when_to_use: Adding or modifying model architecture support in NeMo AutoModel, such as LLM/VLM/MoE model files, custom layers, state-dict adapters, registry entries, Hugging Face config mapping, or capability flags.
 license: Apache-2.0
 ---
 
 # Adding Model Support to NeMo AutoModel
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
+
+## Routing Boundary
+
+Use this skill only when the user is adding or modifying model architecture support: model files, custom layers, state-dict adapters, Hugging Face config mapping, registry entries, or model capability flags.
+
+Do not use this skill for standalone training recipe YAML questions about optimizers, datasets, schedulers, validation datasets, or trainer wiring unless they are explicitly part of onboarding a new model architecture. Those recipe questions belong to the recipe-development skill.
+
+In-scope examples:
+
+- "Add support for a new Hugging Face causal LM architecture."
+- "Map MoE router and expert weights from a Hugging Face checkpoint."
+- "Register a new model class in NeMo AutoModel."
+
+Out-of-scope examples:
+
+- "Write a finetuning recipe YAML with optimizer and dataset sections."
+- "Choose FSDP2, DDP, tensor parallel, or context parallel settings."
+- "Configure Slurm, SkyPilot, containers, mounts, or launch dispatch."
 
 ## Phase 1: Discovery
 
@@ -109,7 +127,33 @@ See the pattern files for detailed implementation guidance:
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
 
-### 2.3 Register in registry
+### 2.3 MoE state-dict adapter checklist
+
+For MoE models, do not stop at generic loading. The adapter must explicitly map:
+
+- Router weights, including gate bias or correction-bias tensors when the Hugging Face model has them.
+- Expert weights, preserving expert index order across local and routed experts.
+- Gate/up/down projections, including combined or split projection layouts.
+- Shared experts separately from routed experts when the architecture has both.
+
+Add tests that assert expected key mappings and run numerical equivalence with tiny configs before trying full checkpoints.
+
+### 2.4 VLM onboarding checklist
+
+For VLMs, confirm the Hugging Face config has `vision_config` and `text_config`
+and that `architectures` points to a conditional-generation class. Start from
+the closest VLM pattern file, usually [vlm-patterns.md](./vlm-patterns.md), and
+compare existing implementations such as `mistral4`, `kimivl`, or
+`kimi_k25_vl`.
+
+The implementation should explicitly cover:
+
+- Text backbone, vision tower, projector, and processor or image preprocessing assumptions.
+- Weight mapping for both text and vision modules in `state_dict_adapter.py`.
+- Registration of the `ForConditionalGeneration` class in `_transformers/registry.py`.
+- Tiny tests that exercise image-text inputs and verify the adapter round-trip.
+
+### 2.5 Register in registry
 
 Add the model to `MODEL_ARCH_MAPPING` in `_transformers/registry.py`:
 
@@ -135,7 +179,11 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 
 ---
 
-## Phase 3: Recipe & Config
+## Phase 3: Onboarding Example Config
+
+This phase is only for adding a minimal example config that proves the newly
+onboarded architecture can load and run. Use recipe-development for general
+recipe authoring or existing recipe modifications.
 
 ### 3.1 Create example YAML config
 

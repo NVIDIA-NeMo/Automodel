@@ -7,6 +7,16 @@ license: Apache-2.0
 
 # NeMo AutoModel Recipe Development
 
+## Routing Boundary
+
+Use this skill for recipe construction and execution-flow questions: YAML
+structure, `_target_` callables, builder functions, validation datasets,
+checkpoint configuration, CLI route registration, and recipe-specific tests.
+
+Do not use this skill for standalone distributed strategy selection, cluster
+launcher configuration, or model architecture onboarding unless the user is
+asking how those choices appear inside an AutoModel recipe YAML.
+
 ## Recipe Architecture
 
 ### Execution Flow

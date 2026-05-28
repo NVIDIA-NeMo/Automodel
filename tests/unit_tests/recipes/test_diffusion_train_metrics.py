@@ -328,7 +328,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
     recipe.device = torch.device("cpu")
-    recipe.bf16 = torch.float32
+    recipe.compute_dtype = torch.float32
     recipe.check_loss = True
     recipe.clip_grad_max_norm = 0.5
     recipe.grad_clip_foreach = False

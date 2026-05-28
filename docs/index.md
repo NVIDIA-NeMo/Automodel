@@ -27,7 +27,8 @@ content_type: index
 # NeMo AutoModel Documentation
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
-**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md)
+
+**Quick links:** [🤗 HF Compatible](guides/huggingface-api-compatibility.md) | [🚀 Performance](performance-summary.md) | [📐 Scalability](about/key-features.md) | [🎯 SFT & PEFT](guides/llm/finetune.md) | [🎨 Diffusion](guides/diffusion/finetune.md) | [👁️ VLM](guides/vlm/gemma4.md) | [🌐 Omni](guides/omni/gemma3-3n.md) | [🌊 dLLM](guides/dllm/finetune.md)
 
 ::::{grid} 2 2 2 2
 :gutter: 1 1 1 2
@@ -147,6 +148,14 @@ Torch-native pipelining composable with FSDP2 and DTensor.
 Mixed-precision FP8 training with torchao.
 +++
 {bdg-secondary}`FP8` {bdg-secondary}`mixed-precision`
+:::
+
+:::{grid-item-card} {octicon}`stack;1.5em;sd-mr-1` Mixed-Precision Training
+:link: guides/mixed-precision-training
+:link-type: doc
+fp32 master weights, bf16 compute, and the precision traps to avoid.
++++
+{bdg-secondary}`bf16` {bdg-secondary}`mixed-precision`
 :::
 
 :::{grid-item-card} {octicon}`database;1.5em;sd-mr-1` Checkpointing
@@ -303,6 +312,7 @@ SkyPilot k8s <launcher/skypilot-kubernetes.md>
 guides/checkpointing.md
 Gradient Checkpointing <guides/gradient-checkpointing.md>
 Pipeline Parallelism <guides/pipelining.md>
+Mixed-Precision Training <guides/mixed-precision-training.md>
 guides/fp8-training.md
 guides/mlflow-logging.md
 API Reference <apidocs/index.rst>
