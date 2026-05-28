@@ -180,31 +180,39 @@ class _StubTokenizerChatWithReasoning(_StubTokenizerPlain):  # noqa: D401
         return ids
 
 
-def test_format_prompt_completion_forces_right_padding_and_restores():
-    """Covers the padding_side save/restore branch added for transformers v5.8.
+class _RecordingPaddingTokenizer(_StubTokenizerPlain):
+    """Stub tokenizer that records ``padding_side`` during ``__call__``.
 
-    The function temporarily flips ``tokenizer.padding_side`` to ``"right"`` for
-    the duration of the tokenize call (so the label-masking / attention-mask
-    logic below it sees right-padded ids) and must restore the original side
-    after — including when the original is ``"left"`` (the v5.8 LlamaTokenizer
-    class default).
+    Used to assert that ``format_prompt_completion`` flips the side to
+    ``"right"`` for the duration of the tokenize call and restores the
+    original value after — including when the original is ``"left"`` (the
+    transformers v5.8 ``LlamaTokenizer`` class default).
     """
 
-    class _LeftPaddingStubTokenizer(_StubTokenizerPlain):
-        padding_side = "left"
+    padding_side = "right"
 
-        def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
-            # Record what padding_side was during the tokenize call.
-            self.padding_side_during_call = self.padding_side
-            return super().__call__(
-                text,
-                add_special_tokens=add_special_tokens,
-                padding=padding,
-                truncation=truncation,
-                max_length=max_length,
-            )
+    def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
+        self.padding_side_during_call = self.padding_side
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+        )
 
-    tok = _LeftPaddingStubTokenizer()
+
+@pytest.mark.parametrize("initial_side", ["left", "right"])
+def test_format_prompt_completion_forces_right_padding_and_restores(initial_side):
+    """Covers the padding_side save/restore wrapper for both initial sides.
+
+    Each call goes through every line of the wrapper (save, set, try, finally,
+    restore), so the parametrize ensures the inner ``if _saved_padding_side
+    is not None`` branches are exercised regardless of which session codecov
+    looks at.
+    """
+    tok = _RecordingPaddingTokenizer()
+    tok.padding_side = initial_side
     out = format_prompt_completion(
         tok,
         "Context Q?",
@@ -213,10 +221,31 @@ def test_format_prompt_completion_forces_right_padding_and_restores():
         pad_token_id=tok.eos_token_id,
         answer_only_loss_mask=True,
     )
-    # Right-padding was set during the call; original "left" was restored after.
     assert tok.padding_side_during_call == "right"
-    assert tok.padding_side == "left"
-    # Sanity: the function still returns a usable dict.
+    assert tok.padding_side == initial_side
+    assert "input_ids" in out and "labels" in out
+
+
+def test_format_prompt_completion_without_padding_side_attr_is_a_noop_for_the_wrapper():
+    """Covers the False branches of the padding_side wrapper.
+
+    When the tokenizer has no ``padding_side`` attribute (e.g.
+    ``_StubTokenizerPlain``), ``getattr`` returns ``None`` and the
+    ``if _saved_padding_side is not None`` set/restore branches must
+    short-circuit without touching the tokenizer.
+    """
+    tok = _StubTokenizerPlain()
+    assert not hasattr(tok, "padding_side")
+    out = format_prompt_completion(
+        tok,
+        "Context Q?",
+        "A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    # No attribute was created on the tokenizer as a side effect.
+    assert not hasattr(tok, "padding_side")
     assert "input_ids" in out and "labels" in out
 
 
