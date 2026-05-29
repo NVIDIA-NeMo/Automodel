@@ -154,9 +154,7 @@ class ToolCallAccuracyEvaluator:
                 logits = outputs
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones_like(next_token)], dim=1
-            )
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
         return input_ids
@@ -307,9 +305,7 @@ class ToolCallAccuracyEvaluator:
                 "max_new_tokens": self._max_new_tokens,
                 "do_sample": self._do_sample,
                 "pad_token_id": (
-                    tokenizer.pad_token_id
-                    if tokenizer.pad_token_id is not None
-                    else tokenizer.eos_token_id
+                    tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
                 ),
             }
             try:
@@ -364,9 +360,7 @@ class ToolCallAccuracyEvaluator:
                             _f.write(f"exception repr: {exc!r}\n")
                             _f.write("traceback:\n")
                             _f.write(_tb.format_exc())
-                        logger.warning(
-                            "wrote generate() traceback to %s", dump_path
-                        )
+                        logger.warning("wrote generate() traceback to %s", dump_path)
                     except OSError:
                         pass
                 continue
@@ -391,9 +385,7 @@ class ToolCallAccuracyEvaluator:
                 skip_reasons if skip_reasons else "unknown",
             )
         else:
-            logger.info(
-                "tool_call_evaluator scored %d/%d samples", n_scored, n_considered
-            )
+            logger.info("tool_call_evaluator scored %d/%d samples", n_scored, n_considered)
 
         result: Dict[str, float] = {}
         if n_scored > 0:

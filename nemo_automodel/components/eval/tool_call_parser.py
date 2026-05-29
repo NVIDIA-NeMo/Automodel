@@ -183,11 +183,7 @@ def _parse_qwen_style(text: str) -> List[ParsedToolCall]:
         try:
             obj = json.loads(inner)
         except json.JSONDecodeError:
-            calls.append(
-                ParsedToolCall(
-                    name=None, arguments={}, arguments_valid_json=False, raw=m.group(0)
-                )
-            )
+            calls.append(ParsedToolCall(name=None, arguments={}, arguments_valid_json=False, raw=m.group(0)))
             continue
         if isinstance(obj, list):
             for item in obj:
@@ -212,11 +208,7 @@ def _parse_llama_style(text: str) -> List[ParsedToolCall]:
         try:
             obj = json.loads(body)
         except json.JSONDecodeError:
-            calls.append(
-                ParsedToolCall(
-                    name=None, arguments={}, arguments_valid_json=False, raw=raw_span
-                )
-            )
+            calls.append(ParsedToolCall(name=None, arguments={}, arguments_valid_json=False, raw=raw_span))
             continue
         if isinstance(obj, dict):
             parsed = _from_call_object(obj, raw_span)
@@ -322,9 +314,7 @@ def _coerce_gt_args(args_value: Any) -> Dict[str, Any]:
     return {}
 
 
-def _score_one_pair(
-    pred: Optional[ParsedToolCall], gt: Dict[str, Any]
-) -> Dict[str, float]:
+def _score_one_pair(pred: Optional[ParsedToolCall], gt: Dict[str, Any]) -> Dict[str, float]:
     """Score a single (pred, gt) tool-call pair. ``pred`` may be ``None``."""
     metrics = {
         "has_call": 0.0,
