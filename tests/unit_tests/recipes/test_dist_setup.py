@@ -18,6 +18,7 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 """
 
 import pytest
+import torch
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -137,6 +138,30 @@ class TestPipeline:
 
     def test_pp_enabled_false_when_pp_eq_1(self):
         assert parse_distributed_section({"pp_size": 1})["pp_enabled"] is False
+
+    def test_pipeline_dtype_defaults_to_mp_policy_output_dtype(self):
+        """Unset pipeline.dtype is derived from the FSDP mp_policy output dtype (bf16 default)."""
+        result = parse_distributed_section({"pp_size": 2})
+        assert result["pipeline_config"].dtype == torch.bfloat16
+
+    def test_pipeline_dtype_explicit_match_kept(self, caplog):
+        cfg = {"pp_size": 2, "pipeline": {"dtype": "bfloat16"}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        assert result["pipeline_config"].dtype == torch.bfloat16
+        assert "does not match" not in caplog.text
+
+    def test_pipeline_dtype_explicit_mismatch_warns_and_kept(self, caplog):
+        cfg = {"pp_size": 2, "pipeline": {"dtype": "float32"}}
+        with caplog.at_level("WARNING"):
+            result = parse_distributed_section(cfg)
+        # Explicit value is honored (not overridden) but a mismatch warning fires.
+        assert result["pipeline_config"].dtype == torch.float32
+        assert "does not match" in caplog.text
+
+    def test_pipeline_dtype_not_set_when_pp_eq_1(self):
+        result = parse_distributed_section({"pp_size": 1})
+        assert result["pipeline_config"] is None
 
 
 # ---------------------------------------------------------------------------

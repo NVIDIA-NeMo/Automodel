@@ -20,6 +20,7 @@ All dict handling lives here; the component layer (``mesh``) stays purely typed.
 """
 
 import dataclasses
+import logging
 from typing import Any, Dict, Optional
 
 from nemo_automodel.components.distributed.mesh import (
@@ -29,6 +30,8 @@ from nemo_automodel.components.distributed.mesh import (
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from nemo_automodel.shared.utils import dtype_from_str
+
+logger = logging.getLogger(__name__)
 
 _PARALLELISM_DEFAULTS: Dict[str, Any] = {
     "tp_size": 1,
@@ -172,6 +175,30 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         pipeline_config = PipelineConfig()
     else:
         pipeline_config = None
+
+    # Default the pipeline communication dtype to the FSDP mixed-precision activation
+    # dtype (the dtype of tensors crossing pipeline stage boundaries) so PP stage
+    # shape inference matches the real activation dtype (e.g. bf16 compute under fp32
+    # master weights). Deriving it from mp_policy.output_dtype is silent and correct;
+    # an explicit mismatch is honored but warned, since it can corrupt inter-stage
+    # recv buffers.
+    if pipeline_config is not None and pp_size > 1:
+        mp_policy = getattr(strategy_config, "mp_policy", None)
+        activation_dtype = None
+        if mp_policy is not None:
+            activation_dtype = getattr(mp_policy, "output_dtype", None) or getattr(mp_policy, "param_dtype", None)
+        if activation_dtype is not None:
+            if pipeline_config.dtype is None:
+                pipeline_config.dtype = activation_dtype
+            elif pipeline_config.dtype != activation_dtype:
+                logger.warning(
+                    "pipeline.dtype=%s does not match the FSDP activation dtype "
+                    "(mp_policy.output_dtype=%s) used for inter-stage communication; "
+                    "this can corrupt pipeline stage shape inference. Leave pipeline.dtype "
+                    "unset to derive it automatically.",
+                    pipeline_config.dtype,
+                    activation_dtype,
+                )
 
     # Instantiate nested _target_ configs (e.g. mp_policy) before constructing MoEParallelizerConfig
     if moe_dict is not None and "mp_policy" in moe_dict:
