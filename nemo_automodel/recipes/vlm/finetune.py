@@ -172,8 +172,11 @@ def build_model(
             NeMoAutoModelForCausalLM.from_pretrained,
         )
 
-        if is_nemo_auto_model:
-            # NeMoAutoModel handles infrastructure internally
+        # The Gemma4 base + drafter composite loads its sub-models via the
+        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
+        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
+
+        if is_nemo_auto_model or is_joint_composite:
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
@@ -181,6 +184,24 @@ def build_model(
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
     return model
+
+
+def _is_gemma4_joint_target(target) -> bool:
+    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
+
+    Imported lazily so the optional ``transformers.models.gemma4_assistant``
+    dependency only fires when a joint recipe is actually requested.
+    """
+    if target is None:
+        return False
+    try:
+        from nemo_automodel.components.models.gemma4_drafter.composite import (
+            Gemma4WithDrafter,
+        )
+    except ImportError:
+        return False
+    # Bound classmethods are not identity-stable across accesses; compare via ==.
+    return target == Gemma4WithDrafter.from_pretrained
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
@@ -611,6 +632,38 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
+def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:
+    """Shift ``labels`` left by ``k`` positions, padding the tail with ``-100``.
+
+    Used to build drafter-step targets in joint base + drafter training.
+
+    The VLM collate pipeline already pre-shifts labels by 1 so that
+    ``labels[t] == input_ids[t + 1]`` (the next-token target). Drafter step ``k``
+    predicts position ``t + 1 + k`` of the original sequence, which corresponds
+    to ``labels[t + k]`` in the pre-shifted convention. So for step ``k``:
+
+    * ``k = 0`` (one-step drafter) -> no shift; reuse ``labels`` as-is.
+    * ``k = 1`` -> shift labels left by 1 (drafter predicts two tokens ahead).
+    * ``k = n`` -> shift labels left by ``n``.
+
+    Args:
+        labels: ``[B, S]`` LongTensor of label ids (``-100`` marks ignored
+            positions).
+        k: Number of positions to shift to the left. ``k <= 0`` is a no-op.
+
+    Returns:
+        A new ``[B, S]`` LongTensor with ``labels[:, k:]`` in the leading slice
+        and ``-100`` in the trailing ``k`` columns. When ``k <= 0``, the input
+        is returned unchanged.
+    """
+    if k <= 0:
+        return labels
+    shifted = torch.full_like(labels, fill_value=-100)
+    if k < labels.size(-1):
+        shifted[..., : labels.size(-1) - k] = labels[..., k:]
+    return shifted
+
+
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     """Calculate the loss.
 
@@ -933,6 +986,55 @@ class FinetuneRecipeForVLM(BaseRecipe):
             end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
+    def _maybe_add_drafter_loss(
+        self,
+        *,
+        out: Any,
+        base_loss: torch.Tensor,
+        labels: torch.Tensor,
+        model: nn.Module,
+        num_label_tokens: int,
+        log: bool = False,
+    ) -> torch.Tensor:
+        """Return ``base_loss + lambda * sum_k CE(drafter_logits[k], shifted_labels_k)``.
+
+        If ``out`` does not carry a non-empty ``drafter_logits`` attribute (i.e. the
+        model isn't a joint composite), returns ``base_loss`` unchanged.
+
+        For drafter step ``k``, labels are shifted left by ``k`` positions to match
+        the VLM collate's pre-shifted convention (``labels[t] == input_ids[t+1]``).
+        ``log=True`` emits a one-line breakdown on rank 0; callers should gate this
+        on the appropriate step / microbatch index to avoid log spam.
+        """
+        drafter_logits = getattr(out, "drafter_logits", None)
+        if drafter_logits is None or len(drafter_logits) == 0:
+            return base_loss
+
+        drafter_loss_weight = getattr(out, "drafter_loss_weight", 1.0)
+        drafter_loss_total = None
+        for k, dl in enumerate(drafter_logits):
+            shifted_labels = _shift_labels_left(labels, k)
+            l_k = calculate_loss(
+                self.loss_fn,
+                logits=dl,
+                labels=shifted_labels,
+                model=model,
+                hidden_states=None,
+                num_label_tokens=num_label_tokens,
+            )
+            drafter_loss_total = l_k if drafter_loss_total is None else drafter_loss_total + l_k
+
+        total_loss = base_loss + drafter_loss_weight * drafter_loss_total
+        if log and self.dist_env.is_main:
+            logger.info(
+                "[joint-drafter] L_base=%.4f L_drafter=%.4f L_total=%.4f (lambda=%.3f)",
+                base_loss.detach().item(),
+                drafter_loss_total.detach().item(),
+                total_loss.detach().item(),
+                drafter_loss_weight,
+            )
+        return total_loss
+
     def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
         if (
             not self.pp_enabled
@@ -1052,6 +1154,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                # DSV4-style MTP loss (from main): triggers when the model emits
+                # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
@@ -1064,6 +1168,25 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         scaling_factor=out.mtp_loss_scaling_factor,
                         num_label_tokens=num_label_tokens,
                     )
+
+                # Joint base + drafter co-training (Gemma4WithDrafter and
+                # similar): detect by presence of ``drafter_logits`` on the
+                # model output and add
+                # ``drafter_loss_weight * sum_k CE(drafter_logits[k], shifted_labels_k)``
+                # to the base loss. See ``_shift_labels_left`` for the shift
+                # convention. Mutually exclusive with the DSV4-style MTP path
+                # above -- only one of ``drafter_logits`` /
+                # ``mtp_per_depth_*`` is set per model.
+                local_loss = self._maybe_add_drafter_loss(
+                    out=out,
+                    base_loss=local_loss,
+                    labels=labels,
+                    model=model,
+                    num_label_tokens=num_label_tokens,
+                    # Log once per remote-logging step on the first microbatch.
+                    log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
+                )
+
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1278,6 +1401,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         hidden_states=out.hidden_states[-1]
                         if getattr(out, "hidden_states", None) is not None
                         else None,
+                        num_label_tokens=num_label_tokens,
+                    )
+                    # Mirror training: include the drafter term so validation
+                    # reflects drafter drift, not just the base.
+                    local_loss = self._maybe_add_drafter_loss(
+                        out=out,
+                        base_loss=local_loss,
+                        labels=labels,
+                        model=self.model_parts[0],
                         num_label_tokens=num_label_tokens,
                     )
                     total_num_label_tokens += num_label_tokens
