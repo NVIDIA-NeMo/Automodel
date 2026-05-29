@@ -385,3 +385,73 @@ def test_format_example_forwards_mask_reasoning_content(monkeypatch):
 
     agent_chat._format_example(example, Tok(), 0, 0, mask_reasoning_content=True)
     assert captured["mask_reasoning_content"] is True
+
+
+def test_convert_messages_drops_history_reasoning_keeps_last():
+    # Two assistant turns each carry reasoning; only the final one should keep it.
+    messages = [
+        {"role": "user", "content": "weather BJ?"},
+        {"role": "assistant", "content": "Beijing is sunny", "reasoning_content": "first thought"},
+        {"role": "user", "content": "and SH?"},
+        {"role": "assistant", "content": "Shanghai is rainy", "reasoning_content": "second thought"},
+    ]
+    out = agent_chat._convert_messages(messages, drop_history_reasoning_content=True)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]
+    assert assistants[1]["reasoning_content"] == "second thought"
+
+
+def test_convert_messages_keeps_all_reasoning_by_default():
+    messages = [
+        {"role": "user", "content": "weather BJ?"},
+        {"role": "assistant", "content": "Beijing is sunny", "reasoning_content": "first thought"},
+        {"role": "user", "content": "and SH?"},
+        {"role": "assistant", "content": "Shanghai is rainy", "reasoning_content": "second thought"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert assistants[0]["reasoning_content"] == "first thought"
+    assert assistants[1]["reasoning_content"] == "second thought"
+
+
+def test_convert_messages_drop_history_reasoning_handles_tool_call_turn():
+    # The final assistant turn is a tool_call merge; its reasoning must survive
+    # while an earlier assistant turn's reasoning is dropped.
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello", "reasoning_content": "greet back"},
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "reasoning_content": "call the tool"},
+        {"role": "tool_call", "content": '{"name":"aqi","arguments":{"city":"BJ"}}'},
+    ]
+    out = agent_chat._convert_messages(messages, example_id=1, drop_history_reasoning_content=True)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]
+    assert assistants[1]["reasoning_content"] == "call the tool"
+    assert assistants[1]["tool_calls"][0]["function"]["name"] == "aqi"
+
+
+def test_format_example_forwards_drop_history_reasoning_content(monkeypatch):
+    captured = {}
+
+    def fake_convert_messages(messages, example_id=None, drop_history_reasoning_content=False):
+        captured["drop_history_reasoning_content"] = drop_history_reasoning_content
+        return [{"role": "user", "content": "hi"}]
+
+    def fake_format_chat_template(**kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "_convert_messages", fake_convert_messages)
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["drop_history_reasoning_content"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, drop_history_reasoning_content=True)
+    assert captured["drop_history_reasoning_content"] is True
