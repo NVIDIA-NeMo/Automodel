@@ -98,9 +98,16 @@ class Step3p5RotaryEmbedding(nn.Module):
         inv_freq = self._compute_inv_freq()
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def _compute_inv_freq(self) -> torch.Tensor:
+    def _apply(self, fn):
+        super()._apply(fn)
+        if self.inv_freq is not None:
+            self._buffers["inv_freq"] = self._compute_inv_freq(device=self.inv_freq.device)
+        return self
+
+    def _compute_inv_freq(self, device: torch.device | None = None) -> torch.Tensor:
         """Compute inverse frequencies for rotary embeddings."""
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
+        positions = torch.arange(0, self.rotary_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (self.base ** (positions / self.rotary_dim))
         return inv_freq
 
     @torch.no_grad()
@@ -118,14 +125,15 @@ class Step3p5RotaryEmbedding(nn.Module):
         Returns:
             Tuple of (cos, sin) tensors.
         """
-        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
-        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float().to(x.device)
 
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
@@ -259,7 +267,7 @@ class Step3p5Attention(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        freqs_cis: torch.Tensor,
+        freqs_cis: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
@@ -290,6 +298,12 @@ class Step3p5Attention(nn.Module):
 
         # Apply rotary embeddings if enabled
         if self.use_rope:
+            if position_ids is not None and not self.backend.rope_fusion:
+                cos, sin = self.rotary_emb(x, position_ids)
+                rotary_half_dim = cos.shape[-1] // 2
+                freqs_cis = torch.cat((cos[..., :rotary_half_dim], sin[..., :rotary_half_dim]), dim=-1)
+            if freqs_cis is None:
+                raise ValueError("Step3p5Attention requires freqs_cis or position_ids when RoPE is enabled.")
             q, k = apply_rotary_emb_qk(
                 q,
                 k,

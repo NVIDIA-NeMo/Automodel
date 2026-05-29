@@ -221,6 +221,14 @@ def _resolve_custom_model_cls_for_config(config):
         return None
 
     arch_name = architectures[0]
+    if arch_name == "HYV3ForCausalLM":
+        from nemo_automodel.components.models.hy_mt2.dispatch import is_hy_mt2_config
+
+        if is_hy_mt2_config(config):
+            from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
+
+            return HyMT2ForCausalLM
+
     if not ModelRegistry.has_custom_model(arch_name):
         return None
 
