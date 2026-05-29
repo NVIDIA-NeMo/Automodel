@@ -205,10 +205,10 @@ def _convert_messages(
             i += 1
 
     if drop_history_reasoning_content:
-        last_assistant = -1
-        for idx, m in enumerate(out):
-            if m.get("role") == "assistant":
-                last_assistant = idx
+        last_assistant = max(
+            (idx for idx, m in enumerate(out) if m.get("role") == "assistant"),
+            default=-1,
+        )
         for idx, m in enumerate(out):
             if idx != last_assistant and m.get("role") == "assistant":
                 m.pop("reasoning_content", None)
@@ -340,10 +340,10 @@ def make_agent_chat_dataset(
         tokenizer,
         eos_token_id,
         pad_token_id,
-        seq_length,
-        padding,
-        truncation,
-        mask_reasoning_content,
-        drop_history_reasoning_content,
+        seq_length=seq_length,
+        padding=padding,
+        truncation=truncation,
+        mask_reasoning_content=mask_reasoning_content,
+        drop_history_reasoning_content=drop_history_reasoning_content,
     )
     return LazyMappedDataset(dataset, fmt_fn)
