@@ -372,6 +372,169 @@ def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
     logger.info("BnB loading: device_map=%s", kwargs["device_map"])
 
 
+# Fraction of free CUDA memory that the estimated BF16 footprint must fit under.
+# Below this we let the load proceed; above it we refuse and point the user at
+# the streaming workaround. The slack covers loader scratch, activations, and
+# the inevitable inaccuracy in the parameter-count estimate.
+_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD = 0.70
+_FP8_PREFLIGHT_DISABLE_ENV = "NEMO_AUTOMODEL_DISABLE_FP8_PREFLIGHT"
+
+
+def _get_quant_attr(quantization_config, key):
+    """Read ``key`` from a quant config that may be a dict or an object."""
+    if quantization_config is None:
+        return None
+    if isinstance(quantization_config, dict):
+        return quantization_config.get(key)
+    return getattr(quantization_config, key, None)
+
+
+def _quant_config_is_fp8_full_materialize(quantization_config) -> bool:
+    """True if this config asks HF to dequantize the FP8 checkpoint to BF16 in full.
+
+    Accepts the canonical ``dequantize`` attribute used by transformers'
+    ``FineGrainedFP8Config`` as well as a couple of close variants that show up
+    on older / forked configs.
+    """
+    if _get_quant_attr(quantization_config, "quant_method") != "fp8":
+        return False
+    return any(_get_quant_attr(quantization_config, k) is True for k in ("dequantize", "is_dequantize", "dequant"))
+
+
+def _get_hf_param_count_estimate(hf_config) -> int | None:
+    """Best-effort parameter count for ``hf_config``.
+
+    Order of preference:
+      1. ``hf_config.num_parameters`` if the loader populated it.
+      2. A coarse transformer formula:
+         ``L * (4*H*H + n_experts * 3*H*I) + V*H``, summed over any
+         text/vision/audio sub-configs (multimodal models).
+
+    The formula assumes gated MLPs (LLaMA/Mistral-style) and counts only the
+    dominant weight matrices. It is intentionally rough — this is a sanity
+    check, not a memory planner. Returns ``None`` when no estimate can be
+    formed.
+    """
+    if hf_config is None:
+        return None
+
+    explicit = getattr(hf_config, "num_parameters", None)
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+
+    total = 0
+    seen: set[int] = set()
+
+    def _walk(cfg) -> None:
+        nonlocal total
+        if cfg is None or id(cfg) in seen:
+            return
+        seen.add(id(cfg))
+
+        # Multimodal wrappers (e.g. Gemma4, Mistral3-VLM) park real layer
+        # counts on text_config / vision_config / audio_config. Recurse into
+        # those and skip the wrapper itself so we don't double count.
+        sub_configs = [getattr(cfg, attr, None) for attr in ("text_config", "vision_config", "audio_config")]
+        sub_configs = [s for s in sub_configs if isinstance(s, PretrainedConfig)]
+        if sub_configs:
+            for sub in sub_configs:
+                _walk(sub)
+            return
+
+        layers = getattr(cfg, "num_hidden_layers", None) or getattr(cfg, "n_layer", None) or 0
+        hidden = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None) or getattr(cfg, "d_model", None) or 0
+        vocab = getattr(cfg, "vocab_size", None) or 0
+        inter = getattr(cfg, "intermediate_size", None) or getattr(cfg, "ffn_hidden_size", None) or (4 * hidden)
+        n_experts = (
+            getattr(cfg, "num_local_experts", None)
+            or getattr(cfg, "num_experts", None)
+            or getattr(cfg, "n_routed_experts", None)
+            or 1
+        )
+
+        if not layers or not hidden:
+            return
+
+        per_layer = 4 * hidden * hidden + n_experts * 3 * hidden * inter
+        total += layers * per_layer + vocab * hidden
+
+    _walk(hf_config)
+    return total if total > 0 else None
+
+
+def _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path) -> None:
+    """Refuse FP8-dequantize loads that won't fit in CUDA HBM.
+
+    When ``force_hf=True`` meets an FP8 quant config with ``dequantize=True``,
+    ``transformers`` materializes the entire model in BF16 inside
+    ``_from_pretrained_parent_class`` on every rank *before* any Automodel
+    sharding kicks in. For models > available HBM (Devstral 123B,
+    Mistral Medium 128B, ...) this OOMs deep inside the HF loader with no
+    useful log line. See https://github.com/NVIDIA-NeMo/Automodel/issues/2114.
+
+    This pre-flight estimates the BF16 footprint from ``hf_config`` and
+    compares it to free CUDA memory. The estimate is conservative — it skips
+    activations / gradients / optimizer state — so we only trip when the
+    parameters alone clearly won't fit, leaving a margin via
+    ``_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD``.
+
+    No-ops when CUDA isn't available, the config isn't an FP8 full-materialize
+    config, the param count can't be estimated, or
+    ``NEMO_AUTOMODEL_DISABLE_FP8_PREFLIGHT=1`` is set.
+
+    Raises:
+        RuntimeError: if the estimated BF16 footprint exceeds the safe budget.
+    """
+    if os.environ.get(_FP8_PREFLIGHT_DISABLE_ENV) == "1":
+        return None
+    if not _quant_config_is_fp8_full_materialize(quantization_config):
+        return None
+    if not torch.cuda.is_available():
+        return None
+
+    n_params = _get_hf_param_count_estimate(hf_config)
+    if not n_params:
+        logger.warning(
+            "FP8 dequantize pre-flight: could not estimate parameter count from hf_config; "
+            "skipping memory check for %s.",
+            pretrained_model_name_or_path,
+        )
+        return None
+
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info()
+    except (RuntimeError, AssertionError) as exc:
+        logger.warning(
+            "FP8 dequantize pre-flight: torch.cuda.mem_get_info() failed (%s); skipping memory check for %s.",
+            exc,
+            pretrained_model_name_or_path,
+        )
+        return None
+
+    bf16_bytes = n_params * 2
+    budget_bytes = int(free_bytes * _FP8_PREFLIGHT_FOOTPRINT_THRESHOLD)
+    if bf16_bytes <= budget_bytes:
+        return None
+
+    gib = 1024**3
+    raise RuntimeError(
+        f"FP8 dequantize pre-flight failed for {pretrained_model_name_or_path!r}.\n"
+        f"  Estimated BF16 footprint: {bf16_bytes / gib:.1f} GB "
+        f"(~{n_params / 1e9:.1f}B parameters x 2 bytes, gated-MLP transformer estimate).\n"
+        f"  Free CUDA memory: {free_bytes / gib:.1f} GB "
+        f"(safe budget at {int(_FP8_PREFLIGHT_FOOTPRINT_THRESHOLD * 100)}%: {budget_bytes / gib:.1f} GB).\n"
+        f"  With force_hf=True and quant_method='fp8' + dequantize=True, transformers "
+        f"materializes the full BF16 model on every rank inside _from_pretrained_parent_class "
+        f"BEFORE Automodel sharding runs, which OOMs for any model larger than one device's HBM.\n"
+        f"  Workaround: provide a streaming-aware custom model class (see the mistral3_vlm "
+        f"adapter in nemo_automodel/components/models/ for the pattern), or drop force_hf=True "
+        f"so the custom path can shard the FP8 checkpoint directly.\n"
+        f"  Tracking issue: https://github.com/NVIDIA-NeMo/Automodel/issues/2114\n"
+        f"  Bypass (use only if you're sure the estimate is wrong): "
+        f"export {_FP8_PREFLIGHT_DISABLE_ENV}=1."
+    )
+
+
 def _resolve_model_dir(pretrained_model_name_or_path: str) -> str:
     """Resolve a HF repo id or local path to a local directory with model files."""
     if os.path.isdir(pretrained_model_name_or_path):
@@ -745,6 +908,14 @@ def __init_model(
 
     # 1. if force_hf is True, use HF model class wrapped with mixin
     if force_hf:
+        # Refuse early if HF's loader would dequantize an FP8 checkpoint to a
+        # full BF16 model that won't fit in HBM (issue #2114). Both the
+        # user-supplied quant config and the one baked into the HF config
+        # (e.g. set by _maybe_dequantize_fp8_for_peft) can trigger this path.
+        _check_fp8_dequantize_will_fit(hf_config, quantization_config, pretrained_model_name_or_path)
+        _check_fp8_dequantize_will_fit(
+            hf_config, getattr(hf_config, "quantization_config", None), pretrained_model_name_or_path
+        )
         if quantization_config is not None:
             kwargs["quantization_config"] = quantization_config
             _setup_bnb_loading_kwargs(kwargs)
