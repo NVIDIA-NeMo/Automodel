@@ -173,6 +173,27 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
         ),
         (
+            "Qwen2_5OmniModel",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
+            "Qwen2_5OmniForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
             "Qwen3MoeForCausalLM",
             ("nemo_automodel.components.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
         ),
@@ -196,8 +217,16 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
         ),
         (
+            "Step3p6ForConditionalGeneration",
+            ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
+        ),
+        (
             "Step3p5ForCausalLM",
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
+        ),
+        (
+            "Step3p7ForConditionalGeneration",
+            ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
     ]
 )
@@ -216,6 +245,8 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
+    "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
 
