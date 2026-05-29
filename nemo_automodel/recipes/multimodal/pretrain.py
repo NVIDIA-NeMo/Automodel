@@ -12,4 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training utilities shared across recipes."""
+from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
+
+
+class PretrainRecipeForMultimodal(FinetuneRecipeForMultimodal):
+    """Pretraining entrypoint for multimodal BAGEL training.
+
+    The shared implementation lives in ``FinetuneRecipeForMultimodal`` because
+    the BAGEL training step is the same; pretraining behavior is selected by
+    the YAML model initializer and data mixture.
+    """
