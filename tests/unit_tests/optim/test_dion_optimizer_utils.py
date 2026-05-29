@@ -508,7 +508,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_dion_optimizer_single_model(self, monkeypatch):
         """When is_dion_optimizer returns True, build_dion_optimizer is called."""
-        import nemo_automodel.components.optim.api as optim_build_mod
+        import nemo_automodel.components.optim.optimizer as optim_build_mod
 
         model = self._make_simple_model()
         sentinel_mesh = MagicMock()
@@ -527,11 +527,11 @@ class TestBuildOptimizerDionBranch:
             ),
         )
 
-        optimizers = optim_build_mod.build_optimizer(
+        optimizers = optim_build_mod.build_optimizer_for_rl(
+            fake_optimizer_factory,
             model,
-            optimizer_factory=fake_optimizer_factory,
-            optimizer_kwargs={"foreach": True},
             device_mesh=sentinel_mesh,
+            foreach=True,
         )
 
         assert optimizers == ["fake_dion_opt"]
@@ -541,7 +541,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_dion_optimizer_with_parts(self, monkeypatch):
         """When model has `parts`, build_dion_optimizer is called per part."""
-        import nemo_automodel.components.optim.api as optim_build_mod
+        import nemo_automodel.components.optim.optimizer as optim_build_mod
 
         model = self._make_parts_model()
         build_calls = []
@@ -558,9 +558,7 @@ class TestBuildOptimizerDionBranch:
             ),
         )
 
-        optimizers = optim_build_mod.build_optimizer(
-            model, optimizer_factory=fake_optimizer_factory, optimizer_kwargs={"foreach": True}
-        )
+        optimizers = optim_build_mod.build_optimizer_for_rl(fake_optimizer_factory, model, foreach=True)
 
         assert len(build_calls) == 2
         assert build_calls[0] is model.parts[0]
@@ -569,7 +567,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_non_dion_optimizer_single_model(self, monkeypatch):
         """When is_dion_optimizer returns False, normal instantiate path is used."""
-        import nemo_automodel.components.optim.api as optim_build_mod
+        import nemo_automodel.components.optim.optimizer as optim_build_mod
 
         model = self._make_simple_model()
         instantiate_calls = []
@@ -580,9 +578,7 @@ class TestBuildOptimizerDionBranch:
 
         monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        optimizers = optim_build_mod.build_optimizer(
-            model, optimizer_factory=fake_optimizer_factory, optimizer_kwargs={"foreach": True}
-        )
+        optimizers = optim_build_mod.build_optimizer_for_rl(fake_optimizer_factory, model, foreach=True)
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
@@ -590,7 +586,7 @@ class TestBuildOptimizerDionBranch:
 
     def test_non_dion_optimizer_with_parts(self, monkeypatch):
         """Non-dion optimizer with model.parts -> instantiate per part."""
-        import nemo_automodel.components.optim.api as optim_build_mod
+        import nemo_automodel.components.optim.optimizer as optim_build_mod
 
         model = self._make_parts_model()
         instantiate_calls = []
@@ -601,9 +597,7 @@ class TestBuildOptimizerDionBranch:
 
         monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        optimizers = optim_build_mod.build_optimizer(
-            model, optimizer_factory=fake_optimizer_factory, optimizer_kwargs={"foreach": True}
-        )
+        optimizers = optim_build_mod.build_optimizer_for_rl(fake_optimizer_factory, model, foreach=True)
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2

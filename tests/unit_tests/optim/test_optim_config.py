@@ -12,117 +12,158 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for nemo_automodel.components.optim.config — OptimizerConfig hierarchy + LRSchedulerConfig."""
+"""Tests for nemo_automodel.components.optim.optimizer — typed configs + builders."""
 
-from nemo_automodel.components.optim.config import (
+import pytest
+import torch
+import torch.nn as nn
+
+from nemo_automodel.components.optim.optimizer import (
     AdamConfig,
     AdamWConfig,
-    FlashAdamWConfig,
-    FusedAdamConfig,
     LRSchedulerConfig,
-    MuonConfig,
     OptimizerConfig,
+    _resolve_dotted_path,
+    build_optimizer,
+    build_optimizer_for_rl,
 )
 
-# ---------------------------------------------------------------------------
-# OptimizerConfig base
-# ---------------------------------------------------------------------------
+
+def _model():
+    return nn.Linear(4, 4)
 
 
-class TestOptimizerConfig:
-    def test_defaults(self):
-        cfg = OptimizerConfig()
-        assert cfg.name == "torch.optim.AdamW"
-        assert cfg.lr == 1e-4
-        assert cfg.weight_decay == 0.01
-        assert cfg.extra_kwargs == {}
-
-    def test_to_kwargs(self):
-        cfg = OptimizerConfig(lr=1e-3, extra_kwargs={"momentum": 0.9})
-        kwargs = cfg.to_kwargs()
-        assert kwargs == {"lr": 1e-3, "weight_decay": 0.01, "momentum": 0.9}
-
-    def test_extra_kwargs_override(self):
-        cfg = OptimizerConfig(extra_kwargs={"weight_decay": 0.05})
-        kwargs = cfg.to_kwargs()
-        # extra_kwargs should override the base field via dict merge order
-        assert kwargs["weight_decay"] == 0.05
+def _params():
+    return list(_model().parameters())
 
 
 # ---------------------------------------------------------------------------
-# Typed subclasses — to_kwargs
+# Typed config fields + build()
 # ---------------------------------------------------------------------------
 
 
 class TestAdamConfig:
     def test_defaults(self):
         cfg = AdamConfig()
-        assert cfg.name == "torch.optim.Adam"
+        assert cfg.lr == 1e-4
         assert cfg.betas == (0.9, 0.999)
+        assert cfg.eps == 1e-8
+        assert cfg.amsgrad is False
 
-    def test_to_kwargs(self):
-        cfg = AdamConfig(lr=2e-4, betas=(0.8, 0.99), amsgrad=True)
-        kwargs = cfg.to_kwargs()
-        assert kwargs["lr"] == 2e-4
-        assert kwargs["betas"] == (0.8, 0.99)
-        assert kwargs["amsgrad"] is True
-        assert kwargs["eps"] == 1e-8
+    def test_build_returns_adam_with_fields(self):
+        cfg = AdamConfig(lr=2e-4, betas=(0.8, 0.99), amsgrad=True, weight_decay=0.05)
+        opt = cfg.build(_params())
+        assert isinstance(opt, torch.optim.Adam)
+        group = opt.param_groups[0]
+        assert group["lr"] == 2e-4
+        assert group["betas"] == (0.8, 0.99)
+        assert group["amsgrad"] is True
+        assert group["weight_decay"] == 0.05
+
+    def test_build_forwards_foreach(self):
+        opt = AdamConfig().build(_params(), foreach=False)
+        assert opt.param_groups[0]["foreach"] is False
 
 
 class TestAdamWConfig:
     def test_defaults(self):
         cfg = AdamWConfig()
-        assert cfg.name == "torch.optim.AdamW"
         assert cfg.fused is False
+        assert cfg.weight_decay == 0.01
 
-    def test_to_kwargs_fused(self):
-        cfg = AdamWConfig(fused=True)
-        assert cfg.to_kwargs()["fused"] is True
+    def test_build_returns_adamw(self):
+        opt = AdamWConfig(lr=1e-3).build(_params(), foreach=False)
+        assert isinstance(opt, torch.optim.AdamW)
+        assert opt.param_groups[0]["lr"] == 1e-3
+        assert opt.param_groups[0]["foreach"] is False
 
-
-class TestFusedAdamConfig:
-    def test_defaults(self):
-        cfg = FusedAdamConfig()
-        assert "transformer_engine" in cfg.name
-        assert cfg.adam_w_mode is True
-        assert cfg.master_weights is True
-
-    def test_to_kwargs_no_master_dtype(self):
-        cfg = FusedAdamConfig()
-        kwargs = cfg.to_kwargs()
-        assert "master_weight_dtype" not in kwargs
-
-    def test_to_kwargs_with_master_dtype(self):
-        cfg = FusedAdamConfig(master_weight_dtype="torch.bfloat16")
-        kwargs = cfg.to_kwargs()
-        assert kwargs["master_weight_dtype"] == "torch.bfloat16"
+    def test_build_fused_skips_foreach(self):
+        # fused and foreach are mutually exclusive; foreach must not be forwarded.
+        opt = AdamWConfig(fused=True).build(_params(), foreach=False)
+        assert opt.param_groups[0]["fused"] is True
+        assert opt.param_groups[0]["foreach"] is None
 
 
-class TestFlashAdamWConfig:
-    def test_defaults(self):
-        cfg = FlashAdamWConfig()
-        assert cfg.name == "flashoptim.FlashAdamW"
-        assert cfg.master_weight_bits == 24
-
-    def test_to_kwargs(self):
-        cfg = FlashAdamWConfig(master_weight_bits=16)
-        assert cfg.to_kwargs()["master_weight_bits"] == 16
+class TestOptimizerConfigBase:
+    def test_base_build_not_implemented(self):
+        with pytest.raises(NotImplementedError):
+            OptimizerConfig().build(_params())
 
 
-class TestMuonConfig:
-    def test_defaults(self):
-        cfg = MuonConfig()
-        assert cfg.name == "dion.Muon"
-        assert cfg.mu == 0.95
-        assert cfg.scalar_opt == "adamw"
+# ---------------------------------------------------------------------------
+# build_optimizer (Automodel-native orchestration)
+# ---------------------------------------------------------------------------
 
-    def test_to_kwargs(self):
-        cfg = MuonConfig(lr=1e-3, mu=0.9, scalar_betas=(0.8, 0.99))
-        kwargs = cfg.to_kwargs()
-        assert kwargs["lr"] == 1e-3
-        assert kwargs["mu"] == 0.9
-        assert kwargs["scalar_betas"] == (0.8, 0.99)
-        assert kwargs["adjust_lr"] == "spectral_norm"
+
+class TestBuildOptimizer:
+    def test_single_model_returns_one_optimizer(self):
+        model = _model()
+        optimizers = build_optimizer(model, AdamWConfig(lr=1e-3))
+        assert len(optimizers) == 1
+        assert isinstance(optimizers[0], torch.optim.AdamW)
+        assert optimizers[0].param_groups[0]["lr"] == 1e-3
+
+    def test_parts_model_returns_optimizer_per_part(self):
+        class PartsModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.part1 = nn.Linear(4, 4)
+                self.part2 = nn.Linear(4, 4)
+                self.parts = [self.part1, self.part2]
+
+        optimizers = build_optimizer(PartsModel(), AdamConfig())
+        assert len(optimizers) == 2
+        assert all(isinstance(o, torch.optim.Adam) for o in optimizers)
+
+    def test_tp_mesh_disables_foreach(self, monkeypatch):
+
+        class FakeMesh:
+            mesh_dim_names = ("tp",)
+
+            def __getitem__(self, key):
+                m = type("M", (), {})()
+                m.size = lambda self=m: 2
+                return m
+
+        optimizers = build_optimizer(_model(), AdamConfig(), device_mesh=FakeMesh())
+        assert optimizers[0].param_groups[0]["foreach"] is False
+
+
+# ---------------------------------------------------------------------------
+# build_optimizer_for_rl (integration escape hatch)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildOptimizerForRL:
+    def test_dotted_path_string(self):
+        optimizers = build_optimizer_for_rl("torch.optim.AdamW", _model(), lr=1e-3, betas=(0.9, 0.95))
+        assert isinstance(optimizers[0], torch.optim.AdamW)
+        assert optimizers[0].param_groups[0]["lr"] == 1e-3
+
+    def test_resolved_class(self):
+        optimizers = build_optimizer_for_rl(torch.optim.SGD, _model(), lr=0.01, momentum=0.9)
+        assert isinstance(optimizers[0], torch.optim.SGD)
+        assert optimizers[0].param_groups[0]["momentum"] == 0.9
+
+    def test_arbitrary_new_optimizer_no_typed_config(self):
+        # Adding support for a new optimizer requires no code change here:
+        # any importable optimizer + kwargs works.
+        optimizers = build_optimizer_for_rl("torch.optim.RMSprop", _model(), lr=0.01, alpha=0.95)
+        assert isinstance(optimizers[0], torch.optim.RMSprop)
+        assert optimizers[0].param_groups[0]["alpha"] == 0.95
+
+
+class TestResolveDottedPath:
+    def test_resolve_adamw(self):
+        assert _resolve_dotted_path("torch.optim.AdamW") is torch.optim.AdamW
+
+    def test_bad_path_no_dot(self):
+        with pytest.raises(ValueError, match="Expected a dotted path"):
+            _resolve_dotted_path("AdamW")
+
+    def test_bad_class(self):
+        with pytest.raises(ImportError, match="Cannot find"):
+            _resolve_dotted_path("torch.optim.NonExistentOptimizer")
 
 
 # ---------------------------------------------------------------------------

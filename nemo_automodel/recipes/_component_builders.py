@@ -21,7 +21,7 @@ from nemo_automodel.components.checkpoint import build_checkpoint_config as _bui
 from nemo_automodel.components.loggers.api import build_wandb as _build_wandb
 from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
 from nemo_automodel.components.optim import build_lr_scheduler as _build_lr_scheduler
-from nemo_automodel.components.optim import build_optimizer as _build_optimizer
+from nemo_automodel.components.optim import build_optimizer_for_rl as _build_optimizer_for_rl
 from nemo_automodel.components.training import build_step_scheduler as _build_step_scheduler
 
 
@@ -71,18 +71,20 @@ def build_loss_fn(cfg_loss: Any) -> Any:
 
 
 def build_optimizer(model: Any, cfg_opt: Any, distributed_config: Any, device_mesh: Any):
+    # YAML resolves _target_ to a callable; route through the RL/integration
+    # escape hatch which accepts a resolved class/callable + arbitrary kwargs.
     optimizer_factory, optimizer_kwargs = _callable_and_kwargs(cfg_opt)
-    return _build_optimizer(
-        model=model,
-        optimizer_factory=optimizer_factory,
-        optimizer_kwargs=optimizer_kwargs,
+    return _build_optimizer_for_rl(
+        optimizer_factory,
+        model,
         distributed_config=distributed_config,
         device_mesh=device_mesh,
+        **optimizer_kwargs,
     )
 
 
 def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any):
-    from nemo_automodel.components.optim.config import LRSchedulerConfig
+    from nemo_automodel.components.optim import LRSchedulerConfig
 
     if cfg is None:
         return _build_lr_scheduler(config=None, optimizer=optimizer, step_scheduler=step_scheduler)
