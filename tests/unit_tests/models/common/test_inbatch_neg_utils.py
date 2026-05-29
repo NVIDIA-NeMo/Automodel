@@ -65,9 +65,34 @@ def test_dist_gather_tensor_uses_autograd_gather_for_grad_tensors(monkeypatch):
     monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fake_autograd_all_gather)
 
     t = torch.tensor([[1.0], [2.0]], requires_grad=True)
-    gathered = dist_gather_tensor(t)
+    gathered = dist_gather_tensor(t, preserve_grad=True)
 
     assert gathered.shape == (4, 1)
+    gathered.sum().backward()
+    assert torch.equal(t.grad, torch.ones_like(t))
+
+
+def test_dist_gather_tensor_detaches_remote_grad_tensors_by_default(monkeypatch):
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_rank", lambda: 1)
+
+    def fail_autograd_all_gather(*args, **kwargs):
+        raise AssertionError("autograd all_gather should not handle detached mode")
+
+    def fake_regular_all_gather(gathered, tensor):
+        gathered[0].copy_(tensor.detach() + 10)
+        gathered[1].copy_(tensor.detach() + 20)
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_regular_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+
+    t = torch.tensor([[1.0], [2.0]], requires_grad=True)
+    gathered = dist_gather_tensor(t)
+
+    expected = torch.tensor([[11.0], [12.0], [1.0], [2.0]])
+    assert torch.equal(gathered, expected)
     gathered.sum().backward()
     assert torch.equal(t.grad, torch.ones_like(t))
 
@@ -122,9 +147,41 @@ def test_dist_gather_tensor_with_dim1_padding_preserves_grad_through_padding(mon
     monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fake_autograd_all_gather)
 
     t = torch.randn(2, 2, 3, requires_grad=True)
+    gathered = dist_gather_tensor_with_dim1_padding(t, preserve_grad=True)
+
+    assert gathered.shape == (4, 4, 3)
+    gathered.sum().backward()
+    assert torch.equal(t.grad, torch.ones_like(t))
+
+
+def test_dist_gather_tensor_with_dim1_padding_detaches_remote_grad_tensors_by_default(monkeypatch):
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(inbatch_neg_utils.dist, "get_rank", lambda: 1)
+
+    def fake_regular_all_gather(gathered, tensor):
+        if tensor.dtype == torch.long:
+            gathered[0].copy_(torch.tensor([2, 4, 3], device=tensor.device))
+            gathered[1].copy_(torch.tensor([2, 2, 3], device=tensor.device))
+        else:
+            assert tensor.shape == (2, 4, 3)
+            gathered[0].copy_(tensor.detach() + 10)
+            gathered[1].copy_(tensor.detach() + 20)
+
+    def fail_autograd_all_gather(*args, **kwargs):
+        raise AssertionError("autograd all_gather should not handle detached mode")
+
+    monkeypatch.setattr(inbatch_neg_utils.dist, "all_gather", fake_regular_all_gather)
+    monkeypatch.setattr(inbatch_neg_utils.dist_nn_func, "all_gather", fail_autograd_all_gather)
+
+    t = torch.randn(2, 2, 3, requires_grad=True)
     gathered = dist_gather_tensor_with_dim1_padding(t)
 
     assert gathered.shape == (4, 4, 3)
+    assert torch.allclose(gathered[:2], torch.cat([t.detach(), torch.zeros_like(t)], dim=1) + 10)
+    assert torch.allclose(gathered[2:, :2], t)
+    assert torch.equal(gathered[2:, 2:], torch.zeros_like(t))
     gathered.sum().backward()
     assert torch.equal(t.grad, torch.ones_like(t))
 

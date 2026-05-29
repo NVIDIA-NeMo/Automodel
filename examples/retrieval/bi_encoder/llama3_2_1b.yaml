@@ -41,6 +41,7 @@ model:
   use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16
+  do_distributed_inbatch_negative: false
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained

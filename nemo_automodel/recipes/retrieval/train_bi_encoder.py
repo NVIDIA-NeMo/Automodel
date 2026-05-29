@@ -48,6 +48,11 @@ from nemo_automodel.shared.te_patches import apply_te_patches
 logger = logging.getLogger(__name__)
 
 
+def _uses_multi_vector_scoring(model) -> bool:
+    """Return whether the model emits token-level embeddings for MaxSim scoring."""
+    return getattr(model, "pooling", None) in {"colbert", "multi_vector"}
+
+
 def contrastive_scores_and_labels(
     query: torch.Tensor, key: torch.Tensor, current_train_n_passages: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -78,7 +83,7 @@ def maxsim_scores_and_labels(
     current_train_n_passages: int,
     key_attention_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local ColBERT MaxSim scores and labels without in-batch negatives."""
+    """Compute local multi-vector MaxSim scores and labels without in-batch negatives."""
     assert key.shape[0] == query.shape[0] * current_train_n_passages, "{} != {} * {}".format(
         key.shape[0], query.shape[0], current_train_n_passages
     )
@@ -102,7 +107,7 @@ def distributed_maxsim_scores_and_labels(
     key_attention_mask: torch.Tensor,
     rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute local-query ColBERT MaxSim scores against globally gathered passages."""
+    """Compute local-query multi-vector MaxSim scores against globally gathered passages."""
     assert key.shape[0] % current_train_n_passages == 0, "{} % {} > 0".format(
         key.shape[0], current_train_n_passages
     )
@@ -402,6 +407,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             p_reps = model(passage)
 
             n_passages = self.train_n_passages
+            use_multi_vector_scoring = _uses_multi_vector_scoring(model)
             if is_train and getattr(model, "do_distributed_inbatch_negative", False):
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
@@ -413,8 +419,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                if getattr(model, "pooling", None) == "colbert":
-                    all_p = dist_gather_tensor_with_dim1_padding(p_reps)
+                preserve_gather_grad = not getattr(model, "detach_distributed_inbatch_negatives", True)
+
+                if use_multi_vector_scoring:
+                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
                     all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
                     expected_p = world_size * local_bs * n_passages
                     assert (
@@ -428,7 +436,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         rank,
                     )
                 else:
-                    all_p = dist_gather_tensor(p_reps)
+                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
                     expected_p = world_size * local_bs * n_passages
                     assert (
                         all_p.shape[0] == expected_p
@@ -448,7 +456,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         local_batch_size=local_bs,
                     )
             else:
-                if getattr(model, "pooling", None) == "colbert":
+                if use_multi_vector_scoring:
                     scores, labels = maxsim_scores_and_labels(
                         q_reps,
                         p_reps,
@@ -544,7 +552,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     q_reps = model(query)
                     p_reps = model(passage)
 
-                    if getattr(model, "pooling", None) == "colbert":
+                    if _uses_multi_vector_scoring(model):
                         scores, labels = maxsim_scores_and_labels(
                             q_reps,
                             p_reps,

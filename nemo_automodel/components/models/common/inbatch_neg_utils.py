@@ -27,22 +27,26 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_func
 
 
-def _all_gather_tensor(t: torch.Tensor) -> torch.Tensor:
+def _all_gather_tensor(t: torch.Tensor, preserve_grad: bool = False) -> torch.Tensor:
     """All-gather ``t`` along dim 0, preserving autograd only when needed."""
-    if t.requires_grad:
+    if preserve_grad and t.requires_grad:
         return torch.cat(dist_nn_func.all_gather(t), dim=0)
 
     gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
+    if t.requires_grad:
+        gathered[dist.get_rank()] = t
     return torch.cat(gathered, dim=0)
 
 
-def dist_gather_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def dist_gather_tensor(t: Optional[torch.Tensor], preserve_grad: bool = False) -> Optional[torch.Tensor]:
     """All-gather ``t`` along dim 0 across the default process group.
 
-    Tensors that require gradients use an autograd-aware gather so distributed
-    in-batch-negative losses can send passage gradients back to the owning rank.
-    Non-gradient tensors, such as masks or IDs, use a regular detached gather.
+    When ``preserve_grad`` is true, tensors that require gradients use an
+    autograd-aware gather so distributed in-batch-negative losses can send
+    passage gradients back to the owning rank. Otherwise, remote slices are
+    detached and only the local slice keeps gradient flow. Non-gradient tensors,
+    such as masks or IDs, always use a regular detached gather.
     Returns ``t`` unchanged when distributed is not available, not initialized,
     or world size is 1.
     """
@@ -51,12 +55,13 @@ def dist_gather_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
         return t
     t = t.contiguous()
-    return _all_gather_tensor(t)
+    return _all_gather_tensor(t, preserve_grad=preserve_grad)
 
 
 def dist_gather_tensor_with_dim1_padding(
     t: Optional[torch.Tensor],
     padding_value: int | float | bool = 0,
+    preserve_grad: bool = False,
 ) -> Optional[torch.Tensor]:
     """All-gather ``t`` after padding dim 1 to the maximum length across ranks."""
     if t is None:
@@ -73,7 +78,7 @@ def dist_gather_tensor_with_dim1_padding(
         padding = t.new_full(pad_shape, padding_value)
         t = torch.cat([t, padding], dim=1)
     t = t.contiguous()
-    return _all_gather_tensor(t)
+    return _all_gather_tensor(t, preserve_grad=preserve_grad)
 
 
 def mask_gathered_passages_same_doc_as_positive(

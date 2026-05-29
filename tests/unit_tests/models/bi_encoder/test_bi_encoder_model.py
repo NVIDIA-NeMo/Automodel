@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import nemo_automodel._transformers.auto_model as am
@@ -36,10 +37,10 @@ class DummyMesh:
     pass
 
 
-class _ToyColbertBiEncoder(torch.nn.Module):
+class _ToyMultiVectorBiEncoder(torch.nn.Module):
     do_distributed_inbatch_negative = False
     l2_normalize = False
-    pooling = "colbert"
+    pooling = "multi_vector"
 
     def __init__(self):
         super().__init__()
@@ -89,6 +90,8 @@ def test_from_pretrained_happy_path(monkeypatch):
         pretrained_model_name_or_path="some/path",
         pooling="avg",
         l2_normalize=True,
+        do_distributed_inbatch_negative=True,
+        detach_distributed_inbatch_negatives=False,
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -99,6 +102,8 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert "liger" in model.marker and "sdpa" in model.marker
     # Ensure HF kwargs injected + passthrough of parameters to build
     assert last_kwargs["attn_implementation"] == "flash_attention_2"
+    assert last_kwargs["do_distributed_inbatch_negative"] is True
+    assert last_kwargs["detach_distributed_inbatch_negatives"] is False
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
@@ -234,38 +239,10 @@ def test_maxsim_scores_and_labels_masks_padding_before_maxsim():
     assert torch.equal(labels, torch.tensor([0, 0]))
 
 
-def test_distributed_maxsim_scores_and_labels_uses_global_positive_labels():
-    query = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
-    key = torch.tensor(
-        [
-            [[1.0, 0.0]],
-            [[0.0, 1.0]],
-            [[0.5, 0.0]],
-            [[0.0, 0.5]],
-            [[0.8, 0.0]],
-            [[0.0, 0.8]],
-            [[0.2, 0.0]],
-            [[0.0, 0.2]],
-        ]
-    )
-    key_attention_mask = torch.ones(key.shape[:2], dtype=torch.long)
-
-    scores, labels = distributed_maxsim_scores_and_labels(
-        query,
-        key,
-        current_train_n_passages=2,
-        key_attention_mask=key_attention_mask,
-        rank=1,
-    )
-
-    assert scores.shape == (2, 8)
-    assert torch.equal(labels, torch.tensor([4, 6]))
-
-
 def test_distributed_maxsim_scores_and_labels_matches_all_at_once_scoring():
     torch.manual_seed(0)
     query = torch.randn(2, 3, 4, requires_grad=True)
-    key = torch.randn(6, 5, 4, requires_grad=True)
+    key = torch.randn(8, 5, 4, requires_grad=True)
     key_attention_mask = torch.tensor(
         [
             [1, 1, 1, 0, 0],
@@ -274,6 +251,8 @@ def test_distributed_maxsim_scores_and_labels_matches_all_at_once_scoring():
             [1, 1, 1, 1, 0],
             [1, 0, 0, 0, 0],
             [1, 1, 1, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1],
         ],
         dtype=torch.long,
     )
@@ -296,6 +275,7 @@ def test_distributed_maxsim_scores_and_labels_matches_all_at_once_scoring():
     ref_scores = ref_token_scores.max(dim=3).values.sum(dim=2)
     ref_labels = torch.tensor([4, 6])
 
+    assert scores.shape == (2, 8)
     assert torch.allclose(scores, ref_scores)
     assert torch.equal(labels, ref_labels)
 
@@ -305,11 +285,11 @@ def test_distributed_maxsim_scores_and_labels_matches_all_at_once_scoring():
     assert torch.allclose(key.grad, key_ref.grad)
 
 
-def test_forward_backward_step_supports_local_colbert_pooling():
+def test_forward_backward_step_supports_local_multi_vector_pooling():
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    recipe.model_parts = [_ToyColbertBiEncoder()]
+    recipe.model_parts = [_ToyMultiVectorBiEncoder()]
     recipe.temperature = 1.0
     recipe.train_n_passages = 2
 
@@ -340,10 +320,10 @@ def test_forward_backward_step_supports_local_colbert_pooling():
     assert recipe.model_parts[0].scale.grad is not None
 
 
-def test_validation_epoch_supports_colbert_pooling():
+def test_validation_epoch_supports_multi_vector_pooling():
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
-    recipe.model_parts = [_ToyColbertBiEncoder()]
+    recipe.model_parts = [_ToyMultiVectorBiEncoder()]
     recipe.temperature = 1.0
     recipe.val_n_passages = 2
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
@@ -379,15 +359,20 @@ def test_validation_epoch_supports_colbert_pooling():
     assert recipe.model_parts[0].scale.grad is None
 
 
-def test_forward_backward_step_supports_distributed_colbert_inbatch_negatives(monkeypatch):
-    """Exercise the trainer branch that gathers ColBERT token embeddings across ranks."""
+@pytest.mark.parametrize("detach_distributed_inbatch_negatives", [True, False])
+def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negatives(
+    monkeypatch,
+    detach_distributed_inbatch_negatives,
+):
+    """Exercise the trainer branch that gathers token embeddings across ranks."""
     import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
 
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
-    model = _ToyColbertBiEncoder()
+    model = _ToyMultiVectorBiEncoder()
     model.do_distributed_inbatch_negative = True
+    model.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
     recipe.model_parts = [model]
     recipe.temperature = 1.0
     recipe.train_n_passages = 2
@@ -399,11 +384,14 @@ def test_forward_backward_step_supports_distributed_colbert_inbatch_negatives(mo
 
     gather_with_padding_calls = []
 
-    def fake_gather_with_dim1_padding(tensor, padding_value=0):
-        gather_with_padding_calls.append((tuple(tensor.shape), padding_value))
+    def fake_gather_with_dim1_padding(tensor, padding_value=0, preserve_grad=False):
+        gather_with_padding_calls.append((tuple(tensor.shape), padding_value, preserve_grad))
         return torch.cat([tensor.detach().clone(), tensor], dim=0)
 
-    def fake_gather_tensor(tensor):
+    gather_tensor_calls = []
+
+    def fake_gather_tensor(tensor, preserve_grad=False):
+        gather_tensor_calls.append((tuple(tensor.shape), preserve_grad))
         remote_doc_ids = torch.tensor([500, 999, 600, 998], dtype=tensor.dtype, device=tensor.device)
         return torch.cat([remote_doc_ids, tensor], dim=0)
 
@@ -441,7 +429,11 @@ def test_forward_backward_step_supports_distributed_colbert_inbatch_negatives(mo
 
     recipe._forward_backward_step(0, batch, loss_buffer=loss_buffer, num_batches=1, is_train=True)
 
-    assert gather_with_padding_calls == [((4, 2, 2), 0), ((4, 2), False)]
+    assert gather_with_padding_calls == [
+        ((4, 2, 2), 0, not detach_distributed_inbatch_negatives),
+        ((4, 2), False, False),
+    ]
+    assert gather_tensor_calls == [((4,), False)]
     assert torch.equal(captured["labels"], torch.tensor([4, 6]))
     assert captured["scores"].shape == (2, 8)
     assert captured["scores"][0, 0].item() == torch.finfo(captured["scores"].dtype).min
