@@ -69,7 +69,13 @@ jobs:
           export PATH="./bin/:$PATH"
 
           uv sync --link-mode copy --locked --group linting
-
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          brew cleanup || true
+          pip cache purge || true
       - name: Run ruff
         run: |
           source ./venv/bin/activate
@@ -90,6 +96,13 @@ jobs:
         uses: astral-sh/setup-uv@v1
         with:
           version: 0.8.22
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          brew cleanup || true
+          pip cache purge || true
       - name: Install ruff
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
