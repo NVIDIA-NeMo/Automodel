@@ -100,9 +100,16 @@ class Gemma4Gate(nn.Module):
         self.topk = config.top_k_experts
         self.num_experts = num_experts
 
+        # Thread dtype explicitly from config.torch_dtype so the router's own
+        # params (proj weight + scale) stay aligned with the rest of the model
+        # (fp32 under fp32 master weights) even when construction is not wrapped
+        # in local_torch_dtype(). Gemma4RMSNorm(with_scale=False) holds no
+        # learnable parameter, so it needs no dtype threading.
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.norm = Gemma4RMSNorm(hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        self.proj = nn.Linear(hidden_size, num_experts, bias=False)
-        self.scale = nn.Parameter(torch.ones(hidden_size))
+        self.proj = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+        self.scale = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         scalar_root_size = hidden_size**-0.5
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
