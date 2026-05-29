@@ -697,3 +697,69 @@ def test_pipeline_wrapper_components_excludes_none():
 
     pipe = NeMoAutoDiffusionPipeline(transformer=None)
     assert "transformer" not in pipe.components
+
+
+# =============================================================================
+# _select_active_transformer tests (Wan2.2 two-transformer pipeline)
+# =============================================================================
+
+
+def test_select_active_transformer_invalid_value_raises():
+    """Anything other than 'transformer' / 'transformer_2' must be rejected."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    pipe = DummyPipeline({"transformer": DummyModule(), "transformer_2": DummyModule()})
+    with pytest.raises(ValueError, match="active_transformer must be"):
+        _select_active_transformer(pipe, "transformer_3")
+
+
+def test_select_active_transformer_2_on_pipeline_without_t2_raises():
+    """Requesting transformer_2 from a single-transformer pipeline (e.g. Wan2.1)
+    must raise — silently falling back would mask configuration mistakes."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    pipe = DummyPipeline({"transformer": DummyModule()})
+    with pytest.raises(AttributeError, match="transformer_2"):
+        _select_active_transformer(pipe, "transformer_2")
+
+
+def test_select_active_transformer_2_swaps_into_transformer_slot():
+    """For Wan2.2 low-noise stage: transformer_2's module moves to pipe.transformer
+    and pipe.transformer_2 becomes None so subsequent FSDP2/device placement
+    only touches one model."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    t1, t2 = DummyModule(), DummyModule()
+    pipe = DummyPipeline({"transformer": t1, "transformer_2": t2})
+
+    _select_active_transformer(pipe, "transformer_2")
+
+    assert pipe.transformer is t2
+    assert pipe.transformer_2 is None
+
+
+def test_select_active_transformer_drops_transformer_2():
+    """For Wan2.2 high-noise stage: transformer stays put, transformer_2 is
+    cleared to None so it does not consume GPU memory or get sharded."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    t1, t2 = DummyModule(), DummyModule()
+    pipe = DummyPipeline({"transformer": t1, "transformer_2": t2})
+
+    _select_active_transformer(pipe, "transformer")
+
+    assert pipe.transformer is t1
+    assert pipe.transformer_2 is None
+
+
+def test_select_active_transformer_noop_on_single_transformer_pipeline():
+    """active_transformer='transformer' on a pipeline that has no transformer_2
+    attribute at all (e.g. Wan2.1 / FLUX) must be a no-op, not an error."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    t1 = DummyModule()
+    pipe = DummyPipeline({"transformer": t1})
+
+    _select_active_transformer(pipe, "transformer")
+
+    assert pipe.transformer is t1

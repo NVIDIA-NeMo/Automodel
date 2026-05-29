@@ -159,7 +159,7 @@ Model Coverage and 🤗 Ecosystem compatibility
 - ✅ **🤗 HuggingFace Integration** - Works with dense models (e.g., Qwen, Llama3, etc) and large MoEs (e.g., DSv3, DSv4).
 - ✅ **VLM** - Finetuning for VLMs (Qwen2.5/3/3.5/3.6 VL, Gemma-3/3n/4 VL, Mistral 3.5/4, LLaVA-OneVision-1.5, Kimi-VL, etc.).
 - ✅ **Omnimodal** - Finetuning for omnimodal MoE models (Nemotron-3-Nano-Omni, Qwen3-Omni).
-- ✅ **Diffusion** - Pretraining and LoRA finetuning for image/video diffusion models (Qwen-Image, FLUX, Wan2.1, Hunyuan).
+- ✅ **Diffusion** - Pretraining and LoRA finetuning for image/video diffusion models (Qwen-Image, FLUX, Wan2.1, Wan2.2-T2V-A14B, Hunyuan).
 - ✅ **dLLM** - Discrete diffusion LM finetuning (LLaDA).
 - ✅ **Retrieval** - Bi-encoder and cross-encoder training with in-batch negative sampling.
 - ✅ **Extended MoE support** - GPT-OSS, Qwen3 / Qwen3.5 / Qwen3.6 MoE, Qwen-next, MiniMax-M2.x, GLM-4.7 / GLM-5 / GLM-5.1, DeepSeek V3.2 / V4 / V4-Flash, ERNIE 4.5, MiMo-V2-Flash, Ling 2.0, Hy3-preview.

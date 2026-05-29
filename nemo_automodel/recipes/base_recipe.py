@@ -269,6 +269,14 @@ class BaseRecipe:
         # Wait for any in-flight checkpoint (async case) to complete
         self.checkpointer.async_wait()
 
+        # Free GPU caches before DCP's gather-and-write. DCP allocates NCCL
+        # workspace and materializes DTensor shards on GPU; with CPU-offloaded
+        # FSDP2 the residual training-time fragments can leave just enough
+        # headroom to break the gather (cuda failure 2 / "out of memory").
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
         # If a previous async checkpoint just finished, update the "latest" symlink now
         prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
         is_dist_initialized = torch.distributed.is_initialized()
@@ -406,6 +414,13 @@ class BaseRecipe:
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
                 torch.distributed.barrier()
+
+        # Release NCCL workspace and DCP gather scratch back to the allocator.
+        # Without this, the next training step's backward sees a fragmented
+        # heap (~74 GB still resident on tight 14B FSDP2 runs) and OOMs.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
