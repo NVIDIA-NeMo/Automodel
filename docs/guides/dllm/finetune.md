@@ -167,10 +167,10 @@ dflash:
 In addition to the shared metrics (`loss`, `grad_norm`, `lr`, `mem`, `tps`,
 `mfu`), DFlash runs log a draft top-1 accuracy proxy for acceptance length:
 
-| Metric | Meaning |
-|--------|---------|
-| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` |
-| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`) — the acceptance-length curve |
+| Metric | Meaning | Where |
+|--------|---------|-------|
+| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line + wandb / mlflow / comet + file logger |
+| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`) — the acceptance-length curve | wandb / mlflow / comet + file logger (one panel per offset); intentionally omitted from the console line to keep it readable |
 
 Both are computed for free inside the chunked linear-CE path (same logits used
 for the loss) and DP/CP-reduced via per-rank raw `(correct, count)` sums that

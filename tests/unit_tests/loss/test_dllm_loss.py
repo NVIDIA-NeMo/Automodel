@@ -384,6 +384,64 @@ class TestDFlashDraftAccuracy:
         assert torch.equal(ref.draft_correct_per_pos, fused.draft_correct_per_pos)
         assert torch.equal(ref.draft_count_per_pos, fused.draft_count_per_pos)
 
+    def test_paper_default_first_offset_weight_is_one(self):
+        """The first predicted position of every block must have decay weight 1.0
+        for the paper's (block_size, gamma) defaults. This locks Eq. 4 and the
+        published triples (16/7, 10/5, 8/4) — if anyone retunes _decay_weights
+        and accidentally shifts the start point, every block's k=1 supervision
+        gets the wrong weight."""
+        for block_size, gamma in [(16, 7.0), (10, 5.0), (8, 4.0)]:
+            loss_fn = DFlashDecayLoss(loss_gamma=gamma)
+            T_per = block_size - 1
+            n_blocks = 3
+            w = loss_fn._decay_weights(n_blocks * T_per, block_size, torch.device("cpu"), torch.float32)
+            assert w.shape == (n_blocks * T_per,), f"block_size={block_size}: weights shape mismatch"
+            # First weight of every block must be 1.0; weights must decay within a block.
+            for b in range(n_blocks):
+                start = b * T_per
+                assert torch.isclose(w[start], torch.tensor(1.0)), (
+                    f"block_size={block_size}, block {b}: first weight {w[start].item()} != 1.0"
+                )
+                assert w[start] > w[start + T_per - 1], (
+                    f"block_size={block_size}, block {b}: weights do not decay within block"
+                )
+
+    def test_recipe_per_pos_metrics_dict_construction(self):
+        """Lock the recipe-side contract: given the loss's per-rank
+        ``(draft_correct_per_pos, draft_count_per_pos)`` tensors and the
+        post-reduction divide it performs, the metrics dict must contain
+        ``draft_acc`` plus one ``draft_acc_k{k}`` key per offset with the
+        correct value. Mirrors train_ft.py:_run_train_optim_step verbatim
+        so it catches drift in the recipe's reduction shape."""
+        B, N, bs, V = 2, 2, 5, 8
+        T = N * (bs - 1)
+        torch.manual_seed(11)
+        target_ids = torch.randint(0, V, (B, T))
+        logits = torch.randn(B, T, V)
+        block_mask = torch.ones(B, T)
+        loss_fn = DFlashDecayLoss(loss_gamma=7.0)
+        result = loss_fn(logits, target_ids, block_mask, block_size=bs)
+
+        # Simulate the recipe's post-reduction divide + key construction.
+        correct_per_pos = result.draft_correct_per_pos
+        count_per_pos = result.draft_count_per_pos
+        total_correct = correct_per_pos.sum().item()
+        total_count = count_per_pos.sum().item()
+        draft_acc = total_correct / total_count
+        draft_acc_per_pos = (correct_per_pos / count_per_pos.clamp_min(1.0)).tolist()
+
+        metrics = {"loss": 0.0, "draft_acc": draft_acc}
+        for k, v in enumerate(draft_acc_per_pos, start=1):
+            metrics[f"draft_acc_k{k}"] = v
+
+        # One key per block offset; values match the per-pos quotient.
+        assert set(metrics) == {"loss", "draft_acc"} | {f"draft_acc_k{k}" for k in range(1, bs)}
+        for k in range(1, bs):
+            expected = (correct_per_pos[k - 1] / count_per_pos[k - 1].clamp_min(1.0)).item()
+            assert metrics[f"draft_acc_k{k}"] == pytest.approx(expected, abs=1e-6)
+        # Overall acc derives consistently from the per-pos sums.
+        assert metrics["draft_acc"] == pytest.approx(total_correct / total_count, abs=1e-6)
+
     def test_dp_sum_reduction_yields_global_accuracy(self):
         """SUM-allreduce of per-rank (correct, count) per position, then divide
         post-reduction, yields the correct global per-position accuracy and

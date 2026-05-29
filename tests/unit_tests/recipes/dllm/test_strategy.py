@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_automodel.recipes.dllm.strategy import (
+    DLLM_STRATEGIES,
     DFlashStrategy,
     HybridStrategy,
     MDLMStrategy,
@@ -28,8 +29,25 @@ from nemo_automodel.recipes.dllm.strategy import (
 
 
 def test_get_dllm_strategy_rejects_unknown_mode():
+    """Unknown mode must raise a clear ValueError (recipe entry point relies on this)."""
     with pytest.raises(ValueError, match="Unknown dllm.mode"):
         get_dllm_strategy("unknown")
+
+
+def test_get_dllm_strategy_resolves_dflash():
+    """Registry happy-path for the flagship DFlash strategy — a typo in the
+    DLLM_STRATEGIES dict would only surface at smoke time without this test."""
+    assert isinstance(get_dllm_strategy("dflash"), DFlashStrategy)
+
+
+def test_every_registered_strategy_has_valid_normalization_mode():
+    """Strategy contract: ``normalization_mode`` selects the loss denominator in
+    ``_run_train_optim_step``; a typo (e.g. ``"supervize"``) raises
+    ``Invalid normalization_mode`` at runtime. Iterating the registry catches
+    this at test time for every strategy."""
+    for name, cls in DLLM_STRATEGIES.items():
+        mode = cls().normalization_mode
+        assert mode in ("supervised", "noise"), f"strategy {name!r}: invalid normalization_mode {mode!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +195,30 @@ class TestHybridStrategy:
 
 MASK_ID = 999
 BLOCK_SIZE = 16
+
+
+def test_dflash_strategy_defaults():
+    """Lock load-bearing DFlashStrategy constructor defaults.
+
+    These defaults encode deliberate design decisions (paper §4.2 + the
+    safety guard rails surfaced by the original PR review):
+
+    - ``overlap_anchors=True``: paper-default per-sample independent anchor
+      sampling (gap #1 fix). Flipping to False silently reverts to the legacy
+      batch-shared stars-and-bars sampler.
+    - ``block_size=0``: sentinel meaning "read block_size from the draft
+      model's config". Any non-zero default would override the draft config.
+    - ``num_blocks_per_sample=1``: safe default; production yaml must opt
+      into the paper's 512 explicitly. A larger default would silently OOM
+      smaller GPUs.
+    - ``attention_backend="sdpa"``: dense fallback that works everywhere;
+      production yaml must opt into ``flex_attention`` for N=512.
+    """
+    s = DFlashStrategy()
+    assert s.overlap_anchors is True
+    assert s.block_size == 0
+    assert s.num_blocks_per_sample == 1
+    assert s.attention_backend == "sdpa"
 
 
 def _make_recipe(mask_token_id=MASK_ID):
