@@ -16,8 +16,14 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
 import torch
-from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
+from transformers import AutoConfig, AutoProcessor, DataCollatorWithPadding, PreTrainedTokenizerBase
 from transformers.file_utils import PaddingStrategy
+
+from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
+
+MODELS_WITH_PROCESSOR = {
+    "llama_nemotron_vl": LlamaNemotronVLProcessor,
+}
 
 
 def _doc_id_str_to_int64(doc_id: str) -> int:
@@ -302,3 +308,26 @@ class CrossEncoderCollator(DataCollatorWithPadding):
             batch_dict["labels"] = torch.zeros(num_labels, dtype=torch.long)
 
         return batch_dict
+
+
+def make_vision_retrieval_collator_from_processor(model_name_or_path: str, **kwargs):
+    """ "
+    Make a vision retrieval collator from a processor.
+
+    Args:
+        model_name_or_path: The name or path of the model to use, where the processor is defined.
+        **kwargs: Additional arguments to pass to the processor.
+
+    Returns:
+        A collator for vision/multimodal retrieval datasets.
+    """
+    if "tokenizer" in kwargs:
+        del kwargs["tokenizer"]
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    if config.model_type in MODELS_WITH_PROCESSOR:
+        processor = MODELS_WITH_PROCESSOR[config.model_type].from_pretrained(
+            model_name_or_path, trust_remote_code=True, **kwargs
+        )
+    else:
+        processor = AutoProcessor.from_pretrained(model_name_or_path, trust_remote_code=True, **kwargs)
+    return processor.process_queries_documents_biencoder
