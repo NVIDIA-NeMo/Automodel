@@ -87,6 +87,7 @@ from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
@@ -321,7 +322,7 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -329,6 +330,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     # Resolve dtype strings (e.g. "torch.bfloat16") to torch.dtype objects for
     # optimizers like TE FusedAdam that accept dtype kwargs.
@@ -338,8 +340,16 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             setattr(cfg_opt, attr, dtype_from_str(val))
 
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
+        # TP does not support foreach for torch optimizers. Do not add this kwarg
+        # to optimizer classes that do not declare it, such as TE FusedAdam.
+        target = getattr(cfg_opt, "_target_", None)
+        if isinstance(target, str):
+            target_name = target
+        else:
+            target_module = getattr(target, "__module__", "")
+            target_name = f"{target_module}.{getattr(target, '__qualname__', '')}"
+        if target_name.startswith("torch.optim.") or hasattr(cfg_opt, "foreach"):
+            cfg_opt.foreach = False
 
     optimizer = []
     has_dion_optimizer = is_dion_optimizer(cfg_opt)
@@ -359,6 +369,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             assert not has_dion_optimizer, "Dion optimizer does not support fully_shard_optimizer"
             tmp_optimizer = fully_shard_optimizer(part, tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="llm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -752,15 +770,22 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
     if cfg is None:
         return None
 
-    # Calculate total steps for the training run
+    # Calculate total steps for the training run.
+    # `step_scheduler.epoch_len` is already in optimizer-step units
+    # (microbatches // grad_acc_steps) and is None for IterableDataset, in which
+    # case `max_steps` governs the total step count.
     total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+    if step_scheduler.epoch_len is not None:
+        total_steps = total_epochs * step_scheduler.epoch_len
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+    else:
+        if step_scheduler.max_steps is None:
+            raise ValueError(
+                "build_lr_scheduler: dataloader has no __len__ (iterable dataset) and "
+                "step_scheduler.max_steps is not set. Set step_scheduler.max_steps in your config."
+            )
+        total_steps = step_scheduler.max_steps
 
     # Set defaults for scheduler parameters
     optimizer_param_schedulers = []
@@ -1019,7 +1044,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -1418,10 +1449,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                if mtp_per_depth_h is not None:
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
                         labels=labels,
                         model=model,
                         scaling_factor=out.mtp_loss_scaling_factor,

@@ -25,6 +25,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 @dataclass
 class MockStep3p5Config:
     """Mock configuration for Step3p5 model."""
+
     vocab_size: int = 128
     hidden_size: int = 64
     intermediate_size: int = 128
@@ -128,7 +129,7 @@ class TestStep3p5StateDictAdapterFromHF:
         )
 
     def test_router_bias_mapping(self, adapter, moe_config):
-        """Test that HF router_bias is mapped to native gate.bias."""
+        """Test that HF router_bias is mapped to native correction bias."""
         n_experts = moe_config.n_routed_experts
 
         router_bias = torch.randn(n_experts)
@@ -139,10 +140,10 @@ class TestStep3p5StateDictAdapterFromHF:
 
         native_state_dict = adapter.from_hf(hf_state_dict)
 
-        # HF router_bias should be mapped to gate.bias
-        assert "model.layers.0.moe.gate.bias" in native_state_dict
+        # HF router_bias should be mapped to e_score_correction_bias.
+        assert "model.layers.0.moe.gate.e_score_correction_bias" in native_state_dict
         torch.testing.assert_close(
-            native_state_dict["model.layers.0.moe.gate.bias"],
+            native_state_dict["model.layers.0.moe.gate.e_score_correction_bias"],
             router_bias,
         )
 
@@ -245,8 +246,16 @@ class TestStep3p5StateDictAdapterFromHF:
         assert "model.layers.1.moe.experts.down_projs" in native_state_dict
 
         # Verify shapes
-        assert native_state_dict["model.layers.0.moe.experts.gate_and_up_projs"].shape == (n_experts, dim, 2 * inter_dim)
-        assert native_state_dict["model.layers.1.moe.experts.gate_and_up_projs"].shape == (n_experts, dim, 2 * inter_dim)
+        assert native_state_dict["model.layers.0.moe.experts.gate_and_up_projs"].shape == (
+            n_experts,
+            dim,
+            2 * inter_dim,
+        )
+        assert native_state_dict["model.layers.1.moe.experts.gate_and_up_projs"].shape == (
+            n_experts,
+            dim,
+            2 * inter_dim,
+        )
 
 
 class TestStep3p5StateDictAdapterToHF:
@@ -309,6 +318,30 @@ class TestStep3p5StateDictAdapterToHF:
             gate_bias,
         )
 
+    def test_maps_e_score_correction_bias_to_router_bias(self, adapter, moe_config):
+        """Test that native correction bias is mapped to HF router_bias."""
+        n_experts = moe_config.n_routed_experts
+
+        correction_bias = torch.randn(n_experts)
+        native_state_dict = {
+            "model.layers.0.moe.gate.e_score_correction_bias": correction_bias,
+        }
+
+        hf_state_dict = adapter.to_hf(native_state_dict)
+
+        assert "model.layers.0.moe.router_bias" in hf_state_dict
+        torch.testing.assert_close(
+            hf_state_dict["model.layers.0.moe.router_bias"],
+            correction_bias,
+        )
+
+    def test_unmatched_e_score_correction_bias_falls_back_to_original_key(self, adapter):
+        tensor = torch.randn(4)
+
+        converted = adapter.convert_single_tensor_to_hf("prefix.moe.gate.e_score_correction_bias", tensor)
+
+        assert converted == [("prefix.moe.gate.e_score_correction_bias", tensor)]
+
 
 class TestStep3p5StateDictAdapterRoundtrip:
     def test_roundtrip_preserves_weights(self, adapter, moe_config):
@@ -366,7 +399,7 @@ class TestStep3p5StateDictAdapterRoundtrip:
 
         # HF -> Native
         native_state_dict = adapter.from_hf(hf_state_dict)
-        assert "model.layers.0.moe.gate.bias" in native_state_dict
+        assert "model.layers.0.moe.gate.e_score_correction_bias" in native_state_dict
 
         # Native -> HF
         recovered_hf = adapter.to_hf(native_state_dict)
