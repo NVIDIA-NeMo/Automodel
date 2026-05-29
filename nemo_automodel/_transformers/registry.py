@@ -173,6 +173,27 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
         ),
         (
+            "Qwen2_5OmniModel",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
+            "Qwen2_5OmniForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
             "Qwen3MoeForCausalLM",
             ("nemo_automodel.components.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
         ),
