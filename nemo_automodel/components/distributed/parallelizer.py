@@ -102,7 +102,7 @@ try:
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
     HAVE_MEGATRON_FSDP = True
-except ImportError:
+except (ImportError, FileNotFoundError, OSError):
     pass
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
