@@ -1,0 +1,206 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import torch
+
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.step3p7.configuration_step3p7 import Step3p7Config
+from nemo_automodel.components.models.step3p7.state_dict_adapter import Step3p7StateDictAdapter
+from nemo_automodel.components.moe.config import MoEConfig
+
+
+def _adapter(dtype=torch.float32, num_nextn_predict_layers=0, mtp_base_layer_idx=None):
+    text_config = {
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "moe_intermediate_size": 2,
+        "moe_num_experts": 3,
+        "moe_top_k": 1,
+        "num_hidden_layers": 1,
+        "num_nextn_predict_layers": num_nextn_predict_layers,
+        "vocab_size": 16,
+        "head_dim": 2,
+    }
+    if mtp_base_layer_idx is not None:
+        text_config["mtp_base_layer_idx"] = mtp_base_layer_idx
+
+    config = Step3p7Config(
+        text_config=text_config,
+    )
+    moe_config = MoEConfig(
+        dim=4,
+        inter_dim=8,
+        moe_inter_dim=2,
+        n_routed_experts=3,
+        n_shared_experts=0,
+        n_activated_experts=1,
+        n_expert_groups=0,
+        n_limited_groups=0,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        aux_loss_coeff=0.0,
+        norm_topk_prob=True,
+        router_bias=False,
+        expert_bias=False,
+        expert_activation="swiglu",
+        dtype=dtype,
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=True,
+    )
+    return Step3p7StateDictAdapter(config, moe_config, backend, dtype=dtype)
+
+
+def test_static_key_mapping_helpers_cover_all_prefixes():
+    assert Step3p7StateDictAdapter._is_text_key("model.layers.0.weight")
+    assert Step3p7StateDictAdapter._is_text_key("model.language_model.layers.0.weight")
+    assert Step3p7StateDictAdapter._is_text_key("language_model.layers.0.weight")
+    assert not Step3p7StateDictAdapter._is_text_key("vision_model.weight")
+
+    assert Step3p7StateDictAdapter._to_text_hf_key("model.language_model.layers.0.weight") == ("model.layers.0.weight")
+    assert Step3p7StateDictAdapter._to_text_hf_key("language_model.layers.0.weight") == "model.layers.0.weight"
+    assert Step3p7StateDictAdapter._to_text_hf_key("model.layers.0.weight") == "model.layers.0.weight"
+
+    assert Step3p7StateDictAdapter._to_native_text_key("model.layers.0.weight") == (
+        "model.language_model.layers.0.weight"
+    )
+    assert Step3p7StateDictAdapter._to_native_text_key("language_model.layers.0.weight") == (
+        "model.language_model.layers.0.weight"
+    )
+    assert Step3p7StateDictAdapter._to_native_text_key("layers.0.weight") == ("model.language_model.layers.0.weight")
+
+    assert Step3p7StateDictAdapter._map_non_text_from_hf("foo.weight_scale_inv") is None
+    assert Step3p7StateDictAdapter._map_non_text_from_hf("vision_model.conv.weight") == (
+        "model.vision_model.conv.weight"
+    )
+    assert Step3p7StateDictAdapter._map_non_text_from_hf("vit_large_projector.weight") == (
+        "model.vit_large_projector.weight"
+    )
+    assert Step3p7StateDictAdapter._map_non_text_from_hf("other.weight") == "other.weight"
+
+    assert Step3p7StateDictAdapter._map_non_text_to_hf("model.vision_model.conv.weight") == ("vision_model.conv.weight")
+    assert Step3p7StateDictAdapter._map_non_text_to_hf("model.vit_large_projector.weight") == (
+        "vit_large_projector.weight"
+    )
+    assert Step3p7StateDictAdapter._map_non_text_to_hf("other.weight") == "other.weight"
+
+
+def test_from_hf_maps_text_vision_projector_router_bias_and_ignores_fp8_scale():
+    adapter = _adapter(dtype=torch.float32)
+    gate = torch.arange(3 * 2 * 4, dtype=torch.float32).reshape(3, 2, 4)
+    up = gate + 100
+    router_bias = torch.tensor([1.0, 2.0, 3.0])
+    vision_weight = torch.randn(2, 2)
+    projector_weight = torch.randn(4, 4)
+
+    native = adapter.from_hf(
+        {
+            "model.layers.0.moe.gate_proj.weight": gate,
+            "model.layers.0.moe.up_proj.weight": up,
+            "model.layers.0.moe.router_bias": router_bias,
+            "model.norm.weight": torch.ones(4),
+            "language_model.embed_tokens.weight": torch.ones(16, 4),
+            "vision_model.conv.weight": vision_weight,
+            "vit_large_projector.weight": projector_weight,
+            "vit_large_projector.weight_scale_inv": torch.ones(1),
+        }
+    )
+
+    assert "model.language_model.layers.0.moe.experts.gate_and_up_projs" in native
+    assert "model.language_model.layers.0.moe.gate.e_score_correction_bias" in native
+    torch.testing.assert_close(
+        native["model.language_model.layers.0.moe.gate.e_score_correction_bias"],
+        router_bias,
+    )
+    assert "model.language_model.norm.weight" in native
+    assert "model.language_model.embed_tokens.weight" in native
+    assert native["model.vision_model.conv.weight"] is vision_weight
+    assert native["model.vit_large_projector.weight"] is projector_weight
+    assert all("weight_scale_inv" not in key for key in native)
+
+
+def test_to_hf_maps_text_and_non_text_keys_with_exclude_filter():
+    adapter = _adapter(dtype=torch.float32)
+    native = {
+        "model.language_model.layers.0.moe.gate.e_score_correction_bias": torch.tensor([1.0, 2.0, 3.0]),
+        "model.vision_model.conv.weight": torch.randn(2, 2),
+        "model.vit_large_projector.weight": torch.randn(4, 4),
+        "other.weight": torch.randn(1),
+    }
+
+    hf = adapter.to_hf(native, exclude_key_regex=r"vision_model\..*")
+
+    assert "model.layers.0.moe.router_bias" in hf
+    assert "vision_model.conv.weight" not in hf
+    assert "vit_large_projector.weight" in hf
+    assert "other.weight" in hf
+
+
+def test_from_hf_maps_step37_mtp_layers_in_step37_adapter():
+    adapter = _adapter(dtype=torch.float32, num_nextn_predict_layers=2, mtp_base_layer_idx=1)
+    base_norm = torch.ones(4)
+    mtp_enorm = torch.randn(4)
+    mtp_head = torch.randn(16, 4)
+
+    native = adapter.from_hf(
+        {
+            "model.layers.0.input_layernorm.weight": base_norm,
+            "model.layers.1.enorm.weight": mtp_enorm,
+            "model.layers.2.transformer.shared_head.output.weight": mtp_head,
+        }
+    )
+
+    assert native["model.language_model.layers.0.input_layernorm.weight"] is base_norm
+    assert native["mtp.layers.0.enorm.weight"] is mtp_enorm
+    assert native["mtp.layers.1.transformer.shared_head.output.weight"] is mtp_head
+
+
+def test_to_hf_maps_step37_mtp_layers_in_step37_adapter():
+    adapter = _adapter(dtype=torch.float32, num_nextn_predict_layers=2, mtp_base_layer_idx=1)
+    mtp_enorm = torch.randn(4)
+    mtp_head = torch.randn(16, 4)
+
+    hf = adapter.to_hf(
+        {
+            "mtp.layers.0.enorm.weight": mtp_enorm,
+            "mtp.layers.1.transformer.shared_head.output.weight": mtp_head,
+        }
+    )
+
+    assert hf["model.layers.1.enorm.weight"] is mtp_enorm
+    assert hf["model.layers.2.transformer.shared_head.output.weight"] is mtp_head
+
+
+def test_convert_single_tensor_to_hf_passthrough_and_exclude():
+    adapter = _adapter(dtype=torch.float32)
+    tensor = torch.ones(1)
+
+    assert adapter.convert_single_tensor_to_hf("model.vision_model.weight", tensor) == [("vision_model.weight", tensor)]
+    assert (
+        adapter.convert_single_tensor_to_hf(
+            "model.vision_model.weight",
+            tensor,
+            exclude_key_regex=r"vision_model\..*",
+        )
+        == []
+    )

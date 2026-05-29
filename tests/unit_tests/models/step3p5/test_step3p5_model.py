@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not 
 @dataclass
 class MockStep3p5Config:
     """Mock configuration for Step3p5 model."""
+
     vocab_size: int = 128
     hidden_size: int = 64
     intermediate_size: int = 128
@@ -245,7 +246,9 @@ class TestStep3p5Model:
         freqs_mock = MagicMock(return_value=(1.0, torch.ones(config.head_dim // 2)))
 
         with patch.object(model.rotary_emb, "_compute_concentration_and_inv_freq", freqs_mock):
-            with patch.object(Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq, config.hidden_size)) as mock_block:
+            with patch.object(
+                Block, "forward", side_effect=lambda *_, **__: torch.randn(batch, seq, config.hidden_size)
+            ) as mock_block:
                 out = model(input_ids)
 
         assert out.shape == (batch, seq, config.hidden_size)
@@ -265,7 +268,9 @@ class TestStep3p5ForCausalLM:
         batch, seq = 2, 6
         input_ids = torch.randint(0, config.vocab_size, (batch, seq))
 
-        with patch.object(model.model, "forward", return_value=torch.randn(batch, seq, config.hidden_size).to(torch.bfloat16)):
+        with patch.object(
+            model.model, "forward", return_value=torch.randn(batch, seq, config.hidden_size).to(torch.bfloat16)
+        ):
             logits = model(input_ids)
 
         assert logits.shape == (batch, seq, config.vocab_size)
@@ -288,10 +293,24 @@ class TestStep3p5ForCausalLM:
 
         config.need_fp32_gate = True
         config.moe_layers_enum = "1"  # Layer 1 is MoE
-        model = Step3p5ForCausalLM(config, backend=sdpa_backend)
+        Step3p5ForCausalLM(config, backend=sdpa_backend)
 
         # Check that backend.gate_precision was set
         assert sdpa_backend.gate_precision == torch.float32
+
+    def test_router_correction_bias_stays_fp32_after_dtype_cast(self, config, sdpa_backend):
+        config.use_moe_router_bias = True
+        config.moe_layers_enum = "1"
+        model = Step3p5ForCausalLM(config, backend=sdpa_backend)
+
+        gate = model.model.layers["1"].moe.gate
+        assert gate.e_score_correction_bias.dtype == torch.float32
+        gate.e_score_correction_bias_master = gate.e_score_correction_bias.clone().to(torch.bfloat16)
+
+        model.to(torch.bfloat16)
+
+        assert gate.e_score_correction_bias.dtype == torch.float32
+        assert gate.e_score_correction_bias_master.dtype == torch.float32
 
     def test_config_num_experts_set_from_moe_num_experts(self, config, sdpa_backend):
         """Test that model.config.num_experts is set from config.moe_num_experts.
