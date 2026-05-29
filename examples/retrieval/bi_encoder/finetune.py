@@ -19,7 +19,7 @@ import warnings
 warnings.warn(
     "Running recipes via examples/ scripts is deprecated. "
     "Use: automodel <config.yaml> [--nproc-per-node N]\n"
-    "See BREAKING_CHANGES.md for details.",
+    "See docs/BREAKING_CHANGES.md for details.",
     DeprecationWarning,
     stacklevel=2,
 )

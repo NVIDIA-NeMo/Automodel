@@ -1,6 +1,6 @@
 # Mistral-Small-4
 
-[Mistral-Small-4-119B](https://huggingface.co/mistralai/Mistral-Small-4-119B-Instruct-2512) is Mistral AI's multimodal MoE model supporting both text and image inputs at scale.
+[Mistral-Small-4-119B](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) is Mistral AI's multimodal MoE model supporting both text and image inputs at scale.
 
 :::{card}
 | | |
@@ -13,7 +13,7 @@
 
 ## Available Models
 
-- **Mistral-Small-4-119B-Instruct-2512**
+- **Mistral-Small-4-119B-2603**
 
 ## Architecture
 
@@ -23,7 +23,7 @@
 
 | Model | HF ID |
 |---|---|
-| Mistral-Small-4 119B Instruct | [`mistralai/Mistral-Small-4-119B-Instruct-2512`](https://huggingface.co/mistralai/Mistral-Small-4-119B-Instruct-2512) |
+| Mistral-Small-4 119B | [`mistralai/Mistral-Small-4-119B-2603`](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603) |
 
 ## Example Recipes
 
@@ -88,4 +88,4 @@ See the [VLM Fine-Tuning Guide](../../../guides/omni/gemma3-3n.md).
 
 ## Hugging Face Model Cards
 
-- [mistralai/Mistral-Small-4-119B-Instruct-2512](https://huggingface.co/mistralai/Mistral-Small-4-119B-Instruct-2512)
+- [mistralai/Mistral-Small-4-119B-2603](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603)

@@ -174,6 +174,8 @@ def restore_dataset(ds_name: str, repo_id: str, local_base_path: str) -> None:
 
 
 def main():
+    """Download and restore Embed Nemotron datasets from Hugging Face."""
+
     parser = argparse.ArgumentParser(
         description="Download and restore embed-nemotron-dataset-v1 datasets from HuggingFace"
     )

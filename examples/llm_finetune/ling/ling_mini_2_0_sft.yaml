@@ -1,0 +1,98 @@
+
+# ------------------------------------------------------------------------------------------------
+# Ling-mini-2.0 (BailingMoeV2: 16B total / 1.43B activated) FULL SFT on HellaSwag.
+# ------------------------------------------------------------------------------------------------
+# Companion to ling_mini_2_0_hellaswag.yaml (LoRA).  Removes the `peft:` block so
+# every parameter is trainable.  Recommended hardware: 8x H100 80GB with FSDP2
+# + EP=8 + activation_checkpointing (Adam state for 16B params in fp32 is
+# ~190GB total, ~24GB/rank when sharded across 8 GPUs).  Reduce
+# local_batch_size first if running on fewer GPUs.
+# ------------------------------------------------------------------------------------------------
+#
+# To run:
+#   automodel examples/llm_finetune/ling/ling_mini_2_0_sft.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 8
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 2
+  max_steps: 1000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: inclusionAI/Ling-mini-2.0
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/ling_mini_2_0_sft
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+  num_workers: 4
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 128
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1e-8
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 2.0e-6
