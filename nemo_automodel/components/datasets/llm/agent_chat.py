@@ -95,7 +95,12 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
         src_role = turn.get("from")
         if src_role not in _SHAREGPT_ROLE_MAP:
             raise ValueError(f"Unsupported sharegpt role: {src_role!r}")
-        out.append({"role": _SHAREGPT_ROLE_MAP[src_role], "content": turn.get("value", "")})
+        chatml_turn = {"role": _SHAREGPT_ROLE_MAP[src_role], "content": turn.get("value", "")}
+        # Carry an explicit reasoning/thinking field through if the export
+        # stores it alongside the turn (e.g. ``reasoning_content``).
+        if turn.get("reasoning_content"):
+            chatml_turn["reasoning_content"] = turn["reasoning_content"]
+        out.append(chatml_turn)
     return out
 
 
@@ -181,7 +186,17 @@ def _convert_messages(
             content = messages[i].get("content", "")
             if not isinstance(content, str):
                 content = "" if content is None else str(content)
-            out.append({"role": role, "content": content})
+            msg: Dict[str, Any] = {"role": role, "content": content}
+            # Preserve an assistant turn's reasoning/thinking trace so it
+            # survives into the rendered chat (chat templates that reference
+            # ``reasoning_content`` will emit it; otherwise it is dropped with
+            # a warning by ``format_chat_template``). Carried through here so a
+            # following tool_call group can merge onto this same turn.
+            if role == "assistant":
+                reasoning = messages[i].get("reasoning_content")
+                if reasoning:
+                    msg["reasoning_content"] = reasoning if isinstance(reasoning, str) else str(reasoning)
+            out.append(msg)
             i += 1
 
     return out
@@ -195,6 +210,7 @@ def _format_example(
     seq_length: Optional[int] = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
+    mask_reasoning_content: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
@@ -229,6 +245,7 @@ def _format_example(
         padding=padding,
         truncation=truncation,
         answer_only_loss_mask=True,
+        mask_reasoning_content=mask_reasoning_content,
     )
 
 
@@ -242,6 +259,7 @@ def make_agent_chat_dataset(
     limit_dataset_samples: Optional[int] = None,
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
+    mask_reasoning_content: bool = False,
 ) -> LazyMappedDataset:
     """Load a multi-turn function-calling SFT dataset.
 
@@ -259,6 +277,11 @@ def make_agent_chat_dataset(
         limit_dataset_samples: If set, keep only the first N examples.
         padding: Padding strategy forwarded to the tokenizer.
         truncation: Truncation strategy forwarded to the tokenizer.
+        mask_reasoning_content: If True, exclude assistant ``reasoning_content``
+            (thinking) tokens from the loss while still rendering them into the
+            prompt. Requires a chat template that emits ``reasoning_content``.
+            Defaults to False, which trains on reasoning tokens like any other
+            assistant content.
 
     Returns:
         A ``LazyMappedDataset`` yielding dicts with ``input_ids``, ``labels``
@@ -293,5 +316,6 @@ def make_agent_chat_dataset(
         seq_length,
         padding,
         truncation,
+        mask_reasoning_content,
     )
     return LazyMappedDataset(dataset, fmt_fn)
