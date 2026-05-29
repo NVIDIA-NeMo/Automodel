@@ -121,6 +121,7 @@ CI_KEY_TO_VAR = {
     "local_batch_size": "LOCAL_BATCH_SIZE",
     "recipe_owner": "RECIPE_OWNER",
     "nproc_per_node": "CONFIG_NPROC_PER_NODE",
+    "cluster_tag": "RESERVED_CLUSTER_TAG",
 }
 
 
@@ -176,6 +177,8 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
             job["variables"][ci_var] = DQ(str(value))
         elif ci_var == "NODE_MULTIPLIER":
             job["variables"][ci_var] = str(value).lower()
+        elif ci_var == "RESERVED_CLUSTER_TAG":
+            job["variables"][ci_var] = f"/{value}/"
         else:
             job["variables"][ci_var] = value
 
