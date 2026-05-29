@@ -72,7 +72,7 @@ def contrastive_scores_and_labels(
     return qk, labels
 
 
-def colbert_scores_and_labels(
+def maxsim_scores_and_labels(
     query: torch.Tensor,
     key: torch.Tensor,
     current_train_n_passages: int,
@@ -95,7 +95,7 @@ def colbert_scores_and_labels(
     return scores, labels
 
 
-def distributed_colbert_scores_and_labels(
+def distributed_maxsim_scores_and_labels(
     query: torch.Tensor,
     key: torch.Tensor,
     current_train_n_passages: int,
@@ -108,9 +108,20 @@ def distributed_colbert_scores_and_labels(
     )
     assert key_attention_mask.shape == key.shape[:2], "{} != {}".format(key_attention_mask.shape, key.shape[:2])
 
-    token_scores = torch.einsum("bqd,kpd->bkqp", query, key)
-    token_scores.masked_fill_(~key_attention_mask[None, :, None, :].bool(), torch.finfo(token_scores.dtype).min)
-    scores = token_scores.max(dim=3).values.sum(dim=2)
+    global_batch_size = key.shape[0] // current_train_n_passages
+    key = key.reshape(global_batch_size, current_train_n_passages, key.shape[1], key.shape[2])
+    key_attention_mask = key_attention_mask.reshape(global_batch_size, current_train_n_passages, key.shape[2])
+
+    scores_by_passage = []
+    for passage_idx in range(current_train_n_passages):
+        token_scores = torch.einsum("bqd,gpd->bgqp", query, key[:, passage_idx])
+        token_scores.masked_fill_(
+            ~key_attention_mask[None, :, passage_idx, None, :].bool(),
+            torch.finfo(token_scores.dtype).min,
+        )
+        scores_by_passage.append(token_scores.max(dim=3).values.sum(dim=2))
+
+    scores = torch.stack(scores_by_passage, dim=2).reshape(query.shape[0], key.shape[0] * current_train_n_passages)
     labels = torch.arange(query.shape[0], dtype=torch.long, device=query.device) + rank * query.shape[0]
     labels = labels * current_train_n_passages
     return scores, labels
@@ -409,7 +420,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     assert (
                         all_p.shape[0] == expected_p
                     ), f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                    scores, labels = distributed_colbert_scores_and_labels(
+                    scores, labels = distributed_maxsim_scores_and_labels(
                         q_reps,
                         all_p,
                         n_passages,
@@ -438,7 +449,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     )
             else:
                 if getattr(model, "pooling", None) == "colbert":
-                    scores, labels = colbert_scores_and_labels(
+                    scores, labels = maxsim_scores_and_labels(
                         q_reps,
                         p_reps,
                         n_passages,
@@ -534,7 +545,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     p_reps = model(passage)
 
                     if getattr(model, "pooling", None) == "colbert":
-                        scores, labels = colbert_scores_and_labels(
+                        scores, labels = maxsim_scores_and_labels(
                             q_reps,
                             p_reps,
                             self.val_n_passages,

@@ -17,11 +17,12 @@ from types import SimpleNamespace
 import torch
 
 import nemo_automodel._transformers.auto_model as am
+import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
-    colbert_scores_and_labels,
-    distributed_colbert_scores_and_labels,
+    distributed_maxsim_scores_and_labels,
+    maxsim_scores_and_labels,
 )
 
 
@@ -203,7 +204,7 @@ def test_cross_encoder_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, CrossEncoderModel, am.NeMoAutoModelCrossEncoder)
 
 
-def test_colbert_scores_and_labels_masks_padding_before_maxsim():
+def test_maxsim_scores_and_labels_masks_padding_before_maxsim():
     query = torch.tensor(
         [
             [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
@@ -222,7 +223,7 @@ def test_colbert_scores_and_labels_masks_padding_before_maxsim():
     )
     key_attention_mask = torch.tensor([[1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0], [1, 1, 0]])
 
-    scores, labels = colbert_scores_and_labels(
+    scores, labels = maxsim_scores_and_labels(
         query,
         key,
         current_train_n_passages=3,
@@ -233,7 +234,7 @@ def test_colbert_scores_and_labels_masks_padding_before_maxsim():
     assert torch.equal(labels, torch.tensor([0, 0]))
 
 
-def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
+def test_distributed_maxsim_scores_and_labels_uses_global_positive_labels():
     query = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
     key = torch.tensor(
         [
@@ -249,7 +250,7 @@ def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
     )
     key_attention_mask = torch.ones(key.shape[:2], dtype=torch.long)
 
-    scores, labels = distributed_colbert_scores_and_labels(
+    scores, labels = distributed_maxsim_scores_and_labels(
         query,
         key,
         current_train_n_passages=2,
@@ -259,6 +260,49 @@ def test_distributed_colbert_scores_and_labels_uses_global_positive_labels():
 
     assert scores.shape == (2, 8)
     assert torch.equal(labels, torch.tensor([4, 6]))
+
+
+def test_distributed_maxsim_scores_and_labels_matches_all_at_once_scoring():
+    torch.manual_seed(0)
+    query = torch.randn(2, 3, 4, requires_grad=True)
+    key = torch.randn(6, 5, 4, requires_grad=True)
+    key_attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0],
+            [1, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0],
+            [1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    query_ref = query.detach().clone().requires_grad_()
+    key_ref = key.detach().clone().requires_grad_()
+
+    scores, labels = distributed_maxsim_scores_and_labels(
+        query,
+        key,
+        current_train_n_passages=2,
+        key_attention_mask=key_attention_mask,
+        rank=1,
+    )
+
+    ref_token_scores = torch.einsum("bqd,kpd->bkqp", query_ref, key_ref)
+    ref_token_scores.masked_fill_(
+        ~key_attention_mask[None, :, None, :].bool(),
+        torch.finfo(ref_token_scores.dtype).min,
+    )
+    ref_scores = ref_token_scores.max(dim=3).values.sum(dim=2)
+    ref_labels = torch.tensor([4, 6])
+
+    assert torch.allclose(scores, ref_scores)
+    assert torch.equal(labels, ref_labels)
+
+    scores.sum().backward()
+    ref_scores.sum().backward()
+    assert torch.allclose(query.grad, query_ref.grad)
+    assert torch.allclose(key.grad, key_ref.grad)
 
 
 def test_forward_backward_step_supports_local_colbert_pooling():
@@ -294,3 +338,116 @@ def test_forward_backward_step_supports_local_colbert_pooling():
     assert len(loss_buffer) == 1
     assert torch.isfinite(loss_buffer[0])
     assert recipe.model_parts[0].scale.grad is not None
+
+
+def test_validation_epoch_supports_colbert_pooling():
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.model_parts = [_ToyColbertBiEncoder()]
+    recipe.temperature = 1.0
+    recipe.val_n_passages = 2
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+
+    val_dataloader = [
+        {
+            "q_input_ids": torch.tensor(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[1.0, 1.0], [0.0, 0.0]],
+                ]
+            ),
+            "q_attention_mask": torch.tensor([[1, 1], [1, 0]]),
+            "d_input_ids": torch.tensor(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[0.0, 1.0], [0.0, 0.0]],
+                    [[1.0, 0.0], [0.0, 0.0]],
+                    [[0.0, 1.0], [1.0, 1.0]],
+                ]
+            ),
+            "d_attention_mask": torch.tensor([[1, 1], [1, 0], [1, 0], [1, 1]]),
+        }
+    ]
+
+    metrics = recipe._run_validation_epoch(val_dataloader)
+
+    assert metrics.step == 3
+    assert metrics.epoch == 1
+    assert torch.isfinite(torch.tensor(metrics.metrics["val_loss"]))
+    assert 0.0 <= metrics.metrics["val_acc1"] <= 1.0
+    assert 0.0 <= metrics.metrics["val_mrr"] <= 1.0
+    assert recipe.model_parts[0].scale.grad is None
+
+
+def test_forward_backward_step_supports_distributed_colbert_inbatch_negatives(monkeypatch):
+    """Exercise the trainer branch that gathers ColBERT token embeddings across ranks."""
+    import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
+
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    model = _ToyColbertBiEncoder()
+    model.do_distributed_inbatch_negative = True
+    recipe.model_parts = [model]
+    recipe.temperature = 1.0
+    recipe.train_n_passages = 2
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    gather_with_padding_calls = []
+
+    def fake_gather_with_dim1_padding(tensor, padding_value=0):
+        gather_with_padding_calls.append((tuple(tensor.shape), padding_value))
+        return torch.cat([tensor.detach().clone(), tensor], dim=0)
+
+    def fake_gather_tensor(tensor):
+        remote_doc_ids = torch.tensor([500, 999, 600, 998], dtype=tensor.dtype, device=tensor.device)
+        return torch.cat([remote_doc_ids, tensor], dim=0)
+
+    captured = {}
+
+    def fake_cross_entropy(scores, labels):
+        captured["scores"] = scores.detach().clone()
+        captured["labels"] = labels.detach().clone()
+        return -scores.gather(1, labels.unsqueeze(1)).mean()
+
+    monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor_with_dim1_padding", fake_gather_with_dim1_padding)
+    monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor", fake_gather_tensor)
+    monkeypatch.setattr(tbe.F, "cross_entropy", fake_cross_entropy)
+
+    batch = {
+        "q_input_ids": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.0, 1.0], [1.0, 0.0]],
+            ]
+        ),
+        "q_attention_mask": torch.tensor([[1, 1], [1, 1]]),
+        "d_input_ids": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 0.0]],
+                [[0.0, 1.0], [1.0, 0.0]],
+                [[1.0, 0.0], [0.0, 0.0]],
+            ]
+        ),
+        "d_attention_mask": torch.tensor([[1, 1], [1, 0], [1, 1], [1, 0]]),
+        "passage_doc_ids": torch.tensor([500, 501, 600, 601], dtype=torch.long),
+    }
+    loss_buffer = []
+
+    recipe._forward_backward_step(0, batch, loss_buffer=loss_buffer, num_batches=1, is_train=True)
+
+    assert gather_with_padding_calls == [((4, 2, 2), 0), ((4, 2), False)]
+    assert torch.equal(captured["labels"], torch.tensor([4, 6]))
+    assert captured["scores"].shape == (2, 8)
+    assert captured["scores"][0, 0].item() == torch.finfo(captured["scores"].dtype).min
+    assert captured["scores"][1, 2].item() == torch.finfo(captured["scores"].dtype).min
+    assert captured["scores"][0, 4].item() > torch.finfo(captured["scores"].dtype).min
+    assert captured["scores"][1, 6].item() > torch.finfo(captured["scores"].dtype).min
+    assert len(loss_buffer) == 1
+    assert torch.isfinite(loss_buffer[0])
+    assert model.scale.grad is not None

@@ -24,25 +24,34 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_func
+
+
+def _all_gather_tensor(t: torch.Tensor) -> torch.Tensor:
+    """All-gather ``t`` along dim 0, preserving autograd only when needed."""
+    if t.requires_grad:
+        return torch.cat(dist_nn_func.all_gather(t), dim=0)
+
+    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, t)
+    return torch.cat(gathered, dim=0)
 
 
 def dist_gather_tensor(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """All-gather ``t`` along dim 0 across the default process group.
 
-    The local-rank slice is replaced with the original ``t`` so that gradients
-    flow back only to the local portion of the gathered tensor (other ranks'
-    slices are detached). Returns ``t`` unchanged when distributed is not
-    available, not initialized, or world size is 1.
+    Tensors that require gradients use an autograd-aware gather so distributed
+    in-batch-negative losses can send passage gradients back to the owning rank.
+    Non-gradient tensors, such as masks or IDs, use a regular detached gather.
+    Returns ``t`` unchanged when distributed is not available, not initialized,
+    or world size is 1.
     """
     if t is None:
         return None
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
         return t
     t = t.contiguous()
-    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, t)
-    gathered[dist.get_rank()] = t
-    return torch.cat(gathered, dim=0)
+    return _all_gather_tensor(t)
 
 
 def dist_gather_tensor_with_dim1_padding(
@@ -59,18 +68,12 @@ def dist_gather_tensor_with_dim1_padding(
     dist.all_gather(shapes, local_shape)
     max_dim1 = max(int(shape[1].item()) for shape in shapes)
     if t.shape[1] < max_dim1:
-        padded_shape = list(t.shape)
-        padded_shape[1] = max_dim1
-        padded = t.new_full(padded_shape, padding_value)
-        slices = [slice(None)] * t.ndim
-        slices[1] = slice(0, t.shape[1])
-        padded[tuple(slices)] = t
-        t = padded
+        pad_shape = list(t.shape)
+        pad_shape[1] = max_dim1 - t.shape[1]
+        padding = t.new_full(pad_shape, padding_value)
+        t = torch.cat([t, padding], dim=1)
     t = t.contiguous()
-    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, t)
-    gathered[dist.get_rank()] = t
-    return torch.cat(gathered, dim=0)
+    return _all_gather_tensor(t)
 
 
 def mask_gathered_passages_same_doc_as_positive(
