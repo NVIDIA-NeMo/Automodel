@@ -6,7 +6,7 @@
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text / Video-Text-to-Text |
-| **Architecture** | 198B total / 13B active MoE VLM |
+| **Architecture** | `Step3p7ForConditionalGeneration` — 198B total / 13B active MoE VLM |
 | **Language Module** | Step-3.5-Flash-derived backbone, 45 layers, 288 experts, top-8 routing |
 | **Vision Module** | 1.8B ViT, 47 layers, 728x728 image size |
 | **Context Window** | 256k tokens |
@@ -33,7 +33,7 @@ Step-3.7-Flash is positioned as a multimodal foundation model for agents and age
 
 ## Available Models
 
-- **Step-3.7-Flash**
+- **Step-3.7-Flash** — registered as `Step3p7ForConditionalGeneration`, with the checkpoint-facing alias `Step3p6ForConditionalGeneration` mapping to the same model class.
 
 ## Example HF Models
 

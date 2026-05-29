@@ -370,6 +370,7 @@ class _FakePPModel:
         self.parts = [stage0]
         self.pp_batch_size = 4
         self.pp_microbatch_size = 2
+        self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
 
 
 class _StageWithCPPrepare:
