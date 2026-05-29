@@ -112,9 +112,8 @@ class WanProcessor(BaseVideoProcessor):
                 - text_encoder: UMT5EncoderModel
                 - tokenizer: AutoTokenizer
         """
-        from transformers import AutoTokenizer, UMT5EncoderModel
-
         from diffusers import AutoencoderKLWan
+        from transformers import AutoTokenizer, UMT5EncoderModel
 
         dtype = torch.float16 if "cuda" in device else torch.float32
         # UMT5 requires bfloat16 (float16 causes overflow/zeros in attention and layer norm)
