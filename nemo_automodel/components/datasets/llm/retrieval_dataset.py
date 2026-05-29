@@ -61,6 +61,31 @@ class TextQADataset(AbstractDataset):
         return sorted(list(self.docid2idx.keys()))
 
 
+class ColPaliDataset(AbstractDataset):
+    """Load ColPali corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path)["train"]
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["image_filename"]):
+            docid2idx[str(docid)] = idx
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        doc = self.data[self.docid2idx[id]]
+        example["image"] = doc["image"]
+        if "nr_ocr" in doc:
+            example["nr_ocr"] = doc["nr_ocr"]
+        if "complex_ocr" in doc:
+            example["complex_ocr"] = doc["complex_ocr"]
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
 class HFCorpusDataset(AbstractDataset):
     """Wraps an already-loaded HuggingFace Dataset as a corpus (in-memory, no local Parquet)."""
 
@@ -80,6 +105,7 @@ class HFCorpusDataset(AbstractDataset):
 
 DATASETS = {
     "TextQADataset": TextQADataset,
+    "ColPaliDataset": ColPaliDataset,
 }
 
 
