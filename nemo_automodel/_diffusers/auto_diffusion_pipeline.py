@@ -262,12 +262,16 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
             tp_plan=args.get("tp_plan", None),
             patch_is_packed_sequence=args.get("patch_is_packed_sequence", False),
             offload_policy=args.get("offload_policy", None),
+            autocast_dtype=args.get("autocast_dtype", None),
             defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
             enable_async_tensor_parallel=args.get("enable_async_tensor_parallel", False),
             enable_compile=args.get("enable_compile", False),
             enable_fsdp2_prefetch=args.get("enable_fsdp2_prefetch", False),
             fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
             fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
+            fsdp2_no_reshard_last_units=args.get("fsdp2_no_reshard_last_units", 1),
+            fsdp2_unit_group_size=args.get("fsdp2_unit_group_size", 1),
+            activation_checkpointing_skip_last_units=args.get("activation_checkpointing_skip_last_units", 0),
         )
 
         world_size = args.get("world_size") or torch.distributed.get_world_size()

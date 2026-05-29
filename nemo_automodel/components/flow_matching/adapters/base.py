@@ -21,7 +21,7 @@ dataclass used to pass data between the pipeline and adapters.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -100,6 +100,25 @@ class ModelAdapter(ABC):
 
         pipeline = FlowMatchingPipelineV2(model_adapter=MyCustomAdapter())
     """
+
+    def attach_pipeline(self, pipe: Any, device: torch.device, dtype: torch.dtype) -> None:
+        """Attach the loaded diffusion pipeline when an adapter needs frozen components."""
+        del pipe, device, dtype
+
+    def prepare_latents(
+        self,
+        batch: Dict[str, Any],
+        device: torch.device,
+        dtype: torch.dtype,
+        global_step: int,
+    ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
+        """Optionally build clean latents online before the generic flow step.
+
+        Adapters that train from cached latents should return ``None``. Adapters
+        that need online VAE/text encoding can return ``(latents, batch_updates)``.
+        """
+        del batch, device, dtype, global_step
+        return None
 
     @abstractmethod
     def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:

@@ -20,6 +20,7 @@ _LAZY_ATTRS = {
     # Dataset classes
     "BaseMultiresolutionDataset": (".base_dataset", "BaseMultiresolutionDataset"),
     "TextToImageDataset": (".text_to_image_dataset", "TextToImageDataset"),
+    "QwenImageEditDataset": (".qwen_image_edit_dataset", "QwenImageEditDataset"),
     "TextToVideoDataset": (".text_to_video_dataset", "TextToVideoDataset"),
     "MetaFilesDataset": (".meta_files_dataset", "MetaFilesDataset"),
     # Utilities
@@ -28,6 +29,7 @@ _LAZY_ATTRS = {
     "VIDEO_OPTIONAL_FIELDS": (".text_to_video_dataset", "VIDEO_OPTIONAL_FIELDS"),
     # Collate functions
     "collate_fn_text_to_image": (".collate_fns", "collate_fn_text_to_image"),
+    "collate_fn_qwen_image_edit": (".collate_fns", "collate_fn_qwen_image_edit"),
     "collate_fn_video": (".collate_fns", "collate_fn_video"),
     "collate_fn_production": (".collate_fns", "collate_fn_production"),
     # Dataloader builders
@@ -35,6 +37,7 @@ _LAZY_ATTRS = {
         ".collate_fns",
         "build_text_to_image_multiresolution_dataloader",
     ),
+    "build_qwen_image_edit_dataloader": (".collate_fns", "build_qwen_image_edit_dataloader"),
     "build_video_multiresolution_dataloader": (".collate_fns", "build_video_multiresolution_dataloader"),
     # Legacy (non-multiresolution)
     "build_dataloader": (".meta_files_dataset", "build_dataloader"),

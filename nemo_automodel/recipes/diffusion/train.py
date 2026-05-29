@@ -29,6 +29,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -147,7 +148,7 @@ def _build_optimizer(
 
 def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:
     """Return the number of samples in one local diffusion micro-batch."""
-    for key in ("video_latents", "image_latents", "latents", "text_embeddings", "text_embeddings_2"):
+    for key in ("video_latents", "image_latents", "target_image", "latents", "text_embeddings", "text_embeddings_2"):
         value = batch.get(key)
         if value is not None and hasattr(value, "shape") and len(value.shape) > 0:
             return int(value.shape[0])
@@ -184,6 +185,11 @@ def _calculate_throughput_metrics(
         "log_window_steps": float(optimizer_steps),
         "log_window_samples": float(global_samples),
     }
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    """Divide two floats, returning zero for an empty denominator."""
+    return numerator / denominator if denominator > 0 else 0.0
 
 
 def build_model_and_optimizer(
@@ -286,6 +292,12 @@ def build_model_and_optimizer(
                 )
             dp_size = world_size // denom
 
+        reduce_dtype = dtype_from_str(fsdp_cfg.get("reduce_dtype", None), default=torch.float32)
+        output_dtype = dtype_from_str(fsdp_cfg.get("output_dtype", None), default=compute_dtype)
+        autocast_dtype = fsdp_cfg.get("autocast_dtype", None)
+        if autocast_dtype is not None:
+            autocast_dtype = dtype_from_str(autocast_dtype, default=compute_dtype)
+
         manager_args: Dict[str, Any] = {
             "_manager_type": "fsdp2",
             "dp_size": dp_size,
@@ -301,15 +313,23 @@ def build_model_and_optimizer(
             "patch_is_packed_sequence": fsdp_cfg.get("patch_is_packed_sequence", False),
             "activation_checkpointing": fsdp_cfg.get("activation_checkpointing", True),
             "defer_fsdp_grad_sync": fsdp_cfg.get("defer_fsdp_grad_sync", True),
+            "autocast_dtype": autocast_dtype,
             "enable_async_tensor_parallel": fsdp_cfg.get("enable_async_tensor_parallel", False),
             "enable_compile": fsdp_cfg.get("enable_compile", False),
             "enable_fsdp2_prefetch": fsdp_cfg.get("enable_fsdp2_prefetch", True),
             "fsdp2_backward_prefetch_depth": fsdp_cfg.get("fsdp2_backward_prefetch_depth", 2),
             "fsdp2_forward_prefetch_depth": fsdp_cfg.get("fsdp2_forward_prefetch_depth", 1),
+            "fsdp2_no_reshard_last_units": fsdp_cfg.get("fsdp2_no_reshard_last_units", 1),
+            "fsdp2_unit_group_size": fsdp_cfg.get("fsdp2_unit_group_size", 1),
+            "activation_checkpointing_skip_last_units": fsdp_cfg.get(
+                "activation_checkpointing_skip_last_units",
+                0,
+            ),
             "mp_policy": MixedPrecisionPolicy(
                 param_dtype=param_dtype,
-                reduce_dtype=torch.float32,
-                output_dtype=compute_dtype,
+                reduce_dtype=reduce_dtype,
+                output_dtype=output_dtype,
+                cast_forward_inputs=True,
             ),
         }
 
@@ -554,6 +574,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
 
         self.cpu_offload = fsdp_cfg.get("cpu_offload", False) if fsdp_cfg else False
+        self.defer_fsdp_grad_sync = fsdp_cfg.get("defer_fsdp_grad_sync", True) if fsdp_cfg else True
 
         # Flow matching configuration
         self.adapter_type = fm_cfg.get("adapter_type", "simple")
@@ -562,6 +583,9 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.logit_std = fm_cfg.get("logit_std", 1.0)
         self.flow_shift = fm_cfg.get("flow_shift", 3.0)
         self.mix_uniform_ratio = fm_cfg.get("mix_uniform_ratio", 0.1)
+        self.beta_alpha = fm_cfg.get("beta_alpha", 2.5)
+        self.beta_beta = fm_cfg.get("beta_beta", 1.5)
+        self.beta_seed_by_step = fm_cfg.get("beta_seed_by_step", False)
         self.use_sigma_noise = fm_cfg.get("use_sigma_noise", True)
         self.sigma_min = fm_cfg.get("sigma_min", 0.0)
         self.sigma_max = fm_cfg.get("sigma_max", 1.0)
@@ -752,6 +776,9 @@ class TrainDiffusionRecipe(BaseRecipe):
             logit_mean=self.logit_mean,
             logit_std=self.logit_std,
             mix_uniform_ratio=self.mix_uniform_ratio,
+            beta_alpha=self.beta_alpha,
+            beta_beta=self.beta_beta,
+            beta_seed_by_step=self.beta_seed_by_step,
             use_sigma_noise=self.use_sigma_noise,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
@@ -761,6 +788,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             summary_log_interval=self.summary_log_interval,
             device=self.device,
         )
+        model_adapter.attach_pipeline(self.pipe, self.device, self.compute_dtype)
         logging.info(f"[INFO] Flow Matching Pipeline V2 initialized with {self.adapter_type} adapter")
 
         if is_main_process():
@@ -799,35 +827,54 @@ class TrainDiffusionRecipe(BaseRecipe):
             num_steps = 0
 
             for batch_group in self.step_scheduler:
+                self._sync_device()
+                step_start_time = time.perf_counter()
                 self.optimizer.zero_grad(set_to_none=True)
 
                 micro_losses = []
+                micro_metrics = []
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
                 num_microbatches = len(batch_group)
                 for microbatch_idx, micro_batch in enumerate(batch_group):
-                    if microbatch_idx == num_microbatches - 1:
+                    is_final_microbatch = microbatch_idx == num_microbatches - 1
+                    if is_final_microbatch:
                         prepare_for_final_backward([self.model], pp_enabled=False)
 
-                    try:
-                        _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
-                            model=self.model,
-                            batch=micro_batch,
-                            device=self.device,
-                            dtype=self.compute_dtype,
-                            global_step=global_step,
-                            collect_metrics=False,
-                            check_loss=self.check_loss,
-                        )
-                    except Exception as exc:
-                        logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
-                        video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
-                        text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
-                        logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
-                        raise
+                    sync_ctx = get_sync_ctx(
+                        self.model,
+                        is_final_microbatch,
+                        defer_fsdp_grad_sync=getattr(self, "defer_fsdp_grad_sync", True),
+                    )
+                    with sync_ctx:
+                        try:
+                            _, average_weighted_loss, _, metrics = self.flow_matching_pipeline.step(
+                                model=self.model,
+                                batch=micro_batch,
+                                device=self.device,
+                                dtype=self.compute_dtype,
+                                global_step=global_step,
+                                collect_metrics=False,
+                                check_loss=self.check_loss,
+                            )
+                        except Exception as exc:
+                            logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
+                            video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
+                            image_shape = micro_batch.get("image_latents", torch.tensor([])).shape
+                            target_shape = micro_batch.get("target_image", torch.tensor([])).shape
+                            text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
+                            logging.info(
+                                "[DEBUG] Batch shapes - video: %s, image: %s, target: %s, text: %s",
+                                video_shape,
+                                image_shape,
+                                target_shape,
+                                text_shape,
+                            )
+                            raise
 
-                    # Use average_weighted_loss for backprop (scalar for gradient accumulation)
-                    (average_weighted_loss / num_microbatches).backward()
+                        # Use average_weighted_loss for backprop (scalar for gradient accumulation)
+                        (average_weighted_loss / num_microbatches).backward()
                     micro_losses.append(average_weighted_loss.detach())
+                    micro_metrics.append(metrics)
 
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
@@ -860,6 +907,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 global_step = int(self.step_scheduler.step)
 
                 should_log = self.log_every and self.log_every > 0 and global_step % self.log_every == 0
+                primary_perf_metrics = {}
                 if should_log:
                     elapsed_seconds, perf_window_end_time = self._elapsed_seconds_since(perf_window_start_time)
                     perf_window_global_samples = self._count_global_samples(perf_window_local_samples)
@@ -873,6 +921,11 @@ class TrainDiffusionRecipe(BaseRecipe):
                     perf_window_start_time = perf_window_end_time
                     perf_window_steps = 0
                     perf_window_local_samples = 0
+                    primary_perf_metrics = self._build_primary_perf_log_dict(
+                        local_step_time_sec=time.perf_counter() - step_start_time,
+                        micro_metrics=micro_metrics,
+                        fallback_local_sample_count=_count_local_batch_group_samples(batch_group),
+                    )
 
                 if should_log and is_main_process():
                     avg_loss = epoch_loss / num_steps
@@ -884,6 +937,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         "epoch": epoch,
                         "global_step": global_step,
                         **throughput_metrics,
+                        **primary_perf_metrics,
                         **memory_metrics,
                     }
                     if wandb.run is not None:
@@ -963,6 +1017,56 @@ class TrainDiffusionRecipe(BaseRecipe):
         if dist.is_initialized() and str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():
             return self.device
         return torch.device("cpu")
+
+    def _reduce_perf_float(self, value: float, op: dist.ReduceOp, group: Any = None) -> float:
+        """Reduce a float metric on the active collective device."""
+        reduced = torch.tensor(float(value), device=self._get_collective_device(), dtype=torch.float64)
+        if dist.is_initialized():
+            dist.all_reduce(reduced, op=op, group=group)
+        return float(reduced.item())
+
+    def _build_primary_perf_log_dict(
+        self,
+        *,
+        local_step_time_sec: float,
+        micro_metrics: list[Dict[str, Any]],
+        fallback_local_sample_count: int,
+    ) -> Dict[str, float]:
+        """Build baseline-compatible primary performance metrics for one optimizer step."""
+        local_sample_count = 0.0
+        local_model_token_count = 0.0
+        local_target_token_count = 0.0
+
+        for metrics in micro_metrics:
+            batch_size = float(metrics.get("perf/model_input_batch_size", 0.0) or 0.0)
+            image_seq_len = float(metrics.get("perf/model_image_seq_len", 0.0) or 0.0)
+            text_seq_len = float(metrics.get("perf/model_text_seq_len", 0.0) or 0.0)
+            target_token_count = float(metrics.get("perf/model_target_token_count", 0.0) or 0.0)
+
+            local_sample_count += batch_size
+            local_model_token_count += batch_size * (image_seq_len + text_seq_len)
+            local_target_token_count += batch_size * target_token_count
+
+        if local_sample_count <= 0:
+            local_sample_count = float(max(fallback_local_sample_count, 0))
+
+        dp_group = self._get_dp_group(include_cp=True) if getattr(self, "device_mesh", None) is not None else None
+        step_time_sec = self._reduce_perf_float(local_step_time_sec, dist.ReduceOp.MAX)
+        actual_global_batch_size = self._reduce_perf_float(local_sample_count, dist.ReduceOp.SUM, group=dp_group)
+        global_model_token_count = self._reduce_perf_float(local_model_token_count, dist.ReduceOp.SUM, group=dp_group)
+        global_target_token_count = self._reduce_perf_float(
+            local_target_token_count,
+            dist.ReduceOp.SUM,
+            group=dp_group,
+        )
+
+        return {
+            "perf/samples_per_sec": _safe_divide(actual_global_batch_size, step_time_sec),
+            "perf/model_tokens_per_sec": _safe_divide(global_model_token_count, step_time_sec),
+            "perf/target_tokens_per_sec": _safe_divide(global_target_token_count, step_time_sec),
+            "perf/step_time_sec": step_time_sec,
+            "perf/actual_global_batch_size": actual_global_batch_size,
+        }
 
     def _elapsed_seconds_since(self, start_time: float) -> tuple[float, float]:
         """Return the max elapsed wall-clock seconds across ranks since start_time."""

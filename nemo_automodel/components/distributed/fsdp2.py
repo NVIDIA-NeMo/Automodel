@@ -101,6 +101,9 @@ class FSDP2Manager:
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
         self.fsdp2_backward_prefetch_depth = config.fsdp2_backward_prefetch_depth
         self.fsdp2_forward_prefetch_depth = config.fsdp2_forward_prefetch_depth
+        self.fsdp2_no_reshard_last_units = config.fsdp2_no_reshard_last_units
+        self.fsdp2_unit_group_size = config.fsdp2_unit_group_size
+        self.activation_checkpointing_skip_last_units = config.activation_checkpointing_skip_last_units
 
     def parallelize(self, model):
         """
@@ -137,6 +140,9 @@ class FSDP2Manager:
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
+            fsdp2_no_reshard_last_units=self.fsdp2_no_reshard_last_units,
+            fsdp2_unit_group_size=self.fsdp2_unit_group_size,
+            activation_checkpointing_skip_last_units=self.activation_checkpointing_skip_last_units,
         )
 
         return model

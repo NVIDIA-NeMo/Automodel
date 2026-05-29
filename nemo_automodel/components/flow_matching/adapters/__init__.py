@@ -24,6 +24,7 @@ Available Adapters:
 - SimpleAdapter: For simple transformer models (e.g., Wan)
 - FluxAdapter: For FLUX.1 text-to-image models
 - QwenImageAdapter: For Qwen-Image text-to-image models
+- QwenImageEditAdapter: For Qwen-Image-Edit image editing models
 
 Usage:
     from automodel.flow_matching.adapters import HunyuanAdapter, SimpleAdapter, FluxAdapter
@@ -36,6 +37,7 @@ from .base import FlowMatchingContext, ModelAdapter
 from .flux import FluxAdapter
 from .hunyuan import HunyuanAdapter
 from .qwen_image import QwenImageAdapter
+from .qwen_image_edit import QwenImageEditAdapter
 from .simple import SimpleAdapter
 
 __all__ = [
@@ -44,5 +46,6 @@ __all__ = [
     "FluxAdapter",
     "HunyuanAdapter",
     "QwenImageAdapter",
+    "QwenImageEditAdapter",
     "SimpleAdapter",
 ]

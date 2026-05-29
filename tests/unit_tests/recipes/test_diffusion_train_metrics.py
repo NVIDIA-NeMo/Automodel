@@ -137,6 +137,9 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
             "enable_fsdp2_prefetch": False,
             "fsdp2_backward_prefetch_depth": 4,
             "fsdp2_forward_prefetch_depth": 3,
+            "fsdp2_no_reshard_last_units": 2,
+            "fsdp2_unit_group_size": 6,
+            "activation_checkpointing_skip_last_units": 3,
         },
         attention_backend="flash",
         optimizer_cfg={
@@ -159,6 +162,9 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert manager_args["enable_fsdp2_prefetch"] is False
     assert manager_args["fsdp2_backward_prefetch_depth"] == 4
     assert manager_args["fsdp2_forward_prefetch_depth"] == 3
+    assert manager_args["fsdp2_no_reshard_last_units"] == 2
+    assert manager_args["fsdp2_unit_group_size"] == 6
+    assert manager_args["activation_checkpointing_skip_last_units"] == 3
     assert pipe.transformer.attention_backend == "flash"
     assert device_mesh == "mesh"
     assert optimizer.defaults["lr"] == pytest.approx(0.125)

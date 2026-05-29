@@ -293,6 +293,9 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
                 "enable_fsdp2_prefetch": True,
                 "fsdp2_backward_prefetch_depth": 4,
                 "fsdp2_forward_prefetch_depth": 3,
+                "fsdp2_no_reshard_last_units": 2,
+                "fsdp2_unit_group_size": 6,
+                "activation_checkpointing_skip_last_units": 3,
             }
         )
 
@@ -306,6 +309,9 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
     assert config_kwargs["enable_fsdp2_prefetch"] is True
     assert config_kwargs["fsdp2_backward_prefetch_depth"] == 4
     assert config_kwargs["fsdp2_forward_prefetch_depth"] == 3
+    assert config_kwargs["fsdp2_no_reshard_last_units"] == 2
+    assert config_kwargs["fsdp2_unit_group_size"] == 6
+    assert config_kwargs["activation_checkpointing_skip_last_units"] == 3
 
 
 def test_create_parallel_manager_unknown_type_raises():
