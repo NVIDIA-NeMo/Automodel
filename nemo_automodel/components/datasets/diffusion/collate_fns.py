@@ -24,8 +24,10 @@ import logging
 from typing import Callable, Dict, List, Tuple
 
 import torch
+from torch.utils.data.distributed import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from .qwen_image_edit_dataset import QwenImageEditDataset
 from .sampler import SequentialBucketSampler
 from .text_to_image_dataset import TextToImageDataset
 from .text_to_video_dataset import TextToVideoDataset, collate_optional_video_fields
@@ -231,6 +233,88 @@ def build_text_to_image_multiresolution_dataloader(
 
     logger.info(f"  Dataset size: {len(dataset)}")
     logger.info(f"  Batches per epoch: {len(sampler)}")
+
+    return dataloader, sampler
+
+
+def collate_fn_qwen_image_edit(batch: List[Dict]) -> Dict:
+    """Collate Qwen-Image-Edit samples for online VAE/text encoding."""
+    if len(batch) != 1:
+        raise ValueError("Qwen-Image-Edit training currently requires local_batch_size=1.")
+
+    item = batch[0]
+    return {
+        "target_image": item["target_image"].unsqueeze(0),
+        "context_images": [image.unsqueeze(0) for image in item["context_images"]],
+        "condition_images": item["condition_images"],
+        "prompt": [item["prompt"]],
+        "data_type": "image_edit",
+        "metadata": {
+            "target_path": item.get("target_path"),
+            "context_paths": item.get("context_paths", []),
+            "condition_paths": item.get("condition_paths", []),
+        },
+    }
+
+
+def build_qwen_image_edit_dataloader(
+    *,
+    csv_path: str,
+    max_image_area: int | float | None = None,
+    max_context_image_area: int | float | None = None,
+    max_condition_image_area: int | float | None = None,
+    max_total_seq_area: int | float | None = None,
+    add_hex_rate: float = 0.0,
+    batch_size: int = 1,
+    dp_rank: int = 0,
+    dp_world_size: int = 1,
+    shuffle: bool = False,
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
+) -> Tuple[StatefulDataLoader, DistributedSampler | None]:
+    """Build a raw Qwen-Image-Edit dataloader for ``TrainDiffusionRecipe``."""
+    logger.info("Building Qwen-Image-Edit dataloader:")
+    logger.info(f"  csv_path: {csv_path}")
+    logger.info(f"  batch_size: {batch_size}")
+    logger.info(f"  dp_rank: {dp_rank}, dp_world_size: {dp_world_size}")
+
+    if batch_size != 1:
+        raise ValueError("Qwen-Image-Edit training currently requires local_batch_size=1.")
+
+    dataset = QwenImageEditDataset(
+        csv_path=csv_path,
+        max_image_area=max_image_area,
+        max_context_image_area=max_context_image_area,
+        max_condition_image_area=max_condition_image_area,
+        max_total_seq_area=max_total_seq_area,
+        add_hex_rate=add_hex_rate,
+    )
+
+    sampler = None
+    if dp_world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dp_world_size,
+            rank=dp_rank,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+
+    dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=shuffle if sampler is None else False,
+        collate_fn=collate_fn_qwen_image_edit,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+    )
+
+    logger.info(f"  Dataset size: {len(dataset)}")
+    logger.info(f"  Batches per epoch: {len(dataloader)}")
 
     return dataloader, sampler
 

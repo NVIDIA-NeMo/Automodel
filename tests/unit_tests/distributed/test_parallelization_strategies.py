@@ -34,6 +34,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
+    QwenImageParallelizationStrategy,
     WanParallelizationStrategy,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
@@ -705,6 +706,76 @@ class TestWanParallelizationStrategy:
         assert result is wan_model
 
 
+class MockQwenImageTransformer(nn.Module):
+    """Mock Diffusers Qwen image transformer for strategy tests."""
+
+    def __init__(self, num_blocks: int = 5) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(num_attention_heads=8, num_key_value_heads=8, hidden_size=64)
+        self.transformer_blocks = nn.ModuleList([nn.Linear(1, 1) for _ in range(num_blocks)])
+        self.gradient_checkpointing_func = None
+
+    def enable_gradient_checkpointing(self, gradient_checkpointing_func=None):
+        self.gradient_checkpointing_func = gradient_checkpointing_func
+
+
+class TestQwenImageParallelizationStrategy:
+    """Tests for generic FSDP options used by the Qwen image strategy."""
+
+    @pytest.fixture
+    def strategy(self):
+        return QwenImageParallelizationStrategy()
+
+    def test_groups_units_and_skips_tail_checkpointing(self, strategy, mock_device_mesh, monkeypatch):
+        mesh, _, _, _ = mock_device_mesh
+        model = MockQwenImageTransformer(num_blocks=5)
+
+        monkeypatch.setattr(
+            DefaultParallelizationStrategy,
+            "parallelize",
+            lambda self, **kwargs: kwargs["model"],
+        )
+
+        result = strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            activation_checkpointing=True,
+            fsdp2_unit_group_size=2,
+            activation_checkpointing_skip_last_units=1,
+        )
+
+        assert result is model
+        assert [len(group.blocks) for group in model.transformer_blocks] == [2, 2, 1]
+        assert model.gradient_checkpointing_func is not None
+        assert not getattr(model.transformer_blocks[0], "_nemo_skip_activation_checkpointing", False)
+        assert getattr(model.transformer_blocks[-1], "_nemo_skip_activation_checkpointing", False)
+
+    def test_compile_checkpointing_wraps_grouped_units(self, strategy, mock_device_mesh, monkeypatch):
+        mesh, _, _, _ = mock_device_mesh
+        model = MockQwenImageTransformer(num_blocks=4)
+        checkpoint_wrapper_mock = MagicMock(side_effect=lambda module, **_kwargs: module)
+
+        monkeypatch.setattr(
+            DefaultParallelizationStrategy,
+            "parallelize",
+            lambda self, **kwargs: kwargs["model"],
+        )
+        monkeypatch.setattr(parallelizer_mod, "checkpoint_wrapper", checkpoint_wrapper_mock)
+
+        result = strategy.parallelize(
+            model=model,
+            device_mesh=mesh,
+            activation_checkpointing=True,
+            enable_compile=True,
+            fsdp2_unit_group_size=2,
+        )
+
+        assert result is model
+        assert len(model.transformer_blocks) == 2
+        assert checkpoint_wrapper_mock.call_count == 2
+        assert model.gradient_checkpointing_func is None
+
+
 class TestHunyuanParallelizationStrategy:
     """Tests for HunyuanParallelizationStrategy."""
 
@@ -845,6 +916,8 @@ class TestFsdp2StrategyParallelizeIntegration:
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
+            "fsdp2_unit_group_size",
+            "activation_checkpointing_skip_last_units",
         ]
 
         for param in expected_params:

@@ -101,6 +101,15 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
+        fsdp2_no_reshard_last_units (int): Number of final FSDP units to keep
+            gathered after forward. ``1`` preserves the existing behavior.
+        fsdp2_unit_group_size (int): Group adjacent model-specific FSDP units
+            before sharding when the selected parallelization strategy supports
+            grouping. ``1`` preserves per-unit FSDP wrapping.
+        activation_checkpointing_skip_last_units (int): Number of final
+            model-specific units to leave outside activation checkpointing when
+            the selected parallelization strategy supports selective
+            checkpointing. ``0`` checkpoints every eligible unit.
     """
 
     sequence_parallel: bool = False
@@ -117,6 +126,9 @@ class FSDP2Config:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
+    fsdp2_no_reshard_last_units: int = 1
+    fsdp2_unit_group_size: int = 1
+    activation_checkpointing_skip_last_units: int = 0
 
     def __post_init__(self):
         if self.mp_policy is None:

@@ -22,6 +22,7 @@ from types import FunctionType
 from typing import Any, Dict, Generator, List, Optional, Union
 
 import torch
+import torch.utils.checkpoint
 import transformers
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -154,6 +155,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         enable_fsdp2_prefetch: bool = True,
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
+        fsdp2_no_reshard_last_units: int = 1,
+        fsdp2_unit_group_size: int = 1,
+        activation_checkpointing_skip_last_units: int = 0,
         fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
@@ -302,6 +306,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
             enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth,
+            fsdp2_no_reshard_last_units,
             fully_shard_fn=fully_shard_fn,
         )
 
@@ -650,12 +655,74 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class QwenImageParallelizationStrategy(DefaultParallelizationStrategy):
+    """Parallelization strategy for Diffusers Qwen image transformer modules."""
+
+    def parallelize(
+        self,
+        model: nn.Module,
+        device_mesh: DeviceMesh,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        offload_policy: Optional[OffloadPolicy] = None,
+        sequence_parallel: bool = False,
+        activation_checkpointing: bool = False,
+        tp_shard_plan: Optional[Union[Dict[str, ParallelStyle], str]] = None,
+        dp_replicate_mesh_name: str = "dp_replicate",
+        dp_shard_cp_mesh_name: str = "dp_shard_cp",
+        tp_mesh_name: str = "tp",
+        **kwargs,
+    ) -> nn.Module:
+        """Apply Diffusers Qwen image checkpointing before FSDP2 sharding."""
+        _group_module_list_units(
+            model,
+            module_list_name="transformer_blocks",
+            group_size=int(kwargs.get("fsdp2_unit_group_size", 1)),
+            group_cls=_QwenImageTransformerBlockGroup,
+            description="Qwen image transformer blocks",
+        )
+
+        if activation_checkpointing:
+            enable_compile = bool(kwargs.get("enable_compile", False))
+            checkpoint_skip_last_units = max(
+                0,
+                int(kwargs.get("activation_checkpointing_skip_last_units", 0)),
+            )
+            if enable_compile and hasattr(model, "transformer_blocks"):
+                _checkpoint_module_list_units(
+                    model.transformer_blocks,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+                logger.info("Enabled block-level non-reentrant checkpointing for Qwen image transformer compile")
+            else:
+                _enable_diffusers_gradient_checkpointing(
+                    model,
+                    module_list_name="transformer_blocks",
+                    skip_last_units=checkpoint_skip_last_units,
+                    description="Qwen image transformer",
+                )
+
+        return super().parallelize(
+            model=model,
+            device_mesh=device_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            sequence_parallel=sequence_parallel,
+            activation_checkpointing=False,
+            tp_shard_plan=tp_shard_plan,
+            dp_replicate_mesh_name=dp_replicate_mesh_name,
+            dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
+            tp_mesh_name=tp_mesh_name,
+            **kwargs,
+        )
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
     "DeepseekV4ForCausalLM": DeepseekV4ParallelizationStrategy(),
     "Qwen3_5ForConditionalGeneration": Qwen3_5ParallelizationStrategy(),
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
+    "QwenImageTransformer2DModel": QwenImageParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
 }
@@ -668,6 +735,109 @@ def get_parallelization_strategy(model: nn.Module) -> ParallelizationStrategy:
     """Get the appropriate parallelization strategy for the given model."""
     model_name = type(model).__name__
     return PARALLELIZATION_STRATEGIES.get(model_name, _DEFAULT_STRATEGY)
+
+
+class _QwenImageTransformerBlockGroup(nn.Module):
+    """Grouped Qwen Image blocks exposed as one FSDP unit."""
+
+    def __init__(self, blocks: list[nn.Module]) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        modulate_index: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for block in self.blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+                modulate_index=modulate_index,
+            )
+        return encoder_hidden_states, hidden_states
+
+
+def _group_module_list_units(
+    model: nn.Module,
+    *,
+    module_list_name: str,
+    group_size: int,
+    group_cls: type[nn.Module],
+    description: str,
+) -> None:
+    """Group adjacent modules in a ``ModuleList`` before FSDP wrapping."""
+    if group_size < 1:
+        raise ValueError("fsdp2_unit_group_size must be >= 1")
+    module_list = getattr(model, module_list_name, None)
+    if group_size == 1 or module_list is None:
+        return
+    if not isinstance(module_list, nn.ModuleList):
+        raise TypeError(f"{module_list_name} must be an nn.ModuleList to use fsdp2_unit_group_size")
+
+    units = list(module_list)
+    if not units:
+        return
+
+    grouped_units = [group_cls(units[start : start + group_size]) for start in range(0, len(units), group_size)]
+    setattr(model, module_list_name, nn.ModuleList(grouped_units))
+    logger.info(
+        "Grouped %d %s into %d FSDP units with group size %d",
+        len(units),
+        description,
+        len(grouped_units),
+        group_size,
+    )
+
+
+def _checkpoint_module_list_units(module_list: nn.ModuleList, *, checkpoint_impl: CheckpointImpl) -> None:
+    """Apply checkpoint wrappers to each unit in a ``ModuleList``."""
+    for unit_idx, unit in enumerate(module_list):
+        module_list[unit_idx] = checkpoint_wrapper(unit, checkpoint_impl=checkpoint_impl)
+
+
+def _enable_diffusers_gradient_checkpointing(
+    model: nn.Module,
+    *,
+    module_list_name: str,
+    skip_last_units: int,
+    description: str,
+) -> None:
+    """Enable Diffusers-style gradient checkpointing with an optional tail skip window."""
+    if not hasattr(model, "enable_gradient_checkpointing"):
+        logger.warning("%s does not expose enable_gradient_checkpointing()", description)
+        return
+
+    if skip_last_units <= 0:
+        model.enable_gradient_checkpointing()
+        logger.info("Enabled native Diffusers gradient checkpointing for %s", description)
+        return
+
+    units = list(getattr(model, module_list_name, []))
+    skip_count = min(skip_last_units, len(units))
+    for unit in units[-skip_count:]:
+        unit._nemo_skip_activation_checkpointing = True
+
+    def _gradient_checkpointing_func(module: nn.Module, *args: Any) -> Any:
+        if getattr(module, "_nemo_skip_activation_checkpointing", False):
+            return module.__call__(*args)
+        return torch.utils.checkpoint.checkpoint(module.__call__, *args, use_reentrant=False)
+
+    model.enable_gradient_checkpointing(gradient_checkpointing_func=_gradient_checkpointing_func)
+    logger.info(
+        "Enabled selective Diffusers gradient checkpointing for %s; skipped last %d units",
+        description,
+        skip_count,
+    )
 
 
 def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
@@ -747,6 +917,8 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
         module_list = model.model.layers
     elif hasattr(model, "layers"):
         module_list = model.layers
+    elif hasattr(model, "transformer_blocks"):
+        module_list = model.transformer_blocks
     else:
         logger.warning("_apply_per_layer_compile: cannot find transformer layers, skipping")
         return
@@ -773,6 +945,7 @@ def apply_fsdp2_sharding_recursively(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    fsdp2_no_reshard_last_units: int = 1,
     fully_shard_fn=None,
 ) -> None:
     """
@@ -796,6 +969,8 @@ def apply_fsdp2_sharding_recursively(
         enable_fsdp2_prefetch (bool): Enable explicit forward/backward prefetch chains.
         fsdp2_backward_prefetch_depth (int): Backward prefetch depth.
         fsdp2_forward_prefetch_depth (int): Forward prefetch depth.
+        fsdp2_no_reshard_last_units (int): Number of final FSDP units to keep
+            gathered after forward. ``1`` preserves the existing behavior.
     Note:
         This function modifies the module in-place by replacing modules with their
         FSDP2-subclassed versions.
@@ -829,16 +1004,19 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                fsdp2_no_reshard_last_units,
                 fully_shard_fn=fully_shard_fn,
             )
 
+        no_reshard_last_units = max(1, int(fsdp2_no_reshard_last_units))
         for enum_id, (layer_key, child_module) in enumerate(flat_layer_items):
             # With PP: keep weights gathered across microbatches (no per-microbatch all-gather).
-            # Without PP: reshard all but last layer to enable forward+backward weight prefetching.
+            # Without PP: keep a tail window gathered and reshard earlier layers to enable
+            # forward+backward weight prefetching.
             if pp_enabled:
                 reshard_after_forward = False
             else:
-                reshard_after_forward = enum_id < len(flat_layer_items) - 1
+                reshard_after_forward = enum_id < len(flat_layer_items) - no_reshard_last_units
             fully_shard_fn(
                 child_module,
                 mesh=mesh,
@@ -876,6 +1054,7 @@ def apply_fsdp2_sharding_recursively(
                 enable_fsdp2_prefetch,
                 fsdp2_backward_prefetch_depth,
                 fsdp2_forward_prefetch_depth,
+                fsdp2_no_reshard_last_units,
                 fully_shard_fn=fully_shard_fn,
             )
 
@@ -1626,6 +1805,9 @@ def fsdp2_strategy_parallelize(
     enable_fsdp2_prefetch: bool = True,
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
+    fsdp2_no_reshard_last_units: int = 1,
+    fsdp2_unit_group_size: int = 1,
+    activation_checkpointing_skip_last_units: int = 0,
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1684,6 +1866,9 @@ def fsdp2_strategy_parallelize(
         enable_fsdp2_prefetch=enable_fsdp2_prefetch,
         fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
+        fsdp2_no_reshard_last_units=fsdp2_no_reshard_last_units,
+        fsdp2_unit_group_size=fsdp2_unit_group_size,
+        activation_checkpointing_skip_last_units=activation_checkpointing_skip_last_units,
     )
 
 

@@ -34,6 +34,7 @@ import random
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 # Import adapters from the adapters module
@@ -43,10 +44,35 @@ from .adapters import (
     HunyuanAdapter,
     ModelAdapter,
     QwenImageAdapter,
+    QwenImageEditAdapter,
     SimpleAdapter,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_model_input_metrics(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect lightweight model-input shape metrics for throughput estimates."""
+    if not isinstance(inputs, dict):
+        return {}
+
+    metrics: Dict[str, Any] = {}
+    hidden_states = inputs.get("hidden_states")
+    if torch.is_tensor(hidden_states) and hidden_states.ndim >= 3:
+        metrics["perf/model_input_batch_size"] = int(hidden_states.shape[0])
+        metrics["perf/model_image_seq_len"] = int(hidden_states.shape[1])
+        metrics["perf/model_image_in_channels"] = int(hidden_states.shape[2])
+
+    encoder_hidden_states = inputs.get("encoder_hidden_states")
+    if torch.is_tensor(encoder_hidden_states) and encoder_hidden_states.ndim >= 3:
+        metrics["perf/model_text_seq_len"] = int(encoder_hidden_states.shape[1])
+        metrics["perf/model_text_hidden_size"] = int(encoder_hidden_states.shape[2])
+
+    target_token_count = inputs.get("target_token_count")
+    if isinstance(target_token_count, int):
+        metrics["perf/model_target_token_count"] = target_token_count
+
+    return metrics
 
 
 # =============================================================================
@@ -122,6 +148,10 @@ class FlowMatchingPipeline:
         logit_std: float = 1.0,
         # Mix sampling parameters
         mix_uniform_ratio: float = 0.1,
+        # Beta sampling parameters
+        beta_alpha: float = 2.5,
+        beta_beta: float = 1.5,
+        beta_seed_by_step: bool = False,
         # Sigma sampling mode
         use_sigma_noise: bool = True,
         # Sigma clamping for finetuning (pretrain uses [0.0, 1.0])
@@ -175,6 +205,9 @@ class FlowMatchingPipeline:
         self.logit_mean = logit_mean
         self.logit_std = logit_std
         self.mix_uniform_ratio = mix_uniform_ratio
+        self.beta_alpha = beta_alpha
+        self.beta_beta = beta_beta
+        self.beta_seed_by_step = beta_seed_by_step
         self.use_sigma_noise = use_sigma_noise
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
@@ -215,6 +248,7 @@ class FlowMatchingPipeline:
         self,
         batch_size: int,
         device: Optional[torch.device] = None,
+        global_step: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """
         Sample timesteps and compute sigma values with flow shift.
@@ -233,6 +267,19 @@ class FlowMatchingPipeline:
         """
         if device is None:
             device = self.device
+
+        if self.timestep_sampling == "beta":
+            if self.beta_seed_by_step and global_step is not None:
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                process_seed = (rank * 1_000_000 + int(global_step)) % (2**32)
+                torch.manual_seed(process_seed)
+
+            alpha = torch.tensor(self.beta_alpha, device=device, dtype=torch.float32)
+            beta = torch.tensor(self.beta_beta, device=device, dtype=torch.float32)
+            sigma = torch.distributions.Beta(alpha, beta).sample((batch_size,))
+            sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
+            timesteps = sigma * self.num_train_timesteps
+            return sigma, timesteps, "beta"
 
         # Backward-compatible path from pre-migration training step:
         # disable flow shift and sample plain uniform sigma.
@@ -398,13 +445,21 @@ class FlowMatchingPipeline:
         detailed_log = global_step % self.log_interval == 0
         summary_log = global_step % self.summary_log_interval == 0
 
-        # Extract and prepare batch data (either image_latents or video_latents)
-        if "video_latents" in batch:
+        # Extract and prepare batch data (either image_latents/video_latents or adapter-provided latents)
+        with torch.profiler.record_function("flow_matching.prepare_latents"):
+            prepared_latents = self.model_adapter.prepare_latents(batch, device, dtype, global_step)
+        if prepared_latents is not None:
+            latents, batch_updates = prepared_latents
+            batch = {**batch, **batch_updates}
+        elif "video_latents" in batch:
             latents = batch["video_latents"].to(device, dtype=dtype, non_blocking=True)
         elif "image_latents" in batch:
             latents = batch["image_latents"].to(device, dtype=dtype, non_blocking=True)
         else:
-            raise KeyError("Batch must contain either 'video_latents' or 'image_latents'")
+            raise KeyError(
+                "Batch must contain either 'video_latents' or 'image_latents', "
+                "or the model adapter must implement prepare_latents()."
+            )
 
         # latents can be 4D [B, C, H, W] for images or 5D [B, C, F, H, W] for videos
         batch_size = latents.shape[0]
@@ -416,7 +471,7 @@ class FlowMatchingPipeline:
         # ====================================================================
         # Flow Matching: Sample Timesteps
         # ====================================================================
-        sigma, timesteps, sampling_method = self.sample_timesteps(batch_size, device)
+        sigma, timesteps, sampling_method = self.sample_timesteps(batch_size, device, global_step=global_step)
 
         # ====================================================================
         # Flow Matching: Add Noise
@@ -461,6 +516,7 @@ class FlowMatchingPipeline:
         )
 
         inputs = self.model_adapter.prepare_inputs(context)
+        model_input_metrics = _collect_model_input_metrics(inputs)
         model_pred = self.model_adapter.forward(model, inputs)
 
         # ====================================================================
@@ -492,7 +548,7 @@ class FlowMatchingPipeline:
                 f"w=[{loss_weight.min():.2f},{loss_weight.max():.2f}]"
             )
 
-        metrics = {}
+        metrics = model_input_metrics
         if collect_metrics:
             metrics = {
                 "loss": average_weighted_loss.item(),
@@ -509,6 +565,7 @@ class FlowMatchingPipeline:
                 "sampling_method": sampling_method,
                 "task_type": task_type,
                 "data_type": data_type,
+                **model_input_metrics,
             }
 
         return weighted_loss, average_weighted_loss, loss_mask, metrics
@@ -602,7 +659,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "qwen_image")
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "qwen_image", "qwen_image_edit")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
@@ -613,6 +670,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
         "qwen_image": QwenImageAdapter,
+        "qwen_image_edit": QwenImageEditAdapter,
     }
 
     if adapter_type not in adapters:
