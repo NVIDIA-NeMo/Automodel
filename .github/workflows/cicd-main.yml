@@ -74,7 +74,6 @@ jobs:
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /usr/local/.ghcup || true
           sudo rm -rf /usr/local/lib/node_modules || true
-          brew cleanup || true
           pip cache purge || true
       - name: Run ruff
         run: |
@@ -101,7 +100,6 @@ jobs:
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /usr/local/.ghcup || true
           sudo rm -rf /usr/local/lib/node_modules || true
-          brew cleanup || true
           pip cache purge || true
       - name: Install ruff
         env:
