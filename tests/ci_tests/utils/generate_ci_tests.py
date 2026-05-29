@@ -119,6 +119,7 @@ CI_KEY_TO_VAR = {
     "nodes": "TEST_NODE_COUNT",
     "node_multiplier": "NODE_MULTIPLIER",
     "local_batch_size": "LOCAL_BATCH_SIZE",
+    "ep_size": "EP_SIZE",
     "recipe_owner": "RECIPE_OWNER",
     "nproc_per_node": "CONFIG_NPROC_PER_NODE",
     "cluster_tag": "RESERVED_CLUSTER_TAG",
