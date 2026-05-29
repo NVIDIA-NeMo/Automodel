@@ -427,8 +427,11 @@ class TrainDiffusionRecipe(BaseRecipe):
             suppress_wandb_log_messages()
             # For two-stage Wan2.2 finetuning, suffix the wandb run name with the
             # active stage so high-noise and low-noise runs are distinguishable.
+            # Normalize to lowercase to match self.stage (set at line ~521) so the
+            # wandb suffix and the internal stage name stay consistent.
             stage_for_wandb = self.cfg.get("model.stage", None)
             if stage_for_wandb is not None:
+                stage_for_wandb = str(stage_for_wandb).lower()
                 current_name = self.cfg.get("wandb.name", None)
                 if current_name is not None and not str(current_name).endswith(f"_{stage_for_wandb}"):
                     self.cfg.wandb.name = f"{current_name}_{stage_for_wandb}"
@@ -595,6 +598,11 @@ class TrainDiffusionRecipe(BaseRecipe):
                     "carries boundary_ratio (e.g. Wan-AI/Wan2.2-T2V-A14B-Diffusers)."
                 )
             self.boundary_ratio = float(self.boundary_ratio)
+            # A boundary outside (0, 1) collapses the stage sigma window to an empty
+            # or degenerate range (e.g. boundary_ratio=0.0 with stage=low_noise gives
+            # sigma_min=sigma_max=0.0), silently yielding a useless model.
+            if not (0.0 < self.boundary_ratio < 1.0):
+                raise ValueError(f"model.boundary_ratio must be in (0, 1), got {self.boundary_ratio}")
             if self.stage == "high_noise":
                 self.sigma_min = self.boundary_ratio
                 self.sigma_max = 1.0
