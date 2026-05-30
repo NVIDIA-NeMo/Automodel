@@ -306,20 +306,15 @@ def build_optimizer(
         One optimizer per model part.
     """
     foreach = _foreach_for_mesh(device_mesh)
+    is_config = isinstance(optimizer, OptimizerConfig)
 
-    if isinstance(optimizer, OptimizerConfig):
+    if is_config:
         if optimizer_kwargs:
             raise ValueError(
                 "Optimizer hyperparameters must be set on the config, not passed as keyword "
                 f"arguments to build_optimizer (got {sorted(optimizer_kwargs)})."
             )
         is_dion = isinstance(optimizer, MuonConfig)
-
-        def make_one(params):
-            return optimizer.build(params, foreach=foreach)
-
-        def make_dion(part):
-            return optimizer.build_dion(part, device_mesh)
     else:
         if isinstance(optimizer, type) and issubclass(optimizer, OptimizerConfig):
             raise TypeError(
@@ -336,22 +331,23 @@ def build_optimizer(
             kwargs.setdefault("foreach", foreach)
         is_dion = is_dion_optimizer(factory)
 
-        def make_one(params):
-            return factory(params=params, **kwargs)
-
-        def make_dion(part):
-            return build_dion_optimizer(
+    optimizers: list[torch.optim.Optimizer] = []
+    for part in getattr(model, "parts", [model]):
+        trainable_params = [p for p in part.parameters() if p.requires_grad]
+        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        if is_dion and is_config:
+            opt = optimizer.build_dion(part, device_mesh)
+        elif is_dion:
+            opt = build_dion_optimizer(
                 optimizer_factory=factory,
                 optimizer_kwargs=kwargs,
                 model=part,
                 distributed_mesh=device_mesh,
             )
-
-    optimizers: list[torch.optim.Optimizer] = []
-    for part in getattr(model, "parts", [model]):
-        trainable_params = [p for p in part.parameters() if p.requires_grad]
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        opt = make_dion(part) if is_dion else make_one(trainable_params)
+        elif is_config:
+            opt = optimizer.build(trainable_params, foreach=foreach)
+        else:
+            opt = factory(params=trainable_params, **kwargs)
         opt = _maybe_shard_megatron(part, opt, distributed_config, allow=not is_dion)
         optimizers.append(opt)
     return optimizers
