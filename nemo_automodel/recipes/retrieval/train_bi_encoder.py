@@ -26,8 +26,8 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -36,14 +36,8 @@ from nemo_automodel.components.training.precision_warnings import warn_if_torch_
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import (
-    build_checkpoint_config,
-    build_distributed,
-    build_lr_scheduler,
-    build_step_scheduler,
-    build_wandb,
-)
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 logger = logging.getLogger(__name__)
@@ -140,7 +134,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
 
@@ -164,9 +158,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.pp_enabled:
             raise NotImplementedError("Encoder does not support pipeline parallelism")
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(
+                run_config=self.cfg.to_dict(), model_name=self.cfg.model.pretrained_model_name_or_path
+            )
             logging.info("🚀 View run at {}".format(run.url))
 
         self._log_experiment_details()
@@ -176,10 +172,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            self.cfg.model.pretrained_model_name_or_path,
+        checkpoint_config = self.cfg.checkpoint.build(
+            cache_dir=self.cfg.get("model.cache_dir", None),
+            model_repo_id=self.cfg.model.pretrained_model_name_or_path,
             is_peft=self.peft_config is not None,
         )
 
@@ -189,8 +184,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-        self.checkpointer = Checkpointer(
-            config=checkpoint_config,
+        self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
@@ -229,10 +223,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
 
         logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
-        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
+        self.optimizer = [self.cfg.get("optimizer").instantiate(params=param_groups)]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.optimizer,
+            optimizer_cfg=self.cfg.get("optimizer"),
             is_peft=self.peft_config is not None,
             context="retrieval",
             logger=logger,
@@ -268,15 +262,18 @@ class TrainBiEncoderRecipe(BaseRecipe):
             )
             self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
 
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
         self.metric_logger_train = build_metric_logger(

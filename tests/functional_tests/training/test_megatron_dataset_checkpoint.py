@@ -20,12 +20,14 @@ import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.recipes._dist_setup import setup_distributed
-from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
+from nemo_automodel.recipes.llm.train_ft import build_dataloader
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
 """
+
 
 def test_megatron_dataset_checkpointing():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
@@ -113,14 +115,18 @@ def test_megatron_dataset_checkpointing():
 
     initial_batch = next(iter(dataset))
     for k in ["input_ids", "labels"]:
-        assert torch.any(initial_batch[k] != expected_batch[k]), f"Initial batch key {k, initial_batch[k]} should not be equal to expected batch key {k, expected_batch[k]}"
+        assert torch.any(initial_batch[k] != expected_batch[k]), (
+            f"Initial batch key {k, initial_batch[k]} should not be equal to expected batch key {k, expected_batch[k]}"
+        )
 
     # load checkpoint
     checkpointer.load_on_dp_ranks(dataset, "dataloader", cfg.checkpoint.checkpoint_dir)
 
     for i, batch in enumerate(dataset):
         for k in batch.keys():
-            assert torch.all(batch[k] == expected_batch[k]), f"Batch key {k, batch[k]} is not equal to expected batch key {k, expected_batch[k]}"
+            assert torch.all(batch[k] == expected_batch[k]), (
+                f"Batch key {k, batch[k]} is not equal to expected batch key {k, expected_batch[k]}"
+            )
         break
 
     torch.distributed.barrier(device_mesh["dp"].get_group())

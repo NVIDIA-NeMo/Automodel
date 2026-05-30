@@ -31,15 +31,29 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.recipes._typed_config import CheckpointSpec, OptimizerSpec, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
     build_model,
-    build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
+    return OptimizerSpec(*_callable_and_kwargs(cfg_opt)).build(
+        model, distributed_config=distributed_config, device_mesh=device_mesh
+    )
+
+
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
+    """Resolve a YAML checkpoint block and build it (mirrors ``RecipeConfig.checkpoint.build``)."""
+    return CheckpointSpec(_as_dict(cfg_ckpt) if cfg_ckpt is not None else None).build(
+        cache_dir=cache_dir, model_repo_id=model_repo_id, is_peft=is_peft
+    )
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -327,7 +341,6 @@ def test_peft_with_tp_disables_triton(caplog):
 def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog):
     """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
     from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
-    from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
 
     cfg_ckpt = MagicMock()
     cfg_ckpt.to_dict.return_value = {
@@ -482,10 +495,21 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
+
+    def _stub_build_checkpoint_config(*a, **k):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+        return cfg
+
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
-        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
+        lambda self, **kw: _stub_build_checkpoint_config(),
     )
     # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(
@@ -502,17 +526,6 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         ),
     )
 
-    # Stub Checkpointer
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
-            load_base_model=lambda *a, **k: None,
-            maybe_wait_for_staging=lambda: None,
-            close=lambda: None,
-        ),
-    )
-
     # Stub model/optimizer creation
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
@@ -521,18 +534,21 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         lambda *a, **k: dummy_model,
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_optimizer",
-        lambda *a, **k: [dummy_opt],
+        "nemo_automodel.recipes._typed_config.OptimizerSpec.build",
+        lambda self, *a, **k: [dummy_opt],
     )
 
     # Data-related stubs
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_step_scheduler",
-        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build",
+        lambda self, *a, **k: [],
+    )
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_metric_logger",
         lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
@@ -661,13 +677,13 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
             parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None)
         )
 
-    def _build_optimizer_stub(*args, **kwargs):
+    def _build_optimizer_stub(self, *args, **kwargs):
         dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
         return [dummy_opt]
 
     # Override the default stubs to return a pipeline-wrapped model
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_optimizer", _build_optimizer_stub)
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.OptimizerSpec.build", _build_optimizer_stub)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)
@@ -1242,36 +1258,6 @@ def test_build_model_without_quant_config():
 
 
 @requires_cuda
-def test_build_optimizer_disables_foreach_with_tp():
-    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False."""
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
-    cfg_opt.foreach = True  # Initially True
-
-    # Create mock device_mesh with TP > 1
-    mock_tp = MagicMock()
-    mock_tp.size.return_value = 2
-    mock_mesh = MagicMock()
-    mock_mesh.mesh_dim_names = ("dp", "tp")
-    mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
-        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
-            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
-                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=None,
-                        seed=42,
-                        device_mesh=mock_mesh,
-                    )
-                    _ = build_optimizer(model, cfg_opt, None, mock_mesh)
-
-    # Verify foreach was disabled
-    assert cfg_opt.foreach is False
-
-
-@requires_cuda
 def test_build_model_and_optimizer_return_values():
     """Test that build_model and build_optimizer return proper values."""
     cfg_model = DummyModelConfig()
@@ -1295,86 +1281,6 @@ def test_build_model_and_optimizer_return_values():
 # =============================================================================
 # Tests for optimizer dtype string resolution in build_optimizer
 # =============================================================================
-
-
-class TestBuildOptimizerDtypeResolution:
-    """Tests that build_optimizer resolves dtype strings to torch.dtype for TE FusedAdam kwargs."""
-
-    def _make_cfg_opt(self, **extra_attrs):
-        cfg = DummyOptConfig()
-        for k, v in extra_attrs.items():
-            setattr(cfg, k, v)
-        return cfg
-
-    def _make_model(self):
-        model = DummyModel()
-        # Ensure at least one param requires grad
-        for p in model.parameters():
-            p.requires_grad_(True)
-        return model
-
-    def test_resolves_all_three_dtype_strings(self):
-        cfg_opt = self._make_cfg_opt(
-            master_weight_dtype="torch.float32",
-            exp_avg_dtype="torch.bfloat16",
-            exp_avg_sq_dtype="torch.float16",
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.master_weight_dtype is torch.float32
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert cfg_opt.exp_avg_sq_dtype is torch.float16
-
-    def test_resolves_dtype_strings_without_torch_prefix(self):
-        cfg_opt = self._make_cfg_opt(
-            exp_avg_dtype="bfloat16",
-            exp_avg_sq_dtype="float16",
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert cfg_opt.exp_avg_sq_dtype is torch.float16
-
-    def test_preserves_torch_dtype_objects(self):
-        cfg_opt = self._make_cfg_opt(
-            master_weight_dtype=torch.float32,
-            exp_avg_dtype=torch.bfloat16,
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        # Should remain unchanged since they are already torch.dtype
-        assert cfg_opt.master_weight_dtype is torch.float32
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-
-    def test_ignores_missing_dtype_attrs(self):
-        cfg_opt = self._make_cfg_opt()  # No dtype attrs
-        model = self._make_model()
-
-        # Should not raise
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert not hasattr(cfg_opt, "master_weight_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
-
-    def test_resolves_partial_dtype_attrs(self):
-        cfg_opt = self._make_cfg_opt(
-            exp_avg_dtype="torch.bfloat16",
-            # master_weight_dtype and exp_avg_sq_dtype not set
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert not hasattr(cfg_opt, "master_weight_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
 
 
 # =============================================================================

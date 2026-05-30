@@ -28,12 +28,48 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
     stage_vlm_media_for_pp,
 )
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+from nemo_automodel.recipes._typed_config import (
+    _STEP_SCHEDULER_RUNTIME_KEYS,
+    CheckpointSpec,
+    OptimizerSpec,
+    _as_dict,
+    _callable_and_kwargs,
+    _section_kwargs,
+)
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
     build_model,
-    build_optimizer,
 )
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
+    return OptimizerSpec(*_callable_and_kwargs(cfg_opt)).build(
+        model, distributed_config=distributed_config, device_mesh=device_mesh
+    )
+
+
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
+    """Resolve a YAML checkpoint block and build it (mirrors ``RecipeConfig.checkpoint.build``)."""
+    return CheckpointSpec(_as_dict(cfg_ckpt) if cfg_ckpt is not None else None).build(
+        cache_dir=cache_dir, model_repo_id=model_repo_id, is_peft=is_peft
+    )
+
+
+def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
+    """Build a StepScheduler from a YAML block (mirrors ``RecipeConfig.step_scheduler.build``)."""
+    kwargs = {k: v for k, v in _section_kwargs(cfg).items() if k not in _STEP_SCHEDULER_RUNTIME_KEYS}
+    return StepSchedulerConfig(**kwargs).build(dataloader, dp_group_size, local_batch_size)
+
+
+def build_lr_scheduler(cfg, optimizer, step_scheduler):
+    """Build an LR scheduler from a YAML block (mirrors ``RecipeConfig.lr_scheduler.build``)."""
+    if cfg is None:
+        return None
+    return LRSchedulerConfig(**_section_kwargs(cfg)).build(optimizer, step_scheduler)
 
 
 class _Cfg(SimpleNamespace):
@@ -1001,50 +1037,7 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
         )
 
 
-def test_vlm_build_optimizer_disables_foreach_with_tp():
-    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False in VLM."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    class NeMoVLMModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoVLMModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-    cfg_opt.foreach = True  # Initially True
-
-    # Create a mock device_mesh with tp size > 1
-    mock_tp_submesh = MagicMock()
-    mock_tp_submesh.size.return_value = 2
-    mock_device_mesh = MagicMock()
-    mock_device_mesh.mesh_dim_names = ("dp", "tp")
-    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-            device_mesh=mock_device_mesh,
-        )
-        build_optimizer(model, cfg_opt, None, mock_device_mesh)
-
-    assert cfg_opt.foreach is False
-
-
-from nemo_automodel.recipes.vlm.finetune import (
-    build_checkpoint_config,
-    build_lr_scheduler,
-    build_step_scheduler,
-    calculate_loss,
-)
+from nemo_automodel.recipes.vlm.finetune import calculate_loss
 
 # -----------------------------------------------------------------------------
 # build_step_scheduler tests
@@ -1099,21 +1092,45 @@ class TestBuildStepScheduler:
         assert step_scheduler.ckpt_every_steps == 50
         assert step_scheduler.max_steps == 200
 
-    def test_build_step_scheduler_rejects_target(self):
-        """Test that _target_ in config raises error when passed to StepScheduler."""
+    def test_build_step_scheduler_ignores_local_batch_size_in_yaml_block(self):
+        """Real YAML step_scheduler blocks carry local_batch_size (a runtime arg
+        passed separately); it must not crash StepSchedulerConfig construction."""
+        mock_dataloader = MagicMock()
+        mock_dataloader.__len__ = MagicMock(return_value=50)
+
+        cfg = MagicMock()
+        cfg.to_dict.return_value = {
+            "global_batch_size": 256,
+            "local_batch_size": 2,  # runtime arg present in the YAML block
+            "ckpt_every_steps": 50,
+        }
+
+        step_scheduler = build_step_scheduler(
+            cfg=cfg,
+            dataloader=mock_dataloader,
+            dp_group_size=4,
+            local_batch_size=2,
+        )
+
+        # global_batch_size (256, from config) // (local_batch_size 2 * dp_size 4) = 32
+        assert step_scheduler.grad_acc_steps == 32
+        assert step_scheduler.ckpt_every_steps == 50
+
+    def test_build_step_scheduler_ignores_target(self):
+        """``_target_`` in the step_scheduler block is dropped by the typed boundary
+        (RecipeConfig.step_scheduler), not passed into StepSchedulerConfig."""
         mock_dataloader = MagicMock()
         mock_dataloader.__len__ = MagicMock(return_value=100)
 
-        # Create a config object where "_target_" in cfg returns True
         cfg = {"_target_": "some.class"}
 
-        with pytest.raises(AssertionError, match="_target_ not permitted"):
-            build_step_scheduler(
-                cfg=cfg,
-                dataloader=mock_dataloader,
-                dp_group_size=1,
-                local_batch_size=1,
-            )
+        step_scheduler = build_step_scheduler(
+            cfg=cfg,
+            dataloader=mock_dataloader,
+            dp_group_size=1,
+            local_batch_size=1,
+        )
+        assert step_scheduler is not None
 
 
 # -----------------------------------------------------------------------------
@@ -2030,7 +2047,7 @@ class TestFinetuneRecipeSetup:
         )
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.initialize_distributed",
+            "nemo_automodel.components.distributed.init_utils.initialize_distributed",
             lambda backend, timeout_minutes: mock_dist_info,
         )
 
@@ -2385,35 +2402,6 @@ class TestForwardBackwardStepNonPP:
 # -----------------------------------------------------------------------------
 
 
-def test_build_optimizer_disables_foreach_with_tp():
-    """Test that build_optimizer disables foreach with TP."""
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-
-    # Create a mock device_mesh with tp size > 1
-    mock_tp_submesh = MagicMock()
-    mock_tp_submesh.size.return_value = 2
-    mock_device_mesh = MagicMock()
-    mock_device_mesh.mesh_dim_names = ("dp", "tp")
-    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-            device_mesh=mock_device_mesh,
-        )
-        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
-
-    # Verify foreach was disabled due to TP > 1
-    assert cfg_opt.foreach is False
-    # Verify optimizer is returned as a list
-    assert isinstance(optimizer, list)
-    assert len(optimizer) == 1
-
-
 def test_vlm_build_model_and_optimizer_return_values():
     """Test that VLM build_model and build_optimizer return proper values."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -2519,10 +2507,21 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
+
+    def _stub_build_checkpoint_config(*a, **k):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+        return cfg
+
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_checkpoint_config",
-        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
+        lambda self, **kw: _stub_build_checkpoint_config(),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.setup_distributed",
@@ -2537,26 +2536,16 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
             cp_size=cp_size,
         ),
     )
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
-            load_base_model=lambda *a, **k: None,
-            maybe_wait_for_staging=lambda: None,
-            close=lambda: None,
-        ),
-    )
-
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_optimizer", lambda *a, **k: [dummy_opt])
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.OptimizerSpec.build", lambda self, *a, **k: [dummy_opt])
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_step_scheduler",
-        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr("nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build", lambda self, *a, **k: [])
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.build_metric_logger",
         lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
