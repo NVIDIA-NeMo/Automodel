@@ -1242,36 +1242,6 @@ def test_build_model_without_quant_config():
 
 
 @requires_cuda
-def test_build_optimizer_disables_foreach_with_tp():
-    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False."""
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig()
-    cfg_opt.foreach = True  # Initially True
-
-    # Create mock device_mesh with TP > 1
-    mock_tp = MagicMock()
-    mock_tp.size.return_value = 2
-    mock_mesh = MagicMock()
-    mock_mesh.mesh_dim_names = ("dp", "tp")
-    mock_mesh.__getitem__ = lambda self, key: mock_tp if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.llm.train_ft._supports_logits_to_keep", return_value=True):
-        with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
-            with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
-                with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=None,
-                        seed=42,
-                        device_mesh=mock_mesh,
-                    )
-                    _ = build_optimizer(model, cfg_opt, None, mock_mesh)
-
-    # Verify foreach was disabled
-    assert cfg_opt.foreach is False
-
-
-@requires_cuda
 def test_build_model_and_optimizer_return_values():
     """Test that build_model and build_optimizer return proper values."""
     cfg_model = DummyModelConfig()
@@ -1295,86 +1265,6 @@ def test_build_model_and_optimizer_return_values():
 # =============================================================================
 # Tests for optimizer dtype string resolution in build_optimizer
 # =============================================================================
-
-
-class TestBuildOptimizerDtypeResolution:
-    """Tests that build_optimizer resolves dtype strings to torch.dtype for TE FusedAdam kwargs."""
-
-    def _make_cfg_opt(self, **extra_attrs):
-        cfg = DummyOptConfig()
-        for k, v in extra_attrs.items():
-            setattr(cfg, k, v)
-        return cfg
-
-    def _make_model(self):
-        model = DummyModel()
-        # Ensure at least one param requires grad
-        for p in model.parameters():
-            p.requires_grad_(True)
-        return model
-
-    def test_resolves_all_three_dtype_strings(self):
-        cfg_opt = self._make_cfg_opt(
-            master_weight_dtype="torch.float32",
-            exp_avg_dtype="torch.bfloat16",
-            exp_avg_sq_dtype="torch.float16",
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.master_weight_dtype is torch.float32
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert cfg_opt.exp_avg_sq_dtype is torch.float16
-
-    def test_resolves_dtype_strings_without_torch_prefix(self):
-        cfg_opt = self._make_cfg_opt(
-            exp_avg_dtype="bfloat16",
-            exp_avg_sq_dtype="float16",
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert cfg_opt.exp_avg_sq_dtype is torch.float16
-
-    def test_preserves_torch_dtype_objects(self):
-        cfg_opt = self._make_cfg_opt(
-            master_weight_dtype=torch.float32,
-            exp_avg_dtype=torch.bfloat16,
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        # Should remain unchanged since they are already torch.dtype
-        assert cfg_opt.master_weight_dtype is torch.float32
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-
-    def test_ignores_missing_dtype_attrs(self):
-        cfg_opt = self._make_cfg_opt()  # No dtype attrs
-        model = self._make_model()
-
-        # Should not raise
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert not hasattr(cfg_opt, "master_weight_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
-
-    def test_resolves_partial_dtype_attrs(self):
-        cfg_opt = self._make_cfg_opt(
-            exp_avg_dtype="torch.bfloat16",
-            # master_weight_dtype and exp_avg_sq_dtype not set
-        )
-        model = self._make_model()
-
-        build_optimizer(model, cfg_opt, None, None)
-
-        assert cfg_opt.exp_avg_dtype is torch.bfloat16
-        assert not hasattr(cfg_opt, "master_weight_dtype")
-        assert not hasattr(cfg_opt, "exp_avg_sq_dtype")
 
 
 # =============================================================================

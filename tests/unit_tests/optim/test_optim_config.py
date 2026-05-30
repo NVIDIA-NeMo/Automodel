@@ -158,6 +158,24 @@ class TestBuildOptimizerEscapeHatch:
         assert isinstance(optimizers[0], torch.optim.RMSprop)
         assert optimizers[0].param_groups[0]["alpha"] == 0.95
 
+    def test_resolves_dtype_string_kwargs(self):
+        # dtype strings (e.g. for TE FusedAdam) are resolved to torch.dtype objects.
+        captured = {}
+
+        def fake_factory(params, **kwargs):
+            captured.update(kwargs)
+            return torch.optim.SGD(params, lr=kwargs.get("lr", 0.01))
+
+        build_optimizer(
+            _model(),
+            fake_factory,
+            lr=1e-3,
+            master_weight_dtype="torch.bfloat16",
+            exp_avg_dtype="float16",
+        )
+        assert captured["master_weight_dtype"] is torch.bfloat16
+        assert captured["exp_avg_dtype"] is torch.float16
+
 
 class TestResolveDottedPath:
     def test_resolve_adamw(self):
