@@ -72,14 +72,20 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = BailingMoeV2Attention(config, backend)
 
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         if layer_idx < config.first_k_dense_replace:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
         else:
             self.mlp = MoE(moe_config, backend)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
 
     def forward(
@@ -137,6 +143,11 @@ class BailingMoeV2Model(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
+        # Resolve model dtype once from config.torch_dtype and thread it
+        # explicitly into every sub-module so fp32 master weights work even
+        # when construction is not wrapped in local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # MoE wiring: DeepSeek-V3-style sigmoid + grouped topk + per-expert bias
         # + shared expert.  The framework's ``Gate`` (score_func='sigmoid', n_groups>1,
         # force_e_score_correction_bias=True) is bit-equivalent to BailingMoeV2Gate.
@@ -165,18 +176,19 @@ class BailingMoeV2Model(nn.Module):
             shared_expert_inter_dim=config.moe_intermediate_size,
             shared_expert_activation="swiglu",
             softmax_before_topk=False,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = config.head_dim
@@ -313,13 +325,16 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = BailingMoeV2StateDictAdapter(
                 self.config,
                 self.model.moe_config,
                 self.backend,
-                dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+                dtype=model_dtype,
             )
 
     def get_input_embeddings(self):

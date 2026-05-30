@@ -100,23 +100,38 @@ class Gemma4Gate(nn.Module):
         self.topk = config.top_k_experts
         self.num_experts = num_experts
 
+        # Thread dtype explicitly from config.torch_dtype so the router's own
+        # params (proj weight + scale) stay aligned with the rest of the model
+        # (fp32 under fp32 master weights) even when construction is not wrapped
+        # in local_torch_dtype(). Gemma4RMSNorm(with_scale=False) holds no
+        # learnable parameter, so it needs no dtype threading.
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.norm = Gemma4RMSNorm(hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        self.proj = nn.Linear(hidden_size, num_experts, bias=False)
-        self.scale = nn.Parameter(torch.ones(hidden_size))
+        self.proj = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+        self.scale = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         scalar_root_size = hidden_size**-0.5
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
-        x_norm = self.norm(x)
-        x_norm = x_norm * self.root_size.to(x_norm.dtype)
-        x_norm = x_norm * self.scale.to(x_norm.dtype)
+        # Router math runs in fp32 regardless of parameter/activation storage
+        # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
+        # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
+        # the linear, scaling, and softmax in fp32 — mirroring the fp32 routing
+        # the standard MoE Gate enforces via gate_precision. Weights are cast
+        # back to the input dtype for the downstream expert computation.
+        input_dtype = x.dtype
 
-        expert_scores = self.proj(x_norm)
+        x_norm = self.norm(x).to(torch.float32)
+        x_norm = x_norm * self.root_size.to(torch.float32)
+        x_norm = x_norm * self.scale.to(torch.float32)
+
+        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
-        return weights, indices, None
+        return weights.to(input_dtype), indices, None
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         pass
@@ -305,6 +320,14 @@ class Gemma4MoETextModelBackend(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
+        # Resolve model dtype once from config.torch_dtype and thread it into
+        # MoEConfig so the MoE expert params stay aligned with the rest of the
+        # model (fp32 under fp32 master weights). HF-native submodules
+        # (attention, Gemma4MLP, Gemma4RMSNorm, Gemma4TextScaledWordEmbedding)
+        # inherit their dtype from torch.get_default_dtype() via the
+        # local_torch_dtype() context established by _init_model().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         moe_defaults = dict(
             dim=config.hidden_size,
             inter_dim=config.intermediate_size,
@@ -323,12 +346,12 @@ class Gemma4MoETextModelBackend(nn.Module):
             norm_topk_prob=True,
             expert_activation="geglu",
             softmax_before_topk=False,
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -517,6 +540,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             cfg_text.moe_intermediate_size = cfg_text.expert_intermediate_size
         if not getattr(cfg_text, "expert_intermediate_size", None) and getattr(cfg_text, "moe_intermediate_size", None):
             cfg_text.expert_intermediate_size = cfg_text.moe_intermediate_size
+
+        # _init_model() only overrides the top-level hf_config.torch_dtype; for
+        # VL configs the nested text_config / vision_config keep their original
+        # dtype (typically bf16 from the checkpoint's config.json). Propagate
+        # the user-requested dtype to every nested sub-config that exposes a
+        # torch_dtype attribute, before constructing the HF parent and our
+        # text backend.
+        top_dtype = getattr(config, "torch_dtype", None)
+        if top_dtype is not None:
+            for sub_cfg in vars(config).values():
+                if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
+                    sub_cfg.torch_dtype = top_dtype
 
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)

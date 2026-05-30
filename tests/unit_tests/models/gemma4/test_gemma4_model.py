@@ -154,7 +154,8 @@ class TestGemma4Gate:
 
     def test_scale_initialized_to_ones(self, text_config):
         gate = Gemma4Gate(text_config)
-        torch.testing.assert_close(gate.scale, torch.ones(text_config.hidden_size))
+        # scale storage dtype follows config.torch_dtype; assert the value, not dtype.
+        torch.testing.assert_close(gate.scale, torch.ones(text_config.hidden_size, dtype=gate.scale.dtype))
 
     def test_forward_output_shapes(self, text_config):
         gate = Gemma4Gate(text_config)
@@ -192,6 +193,40 @@ class TestGemma4Gate:
 
         assert (indices >= 0).all()
         assert (indices < text_config.num_experts).all()
+
+    def test_routing_computed_in_fp32_under_bf16_storage(self, text_config, monkeypatch):
+        # Contract: the routing linear + softmax must run in fp32 regardless of
+        # bf16 parameter storage and bf16 activations, so bf16 rounding cannot
+        # flip top-k expert selection. text_config defaults to bf16 storage.
+        import torch.nn.functional as F
+
+        gate = Gemma4Gate(text_config)
+        assert gate.proj.weight.dtype == torch.bfloat16
+        assert gate.scale.dtype == torch.bfloat16
+
+        seen = {}
+        real_linear, real_softmax = F.linear, F.softmax
+
+        def linear_spy(inp, weight, *args, **kwargs):
+            seen["linear_in"] = inp.dtype
+            seen["linear_w"] = weight.dtype
+            return real_linear(inp, weight, *args, **kwargs)
+
+        def softmax_spy(inp, *args, **kwargs):
+            seen["softmax_in"] = inp.dtype
+            return real_softmax(inp, *args, **kwargs)
+
+        monkeypatch.setattr(F, "linear", linear_spy)
+        monkeypatch.setattr(F, "softmax", softmax_spy)
+
+        x = torch.randn(2, 4, text_config.hidden_size, dtype=torch.bfloat16)
+        weights, _, _ = gate(x)
+
+        assert seen["linear_in"] == torch.float32
+        assert seen["linear_w"] == torch.float32
+        assert seen["softmax_in"] == torch.float32
+        # weights are cast back to the input dtype for the downstream experts
+        assert weights.dtype == torch.bfloat16
 
     def test_init_weights_is_noop(self, text_config):
         gate = Gemma4Gate(text_config)
