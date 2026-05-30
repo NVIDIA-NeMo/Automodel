@@ -103,6 +103,16 @@ validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
+# See companion full-SFT yaml for explanation. Disabled-by-omission;
+# uncomment-and-edit this block to enable on LoRA runs.
+# tool_call_eval:
+#   _target_: nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator
+#   dataset_name: llamafactory/glaive_toolcall_en
+#   split: train[:128]
+#   max_eval_samples: 128
+#   max_new_tokens: 256
+#   max_prompt_tokens: 3584
+
 optimizer:
   _target_: torch.optim.AdamW
   betas: [0.9, 0.95]

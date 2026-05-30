@@ -336,6 +336,131 @@ def test_format_example_accepts_empty_tools_string(monkeypatch):
     assert captured["tools"] is None
 
 
+# ---------- _extract_eval_samples_from_example ----------
+
+
+def test_extract_eval_samples_single_toolcall():
+    example = {
+        "id": 42,
+        "tools": json.dumps([{"name": "get_weather"}]),
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "tool_call", "content": json.dumps({"name": "get_weather", "arguments": {"city": "Tokyo"}})},
+            {"role": "tool_response", "content": "sunny"},
+            {"role": "assistant", "content": "It is sunny."},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    s = samples[0]
+    assert s["example_id"] == 42
+    assert s["turn_index"] == 0
+    assert s["tools"] == [{"name": "get_weather"}]
+    assert s["gt_tool_calls"] == [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+    # prompt is just the user turn — assistant tool_call comes next.
+    assert s["prompt_messages"] == [{"role": "user", "content": "weather?"}]
+
+
+def test_extract_eval_samples_multiple_toolcall_positions():
+    example = {
+        "id": "abc",
+        "tools": [{"name": "f"}, {"name": "g"}],
+        "messages": [
+            {"role": "user", "content": "do two things"},
+            {"role": "tool_call", "content": json.dumps({"name": "f", "arguments": {"x": 1}})},
+            {"role": "tool_response", "content": "ok"},
+            {"role": "assistant", "content": "first done"},
+            {"role": "tool_call", "content": json.dumps({"name": "g", "arguments": {"y": 2}})},
+            {"role": "tool_response", "content": "ok"},
+            {"role": "assistant", "content": "all done"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 2
+    assert [s["turn_index"] for s in samples] == [0, 1]
+    assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"x": 1}}]
+    assert samples[1]["gt_tool_calls"] == [{"name": "g", "arguments": {"y": 2}}]
+    # Second sample's prompt is longer than first's.
+    assert len(samples[1]["prompt_messages"]) > len(samples[0]["prompt_messages"])
+
+
+def test_extract_eval_samples_parallel_calls_in_one_turn():
+    example = {
+        "id": 1,
+        "tools": [{"name": "a"}, {"name": "b"}],
+        "messages": [
+            {"role": "user", "content": "do both"},
+            {"role": "tool_call", "content": json.dumps({"name": "a", "arguments": {}})},
+            {"role": "tool_call", "content": json.dumps({"name": "b", "arguments": {"k": 1}})},
+            {"role": "tool_response", "content": "r1"},
+            {"role": "tool_response", "content": "r2"},
+            {"role": "assistant", "content": "done"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    # Parallel calls collapse into one assistant turn -> one eval sample.
+    assert len(samples) == 1
+    assert samples[0]["gt_tool_calls"] == [
+        {"name": "a", "arguments": {}},
+        {"name": "b", "arguments": {"k": 1}},
+    ]
+
+
+def test_extract_eval_samples_no_toolcalls_returns_empty():
+    example = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ],
+    }
+    assert agent_chat._extract_eval_samples_from_example(example) == []
+
+
+def test_extract_eval_samples_sharegpt_schema():
+    example = {
+        "id": 7,
+        "tools": json.dumps([{"name": "search"}]),
+        "conversations": [
+            {"from": "human", "value": "find cats"},
+            {"from": "function_call", "value": json.dumps({"name": "search", "arguments": {"q": "cats"}})},
+            {"from": "observation", "value": "10 results"},
+            {"from": "gpt", "value": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    assert samples[0]["gt_tool_calls"] == [{"name": "search", "arguments": {"q": "cats"}}]
+    assert samples[0]["prompt_messages"] == [{"role": "user", "content": "find cats"}]
+
+
+def test_extract_eval_samples_empty_tools_field_becomes_none():
+    example = {
+        "tools": "",
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "tool_call", "content": json.dumps({"name": "f", "arguments": {}})},
+            {"role": "tool_response", "content": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    assert samples[0]["tools"] is None
+
+
+def test_extract_eval_samples_args_already_dict():
+    # _convert_messages JSON-encodes dict args, but our normalizer must
+    # round-trip them back to a dict so the evaluator can compare directly.
+    example = {
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "tool_call", "content": {"name": "f", "arguments": {"a": 1}}},
+            {"role": "tool_response", "content": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"a": 1}}]
+
+
 def test_mask_labels_to_last_turn_keeps_only_final_run():
     # Two supervised assistant runs separated by an ignored (user/tool) run.
     labels = [-100, 1, 2, -100, -100, 3, 4, -100]
