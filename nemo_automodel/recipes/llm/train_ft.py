@@ -1444,10 +1444,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                if mtp_per_depth_h is not None:
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
                         labels=labels,
                         model=model,
                         scaling_factor=out.mtp_loss_scaling_factor,
