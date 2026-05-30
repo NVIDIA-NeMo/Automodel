@@ -99,9 +99,9 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return state_dict
 
     @staticmethod
-    def _is_unsupported_stage1_key(key: str) -> bool:
-        """Sparse-attention index branch (Stage 2) and MTP (Stage 4) tensors."""
-        return ".self_attn.index_" in key or ".mtp." in key
+    def _is_unsupported_key(key: str) -> bool:
+        """MTP (Stage 4) tensors, not yet owned by the model."""
+        return ".mtp." in key
 
     def _hf_key_to_native(self, key: str) -> str:
         key = key.replace(".block_sparse_moe.gate.weight", ".mlp.gate.weight")
@@ -110,6 +110,8 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         key = re.sub(r"\.block_sparse_moe\.experts\.(\d+)\.w1\.weight$", r".mlp.experts.\1.gate_proj.weight", key)
         key = re.sub(r"\.block_sparse_moe\.experts\.(\d+)\.w3\.weight$", r".mlp.experts.\1.up_proj.weight", key)
         key = re.sub(r"\.block_sparse_moe\.experts\.(\d+)\.w2\.weight$", r".mlp.experts.\1.down_proj.weight", key)
+        # Sparse-attention index branch lives under an ``indexer`` submodule.
+        key = key.replace(".self_attn.index_", ".self_attn.indexer.index_")
         return key
 
     def _native_key_to_hf(self, key: str) -> str:
@@ -119,6 +121,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         key = key.replace(".mlp.gate.weight", ".block_sparse_moe.gate.weight")
         key = key.replace(".mlp.gate.e_score_correction_bias", ".block_sparse_moe.e_score_correction_bias")
         key = key.replace(".shared_experts.", ".block_sparse_moe.shared_experts.")
+        key = key.replace(".self_attn.indexer.index_", ".self_attn.index_")
         return key
 
     def from_hf(
@@ -133,9 +136,9 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 self._uses_model_prefix = key.startswith("model.")
                 break
 
-        # Stage 1: drop tensors for components not yet implemented (index branch / MTP).
+        # Drop tensors for components not yet implemented (MTP, Stage 4).
         for key in list(hf_state_dict.keys()):
-            if self._is_unsupported_stage1_key(key):
+            if self._is_unsupported_key(key):
                 hf_state_dict.pop(key, None)
 
         self._dequantize(hf_state_dict)
