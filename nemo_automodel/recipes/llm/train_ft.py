@@ -94,17 +94,6 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
-
-# optimizer/loss_fn/checkpoint/wandb/mlflow/step_scheduler/lr_scheduler are now
-# consumed via the typed RecipeConfig in setup().  These names are kept only as
-# transitional re-exports for sibling recipes (seq_cls, retrieval) that still
-# import them from this module; removed in Stage 3 once _component_builders is gone.
-from nemo_automodel.recipes._component_builders import (  # noqa: F401
-    build_checkpoint_config,
-    build_lr_scheduler,
-    build_optimizer,
-    build_step_scheduler,
-)
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe

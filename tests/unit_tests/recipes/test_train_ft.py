@@ -31,15 +31,29 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
+from nemo_automodel.recipes._typed_config import CheckpointSpec, OptimizerSpec, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
     build_dataloader,
     build_model,
-    build_optimizer,
     build_validation_dataloader,
     compute_trust_remote_code_from_model,
 )
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
+    return OptimizerSpec(*_callable_and_kwargs(cfg_opt)).build(
+        model, distributed_config=distributed_config, device_mesh=device_mesh
+    )
+
+
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
+    """Resolve a YAML checkpoint block and build it (mirrors ``RecipeConfig.checkpoint.build``)."""
+    return CheckpointSpec(_as_dict(cfg_ckpt) if cfg_ckpt is not None else None).build(
+        cache_dir=cache_dir, model_repo_id=model_repo_id, is_peft=is_peft
+    )
 
 
 class DummyIterableDataset(IterableDataset):  # noqa: D401
@@ -327,7 +341,6 @@ def test_peft_with_tp_disables_triton(caplog):
 def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog):
     """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
     from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
-    from nemo_automodel.recipes.llm.train_ft import build_checkpoint_config
 
     cfg_ckpt = MagicMock()
     cfg_ckpt.to_dict.return_value = {

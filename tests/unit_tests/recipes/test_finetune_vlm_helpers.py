@@ -22,12 +22,48 @@ import torch.nn as nn
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.vlm.pp_media import chunk_vlm_media, prepare_vlm_media_for_pp
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.recipes._component_builders import build_optimizer
+from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+from nemo_automodel.recipes._typed_config import (
+    _STEP_SCHEDULER_RUNTIME_KEYS,
+    CheckpointSpec,
+    OptimizerSpec,
+    _as_dict,
+    _callable_and_kwargs,
+    _section_kwargs,
+)
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
     build_model,
 )
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+    """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
+    return OptimizerSpec(*_callable_and_kwargs(cfg_opt)).build(
+        model, distributed_config=distributed_config, device_mesh=device_mesh
+    )
+
+
+def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
+    """Resolve a YAML checkpoint block and build it (mirrors ``RecipeConfig.checkpoint.build``)."""
+    return CheckpointSpec(_as_dict(cfg_ckpt) if cfg_ckpt is not None else None).build(
+        cache_dir=cache_dir, model_repo_id=model_repo_id, is_peft=is_peft
+    )
+
+
+def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
+    """Build a StepScheduler from a YAML block (mirrors ``RecipeConfig.step_scheduler.build``)."""
+    kwargs = {k: v for k, v in _section_kwargs(cfg).items() if k not in _STEP_SCHEDULER_RUNTIME_KEYS}
+    return StepSchedulerConfig(**kwargs).build(dataloader, dp_group_size, local_batch_size)
+
+
+def build_lr_scheduler(cfg, optimizer, step_scheduler):
+    """Build an LR scheduler from a YAML block (mirrors ``RecipeConfig.lr_scheduler.build``)."""
+    if cfg is None:
+        return None
+    return LRSchedulerConfig(**_section_kwargs(cfg)).build(optimizer, step_scheduler)
 
 
 class _Cfg(SimpleNamespace):
@@ -992,11 +1028,6 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
         )
 
 
-from nemo_automodel.recipes._component_builders import (
-    build_checkpoint_config,
-    build_lr_scheduler,
-    build_step_scheduler,
-)
 from nemo_automodel.recipes.vlm.finetune import calculate_loss
 
 # -----------------------------------------------------------------------------
@@ -1076,21 +1107,21 @@ class TestBuildStepScheduler:
         assert step_scheduler.grad_acc_steps == 32
         assert step_scheduler.ckpt_every_steps == 50
 
-    def test_build_step_scheduler_rejects_target(self):
-        """Test that _target_ in config raises error when passed to StepScheduler."""
+    def test_build_step_scheduler_ignores_target(self):
+        """``_target_`` in the step_scheduler block is dropped by the typed boundary
+        (RecipeConfig.step_scheduler), not passed into StepSchedulerConfig."""
         mock_dataloader = MagicMock()
         mock_dataloader.__len__ = MagicMock(return_value=100)
 
-        # Create a config object where "_target_" in cfg returns True
         cfg = {"_target_": "some.class"}
 
-        with pytest.raises(AssertionError, match="_target_ not permitted"):
-            build_step_scheduler(
-                cfg=cfg,
-                dataloader=mock_dataloader,
-                dp_group_size=1,
-                local_batch_size=1,
-            )
+        step_scheduler = build_step_scheduler(
+            cfg=cfg,
+            dataloader=mock_dataloader,
+            dp_group_size=1,
+            local_batch_size=1,
+        )
+        assert step_scheduler is not None
 
 
 # -----------------------------------------------------------------------------
