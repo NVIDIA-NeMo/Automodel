@@ -15,14 +15,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from nemo_automodel.components.checkpoint import build_checkpoint_config as _build_checkpoint_config
 from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
 from nemo_automodel.components.optim import build_optimizer as _build_optimizer
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 
 def _as_dict(cfg: Any | None) -> dict[str, Any]:
@@ -138,22 +135,3 @@ def build_mlflow(cfg: Any):
     run_config = cfg.to_yaml_dict(use_orig_values=True) if hasattr(cfg, "to_yaml_dict") else _as_dict(cfg)
     checkpoint_dir = cfg.get("checkpoint.checkpoint_dir", None) if hasattr(cfg, "get") else None
     return MLflowConfig(**mlflow_dict).build(checkpoint_dir=checkpoint_dir, run_config=run_config)
-
-
-def build_distributed(cfg_dist: dict[str, Any]) -> DistInfo:
-    """Initialize the distributed environment from a YAML ``dist_env`` block.
-
-    Reads ``backend``/``timeout_minutes`` from the config mapping and delegates
-    to the pure-kwargs component entry point ``initialize_distributed``.
-
-    Args:
-        cfg_dist: The ``dist_env`` config mapping.
-
-    Returns:
-        The initialized ``DistInfo``.
-    """
-    from nemo_automodel.components.distributed.init_utils import initialize_distributed
-
-    backend = cfg_dist.get("backend", "nccl")
-    timeout = cfg_dist.get("timeout_minutes", 1)
-    return initialize_distributed(backend=backend, timeout_minutes=timeout)

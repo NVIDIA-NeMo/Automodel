@@ -57,6 +57,7 @@ from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPret
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -99,7 +100,6 @@ from nemo_automodel.components.utils.model_utils import (
 # recipes that still import them from this module.
 from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
-    build_distributed,
     build_loss_fn,
     build_lr_scheduler,  # noqa: F401
     build_mlflow,  # noqa: F401
