@@ -106,3 +106,38 @@ def sparse_model(sparse_text_config, backend):
     m = MiniMaxM3SparseForCausalLM(sparse_text_config, backend=backend).eval()
     m.initialize_weights(dtype=torch.float32)
     return m
+
+
+# Tiny vision tower (Conv3d patch 2 + temporal 2; head_dim 8; 2 layers).
+VISION_CONFIG = dict(
+    hidden_size=32,
+    num_attention_heads=4,
+    num_hidden_layers=2,
+    intermediate_size=64,
+    patch_size=2,
+    num_channels=3,
+    rope_theta=10000.0,
+    hidden_act="gelu",
+    layer_norm_eps=1e-5,
+    img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2},
+)
+IMAGE_TOKEN_INDEX = 100
+VIDEO_TOKEN_INDEX = 101
+
+
+@pytest.fixture
+def vlm_model(backend):
+    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
+
+    text = {**TINY_CFG, "torch_dtype": "float32", "sparse_attention_config": dict(SPARSE_ATTENTION_CONFIG)}
+    cfg = MiniMaxM3VLConfig(
+        vision_config=dict(VISION_CONFIG),
+        text_config=text,
+        image_token_index=IMAGE_TOKEN_INDEX,
+        video_token_index=VIDEO_TOKEN_INDEX,
+        projector_hidden_size=TINY_CFG["hidden_size"],
+    )
+    m = MiniMaxM3SparseForConditionalGeneration(cfg, backend=backend).eval()
+    m.initialize_weights(dtype=torch.float32)
+    return m

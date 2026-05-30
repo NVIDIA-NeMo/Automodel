@@ -175,3 +175,71 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
         return result
+
+
+class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
+    """VLM adapter: splits the M3 VL checkpoint into text / vision / projector parts.
+
+    The released checkpoint stores the language backbone under
+    ``language_model.model.*`` / ``language_model.lm_head`` and the vision side
+    under ``vision_tower.vision_model.*`` with the projector / patch-merger at
+    top level (``multi_modal_projector.*`` / ``patch_merge_mlp.*``).  The native
+    VLM keeps the text model at ``model.*`` / ``lm_head`` and nests the projector
+    / merger under ``vision_tower.*``.  Text tensors are delegated to
+    :class:`MiniMaxM3StateDictAdapter` (block_sparse_moe -> mlp, index branch,
+    MXFP8 dequant, grouped experts); vision tensors are BF16 and pass through.
+    """
+
+    def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig, dtype: torch.dtype = torch.bfloat16):
+        self.config = config
+        self.text_adapter = MiniMaxM3StateDictAdapter(config.text_config, moe_config, backend, dtype=dtype)
+
+    @staticmethod
+    def _map_non_text_from_hf(key: str) -> str | None:
+        if ".mtp." in key:
+            return None  # MTP (Stage 4)
+        if key.startswith("multi_modal_projector.") or key.startswith("patch_merge_mlp."):
+            return "vision_tower." + key
+        return key  # vision_tower.vision_model.* passes through
+
+    @staticmethod
+    def _map_non_text_to_hf(key: str) -> str:
+        if key.startswith("vision_tower.multi_modal_projector.") or key.startswith("vision_tower.patch_merge_mlp."):
+            return key[len("vision_tower.") :]
+        return key
+
+    def from_hf(self, hf_state_dict: dict[str, Any], device_mesh=None, **kwargs) -> dict[str, Any]:
+        # Native text keys are model.* / lm_head.* (self.model + self.lm_head);
+        # the checkpoint's language_model. prefix is stripped here and re-added in to_hf.
+        text_hf: dict[str, Any] = {}
+        native: dict[str, Any] = {}
+        for key, value in hf_state_dict.items():
+            if key.startswith("language_model."):
+                text_hf[key[len("language_model.") :]] = value
+                continue
+            mapped = self._map_non_text_from_hf(key)
+            if mapped is not None:
+                native[mapped] = value
+
+        native.update(self.text_adapter.from_hf(text_hf, device_mesh=device_mesh, **kwargs))
+        return native
+
+    def to_hf(self, state_dict: dict[str, Any], exclude_key_regex=None, quantization: bool = False, **kwargs):
+        hf_state_dict: dict[str, Any] = {}
+        for key, tensor in state_dict.items():
+            for hf_key, hf_tensor in self.convert_single_tensor_to_hf(
+                key, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization, **kwargs
+            ):
+                hf_state_dict[hf_key] = hf_tensor
+        return hf_state_dict
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        if fqn.startswith("vision_tower."):
+            hf_key = self._map_non_text_to_hf(fqn)
+            if exclude_key_regex and re.match(exclude_key_regex, hf_key):
+                return []
+            return [(hf_key, tensor)]
+        # Text backbone (model.* / lm_head.*): delegate, then re-add language_model. prefix.
+        converted = self.text_adapter.convert_single_tensor_to_hf(fqn, tensor, **kwargs)
+        return [("language_model." + k, v) for k, v in converted]
