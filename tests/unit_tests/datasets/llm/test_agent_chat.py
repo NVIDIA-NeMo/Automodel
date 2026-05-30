@@ -336,6 +336,171 @@ def test_format_example_accepts_empty_tools_string(monkeypatch):
     assert captured["tools"] is None
 
 
+# ---------- _extract_eval_samples_from_example ----------
+
+
+def test_extract_eval_samples_single_toolcall():
+    example = {
+        "id": 42,
+        "tools": json.dumps([{"name": "get_weather"}]),
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "tool_call", "content": json.dumps({"name": "get_weather", "arguments": {"city": "Tokyo"}})},
+            {"role": "tool_response", "content": "sunny"},
+            {"role": "assistant", "content": "It is sunny."},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    s = samples[0]
+    assert s["example_id"] == 42
+    assert s["turn_index"] == 0
+    assert s["tools"] == [{"name": "get_weather"}]
+    assert s["gt_tool_calls"] == [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+    # prompt is just the user turn — assistant tool_call comes next.
+    assert s["prompt_messages"] == [{"role": "user", "content": "weather?"}]
+
+
+def test_extract_eval_samples_multiple_toolcall_positions():
+    example = {
+        "id": "abc",
+        "tools": [{"name": "f"}, {"name": "g"}],
+        "messages": [
+            {"role": "user", "content": "do two things"},
+            {"role": "tool_call", "content": json.dumps({"name": "f", "arguments": {"x": 1}})},
+            {"role": "tool_response", "content": "ok"},
+            {"role": "assistant", "content": "first done"},
+            {"role": "tool_call", "content": json.dumps({"name": "g", "arguments": {"y": 2}})},
+            {"role": "tool_response", "content": "ok"},
+            {"role": "assistant", "content": "all done"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 2
+    assert [s["turn_index"] for s in samples] == [0, 1]
+    assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"x": 1}}]
+    assert samples[1]["gt_tool_calls"] == [{"name": "g", "arguments": {"y": 2}}]
+    # Second sample's prompt is longer than first's.
+    assert len(samples[1]["prompt_messages"]) > len(samples[0]["prompt_messages"])
+
+
+def test_extract_eval_samples_parallel_calls_in_one_turn():
+    example = {
+        "id": 1,
+        "tools": [{"name": "a"}, {"name": "b"}],
+        "messages": [
+            {"role": "user", "content": "do both"},
+            {"role": "tool_call", "content": json.dumps({"name": "a", "arguments": {}})},
+            {"role": "tool_call", "content": json.dumps({"name": "b", "arguments": {"k": 1}})},
+            {"role": "tool_response", "content": "r1"},
+            {"role": "tool_response", "content": "r2"},
+            {"role": "assistant", "content": "done"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    # Parallel calls collapse into one assistant turn -> one eval sample.
+    assert len(samples) == 1
+    assert samples[0]["gt_tool_calls"] == [
+        {"name": "a", "arguments": {}},
+        {"name": "b", "arguments": {"k": 1}},
+    ]
+
+
+def test_extract_eval_samples_no_toolcalls_returns_empty():
+    example = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ],
+    }
+    assert agent_chat._extract_eval_samples_from_example(example) == []
+
+
+def test_extract_eval_samples_sharegpt_schema():
+    example = {
+        "id": 7,
+        "tools": json.dumps([{"name": "search"}]),
+        "conversations": [
+            {"from": "human", "value": "find cats"},
+            {"from": "function_call", "value": json.dumps({"name": "search", "arguments": {"q": "cats"}})},
+            {"from": "observation", "value": "10 results"},
+            {"from": "gpt", "value": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    assert samples[0]["gt_tool_calls"] == [{"name": "search", "arguments": {"q": "cats"}}]
+    assert samples[0]["prompt_messages"] == [{"role": "user", "content": "find cats"}]
+
+
+def test_extract_eval_samples_empty_tools_field_becomes_none():
+    example = {
+        "tools": "",
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "tool_call", "content": json.dumps({"name": "f", "arguments": {}})},
+            {"role": "tool_response", "content": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    assert samples[0]["tools"] is None
+
+
+def test_extract_eval_samples_args_already_dict():
+    # _convert_messages JSON-encodes dict args, but our normalizer must
+    # round-trip them back to a dict so the evaluator can compare directly.
+    example = {
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "tool_call", "content": {"name": "f", "arguments": {"a": 1}}},
+            {"role": "tool_response", "content": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"a": 1}}]
+
+
+def test_mask_labels_to_last_turn_keeps_only_final_run():
+    # Two supervised assistant runs separated by an ignored (user/tool) run.
+    labels = [-100, 1, 2, -100, -100, 3, 4, -100]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100, -100, -100, 3, 4, -100]
+
+
+def test_mask_labels_to_last_turn_single_run_unchanged():
+    labels = [-100, -100, 5, 6, 7]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, 5, 6, 7]
+
+
+def test_mask_labels_to_last_turn_no_supervised_tokens_is_noop():
+    labels = [-100, -100, -100]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100]
+
+
+def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch):
+    # ``labels`` carry two supervised assistant runs; with the flag set only
+    # the final run survives. Without it, both runs stay supervised.
+    def fake_format_chat_template(**kwargs):
+        return {"input_ids": [10, 11, 12, 13, 14, 15], "labels": [-100, 1, -100, -100, 2, 3]}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+
+    kept = agent_chat._format_example(example, Tok(), 0, 0)
+    assert kept["labels"] == [-100, 1, -100, -100, 2, 3]
+
+    masked = agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
+    assert masked["labels"] == [-100, -100, -100, -100, 2, 3]
+
+
 def test_convert_messages_preserves_assistant_reasoning_content():
     messages = [
         {"role": "user", "content": "2+2?"},
@@ -385,3 +550,73 @@ def test_format_example_forwards_mask_reasoning_content(monkeypatch):
 
     agent_chat._format_example(example, Tok(), 0, 0, mask_reasoning_content=True)
     assert captured["mask_reasoning_content"] is True
+
+
+def test_convert_messages_drops_history_reasoning_keeps_last():
+    # Two assistant turns each carry reasoning; only the final one should keep it.
+    messages = [
+        {"role": "user", "content": "weather BJ?"},
+        {"role": "assistant", "content": "Beijing is sunny", "reasoning_content": "first thought"},
+        {"role": "user", "content": "and SH?"},
+        {"role": "assistant", "content": "Shanghai is rainy", "reasoning_content": "second thought"},
+    ]
+    out = agent_chat._convert_messages(messages, drop_history_reasoning_content=True)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]
+    assert assistants[1]["reasoning_content"] == "second thought"
+
+
+def test_convert_messages_keeps_all_reasoning_by_default():
+    messages = [
+        {"role": "user", "content": "weather BJ?"},
+        {"role": "assistant", "content": "Beijing is sunny", "reasoning_content": "first thought"},
+        {"role": "user", "content": "and SH?"},
+        {"role": "assistant", "content": "Shanghai is rainy", "reasoning_content": "second thought"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert assistants[0]["reasoning_content"] == "first thought"
+    assert assistants[1]["reasoning_content"] == "second thought"
+
+
+def test_convert_messages_drop_history_reasoning_handles_tool_call_turn():
+    # The final assistant turn is a tool_call merge; its reasoning must survive
+    # while an earlier assistant turn's reasoning is dropped.
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello", "reasoning_content": "greet back"},
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "reasoning_content": "call the tool"},
+        {"role": "tool_call", "content": '{"name":"aqi","arguments":{"city":"BJ"}}'},
+    ]
+    out = agent_chat._convert_messages(messages, example_id=1, drop_history_reasoning_content=True)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]
+    assert assistants[1]["reasoning_content"] == "call the tool"
+    assert assistants[1]["tool_calls"][0]["function"]["name"] == "aqi"
+
+
+def test_format_example_forwards_drop_history_reasoning_content(monkeypatch):
+    captured = {}
+
+    def fake_convert_messages(messages, example_id=None, drop_history_reasoning_content=False):
+        captured["drop_history_reasoning_content"] = drop_history_reasoning_content
+        return [{"role": "user", "content": "hi"}]
+
+    def fake_format_chat_template(**kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "_convert_messages", fake_convert_messages)
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["drop_history_reasoning_content"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, drop_history_reasoning_content=True)
+    assert captured["drop_history_reasoning_content"] is True

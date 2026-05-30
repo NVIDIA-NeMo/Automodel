@@ -328,7 +328,10 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     recipe.model_parts = [model]  # Now uses model_parts instead of model
     recipe.pp_enabled = False  # Pipeline parallelism disabled
     recipe.optimizer = [_DummyOptimizer()]  # Now a list
-    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` when the
+    # composite (gemma4 joint drafter) attaches drafter logits; default False
+    # so non-drafter test paths skip the log line.
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
@@ -402,7 +405,7 @@ def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     recipe.model_parts = [_TensorModel()]
     recipe.pp_enabled = True
     recipe.optimizer = [_DummyOptimizer()]
-    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0)
+    recipe.step_scheduler = SimpleNamespace(step=0, epoch=0, is_remote_logging_step=False)
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.cfg = _Cfg(fp8=None)
     recipe.lr_scheduler = None
@@ -2133,6 +2136,10 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe.__dict__["distributed_config"] = None
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
+    # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to
+    # gate the joint-drafter loss-log line; default False so non-drafter
+    # test paths don't trip on the new attribute.
+    recipe.__dict__["step_scheduler"] = SimpleNamespace(is_remote_logging_step=False)
     return recipe
 
 
