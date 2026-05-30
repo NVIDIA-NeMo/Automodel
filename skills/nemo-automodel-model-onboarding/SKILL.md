@@ -249,6 +249,28 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
+### 2.6 Keep intrinsically-fp32 params in fp32 compute
+
+Some parameters are numerically unstable in low precision and must be **computed** in fp32
+even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log`, `dt_bias`, `D`;
+MoE sigmoid-gate bias (`e_score_correction_bias`); attention-sink bias; per-head `scale`.
+If your model has any such params, declare them in `_keep_in_fp32_modules_strict` as
+parameter-name substrings; sharding (`fully_shard_by_dtype`) reads this list and gives those
+params an fp32 compute dtype while everything else uses `mp_policy.param_dtype` (bf16). A
+plain dense LLM with no precision-sensitive params needs nothing here.
+
+Where to declare it:
+
+- **NeMo-native model class** (you own `model.py`): a class attribute, e.g.
+  `_keep_in_fp32_modules_strict = ["e_score_correction_bias"]` (see `deepseek_v4`, `ling_v2`).
+- **HF model you only patch** (e.g. Qwen3.5): set it on the instance inside `patch_hf_model`,
+  e.g. `model._keep_in_fp32_modules_strict = existing + ("_fp32_params",)`.
+
+Always declare the pin for these params. A normal checkpoint load also auto-records each
+param's original HF dtype and uses it as a fallback, but that recording is skipped on the
+quantized, from-scratch, and odd-checkpoint paths — so the explicit pin is the only signal
+that holds across every path.
+
 ---
 
 ## Phase 3: Onboarding Example Config
@@ -374,6 +396,7 @@ that only surface in a full parity comparison.
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
+- [ ] Declared `_keep_in_fp32_modules_strict` for every intrinsically-fp32 param (SSM `A_log`/`dt_bias`/`D`, MoE gate bias, attention-sink bias, `scale`, …) — see §2.6
 - [ ] Created layer equivalence tests for every rewritten layer (matching model dtype)
 - [ ] Created functional tests (training loss decreases)
 - [ ] Updated docs/model-coverage page
