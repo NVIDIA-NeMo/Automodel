@@ -529,10 +529,13 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_dataloader", lambda *a, **k: ("dl", "tok"))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_validation_dataloader", lambda *a, **k: {})
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_step_scheduler",
-        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build",
+        lambda self, *a, **k: [],
+    )
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_metric_logger",
         lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),

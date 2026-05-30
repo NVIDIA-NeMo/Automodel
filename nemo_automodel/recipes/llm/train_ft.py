@@ -58,9 +58,9 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -97,16 +97,21 @@ from nemo_automodel.components.utils.model_utils import (
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
+
+# wandb/mlflow/step_scheduler/lr_scheduler are now consumed via the typed
+# RecipeConfig in setup(); these names are kept only as re-exports for sibling
+# recipes that still import them from this module.
 from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
     build_loss_fn,
-    build_lr_scheduler,
-    build_mlflow,
+    build_lr_scheduler,  # noqa: F401
+    build_mlflow,  # noqa: F401
     build_optimizer,
-    build_step_scheduler,
-    build_wandb,
+    build_step_scheduler,  # noqa: F401
+    build_wandb,  # noqa: F401
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 
@@ -166,7 +171,7 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
-        return cfg.step_scheduler.local_batch_size // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+        return cfg.get("step_scheduler.local_batch_size", 1) // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
     return 1
 
 
@@ -654,9 +659,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Initialize the recipe with configuration.
 
         Args:
-            cfg: Configuration dictionary/object for training.
+            cfg: Configuration dictionary/object for training.  May be a raw
+                ``ConfigNode`` or an already-coerced ``RecipeConfig`` — the
+                wrapper is idempotent.
         """
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     # ------------------ build phase ------------------
     def setup(self):
@@ -686,13 +693,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
-        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            if build_mlflow(self.cfg) is not None:
+        if self.dist_env.is_main and self.cfg.mlflow is not None:
+            run_config = self.cfg.to_yaml_dict(use_orig_values=True)
+            checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
+            if self.cfg.mlflow.build(checkpoint_dir=checkpoint_dir, run_config=run_config) is not None:
                 logging.info("MLflow experiment tracking enabled")
 
         self.comet_logger = None
@@ -710,7 +719,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
-            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
             assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
@@ -869,17 +878,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             model=self.model_parts[0],
         )
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
-        # Scheduler
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        # Scheduler — typed configs from RecipeConfig, built with runtime args here.
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
-        # Build learning rate scheduler
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        # Build learning rate scheduler (None when no lr_scheduler section).
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
 
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
