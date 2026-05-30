@@ -66,8 +66,10 @@ def build_checkpoint_config(
 
 
 def build_loss_fn(cfg_loss: Any) -> Any:
+    # YAML resolves _target_ to a callable; pass it (plus kwargs) to the
+    # dotted-path / class form of build_loss_fn.
     loss_factory, loss_kwargs = _callable_and_kwargs(cfg_loss)
-    return _build_loss_fn(loss_factory=loss_factory, loss_kwargs=loss_kwargs)
+    return _build_loss_fn(loss_factory, **loss_kwargs)
 
 
 def build_optimizer(model: Any, cfg_opt: Any, distributed_config: Any, device_mesh: Any):

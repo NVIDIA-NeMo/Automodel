@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.loss.api import build_loss_fn
-from nemo_automodel.components.loss.config import (
+from nemo_automodel.components.loss.loss import (
     FusedLinearCEConfig,
     KDLossConfig,
     LossConfig,
     MaskedCrossEntropyConfig,
     TEParallelCEConfig,
+    build_loss_fn,
 )
 
 __all__ = [

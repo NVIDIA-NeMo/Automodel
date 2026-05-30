@@ -12,36 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for nemo_automodel.components.loss.config — LossConfig hierarchy."""
+"""Tests for nemo_automodel.components.loss.loss — typed configs + build_loss_fn."""
 
 import pytest
 
-from nemo_automodel.components.loss.config import (
+from nemo_automodel.components.loss.loss import (
     FusedLinearCEConfig,
     KDLossConfig,
     LossConfig,
     MaskedCrossEntropyConfig,
     TEParallelCEConfig,
+    _resolve_dotted_path,
+    build_loss_fn,
 )
 
 # ---------------------------------------------------------------------------
-# LossConfig base
-# ---------------------------------------------------------------------------
-
-
-class TestLossConfig:
-    def test_defaults(self):
-        cfg = LossConfig()
-        assert "MaskedCrossEntropy" in cfg.name
-        assert cfg.extra_kwargs == {}
-
-    def test_to_kwargs(self):
-        cfg = LossConfig(extra_kwargs={"alpha": 0.5})
-        assert cfg.to_kwargs() == {"alpha": 0.5}
-
-
-# ---------------------------------------------------------------------------
-# Typed subclasses
+# Typed config fields + build()
 # ---------------------------------------------------------------------------
 
 
@@ -52,22 +38,20 @@ class TestMaskedCrossEntropyConfig:
         assert cfg.ignore_index == -100
         assert cfg.reduction == "sum"
 
-    def test_to_kwargs(self):
-        cfg = MaskedCrossEntropyConfig(fp32_upcast=False)
-        kwargs = cfg.to_kwargs()
-        assert kwargs["fp32_upcast"] is False
-        assert kwargs["ignore_index"] == -100
-        assert kwargs["reduction"] == "sum"
+    def test_build(self):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        loss = MaskedCrossEntropyConfig(fp32_upcast=False).build()
+        assert isinstance(loss, MaskedCrossEntropy)
+        assert loss.fp32_upcast is False
 
 
 class TestFusedLinearCEConfig:
     def test_defaults(self):
         cfg = FusedLinearCEConfig()
         assert cfg.logit_softcapping == 0.0
-
-    def test_to_kwargs(self):
-        cfg = FusedLinearCEConfig(logit_softcapping=30.0)
-        assert cfg.to_kwargs()["logit_softcapping"] == 30.0
+        assert cfg.ignore_index == -100
+        assert cfg.reduction == "sum"
 
 
 class TestTEParallelCEConfig:
@@ -76,48 +60,102 @@ class TestTEParallelCEConfig:
         assert cfg.ignore_index == -100
         assert cfg.reduction == "sum"
 
-    def test_to_kwargs(self):
-        cfg = TEParallelCEConfig(reduction="mean")
-        assert cfg.to_kwargs()["reduction"] == "mean"
-
 
 class TestKDLossConfig:
     def test_defaults(self):
         cfg = KDLossConfig()
         assert cfg.temperature == 1.0
         assert cfg.fp32_upcast is True
+        assert cfg.ignore_index == -100
 
-    def test_to_kwargs(self):
-        cfg = KDLossConfig(temperature=2.0, fp32_upcast=False)
-        kwargs = cfg.to_kwargs()
-        assert kwargs["temperature"] == 2.0
-        assert kwargs["fp32_upcast"] is False
-
-
-# ---------------------------------------------------------------------------
-# build_loss_fn with config
-# ---------------------------------------------------------------------------
-
-
-class TestBuildLossFnWithConfig:
-    def test_build_masked_ce_from_config(self):
-        from nemo_automodel.components.loss.api import build_loss_fn
-        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-        loss = build_loss_fn(config=MaskedCrossEntropyConfig(fp32_upcast=False))
-        assert isinstance(loss, MaskedCrossEntropy)
-        assert loss.fp32_upcast is False
-
-    def test_build_kd_loss_from_config(self):
-        from nemo_automodel.components.loss.api import build_loss_fn
+    def test_build(self):
         from nemo_automodel.components.loss.kd_loss import KDLoss
 
-        loss = build_loss_fn(config=KDLossConfig(temperature=2.0))
+        loss = KDLossConfig(temperature=2.0).build()
         assert isinstance(loss, KDLoss)
         assert loss.temperature == 2.0
 
-    def test_build_requires_config_or_factory(self):
-        from nemo_automodel.components.loss.api import build_loss_fn
 
-        with pytest.raises(ValueError, match="Either config or loss_factory"):
-            build_loss_fn()
+class TestLossConfigBase:
+    def test_base_build_not_implemented(self):
+        with pytest.raises(NotImplementedError):
+            LossConfig().build()
+
+
+# ---------------------------------------------------------------------------
+# build_loss_fn — typed config (native path)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLossFnTypedConfig:
+    def test_masked_ce(self):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        loss = build_loss_fn(MaskedCrossEntropyConfig(fp32_upcast=False))
+        assert isinstance(loss, MaskedCrossEntropy)
+        assert loss.fp32_upcast is False
+
+    def test_kd_loss(self):
+        from nemo_automodel.components.loss.kd_loss import KDLoss
+
+        loss = build_loss_fn(KDLossConfig(temperature=2.0))
+        assert isinstance(loss, KDLoss)
+        assert loss.temperature == 2.0
+
+    def test_config_with_kwargs_raises(self):
+        with pytest.raises(ValueError, match="must be set on the config"):
+            build_loss_fn(MaskedCrossEntropyConfig(), fp32_upcast=False)
+
+    def test_config_class_instead_of_instance_raises(self):
+        with pytest.raises(TypeError, match="instance, not the class"):
+            build_loss_fn(MaskedCrossEntropyConfig)
+
+
+# ---------------------------------------------------------------------------
+# build_loss_fn — dotted-path / class form (integration / YAML escape hatch)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLossFnEscapeHatch:
+    def test_dotted_path_string(self):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        loss = build_loss_fn(
+            "nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy",
+            fp32_upcast=False,
+        )
+        assert isinstance(loss, MaskedCrossEntropy)
+        assert loss.fp32_upcast is False
+
+    def test_resolved_class(self):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        loss = build_loss_fn(MaskedCrossEntropy, reduction="mean")
+        assert isinstance(loss, MaskedCrossEntropy)
+
+    def test_arbitrary_factory_kwargs(self):
+        # Any callable + kwargs works; no typed config required.
+        captured = {}
+
+        def fake_loss(**kwargs):
+            captured.update(kwargs)
+            return "loss_module"
+
+        result = build_loss_fn(fake_loss, alpha=0.5, beta=0.3)
+        assert result == "loss_module"
+        assert captured == {"alpha": 0.5, "beta": 0.3}
+
+
+class TestResolveDottedPath:
+    def test_resolve(self):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+        assert _resolve_dotted_path("nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy") is MaskedCrossEntropy
+
+    def test_bad_path_no_dot(self):
+        with pytest.raises(ValueError, match="Expected a dotted path"):
+            _resolve_dotted_path("MaskedCrossEntropy")
+
+    def test_bad_class(self):
+        with pytest.raises(ImportError, match="Cannot find"):
+            _resolve_dotted_path("nemo_automodel.components.loss.masked_ce.NonExistent")
