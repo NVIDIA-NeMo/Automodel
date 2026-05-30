@@ -33,9 +33,13 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3RMSNorm
-from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import MiniMaxM3StateDictAdapter
+from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
+    MiniMaxM3StateDictAdapter,
+    MiniMaxM3VLStateDictAdapter,
+)
+from nemo_automodel.components.models.minimax_m3_vl.vision_encoder import MiniMaxM3VisionModel
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
@@ -266,4 +270,147 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
             self.model.rotary_emb.device = buffer_device
 
 
-ModelClass = MiniMaxM3SparseForCausalLM
+class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    """MiniMax M3 VL: CLIP-style vision tower + projector/merger + M3 text backbone.
+
+    Vision features (``vision_tower(pixel_values, grid_thw)``) are spliced into
+    the text embeddings at ``image_token_index`` / ``video_token_index``
+    positions, then run through the (sparse/dense MoE) language model + lm_head.
+    """
+
+    @classmethod
+    def from_config(
+        cls, config: Any, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None, **kwargs
+    ):
+        return cls(config, moe_config, backend, **kwargs)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
+        config = MiniMaxM3VLConfig.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
+
+    def __init__(
+        self,
+        config: Any,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.config = config
+        text_config = config.text_config
+        self.backend = backend or BackendConfig()
+        self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False
+        )
+        self.vision_tower = MiniMaxM3VisionModel(
+            config.vision_config,
+            text_config.hidden_size,
+            config.projector_hidden_size,
+            projector_hidden_act=config.projector_hidden_act,
+            multimodal_projector_bias=config.multimodal_projector_bias,
+        )
+        self.image_token_index = config.image_token_index
+        self.video_token_index = config.video_token_index
+        self.vocab_size = text_config.vocab_size
+        if self.backend.enable_hf_state_dict_adapter:
+            self.state_dict_adapter = MiniMaxM3VLStateDictAdapter(
+                config,
+                self.model.moe_config,
+                self.backend,
+                dtype=get_dtype(getattr(text_config, "torch_dtype", "bfloat16"), torch.bfloat16),
+            )
+
+    @property
+    def language_model(self):
+        return self.model
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    @staticmethod
+    def _to_grid_list(grid_thw) -> list[list[int]]:
+        if isinstance(grid_thw, torch.Tensor):
+            return grid_thw.detach().cpu().to(torch.int64).tolist()
+        return [list(map(int, g)) for g in grid_thw]
+
+    def _splice_multimodal(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        grid_thw,
+        token_index: int,
+    ) -> torch.Tensor:
+        features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
+        mask = input_ids == token_index
+        expected = int(mask.sum().item())
+        if features.shape[0] != expected:
+            raise ValueError(
+                f"MiniMax M3 VL: got {features.shape[0]} vision tokens for {expected} placeholder positions "
+                f"(token_index={token_index})."
+            )
+        inputs_embeds[mask] = features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        return inputs_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw=None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw=None,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            if pixel_values is not None or pixel_values_videos is not None:
+                inputs_embeds = inputs_embeds.clone()
+            if pixel_values is not None:
+                inputs_embeds = self._splice_multimodal(
+                    inputs_embeds, input_ids, pixel_values, image_grid_thw, self.image_token_index
+                )
+            if pixel_values_videos is not None:
+                inputs_embeds = self._splice_multimodal(
+                    inputs_embeds, input_ids, pixel_values_videos, video_grid_thw, self.video_token_index
+                )
+
+        hidden = self.model(
+            None,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        return self.lm_head(hidden)
+
+    @torch.no_grad()
+    def initialize_weights(
+        self, buffer_device: torch.device | None = None, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
+        buffer_device = buffer_device or torch.device(
+            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+        )
+        with buffer_device:
+            self.model.init_weights(buffer_device=buffer_device)
+            final_out_std = self.config.text_config.hidden_size**-0.5
+            nn.init.trunc_normal_(
+                self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
+            )
+        cast_model_to_dtype(self, dtype)
+        with buffer_device:
+            self.model.rotary_emb.device = buffer_device
+
+
+ModelClass = MiniMaxM3SparseForConditionalGeneration

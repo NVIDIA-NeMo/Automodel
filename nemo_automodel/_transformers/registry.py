@@ -126,8 +126,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
         ),
         (
-            "MiniMaxM3SparseForCausalLM",
-            ("nemo_automodel.components.models.minimax_m3_vl.model", "MiniMaxM3SparseForCausalLM"),
+            "MiniMaxM3SparseForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.minimax_m3_vl.model",
+                "MiniMaxM3SparseForConditionalGeneration",
+            ),
         ),
         (
             "MiMoV2FlashForCausalLM",
@@ -275,7 +278,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
-    "minimax_m3": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLTextConfig"),
+    "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),

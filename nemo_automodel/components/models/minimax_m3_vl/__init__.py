@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+from nemo_automodel.components.models.minimax_m3_vl.config import (
+    MiniMaxM3VLConfig,
+    MiniMaxM3VLTextConfig,
+    MiniMaxM3VLVisionConfig,
+)
+from nemo_automodel.components.models.minimax_m3_vl.model import (
+    MiniMaxM3SparseForCausalLM,
+    MiniMaxM3SparseForConditionalGeneration,
+)
 
-ModelClass = MiniMaxM3SparseForCausalLM
+ModelClass = MiniMaxM3SparseForConditionalGeneration
+
+__all__ = [
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+    "MiniMaxM3VLConfig",
+    "MiniMaxM3VLTextConfig",
+    "MiniMaxM3VLVisionConfig",
+    "ModelClass",
+]
