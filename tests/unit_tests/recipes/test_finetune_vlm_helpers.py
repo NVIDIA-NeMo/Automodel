@@ -290,6 +290,77 @@ def test_build_model_no_moe_config_when_cfg_moe_is_none():
     assert "activation_checkpointing" not in captured_kwargs
 
 
+def test_build_model_passes_quantization_config():
+    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    cfg_quantization = SimpleNamespace(load_in_4bit=True)
+    sentinel_bnb = object()
+
+    with (
+        patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
+        patch(
+            "nemo_automodel.components.quantization.qlora.create_bnb_config",
+            return_value=sentinel_bnb,
+        ) as mock_create,
+    ):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+            cfg_quantization=cfg_quantization,
+        )
+
+    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
+    mock_create.assert_called_once_with(cfg_quantization)
+    assert captured_kwargs.get("quantization_config") is sentinel_bnb
+
+
+def test_build_model_no_quantization_config_when_none():
+    """No quantization_config kwarg when cfg_quantization is None (the default)."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+
+    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
+        build_model(
+            cfg_model=cfg_model,
+            cfg_freeze=None,
+            cfg_peft=None,
+            seed=123,
+        )
+
+    assert "quantization_config" not in captured_kwargs
+
+
 # -----------------------------------------------------------------------------
 # FinetuneRecipeForVLM helpers
 # -----------------------------------------------------------------------------
