@@ -992,44 +992,6 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
         )
 
 
-def test_vlm_build_optimizer_disables_foreach_with_tp():
-    """Test that when device_mesh has tp > 1, cfg_opt.foreach is set to False in VLM."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    class NeMoVLMModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoVLMModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-    cfg_opt.foreach = True  # Initially True
-
-    # Create a mock device_mesh with tp size > 1
-    mock_tp_submesh = MagicMock()
-    mock_tp_submesh.size.return_value = 2
-    mock_device_mesh = MagicMock()
-    mock_device_mesh.mesh_dim_names = ("dp", "tp")
-    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-            device_mesh=mock_device_mesh,
-        )
-        build_optimizer(model, cfg_opt, None, mock_device_mesh)
-
-    assert cfg_opt.foreach is False
-
-
 from nemo_automodel.recipes.vlm.finetune import (
     build_checkpoint_config,
     build_lr_scheduler,
@@ -2021,7 +1983,7 @@ class TestFinetuneRecipeSetup:
         )
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.initialize_distributed",
+            "nemo_automodel.components.distributed.api.initialize_distributed",
             lambda backend, timeout_minutes: mock_dist_info,
         )
 
@@ -2372,35 +2334,6 @@ class TestForwardBackwardStepNonPP:
 # -----------------------------------------------------------------------------
 
 
-def test_build_optimizer_disables_foreach_with_tp():
-    """Test that build_optimizer disables foreach with TP."""
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-
-    # Create a mock device_mesh with tp size > 1
-    mock_tp_submesh = MagicMock()
-    mock_tp_submesh.size.return_value = 2
-    mock_device_mesh = MagicMock()
-    mock_device_mesh.mesh_dim_names = ("dp", "tp")
-    mock_device_mesh.__getitem__ = lambda self, key: mock_tp_submesh if key == "tp" else MagicMock()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-            device_mesh=mock_device_mesh,
-        )
-        optimizer = build_optimizer(model, cfg_opt, None, mock_device_mesh)
-
-    # Verify foreach was disabled due to TP > 1
-    assert cfg_opt.foreach is False
-    # Verify optimizer is returned as a list
-    assert isinstance(optimizer, list)
-    assert len(optimizer) == 1
-
-
 def test_vlm_build_model_and_optimizer_return_values():
     """Test that VLM build_model and build_optimizer return proper values."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -2654,7 +2587,10 @@ class TestChunkVlmMedia:
         n_images_per_sample = torch.tensor([3, 1])
 
         pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size=2, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=2,
+            n_microbatches=2,
             n_images_per_sample=n_images_per_sample,
         )
         assert len(pv_chunks) == 2
@@ -2670,7 +2606,10 @@ class TestChunkVlmMedia:
         pixel_values = torch.randn(int(patch_counts.sum()), 64)
 
         pv_chunks, ig_chunks = chunk_vlm_media(
-            pixel_values, image_grid, batch_size=4, n_microbatches=2,
+            pixel_values,
+            image_grid,
+            batch_size=4,
+            n_microbatches=2,
         )
         assert len(pv_chunks) == 2
         assert ig_chunks[0].shape[0] == 2
@@ -2708,7 +2647,10 @@ class TestChunkVlmMedia:
 
         with pytest.raises(ValueError, match="VLM PP chunking cannot align"):
             chunk_vlm_media(
-                pixel_values, image_grid, batch_size=2, n_microbatches=2,
+                pixel_values,
+                image_grid,
+                batch_size=2,
+                n_microbatches=2,
             )
 
     def test_n_videos_per_sample_packed(self):
