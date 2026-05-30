@@ -19,7 +19,6 @@ from typing import Any
 
 from nemo_automodel.components.checkpoint import build_checkpoint_config as _build_checkpoint_config
 from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
-from nemo_automodel.components.optim import build_lr_scheduler as _build_lr_scheduler
 from nemo_automodel.components.optim import build_optimizer as _build_optimizer
 
 
@@ -84,15 +83,11 @@ def build_optimizer(model: Any, cfg_opt: Any, distributed_config: Any, device_me
 
 
 def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any):
+    if cfg is None:
+        return None  # LR scheduling disabled
     from nemo_automodel.components.optim import LRSchedulerConfig
 
-    if cfg is None:
-        return _build_lr_scheduler(config=None, optimizer=optimizer, step_scheduler=step_scheduler)
-    return _build_lr_scheduler(
-        config=LRSchedulerConfig(**_as_dict(cfg)),
-        optimizer=optimizer,
-        step_scheduler=step_scheduler,
-    )
+    return LRSchedulerConfig(**_as_dict(cfg)).build(optimizer, step_scheduler)
 
 
 def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_batch_size: int):

@@ -212,9 +212,8 @@ class MuonConfig(OptimizerConfig):
 
 @dataclass
 class LRSchedulerConfig:
-    """LR scheduler configuration.  ``None`` fields are computed from the
-    training schedule (total steps, optimizer base LR/WD) by
-    :func:`build_lr_scheduler`."""
+    """LR scheduler configuration.  ``None`` fields are computed by
+    :meth:`build` from the training schedule (total steps, optimizer base LR/WD)."""
 
     lr_warmup_steps: int | None = None
     lr_decay_steps: int | None = None
@@ -230,6 +229,61 @@ class LRSchedulerConfig:
     override_opt_param_scheduler: bool = False
     wsd_decay_steps: int | None = None
     lr_wsd_decay_style: str | None = None
+
+    def build(
+        self,
+        optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
+        step_scheduler: StepScheduler,
+    ) -> list[OptimizerParamScheduler]:
+        """Build one LR scheduler per optimizer.
+
+        ``None`` fields are filled from the training schedule and each
+        optimizer's base LR/WD.
+
+        Args:
+            optimizer: The optimizer(s) to schedule.
+            step_scheduler: The step scheduler, used to derive total steps.
+
+        Returns:
+            One :class:`OptimizerParamScheduler` per optimizer.
+        """
+        total_steps = (step_scheduler.num_epochs * len(step_scheduler.dataloader)) // step_scheduler.grad_acc_steps
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        schedulers = []
+        for opt in optimizers:
+            base_lr = opt.param_groups[0]["lr"]
+            base_wd = opt.param_groups[0].get("weight_decay", 0.0)
+            schedulers.append(
+                OptimizerParamScheduler(
+                    optimizer=opt,
+                    init_lr=self.init_lr if self.init_lr is not None else base_lr * 0.1,
+                    max_lr=self.max_lr if self.max_lr is not None else base_lr,
+                    min_lr=self.min_lr if self.min_lr is not None else base_lr * 0.01,
+                    lr_warmup_steps=self.lr_warmup_steps
+                    if self.lr_warmup_steps is not None
+                    else min(1000, total_steps // 10),
+                    lr_decay_steps=self.lr_decay_steps if self.lr_decay_steps is not None else total_steps,
+                    lr_decay_style=self.lr_decay_style,
+                    start_wd=self.start_wd if self.start_wd is not None else base_wd,
+                    end_wd=self.end_wd if self.end_wd is not None else base_wd,
+                    wd_incr_steps=self.wd_incr_steps if self.wd_incr_steps is not None else total_steps,
+                    wd_incr_style=self.wd_incr_style,
+                    use_checkpoint_opt_param_scheduler=self.use_checkpoint_opt_param_scheduler,
+                    override_opt_param_scheduler=self.override_opt_param_scheduler,
+                    wsd_decay_steps=self.wsd_decay_steps,
+                    lr_wsd_decay_style=self.lr_wsd_decay_style,
+                )
+            )
+
+        logger.info(
+            f"Building LR scheduler with total_steps={total_steps}, "
+            f"warmup_steps={schedulers[0].lr_warmup_steps}, "
+            f"decay_style={self.lr_decay_style}"
+        )
+        return schedulers
 
 
 # ---------------------------------------------------------------------------
@@ -359,70 +413,6 @@ def build_optimizer(
     return optimizers
 
 
-def build_lr_scheduler(
-    config: LRSchedulerConfig | None,
-    optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
-    step_scheduler: StepScheduler,
-) -> list[OptimizerParamScheduler] | None:
-    """Build the learning rate scheduler(s).
-
-    Args:
-        config: LR scheduler configuration.  ``None`` disables scheduling.
-        optimizer: The optimizer(s) to be scheduled.
-        step_scheduler: The step scheduler to extract training parameters.
-
-    Returns:
-        Configured optimizer parameter schedulers, or ``None`` if not configured.
-    """
-    if config is None:
-        return None
-
-    total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
-
-    if not isinstance(optimizer, list):
-        optimizer = [optimizer]
-
-    optimizer_param_schedulers = []
-    for opt in optimizer:
-        base_lr = opt.param_groups[0]["lr"]
-        base_wd = opt.param_groups[0].get("weight_decay", 0.0)
-
-        scheduler = OptimizerParamScheduler(
-            optimizer=opt,
-            init_lr=config.init_lr if config.init_lr is not None else base_lr * 0.1,
-            max_lr=config.max_lr if config.max_lr is not None else base_lr,
-            min_lr=config.min_lr if config.min_lr is not None else base_lr * 0.01,
-            lr_warmup_steps=config.lr_warmup_steps
-            if config.lr_warmup_steps is not None
-            else min(1000, total_steps // 10),
-            lr_decay_steps=config.lr_decay_steps if config.lr_decay_steps is not None else total_steps,
-            lr_decay_style=config.lr_decay_style,
-            start_wd=config.start_wd if config.start_wd is not None else base_wd,
-            end_wd=config.end_wd if config.end_wd is not None else base_wd,
-            wd_incr_steps=config.wd_incr_steps if config.wd_incr_steps is not None else total_steps,
-            wd_incr_style=config.wd_incr_style,
-            use_checkpoint_opt_param_scheduler=config.use_checkpoint_opt_param_scheduler,
-            override_opt_param_scheduler=config.override_opt_param_scheduler,
-            wsd_decay_steps=config.wsd_decay_steps,
-            lr_wsd_decay_style=config.lr_wsd_decay_style,
-        )
-        optimizer_param_schedulers.append(scheduler)
-
-    logger.info(
-        f"Building LR scheduler with total_steps={total_steps}, "
-        f"warmup_steps={optimizer_param_schedulers[0].lr_warmup_steps}, "
-        f"decay_style={config.lr_decay_style}"
-    )
-
-    return optimizer_param_schedulers
-
-
 __all__ = [
     "AdamConfig",
     "AdamWConfig",
@@ -431,6 +421,5 @@ __all__ = [
     "LRSchedulerConfig",
     "MuonConfig",
     "OptimizerConfig",
-    "build_lr_scheduler",
     "build_optimizer",
 ]

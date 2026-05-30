@@ -21,7 +21,6 @@ from .optimizer import (
     LRSchedulerConfig,
     MuonConfig,
     OptimizerConfig,
-    build_lr_scheduler,
     build_optimizer,
 )
 from .scheduler import OptimizerParamScheduler
@@ -35,7 +34,6 @@ __all__ = [
     "MuonConfig",
     "OptimizerConfig",
     "OptimizerParamScheduler",
-    "build_lr_scheduler",
     "build_optimizer",
     "build_dion_optimizer",
     "is_dion_optimizer",
