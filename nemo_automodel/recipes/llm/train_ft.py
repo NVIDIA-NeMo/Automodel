@@ -25,6 +25,7 @@ try:
 except ImportError:
     pass
 
+import gc
 import inspect
 import logging
 import pathlib
@@ -60,7 +61,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
@@ -1119,6 +1120,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pp_enabled,
             model=self.model_parts[0],
         )
+        # Optional tool-call accuracy evaluator for agent SFT runs.
+        # Presence of the ``tool_call_eval`` block enables it; absence skips it.
+        self.tool_call_evaluator = None
+        tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
+        if tool_call_eval_cfg is not None:
+            self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
+        self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
         self.step_scheduler = build_step_scheduler(
@@ -1674,15 +1682,73 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
 
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        # Tool-call accuracy is the only signal that catches "loss going
+        # down because format was learned but the model picks wrong tools".
+        # Generation on an FSDP2 training model is intentionally opt-in:
+        # generate() repeatedly unshards parameters and can leave enough
+        # allocator pressure to OOM the next backward pass.
+        if getattr(self, "tool_call_evaluator", None) is not None:
+            count_key = f"{self.tool_call_evaluator.metric_prefix}/_count"
+            if isinstance(self.distributed_config, FSDP2Config) and not getattr(
+                self.tool_call_evaluator, "run_on_fsdp2", False
+            ):
+                if not self._warned_tool_call_eval_skipped:
+                    logging.warning(
+                        "Skipping tool_call_evaluator during FSDP2 training. "
+                        "Set tool_call_eval.run_on_fsdp2=true to force in-loop generation, "
+                        "or run the evaluator offline from a checkpoint."
+                    )
+                    self._warned_tool_call_eval_skipped = True
+                metrics[f"{self.tool_call_evaluator.metric_prefix}/_disabled_fsdp2"] = 1.0
+            else:
+                try:
+                    tool_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
+                    # The evaluator returns per-rank means and count-like
+                    # diagnostics. Weighted all-reduce the means by scored
+                    # sample count, and sum diagnostics directly.
+                    local_count = float(tool_metrics.pop(count_key, 0.0))
+                    device = self.dist_env.device
+                    count_t = torch.tensor(local_count, dtype=torch.float32, device=device)
+                    total_count = self._dp_allreduce(count_t).item()
+
+                    count_like_metrics = {
+                        k: v
+                        for k, v in list(tool_metrics.items())
+                        if k.startswith(f"{self.tool_call_evaluator.metric_prefix}/_")
+                    }
+                    for k in count_like_metrics:
+                        tool_metrics.pop(k, None)
+
+                    if total_count > 0:
+                        for k, v in list(tool_metrics.items()):
+                            local_sum = torch.tensor(float(v) * local_count, dtype=torch.float32, device=device)
+                            total_sum = self._dp_allreduce(local_sum).item()
+                            tool_metrics[k] = total_sum / total_count
+
+                    for k, v in count_like_metrics.items():
+                        local_total = torch.tensor(float(v), dtype=torch.float32, device=device)
+                        tool_metrics[k] = self._dp_allreduce(local_total).item()
+
+                    tool_metrics[count_key] = total_count
+                    metrics.update(tool_metrics)
+                except Exception as exc:
+                    logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
+                finally:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "val_loss": val_loss,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "num_label_tokens": total_num_label_tokens,
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-            },
+            metrics=metrics,
         )
 
     def log_val_metrics(self, val_name, log_data, metric_logger=None):
@@ -1714,14 +1780,25 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not metric_logger is None:
             metric_logger.log(log_data)
 
+        tool_call_suffix = ""
+        if "tool_call/_count" in log_data.metrics:
+            tool_call_suffix = (
+                " | tool_name_acc {:.3f} | args_json_valid {:.3f} | args_exact_match {:.3f} (n={})".format(
+                    log_data.metrics.get("tool_call/name_correct", 0.0),
+                    log_data.metrics.get("tool_call/args_json_valid", 0.0),
+                    log_data.metrics.get("tool_call/args_exact_match", 0.0),
+                    int(log_data.metrics.get("tool_call/_count", 0)),
+                )
+            )
         logging.info(
-            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}'.format(
+            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}{}'.format(
                 val_name,
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["val_loss"],
                 log_data.metrics["lr"],
                 log_data.metrics["num_label_tokens"],
+                tool_call_suffix,
             )
         )
 
