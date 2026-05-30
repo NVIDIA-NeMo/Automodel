@@ -46,14 +46,13 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForMultimodalLM,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
-from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -541,9 +540,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-        # Create Checkpointer instance
-        self.checkpointer = Checkpointer(
-            config=checkpoint_config,
+        # Build the checkpointer from its config
+        self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),

@@ -2464,9 +2464,20 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_loss_fn", lambda cfg: "loss_fn")
+
+    def _stub_build_checkpoint_config(*a, **k):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+        return cfg
+
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.build_checkpoint_config",
-        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+        _stub_build_checkpoint_config,
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.setup_distributed",
@@ -2481,16 +2492,6 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
             cp_size=cp_size,
         ),
     )
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
-            load_base_model=lambda *a, **k: None,
-            maybe_wait_for_staging=lambda: None,
-            close=lambda: None,
-        ),
-    )
-
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)

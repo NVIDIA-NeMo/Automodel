@@ -408,21 +408,18 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
             pp_size=2,
         ),
     )
-    monkeypatch.setattr(
-        vlm_finetune,
-        "build_checkpoint_config",
-        lambda *args, **kwargs: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
-    )
-    monkeypatch.setattr(
-        vlm_finetune,
-        "Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
+
+    def _stub_build_checkpoint_config(*args, **kwargs):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
             load_base_model=lambda *args, **kwargs: None,
             maybe_wait_for_staging=lambda: None,
             close=lambda: None,
-        ),
-    )
+        )
+        return cfg
+
+    monkeypatch.setattr(vlm_finetune, "build_checkpoint_config", _stub_build_checkpoint_config)
     monkeypatch.setattr(vlm_finetune, "build_model", lambda *args, **kwargs: _FakePPModel(stage0))
     monkeypatch.setattr(
         vlm_finetune,

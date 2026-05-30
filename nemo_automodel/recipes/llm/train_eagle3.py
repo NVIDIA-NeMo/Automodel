@@ -32,7 +32,6 @@ from transformers import AutoConfig, LlamaConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import (
-    Checkpointer,
     CheckpointingConfig,
     save_config,
 )
@@ -279,8 +278,7 @@ class TrainEagle3Recipe(BaseRecipe):
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=dp_rank,
             tp_rank=0,
             pp_rank=0,

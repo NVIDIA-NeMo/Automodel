@@ -14,8 +14,10 @@
 
 """Public config surface for the checkpoint component.
 
-Look here for the typed parameters that drive checkpointing behaviour.
-Look at ``api.py`` for the builder that consumes this config.
+``CheckpointingConfig`` holds the typed parameters that drive checkpointing
+behaviour and exposes ``.build()`` to construct the :class:`Checkpointer`
+engine (defined in ``checkpointing.py``). ``build_checkpoint_config`` is the
+adapter that assembles a config from the YAML ``checkpoint:`` block.
 """
 
 from __future__ import annotations
@@ -24,13 +26,18 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from huggingface_hub import constants as hf_constants
 from packaging.version import parse
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +98,32 @@ class CheckpointingConfig:
         if self.is_async and not _is_geq_torch_2_9():
             logging.error("Async mode is only supported for torch >= 2.9.0, disabling async mode")
             self.is_async = False
+
+    def build(
+        self,
+        dp_rank: int,
+        tp_rank: int,
+        pp_rank: int,
+        moe_mesh: DeviceMesh | None = None,
+    ) -> Checkpointer:
+        """Build the :class:`Checkpointer` engine for this config.
+
+        ``Checkpointer`` is imported lazily to avoid a circular import
+        (``checkpointing.py`` imports ``CheckpointingConfig`` from this module)
+        and to keep the heavy DCP/safetensors deps out of module load.
+
+        Args:
+            dp_rank: Data-parallel rank.
+            tp_rank: Tensor-parallel rank.
+            pp_rank: Pipeline-parallel rank.
+            moe_mesh: Optional device mesh for MoE checkpointing.
+
+        Returns:
+            Configured :class:`Checkpointer`.
+        """
+        from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+
+        return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
 
 
 def build_checkpoint_config(

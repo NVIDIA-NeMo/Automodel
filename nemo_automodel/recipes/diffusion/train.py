@@ -27,7 +27,7 @@ from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
+from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -573,8 +573,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
         )
         self.restore_from = checkpoint_cfg.get("restore_from", None)
-        self.checkpointer = Checkpointer(
-            config=self.checkpoint_config,
+        self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),

@@ -26,7 +26,6 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -188,8 +187,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-        self.checkpointer = Checkpointer(
-            config=checkpoint_config,
+        self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),

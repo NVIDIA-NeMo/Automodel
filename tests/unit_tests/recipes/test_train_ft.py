@@ -483,9 +483,20 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
+
+    def _stub_build_checkpoint_config(*a, **k):
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg.build = lambda **kw: SimpleNamespace(
+            config=cfg,
+            load_base_model=lambda *a, **k: None,
+            maybe_wait_for_staging=lambda: None,
+            close=lambda: None,
+        )
+        return cfg
+
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
-        lambda *a, **k: SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None),
+        _stub_build_checkpoint_config,
     )
     # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(
@@ -499,17 +510,6 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
             device_mesh=None,
             moe_mesh=None,
             cp_size=1,
-        ),
-    )
-
-    # Stub Checkpointer
-    monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.Checkpointer",
-        lambda **kwargs: SimpleNamespace(
-            config=kwargs["config"],
-            load_base_model=lambda *a, **k: None,
-            maybe_wait_for_staging=lambda: None,
-            close=lambda: None,
         ),
     )
 
