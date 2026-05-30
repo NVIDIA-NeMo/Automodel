@@ -527,9 +527,9 @@ class TestBuildOptimizerDionBranch:
             ),
         )
 
-        optimizers = optim_build_mod.build_optimizer_for_rl(
-            fake_optimizer_factory,
+        optimizers = optim_build_mod.build_optimizer(
             model,
+            fake_optimizer_factory,
             device_mesh=sentinel_mesh,
             foreach=True,
         )
@@ -558,7 +558,7 @@ class TestBuildOptimizerDionBranch:
             ),
         )
 
-        optimizers = optim_build_mod.build_optimizer_for_rl(fake_optimizer_factory, model, foreach=True)
+        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, foreach=True)
 
         assert len(build_calls) == 2
         assert build_calls[0] is model.parts[0]
@@ -578,7 +578,7 @@ class TestBuildOptimizerDionBranch:
 
         monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        optimizers = optim_build_mod.build_optimizer_for_rl(fake_optimizer_factory, model, foreach=True)
+        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, foreach=True)
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
@@ -597,7 +597,7 @@ class TestBuildOptimizerDionBranch:
 
         monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
 
-        optimizers = optim_build_mod.build_optimizer_for_rl(fake_optimizer_factory, model, foreach=True)
+        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, foreach=True)
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2

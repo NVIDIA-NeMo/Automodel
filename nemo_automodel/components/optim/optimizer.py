@@ -16,18 +16,19 @@
 
 Each optimizer config is a plain dataclass exposing the full parameter surface
 as named fields (no opaque ``**kwargs``) and a ``build(params)`` method that
-constructs the optimizer directly.  Reading the dataclass tells you exactly
+constructs a single optimizer directly.  Reading the dataclass tells you exactly
 what you can configure.
 
-Two entry points consume these configs:
+:func:`build_optimizer` is the single orchestration entry point.  It loops over
+``model.parts`` and applies the per-part concerns (TP ``foreach``, Dion param
+grouping, Megatron-FSDP sharding), dispatching on its second argument:
 
-- :func:`build_optimizer` — Automodel-native path.  Takes a typed config and a
-  model, loops over ``model.parts``, applies the per-part concerns
-  (TP ``foreach``, Dion param grouping, Megatron-FSDP sharding).
-- :func:`build_optimizer_for_rl` — escape hatch for external integrations
-  (e.g. veRL) that pass an optimizer *name/class* plus arbitrary ``**kwargs``.
-  Adding a new typed config above never requires touching this function or the
-  integration that calls it.
+- a typed :class:`OptimizerConfig` instance — the Automodel-native path; per-part
+  construction delegates to ``config.build(...)``.
+- an optimizer *dotted path* or *class* plus arbitrary ``**optimizer_kwargs`` —
+  the escape hatch for external integrations (e.g. veRL).  Adding a new typed
+  config never requires the integration to change: it can keep passing a name
+  and kwargs.
 """
 
 from __future__ import annotations
@@ -271,93 +272,88 @@ def _maybe_shard_megatron(
 
 def build_optimizer(
     model: torch.nn.Module,
-    config: OptimizerConfig,
-    distributed_config: DistributedConfig | None = None,
-    device_mesh: DeviceMesh | None = None,
-) -> list[torch.optim.Optimizer]:
-    """Build one optimizer per ``model.parts`` (or ``[model]``) from a typed config.
-
-    Args:
-        model: Model (or model with ``.parts``) to optimize.
-        config: Typed optimizer config (e.g. :class:`AdamWConfig`).
-        distributed_config: Distributed strategy config; triggers Megatron-FSDP
-            optimizer sharding when it is a :class:`MegatronFSDPConfig`.
-        device_mesh: Device mesh used for tensor/data parallelism.
-
-    Returns:
-        One optimizer per model part.
-    """
-    foreach = _foreach_for_mesh(device_mesh)
-    is_dion = isinstance(config, MuonConfig)
-
-    optimizers: list[torch.optim.Optimizer] = []
-    for part in getattr(model, "parts", [model]):
-        trainable_params = [p for p in part.parameters() if p.requires_grad]
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        if is_dion:
-            optimizer = config.build_dion(part, device_mesh)
-        else:
-            optimizer = config.build(trainable_params, foreach=foreach)
-        optimizer = _maybe_shard_megatron(part, optimizer, distributed_config, allow=not is_dion)
-        optimizers.append(optimizer)
-    return optimizers
-
-
-def build_optimizer_for_rl(
-    optimizer: str | Any,
-    model: torch.nn.Module,
+    optimizer: OptimizerConfig | str | Any,
     *,
     distributed_config: DistributedConfig | None = None,
     device_mesh: DeviceMesh | None = None,
     **optimizer_kwargs: Any,
 ) -> list[torch.optim.Optimizer]:
-    """Generic optimizer builder for external integrations (e.g. veRL).
+    """Build one optimizer per ``model.parts`` (or ``[model]``).
 
-    Accepts an optimizer **dotted path** (``"torch.optim.AdamW"``) or an
-    already-resolved class/callable, plus arbitrary ``**optimizer_kwargs``.
-    This is the integration escape hatch: adding new typed configs above does
-    not require changing this function or its callers.
+    Single orchestration entry point.  It applies the per-part concerns
+    (TP ``foreach``, Dion param grouping, Megatron-FSDP sharding) and dispatches
+    on ``optimizer``:
+
+    - **Typed config** (:class:`OptimizerConfig` instance) — the Automodel-native
+      path.  Hyperparameters come from the config; ``**optimizer_kwargs`` must be
+      empty.  Per-part construction delegates to ``config.build(...)``.
+    - **Dotted path or class** (``"torch.optim.AdamW"`` or ``torch.optim.AdamW``)
+      plus ``**optimizer_kwargs`` — the integration escape hatch (e.g. veRL).
+      Adding new typed configs never forces the integration to change.
 
     Args:
-        optimizer: Dotted import path or optimizer class/callable.
         model: Model (or model with ``.parts``) to optimize.
-        distributed_config: Distributed strategy config (see
-            :func:`build_optimizer`).
+        optimizer: Typed :class:`OptimizerConfig` instance, or an optimizer
+            dotted path / class to construct with ``**optimizer_kwargs``.
+        distributed_config: Distributed strategy config; triggers Megatron-FSDP
+            optimizer sharding when it is a :class:`MegatronFSDPConfig`.
         device_mesh: Device mesh used for tensor/data parallelism.
-        **optimizer_kwargs: Forwarded verbatim to the optimizer constructor
-            (dtype strings such as ``"torch.bfloat16"`` are resolved).
+        **optimizer_kwargs: Constructor kwargs for the dotted-path / class form
+            (dtype strings such as ``"torch.bfloat16"`` are resolved).  Must be
+            empty when ``optimizer`` is a typed config.
 
     Returns:
         One optimizer per model part.
     """
-    factory = optimizer if callable(optimizer) else _resolve_dotted_path(optimizer)
-
-    kwargs = dict(optimizer_kwargs)
-    for attr in _DTYPE_FIELDS:
-        val = kwargs.get(attr, None)
-        if isinstance(val, str):
-            kwargs[attr] = dtype_from_str(val)
-
     foreach = _foreach_for_mesh(device_mesh)
-    if foreach is not None:
-        kwargs.setdefault("foreach", foreach)
 
-    has_dion = is_dion_optimizer(factory)
-    optimizers: list[torch.optim.Optimizer] = []
-    for part in getattr(model, "parts", [model]):
-        trainable_params = [p for p in part.parameters() if p.requires_grad]
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        if has_dion:
-            optimizer_obj = build_dion_optimizer(
+    if isinstance(optimizer, OptimizerConfig):
+        if optimizer_kwargs:
+            raise ValueError(
+                "Optimizer hyperparameters must be set on the config, not passed as keyword "
+                f"arguments to build_optimizer (got {sorted(optimizer_kwargs)})."
+            )
+        is_dion = isinstance(optimizer, MuonConfig)
+
+        def make_one(params):
+            return optimizer.build(params, foreach=foreach)
+
+        def make_dion(part):
+            return optimizer.build_dion(part, device_mesh)
+    else:
+        if isinstance(optimizer, type) and issubclass(optimizer, OptimizerConfig):
+            raise TypeError(
+                f"Pass an OptimizerConfig instance, not the class {optimizer.__name__} "
+                f"(e.g. {optimizer.__name__}(lr=1e-4))."
+            )
+        factory = optimizer if callable(optimizer) else _resolve_dotted_path(optimizer)
+        kwargs = dict(optimizer_kwargs)
+        for attr in _DTYPE_FIELDS:
+            val = kwargs.get(attr, None)
+            if isinstance(val, str):
+                kwargs[attr] = dtype_from_str(val)
+        if foreach is not None:
+            kwargs.setdefault("foreach", foreach)
+        is_dion = is_dion_optimizer(factory)
+
+        def make_one(params):
+            return factory(params=params, **kwargs)
+
+        def make_dion(part):
+            return build_dion_optimizer(
                 optimizer_factory=factory,
                 optimizer_kwargs=kwargs,
                 model=part,
                 distributed_mesh=device_mesh,
             )
-        else:
-            optimizer_obj = factory(params=trainable_params, **kwargs)
-        optimizer_obj = _maybe_shard_megatron(part, optimizer_obj, distributed_config, allow=not has_dion)
-        optimizers.append(optimizer_obj)
+
+    optimizers: list[torch.optim.Optimizer] = []
+    for part in getattr(model, "parts", [model]):
+        trainable_params = [p for p in part.parameters() if p.requires_grad]
+        assert len(trainable_params) > 0, "trainable_params cannot be empty"
+        opt = make_dion(part) if is_dion else make_one(trainable_params)
+        opt = _maybe_shard_megatron(part, opt, distributed_config, allow=not is_dion)
+        optimizers.append(opt)
     return optimizers
 
 
@@ -446,5 +442,4 @@ __all__ = [
     "OptimizerConfig",
     "build_lr_scheduler",
     "build_optimizer",
-    "build_optimizer_for_rl",
 ]

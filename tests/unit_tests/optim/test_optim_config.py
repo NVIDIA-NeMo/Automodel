@@ -25,7 +25,6 @@ from nemo_automodel.components.optim.optimizer import (
     OptimizerConfig,
     _resolve_dotted_path,
     build_optimizer,
-    build_optimizer_for_rl,
 )
 
 
@@ -115,8 +114,7 @@ class TestBuildOptimizer:
         assert len(optimizers) == 2
         assert all(isinstance(o, torch.optim.Adam) for o in optimizers)
 
-    def test_tp_mesh_disables_foreach(self, monkeypatch):
-
+    def test_tp_mesh_disables_foreach(self):
         class FakeMesh:
             mesh_dim_names = ("tp",)
 
@@ -128,27 +126,35 @@ class TestBuildOptimizer:
         optimizers = build_optimizer(_model(), AdamConfig(), device_mesh=FakeMesh())
         assert optimizers[0].param_groups[0]["foreach"] is False
 
+    def test_config_with_kwargs_raises(self):
+        with pytest.raises(ValueError, match="must be set on the config"):
+            build_optimizer(_model(), AdamWConfig(), lr=1e-3)
+
+    def test_config_class_instead_of_instance_raises(self):
+        with pytest.raises(TypeError, match="instance, not the class"):
+            build_optimizer(_model(), AdamWConfig)
+
 
 # ---------------------------------------------------------------------------
-# build_optimizer_for_rl (integration escape hatch)
+# build_optimizer — dotted-path / class form (integration escape hatch)
 # ---------------------------------------------------------------------------
 
 
-class TestBuildOptimizerForRL:
+class TestBuildOptimizerEscapeHatch:
     def test_dotted_path_string(self):
-        optimizers = build_optimizer_for_rl("torch.optim.AdamW", _model(), lr=1e-3, betas=(0.9, 0.95))
+        optimizers = build_optimizer(_model(), "torch.optim.AdamW", lr=1e-3, betas=(0.9, 0.95))
         assert isinstance(optimizers[0], torch.optim.AdamW)
         assert optimizers[0].param_groups[0]["lr"] == 1e-3
 
     def test_resolved_class(self):
-        optimizers = build_optimizer_for_rl(torch.optim.SGD, _model(), lr=0.01, momentum=0.9)
+        optimizers = build_optimizer(_model(), torch.optim.SGD, lr=0.01, momentum=0.9)
         assert isinstance(optimizers[0], torch.optim.SGD)
         assert optimizers[0].param_groups[0]["momentum"] == 0.9
 
     def test_arbitrary_new_optimizer_no_typed_config(self):
         # Adding support for a new optimizer requires no code change here:
         # any importable optimizer + kwargs works.
-        optimizers = build_optimizer_for_rl("torch.optim.RMSprop", _model(), lr=0.01, alpha=0.95)
+        optimizers = build_optimizer(_model(), "torch.optim.RMSprop", lr=0.01, alpha=0.95)
         assert isinstance(optimizers[0], torch.optim.RMSprop)
         assert optimizers[0].param_groups[0]["alpha"] == 0.95
 
