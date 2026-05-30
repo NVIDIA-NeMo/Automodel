@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-based draft model for EAGLE-1 / EAGLE-2 training."""
+"""Llama-style dense LLM draft model for EAGLE-1 / EAGLE-2 training.
+
+Config-driven; supports Llama, Phi-3, and Qwen3 dense via standard HF config
+fields (``attention_bias``, ``mlp_bias``, ``rope_theta``/``rope_scaling``,
+``rms_norm_eps``). Class names are retained for checkpoint-architectures
+compatibility.
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from transformers import LlamaConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
@@ -44,7 +50,7 @@ def _build_causal_mask(
 class EagleLlamaAttention(nn.Module):
     """Standard Llama-style self attention for the EAGLE-1/2 draft."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -53,14 +59,18 @@ class EagleLlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+        )
         self.k_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
         )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config)
 
     def _repeat_kv(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -103,12 +113,18 @@ class EagleLlamaAttention(nn.Module):
 class EagleLlamaMLP(nn.Module):
     """Standard SwiGLU MLP used by the EAGLE-1/2 draft."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
-        self.act_fn = nn.SiLU()
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False)
+        )
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=getattr(config, "mlp_bias", False))
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=getattr(config, "mlp_bias", False)
+        )
+        from transformers.activations import ACT2FN
+
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
@@ -117,7 +133,7 @@ class EagleLlamaMLP(nn.Module):
 class EagleLlamaDecoderLayer(nn.Module):
     """Single decoder layer for the minimal EAGLE-1/2 draft model."""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.self_attn = EagleLlamaAttention(config)
         self.mlp = EagleLlamaMLP(config)
@@ -142,12 +158,16 @@ class EagleLlamaDecoderLayer(nn.Module):
 
 
 class LlamaEagleDraftModel(PreTrainedModel):
-    """Minimal Llama draft that predicts next-step hidden states."""
+    """Llama-style dense draft that predicts next-step hidden states.
 
-    config_class = LlamaConfig
+    Works with Llama, Phi-3, and Qwen3 dense configs. The class name is
+    retained for backward compatibility with already-trained checkpoints.
+    """
+
+    config_class = PretrainedConfig
     main_input_name = "input_ids"
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
@@ -157,9 +177,18 @@ class LlamaEagleDraftModel(PreTrainedModel):
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embeddings: nn.Embedding) -> None:
-        """Copy the target model token embeddings into the draft embeddings."""
+        """Copy the target model token embeddings into the draft embeddings.
+
+        When the target is wrapped with FSDP2, its ``embed_tokens.weight`` is
+        a ``DTensor`` sharded across ranks.  Gather to a local full tensor
+        before copying into the (unsharded) draft parameter -- otherwise
+        ``aten.copy_`` raises a mixed Tensor/DTensor error.
+        """
+        target_weight = target_embeddings.weight
+        if hasattr(target_weight, "full_tensor"):
+            target_weight = target_weight.full_tensor()
         with torch.no_grad():
-            self.embed_tokens.weight.copy_(target_embeddings.weight.to(self.embed_tokens.weight.device))
+            self.embed_tokens.weight.copy_(target_weight.to(self.embed_tokens.weight.device))
 
     def freeze_embeddings(self) -> None:
         """Freeze draft token embeddings."""

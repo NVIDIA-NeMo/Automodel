@@ -104,6 +104,31 @@ def _tokenize_chat(
     return tokenized_chat.get("input_ids", [])
 
 
+def _maybe_shift_mask_for_left_padding(
+    mask: List[int],
+    tokenizer: "PreTrainedTokenizer",
+    attention_mask: Optional[List[int]],
+) -> List[int]:
+    """Shift a token-level mask right when the tokenizer uses left padding.
+
+    ``_build_multiturn_assistant_mask`` and ``_build_reasoning_mask`` compute
+    span indices from **unpadded** (left-aligned) tokenizations.  When the
+    tokenizer pads on the left, actual content is right-aligned in
+    ``input_ids``, so the mask must be shifted right by the padding offset to
+    keep positions aligned.
+
+    For right-padding tokenizers (the majority) this is a no-op.
+    """
+    if getattr(tokenizer, "padding_side", "right") != "left":
+        return mask
+    if attention_mask is None:
+        return mask
+    pad_len = len(mask) - sum(attention_mask)
+    if pad_len <= 0:
+        return mask
+    return [0] * pad_len + mask[: len(mask) - pad_len]
+
+
 def _build_multiturn_assistant_mask(
     tokenizer: "PreTrainedTokenizer",
     formatted_text: List[Dict[str, Any]],
@@ -483,13 +508,24 @@ def format_prompt_completion(
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
-    # Tokenize full text
-    tokenized = tokenizer(
-        full_text,
-        padding=padding,
-        truncation=truncation,
-        max_length=seq_length,
-    )
+    # transformers 5.5.0 still honored `padding_side: "right"` baked into the
+    # tokenizer's saved tokenizer_config.json, but 5.8.1 ignores that field and
+    # uses the LlamaTokenizer class default ("left"). Hardcode "right" here so
+    # pad positions land at the end (the label-masking / attention-mask logic
+    # below assumes right padding).
+    _saved_padding_side = getattr(tokenizer, "padding_side", None)
+    if _saved_padding_side is not None:
+        tokenizer.padding_side = "right"
+    try:
+        tokenized = tokenizer(
+            full_text,
+            padding=padding,
+            truncation=truncation,
+            max_length=seq_length,
+        )
+    finally:
+        if _saved_padding_side is not None:
+            tokenizer.padding_side = _saved_padding_side
     input_ids = tokenized["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
@@ -590,6 +626,9 @@ def format_chat_template(
             truncation=truncation,
             seq_length=seq_length,
         )
+        # _build_multiturn_assistant_mask computes indices from unpadded
+        # lengths — shift for left-padding tokenizers.
+        mask = _maybe_shift_mask_for_left_padding(mask, tokenizer, tokenized_chat.get("attention_mask"))
     else:
         mask = [1] * len(input_ids)
 
@@ -609,6 +648,10 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+        )
+        # _build_reasoning_mask also computes from unpadded lengths.
+        reasoning_mask = _maybe_shift_mask_for_left_padding(
+            reasoning_mask, tokenizer, tokenized_chat.get("attention_mask")
         )
         mask = [assistant if not reasoning else 0 for assistant, reasoning in zip(mask, reasoning_mask)]
 

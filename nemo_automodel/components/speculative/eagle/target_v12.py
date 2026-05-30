@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 
 import torch
@@ -62,14 +63,26 @@ class HFEagleTargetModel:
         loss_mask: torch.Tensor,
     ) -> EagleTargetBatch:
         """Run the target transformer and prepare shifted supervision tensors."""
-        outputs = self.model.model(
+        # Strip HF-only flags when the base model doesn't declare them.
+        # AutoModel's custom backbones expose a ``**attn_kwargs`` catch-all
+        # and silently ignore ``output_*`` / ``use_cache``; HF backbones
+        # declare them and care.
+        base_model = self.model.model
+        base_forward_params = inspect.signature(base_model.forward).parameters
+        extra_kwargs = {
+            name: False
+            for name in ("output_hidden_states", "output_attentions", "use_cache")
+            if name in base_forward_params
+        }
+        outputs = base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=False,
+            **extra_kwargs,
         )
-        hidden_states = outputs[0]
+        # HF base models return a dataclass whose first item is
+        # ``last_hidden_state``; AutoModel custom backbones return the
+        # bare hidden tensor.
+        hidden_states = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
         logits = self.model.lm_head(hidden_states)
         return EagleTargetBatch(
             input_hidden_states=hidden_states,

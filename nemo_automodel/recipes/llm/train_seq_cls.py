@@ -28,6 +28,7 @@ from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
@@ -112,6 +113,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
         self.optimizer = self.cfg.optimizer.build(
             model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
+        )
+        warn_if_torch_adam_with_bf16_params(
+            optimizer=self.optimizer,
+            optimizer_cfg=self.cfg.get("optimizer"),
+            is_peft=self.peft_config is not None,
+            context="llm",
+            logger=logger,
         )
 
         self.model_parts = [model]
