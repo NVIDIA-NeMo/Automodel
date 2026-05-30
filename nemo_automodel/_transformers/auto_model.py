@@ -246,6 +246,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
       Liger patch.  Unsupported models will silently fall back.
     """
 
+    # Marker for recipe `build_model` to accept this class's `from_pretrained`
+    # / `from_config` as a valid `_target_` and forward infrastructure kwargs
+    # (device_mesh, distributed_config, peft_config, freeze_config,
+    # pipeline_config) to it. All `NeMoAutoModelFor*` subclasses inherit the
+    # marker, so any recipe that accepts the auto-classes accepts every
+    # subclass uniformly.
+    __nemo_recipe_target__ = True
+
     @classmethod
     def _from_pretrained_parent_class(cls, *args, **kwargs):
         name = cls.__name__

@@ -44,11 +44,6 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 from wandb import Settings
 
-from nemo_automodel._transformers import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
-    NeMoAutoModelForMultimodalLM,
-)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -162,46 +157,42 @@ def build_model(
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
 
-        # Check if using NeMoAutoModel
-        is_nemo_auto_model = cfg_model.get("_target_", None) in (
-            NeMoAutoModelForImageTextToText.from_config,
-            NeMoAutoModelForImageTextToText.from_pretrained,
-            NeMoAutoModelForMultimodalLM.from_config,
-            NeMoAutoModelForMultimodalLM.from_pretrained,
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        )
-
-        # The Gemma4 base + drafter composite loads its sub-models via the
-        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
-        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
-
-        if is_nemo_auto_model or is_joint_composite:
+        if _is_recipe_target(cfg_model.get("_target_", None)):
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
-                f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
+                f"VLM finetuning requires a recipe-compatible model target "
+                f"(`NeMoAutoModelFor*`, or any class marked "
+                f"`__nemo_recipe_target__ = True`). "
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
     return model
 
 
-def _is_gemma4_joint_target(target) -> bool:
-    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
+def _is_recipe_target(target) -> bool:
+    """Return True if ``target`` opted into the recipe build path.
 
-    Imported lazily so the optional ``transformers.models.gemma4_assistant``
-    dependency only fires when a joint recipe is actually requested.
+    The recipe forwards infrastructure kwargs (``device_mesh``,
+    ``distributed_config``, ``peft_config``, ``freeze_config``,
+    ``pipeline_config``) to whatever ``cfg.model._target_`` resolves to. A
+    callable is recognized as a valid recipe target when its owning class
+    (the ``__self__`` of a bound classmethod, or ``target`` itself when it is
+    a class) declares ``__nemo_recipe_target__ = True``.
+
+    This replaces the older hardcoded whitelist of ``NeMoAutoModelFor*``
+    classmethods plus per-model helpers. New composites opt in by setting
+    the class attribute; no recipe-side change is needed.
     """
     if target is None:
         return False
-    try:
-        from nemo_automodel.components.models.gemma4_drafter.composite import (
-            Gemma4WithDrafter,
-        )
-    except ImportError:
-        return False
-    # Bound classmethods are not identity-stable across accesses; compare via ==.
-    return target == Gemma4WithDrafter.from_pretrained
+    # The marker lives on the class. Bound classmethods (e.g.
+    # ``NeMoAutoModelForCausalLM.from_pretrained``) expose the owning class
+    # via ``__self__``; plain class targets (e.g. ``Gemma4WithDrafter``) are
+    # already the class, and lambdas / regular functions fall through to
+    # themselves and fail the attribute lookup -- which is exactly what we
+    # want.
+    target_cls = getattr(target, "__self__", target)
+    return getattr(target_cls, "__nemo_recipe_target__", False) is True
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):

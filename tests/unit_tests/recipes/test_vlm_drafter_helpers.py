@@ -16,7 +16,10 @@
 
 Covers the small additions in ``recipes/vlm/finetune.py``:
   * ``_shift_labels_left`` -- builds drafter-step targets.
-  * ``_is_gemma4_joint_target`` -- detects the composite's classmethod target.
+  * ``_is_recipe_target`` -- generic, marker-attribute-driven gate that
+    decides whether a YAML ``_target_`` can receive the recipe's
+    infrastructure kwargs. Replaces the older Gemma4-specific
+    ``_is_gemma4_joint_target`` helper.
   * ``FinetuneRecipeForVLM._maybe_add_drafter_loss`` -- adds the
     ``lambda * sum_k CE(drafter_logits[k], shifted_labels_k)`` term to the
     base loss when the model returns a non-empty ``drafter_logits``.
@@ -31,7 +34,7 @@ import torch
 
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
-    _is_gemma4_joint_target,
+    _is_recipe_target,
     _shift_labels_left,
 )
 
@@ -130,38 +133,126 @@ class TestShiftLabelsLeft:
         assert out.dtype == labels.dtype
 
 
-class TestIsGemma4JointTarget:
-    """The composite's classmethod is recognized so the recipe's build_model
-    accepts it the same way it accepts the NeMoAutoModel classmethods."""
+class TestIsRecipeTarget:
+    """``_is_recipe_target`` is the generic gate used by ``build_model`` to
+    decide whether a YAML ``_target_`` can receive infrastructure kwargs
+    (``device_mesh``, ``distributed_config``, ``peft_config``,
+    ``freeze_config``, ``pipeline_config``).
+
+    The contract: anything whose owner class declares
+    ``__nemo_recipe_target__ = True`` passes; everything else is rejected.
+    Both ``NeMoAutoModelFor*.from_pretrained`` / ``.from_config`` (inherited
+    via ``_BaseNeMoAutoModelClass``) and ``Gemma4WithDrafter.from_pretrained``
+    are expected to pass after this refactor; raw ``nn.Module`` classes and
+    lambdas are not.
+    """
 
     def test_none_returns_false(self):
-        assert _is_gemma4_joint_target(None) is False
+        assert _is_recipe_target(None) is False
 
-    def test_unrelated_target_returns_false(self):
-        # Any callable that is clearly not the composite's classmethod.
+    def test_unmarked_class_returns_false(self):
+        """A plain ``nn.Module`` subclass without the marker must not pass."""
         from torch import nn
 
-        assert _is_gemma4_joint_target(nn.Linear) is False
-        assert _is_gemma4_joint_target(lambda: None) is False
+        assert _is_recipe_target(nn.Linear) is False
+
+    def test_lambda_returns_false(self):
+        """Lambdas / regular functions don't carry the marker."""
+        assert _is_recipe_target(lambda: None) is False
+
+    def test_unmarked_classmethod_returns_false(self):
+        """A classmethod whose owner is not marked must be rejected even
+        though it has a ``__self__`` (catches the failure mode where the
+        helper accepted *any* bound classmethod)."""
+
+        class _Plain:
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        assert _is_recipe_target(_Plain.from_pretrained) is False
+
+    def test_marked_class_directly_returns_true(self):
+        """``_target_`` pointing at a marked class (not ``.from_pretrained``)
+        is also accepted -- the gate is about the kwargs contract, not the
+        callable shape."""
+
+        class _Marked:
+            __nemo_recipe_target__ = True
+
+        assert _is_recipe_target(_Marked) is True
+
+    def test_marked_classmethod_returns_true(self):
+        class _Marked:
+            __nemo_recipe_target__ = True
+
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        target = _Marked.from_pretrained
+        assert _is_recipe_target(target) is True
+        # Bound classmethods are not identity-stable across accesses; the
+        # marker-attribute check sidesteps the equality issue the old
+        # whitelist had with ``target == Cls.from_pretrained``.
+        assert _is_recipe_target(_Marked.from_pretrained) is True
+
+    def test_inherited_marker_returns_true(self):
+        """The marker is inherited through normal attribute lookup, so a
+        subclass of a marked base passes without re-declaring the
+        attribute. This is the property that lets a single marker on
+        ``_BaseNeMoAutoModelClass`` cover every ``NeMoAutoModelFor*`` class."""
+
+        class _MarkedBase:
+            __nemo_recipe_target__ = True
+
+        class _Sub(_MarkedBase):
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        assert _is_recipe_target(_Sub) is True
+        assert _is_recipe_target(_Sub.from_pretrained) is True
 
     def test_composite_classmethod_returns_true(self):
+        """End-to-end check against the real composite class."""
         from nemo_automodel.components.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
 
-        # Bound classmethods aren't identity-stable; the helper must use
-        # equality, which is why we go through ``in (...)``-style comparison.
-        # Re-access the classmethod to make sure the helper handles the
-        # non-identity case correctly.
-        target = Gemma4WithDrafter.from_pretrained
-        assert _is_gemma4_joint_target(target) is True
-        assert _is_gemma4_joint_target(Gemma4WithDrafter.from_pretrained) is True
+        assert _is_recipe_target(Gemma4WithDrafter.from_pretrained) is True
 
-    def test_subclass_classmethod_does_not_match(self):
-        """Sanity: an unrelated classmethod must not falsely match."""
-        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+    def test_nemo_auto_model_classmethods_return_true(self):
+        """Every ``NeMoAutoModelFor*`` inherits the marker from
+        ``_BaseNeMoAutoModelClass``, so all of these flow through the same
+        gate as the composite -- no recipe-side whitelist needed."""
+        from nemo_automodel._transformers import (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        )
 
-        assert _is_gemma4_joint_target(NeMoAutoModelForCausalLM.from_pretrained) is False
+        for cls in (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        ):
+            assert _is_recipe_target(cls.from_pretrained) is True, (
+                f"{cls.__name__}.from_pretrained must pass the recipe-target gate"
+            )
+            assert _is_recipe_target(cls.from_config) is True, (
+                f"{cls.__name__}.from_config must pass the recipe-target gate"
+            )
+
+    def test_marker_must_be_exactly_true(self):
+        """Truthy-but-not-True values (e.g. a non-empty string left over
+        from a typo) must be rejected, otherwise the gate becomes a silent
+        no-op for classes that happen to set the attribute by accident."""
+
+        class _Truthy:
+            __nemo_recipe_target__ = "yes"  # type: ignore[assignment]
+
+        assert _is_recipe_target(_Truthy) is False
 
 
 @dataclass
