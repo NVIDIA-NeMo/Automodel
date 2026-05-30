@@ -98,6 +98,10 @@ def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_ba
     else:
         kwargs = _as_dict(cfg)
         assert "_target_" not in kwargs, "_target_ not permitted in step scheduler"
+        # The YAML step_scheduler block carries runtime sizing args that are NOT
+        # StepSchedulerConfig fields (they are passed to .build() separately).
+        for runtime_key in ("local_batch_size", "dp_size", "dataloader"):
+            kwargs.pop(runtime_key, None)
         config = StepSchedulerConfig(**kwargs)
     return config.build(dataloader, dp_group_size, local_batch_size)
 

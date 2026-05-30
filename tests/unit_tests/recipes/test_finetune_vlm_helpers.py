@@ -1052,6 +1052,30 @@ class TestBuildStepScheduler:
         assert step_scheduler.ckpt_every_steps == 50
         assert step_scheduler.max_steps == 200
 
+    def test_build_step_scheduler_ignores_local_batch_size_in_yaml_block(self):
+        """Real YAML step_scheduler blocks carry local_batch_size (a runtime arg
+        passed separately); it must not crash StepSchedulerConfig construction."""
+        mock_dataloader = MagicMock()
+        mock_dataloader.__len__ = MagicMock(return_value=50)
+
+        cfg = MagicMock()
+        cfg.to_dict.return_value = {
+            "global_batch_size": 256,
+            "local_batch_size": 2,  # runtime arg present in the YAML block
+            "ckpt_every_steps": 50,
+        }
+
+        step_scheduler = build_step_scheduler(
+            cfg=cfg,
+            dataloader=mock_dataloader,
+            dp_group_size=4,
+            local_batch_size=2,
+        )
+
+        # global_batch_size (256, from config) // (local_batch_size 2 * dp_size 4) = 32
+        assert step_scheduler.grad_acc_steps == 32
+        assert step_scheduler.ckpt_every_steps == 50
+
     def test_build_step_scheduler_rejects_target(self):
         """Test that _target_ in config raises error when passed to StepScheduler."""
         mock_dataloader = MagicMock()
