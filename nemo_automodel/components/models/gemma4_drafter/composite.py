@@ -105,6 +105,12 @@ class Gemma4WithDrafter(nn.Module, HFCheckpointingMixin):
     """
 
     supports_gradient_checkpointing = True
+    # Marker for recipe `build_model` to accept this class's `from_pretrained`
+    # as a valid `_target_` and forward infrastructure kwargs (device_mesh,
+    # distributed_config, peft_config, freeze_config, pipeline_config) to it.
+    # Recipes detect this via `__self__.__nemo_recipe_target__` on the bound
+    # classmethod target, avoiding any model-specific imports in recipe code.
+    __nemo_recipe_target__ = True
 
     def __init__(
         self,
