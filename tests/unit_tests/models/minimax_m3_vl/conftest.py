@@ -46,6 +46,7 @@ TINY_CFG = dict(
     routed_scaling_factor=2.0,
     swiglu_alpha=1.702,
     swiglu_limit=7.0,
+    num_mtp_modules=0,  # MTP isolated to the Stage-4 fixture/tests
 )
 
 
@@ -123,6 +124,20 @@ VISION_CONFIG = dict(
 )
 IMAGE_TOKEN_INDEX = 100
 VIDEO_TOKEN_INDEX = 101
+
+
+@pytest.fixture
+def mtp_model(backend):
+    """Sparse text backbone with one MTP module (DeepSeek-V3 style)."""
+    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+
+    cfg = MiniMaxM3VLTextConfig(
+        torch_dtype="float32",
+        **{**TINY_CFG, "num_mtp_modules": 1, "sparse_attention_config": dict(SPARSE_ATTENTION_CONFIG)},
+    )
+    m = MiniMaxM3SparseForCausalLM(cfg, backend=backend).eval()
+    m.initialize_weights(dtype=torch.float32)
+    return m
 
 
 @pytest.fixture

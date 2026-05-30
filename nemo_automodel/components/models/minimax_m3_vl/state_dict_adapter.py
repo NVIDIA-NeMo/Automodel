@@ -98,10 +98,9 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             state_dict.pop(key, None)
         return state_dict
 
-    @staticmethod
-    def _is_unsupported_key(key: str) -> bool:
-        """MTP (Stage 4) tensors, not yet owned by the model."""
-        return ".mtp." in key
+    @property
+    def _mtp_enabled(self) -> bool:
+        return int(getattr(self.config, "num_mtp_modules", 0) or 0) > 0
 
     def _hf_key_to_native(self, key: str) -> str:
         key = key.replace(".block_sparse_moe.gate.weight", ".mlp.gate.weight")
@@ -136,17 +135,42 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 self._uses_model_prefix = key.startswith("model.")
                 break
 
-        # Drop tensors for components not yet implemented (MTP, Stage 4).
-        for key in list(hf_state_dict.keys()):
-            if self._is_unsupported_key(key):
-                hf_state_dict.pop(key, None)
+        # MTP tensors are converted separately (the transformer_layer is a full
+        # decoder block); dropped entirely when the model has no MTP module.
+        mtp_keys = {k: hf_state_dict.pop(k) for k in list(hf_state_dict) if ".mtp." in k}
 
         self._dequantize(hf_state_dict)
         for key in list(hf_state_dict.keys()):
             new_key = self._hf_key_to_native(key)
             if new_key != key:
                 hf_state_dict[new_key] = hf_state_dict.pop(key)
-        return self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+        native = self._from_hf_w_merged_experts(hf_state_dict, device_mesh)
+
+        if mtp_keys and self._mtp_enabled:
+            native.update(self._mtp_from_hf(mtp_keys, device_mesh))
+        return native
+
+    def _mtp_from_hf(self, mtp_keys: dict[str, Any], device_mesh: Optional["DeviceMesh"] = None) -> dict[str, Any]:
+        """Convert MTP tensors: the transformer_layer reuses the full text from_hf
+        (as a fake 1-layer model, so expert-merge / index / dequant all apply); the
+        enorm/hnorm/eh_proj/final_layernorm fusion tensors pass through (eh_proj is FP8)."""
+        pattern = re.compile(r"(?P<pfx>.*?)mtp\.layers\.(?P<d>\d+)\.(?P<rest>.+)")
+        tl_hf: dict[str, Any] = {}
+        passthrough: dict[str, Any] = {}
+        for key, value in mtp_keys.items():
+            m = pattern.match(key)
+            depth, rest = m.group("d"), m.group("rest")
+            if rest.startswith("transformer_layer."):
+                tl_hf[f"model.layers.{depth}.{rest[len('transformer_layer.') :]}"] = value
+            else:
+                passthrough[key] = value
+
+        self._dequantize(passthrough)  # eh_proj is MXFP8
+        native = dict(passthrough)
+        for key, value in self.from_hf(tl_hf, device_mesh).items():
+            m = re.match(r"model\.layers\.(\d+)\.(.+)", key)
+            native[f"model.mtp.layers.{m.group(1)}.transformer_layer.{m.group(2)}"] = value
+        return native
 
     def to_hf(
         self,
@@ -164,6 +188,9 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         return hf_state_dict
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        if ".mtp." in fqn:
+            return self._mtp_tensor_to_hf(fqn, tensor, **kwargs)
+
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
         expert_result = self._convert_single_merged_expert_to_hf_split_experts(fqn, tensor, **kwargs)
@@ -175,6 +202,19 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         if exclude_key_regex:
             result = [(k, v) for k, v in result if not re.match(exclude_key_regex, k)]
         return result
+
+    def _mtp_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        m = re.match(r"(?P<head>.*?)mtp\.layers\.(?P<d>\d+)\.(?P<rest>.+)", fqn)
+        head, depth, rest = m.group("head"), m.group("d"), m.group("rest")
+        if rest.startswith("transformer_layer."):
+            suffix = rest[len("transformer_layer.") :]
+            converted = self.convert_single_tensor_to_hf(f"model.layers.{depth}.{suffix}", tensor, **kwargs)
+            tl_prefix = f"{head}mtp.layers.{depth}.transformer_layer."
+            return [(k.replace(f"model.layers.{depth}.", tl_prefix, 1), v) for k, v in converted]
+        exclude_key_regex = kwargs.get("exclude_key_regex", None)
+        if exclude_key_regex and re.match(exclude_key_regex, fqn):
+            return []
+        return [(fqn, tensor)]
 
 
 class MiniMaxM3VLStateDictAdapter(StateDictAdapter):

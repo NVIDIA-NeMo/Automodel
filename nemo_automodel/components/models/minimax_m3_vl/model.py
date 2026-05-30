@@ -20,6 +20,7 @@ the sglang reference before the vision tower / VLM wrapper (Stage 3) embeds the
 text model as ``language_model``.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -35,6 +36,7 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import Block, MiniMaxM3RMSNorm
+from nemo_automodel.components.models.minimax_m3_vl.mtp import MiniMaxM3MTP
 from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import (
     MiniMaxM3StateDictAdapter,
     MiniMaxM3VLStateDictAdapter,
@@ -44,6 +46,14 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+@dataclass
+class MiniMaxM3CausalLMOutput:
+    """Forward output carrying the primary logits and optional per-depth MTP logits."""
+
+    logits: torch.Tensor
+    mtp_per_depth_logits: list[torch.Tensor] | None = None
 
 
 def build_moe_config(config: Any, dtype: torch.dtype) -> MoEConfig:
@@ -131,6 +141,19 @@ class MiniMaxM3TextModel(nn.Module):
             device=torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"),
         )
 
+        # Multi-token prediction (DeepSeek-V3 style); shares the main lm_head.
+        num_mtp = int(getattr(config, "num_mtp_modules", 0) or 0)
+        self.mtp = MiniMaxM3MTP(config, self.moe_config, backend, num_mtp) if num_mtp > 0 else None
+
+    def make_freqs_cis(self, position_ids: torch.Tensor, **attn_kwargs: Any) -> torch.Tensor:
+        return position_ids_to_freqs_cis(
+            self.rotary_emb,
+            position_ids,
+            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            for_fused_rope=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -146,13 +169,7 @@ class MiniMaxM3TextModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(0, h.shape[1], device=h.device).unsqueeze(0).expand(h.shape[0], -1)
 
-        freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb,
-            position_ids,
-            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
-            for_fused_rope=self.backend.rope_fusion,
-            cp_size=attn_kwargs.get("cp_size", 1),
-        )
+        freqs_cis = self.make_freqs_cis(position_ids, **attn_kwargs)
 
         for layer in self.layers.values():
             h = layer(
@@ -176,6 +193,38 @@ class MiniMaxM3TextModel(nn.Module):
             self.rotary_emb.device = buffer_device
         for layer in self.layers.values():
             layer.init_weights(buffer_device=buffer_device)
+        if self.mtp is not None:
+            self.mtp.init_weights(buffer_device)
+
+    def mtp_logits(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        lm_head: nn.Module,
+        *,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """Per-depth MTP logits from the final hidden states (shares ``lm_head``)."""
+        if position_ids is None:
+            position_ids = (
+                torch.arange(0, hidden_states.shape[1], device=hidden_states.device)
+                .unsqueeze(0)
+                .expand(hidden_states.shape[0], -1)
+            )
+        freqs_cis = self.make_freqs_cis(position_ids, **attn_kwargs)
+        return self.mtp(
+            hidden_states,
+            input_ids=input_ids,
+            embed_fn=self.embed_tokens,
+            lm_head=lm_head,
+            freqs_cis=freqs_cis,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            **attn_kwargs,
+        )
 
 
 class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -248,7 +297,18 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         )
         logits = self.lm_head(hidden) if self.lm_head else hidden
         if attn_kwargs.get("qkv_format") == "thd":
-            logits = logits.unsqueeze(0)
+            return logits.unsqueeze(0)
+        if self.model.mtp is not None and self.training and input_ids is not None:
+            mtp_logits = self.model.mtp_logits(
+                hidden,
+                input_ids,
+                self.lm_head,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                **attn_kwargs,
+            )
+            return MiniMaxM3CausalLMOutput(logits=logits, mtp_per_depth_logits=mtp_logits)
         return logits
 
     @torch.no_grad()
@@ -393,7 +453,13 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             attention_mask=attention_mask,
             **kwargs,
         )
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        if self.model.mtp is not None and self.training and input_ids is not None:
+            mtp_logits = self.model.mtp_logits(
+                hidden, input_ids, self.lm_head, position_ids=position_ids, attention_mask=attention_mask, **kwargs
+            )
+            return MiniMaxM3CausalLMOutput(logits=logits, mtp_per_depth_logits=mtp_logits)
+        return logits
 
     @torch.no_grad()
     def initialize_weights(
