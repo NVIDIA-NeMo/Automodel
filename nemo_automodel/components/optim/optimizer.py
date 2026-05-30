@@ -41,8 +41,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
-from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:

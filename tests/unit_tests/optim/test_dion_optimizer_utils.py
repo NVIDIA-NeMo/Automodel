@@ -65,26 +65,26 @@ class FakeSubmesh:
 
 class TestIsDionOptimizer:
     def test_returns_true_for_dion_module(self):
-        from nemo_automodel.components.optim.utils import is_dion_optimizer
+        from nemo_automodel.components.optim.dion import is_dion_optimizer
 
         optimizer_factory = type("SomeOpt", (), {"__module__": "dion.optimizers"})
         assert is_dion_optimizer(optimizer_factory) is True
 
     def test_returns_true_for_known_names(self):
-        from nemo_automodel.components.optim.utils import is_dion_optimizer
+        from nemo_automodel.components.optim.dion import is_dion_optimizer
 
         for name in ("Dion", "Dion2", "Muon", "NorMuon"):
             optimizer_factory = type(name, (), {"__module__": "some.module"})
             assert is_dion_optimizer(optimizer_factory) is True, f"Expected True for {name}"
 
     def test_returns_false_for_non_dion(self):
-        from nemo_automodel.components.optim.utils import is_dion_optimizer
+        from nemo_automodel.components.optim.dion import is_dion_optimizer
 
         optimizer_factory = type("Adam", (), {"__module__": "torch.optim"})
         assert is_dion_optimizer(optimizer_factory) is False
 
     def test_returns_false_when_no_target(self):
-        from nemo_automodel.components.optim.utils import is_dion_optimizer
+        from nemo_automodel.components.optim.dion import is_dion_optimizer
 
         assert is_dion_optimizer(object()) is False
 
@@ -96,7 +96,7 @@ class TestIsDionOptimizer:
 
 class TestSeparateParamGroups:
     def _call(self, **kwargs):
-        from nemo_automodel.components.optim.utils import _separate_param_groups
+        from nemo_automodel.components.optim.dion import _separate_param_groups
 
         return _separate_param_groups(**kwargs)
 
@@ -203,7 +203,7 @@ class TestSeparateParamGroups:
 
 class TestGetDionMesh:
     def _call(self, mesh):
-        from nemo_automodel.components.optim.utils import _get_dion_mesh
+        from nemo_automodel.components.optim.dion import _get_dion_mesh
 
         return _get_dion_mesh(mesh)
 
@@ -241,12 +241,12 @@ class TestGetDionMesh:
 
 class TestBuildDionOptimizer:
     def _build(self, monkeypatch, target_cls, cfg_dict, model=None, mesh=None):
-        from nemo_automodel.components.optim import utils as optim_utils
+        from nemo_automodel.components.optim import dion as optim_dion
 
-        monkeypatch.setattr(optim_utils, "_import_error", None, raising=False)
+        monkeypatch.setattr(optim_dion, "_import_error", None, raising=False)
         if model is None:
             model = TinyModel()
-        return optim_utils.build_dion_optimizer(
+        return optim_dion.build_dion_optimizer(
             optimizer_factory=target_cls,
             optimizer_kwargs=cfg_dict,
             model=model,
@@ -285,16 +285,16 @@ class TestBuildDionOptimizer:
         assert captured["lr"] == pytest.approx(2e-4)
 
     def test_import_error_raises(self, monkeypatch):
-        from nemo_automodel.components.optim import utils as optim_utils
+        from nemo_automodel.components.optim import dion as optim_dion
 
-        monkeypatch.setattr(optim_utils, "_import_error", ImportError("no dion"), raising=False)
+        monkeypatch.setattr(optim_dion, "_import_error", ImportError("no dion"), raising=False)
 
         class Target:
             def __init__(self, param_groups):
                 pass
 
         with pytest.raises(RuntimeError, match="Failed to import Dion"):
-            optim_utils.build_dion_optimizer(
+            optim_dion.build_dion_optimizer(
                 optimizer_factory=Target,
                 optimizer_kwargs={"lr": 1e-3},
                 model=TinyModel(),

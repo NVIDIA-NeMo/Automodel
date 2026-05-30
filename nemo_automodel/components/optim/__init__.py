@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .dion import build_dion_optimizer, is_dion_optimizer
 from .optimizer import (
     AdamConfig,
     AdamWConfig,
@@ -24,7 +25,6 @@ from .optimizer import (
     build_optimizer,
 )
 from .scheduler import OptimizerParamScheduler
-from .utils import build_dion_optimizer, is_dion_optimizer
 
 __all__ = [
     "AdamConfig",
