@@ -482,7 +482,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
 
     def _stub_build_checkpoint_config(*a, **k):
         cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
@@ -495,8 +495,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         return cfg
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_checkpoint_config",
-        _stub_build_checkpoint_config,
+        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
+        lambda self, **kw: _stub_build_checkpoint_config(),
     )
     # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(
@@ -521,8 +521,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         lambda *a, **k: dummy_model,
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_optimizer",
-        lambda *a, **k: [dummy_opt],
+        "nemo_automodel.recipes._typed_config.OptimizerSpec.build",
+        lambda self, *a, **k: [dummy_opt],
     )
 
     # Data-related stubs
@@ -664,13 +664,13 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
             parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None)
         )
 
-    def _build_optimizer_stub(*args, **kwargs):
+    def _build_optimizer_stub(self, *args, **kwargs):
         dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
         return [dummy_opt]
 
     # Override the default stubs to return a pipeline-wrapped model
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_optimizer", _build_optimizer_stub)
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.OptimizerSpec.build", _build_optimizer_stub)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)

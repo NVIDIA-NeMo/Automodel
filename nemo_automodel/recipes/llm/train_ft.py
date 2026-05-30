@@ -95,17 +95,15 @@ from nemo_automodel.components.utils.model_utils import (
     resolve_trust_remote_code,
 )
 
-# wandb/mlflow/step_scheduler/lr_scheduler are now consumed via the typed
-# RecipeConfig in setup(); these names are kept only as re-exports for sibling
-# recipes that still import them from this module.
-from nemo_automodel.recipes._component_builders import (
+# optimizer/loss_fn/checkpoint/wandb/mlflow/step_scheduler/lr_scheduler are now
+# consumed via the typed RecipeConfig in setup().  These names are kept only as
+# transitional re-exports for sibling recipes (seq_cls, retrieval) that still
+# import them from this module; removed in Stage 3 once _component_builders is gone.
+from nemo_automodel.recipes._component_builders import (  # noqa: F401
     build_checkpoint_config,
-    build_loss_fn,
-    build_lr_scheduler,  # noqa: F401
-    build_mlflow,  # noqa: F401
+    build_lr_scheduler,
     build_optimizer,
-    build_step_scheduler,  # noqa: F401
-    build_wandb,  # noqa: F401
+    build_step_scheduler,
 )
 from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -712,7 +710,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._log_library_versions()
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        self.loss_fn = self.cfg.loss_fn.build()
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
@@ -761,11 +759,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.peft_config = self.cfg.peft.instantiate()
 
         # Build checkpoint config
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
+        checkpoint_config = self.cfg.checkpoint.build(
+            cache_dir=self.cfg.get("model.cache_dir", None),
+            model_repo_id=_get_model_name(self.cfg.model),
+            is_peft=bool(self.cfg.get("peft", None)),
         )
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -804,7 +801,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = self.cfg.optimizer.build(
+            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
