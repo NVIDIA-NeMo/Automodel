@@ -75,6 +75,15 @@ def _unpack_qpn(batch: dict[str, torch.Tensor]):
     return q_batch, d_batch, flat_n_batch, n_mask
 
 
+def _dp_group_src_rank(group) -> int:
+    if group is None:
+        return 0
+    try:
+        return torch.distributed.get_process_group_ranks(group)[0]
+    except Exception:
+        return 0
+
+
 def _clean_path(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink()
@@ -243,8 +252,53 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
 
         projection_lr = self.cfg.get("projection_lr", None)
         restore_from = self.cfg.get("checkpoint.restore_from", None)
+        self._sync_projection_parameters()
         if restore_from is None:
             self._rebuild_optimizer_with_projection_group(projection_lr)
+
+    def _projection_parameters(self) -> list[torch.nn.Parameter]:
+        model = self.model_parts[0]
+        if isinstance(model, DistributedDataParallel):
+            model = model.module
+        projection = getattr(model, "projection", None)
+        if projection is None:
+            return []
+        return [param for param in projection.parameters() if param.requires_grad]
+
+    def _sync_projection_parameters(self) -> None:
+        """Keep the rank-local projection head replicated across DP ranks."""
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        params = self._projection_parameters()
+        if not params:
+            return
+        dp_group = self._get_dp_group(include_cp=True)
+        dp_size = self._get_dp_group_size(include_cp=True)
+        if dp_size <= 1:
+            return
+        src_rank = _dp_group_src_rank(dp_group)
+        for param in params:
+            torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
+
+    def _sync_projection_gradients(self) -> None:
+        """Average projection gradients that are outside FSDP/DDP wrapping."""
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        model = self.model_parts[0]
+        if isinstance(model, DistributedDataParallel):
+            return
+        params = self._projection_parameters()
+        if not params:
+            return
+        dp_group = self._get_dp_group(include_cp=True)
+        dp_size = self._get_dp_group_size(include_cp=True)
+        if dp_size <= 1:
+            return
+        for param in params:
+            if param.grad is None:
+                continue
+            torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            param.grad.div_(dp_size)
 
     def _rebuild_optimizer_with_projection_group(self, projection_lr: float | None) -> None:
         model = self.model_parts[0]
@@ -285,6 +339,10 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             self.lr_scheduler[:] = [] if new_lr_schedulers is None else list(new_lr_schedulers)
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
+        uses_hard_negatives = self.loss_weights["nce"] > 0 or self.loss_weights["nce_kd"] > 0
+        if not uses_hard_negatives:
+            batch = {key: value for key, value in batch.items() if not key.startswith("n_")}
+
         batch = _move_to_device(batch, self.dist_env.device)
         q_batch, d_batch, n_batch, n_mask = _unpack_qpn(batch)
 
@@ -305,7 +363,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             s_d_pool, s_d_proj, s_d_inter = student_model(d_batch)
 
             s_n_pool = None
-            if n_batch is not None:
+            if n_batch is not None and uses_hard_negatives:
                 bsz, num_neg = n_mask.shape
                 s_n_pool, _, _ = student_model(n_batch)
                 s_n_pool = s_n_pool.view(bsz, num_neg, s_n_pool.shape[-1])
@@ -390,6 +448,8 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
         loss_buffer = []
         for idx, batch in enumerate(batches):
             self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
+
+        self._sync_projection_gradients()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,

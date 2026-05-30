@@ -152,6 +152,8 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
         Pooled embeddings [batch_size, hidden_size]
     """
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    if pool_type == "mean":
+        pool_type = "avg"
 
     if pool_type == "avg":
         emb = last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
