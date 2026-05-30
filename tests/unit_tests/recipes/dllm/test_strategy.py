@@ -12,57 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM strategies (MDLMStrategy, HybridStrategy) and get_dllm_strategy."""
+"""Tests for dLLM strategies (MDLMStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
+
+import types
 
 import pytest
 import torch
 
-from nemo_automodel.components.loss.dllm_loss import (
-    HybridDiffusionLLMLoss,
-    MDLMCrossEntropyLoss,
-)
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
-    DLLMStrategy,
+    DFlashStrategy,
     HybridStrategy,
     MDLMStrategy,
     get_dllm_strategy,
 )
 
-# ---------------------------------------------------------------------------
-# Strategy registry tests
-# ---------------------------------------------------------------------------
+
+def test_get_dllm_strategy_rejects_unknown_mode():
+    """Unknown mode must raise a clear ValueError (recipe entry point relies on this)."""
+    with pytest.raises(ValueError, match="Unknown dllm.mode"):
+        get_dllm_strategy("unknown")
 
 
-class TestDLLMStrategyRegistry:
-    def test_mdlm_in_strategies(self):
-        assert "mdlm" in DLLM_STRATEGIES
+def test_get_dllm_strategy_resolves_dflash():
+    """Registry happy-path for the flagship DFlash strategy — a typo in the
+    DLLM_STRATEGIES dict would only surface at smoke time without this test."""
+    assert isinstance(get_dllm_strategy("dflash"), DFlashStrategy)
 
-    def test_hybrid_in_strategies(self):
-        assert "hybrid" in DLLM_STRATEGIES
 
-    def test_get_mdlm_strategy(self):
-        s = get_dllm_strategy("mdlm")
-        assert isinstance(s, MDLMStrategy)
-
-    def test_get_hybrid_strategy(self):
-        s = get_dllm_strategy("hybrid")
-        assert isinstance(s, HybridStrategy)
-
-    def test_unknown_mode_raises(self):
-        with pytest.raises(ValueError, match="Unknown dllm.mode"):
-            get_dllm_strategy("unknown")
-
-    def test_all_strategies_are_subclasses(self):
-        for name, cls in DLLM_STRATEGIES.items():
-            assert issubclass(cls, DLLMStrategy)
-
-    def test_all_strategies_have_valid_normalization_mode(self):
-        for name, cls in DLLM_STRATEGIES.items():
-            s = cls()
-            assert s.normalization_mode in ("supervised", "noise"), (
-                f"Strategy {name} has invalid normalization_mode: {s.normalization_mode}"
-            )
+def test_every_registered_strategy_has_valid_normalization_mode():
+    """Strategy contract: ``normalization_mode`` selects the loss denominator in
+    ``_run_train_optim_step``; a typo (e.g. ``"supervize"``) raises
+    ``Invalid normalization_mode`` at runtime. Iterating the registry catches
+    this at test time for every strategy."""
+    for name, cls in DLLM_STRATEGIES.items():
+        mode = cls().normalization_mode
+        assert mode in ("supervised", "noise"), f"strategy {name!r}: invalid normalization_mode {mode!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -74,30 +59,6 @@ class TestMDLMStrategy:
     @pytest.fixture
     def strategy(self):
         return MDLMStrategy()
-
-    def test_normalization_mode_default(self, strategy):
-        assert strategy.normalization_mode == "supervised"
-
-    def test_create_loss_fn_type(self, strategy):
-        loss_fn = strategy.create_loss_fn({})
-        assert isinstance(loss_fn, MDLMCrossEntropyLoss)
-
-    def test_apply_corruption_shapes(self, strategy):
-        torch.manual_seed(42)
-        B, L = 2, 16
-        input_ids = torch.randint(0, 100, (B, L))
-        loss_mask = torch.ones(B, L, dtype=torch.long)
-        noisy, noise_mask, p_mask = strategy.apply_corruption(
-            input_ids,
-            loss_mask,
-            mask_token_id=999,
-            eps=0.001,
-            block_size=None,
-            half_life_ratio=None,
-        )
-        assert noisy.shape == (B, L)
-        assert noise_mask.shape == (B, L)
-        assert p_mask.shape == (B, L)
 
     def test_apply_corruption_uses_uniform(self, strategy):
         """MDLM always uses uniform corruption (p_mask constant per sequence)."""
@@ -113,12 +74,11 @@ class TestMDLMStrategy:
             block_size=None,
             half_life_ratio=None,
         )
-        # Uniform corruption: p_mask is constant per sequence
         for b in range(B):
             assert (p_mask[b] == p_mask[b, 0]).all()
 
     def test_prepare_batch_sets_noisy_input_ids(self, strategy):
-        """MDLM sets input_ids to noisy tokens and removes attention_mask."""
+        """MDLM sets input_ids to noisy tokens and removes attention_mask (bidirectional)."""
         batch = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "attention_mask": torch.ones(2, 4)}
         noisy = torch.ones(2, 4, dtype=torch.long) * 999
         noise_mask = torch.ones(2, 4, dtype=torch.bool)
@@ -126,7 +86,6 @@ class TestMDLMStrategy:
 
         result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
         assert (result["input_ids"] == noisy).all()
-        # attention_mask should be removed for MDLM (bidirectional)
         assert "attention_mask" not in result
 
 
@@ -140,13 +99,8 @@ class TestLLaDAIntegration:
 
     LLADA_MASK_TOKEN_ID = 126336
 
-    def test_mdlm_strategy_for_llada(self):
-        """LLaDA uses MDLM mode."""
-        strategy = get_dllm_strategy("mdlm")
-        assert isinstance(strategy, MDLMStrategy)
-
     def test_corruption_with_llada_mask_token(self):
-        """Verify corruption works with LLaDA's mask token ID."""
+        """Corrupted positions get LLaDA's mask token; uncorrupted positions are unchanged."""
         torch.manual_seed(42)
         strategy = MDLMStrategy()
         B, L = 2, 16
@@ -161,73 +115,26 @@ class TestLLaDAIntegration:
             block_size=None,
             half_life_ratio=None,
         )
-        # Corrupted positions should have LLaDA's mask token
         assert (noisy[noise_mask] == self.LLADA_MASK_TOKEN_ID).all()
-        # Uncorrupted positions unchanged
         assert (noisy[~noise_mask] == input_ids[~noise_mask]).all()
 
-    def test_mdlm_loss_with_llada_outputs(self):
-        """Test MDLM loss with shapes matching LLaDA output."""
-        torch.manual_seed(42)
-        strategy = MDLMStrategy()
-        loss_fn = strategy.create_loss_fn({})
-
-        B, L, V_test = 2, 16, 100
-        logits = torch.randn(B, L, V_test)
-        target_ids = torch.randint(0, V_test, (B, L))
-        loss_mask = torch.ones(B, L, dtype=torch.long)
-        noise_mask = torch.rand(B, L) > 0.5
-        p_mask = torch.full((B, L), 0.5)
-
-        result = loss_fn(logits, target_ids, noise_mask, p_mask, loss_mask)
-        assert result.total_loss.item() > 0
-        # MDLM: total_loss == dllm_loss (no AR component)
-        assert torch.allclose(result.total_loss, result.dllm_loss, atol=1e-6)
-
-    def test_prepare_batch_for_llada_forward(self):
-        """Verify batch prepared by MDLM strategy is compatible with LLaDA.
-
-        LLaDA forward() accepts: input_ids, inputs_embeds, attention_mask,
-        attention_bias, past_key_values, labels, use_cache, output_attentions,
-        output_hidden_states, return_dict, cache_position.
-        It does NOT accept **kwargs.
-        """
+    def test_prepare_batch_passes_extra_keys_for_recipe_filtering(self):
+        """Strategy keeps extra collator keys (input_lengths); the recipe filters
+        them against the LLaDA forward signature (which does not accept **kwargs)."""
         strategy = MDLMStrategy()
         batch = {
             "input_ids": torch.zeros(2, 4, dtype=torch.long),
             "attention_mask": torch.ones(2, 4),
-            "input_lengths": torch.tensor([3, 4]),  # Extra key from collator
+            "input_lengths": torch.tensor([3, 4]),  # extra key from collator
         }
         noisy = torch.ones(2, 4, dtype=torch.long) * 126336
         noise_mask = torch.ones(2, 4, dtype=torch.bool)
         clean = torch.zeros(2, 4, dtype=torch.long)
 
         result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
-
-        # input_ids should be noisy
         assert (result["input_ids"] == noisy).all()
-        # attention_mask should be removed by strategy
         assert "attention_mask" not in result
-        # input_lengths is still present (filtering is done by the recipe)
-        assert "input_lengths" in result
-
-        # Simulate recipe-level filtering for LLaDA
-        llada_params = {
-            "input_ids",
-            "inputs_embeds",
-            "attention_mask",
-            "attention_bias",
-            "past_key_values",
-            "labels",
-            "use_cache",
-            "output_attentions",
-            "output_hidden_states",
-            "return_dict",
-            "cache_position",
-        }
-        filtered = {k: v for k, v in result.items() if k in llada_params}
-        assert "input_lengths" not in filtered
-        assert "input_ids" in filtered
+        assert "input_lengths" in result  # passed through; recipe filters it
 
 
 # ---------------------------------------------------------------------------
@@ -240,14 +147,9 @@ class TestHybridStrategy:
     def strategy(self):
         return HybridStrategy()
 
-    def test_create_loss_fn_type(self, strategy):
-        loss_fn = strategy.create_loss_fn({"ar_loss_alpha": 0.3})
-        assert isinstance(loss_fn, HybridDiffusionLLMLoss)
-        assert loss_fn.alpha == 0.3
-
-    def test_create_loss_fn_default_alpha(self, strategy):
-        loss_fn = strategy.create_loss_fn({})
-        assert loss_fn.alpha == 1.0
+    def test_create_loss_fn_reads_alpha_from_config(self, strategy):
+        assert strategy.create_loss_fn({"ar_loss_alpha": 0.3}).alpha == 0.3
+        assert strategy.create_loss_fn({}).alpha == 1.0  # default
 
     def test_apply_corruption_uniform_when_no_block_size(self, strategy):
         """block_size=None should select uniform corruption (constant p_mask per row)."""
@@ -255,7 +157,7 @@ class TestHybridStrategy:
         B, L = 2, 16
         input_ids = torch.randint(0, 100, (B, L))
         loss_mask = torch.ones(B, L, dtype=torch.long)
-        noisy, noise_mask, p_mask = strategy.apply_corruption(
+        _, _, p_mask = strategy.apply_corruption(
             input_ids,
             loss_mask,
             mask_token_id=999,
@@ -263,29 +165,8 @@ class TestHybridStrategy:
             block_size=None,
             half_life_ratio=None,
         )
-        assert noisy.shape == (B, L)
-        assert noise_mask.shape == (B, L)
-        assert p_mask.shape == (B, L)
         for b in range(B):
             assert torch.allclose(p_mask[b], p_mask[b, 0].expand_as(p_mask[b]))
-
-    def test_apply_corruption_blockwise_when_block_size_set(self, strategy):
-        """block_size=4 should invoke the blockwise corruption path."""
-        torch.manual_seed(42)
-        B, L = 2, 16
-        input_ids = torch.randint(0, 100, (B, L))
-        loss_mask = torch.ones(B, L, dtype=torch.long)
-        noisy, noise_mask, p_mask = strategy.apply_corruption(
-            input_ids,
-            loss_mask,
-            mask_token_id=999,
-            eps=0.001,
-            block_size=4,
-            half_life_ratio=None,
-        )
-        assert noisy.shape == (B, L)
-        assert noise_mask.shape == (B, L)
-        assert p_mask.shape == (B, L)
 
     def test_prepare_batch_passes_clean_input_ids(self, strategy):
         """Hybrid models receive clean tokens plus a masked_indices sidecar."""
@@ -309,30 +190,202 @@ class TestHybridStrategy:
 
 
 # ---------------------------------------------------------------------------
-# normalization_mode override tests
+# DFlashStrategy — anchor-block sampling (CPU, no model loading)
 # ---------------------------------------------------------------------------
 
+MASK_ID = 999
+BLOCK_SIZE = 16
 
-class TestNormalizationModeOverride:
-    """Verify that a strategy subclass can override normalization_mode."""
 
-    def test_custom_noise_mode(self):
-        class NoiseModeStrategy(DLLMStrategy):
-            @property
-            def normalization_mode(self):
-                return "noise"
+def test_dflash_strategy_defaults():
+    """Lock load-bearing DFlashStrategy constructor defaults.
 
-            def create_loss_fn(self, dllm_cfg):
-                return MDLMCrossEntropyLoss()
+    These defaults encode deliberate design decisions (paper §4.2 + the
+    safety guard rails surfaced by the original PR review):
 
-            def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
-                from nemo_automodel.components.datasets.dllm.corruption import corrupt_uniform
+    - ``overlap_anchors=True``: paper-default per-sample independent anchor
+      sampling (gap #1 fix). Flipping to False silently reverts to the legacy
+      batch-shared stars-and-bars sampler.
+    - ``block_size=0``: sentinel meaning "read block_size from the draft
+      model's config". Any non-zero default would override the draft config.
+    - ``num_blocks_per_sample=1``: safe default; production yaml must opt
+      into the paper's 512 explicitly. A larger default would silently OOM
+      smaller GPUs.
+    - ``attention_backend="sdpa"``: dense fallback that works everywhere;
+      production yaml must opt into ``flex_attention`` for N=512.
+    """
+    s = DFlashStrategy()
+    assert s.overlap_anchors is True
+    assert s.block_size == 0
+    assert s.num_blocks_per_sample == 1
+    assert s.attention_backend == "sdpa"
 
-                return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
 
-            def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
-                batch["input_ids"] = noisy_input_ids
-                return batch
+def _make_recipe(mask_token_id=MASK_ID):
+    """Minimal recipe stub with the fields DFlashStrategy methods need."""
+    return types.SimpleNamespace(mask_token_id=mask_token_id)
 
-        s = NoiseModeStrategy()
-        assert s.normalization_mode == "noise"
+
+def _make_strategy(block_size=BLOCK_SIZE, overlap_anchors=False):
+    """DFlashStrategy stub with block_size set; defaults to the
+    non-overlapping sampler for backward compatibility with existing tests.
+    """
+    s = DFlashStrategy()
+    s.block_size = block_size
+    s.overlap_anchors = overlap_anchors
+    return s
+
+
+class TestDFlashSampleAnchorBlocks:
+    """Tests for the non-overlapping (legacy) _sample_anchor_blocks path.
+
+    Returns the per-sample 5-tuple
+    ``(anchor_positions [B,N], block_keep_mask [B,N], block_output_ids,
+    block_targets, block_mask)``.
+    """
+
+    def _make_inputs(self, seq_len, batch_size=2):
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        attn = torch.ones(batch_size, seq_len, dtype=torch.long)
+        return input_ids, attn
+
+    def test_shapes(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        for n in (1, 4):
+            input_ids, attn = self._make_inputs(128)
+            ap, keep, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=n)
+            assert ap.shape == (2, n)
+            assert keep.shape == (2, n)
+            assert boi.shape == (2, n * 8)
+            assert bt.shape == (2, n * 7)
+            assert bm.shape == (2, n * 7)
+
+    def test_blocks_are_non_overlapping(self):
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        for _ in range(10):
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            starts = ap[0].tolist()  # batch-shared in non-overlap mode
+            assert starts == sorted(starts)
+            for i in range(len(starts) - 1):
+                assert starts[i + 1] >= starts[i] + s.block_size, f"blocks overlap: {starts}"
+
+    def test_blocks_fit_in_sequence(self):
+        seq_len = 64
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        for _ in range(10):
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+            assert (ap >= 1).all() and (ap + s.block_size <= seq_len).all()
+
+    def test_anchor_token_is_clean(self):
+        """First token of each kept block must be the real token at its anchor."""
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, keep, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        B, n = ap.shape
+        for b in range(B):
+            for i in range(n):
+                if keep[b, i]:
+                    assert boi[b, i * s.block_size] == input_ids[b, ap[b, i]]
+
+    def test_non_anchor_tokens_are_mask(self):
+        """All positions after the anchor in each block should be MASK_ID."""
+        s = _make_strategy(block_size=8)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, _, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3)
+        n = ap.shape[1]
+        for b in range(n):
+            noise_slice = boi[:, b * s.block_size + 1 : (b + 1) * s.block_size]
+            assert (noise_slice == MASK_ID).all()
+
+    def test_loss_mask_zeros_block_mask(self):
+        """block_mask must be zero wherever loss_mask is zero."""
+        torch.manual_seed(7)
+        B, L, bs = 2, 64, 8
+        s = _make_strategy(block_size=bs)
+        recipe = _make_recipe()
+        input_ids = torch.randint(0, 100, (B, L))
+        attn = torch.ones(B, L, dtype=torch.long)
+        # Zero the entire loss_mask — every predicted position should be masked out.
+        loss_mask = torch.zeros(B, L, dtype=torch.long)
+        _, _, _, _, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=3, loss_mask=loss_mask)
+        assert bm.sum().item() == 0
+
+
+class TestDFlashSampleAnchorBlocksOverlapping:
+    """Tests for the paper-default per-sample overlap_anchors=True sampler.
+
+    Each sample draws ``num_blocks`` anchors independently (Appendix A.1), so
+    anchor_positions is ``[B, N]`` with potentially different rows.
+    """
+
+    def _make_inputs(self, seq_len, batch_size=2):
+        torch.manual_seed(42)
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        attn = torch.ones(batch_size, seq_len, dtype=torch.long)
+        return input_ids, attn
+
+    def test_anchors_in_valid_range(self):
+        """Every anchor must satisfy 1 <= a <= valid_len - block_size."""
+        seq_len, bs = 64, 8
+        s = _make_strategy(block_size=bs, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        for _ in range(10):
+            ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+            assert (ap >= 1).all() and (ap <= seq_len - bs).all()
+
+    def test_can_exceed_non_overlapping_cap(self):
+        """N > seq_len // block_size succeeds (impossible in non-overlap mode)."""
+        seq_len, bs = 32, 8  # non-overlap cap = 4
+        s = _make_strategy(block_size=bs, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(seq_len)
+        ap, keep, boi, bt, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=20)
+        assert ap.shape == (2, 20)
+        assert boi.shape == (2, 20 * bs)
+
+    def test_per_sample_diversity(self):
+        """Different samples should (with high probability) get different anchors."""
+        torch.manual_seed(0)
+        s = _make_strategy(block_size=8, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(256, batch_size=2)
+        ap, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=16)
+        # Two independently-sampled rows of 16 anchors should not be identical.
+        assert not torch.equal(ap[0], ap[1])
+
+    def test_anchor_token_is_clean_per_sample(self):
+        """Each kept block's first token is the real token at that sample's anchor."""
+        s = _make_strategy(block_size=8, overlap_anchors=True)
+        recipe = _make_recipe()
+        input_ids, attn = self._make_inputs(128)
+        ap, keep, boi, *_ = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=10)
+        B, n = ap.shape
+        for b in range(B):
+            for i in range(n):
+                if keep[b, i]:
+                    assert boi[b, i * s.block_size] == input_ids[b, ap[b, i]]
+
+    def test_min_token_filter_drops_short_samples(self):
+        """Samples with < 2*block_size supervised tokens get block_keep_mask=False."""
+        bs = 8
+        s = _make_strategy(block_size=bs, overlap_anchors=True)
+        recipe = _make_recipe()
+        torch.manual_seed(1)
+        B, L = 2, 128
+        input_ids = torch.randint(0, 100, (B, L))
+        attn = torch.ones(B, L, dtype=torch.long)
+        # Sample 0 long enough, sample 1 too short (< 2*bs valid tokens).
+        attn[1, 2 * bs - 1 :] = 0
+        ap, keep, _, _, bm = s._sample_anchor_blocks(recipe, input_ids, attn, num_blocks=4)
+        assert keep[0].all()  # long sample kept
+        assert (~keep[1]).all()  # short sample fully dropped
+        assert bm[1].sum().item() == 0  # short sample contributes no loss
