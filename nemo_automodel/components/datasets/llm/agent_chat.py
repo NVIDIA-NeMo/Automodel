@@ -216,6 +216,38 @@ def _convert_messages(
     return out
 
 
+def _mask_labels_to_last_turn(labels: List[int], ignore_index: int = -100) -> List[int]:
+    """Restrict the loss to the final assistant turn (``mask_history``).
+
+    ``labels`` come from :func:`format_chat_template` with every assistant
+    turn supervised; non-assistant tokens are already ``ignore_index``.
+    Because the chat template renders each assistant message as a single
+    contiguous span, supervised tokens form one maximal run per assistant
+    turn separated by ``ignore_index`` runs. This keeps only the last such
+    run and masks every earlier supervised token in place.
+
+    Args:
+        labels: per-token labels (``ignore_index`` marks unsupervised tokens).
+        ignore_index: the value marking unsupervised tokens.
+
+    Returns:
+        The same list, mutated so only the final supervised run is kept.
+    """
+    last = -1
+    for i in range(len(labels) - 1, -1, -1):
+        if labels[i] != ignore_index:
+            last = i
+            break
+    if last < 0:
+        return labels
+    start = last
+    while start - 1 >= 0 and labels[start - 1] != ignore_index:
+        start -= 1
+    for i in range(start):
+        labels[i] = ignore_index
+    return labels
+
+
 def _format_example(
     example: Dict[str, Any],
     tokenizer,
@@ -225,6 +257,7 @@ def _format_example(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
+    train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
@@ -254,7 +287,7 @@ def _format_example(
         drop_history_reasoning_content=drop_history_reasoning_content,
     )
 
-    return format_chat_template(
+    tokenized = format_chat_template(
         tokenizer=tokenizer,
         formatted_text=formatted,
         tools=tools,
@@ -266,6 +299,9 @@ def _format_example(
         answer_only_loss_mask=True,
         mask_reasoning_content=mask_reasoning_content,
     )
+    if train_on_last_turn_only:
+        _mask_labels_to_last_turn(tokenized["labels"])
+    return tokenized
 
 
 def make_agent_chat_dataset(
@@ -279,6 +315,7 @@ def make_agent_chat_dataset(
     padding: Union[str, bool] = False,
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
+    train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
 ) -> LazyMappedDataset:
     """Load a multi-turn function-calling SFT dataset.
@@ -302,6 +339,10 @@ def make_agent_chat_dataset(
             prompt. Requires a chat template that emits ``reasoning_content``.
             Defaults to False, which trains on reasoning tokens like any other
             assistant content.
+        train_on_last_turn_only: If True, supervise only the final assistant
+            turn of each dialogue (``mask_history``); all earlier assistant
+            turns are excluded from the loss. Defaults to False, which
+            supervises every assistant turn.
         drop_history_reasoning_content: If True, strip ``reasoning_content``
             from all but the final assistant turn so historical thinking is not
             rendered into the prompt (matching inference, where prior-turn
@@ -344,6 +385,7 @@ def make_agent_chat_dataset(
         padding=padding,
         truncation=truncation,
         mask_reasoning_content=mask_reasoning_content,
+        train_on_last_turn_only=train_on_last_turn_only,
         drop_history_reasoning_content=drop_history_reasoning_content,
     )
     return LazyMappedDataset(dataset, fmt_fn)
