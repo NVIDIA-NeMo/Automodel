@@ -189,6 +189,123 @@ def make_llava_onevision_dataset(
     return [format(example) for example in dataset]
 
 
+def make_tulu3_magicoder_text_mix_dataset(
+    tulu_split: str = "train",
+    magicoder_split: str = "train",
+    seed: int = 42,
+    max_turns: int = 16,
+    limit_total: int | None = None,
+    **kwargs,
+) -> list:
+    """Build a text-only 80/20 mix of Tulu-3-SFT-mixture and Magicoder-OSS-Instruct-75K.
+
+    Both datasets are converted into the NeMo VLM ``{"conversation": [...]}`` shape
+    consumed by :func:`nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`.
+    Because ``default_collate_fn`` is image-aware only when a conversation turn
+    contains an ``{"type": "image", ...}`` entry, returning text-only conversations
+    here yields batches with no ``pixel_values`` / vision tensors -- which is what
+    the Gemma 4 base+drafter composite expects for text-only training.
+
+    Sources:
+        - ``allenai/tulu-3-sft-mixture`` (multi-turn, ``messages`` field of
+          ``{"role", "content"}`` dicts).
+        - ``ise-uiuc/Magicoder-OSS-Instruct-75K`` (2-turn, ``problem`` and
+          ``solution`` fields).
+
+    Mixing uses ``datasets.interleave_datasets`` with probabilities ``[0.8, 0.2]``
+    and ``stopping_strategy="all_exhausted"`` so both datasets are sampled until
+    every example has been drawn at least once.
+
+    Args:
+        tulu_split: HF split expression for the Tulu-3 source (e.g. ``"train"``
+            or ``"train[:50000]"``).
+        magicoder_split: HF split expression for the Magicoder source.
+        seed: Seed forwarded to ``interleave_datasets`` for reproducibility.
+        max_turns: Drop Tulu-3 conversations with more than this many turns to
+            keep memory bounded. Magicoder samples are always 2 turns.
+        limit_total: If set, cap the merged dataset to this many rows.
+        **kwargs: Additional arguments forwarded to ``load_dataset`` for both
+            sources.
+
+    Returns:
+        List of ``{"conversation": [...]}`` dicts. Each conversation is a list of
+        ``{"role": "user"|"assistant"|"system", "content": [{"type": "text", "text": ...}]}``
+        turns with no ``image`` field anywhere in the structure.
+    """
+    from datasets import interleave_datasets
+
+    tulu = load_dataset("allenai/tulu-3-sft-mixture", split=tulu_split, **kwargs)
+    magicoder = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split=magicoder_split, **kwargs)
+
+    valid_roles = {"system", "user", "assistant"}
+
+    def _tulu_to_conversation(example):
+        messages = example.get("messages") or []
+        if not messages or len(messages) > max_turns:
+            return None
+        conversation = []
+        for turn in messages:
+            role = turn.get("role", "")
+            text = turn.get("content", "") or ""
+            if role not in valid_roles or not text.strip():
+                continue
+            conversation.append(
+                {
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                }
+            )
+        if len(conversation) < 2:
+            return None
+        # The chat template needs at least one assistant turn for labels.
+        if not any(t["role"] == "assistant" for t in conversation):
+            return None
+        return {"conversation": conversation}
+
+    def _magicoder_to_conversation(example):
+        problem = (example.get("problem") or "").strip()
+        solution = (example.get("solution") or "").strip()
+        if not problem or not solution:
+            return None
+        return {
+            "conversation": [
+                {"role": "user", "content": [{"type": "text", "text": problem}]},
+                {"role": "assistant", "content": [{"type": "text", "text": solution}]},
+            ],
+        }
+
+    # Project both datasets to a single shared column ("conversation") via
+    # ``datasets.Dataset.map`` so ``interleave_datasets`` can concatenate them.
+    # Rows that fail conversion (too long, missing fields) are emitted with an
+    # empty conversation and then filtered out before materialization.
+    def _tulu_map(example):
+        out = _tulu_to_conversation(example)
+        return {"conversation": out["conversation"] if out is not None else []}
+
+    def _magicoder_map(example):
+        out = _magicoder_to_conversation(example)
+        return {"conversation": out["conversation"] if out is not None else []}
+
+    tulu = tulu.map(_tulu_map, remove_columns=tulu.column_names)
+    magicoder = magicoder.map(_magicoder_map, remove_columns=magicoder.column_names)
+    tulu = tulu.filter(lambda ex: len(ex["conversation"]) >= 2)
+    magicoder = magicoder.filter(lambda ex: len(ex["conversation"]) >= 2)
+
+    mixed = interleave_datasets(
+        [tulu, magicoder],
+        probabilities=[0.8, 0.2],
+        stopping_strategy="all_exhausted",
+        seed=seed,
+    )
+
+    out = []
+    for ex in mixed:
+        out.append({"conversation": ex["conversation"]})
+        if limit_total is not None and len(out) >= limit_total:
+            break
+    return out
+
+
 def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
     """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
     dataset = load_dataset(path_or_dataset, split=split)
