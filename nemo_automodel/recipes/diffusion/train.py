@@ -40,7 +40,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
-from nemo_automodel.recipes._component_builders import build_wandb
+from nemo_automodel.recipes._typed_config import RecipeConfig, _model_name_from_cfg
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import build_distributed
 
@@ -406,15 +406,16 @@ class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
         self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
         setup_logging()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
 
@@ -549,7 +550,7 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         checkpoint_cfg = self.cfg.get("checkpoint", None)
 
-        self.num_epochs = self.cfg.step_scheduler.num_epochs
+        self.num_epochs = self.cfg.get("step_scheduler.num_epochs")
         self.log_every = self.cfg.get("step_scheduler.log_every", 5)
 
         # Strictly require checkpoint config from YAML (no fallback)
@@ -587,7 +588,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.dataloader, self.sampler = dataloader_cfg.instantiate(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
-            batch_size=self.cfg.step_scheduler.local_batch_size,
+            batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
 
         self.raw_steps_per_epoch = len(self.dataloader)
@@ -610,9 +611,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.dp_size = max(1, self.world_size // denom)
 
         # Infer local micro-batch size from dataloader if available
-        self.local_batch_size = self.cfg.step_scheduler.local_batch_size
+        self.local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         # Desired global effective batch size across all DP ranks and nodes
-        self.global_batch_size = self.cfg.step_scheduler.global_batch_size
+        self.global_batch_size = self.cfg.get("step_scheduler.global_batch_size")
         # Steps per epoch after gradient accumulation
         grad_acc_steps = max(1, self.global_batch_size // max(1, self.local_batch_size * self.dp_size))
         self.steps_per_epoch = ceil(self.raw_steps_per_epoch / grad_acc_steps)
@@ -636,10 +637,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.start_epoch = 0
         # Initialize StepScheduler for gradient accumulation and step/epoch bookkeeping
         self.step_scheduler = StepScheduler(
-            global_batch_size=self.cfg.step_scheduler.global_batch_size,
-            local_batch_size=self.cfg.step_scheduler.local_batch_size,
+            global_batch_size=self.cfg.get("step_scheduler.global_batch_size"),
+            local_batch_size=self.cfg.get("step_scheduler.local_batch_size"),
             dp_size=int(self.dp_size),
-            ckpt_every_steps=self.cfg.step_scheduler.ckpt_every_steps,
+            ckpt_every_steps=self.cfg.get("step_scheduler.ckpt_every_steps"),
             save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
             dataloader=self.dataloader,
             val_every_steps=None,

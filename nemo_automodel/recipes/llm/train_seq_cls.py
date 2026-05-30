@@ -32,16 +32,13 @@ from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
     _get_model_name,
-    build_checkpoint_config,
     build_dataloader,
     build_distributed,
-    build_lr_scheduler,
     build_model,
-    build_optimizer,
-    build_step_scheduler,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +48,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     """Recipe for fine-tuning a model for sequence classification."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
         torch.cuda.reset_peak_memory_stats()
@@ -67,12 +64,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            # Reuse helper from NTP recipe
-            from nemo_automodel.recipes._component_builders import build_wandb
-
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
         self._log_experiment_details()
@@ -84,11 +78,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         # loss function: standard CE on logits
         self.loss_fn = torch.nn.CrossEntropyLoss()
 
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
+        checkpoint_config = self.cfg.checkpoint.build(
+            cache_dir=self.cfg.get("model.cache_dir", None),
+            model_repo_id=_get_model_name(self.cfg.model),
+            is_peft=bool(self.cfg.get("peft", None)),
         )
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -117,7 +110,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = self.cfg.optimizer.build(
+            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
+        )
 
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
@@ -155,15 +150,18 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
 
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 

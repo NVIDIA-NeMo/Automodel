@@ -76,16 +76,8 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._component_builders import (
-    build_checkpoint_config,
-    build_loss_fn,
-    build_lr_scheduler,
-    build_mlflow,
-    build_optimizer,
-    build_step_scheduler,
-    build_wandb,
-)
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 if TYPE_CHECKING:
@@ -457,7 +449,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         Args:
             cfg: Configuration dictionary/object for training.
         """
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     # ------------------ build phase ------------------
     def setup(self):
@@ -484,13 +476,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
-        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            if build_mlflow(self.cfg) is not None:
+        if self.dist_env.is_main and self.cfg.mlflow is not None:
+            run_config = self.cfg.to_yaml_dict(use_orig_values=True)
+            checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
+            if self.cfg.mlflow.build(checkpoint_dir=checkpoint_dir, run_config=run_config) is not None:
                 logging.info("MLflow experiment tracking enabled")
 
         # Log experiment details on main rank
@@ -498,11 +492,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self._log_library_versions()
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        self.loss_fn = self.cfg.loss_fn.build()
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
-            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
             assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
@@ -527,11 +521,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.peft_config = self.cfg.peft.instantiate()
 
         # Build checkpoint config
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
+        checkpoint_config = self.cfg.checkpoint.build(
+            cache_dir=self.cfg.get("model.cache_dir", None),
+            model_repo_id=_get_model_name(self.cfg.model),
+            is_peft=bool(self.cfg.get("peft", None)),
         )
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
@@ -567,7 +560,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = self.cfg.optimizer.build(
+            model, distributed_config=self.distributed_config, device_mesh=self.device_mesh
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -623,16 +618,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
 
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)

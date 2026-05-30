@@ -22,11 +22,11 @@ import torch.nn as nn
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.vlm.pp_media import chunk_vlm_media, prepare_vlm_media_for_pp
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.recipes._component_builders import build_optimizer
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
     build_model,
-    build_optimizer,
 )
 
 
@@ -992,12 +992,12 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
         )
 
 
-from nemo_automodel.recipes.vlm.finetune import (
+from nemo_automodel.recipes._component_builders import (
     build_checkpoint_config,
     build_lr_scheduler,
     build_step_scheduler,
-    calculate_loss,
 )
+from nemo_automodel.recipes.vlm.finetune import calculate_loss
 
 # -----------------------------------------------------------------------------
 # build_step_scheduler tests
@@ -2463,7 +2463,7 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_loss_fn", lambda cfg: "loss_fn")
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
 
     def _stub_build_checkpoint_config(*a, **k):
         cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
@@ -2476,8 +2476,8 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         return cfg
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_checkpoint_config",
-        _stub_build_checkpoint_config,
+        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
+        lambda self, **kw: _stub_build_checkpoint_config(),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.setup_distributed",
@@ -2495,13 +2495,13 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_optimizer", lambda *a, **k: [dummy_opt])
+    monkeypatch.setattr("nemo_automodel.recipes._typed_config.OptimizerSpec.build", lambda self, *a, **k: [dummy_opt])
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_step_scheduler",
-        lambda *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
+        "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
+        lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_lr_scheduler", lambda *a, **k: [])
+    monkeypatch.setattr("nemo_automodel.components.optim.optimizer.LRSchedulerConfig.build", lambda self, *a, **k: [])
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.build_metric_logger",
         lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
