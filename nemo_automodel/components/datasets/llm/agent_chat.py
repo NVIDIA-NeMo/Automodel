@@ -107,6 +107,7 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
 def _convert_messages(
     messages: List[Dict[str, Any]],
     example_id: Optional[Union[int, str]] = None,
+    drop_history_reasoning_content: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert chatml-style agent messages to OpenAI chat-completions format.
 
@@ -122,6 +123,10 @@ def _convert_messages(
     Args:
         messages: chatml-style turns with roles in ``_VALID_MESSAGE_ROLES``.
         example_id: Optional identifier used to derive unique tool_call ids.
+        drop_history_reasoning_content: If True, strip ``reasoning_content``
+            from every assistant turn except the final one, so historical
+            thinking traces are not rendered into the prompt. This matches
+            inference, where the model never sees its own prior-turn thinking.
 
     Returns:
         A list of OpenAI-format messages suitable for ``apply_chat_template``.
@@ -199,6 +204,15 @@ def _convert_messages(
             out.append(msg)
             i += 1
 
+    if drop_history_reasoning_content:
+        last_assistant = max(
+            (idx for idx, m in enumerate(out) if m.get("role") == "assistant"),
+            default=-1,
+        )
+        for idx, m in enumerate(out):
+            if idx != last_assistant and m.get("role") == "assistant":
+                m.pop("reasoning_content", None)
+
     return out
 
 
@@ -244,6 +258,7 @@ def _format_example(
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
+    drop_history_reasoning_content: bool = False,
 ) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
@@ -266,7 +281,11 @@ def _format_example(
     elif not isinstance(raw_messages, list):
         raise ValueError(f"`messages` must be a list, got {type(raw_messages).__name__}")
 
-    formatted = _convert_messages(raw_messages, example_id=example.get("id"))
+    formatted = _convert_messages(
+        raw_messages,
+        example_id=example.get("id"),
+        drop_history_reasoning_content=drop_history_reasoning_content,
+    )
 
     tokenized = format_chat_template(
         tokenizer=tokenizer,
@@ -297,6 +316,7 @@ def make_agent_chat_dataset(
     truncation: Union[str, bool] = False,
     mask_reasoning_content: bool = False,
     train_on_last_turn_only: bool = False,
+    drop_history_reasoning_content: bool = False,
 ) -> LazyMappedDataset:
     """Load a multi-turn function-calling SFT dataset.
 
@@ -323,6 +343,13 @@ def make_agent_chat_dataset(
             turn of each dialogue (``mask_history``); all earlier assistant
             turns are excluded from the loss. Defaults to False, which
             supervises every assistant turn.
+        drop_history_reasoning_content: If True, strip ``reasoning_content``
+            from all but the final assistant turn so historical thinking is not
+            rendered into the prompt (matching inference, where prior-turn
+            thinking is not visible). Orthogonal to ``mask_reasoning_content``:
+            this controls whether history thinking appears in the prompt at all,
+            the latter controls whether rendered thinking contributes to loss.
+            Defaults to False, which keeps every turn's reasoning_content.
 
     Returns:
         A ``LazyMappedDataset`` yielding dicts with ``input_ids``, ``labels``
@@ -354,10 +381,11 @@ def make_agent_chat_dataset(
         tokenizer,
         eos_token_id,
         pad_token_id,
-        seq_length,
-        padding,
-        truncation,
-        mask_reasoning_content,
-        train_on_last_turn_only,
+        seq_length=seq_length,
+        padding=padding,
+        truncation=truncation,
+        mask_reasoning_content=mask_reasoning_content,
+        train_on_last_turn_only=train_on_last_turn_only,
+        drop_history_reasoning_content=drop_history_reasoning_content,
     )
     return LazyMappedDataset(dataset, fmt_fn)
