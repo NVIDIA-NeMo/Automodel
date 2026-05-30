@@ -50,16 +50,21 @@ def test_state_dict_round_trip_exact(model):
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-5), (key, (a - b).abs().max().item())
 
 
-def test_from_hf_drops_index_and_mtp_keys(model):
+def test_from_hf_maps_index_and_drops_mtp(model):
     adapter = model.state_dict_adapter
+    hidden = model.config.hidden_size
     hf = adapter.to_hf(model.state_dict())
-    # Inject Stage-2/4 tensors that the Stage-1 model does not own yet.
-    hf["model.layers.1.self_attn.index_q_proj.weight"] = torch.zeros(8, model.config.hidden_size)
-    hf["model.layers.1.self_attn.index_q_proj.weight_scale_inv"] = torch.zeros(8, 2, dtype=torch.uint8)
-    hf["model.mtp.layers.0.eh_proj.weight"] = torch.zeros(model.config.hidden_size, 2 * model.config.hidden_size)
+    # Sparse-attention index branch (Stage 2): mapped under indexer.*, FP8 dequantized.
+    hf["model.layers.1.self_attn.index_q_proj.weight"] = torch.zeros(8, hidden).to(torch.float8_e4m3fn)
+    hf["model.layers.1.self_attn.index_q_proj.weight_scale_inv"] = torch.full((8, hidden // 32), 127, dtype=torch.uint8)
+    hf["model.layers.1.self_attn.index_q_norm.weight"] = torch.zeros(8)
+    # MTP (Stage 4): still dropped.
+    hf["model.mtp.layers.0.eh_proj.weight"] = torch.zeros(hidden, 2 * hidden)
 
     native = adapter.from_hf(hf)
-    assert not any("index_" in k for k in native)
+    assert "model.layers.1.self_attn.indexer.index_q_proj.weight" in native
+    assert "model.layers.1.self_attn.indexer.index_q_norm.weight" in native
+    assert not any(k.endswith("_scale_inv") for k in native)
     assert not any(".mtp." in k for k in native)
 
 

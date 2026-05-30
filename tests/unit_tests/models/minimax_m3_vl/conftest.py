@@ -74,3 +74,35 @@ def model(text_config, backend):
     m = MiniMaxM3SparseForCausalLM(text_config, backend=backend).eval()
     m.initialize_weights(dtype=torch.float32)
     return m
+
+
+# Sparse-attention variant: layer 0 dense attn, layers 1-2 block-sparse (DSA indexer).
+# Tiny block_size=4 over seq>=16 exercises real block selection (4 blocks, pick 2).
+SPARSE_ATTENTION_CONFIG = dict(
+    use_sparse_attention=True,
+    sparse_index_dim=16,
+    sparse_num_index_heads=2,  # == num_key_value_heads (one idx head per kv head)
+    sparse_topk_blocks=2,
+    sparse_block_size=4,
+    sparse_score_type="max",
+    sparse_init_block=0,
+    sparse_local_block=1,
+    sparse_attention_freq=[0, 1, 1],
+    sparse_disable_index_value=[0, 1, 1],
+)
+
+
+@pytest.fixture
+def sparse_text_config():
+    return MiniMaxM3VLTextConfig(
+        torch_dtype="float32", sparse_attention_config=dict(SPARSE_ATTENTION_CONFIG), **TINY_CFG
+    )
+
+
+@pytest.fixture
+def sparse_model(sparse_text_config, backend):
+    from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
+
+    m = MiniMaxM3SparseForCausalLM(sparse_text_config, backend=backend).eval()
+    m.initialize_weights(dtype=torch.float32)
+    return m

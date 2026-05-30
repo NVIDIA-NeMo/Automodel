@@ -32,6 +32,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -111,20 +112,172 @@ class MiniMaxM3MLP(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
+@torch.no_grad()
+def build_block_sparse_attn_bias(
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    *,
+    block_size: int,
+    topk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    num_q_heads: int,
+    score_type: str = "max",
+) -> torch.Tensor:
+    """Build the additive block-sparse causal attention bias from index q/k.
+
+    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
+    per-query-position): the index score for (query ``i``, key ``j``) is
+    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
+    grouped into blocks of ``block_size`` and reduced per block (``max`` or
+    ``lse``). For each query, the current block (``local_blocks``) and the first
+    ``init_blocks`` are always kept and the remaining budget is filled with the
+    highest-scoring causal blocks, up to ``min(topk_blocks, valid_blocks)``.
+
+    Args:
+        idx_q: ``[B, T, H_idx, D]`` index queries (post norm + RoPE).
+        idx_k: ``[B, T, 1, D]`` shared index key (post norm + RoPE).
+        num_q_heads: number of main attention heads; the per-idx-head bias is
+            expanded ``num_q_heads // H_idx`` times (GQA, repeat-interleave).
+
+    Returns:
+        ``[B, num_q_heads, T, T]`` float bias (``0`` where attended, ``-inf``
+        otherwise). Non-differentiable (hard selection).
+    """
+    bsz, seqlen, h_idx, dim = idx_q.shape
+    device = idx_q.device
+    scale = dim**-0.5
+
+    q = idx_q.permute(0, 2, 1, 3).float()  # [B, H_idx, Tq, D]
+    k = idx_k.permute(0, 2, 1, 3).float()  # [B, 1, Tk, D]
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H_idx, Tq, Tk]
+
+    causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=device))
+    neg_inf = float("-inf")
+    scores = scores.masked_fill(~causal, neg_inf)
+
+    num_blocks = (seqlen + block_size - 1) // block_size
+    pad = num_blocks * block_size - seqlen
+    if pad:
+        scores = F.pad(scores, (0, pad), value=neg_inf)
+    scores = scores.view(bsz, h_idx, seqlen, num_blocks, block_size)
+    if score_type == "lse":
+        block_score = torch.logsumexp(scores, dim=-1)
+    else:  # "max"
+        block_score = scores.amax(dim=-1)  # [B, H_idx, Tq, num_blocks]
+
+    qpos = torch.arange(seqlen, device=device)
+    blk = torch.arange(num_blocks, device=device)
+    cur_block = qpos // block_size
+    valid_blocks = cur_block + 1  # causal: blocks [0, valid_blocks)
+    causal_block = blk[None, :] < valid_blocks[:, None]  # [Tq, num_blocks]
+    forced = ((blk[None, :] == cur_block[:, None]) & (local_blocks > 0)) | (blk[None, :] < init_blocks)
+    forced = forced & causal_block
+
+    sel = block_score.masked_fill(~causal_block[None, None], neg_inf)
+    sel = sel.masked_fill(forced[None, None], float("inf"))  # force-include init/local blocks
+
+    k_eff = min(topk_blocks, num_blocks)
+    topk_idx = sel.topk(k_eff, dim=-1).indices  # [B, H_idx, Tq, k_eff]
+    block_sel = torch.zeros_like(block_score, dtype=torch.bool).scatter_(-1, topk_idx, True)
+    block_sel = block_sel & causal_block[None, None]  # drop non-causal padding picks
+
+    key_sel = block_sel.repeat_interleave(block_size, dim=-1)[..., :seqlen]  # [B, H_idx, Tq, Tk]
+    key_sel = key_sel & causal[None, None]
+    bias = torch.where(key_sel, 0.0, neg_inf).to(torch.float32)
+
+    rep = num_q_heads // h_idx
+    return bias.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk]
+
+
+class MiniMaxM3Indexer(nn.Module):
+    """Lightning indexer (selection-only) for MiniMax M3 sparse-attention layers.
+
+    Projects hidden states to ``num_index_heads`` index queries and a single
+    shared index key (``disable_index_value=True`` for M3, so there is no index
+    value/output projection). Per-head Gemma RMSNorm + partial RoPE mirror the
+    main attention. The produced ``idx_q``/``idx_k`` feed
+    :func:`build_block_sparse_attn_bias` to select which key blocks each query
+    attends to.
+    """
+
+    def __init__(self, config: Any, sparse_cfg: dict, backend: BackendConfig):
+        super().__init__()
+        self.backend = backend
+        self.num_index_heads = sparse_cfg["sparse_num_index_heads"]
+        self.index_head_dim = sparse_cfg["sparse_index_dim"]
+        self.block_size = sparse_cfg["sparse_block_size"]
+        self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
+        self.init_blocks = sparse_cfg.get("sparse_init_block", 0)
+        self.local_blocks = sparse_cfg.get("sparse_local_block", 1)
+        self.score_type = sparse_cfg.get("sparse_score_type", "max")
+        gemma = getattr(config, "use_gemma_norm", False)
+
+        self.index_q_proj = initialize_linear_module(
+            backend.linear, config.hidden_size, self.num_index_heads * self.index_head_dim, bias=False
+        )
+        self.index_k_proj = initialize_linear_module(
+            backend.linear, config.hidden_size, self.index_head_dim, bias=False
+        )
+        self.index_q_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
+        self.index_k_norm = MiniMaxM3RMSNorm(self.index_head_dim, eps=config.rms_norm_eps, gemma=gemma)
+
+    def forward(
+        self, x: torch.Tensor, *, freqs_cis: torch.Tensor, num_q_heads: int, **attn_kwargs: Any
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+        idx_q = self.index_q_norm(self.index_q_proj(x).view(bsz, seqlen, self.num_index_heads, self.index_head_dim))
+        idx_k = self.index_k_norm(self.index_k_proj(x).view(bsz, seqlen, 1, self.index_head_dim))
+        idx_q, idx_k = apply_rotary_emb_qk(
+            idx_q,
+            idx_k,
+            freqs_cis,
+            format="bshd",
+            rope_fusion=self.backend.rope_fusion,
+            cp_size=attn_kwargs.get("cp_size", 1),
+            cp_rank=attn_kwargs.get("cp_rank", 0),
+        )
+        return build_block_sparse_attn_bias(
+            idx_q,
+            idx_k,
+            block_size=self.block_size,
+            topk_blocks=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            num_q_heads=num_q_heads,
+            score_type=self.score_type,
+        )
+
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02):
+        nn.init.trunc_normal_(self.index_q_proj.weight, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.index_k_proj.weight, mean=0.0, std=init_std)
+        self.index_q_norm.reset_parameters()
+        self.index_k_norm.reset_parameters()
+
+
 class MiniMaxM3Attention(nn.Module):
     """MiniMax M3 GQA attention with per-head Gemma Q/K norm and partial RoPE.
 
-    Stage 1: dense attention only. The sparse-attention index branch
-    (``index_q/k_proj`` + block-level top-k selection) is added in Stage 2.
+    When ``is_sparse_attention_layer`` is set, an additional lightning indexer
+    (``index_q/k_proj`` + per-head Gemma norm) selects, per query, the top-k key
+    *blocks* to attend to (block-level DeepSeek-style sparse attention). M3 sets
+    ``disable_index_value=True`` so the index branch is selection-only.
     """
 
-    def __init__(self, config: Any, backend: BackendConfig):
+    def __init__(
+        self,
+        config: Any,
+        backend: BackendConfig,
+        *,
+        is_sparse_attention_layer: bool = False,
+    ):
         super().__init__()
         self.backend = backend
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        self.is_sparse_attention_layer = is_sparse_attention_layer
         gemma = getattr(config, "use_gemma_norm", False)
 
         self.q_proj = initialize_linear_module(
@@ -147,6 +300,15 @@ class MiniMaxM3Attention(nn.Module):
         else:
             self.q_norm = None
             self.k_norm = None
+
+        if is_sparse_attention_layer:
+            sparse_cfg = config.sparse_attention_config
+            assert getattr(config, "qk_norm_type", "per_head") == "per_head", (
+                "sparse attention requires per_head QK norm"
+            )
+            self.indexer = MiniMaxM3Indexer(config, sparse_cfg, backend)
+        else:
+            self.indexer = None
 
         softmax_scale = self.head_dim**-0.5
         self.attn_module, self.attn_func = initialize_attn_module_and_func(
@@ -185,6 +347,11 @@ class MiniMaxM3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
+        if self.indexer is not None:
+            if qkv_format != "bshd":
+                raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
+            attention_mask = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+
         q, k = apply_rotary_emb_qk(
             q,
             k,
@@ -211,6 +378,8 @@ class MiniMaxM3Attention(nn.Module):
         if self.q_norm is not None:
             self.q_norm.reset_parameters()
             self.k_norm.reset_parameters()
+        if self.indexer is not None:
+            self.indexer.init_weights(buffer_device, init_std)
 
 
 class Block(nn.Module):
@@ -225,7 +394,16 @@ class Block(nn.Module):
     def __init__(self, layer_idx: int, config: Any, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
         self.layer_idx = layer_idx
-        self.self_attn = MiniMaxM3Attention(config, backend)
+
+        # Sparse-attention layers are selected by sparse_attention_config's
+        # ``sparse_attention_freq`` (layers 0-2 are dense, 3-59 sparse for M3).
+        sparse_cfg = getattr(config, "sparse_attention_config", None)
+        if sparse_cfg is not None and sparse_cfg.get("use_sparse_attention", True):
+            sparse_freq = sparse_cfg.get("sparse_attention_freq")
+            is_sparse_attention_layer = sparse_freq is None or sparse_freq[layer_idx] != 0
+        else:
+            is_sparse_attention_layer = False
+        self.self_attn = MiniMaxM3Attention(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
         self.is_moe_layer = True if moe_layer_freq is None else moe_layer_freq[layer_idx] != 0
