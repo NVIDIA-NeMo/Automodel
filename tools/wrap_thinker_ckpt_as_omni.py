@@ -140,10 +140,18 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
     base_weight_map = _read_index(base_dir)
     base_prefixes = _classify_keys(list(base_weight_map.keys()))
     logger.info("base key counts: %s", {k: len(v) for k, v in base_prefixes.items()})
-    needed_base_prefixes = ("code2wav", "talker")
-    for p in needed_base_prefixes:
-        if p not in base_prefixes:
-            raise ValueError(f"base model has no '{p}.*' keys; cannot wrap")
+    # Auto-detect every non-thinker top-level prefix in the base snapshot.
+    # For Qwen3-Omni-Moe this resolves to {"code2wav", "talker"}; for
+    # Qwen2.5-Omni it resolves to {"talker", "token2wav"}. The rule "carry
+    # over anything in the base that is not in the ckpt" is forward-compatible
+    # with any future Omni layout.
+    needed_base_prefixes = tuple(sorted(p for p in base_prefixes if p != "thinker"))
+    if not needed_base_prefixes:
+        raise ValueError(
+            f"base model at {base_dir} has no non-thinker prefixes; nothing to wrap "
+            f"(found prefixes: {sorted(base_prefixes)})"
+        )
+    logger.info("will carry over non-thinker prefixes from base: %s", needed_base_prefixes)
 
     # ---- 3. Re-bucket each ckpt shard's content into the output dir ----
     new_index: Dict[str, str] = {}
@@ -154,30 +162,26 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
     # the standard ``model-XXXXX-of-YYYYY.safetensors`` format), since the
     # tensors and keys are already correctly prefixed.
     ckpt_thinker_shards = list(ckpt_shards.items())
-    base_code2wav_shards: Dict[str, list[str]] = {}
-    base_talker_shards: Dict[str, list[str]] = {}
-    for shard_name, full_map_keys in base_weight_map.items():
-        # weight_map maps key -> shard filename; we need the reverse
-        pass
 
-    # Re-derive base shards by prefix bucket.
+    # Re-derive base shards by prefix bucket. ``base_shards_per_prefix`` maps
+    # each non-thinker prefix -> {shard_filename: [keys]} (a base shard can
+    # mix prefixes, so we filter per-key when writing it out).
     base_shards_by_file: Dict[str, list[str]] = {}
     for key, shard in base_weight_map.items():
         base_shards_by_file.setdefault(shard, []).append(key)
+    base_shards_per_prefix: Dict[str, Dict[str, list[str]]] = {p: {} for p in needed_base_prefixes}
     for shard_name, keys_in_shard in base_shards_by_file.items():
         ks_by_prefix = _classify_keys(keys_in_shard)
-        if "code2wav" in ks_by_prefix:
-            base_code2wav_shards.setdefault(shard_name, []).extend(ks_by_prefix["code2wav"])
-        if "talker" in ks_by_prefix:
-            base_talker_shards.setdefault(shard_name, []).extend(ks_by_prefix["talker"])
+        for prefix in needed_base_prefixes:
+            if prefix in ks_by_prefix:
+                base_shards_per_prefix[prefix].setdefault(shard_name, []).extend(ks_by_prefix[prefix])
 
-    total_shards = len(ckpt_thinker_shards) + len(base_code2wav_shards) + len(base_talker_shards)
+    total_shards = len(ckpt_thinker_shards) + sum(len(v) for v in base_shards_per_prefix.values())
     logger.info(
-        "output plan: %d shards (ckpt thinker=%d, base code2wav=%d, base talker=%d)",
+        "output plan: %d shards (ckpt thinker=%d; %s)",
         total_shards,
         len(ckpt_thinker_shards),
-        len(base_code2wav_shards),
-        len(base_talker_shards),
+        ", ".join(f"base {p}={len(base_shards_per_prefix[p])}" for p in needed_base_prefixes),
     )
 
     def _shard_filename(idx: int) -> str:
@@ -197,9 +201,10 @@ def wrap(ckpt_dir: Path, base_dir: Path, out_dir: Path) -> None:
             "wrote thinker shard %s (%d keys, %.2f GB)", out_name, len(keys), (out_dir / out_name).stat().st_size / 1e9
         )
 
-    # 3c. Copy code2wav + talker shards from base; filter to only those keys
-    # (some base shards mix prefixes).
-    for src_kind, src_shards in (("code2wav", base_code2wav_shards), ("talker", base_talker_shards)):
+    # 3c. Copy every non-thinker prefix's shards from base; filter to only
+    # those keys (some base shards mix prefixes).
+    for src_kind in needed_base_prefixes:
+        src_shards = base_shards_per_prefix[src_kind]
         for shard_name, keys in sorted(src_shards.items()):
             out_name = _shard_filename(next_index)
             next_index += 1

@@ -459,3 +459,94 @@ def test_extract_eval_samples_args_already_dict():
     }
     samples = agent_chat._extract_eval_samples_from_example(example)
     assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"a": 1}}]
+
+
+def test_mask_labels_to_last_turn_keeps_only_final_run():
+    # Two supervised assistant runs separated by an ignored (user/tool) run.
+    labels = [-100, 1, 2, -100, -100, 3, 4, -100]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100, -100, -100, 3, 4, -100]
+
+
+def test_mask_labels_to_last_turn_single_run_unchanged():
+    labels = [-100, -100, 5, 6, 7]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, 5, 6, 7]
+
+
+def test_mask_labels_to_last_turn_no_supervised_tokens_is_noop():
+    labels = [-100, -100, -100]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100]
+
+
+def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch):
+    # ``labels`` carry two supervised assistant runs; with the flag set only
+    # the final run survives. Without it, both runs stay supervised.
+    def fake_format_chat_template(**kwargs):
+        return {"input_ids": [10, 11, 12, 13, 14, 15], "labels": [-100, 1, -100, -100, 2, 3]}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+
+    kept = agent_chat._format_example(example, Tok(), 0, 0)
+    assert kept["labels"] == [-100, 1, -100, -100, 2, 3]
+
+    masked = agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
+    assert masked["labels"] == [-100, -100, -100, -100, 2, 3]
+
+
+def test_convert_messages_preserves_assistant_reasoning_content():
+    messages = [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "4", "reasoning_content": "add two and two"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assert out[1]["content"] == "4"
+    assert out[1]["reasoning_content"] == "add two and two"
+
+
+def test_convert_messages_reasoning_survives_tool_call_merge():
+    # An assistant reasoning turn immediately followed by a tool_call group
+    # merges into one assistant message that keeps the reasoning trace.
+    messages = [
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "reasoning_content": "I should call the weather tool"},
+        {"role": "tool_call", "content": '{"name":"aqi","arguments":{"city":"BJ"}}'},
+    ]
+    out = agent_chat._convert_messages(messages, example_id=1)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert out[1]["reasoning_content"] == "I should call the weather tool"
+    assert out[1]["tool_calls"][0]["function"]["name"] == "aqi"
+
+
+def test_sharegpt_to_chatml_passes_reasoning_content_through():
+    out = agent_chat._sharegpt_to_chatml([{"from": "gpt", "value": "hi", "reasoning_content": "be polite"}])
+    assert out[0] == {"role": "assistant", "content": "hi", "reasoning_content": "be polite"}
+
+
+def test_format_example_forwards_mask_reasoning_content(monkeypatch):
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["mask_reasoning_content"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, mask_reasoning_content=True)
+    assert captured["mask_reasoning_content"] is True
