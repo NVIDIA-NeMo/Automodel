@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for nemo_automodel.components.training.config — StepSchedulerConfig."""
+"""Tests for nemo_automodel.components.training.step_scheduler — StepSchedulerConfig."""
 
-from nemo_automodel.components.training.config import StepSchedulerConfig
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 
 class TestStepSchedulerConfig:

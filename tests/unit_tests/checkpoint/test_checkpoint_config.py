@@ -86,7 +86,7 @@ class TestCheckpointingConfig:
 
 class TestBuildCheckpointConfig:
     def test_build_with_defaults(self):
-        from nemo_automodel.components.checkpoint.api import build_checkpoint_config
+        from nemo_automodel.components.checkpoint.config import build_checkpoint_config
 
         cfg = build_checkpoint_config(
             checkpoint_kwargs=None,
@@ -100,7 +100,7 @@ class TestBuildCheckpointConfig:
         assert cfg.model_repo_id == "test-model"
 
     def test_build_with_user_overrides(self):
-        from nemo_automodel.components.checkpoint.api import build_checkpoint_config
+        from nemo_automodel.components.checkpoint.config import build_checkpoint_config
 
         cfg = build_checkpoint_config(
             checkpoint_kwargs={"checkpoint_dir": "/my/ckpt", "v4_compatible": True},
@@ -113,7 +113,7 @@ class TestBuildCheckpointConfig:
 
     def test_build_peft_torch_save_fallback(self):
         """PEFT + torch_save should fallback to safetensors, preserving checkpoint_dir."""
-        from nemo_automodel.components.checkpoint.api import build_checkpoint_config
+        from nemo_automodel.components.checkpoint.config import build_checkpoint_config
 
         cfg = build_checkpoint_config(
             checkpoint_kwargs={"model_save_format": "torch_save", "checkpoint_dir": "/keep/this"},

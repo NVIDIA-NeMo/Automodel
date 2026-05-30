@@ -21,13 +21,18 @@ Look at ``api.py`` for the builder that consumes this config.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
+from huggingface_hub import constants as hf_constants
 from packaging.version import parse
 
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+
+logger = logging.getLogger(__name__)
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -88,4 +93,48 @@ class CheckpointingConfig:
             self.is_async = False
 
 
-__all__ = ["CheckpointingConfig"]
+def build_checkpoint_config(
+    checkpoint_kwargs: Mapping[str, Any] | None,
+    cache_dir: str | None,
+    model_repo_id: str | None,
+    is_peft: bool,
+) -> CheckpointingConfig:
+    """Build a checkpoint configuration.
+
+    Args:
+        checkpoint_kwargs: Optional keyword overrides from the YAML
+            ``checkpoint:`` block.
+        cache_dir: HF cache directory for the model.
+        model_repo_id: Model repository ID.
+        is_peft: Whether the model uses PEFT.
+
+    Returns:
+        Instantiated ``CheckpointingConfig`` ready for the checkpointer.
+    """
+    ckpt_kwargs = dict(
+        enabled=True,
+        checkpoint_dir="checkpoints/",
+        model_save_format="safetensors",
+        model_repo_id=model_repo_id,
+        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
+        save_consolidated=True,
+        is_peft=is_peft,
+    )
+    user_cfg = {}
+    if checkpoint_kwargs is not None:
+        user_cfg = dict(checkpoint_kwargs)
+        user_cfg.pop("restore_from", None)
+    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+        logger.warning(
+            "PEFT checkpointing is not supported for `torch_save` format; "
+            "discarding user checkpoint config and using safetensors defaults "
+            "(preserving `checkpoint_dir` if set)."
+        )
+        if "checkpoint_dir" in user_cfg:
+            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+    else:
+        ckpt_kwargs |= user_cfg
+    return CheckpointingConfig(**ckpt_kwargs)
+
+
+__all__ = ["CheckpointingConfig", "build_checkpoint_config"]

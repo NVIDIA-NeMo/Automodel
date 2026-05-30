@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for nemo_automodel.components.loggers.config — WandbConfig, MLflowConfig, CometConfig."""
+"""Tests for nemo_automodel.components.loggers.loggers — WandbConfig, MLflowConfig, CometConfig."""
 
-from nemo_automodel.components.loggers.config import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
 
 
 class TestWandbConfig:

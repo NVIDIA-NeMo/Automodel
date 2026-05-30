@@ -1983,7 +1983,7 @@ class TestFinetuneRecipeSetup:
         )
 
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.api.initialize_distributed",
+            "nemo_automodel.components.distributed.init_utils.initialize_distributed",
             lambda backend, timeout_minutes: mock_dist_info,
         )
 

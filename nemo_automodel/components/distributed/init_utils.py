@@ -17,6 +17,7 @@ import datetime
 import os
 import signal
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed
@@ -161,3 +162,17 @@ def destroy_global_state():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def build_distributed(cfg_dist: dict[str, Any]) -> DistInfo:
+    """Build and initialize distributed training resources.
+
+    Args:
+        cfg_dist: Configuration for distributed training.
+
+    Returns:
+        Distributed training information from initialize_distributed.
+    """
+    backend = cfg_dist.get("backend", "nccl")
+    timeout = cfg_dist.get("timeout_minutes", 1)
+    return initialize_distributed(backend=backend, timeout_minutes=timeout)

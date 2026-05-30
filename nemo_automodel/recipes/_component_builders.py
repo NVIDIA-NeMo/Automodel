@@ -18,11 +18,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from nemo_automodel.components.checkpoint import build_checkpoint_config as _build_checkpoint_config
-from nemo_automodel.components.loggers.api import build_wandb as _build_wandb
 from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
 from nemo_automodel.components.optim import build_lr_scheduler as _build_lr_scheduler
 from nemo_automodel.components.optim import build_optimizer as _build_optimizer
-from nemo_automodel.components.training import build_step_scheduler as _build_step_scheduler
 
 
 def _as_dict(cfg: Any | None) -> dict[str, Any]:
@@ -98,20 +96,15 @@ def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any):
 
 
 def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_batch_size: int):
-    from nemo_automodel.components.training.config import StepSchedulerConfig
+    from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
     if cfg is None:
-        config = None
+        config = StepSchedulerConfig()
     else:
         kwargs = _as_dict(cfg)
         assert "_target_" not in kwargs, "_target_ not permitted in step scheduler"
         config = StepSchedulerConfig(**kwargs)
-    return _build_step_scheduler(
-        config=config,
-        dataloader=dataloader,
-        dp_group_size=dp_group_size,
-        local_batch_size=local_batch_size,
-    )
+    return config.build(dataloader, dp_group_size, local_batch_size)
 
 
 def _model_name_from_cfg(cfg_model: Any) -> str | None:
@@ -127,19 +120,14 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 
 
 def build_wandb(cfg: Any):
-    from nemo_automodel.components.loggers.config import WandbConfig
+    from nemo_automodel.components.loggers.loggers import WandbConfig
 
     model_name = _model_name_from_cfg(cfg.model) if hasattr(cfg, "model") else None
-    return _build_wandb(
-        config=WandbConfig(**_as_dict(cfg.wandb)),
-        run_config=_as_dict(cfg),
-        model_name=model_name,
-    )
+    return WandbConfig(**_as_dict(cfg.wandb)).build(run_config=_as_dict(cfg), model_name=model_name)
 
 
 def build_mlflow(cfg: Any):
-    from nemo_automodel.components.loggers.api import build_mlflow as _build_mlflow
-    from nemo_automodel.components.loggers.config import MLflowConfig
+    from nemo_automodel.components.loggers.loggers import MLflowConfig
 
     mlflow_dict = _as_dict(cfg.mlflow) if hasattr(cfg, "mlflow") and cfg.mlflow else {}
     if not mlflow_dict:
@@ -147,8 +135,4 @@ def build_mlflow(cfg: Any):
     # Extract run_config; use to_yaml_dict if available (ConfigNode), else plain dict.
     run_config = cfg.to_yaml_dict(use_orig_values=True) if hasattr(cfg, "to_yaml_dict") else _as_dict(cfg)
     checkpoint_dir = cfg.get("checkpoint.checkpoint_dir", None) if hasattr(cfg, "get") else None
-    return _build_mlflow(
-        config=MLflowConfig(**mlflow_dict),
-        checkpoint_dir=checkpoint_dir,
-        run_config=run_config,
-    )
+    return MLflowConfig(**mlflow_dict).build(checkpoint_dir=checkpoint_dir, run_config=run_config)

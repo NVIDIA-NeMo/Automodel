@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.distributed.api import build_distributed
+from nemo_automodel.components.distributed.init_utils import build_distributed
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
