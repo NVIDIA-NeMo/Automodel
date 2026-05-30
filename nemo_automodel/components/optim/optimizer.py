@@ -34,8 +34,8 @@ grouping, Megatron-FSDP sharding), dispatching on its second argument:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -272,7 +272,7 @@ def _maybe_shard_megatron(
 
 def build_optimizer(
     model: torch.nn.Module,
-    optimizer: OptimizerConfig | str | Any,
+    optimizer: OptimizerConfig | Callable[..., torch.optim.Optimizer],
     *,
     distributed_config: DistributedConfig | None = None,
     device_mesh: DeviceMesh | None = None,
@@ -287,18 +287,19 @@ def build_optimizer(
     - **Typed config** (:class:`OptimizerConfig` instance) — the Automodel-native
       path.  Hyperparameters come from the config; ``**optimizer_kwargs`` must be
       empty.  Per-part construction delegates to ``config.build(...)``.
-    - **Dotted path or class** (``"torch.optim.AdamW"`` or ``torch.optim.AdamW``)
-      plus ``**optimizer_kwargs`` — the integration escape hatch (e.g. veRL).
-      Adding new typed configs never forces the integration to change.
+    - **Optimizer class / callable** (e.g. ``torch.optim.AdamW``) plus
+      ``**optimizer_kwargs`` — the integration escape hatch (e.g. veRL).  The
+      caller resolves any dotted path to a callable; the component never does
+      string resolution.
 
     Args:
         model: Model (or model with ``.parts``) to optimize.
         optimizer: Typed :class:`OptimizerConfig` instance, or an optimizer
-            dotted path / class to construct with ``**optimizer_kwargs``.
+            class/callable to construct with ``**optimizer_kwargs``.
         distributed_config: Distributed strategy config; triggers Megatron-FSDP
             optimizer sharding when it is a :class:`MegatronFSDPConfig`.
         device_mesh: Device mesh used for tensor/data parallelism.
-        **optimizer_kwargs: Constructor kwargs for the dotted-path / class form
+        **optimizer_kwargs: Constructor kwargs for the class/callable form
             (dtype strings such as ``"torch.bfloat16"`` are resolved).  Must be
             empty when ``optimizer`` is a typed config.
 
@@ -321,7 +322,12 @@ def build_optimizer(
                 f"Pass an OptimizerConfig instance, not the class {optimizer.__name__} "
                 f"(e.g. {optimizer.__name__}(lr=1e-4))."
             )
-        factory = optimizer if callable(optimizer) else _resolve_dotted_path(optimizer)
+        if not callable(optimizer):
+            raise TypeError(
+                "build_optimizer expects an OptimizerConfig or an optimizer class/callable, "
+                f"got {type(optimizer).__name__}.  Resolve dotted paths in the caller."
+            )
+        factory = optimizer
         kwargs = dict(optimizer_kwargs)
         for attr in _DTYPE_FIELDS:
             val = kwargs.get(attr, None)
@@ -351,17 +357,6 @@ def build_optimizer(
         opt = _maybe_shard_megatron(part, opt, distributed_config, allow=not is_dion)
         optimizers.append(opt)
     return optimizers
-
-
-def _resolve_dotted_path(name: str) -> Any:
-    """Resolve a dotted path (``"torch.optim.AdamW"``) to a class/callable."""
-    module_path, _, cls_name = name.rpartition(".")
-    if not module_path:
-        raise ValueError(f"Expected a dotted path like 'torch.optim.AdamW', got '{name}'")
-    obj = getattr(import_module(module_path), cls_name, None)
-    if obj is None:
-        raise ImportError(f"Cannot find '{cls_name}' in module '{module_path}'")
-    return obj
 
 
 def build_lr_scheduler(

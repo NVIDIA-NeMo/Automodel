@@ -22,7 +22,6 @@ from nemo_automodel.components.loss.loss import (
     LossConfig,
     MaskedCrossEntropyConfig,
     TEParallelCEConfig,
-    _resolve_dotted_path,
     build_loss_fn,
 )
 
@@ -112,26 +111,17 @@ class TestBuildLossFnTypedConfig:
 
 
 # ---------------------------------------------------------------------------
-# build_loss_fn — dotted-path / class form (integration / YAML escape hatch)
+# build_loss_fn — class / callable form (integration / YAML escape hatch)
 # ---------------------------------------------------------------------------
 
 
 class TestBuildLossFnEscapeHatch:
-    def test_dotted_path_string(self):
-        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-        loss = build_loss_fn(
-            "nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy",
-            fp32_upcast=False,
-        )
-        assert isinstance(loss, MaskedCrossEntropy)
-        assert loss.fp32_upcast is False
-
     def test_resolved_class(self):
         from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 
-        loss = build_loss_fn(MaskedCrossEntropy, reduction="mean")
+        loss = build_loss_fn(MaskedCrossEntropy, fp32_upcast=False)
         assert isinstance(loss, MaskedCrossEntropy)
+        assert loss.fp32_upcast is False
 
     def test_arbitrary_factory_kwargs(self):
         # Any callable + kwargs works; no typed config required.
@@ -145,17 +135,6 @@ class TestBuildLossFnEscapeHatch:
         assert result == "loss_module"
         assert captured == {"alpha": 0.5, "beta": 0.3}
 
-
-class TestResolveDottedPath:
-    def test_resolve(self):
-        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-        assert _resolve_dotted_path("nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy") is MaskedCrossEntropy
-
-    def test_bad_path_no_dot(self):
-        with pytest.raises(ValueError, match="Expected a dotted path"):
-            _resolve_dotted_path("MaskedCrossEntropy")
-
-    def test_bad_class(self):
-        with pytest.raises(ImportError, match="Cannot find"):
-            _resolve_dotted_path("nemo_automodel.components.loss.masked_ce.NonExistent")
+    def test_non_callable_raises(self):
+        with pytest.raises(TypeError, match="class/callable"):
+            build_loss_fn("nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy")

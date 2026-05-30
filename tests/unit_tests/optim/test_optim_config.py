@@ -23,7 +23,6 @@ from nemo_automodel.components.optim.optimizer import (
     AdamWConfig,
     LRSchedulerConfig,
     OptimizerConfig,
-    _resolve_dotted_path,
     build_optimizer,
 )
 
@@ -136,16 +135,11 @@ class TestBuildOptimizer:
 
 
 # ---------------------------------------------------------------------------
-# build_optimizer — dotted-path / class form (integration escape hatch)
+# build_optimizer — class / callable form (integration escape hatch)
 # ---------------------------------------------------------------------------
 
 
 class TestBuildOptimizerEscapeHatch:
-    def test_dotted_path_string(self):
-        optimizers = build_optimizer(_model(), "torch.optim.AdamW", lr=1e-3, betas=(0.9, 0.95))
-        assert isinstance(optimizers[0], torch.optim.AdamW)
-        assert optimizers[0].param_groups[0]["lr"] == 1e-3
-
     def test_resolved_class(self):
         optimizers = build_optimizer(_model(), torch.optim.SGD, lr=0.01, momentum=0.9)
         assert isinstance(optimizers[0], torch.optim.SGD)
@@ -153,8 +147,8 @@ class TestBuildOptimizerEscapeHatch:
 
     def test_arbitrary_new_optimizer_no_typed_config(self):
         # Adding support for a new optimizer requires no code change here:
-        # any importable optimizer + kwargs works.
-        optimizers = build_optimizer(_model(), "torch.optim.RMSprop", lr=0.01, alpha=0.95)
+        # any optimizer class + kwargs works (caller resolves dotted paths).
+        optimizers = build_optimizer(_model(), torch.optim.RMSprop, lr=0.01, alpha=0.95)
         assert isinstance(optimizers[0], torch.optim.RMSprop)
         assert optimizers[0].param_groups[0]["alpha"] == 0.95
 
@@ -176,18 +170,9 @@ class TestBuildOptimizerEscapeHatch:
         assert captured["master_weight_dtype"] is torch.bfloat16
         assert captured["exp_avg_dtype"] is torch.float16
 
-
-class TestResolveDottedPath:
-    def test_resolve_adamw(self):
-        assert _resolve_dotted_path("torch.optim.AdamW") is torch.optim.AdamW
-
-    def test_bad_path_no_dot(self):
-        with pytest.raises(ValueError, match="Expected a dotted path"):
-            _resolve_dotted_path("AdamW")
-
-    def test_bad_class(self):
-        with pytest.raises(ImportError, match="Cannot find"):
-            _resolve_dotted_path("torch.optim.NonExistentOptimizer")
+    def test_non_callable_raises(self):
+        with pytest.raises(TypeError, match="class/callable"):
+            build_optimizer(_model(), "torch.optim.AdamW", lr=1e-3)
 
 
 # ---------------------------------------------------------------------------

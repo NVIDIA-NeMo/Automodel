@@ -30,8 +30,8 @@ load.  Reading the dataclass tells you exactly what you can configure.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -151,7 +151,7 @@ class KDLossConfig(LossConfig):
 # ---------------------------------------------------------------------------
 
 
-def build_loss_fn(loss: LossConfig | str | Any, **loss_kwargs: Any) -> nn.Module:
+def build_loss_fn(loss: LossConfig | Callable[..., nn.Module], **loss_kwargs: Any) -> nn.Module:
     """Build a loss function.
 
     Single entry point.  Dispatches on ``loss``:
@@ -159,15 +159,16 @@ def build_loss_fn(loss: LossConfig | str | Any, **loss_kwargs: Any) -> nn.Module
     - **Typed config** (:class:`LossConfig` instance) — the Automodel-native
       path.  Hyperparameters come from the config; ``**loss_kwargs`` must be
       empty.  Construction delegates to ``config.build()``.
-    - **Dotted path or class** (``"nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy"``
-      or the class) plus ``**loss_kwargs`` — the integration / YAML escape hatch.
-      Adding new typed configs never forces the caller to change.
+    - **Loss class / callable** (e.g. ``MaskedCrossEntropy``) plus
+      ``**loss_kwargs`` — the integration / YAML escape hatch.  The caller
+      resolves any dotted path to a callable; the component never does string
+      resolution.
 
     Args:
-        loss: Typed :class:`LossConfig` instance, or a loss dotted path / class
-            to construct with ``**loss_kwargs``.
-        **loss_kwargs: Constructor kwargs for the dotted-path / class form.  Must
-            be empty when ``loss`` is a typed config.
+        loss: Typed :class:`LossConfig` instance, or a loss class/callable to
+            construct with ``**loss_kwargs``.
+        **loss_kwargs: Constructor kwargs for the class/callable form.  Must be
+            empty when ``loss`` is a typed config.
 
     Returns:
         Instantiated loss function.
@@ -181,19 +182,12 @@ def build_loss_fn(loss: LossConfig | str | Any, **loss_kwargs: Any) -> nn.Module
         return loss.build()
     if isinstance(loss, type) and issubclass(loss, LossConfig):
         raise TypeError(f"Pass a LossConfig instance, not the class {loss.__name__} (e.g. {loss.__name__}()).")
-    factory = loss if callable(loss) else _resolve_dotted_path(loss)
-    return factory(**loss_kwargs)
-
-
-def _resolve_dotted_path(name: str) -> Any:
-    """Resolve a dotted path (``"pkg.module.Class"``) to a class/callable."""
-    module_path, _, cls_name = name.rpartition(".")
-    if not module_path:
-        raise ValueError(f"Expected a dotted path like 'pkg.module.Class', got '{name}'")
-    obj = getattr(import_module(module_path), cls_name, None)
-    if obj is None:
-        raise ImportError(f"Cannot find '{cls_name}' in module '{module_path}'")
-    return obj
+    if not callable(loss):
+        raise TypeError(
+            f"build_loss_fn expects a LossConfig or a loss class/callable, got {type(loss).__name__}.  "
+            "Resolve dotted paths in the caller."
+        )
+    return loss(**loss_kwargs)
 
 
 __all__ = [
