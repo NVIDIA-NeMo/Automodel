@@ -669,6 +669,14 @@ def _restore_loaded_model_dtype(
         if tensor is None:
             continue
 
+        # Record the checkpoint's original dtype on the tensor as the compute-dtype
+        # hint. Storage may be upcast below (fp32 master weights), which erases the
+        # dtype HF intended for compute; downstream sharding (fully_shard_by_dtype)
+        # reads ``_hf_compute_dtype`` to keep intrinsically-fp32 params (e.g. ``A_log``)
+        # computing in fp32 while the bulk computes in mp_policy.param_dtype.
+        if checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
+            tensor._hf_compute_dtype = checkpoint_dtype
+
         # Pick the unification target. For an explicit floating request, take the
         # wider of (checkpoint, requested) so explicit fp32 is honored as master
         # weights while intrinsically-fp32 checkpoint params survive a bf16 request.

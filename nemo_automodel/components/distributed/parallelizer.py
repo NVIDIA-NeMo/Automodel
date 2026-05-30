@@ -476,9 +476,15 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
+        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+
         for layer in layers:
             parallelizer_utils.fully_shard_by_dtype(
-                layer, mesh=dp_mesh, mp_policy=mp_policy, offload_policy=offload_policy
+                layer,
+                mesh=dp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                fp32_compute_module_names=fp32_compute_module_names,
             )
 
         # do not reshard after forward for root model
@@ -508,6 +514,10 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
         cp_enabled = cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1
         patch_hf_model(model, cp_enabled=cp_enabled)
 
+        # Submodules that must compute in fp32 even under fp32 master weights (bf16
+        # compute). patch_hf_model declares ``_fp32_params`` on the model.
+        fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
+
         # Delegate TP, AC, mixed precision to the default strategy, but
         # override the FSDP sharding to use fully_shard_by_dtype.
         # Temporarily swap the global — safe because model init is single-threaded
@@ -527,6 +537,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                             mesh,
                             mp_policy,
                             offload_policy,
+                            fp32_compute_module_names=fp32_compute_module_names,
                         )
             else:
                 for _, sub in module.named_children():

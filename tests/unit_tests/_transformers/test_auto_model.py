@@ -971,6 +971,10 @@ class TestModelMappingKeyErrorFallback:
 
         assert fake_model.linear.weight.dtype == torch.float32
         assert fake_model.norm.weight.dtype == torch.float32
+        # Storage was upcast to fp32, but the checkpoint's original (compute) dtype is
+        # recorded so downstream sharding can keep the bulk in bf16 compute.
+        assert fake_model.linear.weight._hf_compute_dtype == torch.bfloat16
+        assert fake_model.norm.weight._hf_compute_dtype == torch.float32
 
     def test_force_hf_pretrained_explicit_bf16_preserves_intrinsic_fp32(self):
         """Explicit bf16 request keeps bf16 params bf16 but preserves intrinsically-fp32 params."""
