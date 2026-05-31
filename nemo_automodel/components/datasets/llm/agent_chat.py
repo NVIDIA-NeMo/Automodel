@@ -260,6 +260,43 @@ def _format_example(
     train_on_last_turn_only: bool = False,
     drop_history_reasoning_content: bool = False,
 ) -> Dict[str, List[int]]:
+    """Render one agent example into tokenized ``input_ids`` / ``labels``.
+
+    Thin wrapper that re-raises any parsing/rendering failure as a ``ValueError``
+    tagged with the example id. Rows are rendered lazily inside the dataloader,
+    so without this a single malformed row surfaces as an opaque
+    ``JSONDecodeError``/``AssertionError`` deep in the stack — with no hint as to
+    which row caused it — and aborts the whole training run.
+    """
+    try:
+        return _format_example_impl(
+            example,
+            tokenizer,
+            eos_token_id,
+            pad_token_id,
+            seq_length=seq_length,
+            padding=padding,
+            truncation=truncation,
+            mask_reasoning_content=mask_reasoning_content,
+            train_on_last_turn_only=train_on_last_turn_only,
+            drop_history_reasoning_content=drop_history_reasoning_content,
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to format agent SFT example (id={example.get('id')!r}): {e}") from e
+
+
+def _format_example_impl(
+    example: Dict[str, Any],
+    tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    seq_length: Optional[int] = None,
+    padding: Union[str, bool] = False,
+    truncation: Union[str, bool] = False,
+    mask_reasoning_content: bool = False,
+    train_on_last_turn_only: bool = False,
+    drop_history_reasoning_content: bool = False,
+) -> Dict[str, List[int]]:
     """Render one agent example into tokenized ``input_ids`` / ``labels``."""
     raw_tools = example.get("tools")
     if isinstance(raw_tools, str) and not raw_tools.strip():
