@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import MagicMock, patch
+
 try:
     import grouped_gemm
 except ImportError:
@@ -27,10 +29,10 @@ try:
 except ImportError:
     HAS_TE = False
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, patch_moe_module
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
-from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA
-from nemo_automodel.components._peft.lora import patch_moe_module, apply_lora_to_linear_modules, PeftConfig
 
 
 @pytest.fixture

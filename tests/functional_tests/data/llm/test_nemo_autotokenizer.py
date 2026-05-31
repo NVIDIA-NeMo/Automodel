@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from pathlib import Path
+
 import pytest
 from jinja2.exceptions import TemplateError
-from pathlib import Path
-import os
+
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
-
-
 
 _TEST_DATA_DIR = os.environ.get("TEST_DATA_DIR", "/home/TestData/automodel")
 _TOKENIZER_BASE = Path(_TEST_DATA_DIR) / "tokenizers"

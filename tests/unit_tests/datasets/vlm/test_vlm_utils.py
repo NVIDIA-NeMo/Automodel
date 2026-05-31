@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # tests/test_utils.py
-import json
 import types
-
-import pytest
-import torch
 
 from nemo_automodel.components.datasets.vlm import utils
 

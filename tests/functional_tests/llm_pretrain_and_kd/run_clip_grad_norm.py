@@ -18,7 +18,6 @@
 This script runs all gradient clipping tests appropriate for the detected world size.
 """
 
-import os
 import sys
 
 import torch

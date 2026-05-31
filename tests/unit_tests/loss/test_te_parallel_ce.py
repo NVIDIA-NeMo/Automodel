@@ -15,7 +15,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy, HAVE_TE_PARALLEL_CE, MISSING_TE_PARALLEL_CE_MSG
+from nemo_automodel.components.loss.te_parallel_ce import (
+    HAVE_TE_PARALLEL_CE,
+    MISSING_TE_PARALLEL_CE_MSG,
+    TEParallelCrossEntropy,
+)
+
 
 @pytest.mark.skipif(not HAVE_TE_PARALLEL_CE, reason=MISSING_TE_PARALLEL_CE_MSG)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

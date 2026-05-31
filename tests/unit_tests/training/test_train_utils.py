@@ -12,17 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock, patch
-
-import pytest
-import torch
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.training.utils import move_to_device, ScopedModuleOffloading
-from nemo_automodel.components.training.utils import clip_grad_norm, count_tail_padding, scale_grads_and_clip_grad_norm
+from nemo_automodel.components.training.utils import (
+    ScopedModuleOffloading,
+    clip_grad_norm,
+    count_tail_padding,
+    move_to_device,
+    scale_grads_and_clip_grad_norm,
+)
 
 
 def test_docstring_example():

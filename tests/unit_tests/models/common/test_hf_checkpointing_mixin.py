@@ -14,9 +14,10 @@
 
 """Unit tests for HFCheckpointingMixin."""
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch.nn as nn
-from unittest.mock import MagicMock
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 

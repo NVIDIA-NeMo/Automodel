@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import subprocess
 import os
-import tempfile
+import subprocess
 import sys
+import tempfile
 
 # mod_path = Path(__file__).resolve().parents[3] / "tools" / "preprocess_megatron_dataset.py"
 # spec = util.spec_from_file_location("preprocess_megatron_dataset", mod_path)

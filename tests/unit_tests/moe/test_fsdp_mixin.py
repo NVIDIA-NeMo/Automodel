@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
+from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 from nemo_automodel.components.moe.fsdp_mixin import (
     MoEFSDPSyncMixin,
     _configure_fsdp_module,
@@ -23,8 +24,6 @@ from nemo_automodel.components.moe.fsdp_mixin import (
     _run_post_backward_hooks,
     patched_backward_maybe_with_nosync,
 )
-from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.utils import get_is_optim_step, set_is_optim_step
 
 
 class MockFSDPModule:
@@ -539,8 +538,9 @@ class TestPatchedBackwardMaybeWithNosync:
 
     def test_ddp_not_last_backward(self):
         """Test DDP path with last_backward=False."""
-        from torch.nn.parallel import DistributedDataParallel
         from unittest.mock import MagicMock
+
+        from torch.nn.parallel import DistributedDataParallel
 
         mock_stage = Mock()
         mock_ddp_module = Mock(spec=DistributedDataParallel)

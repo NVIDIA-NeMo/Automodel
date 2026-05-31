@@ -92,7 +92,6 @@ def _build_teacher_model(
     seed,
     has_packed_sequence,
     device_mesh=None,
-    moe_mesh=None,
     distributed_config=None,
     device=None,
 ):
@@ -106,7 +105,6 @@ def _build_teacher_model(
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
         device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
         distributed_config: Strategy-specific distributed config.
         device: Device to place the teacher model on.
 
@@ -126,7 +124,6 @@ def _build_teacher_model(
         kwargs: Dict[str, Any] = {
             "has_packed_sequence": has_packed_sequence,
             "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
             "distributed_config": distributed_config,
         }
 
@@ -148,7 +145,6 @@ def _build_teacher_model_with_pp(
     seed: int,
     has_packed_sequence: bool,
     device_mesh,
-    moe_mesh,
     distributed_config,
     pipeline_config: PipelineConfig,
     dist_setup,
@@ -167,7 +163,6 @@ def _build_teacher_model_with_pp(
         seed: Random seed for reproducibility.
         has_packed_sequence: Whether using packed sequences.
         device_mesh: Device mesh for distributed training.
-        moe_mesh: MOE mesh for expert parallelism.
         distributed_config: Strategy-specific distributed config.
         pipeline_config: PipelineConfig from the student, used as a template.
         dist_setup: Distributed setup object (provides moe_config, activation_checkpointing).
@@ -213,7 +208,6 @@ def _build_teacher_model_with_pp(
             cfg_compile=None,
             cfg_quantization=None,
             device_mesh=device_mesh,
-            moe_mesh=moe_mesh,
             distributed_config=distributed_config,
             pipeline_config=teacher_pipeline_config,
             cfg_qat=None,
@@ -277,7 +271,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
                 pipeline_config=self.pipeline_config,
                 dist_setup=self.dist_setup,
@@ -295,7 +288,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 seed=self.cfg.get("seed", 42),
                 has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
                 device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
                 distributed_config=self.distributed_config,
                 device=teacher_device,
             )

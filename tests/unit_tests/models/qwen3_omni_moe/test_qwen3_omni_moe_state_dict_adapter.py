@@ -19,10 +19,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
-
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 

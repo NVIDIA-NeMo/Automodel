@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
-import importlib.util
-import pytest
+from unittest.mock import Mock, patch
+
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 # Mock fast_hadamard_transform before importing deepseek_v32 modules
 try:
@@ -29,10 +29,10 @@ except ImportError:
         mock_hadamard.hadamard_transform = lambda x, scale: x
         sys.modules['fast_hadamard_transform'] = mock_hadamard
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 
 class TestDeepSeekV32StateDictAdapter:
@@ -565,8 +565,8 @@ class TestDeepSeekV32StateDictAdapterBlockSize:
     def test_scale_shape_calculation(self):
         """Test that scale shape is calculated correctly."""
         from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
-            calculate_scale_shape,
             BLOCK_SIZE,
+            calculate_scale_shape,
         )
 
         # Test with tensor that divides evenly by block size
