@@ -233,6 +233,9 @@ navigation:
       - page: "Function Calling with NeMo AutoModel using FunctionGemma"
         path: ./nightly/pages/guides/llm/toolcalling.mdx
         slug: function-calling
+      - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
+        path: ./nightly/pages/guides/llm/agent-sft.mdx
+        slug: agent-sft
       - page: "Knowledge Distillation with NeMo AutoModel"
         path: ./nightly/pages/guides/llm/knowledge-distillation.mdx
         slug: knowledge-distillation
