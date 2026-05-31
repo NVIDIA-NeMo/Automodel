@@ -620,3 +620,44 @@ def test_format_example_forwards_drop_history_reasoning_content(monkeypatch):
 
     agent_chat._format_example(example, Tok(), 0, 0, drop_history_reasoning_content=True)
     assert captured["drop_history_reasoning_content"] is True
+
+
+def test_format_example_malformed_tools_json_reports_example_id():
+    # A row whose `tools` is malformed JSON must fail with the example id, not an
+    # opaque JSONDecodeError surfacing deep in the lazy dataloader map.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 99, "tools": "{not valid json", "messages": [{"role": "user", "content": "hi"}]}
+    with pytest.raises(ValueError, match="id=99"):
+        agent_chat._format_example(example, Tok(), 0, 0)
+
+
+def test_format_example_malformed_tool_call_reports_example_id():
+    # A malformed tool_call payload must also surface the example id.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {
+        "id": "abc",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool_call", "content": "{bad json"},
+        ],
+    }
+    with pytest.raises(ValueError, match="id='abc'"):
+        agent_chat._format_example(example, Tok(), 0, 0)
+
+
+def test_format_example_wraps_missing_fields_with_example_id():
+    # The existing field-validation errors keep their text but gain the id tag.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    with pytest.raises(ValueError, match="missing both `messages` and `conversations`"):
+        agent_chat._format_example({"id": 7}, Tok(), 0, 0)
+    with pytest.raises(ValueError, match="id=7"):
+        agent_chat._format_example({"id": 7}, Tok(), 0, 0)
