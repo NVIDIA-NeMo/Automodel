@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -151,7 +152,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
+        # Forward/backward run in bf16 on GPU (``compute_dtype``) via autocast, but the
+        # trainable draft is stored in fp32 (``storage_dtype``) so ``torch.optim.AdamW``
+        # keeps an fp32 master copy. The draft is not FSDP-sharded, so there is no
+        # ``MixedPrecisionPolicy`` to decouple storage from compute; autocast plays that
+        # role (matching the reference EAGLE setup). On CPU everything stays fp32.
+        # See docs/guides/mixed-precision-training.md.
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.storage_dtype = torch.float32
 
         # ``cached_target_path`` (optional) selects the SpecForge OFFLINE path:
         # the target's supervision was precomputed to disk by
@@ -208,7 +216,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # so architecture-specific defaults like attention_bias and head_dim
         # flow into the draft.
         draft_config_obj = type(target_config).from_dict(draft_config)
-        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.storage_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
         embed_source = (
@@ -549,7 +557,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         and self-contained, so the raw ``batch`` is not needed.
         """
         if target_batch is not None:
-            return self.trainer_module(**target_batch.to_trainer_inputs())
+            with self._compute_autocast():
+                return self.trainer_module(**target_batch.to_trainer_inputs())
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         # Sequence-packing metadata (present only when packed_sequence_size > 0).
         packing_kwargs = {}
@@ -562,22 +571,24 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if self.target_wrapper is None:
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-            return self.trainer_module(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                loss_mask=batch["loss_mask"],
-                aux_hidden_states=batch["aux_hidden_states"],
-                target_probs=batch["target_probs"],
-                position_mask=batch["position_mask"],
-                **packing_kwargs,
-            )
+            with self._compute_autocast():
+                return self.trainer_module(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    loss_mask=batch["loss_mask"],
+                    aux_hidden_states=batch["aux_hidden_states"],
+                    target_probs=batch["target_probs"],
+                    position_mask=batch["position_mask"],
+                    **packing_kwargs,
+                )
         target_batch = self.target_wrapper.generate_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
             **packing_kwargs,
         )
-        return self.trainer_module(**target_batch.to_trainer_inputs())
+        with self._compute_autocast():
+            return self.trainer_module(**target_batch.to_trainer_inputs())
 
     def _prefetched_batches(self, dataloader):
         """Yield ``(batch, target_batch)`` keeping up to ``target_prefetch_depth``
@@ -917,6 +928,17 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+
+    def _compute_autocast(self):
+        """bf16 autocast context for the draft forward.
+
+        Keeps the fp32 master weights resident while running matmuls in
+        ``compute_dtype`` (bf16 on GPU). No-op on CPU, where parameters and
+        compute are already fp32.
+        """
+        if self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=self.compute_dtype)
+        return contextlib.nullcontext()
 
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
