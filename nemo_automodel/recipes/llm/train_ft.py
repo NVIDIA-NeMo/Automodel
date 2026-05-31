@@ -1361,6 +1361,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_chunks=_num_chunks_value,
         )
         labels = batch.pop("labels")
+        # [FIX mbs>1 MTP] capture THD sub-seq boundaries so the MTP loss masks cross-boundary
+        # rolls (non-PP path previously omitted this, matching the PP PipelineCausalLMLoss path).
+        _mtp_cu_seqlens = batch.get("cu_seqlens")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         if self.pp_enabled:
@@ -1456,6 +1459,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         model=model,
                         scaling_factor=out.mtp_loss_scaling_factor,
                         num_label_tokens=num_label_tokens,
+                        cu_seqlens=_mtp_cu_seqlens,
                     )
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:

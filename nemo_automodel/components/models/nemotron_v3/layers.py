@@ -282,7 +282,15 @@ class NemotronV3Mamba2Mixer(nn.Module):
         # Build seq_idx for Mamba kernel (marks sequence boundaries for packing / CP).
         seq_idx = kwargs.get("seq_idx", None)
         if seq_idx is None and "cu_seqlens" in kwargs:
-            cu_seqlens = kwargs["cu_seqlens"]
+            # [FIX mbs>1 THD] hidden_states use the PADDED layout (each packed bin padded
+            # to packed_sequence_size), so seq_idx must segment with cu_seqlens_PADDED.
+            # The real (contiguous) cu_seqlens is misaligned at mbs>1 — mamba's SSD scan
+            # would carry state across bin boundaries (bin-k pad + bin-(k+1) start lumped
+            # into one sub-seq), corrupting the hidden states. At mbs=1 only trailing pad
+            # mismatches (harmless), which is why packing previously required lbs==1.
+            cu_seqlens = kwargs.get("cu_seqlens_padded")
+            if cu_seqlens is None:
+                cu_seqlens = kwargs["cu_seqlens"]
             # cu_seqlens from the THD batch is GLOBAL (pre-TE-partitioning).
             # When CP is active, the mamba kernel receives the global sequence
             # (after all-to-all gather).  Scale total_len by cp_size so that

@@ -84,7 +84,9 @@ def calculate_mtp_loss(
         if cs.dim() == 2 and cs.shape[0] == 1:
             cs = cs.squeeze(0)
         if cs.dim() == 1:
-            total_len = int(cs[-1].item()) if labels.dim() == 1 else labels.shape[-1]
+            # Span the full (padded) token axis; cu_seqlens[-1] excludes tail pad.
+            # Matches the model's mamba seq_idx build (nemotron_v3/layers.py).
+            total_len = labels.shape[-1]
             positions = torch.arange(total_len, device=labels.device)
             # ``right=True`` so a position equal to a boundary (the first token
             # of sub-seq k, position == cu_seqlens[k]) maps to k, not k-1.
