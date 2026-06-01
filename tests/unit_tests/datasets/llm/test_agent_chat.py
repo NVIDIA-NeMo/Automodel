@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import json
+import logging
 
 import pytest
 
@@ -661,3 +662,64 @@ def test_format_example_wraps_missing_fields_with_example_id():
         agent_chat._format_example({"id": 7}, Tok(), 0, 0)
     with pytest.raises(ValueError, match="id=7"):
         agent_chat._format_example({"id": 7}, Tok(), 0, 0)
+
+
+def _patch_minimal_loader(monkeypatch):
+    """Patch load_dataset / pad-token / formatter so dataset build does no real work."""
+
+    class DummyDataset:
+        def __init__(self, items):
+            self.items = items
+
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+        def __len__(self):
+            return len(self.items)
+
+    monkeypatch.setattr(
+        agent_chat, "load_dataset", lambda *a, **k: DummyDataset([{"id": 0, "messages": [], "tools": []}])
+    )
+    monkeypatch.setattr(agent_chat, "_add_pad_token", lambda tok: 0)
+    monkeypatch.setattr(agent_chat, "_format_example", lambda ex, *a, **kw: {"formatted": ex["id"]})
+
+
+def test_make_agent_chat_dataset_warns_when_seq_length_inert(monkeypatch, caplog):
+    # seq_length is forwarded to apply_chat_template(max_length=...), which the
+    # tokenizer ignores unless truncation is on or padding == "max_length". With
+    # the defaults the cap silently does nothing, so the builder must warn.
+    _patch_minimal_loader(monkeypatch)
+
+    class Tok:
+        eos_token_id = 0
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096)
+    assert any("has no effect" in r.getMessage() for r in caplog.records)
+
+
+def test_make_agent_chat_dataset_no_warning_when_seq_length_used(monkeypatch, caplog):
+    # When truncation is enabled (or padding == "max_length") the cap is real, so
+    # there must be no spurious warning.
+    _patch_minimal_loader(monkeypatch)
+
+    class Tok:
+        eos_token_id = 0
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096, truncation=True
+        )
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096, padding="max_length"
+        )
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent")
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
