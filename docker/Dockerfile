@@ -160,6 +160,12 @@ RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
     pip install --no-build-isolation --force-reinstall --no-deps \
         git+https://github.com/pytorch/torchcodec.git@v0.8.0
 
+# MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
+# torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
+# it. Install explicitly AFTER the sync so it is not pruned. Pin matches
+# docker/common/uv-pytorch.lock; the wheel is py3-none-any (no torch-ABI build).
+RUN pip install --no-cache-dir torchao==0.14.0
+
 COPY . /opt/Automodel
 
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
