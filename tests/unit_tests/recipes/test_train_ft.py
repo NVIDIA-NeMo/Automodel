@@ -2010,3 +2010,123 @@ class TestDpEvalSampleShard:
         from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 
         assert _dp_eval_sample_shard(MegatronFSDPConfig(), 1, 4) is None
+
+
+class _FakeToolCallEvaluator:
+    """Stand-in for ToolCallAccuracyEvaluator: returns canned metrics (or raises)
+    so ``_run_validation_epoch``'s reduction can be tested without generation."""
+
+    metric_prefix = "tool_call"
+    METRIC_KEYS = (
+        "has_call",
+        "name_correct",
+        "args_json_valid",
+        "args_field_recall",
+        "args_field_precision",
+        "args_exact_match",
+    )
+
+    def __init__(self, *, sample_shard=None, run_on_fsdp2=False, result=None, raises=False):
+        self.sample_shard = sample_shard
+        self.run_on_fsdp2 = run_on_fsdp2
+        self._result = result if result is not None else {}
+        self._raises = raises
+        self.eval_calls = 0
+
+    def evaluate(self, model, tokenizer):
+        self.eval_calls += 1
+        if self._raises:
+            raise RuntimeError("boom")
+        return dict(self._result)
+
+
+def _make_eval_recipe(distributed_config, evaluator):
+    """Minimal recipe wired for ``_run_validation_epoch`` with an empty val loader.
+
+    Single-rank: ``_dp_allreduce`` is the identity, so the packed all-reduce
+    recovers the per-rank means directly.
+    """
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.model_parts = [SimpleNamespace(eval=lambda: None)]
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.01}])]
+    recipe.pp_enabled = False
+    recipe.distributed_config = distributed_config
+    recipe.tool_call_evaluator = evaluator
+    recipe.tokenizer = object()
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe._warned_tool_call_eval_skipped = False
+    recipe._dp_allreduce = lambda tensor, *args, **kwargs: tensor
+    return recipe
+
+
+class TestRunValidationToolCallEval:
+    """Cover the tool-call eval reduction branches in ``_run_validation_epoch``
+    (FSDP2 skip / DDP packed all-reduce / replicated / evaluate failure) without a
+    real model or process group."""
+
+    def _run(self, recipe, monkeypatch):
+        # max_memory_allocated() is CUDA-only; stub it so the CPU metrics build works.
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 0)
+        return recipe._run_validation_epoch([])  # empty loader -> straight to the eval block
+
+    def test_fsdp2_skips_in_loop_eval(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        ev = _FakeToolCallEvaluator(run_on_fsdp2=False)
+        recipe = _make_eval_recipe(FSDP2Config(), ev)
+        out = self._run(recipe, monkeypatch)
+        assert out.metrics["tool_call/_disabled_fsdp2"] == 1.0
+        assert ev.eval_calls == 0  # generation never ran
+        assert recipe._warned_tool_call_eval_skipped is True
+
+    def test_ddp_sharded_packed_allreduce(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        result = {
+            "tool_call/has_call": 1.0,
+            "tool_call/name_correct": 0.5,
+            "tool_call/args_json_valid": 1.0,
+            "tool_call/args_field_recall": 0.0,
+            "tool_call/args_field_precision": 0.0,
+            "tool_call/args_exact_match": 0.0,
+            "tool_call/_count": 2.0,
+            "tool_call/_skipped": 1.0,
+        }
+        ev = _FakeToolCallEvaluator(sample_shard=(0, 1), result=result)
+        out = self._run(_make_eval_recipe(DDPConfig(), ev), monkeypatch)
+        # Identity all-reduce on one rank: count-weighted sum / count recovers the mean.
+        assert out.metrics["tool_call/has_call"] == 1.0
+        assert out.metrics["tool_call/name_correct"] == 0.5
+        assert out.metrics["tool_call/_count"] == 2.0
+        assert out.metrics["tool_call/_skipped"] == 1.0
+        assert ev.eval_calls == 1
+
+    def test_replicated_reports_local_without_collective(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        result = {
+            "tool_call/has_call": 0.75,
+            "tool_call/name_correct": 0.25,
+            "tool_call/args_json_valid": 0.5,
+            "tool_call/args_field_recall": 0.1,
+            "tool_call/args_field_precision": 0.2,
+            "tool_call/args_exact_match": 0.0,
+            "tool_call/_count": 4.0,
+            "tool_call/_skipped": 0.0,
+        }
+        # FSDP2 + run_on_fsdp2 -> not skipped; sample_shard None -> replicated branch.
+        ev = _FakeToolCallEvaluator(sample_shard=None, run_on_fsdp2=True, result=result)
+        out = self._run(_make_eval_recipe(FSDP2Config(), ev), monkeypatch)
+        assert out.metrics["tool_call/has_call"] == 0.75
+        assert out.metrics["tool_call/_count"] == 4.0
+        assert out.metrics["tool_call/_skipped"] == 0.0
+
+    def test_evaluate_failure_is_tolerated(self, monkeypatch):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        ev = _FakeToolCallEvaluator(sample_shard=(0, 1), raises=True)
+        out = self._run(_make_eval_recipe(DDPConfig(), ev), monkeypatch)
+        # An evaluate() that raised contributes an empty result -> zeros, count 0.
+        assert out.metrics["tool_call/_count"] == 0.0
+        assert out.metrics["tool_call/has_call"] == 0.0
