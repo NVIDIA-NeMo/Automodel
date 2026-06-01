@@ -31,7 +31,9 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
-from nemo_automodel.recipes._typed_config import CheckpointSpec, OptimizerSpec, _as_dict, _callable_and_kwargs
+from nemo_automodel.components.datasets.loader import Dataloader
+from nemo_automodel.components.optim.optimizer import build_optimizer_config
+from nemo_automodel.recipes._typed_config import CheckpointSpec, _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
@@ -41,10 +43,13 @@ from nemo_automodel.recipes.llm.train_ft import (
     compute_trust_remote_code_from_model,
 )
 
+# The recipe loader builder takes the same kwargs the tests already pass.
+_build_dataloader = build_dataloader
+
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
     """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
-    return OptimizerSpec(*_callable_and_kwargs(cfg_opt)).build(
+    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(
         model, distributed_config=distributed_config, device_mesh=device_mesh
     )
 
@@ -56,7 +61,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     )
 
 
-class DummyIterableDataset(IterableDataset):  # noqa: D401
+class DummyIterableDataset(IterableDataset, Dataloader):  # noqa: D401
     """Minimal iterable dataset with shard/shuffle hooks for testing build_dataloader."""
 
     def __init__(self, items=None, num_shards=1, tokenizer=None, **kwargs):
@@ -161,14 +166,10 @@ def test_build_validation_dataloader_collects_and_names_properly():
     with patch("nemo_automodel.recipes.llm.train_ft.build_dataloader", return_value=("dl", "tok")) as mock_build:
         result = build_validation_dataloader(cfg, dp_world_size=4, dp_rank=1, pp_enabled=False)
 
-    # Assert keys are correctly generated
     assert set(result.keys()) == expected_names
-    # Values should be the first element of the tuple returned by build_dataloader
     assert set(result.values()) == {"dl"}
-    # build_dataloader called once per validation dataset
+    # One dataloader built per validation dataset, with the runtime args threaded through.
     assert mock_build.call_count == 4
-
-    # Inspect one call for important kwargs
     _, kwargs = mock_build.call_args
     assert kwargs["dp_world_size"] == 4
     assert kwargs["dp_rank"] == 1
@@ -390,7 +391,7 @@ def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatc
     cfg_model = ConfigNode({})
     cfg_ps = ConfigNode({})
 
-    dl, tok = build_dataloader(
+    dl, tok = _build_dataloader(
         cfg_ds=cfg_ds,
         cfg_dl=cfg_dl,
         cfg_model=cfg_model,
@@ -534,8 +535,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         lambda *a, **k: dummy_model,
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.OptimizerSpec.build",
-        lambda self, *a, **k: [dummy_opt],
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
 
     # Data-related stubs
@@ -677,13 +678,16 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
             parts=parts, info=SimpleNamespace(has_last_stage=False, has_first_stage=False, schedule=None)
         )
 
-    def _build_optimizer_stub(self, *args, **kwargs):
+    def _build_optimizer_stub(*args, **kwargs):
         dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
         return [dummy_opt]
 
     # Override the default stubs to return a pipeline-wrapped model
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
-    monkeypatch.setattr("nemo_automodel.recipes._typed_config.OptimizerSpec.build", _build_optimizer_stub)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=_build_optimizer_stub)),
+    )
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.enable_nvtx = cfg.get("nvtx", False)
@@ -1314,7 +1318,7 @@ def test_build_dataloader_pp_autoconfig_failure_skips_mask_collate(caplog):
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
         caplog.at_level(logging.WARNING),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1359,7 +1363,7 @@ def test_build_dataloader_pp_autoconfig_success_sets_mask_collate():
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=lambda b, **kw: b),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1405,7 +1409,7 @@ def test_build_dataloader_pp_deepseek_v4_skips_mask_collate(caplog):
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,
@@ -1462,7 +1466,7 @@ def test_build_dataloader_pp_autoconfig_success_chains_existing_collate():
         patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=mock_config),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
-        dl, tok = build_dataloader(
+        dl, tok = _build_dataloader(
             cfg_ds=cfg_ds,
             cfg_dl=cfg_dl,
             cfg_model=cfg_model,

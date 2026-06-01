@@ -141,7 +141,6 @@ def _build_optimizer(
         logging.info("[INFO] Optimizer config: %s", optimizer_kwargs)
         warn_if_torch_adam_with_bf16_params(
             optimizer=optimizer,
-            optimizer_cfg=optimizer_cfg,
             parameters=trainable_params,
             is_peft=is_peft,
             context="diffusion",
@@ -170,7 +169,6 @@ def _build_optimizer(
     logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
     warn_if_torch_adam_with_bf16_params(
         optimizer=optimizer,
-        optimizer_cfg=optimizer_cfg,
         parameters=trainable_params,
         is_peft=is_peft,
         context="diffusion",
