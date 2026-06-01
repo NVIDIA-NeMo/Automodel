@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for CheckpointingConfig in config.py and build_checkpoint_config in api.py."""
+"""Tests for CheckpointingConfig in config.py."""
 
 import pytest
 
@@ -83,43 +83,36 @@ class TestCheckpointingConfig:
 
         assert CkptCfg is CheckpointingConfig
 
+    def test_defaults_construct_without_args(self):
+        """Every field has a default, so the recipe layer can construct directly."""
+        from huggingface_hub import constants as hf_constants
 
-class TestBuildCheckpointConfig:
-    def test_build_with_defaults(self):
-        from nemo_automodel.components.checkpoint.config import build_checkpoint_config
-
-        cfg = build_checkpoint_config(
-            checkpoint_kwargs=None,
-            cache_dir="/tmp/cache",
-            model_repo_id="test-model",
-            is_peft=False,
-        )
-        assert isinstance(cfg, CheckpointingConfig)
+        cfg = CheckpointingConfig()
         assert cfg.enabled is True
+        assert str(cfg.checkpoint_dir) == "checkpoints/"
+        assert cfg.model_save_format.value == "safetensors"
+        assert cfg.save_consolidated is True
+        assert cfg.is_peft is False
+        assert cfg.model_repo_id is None
+        # model_cache_dir falls back to the HF hub cache when None.
+        assert str(cfg.model_cache_dir) == str(hf_constants.HF_HUB_CACHE)
+
+    def test_explicit_cache_dir_is_kept(self):
+        cfg = CheckpointingConfig(model_cache_dir="/tmp/cache")
         assert str(cfg.model_cache_dir) == "/tmp/cache"
-        assert cfg.model_repo_id == "test-model"
 
-    def test_build_with_user_overrides(self):
-        from nemo_automodel.components.checkpoint.config import build_checkpoint_config
-
-        cfg = build_checkpoint_config(
-            checkpoint_kwargs={"checkpoint_dir": "/my/ckpt", "v4_compatible": True},
-            cache_dir=None,
-            model_repo_id="test",
-            is_peft=False,
-        )
-        assert str(cfg.checkpoint_dir) == "/my/ckpt"
-        assert cfg.v4_compatible is True
-
-    def test_build_peft_torch_save_fallback(self):
-        """PEFT + torch_save should fallback to safetensors, preserving checkpoint_dir."""
-        from nemo_automodel.components.checkpoint.config import build_checkpoint_config
-
-        cfg = build_checkpoint_config(
-            checkpoint_kwargs={"model_save_format": "torch_save", "checkpoint_dir": "/keep/this"},
-            cache_dir=None,
-            model_repo_id="test",
+    def test_peft_torch_save_fallback(self):
+        """PEFT + torch_save should fall back to safetensors, preserving checkpoint_dir."""
+        cfg = CheckpointingConfig(
+            checkpoint_dir="/keep/this",
+            model_save_format="torch_save",
             is_peft=True,
         )
         assert cfg.model_save_format.value == "safetensors"
+        assert cfg.save_consolidated is True
         assert str(cfg.checkpoint_dir) == "/keep/this"
+
+    def test_non_peft_torch_save_preserved(self):
+        """Without PEFT, torch_save must be honored."""
+        cfg = CheckpointingConfig(model_save_format="torch_save", is_peft=False)
+        assert cfg.model_save_format.value == "torch_save"
