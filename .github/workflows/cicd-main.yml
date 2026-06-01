@@ -682,3 +682,77 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  notify-failure:
+    needs: [Nemo_CICD_Test]
+    if: ${{ !cancelled() && needs.Nemo_CICD_Test.result == 'failure' && startsWith(github.ref, 'refs/heads/pull-request/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Comment failing tests on the PR (notifies author)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          MARKER: "<!-- automodel-ci-failure -->"
+        run: |
+          set -euo pipefail
+
+          PR="${REF##*/}"                                  # refs/heads/pull-request/2283 -> 2283
+          AUTHOR="$(gh api "repos/${REPO}/pulls/${PR}" --jq '.user.login')"
+
+          # Failing jobs in this run (notify-failure itself is still in-progress, so it is excluded).
+          mapfile -t FAILED_IDS < <(gh run view "$RUN_ID" -R "$REPO" --json jobs \
+            --jq '.jobs[] | select(.status == "completed" and .conclusion == "failure") | .databaseId')
+          mapfile -t FAILED_NAMES < <(gh run view "$RUN_ID" -R "$REPO" --json jobs \
+            --jq '.jobs[] | select(.status == "completed" and .conclusion == "failure") | .name')
+
+          # Extract the pytest "FAILED <path>::<test> - <reason>" summary lines from each failed log.
+          : > tests.txt
+          if [ "${#FAILED_IDS[@]}" -gt 0 ]; then
+            for id in "${FAILED_IDS[@]}"; do
+              gh api "repos/${REPO}/actions/jobs/${id}/logs" 2>/dev/null \
+                | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' \
+                | grep -aoE 'FAILED [^[:space:]]+::[^[:space:]]+.*' || true
+            done | sort -u > tests.txt
+          fi
+          N="$(wc -l < tests.txt | tr -d ' ')"
+
+          JOBS_CSV="none"
+          if [ "${#FAILED_NAMES[@]}" -gt 0 ]; then
+            JOBS_CSV="$(printf '%s, ' "${FAILED_NAMES[@]}" | sed 's/, $//')"
+          fi
+
+          {
+            echo "$MARKER"
+            echo "@${AUTHOR} 🔴 **CI failed** on this PR (\`${SHA:0:7}\`)."
+            echo
+            if [ "$N" -gt 0 ]; then
+              echo "**${N} failing test(s):**"
+              echo '```'
+              cat tests.txt
+              echo '```'
+            else
+              echo "No pytest failures were parsed — the failure is likely in a build, lint, or setup step (see the failed jobs below)."
+            fi
+            echo
+            echo "**Failed jobs:** ${JOBS_CSV}"
+            echo
+            echo "[View run logs »](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})"
+          } > body.md
+
+          # Sticky comment: update the existing marker comment if present, otherwise create a new one.
+          CID="$(gh api "repos/${REPO}/issues/${PR}/comments?per_page=100" \
+            --jq '[.[] | select(.body | startswith("<!-- automodel-ci-failure -->"))] | last | .id // empty')"
+          if [ -n "$CID" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${CID}" -F body=@body.md >/dev/null
+            echo "Updated existing comment ${CID}"
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR}/comments" -F body=@body.md >/dev/null
+            echo "Created new comment"
+          fi
