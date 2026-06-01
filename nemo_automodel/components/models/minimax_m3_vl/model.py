@@ -102,6 +102,12 @@ class MiniMaxM3TextModel(nn.Module):
     ):
         super().__init__()
         self.backend = backend
+        # MiniMax M3 routes experts in fp32 (sglang hardcodes the router gate to
+        # fp32: projection + sigmoid + correction-bias add). Forcing it here avoids
+        # bf16 top-k drift -> different expert selection -> different logits. Set
+        # before the decoder/MTP blocks (which build the MoE gates) are constructed.
+        if self.backend.gate_precision is None:
+            self.backend.gate_precision = torch.float32
         self.config = config
         self.config.num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", None))
 
@@ -370,6 +376,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             config.projector_hidden_size,
             projector_hidden_act=config.projector_hidden_act,
             multimodal_projector_bias=config.multimodal_projector_bias,
+            patch_merge_bias=getattr(config, "patch_merge_bias", config.multimodal_projector_bias),
         )
         self.image_token_index = config.image_token_index
         self.video_token_index = config.video_token_index

@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3MLP
+from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 from nemo_automodel.components.moe.layers import MoE
+
+from .conftest import TINY_CFG
 
 
 def test_forward_shape_and_finite(model):
@@ -55,3 +60,22 @@ def test_gemma_norm_zero_centered(text_config, backend):
     out = norm(x)
     ref = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + 1e-6)
     assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_gate_forced_to_fp32(model):
+    # M3 routes experts in fp32 (sglang hardcodes the router gate to fp32) to
+    # avoid bf16 top-k drift -> different expert selection.
+    assert model.backend.gate_precision == torch.float32
+    assert model.model.layers["1"].mlp.gate.gate_precision == torch.float32  # layer 1 is MoE
+
+
+def test_attention_output_gate_rejected(backend):
+    cfg = MiniMaxM3VLTextConfig(torch_dtype="float32", **{**TINY_CFG, "attention_output_gate": True})
+    with pytest.raises(AssertionError):
+        MiniMaxM3SparseForCausalLM(cfg, backend=backend)
+
+
+def test_non_per_head_qk_norm_rejected(backend):
+    cfg = MiniMaxM3VLTextConfig(torch_dtype="float32", **{**TINY_CFG, "qk_norm_type": "per_layer"})
+    with pytest.raises(AssertionError):
+        MiniMaxM3SparseForCausalLM(cfg, backend=backend)
