@@ -172,13 +172,16 @@ RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
 # x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
 # (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
 # --no-build-isolation reuses the container's torch ABI (same as the torchcodec rebuild).
-# setup.py hardcodes the sm_100/sm_100a gencode flags and self-gates on CUDA>=12.8, so
-# no TORCH_CUDA_ARCH_LIST override is needed. v0.14.1 is the git tag matching 0.14.0.
-# CUTLASS is a git submodule and the mxfp8 kernels need its headers, so clone with
-# --recurse-submodules explicitly (pip's git+ submodule handling is unreliable).
+# v0.14.1 is the git tag matching 0.14.0. CUTLASS is a git submodule and the mxfp8 kernels
+# need its headers, so clone with --recurse-submodules explicitly (pip's git+ submodule
+# handling is unreliable). setup.py self-gates the mxfp8/cutlass sm_100a kernels on
+# CUDA>=12.8 and hardcodes their gencode flags, but TORCH_CUDA_ARCH_LIST + MAX_JOBS mirror
+# the in-image DeepEP source build (above) to cover torchao's other CUDAExtensions and to
+# bound build parallelism (the CUTLASS sm_100 compile is heavy).
 RUN git clone --depth 1 --branch v0.14.1 --recurse-submodules --shallow-submodules \
         https://github.com/pytorch/ao.git /tmp/torchao && \
-    pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
+    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" MAX_JOBS=8 \
+        pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
     rm -rf /tmp/torchao
 
 COPY . /opt/Automodel
