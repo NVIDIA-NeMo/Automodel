@@ -1,5 +1,25 @@
 # Breaking Changes
 
+## 0.5.0
+
+### FSDP2 Default `reduce_dtype` Is Now `float32`
+
+The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in fp32 to reduce communication-rounding error at larger data-parallel world sizes.
+
+To restore the previous behavior, override the policy explicitly:
+
+```yaml
+distributed:
+  _target_: nemo_automodel.components.distributed.config.FSDP2Config
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+```
+
+See `docs/guides/mixed-precision-training.md` for how FSDP2 reduction dtype interacts with model storage dtype and optimizer state.
+
 ## 0.4.0 · 26.04
 
 ### CLI Signature Change
@@ -23,7 +43,7 @@ am <config.yaml> [--nproc-per-node N] [--overrides ...]
 ```
 
 The positional `<command>` and `<domain>` arguments have been removed. The recipe
-class is now specified inside the YAML config via the `recipe._target_` key.
+class is now specified inside the YAML config through the `recipe._target_` key.
 
 ### YAML Config: New Required `recipe` Section
 
@@ -49,21 +69,21 @@ Configs without this key will produce an error with guidance on which target to 
 
 ### Launcher Configuration Moved to YAML
 
-Multi-node launch settings (Kubernetes, NeMo-Run) are now configured
+Multi-node launch settings (Kubernetes, NeMo Run) are now configured
 entirely within the YAML config file rather than through CLI arguments.
 
 | Launcher | YAML section |
 |---|---|
 | Kubernetes | `k8s:` |
-| NeMo-Run | `nemo_run:` |
+| NeMo Run | `nemo_run:` |
 
-If none of these sections are present the job runs locally (interactive mode).
+If none of these sections are present, the job runs locally (interactive mode).
 
 ### SLURM: Script-Based Submission
 
-The `slurm:` YAML section and all related fields have been removed.  SLURM
+The `slurm:` YAML section and all related fields have been removed. SLURM
 jobs are now submitted with `sbatch` directly, using a self-contained sbatch
-script.  Copy the reference template and adapt it to your cluster:
+script. Copy the reference template and adapt it to your cluster:
 
 ```bash
 cp slurm.sub my_cluster.sub
@@ -79,7 +99,7 @@ see and edit it directly.
 ### Lightweight CLI-Only Install
 
 A new `automodel[cli]` install extra is available for login nodes or environments
-where you only need to submit jobs (SLURM, k8s, NeMo-Run) without running
+where you only need to submit jobs (SLURM, k8s, NeMo Run) without running
 training locally:
 
 ```
@@ -87,7 +107,8 @@ pip install nemo-automodel[cli]
 ```
 
 This installs only `pyyaml` -- no PyTorch, no CUDA dependencies. It is enough
-to submit jobs via SLURM or Kubernetes. If you also need NeMo-Run, install it
+This installs only `pyyaml` — no PyTorch, no CUDA dependencies. It is enough
+to submit jobs through SLURM or Kubernetes. If you also need NeMo Run, install it
 separately (`pip install nemo-run`). If you try to run a local/interactive job
 with the CLI-only install, you will get a clear error message with instructions
 to install the full package.

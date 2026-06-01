@@ -123,7 +123,10 @@ class TrainEagle1Recipe(BaseRecipe):
             )
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         if self.dist_setup is None:
-            self.target_model = self.target_model.to(self.device)
+            # ``nn.Module.to`` is in-place; reassigning ``self.target_model``
+            # would re-trigger ``BaseRecipe.__setattr__`` state-tracking and
+            # raise ``RuntimeError: State key 'target_model' is already tracked``.
+            self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagleTargetModel(self.target_model)
 
