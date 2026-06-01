@@ -149,7 +149,10 @@ class BackendConfig:
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
-            "torch_mm" uses torch._grouped_mm.
+            "torch_mm" uses torch._grouped_mm, "torch_mm_mxfp8" uses torch._grouped_mm
+            dispatch but routes the expert grouped GEMMs through torchao's MXFP8
+            scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
+            else falls back to torch._grouped_mm at runtime).
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP for token dispatch,
             "uccl_ep" uses UCCL-EP for token dispatch across heterogeneous GPUs and NICs.
@@ -179,7 +182,9 @@ class BackendConfig:
     linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
-    experts: Literal["torch", "te", "gmm", "torch_mm"] = "torch_mm" if torch.cuda.is_available() else "torch"
+    experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
+        "torch_mm" if torch.cuda.is_available() else "torch"
+    )
     dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
