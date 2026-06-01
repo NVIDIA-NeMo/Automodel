@@ -79,7 +79,7 @@ cd /opt/Automodel
 **3. Fine-tune**:
 
 ```bash
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+automodel --nproc-per-node=8 examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml \
   --model.pretrained_model_name_or_path <MODEL_HF_ID>
 ```
 :::
