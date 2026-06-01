@@ -424,8 +424,8 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
         return cfg
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
-        lambda self, **kw: _stub_build_checkpoint_config(),
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: _stub_build_checkpoint_config()),
     )
     monkeypatch.setattr(vlm_finetune, "build_model", lambda *args, **kwargs: _FakePPModel(stage0))
     monkeypatch.setattr(

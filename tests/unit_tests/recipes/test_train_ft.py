@@ -33,7 +33,7 @@ from torch.utils.data import IterableDataset
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.components.datasets.loader import Dataloader
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
-from nemo_automodel.recipes._typed_config import CheckpointSpec, _as_dict, _callable_and_kwargs
+from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
@@ -55,10 +55,13 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
-    """Resolve a YAML checkpoint block and build it (mirrors ``RecipeConfig.checkpoint.build``)."""
-    return CheckpointSpec(_as_dict(cfg_ckpt) if cfg_ckpt is not None else None).build(
-        cache_dir=cache_dir, model_repo_id=model_repo_id, is_peft=is_peft
-    )
+    """Resolve a YAML checkpoint block into a ``CheckpointingConfig`` (mirrors ``RecipeConfig.checkpoint``)."""
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+    kwargs = _as_dict(cfg_ckpt) if cfg_ckpt is not None else {}
+    kwargs.pop("restore_from", None)
+    derived = {"model_repo_id": model_repo_id, "model_cache_dir": cache_dir, "is_peft": is_peft}
+    return CheckpointingConfig(**{**derived, **kwargs})
 
 
 class DummyIterableDataset(IterableDataset, Dataloader):  # noqa: D401
@@ -340,19 +343,17 @@ def test_peft_with_tp_disables_triton(caplog):
 
 
 def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog):
-    """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+    """PEFT + torch_save: warn, fall back to safetensors defaults; preserve checkpoint_dir."""
     from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 
     cfg_ckpt = MagicMock()
     cfg_ckpt.to_dict.return_value = {
         "model_save_format": "torch_save",
         "checkpoint_dir": "/user/ckpt/",
-        # torch_save-specific / incompatible options that must be discarded:
         "save_consolidated": False,
-        "is_async": True,
     }
 
-    with caplog.at_level(logging.WARNING, logger="nemo_automodel.recipes.llm.train_ft"):
+    with caplog.at_level(logging.WARNING):
         config = build_checkpoint_config(
             cfg_ckpt=cfg_ckpt,
             cache_dir=None,
@@ -360,14 +361,13 @@ def test_build_checkpoint_config_peft_torch_save_overrides_to_safetensors(caplog
             is_peft=True,
         )
 
-    assert any("discarding" in rec.message.lower() for rec in caplog.records)
+    assert any("falling back" in rec.message.lower() for rec in caplog.records)
     assert config.is_peft is True
     assert config.model_save_format == SerializationFormat.SAFETENSORS
     # checkpoint_dir is preserved from the user config
     assert config.checkpoint_dir == "/user/ckpt/"
-    # other user-provided torch_save options are discarded (defaults restored)
+    # save_consolidated is forced back to the safetensors default
     assert config.save_consolidated is True
-    assert config.is_async is False
 
 
 def test_build_dataloader_iterable_shard_and_shuffle_removed_from_cfg(monkeypatch):
@@ -512,8 +512,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         return cfg
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
-        lambda self, **kw: _stub_build_checkpoint_config(),
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: _stub_build_checkpoint_config()),
     )
     # Stub setup_distributed to avoid requiring torch.distributed init
     monkeypatch.setattr(

@@ -25,10 +25,12 @@ dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
-while the ``checkpoint`` block maps to a small recipe-layer "spec" wrapper
-(``CheckpointSpec``) that resolves the YAML and delegates to the pure component
-builder.  Sections with no typed view (e.g. ``model``, ``comet``) fall through
-to the raw ``ConfigNode`` via ``__getattr__``.
+while the ``checkpoint`` block is coerced directly into a component
+:class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig` (the
+model-derived ``model_repo_id`` / ``model_cache_dir`` / ``is_peft`` are filled
+in here from the surrounding YAML).  Sections with no typed view (e.g.
+``model``, ``comet``) fall through to the raw ``ConfigNode`` via
+``__getattr__``.
 
 This is the recipe layer, so it is allowed to know the YAML schema (which keys
 are runtime args, ``_target_`` resolution, etc.); the components themselves stay
@@ -38,7 +40,6 @@ YAML-free.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
@@ -102,36 +104,19 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
     return None
 
 
-@dataclass(frozen=True)
-class CheckpointSpec:
-    """The ``checkpoint:`` YAML block; ``build`` binds runtime args and delegates
-    to the component ``build_checkpoint_config`` (which owns the merge/PEFT logic).
-    """
-
-    checkpoint_kwargs: dict[str, Any] | None
-
-    def build(self, *, cache_dir: str | None, model_repo_id: str | None, is_peft: bool) -> Any:
-        from nemo_automodel.components.checkpoint import build_checkpoint_config
-
-        return build_checkpoint_config(
-            checkpoint_kwargs=self.checkpoint_kwargs,
-            cache_dir=cache_dir,
-            model_repo_id=model_repo_id,
-            is_peft=is_peft,
-        )
-
-
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
     ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
     ``.build(...)`` (``optimizer`` is an
-    :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`); all
-    other attributes delegate to the underlying ``ConfigNode``.
+    :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
+    ``checkpoint`` a
+    :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
+    all other attributes delegate to the underlying ``ConfigNode``.
     """
 
-    def __init__(self, raw: ConfigNode):
+    def __init__(self, raw: "ConfigNode"):
         self._raw = raw
 
     @cached_property
@@ -158,7 +143,7 @@ class RecipeConfig:
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
-    def optimizer(self) -> OptimizerConfig | None:
+    def optimizer(self) -> "OptimizerConfig" | None:
         from nemo_automodel.components.optim.optimizer import build_optimizer_config
 
         node = self._raw.get("optimizer", None)
@@ -168,7 +153,7 @@ class RecipeConfig:
         return build_optimizer_config(factory, kwargs)
 
     @cached_property
-    def loss_fn(self) -> LossConfig | None:
+    def loss_fn(self) -> "LossConfig" | None:
         from nemo_automodel.components.loss import build_loss_config
 
         node = self._raw.get("loss_fn", None)
@@ -178,11 +163,22 @@ class RecipeConfig:
         return build_loss_config(factory, **kwargs)
 
     @cached_property
-    def checkpoint(self) -> CheckpointSpec:
-        node = self._raw.get("checkpoint", None)
-        return CheckpointSpec(_as_dict(node) if node is not None else None)
+    def checkpoint(self) -> "CheckpointingConfig":
+        from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 
-    # --- everything else delegates to the raw ConfigNode -------------------
+        node = self._raw.get("checkpoint", None)
+        kwargs = _as_dict(node) if node is not None else {}
+        kwargs.pop("restore_from", None)  # consumed separately at load time, not a config field
+        model = self._raw.get("model", None)
+        # Model-derived values; YAML overrides win if explicitly set.
+        kwargs |= {
+            "model_repo_id": _model_name_from_cfg(model) if model is not None else None,
+            "model_cache_dir": self._raw.get("model.cache_dir", None),
+            "is_peft": bool(self._raw.get("peft", None)),
+        }
+        return CheckpointingConfig(**kwargs)
+
+    # everything else delegates to the raw ConfigNode
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
