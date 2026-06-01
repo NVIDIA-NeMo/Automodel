@@ -100,7 +100,7 @@ finetune_config.yaml
          │
     ┌────┴─────────────────────────────────┐
     ▼            ▼            ▼            ▼
-build_model  build_optimizer build_dataloader build_loss_fn ...
+build_model  build_optimizer build_dataloader build_loss_module ...
     │            │            │            │
     ▼            ▼            ▼            ▼
 cfg.model     cfg.optimizer cfg.dataset   cfg.loss_fn
