@@ -63,6 +63,8 @@ class _Model(nn.Module):
 )
 def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled, expected_aux_scale):
     calls = {
+        "after_first": [],
+        "events": [],
         "prepare": [],
         "final": [],
         "scale": [],
@@ -70,16 +72,30 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     }
 
     monkeypatch.setattr(vlm_kd.time, "perf_counter", lambda: 2.0)
+
+    def _prepare_for_grad_accumulation(model_parts, pp_enabled):
+        calls["prepare"].append((model_parts, pp_enabled))
+        calls["events"].append("prepare")
+
+    def _prepare_for_final_backward(model_parts, pp_enabled):
+        calls["final"].append((model_parts, pp_enabled))
+        calls["events"].append("final")
+
+    def _prepare_after_first_microbatch():
+        calls["after_first"].append("called")
+        calls["events"].append("after_first")
+
     monkeypatch.setattr(
         vlm_kd,
         "prepare_for_grad_accumulation",
-        lambda model_parts, pp_enabled: calls["prepare"].append((model_parts, pp_enabled)),
+        _prepare_for_grad_accumulation,
     )
     monkeypatch.setattr(
         vlm_kd,
         "prepare_for_final_backward",
-        lambda model_parts, pp_enabled: calls["final"].append((model_parts, pp_enabled)),
+        _prepare_for_final_backward,
     )
+    monkeypatch.setattr(vlm_kd, "prepare_after_first_microbatch", _prepare_after_first_microbatch)
 
     def _fake_scale_grads_and_clip_grad_norm(**kwargs):
         calls["scale"].append(kwargs)
@@ -110,6 +126,7 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
 
     def _fake_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train=True):
         calls["forward"].append((idx, num_label_tokens, num_batches, is_train))
+        calls["events"].append(f"forward_{idx}")
         loss_buffer.append(torch.tensor(1.0))
         recipe._ce_loss_buffer.append(torch.tensor(0.25))
         recipe._kd_loss_buffer.append(torch.tensor(0.75))
@@ -127,6 +144,8 @@ def test_vlm_kd_train_step_uses_distributed_step_helpers(monkeypatch, pp_enabled
     assert isinstance(metrics, MetricsSample)
     assert calls["prepare"] == [([model], pp_enabled)]
     assert calls["final"] == [([model], pp_enabled)]
+    assert calls["after_first"] == ["called"]
+    assert calls["events"] == ["prepare", "forward_0", "after_first", "final", "forward_1"]
     assert calls["forward"] == [(0, 3, 2, True), (1, 3, 2, True)]
     assert calls["scale"] == [
         {

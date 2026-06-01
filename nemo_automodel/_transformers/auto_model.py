@@ -38,6 +38,7 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
@@ -163,6 +164,53 @@ def _patch_remote_code_compat():
     _remote_code_compat_applied = True
 
 
+_AUTO_CONFIG_HUB_KWARG_KEYS = (
+    "revision",
+    "subfolder",
+    "token",
+    "use_auth_token",
+    "cache_dir",
+    "local_files_only",
+    "code_revision",
+)
+
+
+def _alias_remote_auto_map_for_target(args, kwargs, target_key):
+    """Return a config with ``auto_map[target_key]`` aliased from ``auto_map[AutoModel]``.
+
+    When a trust-remote-code model card ships ``auto_map`` with only an
+    ``AutoModel`` entry (and no ``target_key`` such as
+    ``AutoModelForCausalLM``), HF's auto resolution fails. For models that
+    are otherwise causal LMs this helper copies the existing ``AutoModel``
+    class reference into ``target_key`` so resolution succeeds on retry.
+
+    Returns the patched ``PretrainedConfig`` if patching applied, else
+    ``None``.
+    """
+    if not kwargs.get("trust_remote_code"):
+        return None
+    config = kwargs.get("config")
+    if config is None:
+        if not args:
+            return None
+        pretrained_path = args[0]
+        hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
+        try:
+            config = AutoConfig.from_pretrained(
+                pretrained_path,
+                trust_remote_code=True,
+                **hub_kwargs,
+            )
+        except Exception:
+            return None
+    auto_map = getattr(config, "auto_map", None)
+    if not auto_map or target_key in auto_map or "AutoModel" not in auto_map:
+        return None
+    config.auto_map = dict(auto_map)
+    config.auto_map[target_key] = auto_map["AutoModel"]
+    return config
+
+
 def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
     """Set ``dequantize=True`` on FP8 quantization configs when PEFT is requested.
 
@@ -214,6 +262,26 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 )
                 _patch_remote_code_compat()
                 model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
+        except ValueError as e:
+            # Some trust-remote-code model cards ship config.json with only
+            # auto_map["AutoModel"] and omit the AutoModelForCausalLM (etc.)
+            # entry, which makes HF's resolution fail. If the model is
+            # otherwise a causal LM, alias the existing AutoModel mapping to
+            # the requested target key and retry.
+            target_key = cls.__name__
+            if "Unrecognized configuration class" in str(e) and target_key in str(e):
+                patched = _alias_remote_auto_map_for_target(args, kwargs, target_key)
+                if patched is not None:
+                    logger.warning(
+                        "Model config.json missing auto_map[%s]; aliasing from auto_map[AutoModel] and retrying.",
+                        target_key,
+                    )
+                    kwargs = dict(kwargs, config=patched)
+                    model = super().from_pretrained(*args, **kwargs)
+                else:
+                    raise
             else:
                 raise
         except OSError:
