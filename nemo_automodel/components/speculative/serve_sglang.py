@@ -15,9 +15,13 @@
 """Serve an Automodel-trained EAGLE / EAGLE-3 drafter with SGLang.
 
 The EAGLE drafter checkpoints produced by the EAGLE recipes
-(``recipes/llm/train_eagle{1,2,3}.py``) are saved as ``draft_model.pt`` plus
-recipe metadata. This script converts that layout into an HF/SGLang-readable
-``model/`` directory when needed, then shells out to
+(``recipes/llm/train_eagle{1,2,3}.py``) are written by the consolidated
+checkpointer as an HF-style ``model/`` directory (``model.safetensors`` +
+``config.json``) inside each ``epoch_<E>_step_<S>/`` checkpoint, alongside the
+EAGLE-3 vocab metadata (``eagle3_meta.pt``). This script resolves that directory
+(regenerating SGLang's speculative token map from the metadata when needed) --
+and still accepts an older ``draft_model.pt`` layout as a fallback for
+hand-exported checkpoints -- then shells out to
 ``python -m sglang.launch_server`` with the right speculative-decoding flags.
 
 NOTE — SGLang is NOT bundled with the NeMo-AutoModel container image and
@@ -177,12 +181,17 @@ def _regenerate_token_map(meta_path: Path, token_map_path: Path) -> None:
 def _maybe_export_training_checkpoint(
     checkpoint_dir: Path, algorithm: str, *, dry_run: bool = False
 ) -> tuple[Path, Path | None]:
-    """Convert recipe-native EAGLE checkpoints into an HF/SGLang-readable directory.
+    """Export a legacy bare ``draft_model.pt`` checkpoint into an HF/SGLang ``model/`` directory.
+
+    The standard recipe output is already a consolidated ``model/`` directory and
+    is resolved directly by ``resolve_draft_artifacts``; this is the fallback for
+    the older layout where the draft weights were hand-saved as a bare
+    ``draft_model.pt``. When ``checkpoint_dir`` has no ``draft_model.pt`` +
+    ``config.json`` it is returned unchanged (the ``model/`` path handles it).
 
     Args:
-        checkpoint_dir: Recipe checkpoint dir, expected to contain
-            ``draft_model.pt`` and ``config.json`` (and ``eagle3_meta.pt`` for
-            EAGLE-3).
+        checkpoint_dir: A dir holding a legacy ``draft_model.pt`` + ``config.json``
+            (and ``eagle3_meta.pt`` for EAGLE-3); otherwise this is a no-op.
         algorithm: Speculative algorithm name, used to pick the right
             SGLang architecture and to decide whether a token map is needed.
         dry_run: When True, return the paths that *would* be produced
