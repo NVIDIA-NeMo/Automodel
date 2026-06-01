@@ -123,6 +123,20 @@ class ToolCallAccuracyEvaluator:
 
         self._samples_cache: Optional[List[Dict[str, Any]]] = None
 
+    @property
+    def sample_shard(self) -> Optional[tuple]:
+        """``(rank, world_size)`` shard, or ``None`` to score every sample.
+
+        The training recipe sets this so each data-parallel rank scores a
+        disjoint subset, but only when the model is replicated per rank (DDP);
+        sharded strategies must keep every rank on the same samples.
+        """
+        return self._sample_shard
+
+    @sample_shard.setter
+    def sample_shard(self, value: Optional[tuple]) -> None:
+        self._sample_shard = value
+
     def _cleanup_cuda(self) -> None:
         gc.collect()
         if torch.cuda.is_available():

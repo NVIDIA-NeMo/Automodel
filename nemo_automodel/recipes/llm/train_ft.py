@@ -61,7 +61,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
-from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
@@ -172,6 +172,20 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.step_scheduler.local_batch_size // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
     return 1
+
+
+def _dp_eval_sample_shard(distributed_config: Any, dp_rank: int, dp_size: int) -> tuple | None:
+    """Return ``(dp_rank, dp_size)`` to shard tool-call eval across DP ranks, else ``None``.
+
+    Only DDP replicates the full model on every rank, so only there can each rank
+    score a disjoint subset independently. Under FSDP2 / MegatronFSDP the model is
+    sharded and ``generate()`` issues per-layer all-gather collectives that must
+    stay in lockstep across the group — different samples per rank would desync
+    them and hang — so every rank scores the same samples (``None``).
+    """
+    if isinstance(distributed_config, DDPConfig) and dp_size > 1:
+        return (dp_rank, dp_size)
+    return None
 
 
 def build_model(
@@ -1126,6 +1140,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
         if tool_call_eval_cfg is not None:
             self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
+            # Shard eval samples across DP ranks so each scores a disjoint subset
+            # instead of every rank redundantly scoring the full set. Only safe
+            # when the model is replicated per rank (DDP); a YAML-set sample_shard
+            # is left untouched.
+            if self.tool_call_evaluator.sample_shard is None:
+                self.tool_call_evaluator.sample_shard = _dp_eval_sample_shard(
+                    self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
+                )
         self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
@@ -1709,14 +1731,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     self._warned_tool_call_eval_skipped = True
                 metrics[f"{prefix}/_disabled_fsdp2"] = 1.0
             else:
-                # Every DP rank must issue the SAME collective here, whatever its
-                # local eval produced. A rank whose evaluate() raised (e.g. a
-                # divergent generate() OOM) or that hit different skip reasons must
-                # not skip or add an all-reduce, or it desyncs the collective and
-                # deadlocks the others. So: treat a local failure as an empty
-                # result, and reduce a FIXED vector (the stable means plus
-                # _count/_skipped, never the per-rank _skip_<reason> keys) in one
-                # packed all-reduce.
+                # sample_shard is set (identically) on every rank only for DDP,
+                # where each rank scored a DISJOINT subset → all-reduce. When it
+                # is None (FSDP2 in-loop, or single rank) every rank scored the
+                # SAME set in lockstep and holds identical results → use them
+                # directly with no collective. The branch is taken identically on
+                # all ranks, so the collectives below stay in sync.
+                sharded = self.tool_call_evaluator.sample_shard is not None
                 try:
                     local_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
                 except Exception as exc:
@@ -1725,22 +1746,35 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 metric_keys = list(self.tool_call_evaluator.METRIC_KEYS)
                 local_count = float(local_metrics.get(count_key, 0.0))
-                # Pack [count, mean_0 * count, ..., mean_n * count, skipped] so the
-                # count-weighted means and the diagnostics reduce in one collective.
-                packed = torch.tensor(
-                    [local_count]
-                    + [float(local_metrics.get(f"{prefix}/{k}", 0.0)) * local_count for k in metric_keys]
-                    + [float(local_metrics.get(f"{prefix}/_skipped", 0.0))],
-                    dtype=torch.float32,
-                    device=self.dist_env.device,
-                )
-                reduced = self._dp_allreduce(packed).tolist()
-
-                total_count = reduced[0]
-                for i, k in enumerate(metric_keys, start=1):
-                    metrics[f"{prefix}/{k}"] = reduced[i] / total_count if total_count > 0 else 0.0
-                metrics[f"{prefix}/_skipped"] = reduced[-1]
-                metrics[count_key] = total_count
+                if sharded:
+                    # Every DP rank must issue the SAME collective here, whatever
+                    # its local eval produced. A rank whose evaluate() raised (e.g.
+                    # a divergent generate() OOM) or that hit different skip reasons
+                    # must not skip or add an all-reduce, or it desyncs the
+                    # collective and deadlocks the others. So reduce a FIXED vector
+                    # (count, count-weighted means, skipped — never the per-rank
+                    # _skip_<reason> keys) in one packed all-reduce; a local failure
+                    # contributes zeros but still participates.
+                    packed = torch.tensor(
+                        [local_count]
+                        + [float(local_metrics.get(f"{prefix}/{k}", 0.0)) * local_count for k in metric_keys]
+                        + [float(local_metrics.get(f"{prefix}/_skipped", 0.0))],
+                        dtype=torch.float32,
+                        device=self.dist_env.device,
+                    )
+                    reduced = self._dp_allreduce(packed).tolist()
+                    total_count = reduced[0]
+                    for i, k in enumerate(metric_keys, start=1):
+                        metrics[f"{prefix}/{k}"] = reduced[i] / total_count if total_count > 0 else 0.0
+                    metrics[f"{prefix}/_skipped"] = reduced[-1]
+                    metrics[count_key] = total_count
+                else:
+                    # Replicated: identical on every rank, so report the local
+                    # values directly (no collective, _count is the true count).
+                    for k in metric_keys:
+                        metrics[f"{prefix}/{k}"] = float(local_metrics.get(f"{prefix}/{k}", 0.0))
+                    metrics[f"{prefix}/_skipped"] = float(local_metrics.get(f"{prefix}/_skipped", 0.0))
+                    metrics[count_key] = local_count
 
                 gc.collect()
                 if torch.cuda.is_available():

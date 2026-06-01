@@ -294,3 +294,16 @@ def test_metric_keys_match_evaluate_mean_metrics(monkeypatch):
     mean_keys = {k for k in metrics if not k.rsplit("/", 1)[-1].startswith("_")}
     expected = {f"{prefix}/{name}" for name in ToolCallAccuracyEvaluator.METRIC_KEYS}
     assert mean_keys == expected
+
+
+def test_sample_shard_property_round_trips_and_drives_sharding(monkeypatch):
+    # The recipe injects the shard after construction via the public property;
+    # it must round-trip and actually drive _iter_my_samples partitioning.
+    evaluator = _make_evaluator(monkeypatch)
+    assert evaluator.sample_shard is None
+
+    evaluator.sample_shard = (1, 4)
+    assert evaluator.sample_shard == (1, 4)
+
+    evaluator._samples_cache = [{"i": i} for i in range(8)]
+    assert evaluator._iter_my_samples() == [{"i": 1}, {"i": 5}]

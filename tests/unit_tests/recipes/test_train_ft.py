@@ -34,6 +34,7 @@ from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.recipes.llm.train_ft import (
     PipelineCausalLMLoss,
     TrainFinetuneRecipeForNextTokenPrediction,
+    _dp_eval_sample_shard,
     build_dataloader,
     build_model,
     build_optimizer,
@@ -1983,3 +1984,29 @@ class TestResolveSdpaMethod:
 
         result = resolve_sdpa_method([SDPBackend.FLASH_ATTENTION, "efficient_attention"])
         assert result == [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+
+
+class TestDpEvalSampleShard:
+    """`_dp_eval_sample_shard` shards tool-call eval only when the model is
+    replicated per DP rank (DDP); sharded strategies must stay in lockstep."""
+
+    def test_ddp_multi_rank_shards(self):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        assert _dp_eval_sample_shard(DDPConfig(), 1, 4) == (1, 4)
+
+    def test_ddp_single_rank_no_shard(self):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        assert _dp_eval_sample_shard(DDPConfig(), 0, 1) is None
+
+    def test_fsdp2_never_shards(self):
+        # Sharding under FSDP2 would desync generate()'s per-layer all-gathers.
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        assert _dp_eval_sample_shard(FSDP2Config(), 1, 4) is None
+
+    def test_megatron_fsdp_never_shards(self):
+        from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+
+        assert _dp_eval_sample_shard(MegatronFSDPConfig(), 1, 4) is None
