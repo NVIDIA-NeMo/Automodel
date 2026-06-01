@@ -20,7 +20,6 @@ import torch
 from nemo_automodel.components.eval import tool_call_evaluator as ev_mod
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 
-
 # ---------- fakes ----------
 
 
@@ -75,9 +74,7 @@ class FakeModel:
         self.generate_calls += 1
         # Append max_new_tokens zeros so the evaluator can slice off the
         # new portion; the decoded text is scripted in the tokenizer.
-        new = torch.zeros(
-            (input_ids.shape[0], max_new_tokens), dtype=input_ids.dtype, device=input_ids.device
-        )
+        new = torch.zeros((input_ids.shape[0], max_new_tokens), dtype=input_ids.dtype, device=input_ids.device)
         return torch.cat([input_ids, new], dim=1)
 
 
@@ -173,7 +170,7 @@ def test_evaluate_malformed_json(monkeypatch):
     evaluator = _make_evaluator(monkeypatch)
     tok = FakeTokenizer()
     tok.responses = [
-        '<tool_call>not json at all</tool_call>',
+        "<tool_call>not json at all</tool_call>",
         '<tool_call>{"name": "calc", "arguments": {"a": 1, "b": 2}}</tool_call>',
     ]
     model = FakeModel()
@@ -281,3 +278,19 @@ def test_metric_prefix_is_applied(monkeypatch):
     metrics = evaluator.evaluate(FakeModel(), tok)
     assert "eval/agent/_count" in metrics
     assert "eval/agent/name_correct" in metrics
+
+
+def test_metric_keys_match_evaluate_mean_metrics(monkeypatch):
+    # The recipe all-reduces a FIXED key set (``METRIC_KEYS``) across DP ranks to
+    # avoid collective desync from the data-dependent ``_skip_<reason>`` keys.
+    # Guard that METRIC_KEYS matches the mean-metrics evaluate() actually emits,
+    # so a newly added metric cannot silently escape the reduction.
+    evaluator = _make_evaluator(monkeypatch)
+    tok = FakeTokenizer()
+    tok.responses = ["", ""]
+    metrics = evaluator.evaluate(FakeModel(), tok)
+
+    prefix = evaluator.metric_prefix
+    mean_keys = {k for k in metrics if not k.rsplit("/", 1)[-1].startswith("_")}
+    expected = {f"{prefix}/{name}" for name in ToolCallAccuracyEvaluator.METRIC_KEYS}
+    assert mean_keys == expected
