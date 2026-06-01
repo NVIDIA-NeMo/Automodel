@@ -79,7 +79,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 
 ## Fine-Tune LLMs with NeMo AutoModel
 
-The models listed above can be fine-tuned using NeMo AutoModel. We support two primary fine-tuning approaches:
+The models listed above can be fine-tuned using NeMo AutoModel. NeMo AutoModel supports two primary fine-tuning approaches:
 
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
