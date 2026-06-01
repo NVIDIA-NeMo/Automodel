@@ -34,7 +34,7 @@ recipe: DiffusionLMSFTRecipe
 step_scheduler:
   global_batch_size: 64
   local_batch_size: 1
-  ckpt_every_steps: 500
+  ckpt_every_steps: 1000
   val_every_steps: 500
   max_steps: null
   num_epochs: 6        # paper Appendix A.1 (≈97K steps at global_batch_size 64 on ~1M samples)
@@ -46,6 +46,7 @@ dist_env:
 seed: 42
 
 wandb:
+  entity: joc
   project: dflash-sft
   name: dflash-nemotron-nano-30b-run
 
@@ -87,9 +88,10 @@ dllm:
 # block_size 0 reads block_size=16 from the draft model config.
 # loss_decay_gamma 0 uses the paper default for the block size.
 #
-# num_blocks_per_sample: 512 = paper default (Appendix A.1) — 512 randomly
-# sampled anchor positions per sequence, each producing a (block_size - 1)-token
-# supervised block. Requires attention_backend=flex_attention; SDPA OOMs at this N.
+# num_blocks_per_sample: 512 samples 512 randomly selected anchor positions per
+# sequence, each producing a (block_size - 1)-token supervised block. This matches
+# the paper default and requires attention_backend=flex_attention; SDPA OOMs at
+# this N.
 # overlap_anchors=True samples anchors independently (paper behaviour); set to
 # False for the legacy non-overlapping stars-and-bars sampler.
 # use_fused_linear_ce: chunked linear-CE (LM-head projection + cross-entropy in
@@ -122,7 +124,7 @@ lr_scheduler:
   lr_decay_style: cosine
   init_lr: 0.0
   min_lr: 0.0
-  warmup_ratio: 0.04
+  lr_warmup_steps: 1954
 
 # Nemotron-Post-Training-Dataset-v2: chat (627K) + math (239K) + code (175K) ≈ 1M samples.
 # HuggingFace datasets supports "split1+split2+split3" concatenation natively.
@@ -149,4 +151,4 @@ dataset:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  group_by_length: true
+  group_by_length: false
