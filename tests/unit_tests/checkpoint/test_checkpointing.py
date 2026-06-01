@@ -1237,14 +1237,16 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
         assert 'CAST_DTYPE="${CAST_DTYPE:-}"' in script
         assert 'PYTHON="${PYTHON:-python3}"' in script
-        assert 'PYTHON_MODULE="${PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}"' in script
-        assert "CONSOLIDATION_TOOL" not in script
+        assert 'CONSOLIDATION_TOOL="${CONSOLIDATION_TOOL:-tools/offline_hf_consolidation.py}"' in script
+        assert "PYTHON_MODULE" not in script
         assert 'NPROC_PER_NODE=16 NUM_THREADS=5 bash "$0"' in script
         assert "NPROC_PER_NODE * NUM_THREADS within your CPU allocation" in script
         assert "sbatch --cpus-per-task=80" in script
         assert "CAST_DTYPE=bf16" in script
         assert 'CAST_DTYPE_ARGS=(--cast-dtype "${CAST_DTYPE}")' in script
-        assert '-m "${PYTHON_MODULE}" \\' in script
+        assert '"${TORCHRUN}" --nproc-per-node="${NPROC_PER_NODE}" "${CONSOLIDATION_TOOL}" \\' in script
+        assert '"${PYTHON}" "${CONSOLIDATION_TOOL}" \\' in script
+        assert "Run from the AutoModel repo root or set CONSOLIDATION_TOOL=" in script
         assert "--backend gloo \\" in script
         assert '--model-name "test/model" \\' in script
         assert f'--input-dir "{model_dir}" \\' in script
@@ -1417,10 +1419,10 @@ class TestOfflineConsolidationScriptAndWarnings:
 
 
 class TestOfflineHFConsolidationTool:
-    """Focused tests for the packaged offline consolidation module."""
+    """Focused tests for the root offline consolidation tool."""
 
     def test_main_renames_index_when_diffusers_compatible(self, tmp_path, monkeypatch, caplog):
-        from nemo_automodel.tools import offline_hf_consolidation as tool
+        from tools import offline_hf_consolidation as tool
 
         input_dir = tmp_path / "model"
         metadata_dir = input_dir / ".hf_metadata"
@@ -1476,7 +1478,7 @@ class TestOfflineHFConsolidationTool:
         assert f"Successfully exported consolidated HF safetensors to {output_dir}." in caplog.text
 
     def test_main_skips_when_output_exists_and_metadata_was_consumed(self, tmp_path, monkeypatch, caplog):
-        from nemo_automodel.tools import offline_hf_consolidation as tool
+        from tools import offline_hf_consolidation as tool
 
         input_dir = tmp_path / "model"
         output_dir = input_dir / "consolidated"
@@ -1512,7 +1514,7 @@ class TestOfflineHFConsolidationTool:
         assert f"Consolidated HF safetensors already exist at {output_dir}" in caplog.text
 
     def test_main_passes_cast_dtype_and_updates_config(self, tmp_path, monkeypatch, caplog):
-        from nemo_automodel.tools import offline_hf_consolidation as tool
+        from tools import offline_hf_consolidation as tool
 
         input_dir = tmp_path / "model"
         metadata_dir = input_dir / ".hf_metadata"

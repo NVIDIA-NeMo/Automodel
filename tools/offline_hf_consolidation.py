@@ -15,13 +15,13 @@
 """Offline consolidation for sharded Hugging Face safetensors checkpoints.
 
 Example usage on 2 workers:
-    torchrun --nproc-per-node=2 -m nemo_automodel.tools.offline_hf_consolidation \
+    torchrun --nproc-per-node=2 tools/offline_hf_consolidation.py \
         --model-name meta-llama/Llama-3.2-1B \
         --input-dir checkpoints/epoch_0_step_19/model/ \
         --output-dir checkpoints/epoch_0_step_19/model/consolidated/
 
 Example usage on 1 worker:
-    python -m nemo_automodel.tools.offline_hf_consolidation \
+    python tools/offline_hf_consolidation.py \
         --model-name meta-llama/Llama-3.2-1B \
         --input-dir checkpoints/epoch_0_step_19/model/ \
         --output-dir checkpoints/epoch_0_step_19/model/consolidated/

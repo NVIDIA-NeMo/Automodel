@@ -20,7 +20,7 @@ import pytest
 
 
 def test_copy_metadata_files_copies_and_preserves_source(tmp_path):
-    from nemo_automodel.tools.offline_hf_consolidation import copy_metadata_files
+    from tools.offline_hf_consolidation import copy_metadata_files
 
     meta_dir = tmp_path / ".hf_metadata"
     out_dir = tmp_path / "out"
@@ -44,7 +44,7 @@ def test_copy_metadata_files_copies_and_preserves_source(tmp_path):
 
 
 def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
-    from nemo_automodel.tools import offline_hf_consolidation as script
+    from tools import offline_hf_consolidation as script
 
     in_dir = tmp_path / "in"
     out_dir = tmp_path / "out"
@@ -117,7 +117,7 @@ def test_main_happy_path_calls_consolidate_and_copies(tmp_path, monkeypatch):
 
 
 def test_main_raises_if_missing_metadata(tmp_path, monkeypatch):
-    from nemo_automodel.tools import offline_hf_consolidation as script
+    from tools import offline_hf_consolidation as script
 
     in_dir = tmp_path / "in_no_meta"
     out_dir = tmp_path / "out_no_meta"

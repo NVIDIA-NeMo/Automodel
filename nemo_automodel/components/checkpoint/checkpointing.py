@@ -1053,14 +1053,19 @@ NUM_THREADS="${{NUM_THREADS:-5}}"
 CAST_DTYPE="${{CAST_DTYPE:-}}"
 PYTHON="${{PYTHON:-python3}}"
 TORCHRUN="${{TORCHRUN:-torchrun}}"
-PYTHON_MODULE="${{PYTHON_MODULE:-nemo_automodel.tools.offline_hf_consolidation}}"
+CONSOLIDATION_TOOL="${{CONSOLIDATION_TOOL:-tools/offline_hf_consolidation.py}}"
 CAST_DTYPE_ARGS=()
 if [[ -n "${{CAST_DTYPE}}" ]]; then
   CAST_DTYPE_ARGS=(--cast-dtype "${{CAST_DTYPE}}")
 fi
+if [[ ! -f "${{CONSOLIDATION_TOOL}}" ]]; then
+  echo "Could not find offline consolidation tool at ${{CONSOLIDATION_TOOL}}." >&2
+  echo "Run from the AutoModel repo root or set CONSOLIDATION_TOOL=/path/to/tools/offline_hf_consolidation.py." >&2
+  exit 1
+fi
 
 if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
-  "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" -m "${{PYTHON_MODULE}}" \\
+  "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
     --model-name "{self.config.model_repo_id}" \\
@@ -1068,7 +1073,7 @@ if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
     --output-dir "{output_dir}"{diffusers_arg} \\
     "${{CAST_DTYPE_ARGS[@]}}"
 else
-  "${{PYTHON}}" -m "${{PYTHON_MODULE}}" \\
+  "${{PYTHON}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
     --model-name "{self.config.model_repo_id}" \\
