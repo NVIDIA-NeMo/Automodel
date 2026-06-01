@@ -235,15 +235,21 @@ class Gemma4MoEDecoderLayer(nn.Module):
         past_key_values=None,
         use_cache: bool | None = False,
         cache_position: torch.LongTensor | None = None,
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         # --- Attention ---
         residual = x
         x = self.input_layernorm(x)
+        # HF's Gemma4TextAttention requires a `shared_kv_states` dict: kv-sharing
+        # layers read their keys/values from it and full-length layers write into
+        # it. The backend threads one dict through every layer so sharing works;
+        # for configs without kv-sharing (e.g. 26B-A4B) it stays empty.
         x, _ = self.self_attn(
             hidden_states=x,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states if shared_kv_states is not None else {},
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -442,6 +448,9 @@ class Gemma4MoETextModelBackend(nn.Module):
         for layer_type in set(self.config.layer_types):
             position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
 
+        # Single dict shared across all layers so kv-sharing layers can reuse the
+        # full-length keys/values cached by earlier layers (HF contract).
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for decoder_layer in self.layers.values():
             hidden_states = decoder_layer(
                 hidden_states,
@@ -449,6 +458,7 @@ class Gemma4MoETextModelBackend(nn.Module):
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
                 padding_mask=padding_mask,
+                shared_kv_states=shared_kv_states,
                 **kwargs,
             )
 
