@@ -84,7 +84,7 @@ automodel --nproc-per-node=8 examples/llm_finetune/minicpm/minicpm5_1b_squad.yam
 ```
 :::
 
-See the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+Refer to the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Fine-Tuning
 
