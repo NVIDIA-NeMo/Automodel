@@ -512,7 +512,7 @@ class MoESplitExpertsStateDictMixin:
                         # ``tensors``/``stacked`` and the per-expert dict
                         # entries hang around until Python's refcount GC
                         # eventually runs — too late under tight GPU budgets
-                        # (e.g. Ultra on 2 nodes / 8 GPUs).
+                        # (e.g. a large MoE on 2 nodes / 8 GPUs).
                         del tensors, stacked
                         del expert_weights_by_layer[layer_num][native_key]
                         if not expert_weights_by_layer[layer_num]:
@@ -583,7 +583,7 @@ class MoESplitExpertsStateDictMixin:
         through the views into the model's storage, and
         ``_from_hf_w_merged_experts`` skips the rebuild for the corresponding
         native key (tracked in ``_inplace_loaded_native_keys``). For loads of
-        Ultra-class MoE checkpoints this avoids tens of GB of per-expert
+        large MoE checkpoints this avoids tens of GB of per-expert
         scratch on top of the already-materialized model.
 
         Save callers must materialize the views before serializing —
