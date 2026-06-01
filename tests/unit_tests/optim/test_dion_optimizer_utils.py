@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from unittest.mock import MagicMock
 
 import pytest
 import torch.nn as nn
@@ -239,154 +238,125 @@ class TestGetDionMesh:
 # ---------------------------------------------------------------------------
 
 
+class FakeDionConfig:
+    """Minimal stand-in for a dion-family OptimizerConfig.
+
+    ``build_dion_optimizer`` reads settings off the config via attribute access,
+    so any object exposing the same attributes works.
+    """
+
+    def __init__(
+        self,
+        *,
+        lr=1e-3,
+        weight_decay=0.0,
+        scalar_opt="adamw",
+        scalar_betas=None,
+        scalar_eps=None,
+        scalar_lr=None,
+        embed_lr=None,
+        lm_head_lr=None,
+        no_compile=False,
+    ):
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.scalar_opt = scalar_opt
+        self.scalar_betas = scalar_betas
+        self.scalar_eps = scalar_eps
+        self.scalar_lr = scalar_lr
+        self.embed_lr = embed_lr
+        self.lm_head_lr = lm_head_lr
+        self.no_compile = no_compile
+
+
 class TestBuildDionOptimizer:
-    def _build(self, monkeypatch, target_cls, cfg_dict, model=None, mesh=None):
+    """``build_dion_optimizer`` reads its settings off the passed config and returns
+    ``(param_groups, mesh_kwargs)``; it does not instantiate the optimizer (the
+    typed config assembles its own kwargs, splatting ``mesh_kwargs``, and
+    instantiates)."""
+
+    def _build(self, monkeypatch, config, model=None, mesh=None, mesh_kwarg="distributed_mesh"):
         from nemo_automodel.components.optim import dion as optim_dion
 
         monkeypatch.setattr(optim_dion, "_import_error", None, raising=False)
         if model is None:
             model = TinyModel()
-        return optim_dion.build_dion_optimizer(
-            optimizer_factory=target_cls,
-            optimizer_kwargs=cfg_dict,
-            model=model,
-            distributed_mesh=mesh,
-        )
+        return optim_dion.build_dion_optimizer(config, model, device_mesh=mesh, mesh_kwarg=mesh_kwarg)
 
-    def test_passes_distributed_mesh(self, monkeypatch):
-        captured = {}
+    def test_returns_param_groups_and_mesh_kwargs(self, monkeypatch):
+        param_groups, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(lr=1e-3, weight_decay=0.05))
+        assert isinstance(param_groups, list)
+        assert len(param_groups) >= 2
+        assert mesh_kwargs == {}
 
-        class Target:
-            def __init__(self, param_groups, distributed_mesh=None, lr=None):
-                captured["param_groups"] = param_groups
-                captured["distributed_mesh"] = distributed_mesh
-                captured["lr"] = lr
-
+    def test_resolves_1d_mesh(self, monkeypatch):
+        """A 1-D device mesh is returned as-is, keyed under ``mesh_kwarg``."""
         mesh = FakeMesh({"dp_replicate": object(), "dp_shard_cp": object()}, ndim=1)
-        self._build(monkeypatch, Target, {"lr": 1e-3, "foo": "ignored"}, mesh=mesh)
+        _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=mesh)
+        assert mesh_kwargs == {"distributed_mesh": mesh}
 
-        assert captured["distributed_mesh"] is mesh
-        assert captured["lr"] == pytest.approx(1e-3)
-        assert isinstance(captured["param_groups"], list)
-        assert len(captured["param_groups"]) >= 2
-
-    def test_no_mesh_param_in_target(self, monkeypatch):
-        """Target that has no distributed_mesh param — mesh should not be passed."""
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, lr=None):
-                captured["param_groups"] = param_groups
-                captured["lr"] = lr
-
+    def test_mesh_kwarg_arg_controls_key(self, monkeypatch):
+        """The ``mesh_kwarg`` argument controls the key the mesh is returned under."""
         mesh = FakeMesh({}, ndim=1)
-        self._build(monkeypatch, Target, {"lr": 2e-4}, mesh=mesh)
-        assert "distributed_mesh" not in captured
-        assert captured["lr"] == pytest.approx(2e-4)
+        _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=mesh, mesh_kwarg="outer_shard_mesh")
+        assert mesh_kwargs == {"outer_shard_mesh": mesh}
+
+    def test_mesh_kwarg_none_omits_mesh(self, monkeypatch):
+        """``mesh_kwarg=None`` never includes the mesh, even when one is provided."""
+        mesh = FakeMesh({}, ndim=1)
+        _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=mesh, mesh_kwarg=None)
+        assert mesh_kwargs == {}
+
+    def test_resolves_submesh_from_multidim(self, monkeypatch):
+        """A multi-dim mesh is reduced to its 1-D dp_shard_cp submesh."""
+        inner = FakeSubmesh()
+        inner.ndim = 1
+        dp_2d = FakeSubmesh({"dp_shard_cp": inner})
+        mesh = FakeMesh({("dp_replicate", "dp_shard_cp"): dp_2d}, ndim=2)
+        _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=mesh)
+        assert mesh_kwargs == {"distributed_mesh": inner}
+
+    def test_none_mesh_returns_empty(self, monkeypatch):
+        """device_mesh=None yields no mesh kwargs."""
+        _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=None)
+        assert mesh_kwargs == {}
 
     def test_import_error_raises(self, monkeypatch):
         from nemo_automodel.components.optim import dion as optim_dion
 
         monkeypatch.setattr(optim_dion, "_import_error", ImportError("no dion"), raising=False)
 
-        class Target:
-            def __init__(self, param_groups):
-                pass
-
         with pytest.raises(RuntimeError, match="Failed to import Dion"):
-            optim_dion.build_dion_optimizer(
-                optimizer_factory=Target,
-                optimizer_kwargs={"lr": 1e-3},
-                model=TinyModel(),
-            )
+            optim_dion.build_dion_optimizer(FakeDionConfig(), TinyModel())
 
-    def test_adjust_lr_forwarded(self, monkeypatch):
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, distributed_mesh=None, lr=None, adjust_lr=None):
-                captured["adjust_lr"] = adjust_lr
-
-        self._build(monkeypatch, Target, {"lr": 1e-3, "adjust_lr": "spectral_norm"})
-        assert captured["adjust_lr"] == "spectral_norm"
-
-    def test_no_compile_pops_cleanly(self, monkeypatch):
-        """no_compile should be consumed and not leak to the target."""
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, distributed_mesh=None, lr=None):
-                captured["kwargs_keys"] = set()
-
-        self._build(monkeypatch, Target, {"lr": 1e-3, "no_compile": True})
-        # no_compile should not cause an error (popped before introspection)
-        assert True  # If we got here, no_compile was handled
-
-    def test_scalar_config_keys_popped(self, monkeypatch):
-        """scalar_opt, scalar_betas, scalar_eps, scalar_lr, embed_lr, lm_head_lr
-        should be consumed and NOT passed to the target."""
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, lr=None, weight_decay=None, **kwargs):
-                captured["extra"] = kwargs
-
-        self._build(
+    def test_scalar_config_drives_param_groups(self, monkeypatch):
+        """scalar_opt / scalar_betas / scalar_eps and the scalar/embed/lm_head LRs
+        are read off the config and applied to the scalar param groups."""
+        param_groups, _ = self._build(
             monkeypatch,
-            Target,
-            {
-                "lr": 1e-3,
-                "weight_decay": 0.01,
-                "scalar_opt": "lion",
-                "scalar_betas": [0.9, 0.95],
-                "scalar_eps": 1e-8,
-                "scalar_lr": 5e-4,
-                "embed_lr": 3e-4,
-                "lm_head_lr": 1e-5,
-            },
+            FakeDionConfig(
+                lr=1e-3,
+                weight_decay=0.01,
+                scalar_opt="lion",
+                scalar_betas=[0.9, 0.95],
+                scalar_eps=1e-8,
+                scalar_lr=5e-4,
+                embed_lr=3e-4,
+                lm_head_lr=1e-5,
+            ),
         )
-        # None of the scalar_* keys should leak through
-        for key in ("scalar_opt", "scalar_betas", "scalar_eps", "scalar_lr", "embed_lr", "lm_head_lr"):
-            assert key not in captured["extra"], f"{key} leaked to target"
-
-    def test_unknown_keys_filtered_out(self, monkeypatch):
-        """Keys not in the target signature should be silently dropped."""
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, lr=None):
-                captured["lr"] = lr
-
-        self._build(monkeypatch, Target, {"lr": 1e-3, "totally_unknown": 42})
-        assert captured["lr"] == pytest.approx(1e-3)
-
-    def test_none_mesh(self, monkeypatch):
-        """distributed_mesh=None should work fine."""
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, distributed_mesh=None, lr=None):
-                captured["distributed_mesh"] = distributed_mesh
-
-        self._build(monkeypatch, Target, {"lr": 1e-3}, mesh=None)
-        assert captured["distributed_mesh"] is None
+        # groups: matrix, vector, embed, lm_head
+        assert param_groups[1]["algorithm"] == "lion"
+        assert param_groups[1]["lr"] == pytest.approx(5e-4)
+        assert param_groups[2]["lr"] == pytest.approx(3e-4)
+        assert param_groups[3]["lr"] == pytest.approx(1e-5)
 
     def test_param_groups_structure(self, monkeypatch):
         """Verify param groups have the right structure."""
-        captured = {}
-
-        class Target:
-            def __init__(self, param_groups, distributed_mesh=None, lr=None):
-                captured["param_groups"] = param_groups
-
-        model = TinyModel()
-        self._build(monkeypatch, Target, {"lr": 1e-3}, model=model)
-
-        groups = captured["param_groups"]
+        param_groups, _ = self._build(monkeypatch, FakeDionConfig(), model=TinyModel())
         # 4 groups: matrix, vector, embed, lm_head
-        assert len(groups) == 4
-        # Each group has 'params' key
-        for g in groups:
+        assert len(param_groups) == 4
+        for g in param_groups:
             assert "params" in g
             assert isinstance(g["params"], list)
 
@@ -472,28 +442,21 @@ class TestSynchronizeForCheckpoint:
 
 
 # ---------------------------------------------------------------------------
-# Tests for the shared optimizer builder Dion branch
+# Tests for the OptimizerFromFactoryConfig escape hatch via build_optimizer
 # ---------------------------------------------------------------------------
 
 
-class TestBuildOptimizerDionBranch:
-    """Test the optimizer creation branch in build_optimizer().
-
-    The logic under test:
-    - is_dion_optimizer(cfg_opt) -> True -> build_dion_optimizer()
-    - is_dion_optimizer(cfg_opt) -> False -> normal cfg_opt.instantiate()
-    - Model with/without `parts` attribute
+class TestBuildOptimizerFactoryConfig:
+    """The factory escape hatch calls ``factory(params=..., **kwargs)`` directly,
+    once per model part (Dion-family optimizers use the typed MuonConfig instead).
     """
 
     @staticmethod
     def _make_simple_model():
-        """A tiny model with requires_grad params."""
         return nn.Linear(4, 4)
 
     @staticmethod
     def _make_parts_model():
-        """A model-like object with a `parts` attribute."""
-
         class PartsModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -506,68 +469,8 @@ class TestBuildOptimizerDionBranch:
 
         return PartsModel()
 
-    def test_dion_optimizer_single_model(self, monkeypatch):
-        """When is_dion_optimizer returns True, build_dion_optimizer is called."""
-        import nemo_automodel.components.optim.optimizer as optim_build_mod
-
-        model = self._make_simple_model()
-        sentinel_mesh = MagicMock()
-        sentinel_mesh.mesh_dim_names = ("dp",)
-        build_calls = []
-
-        def fake_optimizer_factory(**kwargs):
-            raise AssertionError("Dion branch should not call regular optimizer factory")
-
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: True)
-        monkeypatch.setattr(
-            optim_build_mod,
-            "build_dion_optimizer",
-            lambda optimizer_factory, optimizer_kwargs, model, distributed_mesh: (
-                build_calls.append((model, distributed_mesh)) or "fake_dion_opt"
-            ),
-        )
-
-        optimizers = optim_build_mod.build_optimizer(
-            model,
-            fake_optimizer_factory,
-            device_mesh=sentinel_mesh,
-            foreach=True,
-        )
-
-        assert optimizers == ["fake_dion_opt"]
-        assert len(build_calls) == 1
-        assert build_calls[0][0] is model
-        assert build_calls[0][1] is sentinel_mesh
-
-    def test_dion_optimizer_with_parts(self, monkeypatch):
-        """When model has `parts`, build_dion_optimizer is called per part."""
-        import nemo_automodel.components.optim.optimizer as optim_build_mod
-
-        model = self._make_parts_model()
-        build_calls = []
-
-        def fake_optimizer_factory(**kwargs):
-            raise AssertionError("Dion branch should not call regular optimizer factory")
-
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: True)
-        monkeypatch.setattr(
-            optim_build_mod,
-            "build_dion_optimizer",
-            lambda optimizer_factory, optimizer_kwargs, model, distributed_mesh: (
-                build_calls.append(model) or f"opt_for_{id(model)}"
-            ),
-        )
-
-        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, foreach=True)
-
-        assert len(build_calls) == 2
-        assert build_calls[0] is model.parts[0]
-        assert build_calls[1] is model.parts[1]
-        assert len(optimizers) == 2
-
-    def test_non_dion_optimizer_single_model(self, monkeypatch):
-        """When is_dion_optimizer returns False, normal instantiate path is used."""
-        import nemo_automodel.components.optim.optimizer as optim_build_mod
+    def test_factory_single_model(self):
+        from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig, build_optimizer
 
         model = self._make_simple_model()
         instantiate_calls = []
@@ -576,17 +479,14 @@ class TestBuildOptimizerDionBranch:
             instantiate_calls.append(params)
             return "regular_opt"
 
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
-
-        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, foreach=True)
+        optimizers = build_optimizer(model, OptimizerFromFactoryConfig(factory=fake_optimizer_factory))
 
         assert len(instantiate_calls) == 1
         assert len(instantiate_calls[0]) > 0  # trainable params passed
         assert optimizers == ["regular_opt"]
 
-    def test_non_dion_optimizer_with_parts(self, monkeypatch):
-        """Non-dion optimizer with model.parts -> instantiate per part."""
-        import nemo_automodel.components.optim.optimizer as optim_build_mod
+    def test_factory_with_parts(self):
+        from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig, build_optimizer
 
         model = self._make_parts_model()
         instantiate_calls = []
@@ -595,9 +495,7 @@ class TestBuildOptimizerDionBranch:
             instantiate_calls.append(params)
             return f"opt_{len(instantiate_calls)}"
 
-        monkeypatch.setattr(optim_build_mod, "is_dion_optimizer", lambda factory: False)
-
-        optimizers = optim_build_mod.build_optimizer(model, fake_optimizer_factory, foreach=True)
+        optimizers = build_optimizer(model, OptimizerFromFactoryConfig(factory=fake_optimizer_factory))
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2

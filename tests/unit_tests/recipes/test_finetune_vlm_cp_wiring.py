@@ -426,8 +426,12 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     )
     monkeypatch.setattr(vlm_finetune, "build_model", lambda *args, **kwargs: _FakePPModel(stage0))
     monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.OptimizerSpec.build",
-        lambda self, *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)],
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)]
+            )
+        ),
     )
 
     def _build_dataloader(*args, **kwargs):

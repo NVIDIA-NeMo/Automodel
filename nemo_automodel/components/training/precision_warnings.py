@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.optim.optimizer import OptimizerConfig
 
 _WARNED_CONTEXTS: set[str] = set()
 _TORCH_ADAM_TARGETS = {
@@ -34,7 +37,7 @@ _TORCH_ADAM_TARGETS = {
 def warn_if_torch_adam_with_bf16_params(
     *,
     optimizer: Optimizer | Iterable[Optimizer] | None = None,
-    optimizer_cfg: Any | None = None,
+    optimizer_cfg: OptimizerConfig | None = None,
     parameters: Iterable[torch.nn.Parameter] | None = None,
     is_peft: bool = False,
     context: str = "recipe",
@@ -73,12 +76,22 @@ def _is_torch_adam_optimizer(optimizer: Optimizer | Iterable[Optimizer] | None) 
     return any(isinstance(opt, (torch.optim.Adam, torch.optim.AdamW)) for opt in optimizers)
 
 
-def _is_torch_adam_config(optimizer_cfg: Any | None) -> bool:
-    target = getattr(optimizer_cfg, "_target_", None)
-    if target is None and isinstance(optimizer_cfg, dict):
-        target = optimizer_cfg.get("_target_", None)
-    if target is None:
+def _is_torch_adam_config(optimizer_cfg: OptimizerConfig | None) -> bool:
+    if optimizer_cfg is None:
         return False
+
+    # ``OptimizerFromFactoryConfig`` wraps the optimizer class on ``.factory``;
+    # the typed ``AdamConfig``/``AdamWConfig`` build ``torch.optim.Adam``/``AdamW``.
+    factory = getattr(optimizer_cfg, "factory", None)
+    if factory is not None and _is_torch_adam_target(factory):
+        return True
+
+    from nemo_automodel.components.optim.optimizer import AdamConfig, AdamWConfig
+
+    return isinstance(optimizer_cfg, (AdamConfig, AdamWConfig))
+
+
+def _is_torch_adam_target(target: Any) -> bool:
     if isinstance(target, str):
         return target in _TORCH_ADAM_TARGETS
     if target in (torch.optim.Adam, torch.optim.AdamW):

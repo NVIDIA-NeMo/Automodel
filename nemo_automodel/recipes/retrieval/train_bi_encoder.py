@@ -226,7 +226,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.optimizer = [self.cfg.get("optimizer").instantiate(params=param_groups)]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
-            optimizer_cfg=self.cfg.get("optimizer"),
+            optimizer_cfg=self.cfg.optimizer,
             is_peft=self.peft_config is not None,
             context="retrieval",
             logger=logger,

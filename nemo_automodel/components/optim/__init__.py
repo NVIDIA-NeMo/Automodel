@@ -14,27 +14,39 @@
 
 from .dion import build_dion_optimizer, is_dion_optimizer
 from .optimizer import (
+    OPTIMIZER_CONFIG_REGISTRY,
     AdamConfig,
     AdamWConfig,
+    Dion2Config,
+    DionConfig,
     FlashAdamWConfig,
     FusedAdamConfig,
     LRSchedulerConfig,
     MuonConfig,
+    NorMuonConfig,
     OptimizerConfig,
+    OptimizerFromFactoryConfig,
     build_optimizer,
+    build_optimizer_config,
 )
 from .scheduler import OptimizerParamScheduler
 
 __all__ = [
+    "OPTIMIZER_CONFIG_REGISTRY",
     "AdamConfig",
     "AdamWConfig",
+    "Dion2Config",
+    "DionConfig",
     "FlashAdamWConfig",
     "FusedAdamConfig",
     "LRSchedulerConfig",
     "MuonConfig",
+    "NorMuonConfig",
     "OptimizerConfig",
+    "OptimizerFromFactoryConfig",
     "OptimizerParamScheduler",
     "build_optimizer",
+    "build_optimizer_config",
     "build_dion_optimizer",
     "is_dion_optimizer",
 ]
