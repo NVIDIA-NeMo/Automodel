@@ -27,6 +27,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers import initialization as init
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
@@ -196,6 +197,20 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         self.model = LlamaBidirectionalModel(config)
         # Initialize weights and apply final processing
         self.post_init()
+
+    # TODO: remove this once we upgrade to transformers 5.9.x
+    @torch.no_grad()
+    def _init_weights(self, module):
+        if module is self.score:
+            # Backport huggingface/transformers#46030 for transformers 5.8.x:
+            # initialize the actual dtype tensor, not a float() copy.
+            std = getattr(self.config, "initializer_range", 0.02) or 0.02
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+            return
+
+        super()._init_weights(module)
 
     def forward(
         self,

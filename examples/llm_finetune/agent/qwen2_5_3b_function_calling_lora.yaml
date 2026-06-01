@@ -42,6 +42,9 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-3B
   attn_implementation: sdpa
+  # Required by FusedLinearCrossEntropy below, which consumes hidden states
+  # directly instead of materializing the full [bsz, seq_len, vocab] logits.
+  output_hidden_states: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -67,12 +70,17 @@ distributed:
   sequence_parallel: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # See companion full-SFT yaml for rationale; MaskedCrossEntropy OOMs on
+  # Qwen2.5 vocab=151936 with seq_length=4096 even on 8x80GB.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.agent_chat.make_agent_chat_dataset
   dataset_name: llamafactory/glaive_toolcall_en
   split: train
+  # NOTE: seq_length only caps length when truncation is enabled (or pads when
+  # padding: max_length). With the defaults it does NOT truncate, so long
+  # dialogues pass through uncapped. Add `truncation: true` to enforce the cap.
   seq_length: 4096
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen2.5-3B
@@ -97,6 +105,16 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+# See companion full-SFT yaml for explanation. Disabled-by-omission;
+# uncomment-and-edit this block to enable on LoRA runs.
+# tool_call_eval:
+#   _target_: nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator
+#   dataset_name: llamafactory/glaive_toolcall_en
+#   split: train[:128]
+#   max_eval_samples: 128
+#   max_new_tokens: 256
+#   max_prompt_tokens: 3584
 
 optimizer:
   _target_: torch.optim.AdamW

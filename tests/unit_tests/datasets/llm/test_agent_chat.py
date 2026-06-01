@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import json
+import logging
 
 import pytest
 
@@ -80,6 +81,48 @@ def test_convert_messages_passes_string_arguments_through_unchanged():
     ]
     out = agent_chat._convert_messages(messages)
     assert out[1]["tool_calls"][0]["function"]["arguments"] == raw_args
+
+
+def test_convert_messages_merges_tool_calls_into_prior_assistant_turn():
+    # Datasets like Swift's agent traces emit an assistant "think/text" turn
+    # immediately followed by tool_call turns. Logically they are one
+    # assistant message; emitting two consecutive assistant turns would
+    # diverge from what the model produces at inference and may render as
+    # two separate `<|im_start|>assistant` blocks under some chat templates.
+    messages = [
+        {"role": "user", "content": "click button"},
+        {"role": "assistant", "content": "<think>I should click at (1, 2).</think>"},
+        {"role": "tool_call", "content": '{"name":"click","arguments":{"x":1,"y":2}}'},
+        {"role": "tool_response", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+    out = agent_chat._convert_messages(messages, example_id="abc")
+
+    # user / assistant(think + tool_calls) / tool / assistant — not 5 turns
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
+
+    merged = out[1]
+    assert merged["content"] == "<think>I should click at (1, 2).</think>"
+    assert len(merged["tool_calls"]) == 1
+    assert merged["tool_calls"][0]["function"]["name"] == "click"
+    assert merged["tool_calls"][0]["id"] == "call_abc_0"
+    assert out[2]["tool_call_id"] == "call_abc_0"
+
+
+def test_convert_messages_does_not_merge_when_prior_assistant_already_has_tool_calls():
+    # Two distinct rounds of tool calls separated by a tool_response must
+    # stay as two assistant turns; merging would conflate independent calls.
+    messages = [
+        {"role": "user", "content": "?"},
+        {"role": "tool_call", "content": '{"name":"a","arguments":{}}'},
+        {"role": "tool_response", "content": "ra"},
+        {"role": "tool_call", "content": '{"name":"b","arguments":{}}'},
+        {"role": "tool_response", "content": "rb"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert out[1]["tool_calls"][0]["function"]["name"] == "a"
+    assert out[3]["tool_calls"][0]["function"]["name"] == "b"
 
 
 def test_convert_messages_rejects_unknown_role():
@@ -292,3 +335,432 @@ def test_format_example_accepts_empty_tools_string(monkeypatch):
         pad_token_id=0,
     )
     assert captured["tools"] is None
+
+
+# ---------- _extract_eval_samples_from_example ----------
+
+
+def test_extract_eval_samples_single_toolcall():
+    example = {
+        "id": 42,
+        "tools": json.dumps([{"name": "get_weather"}]),
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "tool_call", "content": json.dumps({"name": "get_weather", "arguments": {"city": "Tokyo"}})},
+            {"role": "tool_response", "content": "sunny"},
+            {"role": "assistant", "content": "It is sunny."},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    s = samples[0]
+    assert s["example_id"] == 42
+    assert s["turn_index"] == 0
+    assert s["tools"] == [{"name": "get_weather"}]
+    assert s["gt_tool_calls"] == [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+    # prompt is just the user turn — assistant tool_call comes next.
+    assert s["prompt_messages"] == [{"role": "user", "content": "weather?"}]
+
+
+def test_extract_eval_samples_multiple_toolcall_positions():
+    example = {
+        "id": "abc",
+        "tools": [{"name": "f"}, {"name": "g"}],
+        "messages": [
+            {"role": "user", "content": "do two things"},
+            {"role": "tool_call", "content": json.dumps({"name": "f", "arguments": {"x": 1}})},
+            {"role": "tool_response", "content": "ok"},
+            {"role": "assistant", "content": "first done"},
+            {"role": "tool_call", "content": json.dumps({"name": "g", "arguments": {"y": 2}})},
+            {"role": "tool_response", "content": "ok"},
+            {"role": "assistant", "content": "all done"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 2
+    assert [s["turn_index"] for s in samples] == [0, 1]
+    assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"x": 1}}]
+    assert samples[1]["gt_tool_calls"] == [{"name": "g", "arguments": {"y": 2}}]
+    # Second sample's prompt is longer than first's.
+    assert len(samples[1]["prompt_messages"]) > len(samples[0]["prompt_messages"])
+
+
+def test_extract_eval_samples_parallel_calls_in_one_turn():
+    example = {
+        "id": 1,
+        "tools": [{"name": "a"}, {"name": "b"}],
+        "messages": [
+            {"role": "user", "content": "do both"},
+            {"role": "tool_call", "content": json.dumps({"name": "a", "arguments": {}})},
+            {"role": "tool_call", "content": json.dumps({"name": "b", "arguments": {"k": 1}})},
+            {"role": "tool_response", "content": "r1"},
+            {"role": "tool_response", "content": "r2"},
+            {"role": "assistant", "content": "done"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    # Parallel calls collapse into one assistant turn -> one eval sample.
+    assert len(samples) == 1
+    assert samples[0]["gt_tool_calls"] == [
+        {"name": "a", "arguments": {}},
+        {"name": "b", "arguments": {"k": 1}},
+    ]
+
+
+def test_extract_eval_samples_no_toolcalls_returns_empty():
+    example = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ],
+    }
+    assert agent_chat._extract_eval_samples_from_example(example) == []
+
+
+def test_extract_eval_samples_sharegpt_schema():
+    example = {
+        "id": 7,
+        "tools": json.dumps([{"name": "search"}]),
+        "conversations": [
+            {"from": "human", "value": "find cats"},
+            {"from": "function_call", "value": json.dumps({"name": "search", "arguments": {"q": "cats"}})},
+            {"from": "observation", "value": "10 results"},
+            {"from": "gpt", "value": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    assert samples[0]["gt_tool_calls"] == [{"name": "search", "arguments": {"q": "cats"}}]
+    assert samples[0]["prompt_messages"] == [{"role": "user", "content": "find cats"}]
+
+
+def test_extract_eval_samples_empty_tools_field_becomes_none():
+    example = {
+        "tools": "",
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "tool_call", "content": json.dumps({"name": "f", "arguments": {}})},
+            {"role": "tool_response", "content": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert len(samples) == 1
+    assert samples[0]["tools"] is None
+
+
+def test_extract_eval_samples_args_already_dict():
+    # _convert_messages JSON-encodes dict args, but our normalizer must
+    # round-trip them back to a dict so the evaluator can compare directly.
+    example = {
+        "messages": [
+            {"role": "user", "content": "x"},
+            {"role": "tool_call", "content": {"name": "f", "arguments": {"a": 1}}},
+            {"role": "tool_response", "content": "ok"},
+        ],
+    }
+    samples = agent_chat._extract_eval_samples_from_example(example)
+    assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"a": 1}}]
+
+
+def test_mask_labels_to_last_turn_keeps_only_final_run():
+    # Two supervised assistant runs separated by an ignored (user/tool) run.
+    labels = [-100, 1, 2, -100, -100, 3, 4, -100]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100, -100, -100, 3, 4, -100]
+
+
+def test_mask_labels_to_last_turn_single_run_unchanged():
+    labels = [-100, -100, 5, 6, 7]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, 5, 6, 7]
+
+
+def test_mask_labels_to_last_turn_no_supervised_tokens_is_noop():
+    labels = [-100, -100, -100]
+    agent_chat._mask_labels_to_last_turn(labels)
+    assert labels == [-100, -100, -100]
+
+
+def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch):
+    # ``labels`` carry two supervised assistant runs; with the flag set only
+    # the final run survives. Without it, both runs stay supervised.
+    def fake_format_chat_template(**kwargs):
+        return {"input_ids": [10, 11, 12, 13, 14, 15], "labels": [-100, 1, -100, -100, 2, 3]}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+
+    kept = agent_chat._format_example(example, Tok(), 0, 0)
+    assert kept["labels"] == [-100, 1, -100, -100, 2, 3]
+
+    masked = agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
+    assert masked["labels"] == [-100, -100, -100, -100, 2, 3]
+
+
+def test_convert_messages_preserves_assistant_reasoning_content():
+    messages = [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "4", "reasoning_content": "add two and two"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assert out[1]["content"] == "4"
+    assert out[1]["reasoning_content"] == "add two and two"
+
+
+def test_convert_messages_reasoning_survives_tool_call_merge():
+    # An assistant reasoning turn immediately followed by a tool_call group
+    # merges into one assistant message that keeps the reasoning trace.
+    messages = [
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "reasoning_content": "I should call the weather tool"},
+        {"role": "tool_call", "content": '{"name":"aqi","arguments":{"city":"BJ"}}'},
+    ]
+    out = agent_chat._convert_messages(messages, example_id=1)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert out[1]["reasoning_content"] == "I should call the weather tool"
+    assert out[1]["tool_calls"][0]["function"]["name"] == "aqi"
+
+
+def test_sharegpt_to_chatml_passes_reasoning_content_through():
+    out = agent_chat._sharegpt_to_chatml([{"from": "gpt", "value": "hi", "reasoning_content": "be polite"}])
+    assert out[0] == {"role": "assistant", "content": "hi", "reasoning_content": "be polite"}
+
+
+def test_format_example_forwards_mask_reasoning_content(monkeypatch):
+    captured = {}
+
+    def fake_format_chat_template(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["mask_reasoning_content"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, mask_reasoning_content=True)
+    assert captured["mask_reasoning_content"] is True
+
+
+def test_convert_messages_drops_history_reasoning_keeps_last():
+    # Two assistant turns each carry reasoning; only the final one should keep it.
+    messages = [
+        {"role": "user", "content": "weather BJ?"},
+        {"role": "assistant", "content": "Beijing is sunny", "reasoning_content": "first thought"},
+        {"role": "user", "content": "and SH?"},
+        {"role": "assistant", "content": "Shanghai is rainy", "reasoning_content": "second thought"},
+    ]
+    out = agent_chat._convert_messages(messages, drop_history_reasoning_content=True)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]
+    assert assistants[1]["reasoning_content"] == "second thought"
+
+
+def test_convert_messages_keeps_all_reasoning_by_default():
+    messages = [
+        {"role": "user", "content": "weather BJ?"},
+        {"role": "assistant", "content": "Beijing is sunny", "reasoning_content": "first thought"},
+        {"role": "user", "content": "and SH?"},
+        {"role": "assistant", "content": "Shanghai is rainy", "reasoning_content": "second thought"},
+    ]
+    out = agent_chat._convert_messages(messages)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert assistants[0]["reasoning_content"] == "first thought"
+    assert assistants[1]["reasoning_content"] == "second thought"
+
+
+def test_convert_messages_drop_history_reasoning_handles_tool_call_turn():
+    # The final assistant turn is a tool_call merge; its reasoning must survive
+    # while an earlier assistant turn's reasoning is dropped.
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello", "reasoning_content": "greet back"},
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "reasoning_content": "call the tool"},
+        {"role": "tool_call", "content": '{"name":"aqi","arguments":{"city":"BJ"}}'},
+    ]
+    out = agent_chat._convert_messages(messages, example_id=1, drop_history_reasoning_content=True)
+    assistants = [m for m in out if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]
+    assert assistants[1]["reasoning_content"] == "call the tool"
+    assert assistants[1]["tool_calls"][0]["function"]["name"] == "aqi"
+
+
+def test_format_example_forwards_drop_history_reasoning_content(monkeypatch):
+    captured = {}
+
+    def fake_convert_messages(messages, example_id=None, drop_history_reasoning_content=False):
+        captured["drop_history_reasoning_content"] = drop_history_reasoning_content
+        return [{"role": "user", "content": "hi"}]
+
+    def fake_format_chat_template(**kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(agent_chat, "_convert_messages", fake_convert_messages)
+    monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
+
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["drop_history_reasoning_content"] is False
+
+    agent_chat._format_example(example, Tok(), 0, 0, drop_history_reasoning_content=True)
+    assert captured["drop_history_reasoning_content"] is True
+
+
+def test_format_example_malformed_tools_json_reports_example_id():
+    # A row whose `tools` is malformed JSON must fail with the example id, not an
+    # opaque JSONDecodeError surfacing deep in the lazy dataloader map.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 99, "tools": "{not valid json", "messages": [{"role": "user", "content": "hi"}]}
+    with pytest.raises(ValueError, match="id=99"):
+        agent_chat._format_example(example, Tok(), 0, 0)
+
+
+def test_format_example_malformed_tool_call_reports_example_id():
+    # A malformed tool_call payload must also surface the example id.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {
+        "id": "abc",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool_call", "content": "{bad json"},
+        ],
+    }
+    with pytest.raises(ValueError, match="id='abc'"):
+        agent_chat._format_example(example, Tok(), 0, 0)
+
+
+def test_format_example_wraps_missing_fields_with_example_id():
+    # The existing field-validation errors keep their text but gain the id tag.
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    with pytest.raises(ValueError, match="missing both `messages` and `conversations`"):
+        agent_chat._format_example({"id": 7}, Tok(), 0, 0)
+    with pytest.raises(ValueError, match="id=7"):
+        agent_chat._format_example({"id": 7}, Tok(), 0, 0)
+
+
+def _patch_minimal_loader(monkeypatch):
+    """Patch load_dataset / pad-token / formatter so dataset build does no real work."""
+
+    class DummyDataset:
+        def __init__(self, items):
+            self.items = items
+
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+        def __len__(self):
+            return len(self.items)
+
+    monkeypatch.setattr(
+        agent_chat, "load_dataset", lambda *a, **k: DummyDataset([{"id": 0, "messages": [], "tools": []}])
+    )
+    monkeypatch.setattr(agent_chat, "_add_pad_token", lambda tok: 0)
+    monkeypatch.setattr(agent_chat, "_format_example", lambda ex, *a, **kw: {"formatted": ex["id"]})
+
+
+def test_make_agent_chat_dataset_warns_when_seq_length_inert(monkeypatch, caplog):
+    # seq_length is forwarded to apply_chat_template(max_length=...), which the
+    # tokenizer ignores unless truncation is on or padding == "max_length". With
+    # the defaults the cap silently does nothing, so the builder must warn.
+    _patch_minimal_loader(monkeypatch)
+
+    class Tok:
+        eos_token_id = 0
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096)
+    assert any("has no effect" in r.getMessage() for r in caplog.records)
+
+
+def test_make_agent_chat_dataset_no_warning_when_seq_length_used(monkeypatch, caplog):
+    # When truncation is enabled (or padding == "max_length") the cap is real, so
+    # there must be no spurious warning.
+    _patch_minimal_loader(monkeypatch)
+
+    class Tok:
+        eos_token_id = 0
+
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096, truncation=True
+        )
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(
+            tokenizer=Tok(), dataset_name="dummy/agent", seq_length=4096, padding="max_length"
+        )
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent")
+    assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+
+def test_format_example_warns_and_keeps_when_all_labels_masked(monkeypatch, caplog):
+    # If truncation drops every assistant token the loss mask is all-ignore. A
+    # single such sample is harmless (it contributes nothing to the batch-normalized
+    # loss), so the renderer warns with the id and returns the sample as-is rather
+    # than hard-failing the run.
+    monkeypatch.setattr(
+        agent_chat,
+        "format_chat_template",
+        lambda **kw: {"input_ids": [1, 2, 3], "labels": [-100, -100, -100]},
+    )
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 123, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        result = agent_chat._format_example(example, Tok(), 0, 0)
+    # Sample is kept unchanged (not dropped, not raised on).
+    assert result["labels"] == [-100, -100, -100]
+    # Warning fired and names the offending example id.
+    warnings = [r.getMessage() for r in caplog.records if "no supervised tokens" in r.getMessage()]
+    assert warnings and "123" in warnings[0]
+
+
+def test_format_example_ok_when_some_label_supervised(monkeypatch):
+    # A sample with at least one supervised label passes through unchanged.
+    monkeypatch.setattr(
+        agent_chat,
+        "format_chat_template",
+        lambda **kw: {"input_ids": [1, 2, 3], "labels": [-100, 2, 3]},
+    )
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 1, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+    assert agent_chat._format_example(example, Tok(), 0, 0)["labels"] == [-100, 2, 3]

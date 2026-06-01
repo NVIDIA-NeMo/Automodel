@@ -18,6 +18,7 @@ on:
   pull_request:
     paths:
       - 'pyproject.toml'
+      - 'docker/common/uv-pytorch.toml'
 
 jobs:
   check_uv_lock_and_update:
