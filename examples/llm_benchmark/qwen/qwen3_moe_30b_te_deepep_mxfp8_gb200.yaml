@@ -22,6 +22,10 @@
 #     runtime on CUDA sm_100+ (GB200) and an importable torchao.prototype.moe_training;
 #     it falls back to torch._grouped_mm otherwise. Training-only prototype kernel.
 #
+# dispatcher is hybridep (not deepep): on GB200 the deepep dispatcher fails EP
+# buffer init with 'invalid resource handle'; hybridep is the working GB200 path (matches
+# the passing gpt-oss GB200 recipes and the bf16 qwen3_moe_30b_te_deepep_gb200.yaml).
+#
 # Everything else matches the bf16 baseline for an apples-to-apples comparison:
 #   peak_tflops=2500, num_nodes/ci.nodes=2, ep_size=8, local_batch_size=8,
 #   global_batch_size=512 (=> 512 / (8 dp * 8) = 8 grad-accum micro-batches), seq_len=4096.
@@ -83,7 +87,7 @@ model:
     rms_norm: te
     rope_fusion: true
     experts: torch_mm_mxfp8
-    dispatcher: deepep
+    dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
