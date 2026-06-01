@@ -49,12 +49,16 @@ class DraftSpec:
 
 # Llama-style dense LLMs. The dense draft works for any architecture in this
 # tuple as long as the target supports HuggingFace's
-# ``output_hidden_states=True`` mechanism (all standard causal-LM HF models do,
-# including MoE backbones -- the draft only consumes the post-block hidden
-# states, not the per-expert routing internals).
+# ``output_hidden_states=True`` mechanism. This includes MoE backbones
+# (e.g. ``Qwen3MoeForCausalLM``): the draft only consumes the post-block
+# hidden states emitted by ``register_forward_hook`` on each decoder layer,
+# not the per-expert routing internals -- so an MoE target is treated
+# identically to a dense target end-to-end.
 _DENSE_ARCHITECTURES: tuple[str, ...] = (
     "LlamaForCausalLM",
     "Phi3ForCausalLM",
+    "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM",
 )
 
 

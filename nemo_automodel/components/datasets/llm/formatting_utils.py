@@ -104,6 +104,31 @@ def _tokenize_chat(
     return tokenized_chat.get("input_ids", [])
 
 
+def _maybe_shift_mask_for_left_padding(
+    mask: List[int],
+    tokenizer: "PreTrainedTokenizer",
+    attention_mask: Optional[List[int]],
+) -> List[int]:
+    """Shift a token-level mask right when the tokenizer uses left padding.
+
+    ``_build_multiturn_assistant_mask`` and ``_build_reasoning_mask`` compute
+    span indices from **unpadded** (left-aligned) tokenizations.  When the
+    tokenizer pads on the left, actual content is right-aligned in
+    ``input_ids``, so the mask must be shifted right by the padding offset to
+    keep positions aligned.
+
+    For right-padding tokenizers (the majority) this is a no-op.
+    """
+    if getattr(tokenizer, "padding_side", "right") != "left":
+        return mask
+    if attention_mask is None:
+        return mask
+    pad_len = len(mask) - sum(attention_mask)
+    if pad_len <= 0:
+        return mask
+    return [0] * pad_len + mask[: len(mask) - pad_len]
+
+
 def _build_multiturn_assistant_mask(
     tokenizer: "PreTrainedTokenizer",
     formatted_text: List[Dict[str, Any]],
@@ -112,30 +137,50 @@ def _build_multiturn_assistant_mask(
     tools: Optional[List[Dict]] = None,
     truncation: Union[str, bool] = "do_not_truncate",
     seq_length: Optional[int] = None,
+    full_length: Optional[int] = None,
 ) -> List[int]:
-    """Build a fallback loss mask that supervises every assistant turn."""
+    """Build a fallback loss mask that supervises every assistant turn.
+
+    Each assistant span is located by tokenizing the conversation prefixes
+    before and after the turn, which is O(turns) ``apply_chat_template`` calls.
+    Two reductions keep that from re-doing work:
+
+    - ``full_length`` is the caller's already-known unpadded token count for the
+      whole conversation (``sum(attention_mask)``). When the dialogue ends on an
+      assistant turn its closing boundary is the full conversation, so passing
+      ``full_length`` skips re-tokenizing the entire prefix — the single most
+      expensive call in the loop.
+    - Prefix lengths are memoized so a boundary shared by adjacent turns (a
+      turn's end and the next turn's start) is tokenized at most once.
+
+    Both are exact: ``full_length`` and the memoized values equal what
+    :func:`_tokenized_chat_length` would return, so the mask is unchanged.
+    """
     assistant_mask = [0] * len(input_ids)
     found_assistant = False
+
+    length_cache: Dict[int, int] = {}
+    if full_length is not None:
+        length_cache[len(formatted_text)] = full_length
+
+    def prefix_length(k: int) -> int:
+        if k not in length_cache:
+            length_cache[k] = _tokenized_chat_length(
+                tokenizer,
+                formatted_text[:k],
+                tools=tools,
+                truncation=truncation,
+                seq_length=seq_length,
+            )
+        return length_cache[k]
 
     for idx, message in enumerate(formatted_text):
         if message["role"] != "assistant":
             continue
 
         found_assistant = True
-        start = _tokenized_chat_length(
-            tokenizer,
-            formatted_text[:idx],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
-        end = _tokenized_chat_length(
-            tokenizer,
-            formatted_text[: idx + 1],
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        start = prefix_length(idx)
+        end = prefix_length(idx + 1)
         for pos in range(min(start, len(assistant_mask)), min(end, len(assistant_mask))):
             assistant_mask[pos] = 1
 
@@ -483,13 +528,24 @@ def format_prompt_completion(
         len_prompt_ids = len(prompt_ids)
     else:
         len_prompt_ids = 0
-    # Tokenize full text
-    tokenized = tokenizer(
-        full_text,
-        padding=padding,
-        truncation=truncation,
-        max_length=seq_length,
-    )
+    # transformers 5.5.0 still honored `padding_side: "right"` baked into the
+    # tokenizer's saved tokenizer_config.json, but 5.8.1 ignores that field and
+    # uses the LlamaTokenizer class default ("left"). Hardcode "right" here so
+    # pad positions land at the end (the label-masking / attention-mask logic
+    # below assumes right padding).
+    _saved_padding_side = getattr(tokenizer, "padding_side", None)
+    if _saved_padding_side is not None:
+        tokenizer.padding_side = "right"
+    try:
+        tokenized = tokenizer(
+            full_text,
+            padding=padding,
+            truncation=truncation,
+            max_length=seq_length,
+        )
+    finally:
+        if _saved_padding_side is not None:
+            tokenizer.padding_side = _saved_padding_side
     input_ids = tokenized["input_ids"]
 
     # Create assistant_masks: 0 for prompt tokens, 1 for answer tokens
@@ -582,6 +638,12 @@ def format_chat_template(
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
+        # The unpadded token count of the whole conversation is already known
+        # from this tokenization; pass it so the mask builder need not
+        # re-tokenize the full prefix. Fall back to None (recompute) when no
+        # attention_mask is available.
+        attn_for_len = tokenized_chat.get("attention_mask")
+        full_length = sum(attn_for_len) if attn_for_len is not None else None
         mask = _build_multiturn_assistant_mask(
             tokenizer,
             formatted_text,
@@ -589,15 +651,11 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+            full_length=full_length,
         )
-        # _build_multiturn_assistant_mask computes indices from unpadded (left-aligned)
-        # lengths. Left-padding tokenizers right-align content — shift mask to match.
-        if getattr(tokenizer, "padding_side", "right") == "left":
-            attn_mask = tokenized_chat.get("attention_mask")
-            if attn_mask is not None:
-                pad_len = len(input_ids) - sum(attn_mask)
-                if pad_len > 0:
-                    mask = [0] * pad_len + mask[: len(mask) - pad_len]
+        # _build_multiturn_assistant_mask computes indices from unpadded
+        # lengths — shift for left-padding tokenizers.
+        mask = _maybe_shift_mask_for_left_padding(mask, tokenizer, tokenized_chat.get("attention_mask"))
     else:
         mask = [1] * len(input_ids)
 
@@ -617,6 +675,10 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+        )
+        # _build_reasoning_mask also computes from unpadded lengths.
+        reasoning_mask = _maybe_shift_mask_for_left_padding(
+            reasoning_mask, tokenizer, tokenized_chat.get("attention_mask")
         )
         mask = [assistant if not reasoning else 0 for assistant, reasoning in zip(mask, reasoning_mask)]
 
