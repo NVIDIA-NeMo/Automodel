@@ -22,17 +22,43 @@ Full-model behaviour is covered by ``test_dsv4_model_smoke.py``.
 
 import pytest
 import torch
+import torch.nn as nn
 
+from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.layers import (
+    DeepseekV4Attention,
     DeepseekV4GroupedLinear,
     DeepseekV4HyperConnection,
     DeepseekV4RotaryEmbedding,
     _apply_partial_rope_interleaved,
     _build_indexer_topk_compressed_mask,
+    _rms_norm_last_dim,
     _yarn_correction_dim,
     _yarn_correction_range,
     _yarn_linear_ramp,
+    build_causal_padding_mask,
+    build_packed_causal_padding_mask,
+    eager_attention_with_sink,
 )
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
+    build_dsv4_sparse_topk_indices,
+    dense_attention_topk_torch,
+    dsv4_indexer_scores,
+    dsv4_indexer_topk_scores,
+    dsv4_sinkhorn_normalize,
+    dsv4_sparse_attention,
+    extract_indexer_topk_scores_torch,
+    indexer_scores_torch,
+    is_dsv4_kernel_available,
+    sinkhorn_normalize_torch,
+)
+
+
+def _run_forward_backward(fn, inputs, grad_output):
+    leaves = [input_.detach().clone().requires_grad_(True) for input_ in inputs]
+    output = fn(*leaves)
+    torch.autograd.backward(output, grad_output.to(dtype=output.dtype, device=output.device))
+    return output.detach(), [leaf.grad.detach() for leaf in leaves]
 
 
 class TestDeepseekV4AttentionMask:
@@ -45,6 +71,377 @@ class TestDeepseekV4AttentionMask:
         expected_compressed_mask = torch.tensor([[[[0.0, min_val, 0.0, min_val, min_val]]]])
         compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled=5).unsqueeze(1)
         torch.testing.assert_close(compressed_mask, expected_compressed_mask)
+
+    def test_indexer_topk_mask_drops_high_invalid_entries(self):
+        """Positive out-of-range pool IDs must not become scatter/gather indices."""
+        attention_mask = torch.zeros(1, 1, 1, 1)
+        indexer_topk = torch.tensor([[[2, 99, 0, -1]]])
+
+        min_val = torch.finfo(attention_mask.dtype).min
+        expected_compressed_mask = torch.tensor([[[[0.0, min_val, 0.0, min_val, min_val]]]])
+        compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled=5).unsqueeze(1)
+        torch.testing.assert_close(compressed_mask, expected_compressed_mask)
+
+    def test_sparse_topk_builder_drops_high_invalid_entries(self):
+        compressed_topk = torch.tensor([[[0, 99], [1, -1], [99, 0], [-1, -1]]])
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=4,
+            key_len=6,
+            window_size=2,
+            device=torch.device("cpu"),
+            compress_ratio=4,
+            compressed_topk=compressed_topk,
+            n_pooled=2,
+        )
+
+        assert (topk >= 6).sum().item() == 0
+        assert topk[0, 0, -2].item() == 4
+        assert topk[0, 0, -1].item() == -1
+
+    def test_packed_topk_uses_padded_lengths_for_tail_padding(self):
+        seq_len = 8
+        real_seq_lens = torch.tensor([[3, 2]], dtype=torch.long)
+        padded_seq_lens = torch.tensor([[3, 5]], dtype=torch.long)
+
+        real_mask = build_packed_causal_padding_mask(
+            real_seq_lens,
+            seq_len=seq_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            sliding_window=4,
+        )
+        real_topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=seq_len,
+            key_len=seq_len,
+            window_size=4,
+            device=torch.device("cpu"),
+            attention_mask=real_mask,
+        )
+
+        padded_mask = build_packed_causal_padding_mask(
+            padded_seq_lens,
+            seq_len=seq_len,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            sliding_window=4,
+        )
+        padded_topk = build_dsv4_sparse_topk_indices(
+            batch_size=1,
+            seq_len=seq_len,
+            key_len=seq_len,
+            window_size=4,
+            device=torch.device("cpu"),
+            attention_mask=padded_mask,
+        )
+
+        assert (real_topk[0, 5:] >= 0).sum(dim=-1).eq(0).all()
+        assert (padded_topk[0, 5:] >= 0).sum(dim=-1).gt(0).all()
+
+    def test_short_hca_training_window_stays_disabled_without_group_hca(self):
+        """All-short groups should keep the original no-HCA path and grad=None semantics."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention_ref = DeepseekV4Attention(cfg, layer_idx=0)
+        attention_ref.load_state_dict(attention.state_dict())
+
+        attention_ref.eval()
+        with torch.no_grad():
+            expected, expected_weights = attention_ref(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+            )
+
+        attention.train()
+        actual, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert expected_weights.shape[-1] == seq_len
+        assert actual_weights.shape[-1] == seq_len
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+        actual.square().sum().backward()
+
+        compressor = attention.compressor
+        assert compressor is not None
+        params = list(compressor.named_parameters())
+        before = {name: param.detach().clone() for name, param in params}
+        for name, param in params:
+            assert param.grad is None, name
+
+        optimizer = torch.optim.AdamW([param for _, param in params], lr=1e-3, weight_decay=0.1)
+        optimizer.step()
+        for name, param in params:
+            torch.testing.assert_close(param, before[name], atol=0.0, rtol=0.0)
+
+    def test_short_hca_training_window_is_fully_masked_when_group_has_hca(self, monkeypatch):
+        """Mixed short/long groups should mask the synthetic HCA position completely."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention_ref = DeepseekV4Attention(cfg, layer_idx=0)
+        attention_ref.load_state_dict(attention.state_dict())
+
+        attention_ref.eval()
+        with torch.no_grad():
+            expected, expected_weights = attention_ref(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_embeddings_compress=position_embeddings_compress,
+                rotary_compress=rotary_compress,
+            )
+
+        attention.train()
+        compressor = attention.compressor
+        assert compressor is not None
+        monkeypatch.setattr(
+            compressor,
+            "_compute_fsdp_group_has_complete_hca_window",
+            lambda local_has_complete_hca_window, device: True,
+        )
+        actual, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert expected_weights.shape[-1] == seq_len
+        assert actual_weights.shape[-1] == seq_len + 1
+        torch.testing.assert_close(
+            actual_weights[..., -1], torch.zeros_like(actual_weights[..., -1]), atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+    def test_short_hca_training_window_keeps_compressor_in_backward(self, monkeypatch):
+        """Mixed-group short HCA ranks should produce zero-valued compressor gradients."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        compressor = attention.compressor
+        assert compressor is not None
+        monkeypatch.setattr(
+            compressor,
+            "_compute_fsdp_group_has_complete_hca_window",
+            lambda local_has_complete_hca_window, device: True,
+        )
+
+        output, _ = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+        output.square().sum().backward()
+
+        for name, param in compressor.named_parameters():
+            assert param.grad is not None, name
+            assert torch.isfinite(param.grad).all(), name
+            torch.testing.assert_close(param.grad, torch.zeros_like(param.grad), atol=0.0, rtol=0.0)
+
+    def test_short_hca_training_window_stays_disabled_without_attention_mask(self, monkeypatch):
+        """Synthetic HCA alignment requires a mask so the extra position can be hidden."""
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        seq_len = 7
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, _ = self._hca_inputs(
+            cfg, seq_len
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        compressor = attention.compressor
+        assert compressor is not None
+        monkeypatch.setattr(
+            compressor,
+            "_compute_fsdp_group_has_complete_hca_window",
+            lambda local_has_complete_hca_window, device: True,
+        )
+
+        _, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=None,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert actual_weights.shape[-1] == seq_len
+
+    @pytest.mark.parametrize(
+        ("seq_len", "group_has_hca", "expected_attention_width"),
+        (
+            (127, False, 127),
+            (127, True, 128),
+            (128, False, 129),
+            (129, False, 130),
+        ),
+    )
+    def test_hca_window_boundary_paths(self, monkeypatch, seq_len, group_has_hca, expected_attention_width):
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask = (
+            self._hca_inputs(cfg, seq_len)
+        )
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        if group_has_hca:
+            compressor = attention.compressor
+            assert compressor is not None
+            monkeypatch.setattr(
+                compressor,
+                "_compute_fsdp_group_has_complete_hca_window",
+                lambda local_has_complete_hca_window, device: True,
+            )
+
+        _, actual_weights = attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_embeddings_compress=position_embeddings_compress,
+            rotary_compress=rotary_compress,
+        )
+
+        assert actual_weights.shape[-1] == expected_attention_width
+
+    @staticmethod
+    def _tiny_hca_config() -> DeepseekV4Config:
+        return DeepseekV4Config(
+            vocab_size=32,
+            hidden_size=16,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=1,
+            n_routed_experts=2,
+            n_shared_experts=0,
+            num_experts_per_tok=1,
+            max_position_embeddings=256,
+            compress_ratios=[128],
+            sliding_window=128,
+            attention_dropout=0.0,
+            num_hash_layers=0,
+            hc_mult=1,
+            num_nextn_predict_layers=0,
+            rms_norm_eps=1e-6,
+            torch_dtype="float32",
+        )
+
+    @staticmethod
+    def _hca_inputs(
+        cfg: DeepseekV4Config,
+        seq_len: int,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+        nn.Module,
+        torch.Tensor,
+    ]:
+        hidden_states = torch.randn(1, seq_len, cfg.hidden_size)
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+        partial_rotary_factor = float(cfg.qk_rope_head_dim) / float(cfg.head_dim)
+        rotary = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        rotary_compress = DeepseekV4RotaryEmbedding(
+            rope_theta=float(cfg.compress_rope_theta),
+            head_dim=int(cfg.head_dim),
+            partial_rotary_factor=partial_rotary_factor,
+        )
+        position_embeddings = rotary(hidden_states, position_ids)
+        position_embeddings_compress = rotary_compress(hidden_states, position_ids)
+        attention_mask = build_causal_padding_mask(
+            None,
+            seq_len=seq_len,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            batch_size=hidden_states.shape[0],
+            sliding_window=cfg.sliding_window,
+        )
+        return hidden_states, position_embeddings, position_embeddings_compress, rotary_compress, attention_mask
+
+
+class TestRMSNormLastDim:
+    def _reference(self, x, eps):
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+
+    def test_matches_reference_forward_backward(self):
+        eps = 1e-6
+        x = torch.randn(2, 3, 5, 7)
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(lambda x_: self._reference(x_, eps), (x,), grad)
+        actual, (actual_grad,) = _run_forward_backward(lambda x_: _rms_norm_last_dim(x_, eps), (x,), grad)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for bf16 RMSNorm parity")
+    def test_cuda_bfloat16_matches_reference_forward_backward(self):
+        eps = 1e-6
+        x = torch.randn(2, 4, 16, 64, device="cuda", dtype=torch.bfloat16)
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(lambda x_: self._reference(x_, eps), (x,), grad)
+        actual, (actual_grad,) = _run_forward_backward(lambda x_: _rms_norm_last_dim(x_, eps), (x,), grad)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-2, atol=2e-2)
+
+    def test_bias_free_linear_matches_post_scale_forward_backward(self):
+        eps = 1e-6
+        x = torch.randn(2, 5, 7)
+        weight = torch.randn(3, 7)
+        grad = torch.randn(2, 5, 3)
+
+        def reference(x_, weight_):
+            scale = torch.rsqrt(x_.square().mean(-1, keepdim=True) + eps)
+            return torch.nn.functional.linear(x_, weight_) * scale
+
+        expected, expected_grads = _run_forward_backward(reference, (x, weight), grad)
+        actual, actual_grads = _run_forward_backward(
+            lambda x_, weight_: torch.nn.functional.linear(_rms_norm_last_dim(x_, eps), weight_),
+            (x, weight),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
 
 
 class TestDeepseekV4GroupedLinear:
@@ -143,8 +540,623 @@ class TestDeepseekV4HyperConnection:
         torch.testing.assert_close(col_sums, torch.ones_like(col_sums), rtol=0, atol=1e-2)
 
 
+class TestDeepseekV4OptimizedKernels:
+    """Numerical equivalence tests for optional DSV4 kernel dispatch."""
+
+    def test_eager_attention_with_sink_passes_reference_to_sinks_holder(self):
+        """FSDP2-wrapped fp32 sink holders need a tensor input during recompute."""
+        batch, heads, seq_len, dim = 1, 2, 3, 4
+        q = torch.randn(batch, heads, seq_len, dim)
+        kv = torch.randn(batch, 1, seq_len, dim)
+        sinks = torch.randn(heads)
+
+        class SinksParam:
+            def __init__(self, value):
+                self.value = value
+                self.reference_shape = None
+
+            def __call__(self, reference):
+                self.reference_shape = reference.shape
+                return self.value
+
+        class DummyModule:
+            num_key_value_groups = heads
+            training = False
+
+            def __init__(self, value):
+                self.sinks_param = SinksParam(value)
+
+        module = DummyModule(sinks)
+
+        output, _ = eager_attention_with_sink(module, q, kv, kv, None, scaling=dim**-0.5)
+
+        assert output.shape == (batch, seq_len, heads, dim)
+        assert module.sinks_param.reference_shape == q.shape
+
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available"),
+            ),
+        ],
+    )
+    def test_eager_attention_with_sink_matches_unpacked_packed_sequence(self, device):
+        torch.manual_seed(123)
+        batch, seq_len, heads, dim = 2, 6, 3, 8
+        seq_lens = torch.tensor([[3, 2, 0], [1, 4, 0]], dtype=torch.long)
+        sliding_window = 3
+        q = torch.randn(batch, heads, seq_len, dim, device=device)
+        kv = torch.randn(batch, 1, seq_len, dim, device=device)
+        sinks = torch.randn(heads, device=device)
+        grad = torch.randn(batch, seq_len, heads, dim, device=device)
+        grad = torch.where(
+            (
+                torch.arange(seq_len, device=device).expand(batch, -1)
+                < seq_lens.to(device=device).sum(dim=-1, keepdim=True)
+            )
+            .unsqueeze(-1)
+            .unsqueeze(-1),
+            grad,
+            torch.zeros_like(grad),
+        )
+
+        class DummyModule:
+            num_key_value_groups = heads
+            training = False
+
+            def __init__(self, sinks):
+                self.sinks = sinks
+
+        def packed_attention(q_, kv_, sinks_):
+            attention_mask = build_packed_causal_padding_mask(
+                seq_lens,
+                seq_len=seq_len,
+                dtype=q_.dtype,
+                device=q_.device,
+                sliding_window=sliding_window,
+            )
+            return eager_attention_with_sink(
+                DummyModule(sinks_),
+                q_,
+                kv_,
+                kv_,
+                attention_mask,
+                scaling=dim**-0.5,
+            )[0]
+
+        def unpacked_attention(q_, kv_, sinks_):
+            outputs = []
+            for batch_idx in range(batch):
+                batch_outputs = []
+                offset = 0
+                for length in seq_lens[batch_idx].tolist():
+                    if length == 0:
+                        continue
+                    attention_mask = build_causal_padding_mask(
+                        attention_mask=None,
+                        seq_len=length,
+                        dtype=q_.dtype,
+                        device=q_.device,
+                        batch_size=1,
+                        sliding_window=sliding_window,
+                    )
+                    doc_output = eager_attention_with_sink(
+                        DummyModule(sinks_),
+                        q_[batch_idx : batch_idx + 1, :, offset : offset + length],
+                        kv_[batch_idx : batch_idx + 1, :, offset : offset + length],
+                        kv_[batch_idx : batch_idx + 1, :, offset : offset + length],
+                        attention_mask,
+                        scaling=dim**-0.5,
+                    )[0]
+                    batch_outputs.append(doc_output)
+                    offset += length
+                padding = seq_len - offset
+                if padding:
+                    batch_outputs.append(q_.new_zeros(1, padding, heads, dim))
+                outputs.append(torch.cat(batch_outputs, dim=1))
+            return torch.cat(outputs, dim=0)
+
+        expected, expected_grads = _run_forward_backward(unpacked_attention, (q, kv, sinks), grad)
+        actual, actual_grads = _run_forward_backward(packed_attention, (q, kv, sinks), grad)
+
+        rtol, atol = (1e-4, 1e-5) if device == "cuda" else (1e-5, 1e-6)
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=rtol, atol=atol)
+
+    def test_sinkhorn_torch_backend_matches_reference(self):
+        torch.manual_seed(123)
+        x = torch.randn(2, 3, 4, 4)
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: sinkhorn_normalize_torch(x_, repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
+        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
+    )
+    def test_sinkhorn_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        x = torch.randn(2, 128, 4, 4, device="cuda")
+        grad = torch.randn_like(x)
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
+        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
+    )
+    def test_sinkhorn_tilelang_backend_accepts_non_contiguous_grad(self):
+        torch.manual_seed(123)
+        x = torch.randn(2, 128, 4, 4, device="cuda")
+        grad = torch.randn_like(x).transpose(-1, -2)
+        assert not grad.is_contiguous()
+        expected, (expected_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        actual, (actual_grad,) = _run_forward_backward(
+            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
+            (x,),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_sparse_attention_torch_matches_dense_topk_reference(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim = 2, 7, 3, 8
+        n_pooled = 3
+        q = torch.randn(bsz, seq, heads, dim)
+        kv = torch.randn(bsz, seq + n_pooled, dim)
+        sinks = torch.randn(heads)
+        grad = torch.randn_like(q)
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=bsz,
+            seq_len=seq,
+            key_len=seq + n_pooled,
+            window_size=4,
+            device=q.device,
+            compress_ratio=4,
+            n_pooled=n_pooled,
+        )
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dense_attention_topk_torch(q_, kv_, sinks_, topk, dim**-0.5),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_sparse_attention_torch_ignores_high_invalid_topk(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim = 1, 3, 2, 8
+        q = torch.randn(bsz, seq, heads, dim)
+        kv = torch.randn(bsz, 4, dim)
+        sinks = torch.randn(heads)
+        grad = torch.randn_like(q)
+        topk = torch.tensor([[[0, 99, -1], [1, 2, 99], [3, -1, 99]]])
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dense_attention_topk_torch(q_, kv_, sinks_, topk, dim**-0.5),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_sparse_attention_matches_current_eager_mask_path(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim = 2, 7, 3, 8
+        n_pooled, ratio, window = 3, 4, 4
+        q = torch.randn(bsz, seq, heads, dim)
+        kv = torch.randn(bsz, seq + n_pooled, dim)
+        sinks = torch.randn(heads)
+        grad = torch.randn_like(q)
+
+        base_mask = build_causal_padding_mask(
+            attention_mask=None,
+            seq_len=seq,
+            dtype=q.dtype,
+            device=q.device,
+            batch_size=bsz,
+            sliding_window=window,
+        )
+        min_val = torch.finfo(q.dtype).min
+        q_pos = torch.arange(seq, device=q.device)
+        p_pos = torch.arange(n_pooled, device=q.device)
+        allowed = p_pos.unsqueeze(0) < ((q_pos + 1) // ratio).unsqueeze(1)
+        compressed_mask = torch.where(
+            allowed,
+            torch.zeros((), dtype=q.dtype, device=q.device),
+            torch.full((), min_val, dtype=q.dtype, device=q.device),
+        )
+        attention_mask = torch.cat([base_mask, compressed_mask.expand(bsz, seq, n_pooled).unsqueeze(1)], dim=-1)
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=bsz,
+            seq_len=seq,
+            key_len=seq + n_pooled,
+            window_size=window,
+            device=q.device,
+            attention_mask=attention_mask,
+            compress_ratio=ratio,
+            n_pooled=n_pooled,
+        )
+
+        class DummyModule:
+            num_key_value_groups = heads
+
+            def __init__(self, sinks):
+                self.sinks = sinks
+                self.training = False
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: eager_attention_with_sink(
+                DummyModule(sinks_),
+                q_.transpose(1, 2),
+                kv_.unsqueeze(1),
+                kv_.unsqueeze(1),
+                attention_mask,
+                scaling=dim**-0.5,
+            )[0],
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
+    )
+    def test_sparse_attention_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, key_len, topk_len = 1, 16, 8, 128, 20, 16
+        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
+        sinks = torch.randn(heads, device="cuda")
+        topk = torch.stack(
+            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
+        ).to(torch.int32)
+        topk[:, :, -4:] = -1
+        grad = torch.randn(bsz, seq, dim, heads, device="cuda", dtype=q.dtype).transpose(2, 3)
+        assert not grad.is_contiguous()
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="tilelang",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("sparse_attn") or not torch.cuda.is_available(),
+        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
+    )
+    def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, n_pooled = 1, 192, 128, 128, 48
+        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(bsz, seq + n_pooled, dim, device="cuda", dtype=torch.bfloat16)
+        sinks = torch.randn(heads, device="cuda")
+        topk = build_dsv4_sparse_topk_indices(
+            batch_size=bsz,
+            seq_len=seq,
+            key_len=seq + n_pooled,
+            window_size=128,
+            device=q.device,
+            compress_ratio=4,
+            n_pooled=n_pooled,
+        )
+        assert (topk == -1).any()
+        grad = torch.randn_like(q).transpose(2, 3).contiguous().transpose(2, 3)
+        assert not grad.is_contiguous()
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="sparse_torch",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, kv_, sinks_: dsv4_sparse_attention(
+                q_,
+                kv_,
+                sinks_,
+                topk,
+                dim**-0.5,
+                backend="tilelang",
+            ),
+            (q, kv, sinks),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
+
+    def test_indexer_scores_torch_backend_matches_reference(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled = 2, 7, 3, 8, 5
+        q = torch.randn(bsz, seq, heads, dim)
+        pooled_kv = torch.randn(bsz, pooled, dim)
+        weights = torch.randn(bsz, seq, heads)
+        grad = torch.randn(bsz, seq, pooled)
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: indexer_scores_torch(q_, pooled_kv_, weights_, dim**-0.5),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_indexer_topk_scores_torch_backend_matches_reference(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled, topk = 2, 7, 3, 8, 5, 4
+        q = torch.randn(bsz, seq, heads, dim)
+        pooled_kv = torch.randn(bsz, pooled, dim)
+        weights = torch.randn(bsz, seq, heads)
+        topk_indices = torch.randint(0, pooled, (bsz, seq, topk))
+        topk_indices[:, :, -1] = -1
+        grad = torch.randn(bsz, seq, topk)
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: extract_indexer_topk_scores_torch(
+                indexer_scores_torch(q_, pooled_kv_, weights_, dim**-0.5),
+                topk_indices,
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
+    def test_indexer_topk_scores_torch_ignores_high_invalid_topk(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled = 1, 3, 2, 8, 4
+        q = torch.randn(bsz, seq, heads, dim)
+        pooled_kv = torch.randn(bsz, pooled, dim)
+        weights = torch.randn(bsz, seq, heads)
+        topk_indices = torch.tensor([[[0, 99, -1], [1, 2, 99], [3, -1, 99]]])
+        grad = torch.randn(bsz, seq, topk_indices.shape[-1])
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: extract_indexer_topk_scores_torch(
+                indexer_scores_torch(q_, pooled_kv_, weights_, dim**-0.5),
+                topk_indices,
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
+    )
+    def test_indexer_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled = 2, 17, 8, 128, 5
+        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
+        q_pos = torch.arange(seq, device="cuda")
+        pooled_pos = torch.arange(pooled, device="cuda")
+        valid = pooled_pos.unsqueeze(0) < ((q_pos + 1) // 4).unsqueeze(1)
+        expected = dsv4_indexer_scores(
+            q,
+            pooled_kv,
+            weights,
+            compress_ratio=4,
+            softmax_scale=dim**-0.5,
+            backend="torch",
+        )
+        expected = torch.where(valid.unsqueeze(0), expected, torch.full_like(expected, float("-inf")))
+        actual = dsv4_indexer_scores(
+            q,
+            pooled_kv,
+            weights,
+            compress_ratio=4,
+            softmax_scale=dim**-0.5,
+            backend="tilelang",
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.skipif(
+        not is_dsv4_kernel_available("indexer") or not torch.cuda.is_available(),
+        reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
+    )
+    def test_indexer_topk_tilelang_backend_matches_torch(self):
+        torch.manual_seed(123)
+        bsz, seq, heads, dim, pooled, topk = 1, 17, 8, 128, 5, 4
+        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
+        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
+        topk_indices = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(bsz, seq, -1)
+        q_pos = torch.arange(seq, device="cuda")
+        valid_end = ((q_pos + 1) // 4).view(1, seq, 1)
+        topk_indices = torch.where(topk_indices < valid_end, topk_indices, torch.full_like(topk_indices, -1))
+        grad = torch.randn(bsz, seq, topk, device="cuda")
+
+        expected, expected_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="torch",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        actual, actual_grads = _run_forward_backward(
+            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
+                q_,
+                pooled_kv_,
+                weights_,
+                topk_indices,
+                compress_ratio=4,
+                softmax_scale=dim**-0.5,
+                backend="tilelang",
+            ),
+            (q, pooled_kv, weights),
+            grad,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)
+
+
 class TestApplyPartialRopeInterleaved:
     """Released DSV4-Flash uses INTERLEAVED RoPE pairs ``(2k, 2k+1)``."""
+
+    def _reference_apply(self, x, cos, sin, rd):
+        half = rd // 2
+        nope, rope = x[..., :-rd], x[..., -rd:]
+        rope_pairs = rope.unflatten(-1, (-1, 2))
+        a, b = rope_pairs[..., 0], rope_pairs[..., 1]
+        c = cos[..., :half]
+        s = sin[..., :half]
+        while c.ndim < a.ndim:
+            c = c.unsqueeze(1)
+            s = s.unsqueeze(1)
+        new_a = a * c - b * s
+        new_b = a * s + b * c
+        new_rope = torch.stack([new_a, new_b], dim=-1).flatten(-2)
+        return torch.cat([nope, new_rope], dim=-1)
 
     def _make_cos_sin(self, batch, seq, rd):
         """Build the Llama-style ``cat([f, f], -1)`` cos/sin tensors that
@@ -183,6 +1195,27 @@ class TestApplyPartialRopeInterleaved:
         sin = torch.zeros(bsz, seq, rd)
         y = _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim=rd)
         torch.testing.assert_close(y, x)
+
+    def test_matches_reference_forward_backward(self):
+        bsz, heads, seq, rd, nope = 2, 3, 4, 8, 5
+        x = torch.randn(bsz, heads, seq, nope + rd, requires_grad=True)
+        cos, sin = self._make_cos_sin(bsz, seq, rd)
+        cos = cos.clone().requires_grad_()
+        sin = sin.clone().requires_grad_()
+
+        x_ref = x.detach().clone().requires_grad_()
+        cos_ref = cos.detach().clone().requires_grad_()
+        sin_ref = sin.detach().clone().requires_grad_()
+        expected = self._reference_apply(x_ref, cos_ref, sin_ref, rd)
+        actual = _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim=rd)
+
+        torch.testing.assert_close(actual, expected)
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        expected.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        torch.testing.assert_close(cos.grad, cos_ref.grad)
+        torch.testing.assert_close(sin.grad, sin_ref.grad)
 
 
 class TestYaRNHelpers:

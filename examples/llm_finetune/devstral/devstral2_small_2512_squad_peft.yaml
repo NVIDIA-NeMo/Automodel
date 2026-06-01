@@ -111,12 +111,12 @@ lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
 
-ci:
-  recipe_owner: akoumpa
-  time: "00:30:00"
-
 wandb:
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: devstral_24b_squad_peft
   dir: logs/wandb
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:30:00"

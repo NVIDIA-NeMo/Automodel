@@ -120,7 +120,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
@@ -460,6 +466,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
 
 def main(config_path: str | None = None):
+    """Run the sequence-classification fine-tuning recipe."""
     if config_path is None:
         config_path = (
             pathlib.Path(__file__).parent.resolve()

@@ -366,6 +366,12 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 feature_attention_mask=feature_attention_mask,
                 audio_feature_lengths=audio_feature_lengths,
             )
+            # get_audio_features returns a BaseModelOutputWithPooling (audio_tower's
+            # encoder output); extract the hidden state before moving to the embedding
+            # device/dtype, matching the .pooler_output extraction used for images/videos
+            # below.
+            if hasattr(audio_features, "last_hidden_state"):
+                audio_features = audio_features.last_hidden_state
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)

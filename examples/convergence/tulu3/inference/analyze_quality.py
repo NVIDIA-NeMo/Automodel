@@ -634,6 +634,8 @@ def check_thresholds(stats: dict, thresholds: dict[str, float]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the lm_eval quality analysis CLI."""
+
     parser = argparse.ArgumentParser(
         description="Analyze inference quality from lm_eval benchmark outputs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

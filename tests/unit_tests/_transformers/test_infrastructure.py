@@ -221,8 +221,9 @@ class TestApplyModelInfrastructurePostShardInit:
 
     def test_skips_model_to_device_when_checkpoint_loaded_with_dtensor(self, monkeypatch):
         """DTensor-sharded post-shard checkpoint loads should skip model.to(device)."""
-        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
         import torch.distributed.tensor as dist_tensor
+
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
 
         class FakeDTensor:
             pass

@@ -183,7 +183,7 @@ class TestCreatePipelineForwardCausalLM:
         forward_fn = create_pipeline_forward_causal_lm()
 
         hidden_states = torch.randn(1, 10, 768)
-        output = forward_fn(mock_model, inputs_embeds=hidden_states, logits_to_keep=5)
+        forward_fn(mock_model, inputs_embeds=hidden_states, logits_to_keep=5)
 
         # Verify lm_head was called with sliced hidden states
         called_hidden = mock_lm_head.call_args[0][0]
@@ -854,7 +854,7 @@ class TestValidateHfModelForPipelineSupport:
 
         inputs_embeds = torch.randn(1, 10, 768)
         position_ids = torch.arange(10).unsqueeze(0)
-        output = forward_fn(mock_model, inputs_embeds=inputs_embeds, position_ids=position_ids)
+        forward_fn(mock_model, inputs_embeds=inputs_embeds, position_ids=position_ids)
 
         # Verify get_text_module was called with the model
         mock_get_text_module.assert_called_with(mock_model)
@@ -1001,6 +1001,7 @@ class TestConstants:
         """Test MULTIMODAL_SUFFIXES contains vision-related suffixes."""
         assert "vision_tower" in MULTIMODAL_SUFFIXES
         assert "visual" in MULTIMODAL_SUFFIXES
+        assert "vision_model" in MULTIMODAL_SUFFIXES
         assert "image_encoder" in MULTIMODAL_SUFFIXES
         assert "vision_encoder" in MULTIMODAL_SUFFIXES
 
@@ -1015,6 +1016,7 @@ class TestConstants:
         assert "mm_projector" in MULTIMODAL_SUFFIXES
         assert "multi_modal_projector" in MULTIMODAL_SUFFIXES
         assert "multimodal_projector" in MULTIMODAL_SUFFIXES
+        assert "vit_large_projector" in MULTIMODAL_SUFFIXES
 
 
 # --------------------------------------------------------------------------- #
@@ -1128,7 +1130,7 @@ class TestPipelineForwardMistral3Vlm:
         forward retrieves the current microbatch's chunk and advances the
         chunk index — fixing the original PP-VLM bug."""
         m = self._make_first_stage_model(image_token_id=10)
-        # Pre-stage chunks like the recipe does via _chunk_vlm_media.
+        # Pre-stage chunks like the VLM dataloader PP media prep does for schedule.step.
         chunk0 = torch.zeros(1, 3, 8, 8, dtype=torch.bfloat16)
         chunk1 = torch.ones(1, 3, 8, 8, dtype=torch.bfloat16)
         m._vlm_pixel_values_chunks = [chunk0, chunk1]

@@ -17,6 +17,7 @@ For other installation options, see our [NeMo AutoModel Installation Guide](../.
 | Owner | Model | Modalities | Architecture |
 |---|---|---|---|
 | Qwen / Alibaba Cloud | [Qwen3-Omni](qwen/qwen3-omni.md) | Text · Image · Audio · Video | `Qwen3OmniForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen2.5-Omni](qwen/qwen2-5-omni.md) | Text · Image · Audio · Video | `Qwen2_5OmniForConditionalGeneration` |
 | Microsoft | [Phi-4-multimodal](microsoft/phi4-multimodal.md) | Text · Image · Audio | `Phi4MultimodalForCausalLM` |
 | NVIDIA | [Nemotron-3-Nano-Omni](nvidia/nemotron-omni.md) | Text · Image · Audio | `NemotronH_Nano_Omni_Reasoning_V3` |
 
@@ -28,6 +29,7 @@ All supported omni models can be fine-tuned using full SFT or PEFT (LoRA) approa
 :hidden:
 
 qwen/qwen3-omni
+qwen/qwen2-5-omni
 microsoft/phi4-multimodal
 nvidia/nemotron-omni
 ```

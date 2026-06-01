@@ -29,6 +29,7 @@ TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
 MULTIMODAL_SUFFIXES = (
     "vision_tower",
     "visual",
+    "vision_model",
     "image_encoder",
     "vision_encoder",
     "embed_vision",
@@ -39,6 +40,7 @@ MULTIMODAL_SUFFIXES = (
     "multi_modal_projector",
     "multimodal_projector",
     "vision_projector",
+    "vit_large_projector",
     "audio_projector",
 )
 
@@ -58,6 +60,7 @@ def get_text_module(model: nn.Module) -> nn.Module:
 
 
 def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callable:
+    """Create a pipeline-compatible forward method for HuggingFace inner models."""
     from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
@@ -187,6 +190,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
 
 def create_pipeline_forward_causal_lm() -> Callable:
+    """Create a pipeline-compatible forward method for causal LM wrappers."""
     from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
@@ -643,6 +647,7 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
 
 
 def init_hf_model_buffers(model: torch.nn.Module, device: torch.device) -> None:
+    """Initialize HuggingFace model buffers needed before pipeline execution."""
     if hasattr(getattr(model, "model", model), "rotary_emb"):
         rotary_owner = getattr(model, "model", model)
         if hasattr(rotary_owner.rotary_emb, "rope_init_fn"):

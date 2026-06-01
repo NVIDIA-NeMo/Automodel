@@ -31,6 +31,7 @@ import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import mlflow
 import torch
 import torch.nn as nn
 import wandb
@@ -53,6 +54,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
+from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -60,16 +62,25 @@ from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.mlflow_utils import (
+    configure_mlflow,
+    end_mlflow_active_run_as_killed,
+    to_float_metrics,
+)
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
@@ -115,6 +126,7 @@ def build_model(
     pipeline_config=None,
     cfg_moe=None,
     activation_checkpointing=False,
+    cfg_quantization=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -150,6 +162,11 @@ def build_model(
             kwargs["fp8_config"] = fp8_config
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
         # Check if using NeMoAutoModel
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
@@ -161,8 +178,11 @@ def build_model(
             NeMoAutoModelForCausalLM.from_pretrained,
         )
 
-        if is_nemo_auto_model:
-            # NeMoAutoModel handles infrastructure internally
+        # The Gemma4 base + drafter composite loads its sub-models via the
+        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
+        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
+
+        if is_nemo_auto_model or is_joint_composite:
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
@@ -172,7 +192,25 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
+def _is_gemma4_joint_target(target) -> bool:
+    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
+
+    Imported lazily so the optional ``transformers.models.gemma4_assistant``
+    dependency only fires when a joint recipe is actually requested.
+    """
+    if target is None:
+        return False
+    try:
+        from nemo_automodel.components.models.gemma4_drafter.composite import (
+            Gemma4WithDrafter,
+        )
+    except ImportError:
+        return False
+    # Bound classmethods are not identity-stable across accesses; compare via ==.
+    return target == Gemma4WithDrafter.from_pretrained
+
+
+def build_optimizer(model, cfg_opt, distributed_config, device_mesh, is_peft: bool = False):
     """Build an optimizer for the model.
 
     Args:
@@ -180,6 +218,7 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
         cfg_opt: The configuration for the optimizer.
         distributed_config: The distributed configuration.
         device_mesh: The device mesh.
+        is_peft: Whether the optimizer is for a PEFT run.
     """
     if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
         # TP does not support foreach
@@ -198,6 +237,14 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
             if isinstance(part, MegatronFSDP):
                 fully_shard_optimizer(tmp_optimizer)
         optimizer.append(tmp_optimizer)
+
+    warn_if_torch_adam_with_bf16_params(
+        optimizer=optimizer,
+        optimizer_cfg=cfg_opt,
+        is_peft=is_peft,
+        context="vlm",
+        logger=logger,
+    )
 
     return optimizer
 
@@ -253,100 +300,16 @@ def build_loss_fn(cfg_loss):
     return cfg_loss.instantiate()
 
 
-def _chunk_vlm_media(
-    pixel_values: torch.Tensor,
-    image_grid: torch.Tensor,
-    batch_size: int,
-    n_microbatches: int,
-    n_images_per_sample: torch.Tensor | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Split VLM pixel_values and image_grid into PP microbatch chunks.
-
-    Handles four layouts:
-    1. ``[N, C, H, W]`` with ``N == batch_size`` — one full image per sample.
-    2. ``[N, max_patches, D]`` with ``N == batch_size`` — Gemma4 style (pre-padded patches per image).
-    3. Flat patches ``[total_patches, D]`` with per-sample image counts from
-       ``n_images_per_sample`` (general case, works for packed sequences too).
-    4. Flat patches with ``n_images == batch_size`` — legacy 1-image-per-sample.
-    """
-    n_images = image_grid.shape[0]
-    pixel_values_chunks: list[torch.Tensor] = []
-    image_grid_chunks: list[torch.Tensor] = []
-
-    if pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
-        # Layout 1 (4D: [N, C, H, W]) and Layout 2 (3D Gemma4: [N, max_patches, patch_dim]).
-        # Both are indexed by image along dim 0, one entry per sample.
-        pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
-        image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
-        # Gemma4 multi-image: pixel_values is [N_total_images, max_patches, patch_dim].
-        # All images are padded to the same max_patches, so split by image count directly.
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-        # Ceil division so trailing samples are not dropped when batch_size is not
-        # divisible by n_microbatches.  Mirrors torch.tensor.chunk(n) semantics used
-        # by the PP schedule on input_ids/labels — keeps image chunks aligned with
-        # text chunks even on uneven splits.
-        samples_per_mb = -(-batch_size // n_microbatches)
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-            img_start = 0 if s_start == 0 else int(cumsum_images[s_start - 1].item())
-            img_end = int(cumsum_images[s_end - 1].item()) if s_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[img_start:img_end])
-            image_grid_chunks.append(image_grid[img_start:img_end])
-    elif n_images_per_sample is not None:
-        # General case: use per-sample image counts to associate images with
-        # batch items.  Works for packed sequences (multiple images per item).
-        patch_counts = image_grid.prod(dim=1)
-        cumsum_patches = torch.cumsum(patch_counts, dim=0)
-        cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
-
-        samples_per_mb = -(-batch_size // n_microbatches)
-        for mb_idx in range(n_microbatches):
-            s_start = mb_idx * samples_per_mb
-            s_end = min(s_start + samples_per_mb, batch_size)
-
-            img_start = 0 if s_start == 0 else cumsum_images[s_start - 1].item()
-            img_end = cumsum_images[s_end - 1].item() if s_end > 0 else 0
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum_patches[img_start - 1].item()
-            patch_end = cumsum_patches[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    elif n_images == batch_size:
-        # Legacy: exactly 1 image per sample.
-        patch_counts = image_grid.prod(dim=1)
-        cumsum = torch.cumsum(patch_counts, dim=0)
-
-        images_per_mb = -(-batch_size // n_microbatches)
-        for mb_idx in range(n_microbatches):
-            img_start = mb_idx * images_per_mb
-            img_end = min(img_start + images_per_mb, n_images)
-
-            image_grid_chunks.append(image_grid[img_start:img_end])
-
-            patch_start = 0 if img_start == 0 else cumsum[img_start - 1].item()
-            patch_end = cumsum[img_end - 1].item() if img_end > 0 else 0
-            pixel_values_chunks.append(pixel_values[int(patch_start) : int(patch_end)])
-    else:
-        # No layout matched. Previously this branch logged a warning and gave all
-        # images to mb0 with empty tensors for mb1..N, but trailing microbatches
-        # whose text still contains media tokens would then scatter into empty
-        # pixel_values — silent corruption. Fail loudly so the calling collate is
-        # forced to provide n_images_per_sample (or align n_images with batch_size)
-        # instead of training on broken data.
-        raise ValueError(
-            "VLM PP chunking cannot align pixel_values with the batch: "
-            f"pixel_values.shape={tuple(pixel_values.shape)}, "
-            f"image_grid.shape={tuple(image_grid.shape)}, "
-            f"n_images={n_images}, batch_size={batch_size}, "
-            f"n_images_per_sample={'set' if n_images_per_sample is not None else 'None'}. "
-            "Either ensure pixel_values has shape [batch_size, ...] (one media tensor per "
-            "sample) or pass n_images_per_sample so the chunker can map images to samples."
-        )
-
-    return pixel_values_chunks, image_grid_chunks
+def _move_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device) if v is not None else None for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device) for v in value)
+    return value
 
 
 def build_dataloader(
@@ -360,6 +323,7 @@ def build_dataloader(
     cfg_model=None,
     cfg_ps=None,
     get_rope_index=None,
+    pp_n_microbatches=None,
 ) -> tuple[DataLoader, ProcessorMixin]:
     """Build a DataLoader for the VLM dataset.
 
@@ -379,6 +343,8 @@ def build_dataloader(
             mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
             position semantics across pack boundaries instead of falling back to
             plain 1D positions.
+        pp_n_microbatches: When set, wrap collate so VLM media tensors are
+            pre-chunked for this many PP microbatches before entering the train loop.
 
     Returns:
         The instantiated DataLoader and processor.
@@ -542,6 +508,9 @@ def build_dataloader(
         if hasattr(ds, "robust_collate"):
             collate_fn = ds.robust_collate(collate_fn)
 
+        if pp_n_microbatches is not None:
+            collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
+
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
         ), processor
@@ -669,6 +638,38 @@ def build_wandb(cfg) -> wandb.Run:
     return run
 
 
+def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:
+    """Shift ``labels`` left by ``k`` positions, padding the tail with ``-100``.
+
+    Used to build drafter-step targets in joint base + drafter training.
+
+    The VLM collate pipeline already pre-shifts labels by 1 so that
+    ``labels[t] == input_ids[t + 1]`` (the next-token target). Drafter step ``k``
+    predicts position ``t + 1 + k`` of the original sequence, which corresponds
+    to ``labels[t + k]`` in the pre-shifted convention. So for step ``k``:
+
+    * ``k = 0`` (one-step drafter) -> no shift; reuse ``labels`` as-is.
+    * ``k = 1`` -> shift labels left by 1 (drafter predicts two tokens ahead).
+    * ``k = n`` -> shift labels left by ``n``.
+
+    Args:
+        labels: ``[B, S]`` LongTensor of label ids (``-100`` marks ignored
+            positions).
+        k: Number of positions to shift to the left. ``k <= 0`` is a no-op.
+
+    Returns:
+        A new ``[B, S]`` LongTensor with ``labels[:, k:]`` in the leading slice
+        and ``-100`` in the trailing ``k`` columns. When ``k <= 0``, the input
+        is returned unchanged.
+    """
+    if k <= 0:
+        return labels
+    shifted = torch.full_like(labels, fill_value=-100)
+    if k < labels.size(-1):
+        shifted[..., : labels.size(-1) - k] = labels[..., k:]
+    return shifted
+
+
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
     """Calculate the loss.
 
@@ -762,6 +763,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = build_wandb(self.cfg)
             logging.info("🚀 View run at {}".format(run.url))
 
+        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
+            if configure_mlflow(self.cfg) is not None:
+                logging.info("MLflow experiment tracking enabled")
+
         # Log experiment details on main rank
         self._log_experiment_details()
         self._log_library_versions()
@@ -830,6 +835,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            cfg_quantization=self.cfg.get("quantization", None),
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
@@ -837,7 +843,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_moe=self.dist_setup.moe_config,
             activation_checkpointing=self.dist_setup.activation_checkpointing,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        self.optimizer = build_optimizer(
+            model,
+            self.cfg.optimizer,
+            self.distributed_config,
+            self.device_mesh,
+            is_peft=self.peft_config is not None,
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -849,11 +861,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
 
         # Extract mRoPE position-id builder from the model so VLM neat packing can
-        # produce 3D position_ids per sample. Without this, packed Qwen2.5-VL /
-        # Qwen3-VL training silently degrades mRoPE to plain 1D positions.
+        # produce 3D position_ids per sample. Without this, packed multimodal
+        # training silently degrades mRoPE to plain 1D positions.
         get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+        pp_n_microbatches = None
+        pp_cp_preembed = (
+            self.pp_enabled
+            and self.dist_setup.cp_size > 1
+            and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
+        )
+        if self.pp_enabled and not pp_cp_preembed:
+            pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         self.dataloader, self.processor = build_dataloader(
             self.cfg.dataset,
@@ -866,6 +888,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_model=self.cfg.model,
             cfg_ps=self.cfg.get("packed_sequence", None),
             get_rope_index=get_rope_index,
+            pp_n_microbatches=pp_n_microbatches,
         )
 
         # Build validation dataloader if the config provides it
@@ -965,7 +988,81 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.checkpointer.close()
 
+        # Mark the MLflow run KILLED if training exited via SIGTERM.
+        if self.step_scheduler.sigterm_flag:
+            end_mlflow_active_run_as_killed()
+
     # ------------------ helpers ------------------
+    def _maybe_add_drafter_loss(
+        self,
+        *,
+        out: Any,
+        base_loss: torch.Tensor,
+        labels: torch.Tensor,
+        model: nn.Module,
+        num_label_tokens: int,
+        log: bool = False,
+    ) -> torch.Tensor:
+        """Return ``base_loss + lambda * sum_k CE(drafter_logits[k], shifted_labels_k)``.
+
+        If ``out`` does not carry a non-empty ``drafter_logits`` attribute (i.e. the
+        model isn't a joint composite), returns ``base_loss`` unchanged.
+
+        For drafter step ``k``, labels are shifted left by ``k`` positions to match
+        the VLM collate's pre-shifted convention (``labels[t] == input_ids[t+1]``).
+        ``log=True`` emits a one-line breakdown on rank 0; callers should gate this
+        on the appropriate step / microbatch index to avoid log spam.
+        """
+        drafter_logits = getattr(out, "drafter_logits", None)
+        if drafter_logits is None or len(drafter_logits) == 0:
+            return base_loss
+
+        drafter_loss_weight = getattr(out, "drafter_loss_weight", 1.0)
+        drafter_loss_total = None
+        for k, dl in enumerate(drafter_logits):
+            shifted_labels = _shift_labels_left(labels, k)
+            l_k = calculate_loss(
+                self.loss_fn,
+                logits=dl,
+                labels=shifted_labels,
+                model=model,
+                hidden_states=None,
+                num_label_tokens=num_label_tokens,
+            )
+            drafter_loss_total = l_k if drafter_loss_total is None else drafter_loss_total + l_k
+
+        total_loss = base_loss + drafter_loss_weight * drafter_loss_total
+        if log and self.dist_env.is_main:
+            logger.info(
+                "[joint-drafter] L_base=%.4f L_drafter=%.4f L_total=%.4f (lambda=%.3f)",
+                base_loss.detach().item(),
+                drafter_loss_total.detach().item(),
+                total_loss.detach().item(),
+                drafter_loss_weight,
+            )
+        return total_loss
+
+    def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
+        if (
+            not self.pp_enabled
+            or not getattr(self.pp.info, "has_first_stage", False)
+            or not model_input.dtype.is_floating_point
+            or model_input.ndim != 3
+        ):
+            return
+
+        for stage in self.pp.info.stages:
+            if stage.is_first:
+                stage.inputs_meta = (
+                    torch.empty(
+                        self.pp.pp_microbatch_size,
+                        model_input.shape[1],
+                        model_input.shape[2],
+                        device="meta",
+                        dtype=model_input.dtype,
+                    ),
+                )
+
     def _forward_backward_step(
         self,
         idx,
@@ -976,14 +1073,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
+        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
         # Routed through __call__ so FSDP2 forward pre-hook fires and
         # unshards the vision tower's weights before the embed/scatter.
@@ -992,15 +1082,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
         )
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
+            if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
+                mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
+                with torch.no_grad():
+                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                for k in VLM_INPUT_KEYS:
+                    batch.pop(k, None)
+                batch.update(prepared)
+            else:
+                for k in VLM_INPUT_KEYS:
+                    if k != "input_ids":
+                        batch.pop(k, None)
 
         train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
@@ -1018,86 +1112,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 else:
                     targets = None
 
-                input_ids = batch.pop("input_ids")
-                self.pp.update_seq_len(input_ids.shape[1])
+                model_input_key = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+                model_input = batch.pop(model_input_key)
+                self.pp.update_seq_len(model_input.shape[1])
+                self._maybe_set_pp_first_stage_embed_input_meta(model_input)
 
-                # VLM: Custom chunking for pixel_values and image_grid
-                # These tensors have non-standard structure that can't be naively chunked by dim 0
-                # TODO: @HuiyingLi properly handle pixel_values split
-                pixel_values = batch.pop("pixel_values", None)
-                image_grid_hws = batch.pop("image_grid_hws", None)
-                image_grid_thw = batch.pop("image_grid_thw", None)
-                image_sizes = batch.pop("image_sizes", None)
-                image_position_ids = batch.pop("image_position_ids", None)
-                n_images_per_sample = batch.pop("n_images_per_sample", None)
-                pixel_values_videos = batch.pop("pixel_values_videos", None)
-                video_grid_thw = batch.pop("video_grid_thw", None)
-                n_videos_per_sample = batch.pop("n_videos_per_sample", None)
-
-                image_grid = image_grid_hws if image_grid_hws is not None else image_grid_thw
-                if image_grid is None and image_sizes is not None:
-                    image_grid = image_sizes
-                if image_grid is None and image_position_ids is not None:
-                    image_grid = image_position_ids
-
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    n_microbatches = self.pp._info.schedule._n_microbatches
-                    batch_size = input_ids.shape[0]
-
-                    pixel_values_chunks, image_grid_chunks = _chunk_vlm_media(
-                        pixel_values,
-                        image_grid,
-                        batch_size,
-                        n_microbatches,
-                        n_images_per_sample=n_images_per_sample,
-                    )
-
-                    # Store pre-chunked tensors on model for forward to use
-                    stage0_model._vlm_pixel_values_chunks = pixel_values_chunks
-                    stage0_model._vlm_image_grid_hws_chunks = image_grid_chunks
-                    stage0_model._vlm_chunk_idx = 0
-                elif pixel_values is not None:
-                    batch["pixel_values"] = pixel_values
-
-                if self.pp.info.has_first_stage and pixel_values_videos is not None and video_grid_thw is not None:
-                    stage0_model = self.model_parts[0]
-                    n_microbatches = self.pp._info.schedule._n_microbatches
-                    batch_size = input_ids.shape[0]
-
-                    pixel_values_videos_chunks, video_grid_thw_chunks = _chunk_vlm_media(
-                        pixel_values_videos,
-                        video_grid_thw,
-                        batch_size,
-                        n_microbatches,
-                        n_images_per_sample=n_videos_per_sample,
-                    )
-
-                    stage0_model._vlm_pixel_values_videos_chunks = pixel_values_videos_chunks
-                    stage0_model._vlm_video_grid_thw_chunks = video_grid_thw_chunks
-                    stage0_model._vlm_chunk_idx = 0
-                else:
-                    if pixel_values_videos is not None:
-                        batch["pixel_values_videos"] = pixel_values_videos
-                    if video_grid_thw is not None:
-                        batch["video_grid_thw"] = video_grid_thw
-
-                if self.pp.info.has_first_stage:
-                    self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch)
-                else:
-                    self.pp.info.schedule.step(target=targets, losses=losses, **batch)
-
-                # Clear stored VLM chunks after PP step
-                if self.pp.info.has_first_stage and pixel_values is not None and image_grid is not None:
-                    stage0_model = self.model_parts[0]
-                    stage0_model._vlm_pixel_values_chunks = None
-                    stage0_model._vlm_image_grid_hws_chunks = None
-                    stage0_model._vlm_chunk_idx = None
-                if self.pp.info.has_first_stage and pixel_values_videos is not None and video_grid_thw is not None:
-                    stage0_model = self.model_parts[0]
-                    stage0_model._vlm_pixel_values_videos_chunks = None
-                    stage0_model._vlm_video_grid_thw_chunks = None
-                    stage0_model._vlm_chunk_idx = None
+                with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(model_input, target=targets, losses=losses, **batch)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch)
 
             if self.pp.info.has_last_stage:
                 local_loss = torch.sum(torch.stack(losses))
@@ -1134,12 +1158,59 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                    hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                # DSV4-style MTP loss (from main): triggers when the model emits
+                # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=out.mtp_loss_scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                    )
+
+                # Joint base + drafter co-training (Gemma4WithDrafter and
+                # similar): detect by presence of ``drafter_logits`` on the
+                # model output and add
+                # ``drafter_loss_weight * sum_k CE(drafter_logits[k], shifted_labels_k)``
+                # to the base loss. See ``_shift_labels_left`` for the shift
+                # convention. Mutually exclusive with the DSV4-style MTP path
+                # above -- only one of ``drafter_logits`` /
+                # ``mtp_per_depth_*`` is set per model.
+                local_loss = self._maybe_add_drafter_loss(
+                    out=out,
+                    base_loss=local_loss,
+                    labels=labels,
+                    model=model,
+                    num_label_tokens=num_label_tokens,
+                    # Log once per remote-logging step on the first microbatch.
+                    log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
+                )
+
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = PipelineCausalLMLoss(self.loss_fn, last_stage_model)
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1192,6 +1263,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+
+            if i == 0:
+                prepare_after_first_microbatch()
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm=max_grad_norm,
@@ -1336,6 +1410,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         else None,
                         num_label_tokens=num_label_tokens,
                     )
+                    # Mirror training: include the drafter term so validation
+                    # reflects drafter drift, not just the base.
+                    local_loss = self._maybe_add_drafter_loss(
+                        out=out,
+                        base_loss=local_loss,
+                        labels=labels,
+                        model=self.model_parts[0],
+                        num_label_tokens=num_label_tokens,
+                    )
                     total_num_label_tokens += num_label_tokens
 
                 total_loss += local_loss.item() * num_label_tokens
@@ -1378,6 +1461,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
 
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
 
@@ -1403,10 +1489,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
+        # Log to remote services (WandB, MLflow) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

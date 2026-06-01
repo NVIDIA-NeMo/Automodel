@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 class VideoDecoder:
+    """Decode preprocessed diffusion latent metadata back into videos."""
+
     def __init__(
         self,
         wan21_model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",

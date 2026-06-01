@@ -193,26 +193,6 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
-def attach_linear_attn_position_hooks(model: torch.nn.Module):
-    """Forward pre-hook on decoder layers to pass position_ids to linear_attn.
-
-    HF Qwen3.5 decoder layers don't pass position_ids to linear_attn, but
-    CPAwareGatedDeltaNet needs them under CP to undo load-balanced sharding.
-    This hook captures position_ids from the decoder layer's kwargs and
-    stores it on the linear_attn module so its forward can read it.
-    """
-
-    def _decoder_pre_hook(_module, _args, kwargs):
-        _module.linear_attn._cached_position_ids = kwargs.get("position_ids", None)
-        return None
-
-    for _, mod in model.named_modules():
-        if hasattr(mod, "linear_attn") and hasattr(mod, "layer_type"):
-            if not getattr(mod, "_linear_attn_pos_hook_registered", False):
-                mod.register_forward_pre_hook(_decoder_pre_hook, with_kwargs=True)
-                mod._linear_attn_pos_hook_registered = True
-
-
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -285,8 +265,15 @@ def make_cp_batch_and_ctx(
     seq_len = primary_seq_tensor.shape[1]
 
     # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
+    batch_size = primary_seq_tensor.shape[0]
     if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, seq_len).unsqueeze(0).to(primary_seq_tensor.device)
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    elif "position_ids" in batch:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
 
     position_ids = batch["position_ids"]
 
