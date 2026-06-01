@@ -375,6 +375,56 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Enable activation checkpointing on each transformer (and MTP) block.
+
+        Wraps every decoder block (and MTP block, when present) with a
+        non-reentrant checkpoint wrapper so that block activations are recomputed
+        during the backward pass instead of being stored. This is the single-GPU
+        entry point: ``FSDP2Manager.parallelize`` calls it when ``world_size == 1``
+        (the expert-parallel path performs the equivalent wrapping inside the MoE
+        parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
+        keeps every block's activations live, which is what pushes single-GPU LoRA
+        SFT over a single 80GB device. Idempotent.
+
+        Args:
+            gradient_checkpointing_kwargs: Accepted for HF API compatibility;
+                currently unused (NO_REENTRANT wrapping is always used).
+        """
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        if getattr(self, "_gradient_checkpointing", False):
+            return
+
+        def _wrap(block):
+            return checkpoint_wrapper(block, checkpoint_impl=CheckpointImpl.NO_REENTRANT, preserve_rng_state=True)
+
+        containers = [self.model.layers]
+        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+            containers.append(self.mtp.layers)
+        for layers in containers:
+            for layer_id, block in list(layers.named_children()):
+                layers.register_module(layer_id, _wrap(block))
+        self._gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Unwrap any checkpoint-wrapped blocks (inverse of ``gradient_checkpointing_enable``)."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        if not getattr(self, "_gradient_checkpointing", False):
+            return
+        containers = [self.model.layers]
+        if self.mtp is not None and getattr(self.mtp, "layers", None) is not None:
+            containers.append(self.mtp.layers)
+        for layers in containers:
+            for layer_id, block in list(layers.named_children()):
+                if isinstance(block, CheckpointWrapper):
+                    layers.register_module(layer_id, block._checkpoint_wrapped_module)
+        self._gradient_checkpointing = False
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
