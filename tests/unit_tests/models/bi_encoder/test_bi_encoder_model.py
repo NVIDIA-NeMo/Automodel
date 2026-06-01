@@ -325,10 +325,13 @@ def test_forward_backward_step_supports_local_multi_vector_pooling():
 def test_validation_epoch_supports_multi_vector_pooling():
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
-    recipe.model_parts = [_ToyMultiVectorBiEncoder()]
+    model = _ToyMultiVectorBiEncoder()
+    model.do_distributed_inbatch_negative = False
+    recipe.model_parts = [model]
     recipe.temperature = 1.0
     recipe.val_n_passages = 2
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.device_mesh = None
 
     val_dataloader = [
         {
