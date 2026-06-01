@@ -102,6 +102,12 @@ def _convert_tool_calls(raw_calls: List[Dict], example_id: Optional[int] = None)
             logger.warning("Skipping call without name: %s", call)
             continue
         arguments = call.get("arguments", "")
+        if not isinstance(arguments, str):
+            # OpenAI tool calling format requires `function.arguments` to be a
+            # JSON-encoded string. Upstream xLAM uses string arguments, but
+            # derivative datasets may store them as dicts; serialize so the
+            # rendered chat template emits a consistent, valid JSON payload.
+            arguments = json.dumps(arguments, ensure_ascii=False)
 
         call_id = f"call_{example_id}_{idx}" if example_id is not None else f"call_{idx}"
         tool_calls.append(
@@ -110,7 +116,6 @@ def _convert_tool_calls(raw_calls: List[Dict], example_id: Optional[int] = None)
                 "type": "function",
                 "function": {
                     "name": name,
-                    # Keep arguments as JSON string per OpenAI tool calling format.
                     "arguments": arguments,
                 },
             }
