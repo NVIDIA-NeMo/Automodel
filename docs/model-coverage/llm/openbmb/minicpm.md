@@ -1,6 +1,6 @@
 # MiniCPM
 
-[MiniCPM](https://github.com/OpenBMB/MiniCPM) is a compact language model series from OpenBMB / Tsinghua University, designed to deliver strong performance at small parameter counts using model merging and continuous training techniques.
+[MiniCPM](https://github.com/OpenBMB/MiniCPM) is a compact language model series from OpenBMB and Tsinghua University, designed to deliver strong performance at small parameter counts using model merging and continuous training techniques.
 
 :::{card}
 | | |
