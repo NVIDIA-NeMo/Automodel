@@ -33,6 +33,12 @@ recipe_args:
   num_epochs: 1
   ttt_steps: 4
   draft_vocab_size: 8192
+  # Optional cache for the draft-vocab selection. The recipe otherwise scans
+  # the whole training set every run to rank token frequencies; set this to a
+  # path and the first run writes it while later runs load it and skip the scan.
+  # The cache is keyed only on the target/draft vocab sizes -- point it at a
+  # fresh path (or delete the file) if you change the training data.
+  # selected_token_ids_path: ./outputs/eagle3_llama_mvp/draft_token_map.pt
   freeze_embeddings: true
   trust_remote_code: false
   shuffle_seed: 42
