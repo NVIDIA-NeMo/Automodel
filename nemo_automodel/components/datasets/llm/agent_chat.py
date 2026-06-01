@@ -338,6 +338,23 @@ def _format_example_impl(
     )
     if train_on_last_turn_only:
         _mask_labels_to_last_turn(tokenized["labels"])
+
+    # Truncation (or over-aggressive last-turn masking) can leave a sample with no
+    # supervised tokens at all — every label is ``ignore_index`` (-100). A single
+    # such sample is harmless: the loss normalizes by the batch's supervised-token
+    # count, so it just contributes nothing (a NaN only arises if a *whole* step is
+    # empty, which signals a misconfigured seq_length/truncation). Rather than
+    # hard-failing the run on one example, warn (with the id) and let it through — it
+    # is already effectively skipped from the gradient, and the map-style
+    # dataset/collator cannot drop a row in place at this stage.
+    labels = tokenized.get("labels")
+    if labels is not None and all(label == -100 for label in labels):
+        logger.warning(
+            "Agent SFT example (id=%r) has no supervised tokens (all labels masked); it "
+            "contributes nothing to the loss. This usually means truncation dropped every "
+            "assistant turn — increase seq_length or disable truncation.",
+            example.get("id"),
+        )
     return tokenized
 
 

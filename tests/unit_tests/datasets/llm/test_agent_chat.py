@@ -723,3 +723,44 @@ def test_make_agent_chat_dataset_no_warning_when_seq_length_used(monkeypatch, ca
     with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
         agent_chat.make_agent_chat_dataset(tokenizer=Tok(), dataset_name="dummy/agent")
     assert not any("has no effect" in r.getMessage() for r in caplog.records)
+
+
+def test_format_example_warns_and_keeps_when_all_labels_masked(monkeypatch, caplog):
+    # If truncation drops every assistant token the loss mask is all-ignore. A
+    # single such sample is harmless (it contributes nothing to the batch-normalized
+    # loss), so the renderer warns with the id and returns the sample as-is rather
+    # than hard-failing the run.
+    monkeypatch.setattr(
+        agent_chat,
+        "format_chat_template",
+        lambda **kw: {"input_ids": [1, 2, 3], "labels": [-100, -100, -100]},
+    )
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 123, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.datasets.llm.agent_chat"):
+        result = agent_chat._format_example(example, Tok(), 0, 0)
+    # Sample is kept unchanged (not dropped, not raised on).
+    assert result["labels"] == [-100, -100, -100]
+    # Warning fired and names the offending example id.
+    warnings = [r.getMessage() for r in caplog.records if "no supervised tokens" in r.getMessage()]
+    assert warnings and "123" in warnings[0]
+
+
+def test_format_example_ok_when_some_label_supervised(monkeypatch):
+    # A sample with at least one supervised label passes through unchanged.
+    monkeypatch.setattr(
+        agent_chat,
+        "format_chat_template",
+        lambda **kw: {"input_ids": [1, 2, 3], "labels": [-100, 2, 3]},
+    )
+
+    class Tok:
+        eos_token_id = 0
+        pad_token_id = 0
+
+    example = {"id": 1, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
+    assert agent_chat._format_example(example, Tok(), 0, 0)["labels"] == [-100, 2, 3]
