@@ -212,6 +212,15 @@ class LlamaRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (cos, sin) for the given positions.
 
+        ``cos`` / ``sin`` are gathered by the *values* in ``position_ids``, so
+        non-contiguous positions receive the correct rotary phase: EAGLE TTT
+        depth offsets (``arange(seq_len) + step_idx``), packed sequences, and
+        context parallelism all pass ``position_ids != arange(seq_len)``. The
+        earlier implementation returned ``cos_cache[:seq_len]``, which keyed
+        only on the sequence *length* and silently ignored the position values.
+        For the common ``position_ids == arange(seq_len)`` case the gather is
+        numerically identical to that slice.
+
         Args:
             x: Input tensor (used for device and dtype)
             position_ids: Position IDs tensor [batch, seq_len]
@@ -219,18 +228,25 @@ class LlamaRotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) tensors [batch, seq_len, head_dim]
         """
-        seq_len = position_ids.shape[-1]
-
-        # Build cache if needed
-        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
-            self._build_cache(seq_len, x.device)
-
-        # Slice cache and expand for batch
-        cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-        sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
+        # Size the cache to the highest requested position. ``position_ids`` can
+        # exceed its own length (e.g. EAGLE TTT passes ``arange(seq_len) + k``),
+        # so ``seq_len`` alone is not a safe upper bound.
+        needed = max(int(position_ids.max().item()) + 1, position_ids.shape[-1])
+        if self._cos_cache is None or needed > self.max_seq_len_cached:
+            self._build_cache(needed, x.device)
 
         if self.rope_fusion:
+            # The fused TE kernel consumes raw angles indexed by sequence
+            # position and assumes contiguous ``[0, seq_len)`` positions; keep
+            # the legacy contiguous slice for that path.
+            seq_len = position_ids.shape[-1]
+            cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
+            sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             return cos, sin, self._freqs_cache[:seq_len]
+
+        # Gather per-position; identical to ``cos_cache[:seq_len]`` for arange.
+        cos = self._cos_cache[position_ids]
+        sin = self._sin_cache[position_ids]
         return cos, sin
 
 
