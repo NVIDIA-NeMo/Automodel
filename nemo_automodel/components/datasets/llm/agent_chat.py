@@ -543,6 +543,22 @@ def make_agent_chat_dataset(
     if (dataset_name is None) == (path is None):
         raise ValueError("Exactly one of `dataset_name` or `path` must be provided")
 
+    # ``seq_length`` is forwarded to ``apply_chat_template(max_length=...)``, which
+    # the tokenizer only honors when truncation is enabled (to cap the length) or
+    # when ``padding="max_length"`` (to pad up to it). With the defaults
+    # (``truncation=False``, ``padding=False``) ``max_length`` is ignored, so
+    # ``seq_length`` silently has no effect and over-long dialogues pass through
+    # uncapped. Warn rather than silently dropping tokens by flipping truncation on.
+    truncation_active = bool(truncation) and truncation != "do_not_truncate"
+    if seq_length is not None and not truncation_active and padding != "max_length":
+        logger.warning(
+            "`seq_length=%s` has no effect: truncation is disabled and `padding` is not "
+            "'max_length', so the tokenizer ignores `max_length` and dialogues are not "
+            "capped. Set `truncation=True` to cap long dialogues, or `padding='max_length'` "
+            "to pad to `seq_length`.",
+            seq_length,
+        )
+
     if dataset_name is not None:
         if limit_dataset_samples is not None:
             assert isinstance(limit_dataset_samples, int), "Expected limit_dataset_samples to be an int"
