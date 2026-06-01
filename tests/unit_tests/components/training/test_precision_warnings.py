@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-from types import SimpleNamespace
 
 import torch
 
@@ -59,9 +58,11 @@ def test_skips_full_fp32_training(caplog):
     assert _WARNING_PREFIX not in caplog.text
 
 
-def test_warns_from_optimizer_config_target_and_parameters(caplog):
+def test_warns_from_optimizer_from_factory_config(caplog):
+    from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig
+
     param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
-    optimizer_cfg = SimpleNamespace(_target_="torch.optim.AdamW")
+    optimizer_cfg = OptimizerFromFactoryConfig(factory=torch.optim.AdamW, kwargs={"lr": 1.0e-4})
 
     with caplog.at_level(logging.WARNING):
         warn_if_torch_adam_with_bf16_params(
@@ -71,3 +72,34 @@ def test_warns_from_optimizer_config_target_and_parameters(caplog):
         )
 
     assert _WARNING_PREFIX in caplog.text
+
+
+def test_warns_from_typed_adamw_config(caplog):
+    from nemo_automodel.components.optim.optimizer import AdamWConfig
+
+    param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+
+    with caplog.at_level(logging.WARNING):
+        warn_if_torch_adam_with_bf16_params(
+            optimizer_cfg=AdamWConfig(lr=1.0e-4),
+            parameters=[param],
+            context="unit-test",
+        )
+
+    assert _WARNING_PREFIX in caplog.text
+
+
+def test_skips_non_torch_adam_factory_config(caplog):
+    from nemo_automodel.components.optim.optimizer import OptimizerFromFactoryConfig
+
+    param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    optimizer_cfg = OptimizerFromFactoryConfig(factory=torch.optim.SGD, kwargs={"lr": 1.0e-4})
+
+    with caplog.at_level(logging.WARNING):
+        warn_if_torch_adam_with_bf16_params(
+            optimizer_cfg=optimizer_cfg,
+            parameters=[param],
+            context="unit-test",
+        )
+
+    assert _WARNING_PREFIX not in caplog.text

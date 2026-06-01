@@ -23,6 +23,7 @@ from nemo_automodel.components.optim.optimizer import (
     AdamWConfig,
     LRSchedulerConfig,
     OptimizerConfig,
+    OptimizerFromFactoryConfig,
     build_optimizer,
 )
 
@@ -50,7 +51,7 @@ class TestAdamConfig:
 
     def test_build_returns_adam_with_fields(self):
         cfg = AdamConfig(lr=2e-4, betas=(0.8, 0.99), amsgrad=True, weight_decay=0.05)
-        opt = cfg.build(_params())
+        opt = cfg._build_optimizer(_params())
         assert isinstance(opt, torch.optim.Adam)
         group = opt.param_groups[0]
         assert group["lr"] == 2e-4
@@ -59,7 +60,7 @@ class TestAdamConfig:
         assert group["weight_decay"] == 0.05
 
     def test_build_forwards_foreach(self):
-        opt = AdamConfig().build(_params(), foreach=False)
+        opt = AdamConfig()._build_optimizer(_params(), foreach=False)
         assert opt.param_groups[0]["foreach"] is False
 
 
@@ -70,22 +71,22 @@ class TestAdamWConfig:
         assert cfg.weight_decay == 0.01
 
     def test_build_returns_adamw(self):
-        opt = AdamWConfig(lr=1e-3).build(_params(), foreach=False)
+        opt = AdamWConfig(lr=1e-3)._build_optimizer(_params(), foreach=False)
         assert isinstance(opt, torch.optim.AdamW)
         assert opt.param_groups[0]["lr"] == 1e-3
         assert opt.param_groups[0]["foreach"] is False
 
     def test_build_fused_skips_foreach(self):
-        # fused and foreach are mutually exclusive; foreach must not be forwarded.
-        opt = AdamWConfig(fused=True).build(_params(), foreach=False)
+        # fused and foreach are mutually exclusive; foreach is disabled when fused.
+        opt = AdamWConfig(fused=True)._build_optimizer(_params(), foreach=False)
         assert opt.param_groups[0]["fused"] is True
-        assert opt.param_groups[0]["foreach"] is None
+        assert not opt.param_groups[0]["foreach"]
 
 
 class TestOptimizerConfigBase:
     def test_base_build_not_implemented(self):
         with pytest.raises(NotImplementedError):
-            OptimizerConfig().build(_params())
+            OptimizerConfig()._build_optimizer(_params())
 
 
 # ---------------------------------------------------------------------------
@@ -125,32 +126,76 @@ class TestBuildOptimizer:
         optimizers = build_optimizer(_model(), AdamConfig(), device_mesh=FakeMesh())
         assert optimizers[0].param_groups[0]["foreach"] is False
 
-    def test_config_with_kwargs_raises(self):
-        with pytest.raises(ValueError, match="must be set on the config"):
-            build_optimizer(_model(), AdamWConfig(), lr=1e-3)
-
     def test_config_class_instead_of_instance_raises(self):
-        with pytest.raises(TypeError, match="instance, not the class"):
+        with pytest.raises(TypeError, match="OptimizerConfig instance or a"):
             build_optimizer(_model(), AdamWConfig)
 
 
 # ---------------------------------------------------------------------------
-# build_optimizer — class / callable form (integration escape hatch)
+# OptimizerFromFactoryConfig
 # ---------------------------------------------------------------------------
 
 
-class TestBuildOptimizerEscapeHatch:
-    def test_resolved_class(self):
-        optimizers = build_optimizer(_model(), torch.optim.SGD, lr=0.01, momentum=0.9)
+class TestOptimizerFromFactoryConfig:
+    def test_build_constructs_from_factory(self):
+        cfg = OptimizerFromFactoryConfig(
+            factory=torch.optim.SGD,
+            kwargs={"lr": 0.01, "momentum": 0.9},
+        )
+        optimizers = cfg.build(_model())
+        assert len(optimizers) == 1
         assert isinstance(optimizers[0], torch.optim.SGD)
         assert optimizers[0].param_groups[0]["momentum"] == 0.9
 
-    def test_arbitrary_new_optimizer_no_typed_config(self):
-        # Adding support for a new optimizer requires no code change here:
-        # any optimizer class + kwargs works (caller resolves dotted paths).
-        optimizers = build_optimizer(_model(), torch.optim.RMSprop, lr=0.01, alpha=0.95)
+    def test_build_resolves_dtype_string_kwargs(self):
+        captured = {}
+
+        def fake_factory(params, **kwargs):
+            captured.update(kwargs)
+            return torch.optim.SGD(params, lr=kwargs.get("lr", 0.01))
+
+        OptimizerFromFactoryConfig(
+            factory=fake_factory,
+            kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16"},
+        ).build(_model())
+        assert captured["master_weight_dtype"] is torch.bfloat16
+
+    def test_build_requires_callable_factory(self):
+        with pytest.raises(AssertionError, match="must be a callable"):
+            OptimizerFromFactoryConfig(factory=None).build(_model())
+
+
+# ---------------------------------------------------------------------------
+# build_optimizer — (name_or_path, kwargs) tuple form
+# ---------------------------------------------------------------------------
+
+
+class TestBuildOptimizerTuple:
+    def test_registry_name_builds_typed_config(self):
+        optimizers = build_optimizer(_model(), ("adamw", {"lr": 1e-3, "betas": (0.9, 0.95)}))
+        assert isinstance(optimizers[0], torch.optim.AdamW)
+        assert optimizers[0].param_groups[0]["lr"] == 1e-3
+        assert optimizers[0].param_groups[0]["betas"] == (0.9, 0.95)
+
+    def test_registry_name_is_case_insensitive(self):
+        optimizers = build_optimizer(_model(), ("Adam", {"lr": 2e-4}))
+        assert isinstance(optimizers[0], torch.optim.Adam)
+        assert optimizers[0].param_groups[0]["lr"] == 2e-4
+
+    def test_import_path_to_torch_optimizer(self):
+        optimizers = build_optimizer(_model(), ("torch.optim.SGD", {"lr": 0.01, "momentum": 0.9}))
+        assert isinstance(optimizers[0], torch.optim.SGD)
+        assert optimizers[0].param_groups[0]["momentum"] == 0.9
+
+    def test_import_path_to_torch_optimizer_no_kwargs(self):
+        optimizers = build_optimizer(_model(), ("torch.optim.RMSprop", {}))
         assert isinstance(optimizers[0], torch.optim.RMSprop)
-        assert optimizers[0].param_groups[0]["alpha"] == 0.95
+
+    def test_import_path_to_optimizer_config(self):
+        path = "nemo_automodel.components.optim.optimizer.AdamConfig"
+        optimizers = build_optimizer(_model(), (path, {"lr": 3e-4}))
+        assert isinstance(optimizers[0], torch.optim.Adam)
+        assert optimizers[0].param_groups[0]["lr"] == 3e-4
 
     def test_resolves_dtype_string_kwargs(self):
         # dtype strings (e.g. for TE FusedAdam) are resolved to torch.dtype objects.
@@ -162,17 +207,75 @@ class TestBuildOptimizerEscapeHatch:
 
         build_optimizer(
             _model(),
-            fake_factory,
-            lr=1e-3,
-            master_weight_dtype="torch.bfloat16",
-            exp_avg_dtype="float16",
+            OptimizerFromFactoryConfig(
+                factory=fake_factory,
+                kwargs={"lr": 1e-3, "master_weight_dtype": "torch.bfloat16", "exp_avg_dtype": "float16"},
+            ),
         )
         assert captured["master_weight_dtype"] is torch.bfloat16
         assert captured["exp_avg_dtype"] is torch.float16
 
-    def test_non_callable_raises(self):
-        with pytest.raises(TypeError, match="class/callable"):
-            build_optimizer(_model(), "torch.optim.AdamW", lr=1e-3)
+    def test_unknown_import_path_raises(self):
+        with pytest.raises(ImportError):
+            build_optimizer(_model(), ("torch.optim.NotAnOptimizer", {"lr": 1e-3}))
+
+    def test_bare_name_without_dot_raises(self):
+        # Not in the registry and not a dotted path.
+        with pytest.raises(ValueError, match="dotted import path"):
+            build_optimizer(_model(), ("lamb", {"lr": 1e-3}))
+
+    def test_non_tuple_non_config_raises(self):
+        with pytest.raises(TypeError, match="OptimizerConfig instance or a"):
+            build_optimizer(_model(), 123)
+
+    def test_tuple_wrong_length_raises(self):
+        with pytest.raises(TypeError, match="length 2"):
+            build_optimizer(_model(), ("adamw",))
+
+    def test_tuple_non_string_name_raises(self):
+        with pytest.raises(TypeError, match="registry name or import-path string"):
+            build_optimizer(_model(), (torch.optim.SGD, {"lr": 0.01}))
+
+    def test_tuple_non_dict_kwargs_raises(self):
+        with pytest.raises(TypeError, match="dict of kwargs"):
+            build_optimizer(_model(), ("adamw", [("lr", 1e-3)]))
+
+
+# ---------------------------------------------------------------------------
+# Dion-family typed configs (Dion / Dion2 / Muon / NorMuon)
+# ---------------------------------------------------------------------------
+
+
+class TestDionFamilyConfigs:
+    """The dion-family configs share a per-part Dion ``build`` and forward their
+    fields to ``build_dion_optimizer``; they resolve from the registry by name.
+    (Construction is not exercised here because ``dion`` may not be installed.)"""
+
+    def test_registry_resolves_to_config_types(self):
+        from nemo_automodel.components.optim.optimizer import (
+            Dion2Config,
+            DionConfig,
+            MuonConfig,
+            NorMuonConfig,
+            build_optimizer_config,
+        )
+
+        cases = {
+            "muon": MuonConfig,
+            "normuon": NorMuonConfig,
+            "dion": DionConfig,
+            "dion2": Dion2Config,
+        }
+        for name, cls in cases.items():
+            cfg = build_optimizer_config(name, {"lr": 1e-3})
+            assert isinstance(cfg, cls)
+            assert cfg.lr == pytest.approx(1e-3)
+
+    def test_config_specific_fields(self):
+        from nemo_automodel.components.optim.optimizer import Dion2Config, NorMuonConfig
+
+        assert Dion2Config(fraction=0.5, ef_decay=0.9).fraction == pytest.approx(0.5)
+        assert NorMuonConfig(muon_beta2=0.99).muon_beta2 == pytest.approx(0.99)
 
 
 # ---------------------------------------------------------------------------

@@ -28,12 +28,11 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
     stage_vlm_media_for_pp,
 )
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
-from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
+from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import (
     _STEP_SCHEDULER_RUNTIME_KEYS,
     CheckpointSpec,
-    OptimizerSpec,
     _as_dict,
     _callable_and_kwargs,
     _section_kwargs,
@@ -47,7 +46,7 @@ from nemo_automodel.recipes.vlm.finetune import (
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
     """Resolve a YAML optimizer block and build it (mirrors ``RecipeConfig.optimizer.build``)."""
-    return OptimizerSpec(*_callable_and_kwargs(cfg_opt)).build(
+    return build_optimizer_config(*_callable_and_kwargs(cfg_opt)).build(
         model, distributed_config=distributed_config, device_mesh=device_mesh
     )
 
@@ -2539,7 +2538,10 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
-    monkeypatch.setattr("nemo_automodel.recipes._typed_config.OptimizerSpec.build", lambda self, *a, **k: [dummy_opt])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
+    )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",

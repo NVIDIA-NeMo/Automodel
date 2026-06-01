@@ -21,11 +21,14 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
 ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler`` map to component config
-dataclasses, while the ``_target_``-based ``optimizer``/``loss_fn`` and the
-``checkpoint`` block map to small recipe-layer "spec" wrappers (``OptimizerSpec``,
-``LossSpec``, ``CheckpointSpec``) that resolve the YAML and delegate to the pure
-component builders.  Sections with no typed view (e.g. ``model``, ``comet``) fall
-through to the raw ``ConfigNode`` via ``__getattr__``.
+dataclasses, the ``optimizer`` block resolves to an
+:class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` via
+``build_optimizer_config`` (which itself owns a ``build()``), while the
+``_target_``-based ``loss_fn`` and the ``checkpoint`` block map to small
+recipe-layer "spec" wrappers (``LossSpec``, ``CheckpointSpec``) that resolve the
+YAML and delegate to the pure component builders.  Sections with no typed view
+(e.g. ``model``, ``comet``) fall through to the raw ``ConfigNode`` via
+``__getattr__``.
 
 This is the recipe layer, so it is allowed to know the YAML schema (which keys
 are runtime args, ``_target_`` resolution, etc.); the components themselves stay
@@ -45,6 +48,7 @@ from nemo_automodel.components.training.step_scheduler import StepSchedulerConfi
 
 if TYPE_CHECKING:
     from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.optim.optimizer import OptimizerConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -98,30 +102,6 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 
 
 @dataclass(frozen=True)
-class OptimizerSpec:
-    """Resolved ``optimizer:`` section: a factory callable plus its kwargs.
-
-    ``build`` delegates to the pure component ``build_optimizer`` (which accepts a
-    callable or an ``OptimizerConfig``); the YAML/``_target_`` knowledge stays here
-    in the recipe layer.
-    """
-
-    factory: Callable[..., Any]
-    kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def build(self, model: Any, *, distributed_config: Any = None, device_mesh: Any = None) -> Any:
-        from nemo_automodel.components.optim import build_optimizer
-
-        return build_optimizer(
-            model,
-            self.factory,
-            distributed_config=distributed_config,
-            device_mesh=device_mesh,
-            **self.kwargs,
-        )
-
-
-@dataclass(frozen=True)
 class LossSpec:
     """Resolved ``loss_fn:`` section: a factory callable plus its kwargs."""
 
@@ -158,8 +138,9 @@ class RecipeConfig:
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
     ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
-    ``.build(...)``; all other attributes delegate to the underlying
-    ``ConfigNode``.
+    ``.build(...)`` (``optimizer`` is an
+    :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`); all
+    other attributes delegate to the underlying ``ConfigNode``.
     """
 
     def __init__(self, raw: ConfigNode):
@@ -168,7 +149,7 @@ class RecipeConfig:
     @cached_property
     def wandb(self) -> WandbConfig | None:
         node = self._raw.get("wandb", None)
-        return WandbConfig(**_section_kwargs(node)) if node is not None else None
+        return WandbConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def mlflow(self) -> MLflowConfig | None:
@@ -186,15 +167,17 @@ class RecipeConfig:
     @cached_property
     def lr_scheduler(self) -> LRSchedulerConfig | None:
         node = self._raw.get("lr_scheduler", None)
-        return LRSchedulerConfig(**_section_kwargs(node)) if node is not None else None
+        return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
-    def optimizer(self) -> OptimizerSpec | None:
+    def optimizer(self) -> OptimizerConfig | None:
+        from nemo_automodel.components.optim.optimizer import build_optimizer_config
+
         node = self._raw.get("optimizer", None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
-        return OptimizerSpec(factory, kwargs)
+        return build_optimizer_config(factory, kwargs)
 
     @cached_property
     def loss_fn(self) -> LossSpec | None:
