@@ -21,14 +21,14 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
 ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler`` map to component config
-dataclasses, the ``optimizer`` block resolves to an
-:class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` via
-``build_optimizer_config`` (which itself owns a ``build()``), while the
-``_target_``-based ``loss_fn`` and the ``checkpoint`` block map to small
-recipe-layer "spec" wrappers (``LossSpec``, ``CheckpointSpec``) that resolve the
-YAML and delegate to the pure component builders.  Sections with no typed view
-(e.g. ``model``, ``comet``) fall through to the raw ``ConfigNode`` via
-``__getattr__``.
+dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+:class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
+:class:`~nemo_automodel.components.loss.loss.LossConfig` via
+``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
+while the ``checkpoint`` block maps to a small recipe-layer "spec" wrapper
+(``CheckpointSpec``) that resolves the YAML and delegates to the pure component
+builder.  Sections with no typed view (e.g. ``model``, ``comet``) fall through
+to the raw ``ConfigNode`` via ``__getattr__``.
 
 This is the recipe layer, so it is allowed to know the YAML schema (which keys
 are runtime args, ``_target_`` resolution, etc.); the components themselves stay
@@ -38,7 +38,7 @@ YAML-free.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +48,7 @@ from nemo_automodel.components.training.step_scheduler import StepSchedulerConfi
 
 if TYPE_CHECKING:
     from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
@@ -99,19 +100,6 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
             return model_config
         return model_config.get("pretrained_model_name_or_path", None)
     return None
-
-
-@dataclass(frozen=True)
-class LossSpec:
-    """Resolved ``loss_fn:`` section: a factory callable plus its kwargs."""
-
-    factory: Callable[..., Any]
-    kwargs: dict[str, Any] = field(default_factory=dict)
-
-    def build(self) -> Any:
-        from nemo_automodel.components.loss import build_loss_fn
-
-        return build_loss_fn(self.factory, **self.kwargs)
 
 
 @dataclass(frozen=True)
@@ -180,12 +168,14 @@ class RecipeConfig:
         return build_optimizer_config(factory, kwargs)
 
     @cached_property
-    def loss_fn(self) -> LossSpec | None:
+    def loss_fn(self) -> LossConfig | None:
+        from nemo_automodel.components.loss import build_loss_config
+
         node = self._raw.get("loss_fn", None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
-        return LossSpec(factory, kwargs)
+        return build_loss_config(factory, **kwargs)
 
     @cached_property
     def checkpoint(self) -> CheckpointSpec:

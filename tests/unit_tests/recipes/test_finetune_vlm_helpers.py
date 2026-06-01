@@ -2506,7 +2506,10 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+    )
 
     def _stub_build_checkpoint_config(*a, **k):
         cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)

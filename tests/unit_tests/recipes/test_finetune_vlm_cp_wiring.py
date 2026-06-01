@@ -392,7 +392,10 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     monkeypatch.setattr(vlm_finetune, "setup_logging", lambda: None)
     monkeypatch.setattr(vlm_finetune, "apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr(vlm_finetune, "StatefulRNG", lambda *args, **kwargs: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+    )
     monkeypatch.setattr(vlm_finetune, "_supports_logits_to_keep", lambda model: True)
     monkeypatch.setattr(
         vlm_finetune,
