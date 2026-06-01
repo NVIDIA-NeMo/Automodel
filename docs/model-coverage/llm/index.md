@@ -15,7 +15,7 @@ For other installation options (for example, uv), refer to the [NeMo AutoModel I
 
 ## Supported Models
 
-NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. See [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
+NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. Refer to [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
 
 | Owner | Model Family | Architectures |
 |---|---|---|
