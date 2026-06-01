@@ -55,6 +55,20 @@ from nemo_automodel.recipes.base_recipe import (
 logger = logging.getLogger(__name__)
 
 
+def _optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:
+    """Return ceil(num_batches / accum), the actual number of optimizer steps per epoch.
+
+    Floor division silently drops the trailing partial accumulation window
+    (up to ``grad_accumulation_steps - 1`` micro-batches) from the LR
+    scheduler's view of training, even though the trainer flushes those
+    gradients with an explicit step. Ceil keeps the scheduler aligned with
+    the actual number of ``optimizer.step()`` calls.
+    """
+    if num_batches_per_epoch <= 0 or grad_accumulation_steps <= 0:
+        return 0
+    return -(-num_batches_per_epoch // grad_accumulation_steps)
+
+
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
@@ -202,7 +216,16 @@ class TrainEagle1Recipe(BaseRecipe):
             num_batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             num_batches_per_epoch = 0
-        total_optim_steps = max(1, (self.num_epochs * num_batches_per_epoch) // self.grad_accumulation_steps)
+        # Use ceil division so a trailing partial accumulation window (when
+        # ``num_batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``)
+        # is counted as a real optimizer step. The training loop flushes that
+        # leftover window at the end of each epoch, so the LR scheduler must
+        # cover those steps too -- otherwise ``progress`` saturates and the
+        # final epoch trains at ``min_lr_ratio`` instead of the intended decay.
+        total_optim_steps = max(
+            1,
+            self.num_epochs * _optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps),
+        )
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
@@ -486,6 +509,7 @@ class TrainEagle1Recipe(BaseRecipe):
             running_acc = 0.0
             epoch_loss = 0.0
             micro_step = 0
+            pending_micro_batches = 0
             completed_steps = 0
             last_batch_idx = -1
             for batch_idx, batch in enumerate(self.train_dataloader):
@@ -511,14 +535,16 @@ class TrainEagle1Recipe(BaseRecipe):
                 running_acc += metrics.accuracy.detach().item()
                 epoch_loss += metrics.loss.detach().item()
                 micro_step += 1
+                pending_micro_batches += 1
 
-                if micro_step % self.grad_accumulation_steps == 0:
+                if pending_micro_batches == self.grad_accumulation_steps:
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
                     completed_steps += 1
+                    pending_micro_batches = 0
 
                     if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
                         avg_loss = running_loss / self.log_every_steps
@@ -534,13 +560,31 @@ class TrainEagle1Recipe(BaseRecipe):
                         running_loss = 0.0
                         running_acc = 0.0
 
-            if micro_step % self.grad_accumulation_steps != 0:
+            # Flush the trailing partial accumulation window. When
+            # ``batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``,
+            # up to ``grad_accumulation_steps - 1`` micro-batches have run
+            # ``backward()`` but never reached an ``optimizer.step()`` -- those
+            # gradients would otherwise be wiped by the next epoch's
+            # ``zero_grad`` and the samples wasted.
+            #
+            # Each micro-batch divided its loss by ``grad_accumulation_steps``
+            # in anticipation of a full window. With only ``pending_micro_batches``
+            # contributors, the accumulated gradient magnitude is
+            # ``pending_micro_batches / grad_accumulation_steps`` of a normal
+            # step; rescale by the inverse so the trailing step's gradient is on
+            # the same scale as every other step.
+            if pending_micro_batches > 0:
+                scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
+                for p in self.trainer_module.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
                 torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.lr_scheduler.step()
                 self.runtime.global_step += 1
                 completed_steps += 1
+                pending_micro_batches = 0
 
             eval_metrics = self._run_eval()
             if self.dist_env.is_main:
