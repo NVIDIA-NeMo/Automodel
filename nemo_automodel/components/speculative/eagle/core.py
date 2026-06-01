@@ -245,8 +245,10 @@ class PEagleTrainerModule(nn.Module):
         # Single projected ``mask_hidden`` placeholder, broadcast across the
         # batch / sequence and shared by every masked depth. Computed once: it
         # is independent of the base position, so all masked depths backprop
-        # into the same parameter through this one projection.
-        mask_hidden = self.draft_model.masked_projected_hidden().to(hidden_states.dtype)
+        # into the same parameter through this one projection. It shares the
+        # ``project_hidden_states`` (``fc``) output dtype with ``hidden_states``,
+        # so no cast is needed.
+        mask_hidden = self.draft_model.masked_projected_hidden()
         masked_hidden_states = mask_hidden.view(1, 1, -1).expand(input_ids.shape[0], input_ids.shape[1], -1)
         masked_input_ids = torch.full_like(input_ids, self.ptd_token_id)
 
