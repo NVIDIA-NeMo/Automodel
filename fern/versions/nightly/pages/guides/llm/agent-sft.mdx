@@ -44,7 +44,7 @@ We fine-tune on the [llamafactory/glaive_toolcall_en](https://huggingface.co/dat
 
 ## Hardware Requirements
 
-- **Full-parameter SFT**: Qwen2.5-3B fits comfortably on a single 80 GB GPU (8 GPUs shown below for speed) with FSDP2.
+- **Full-parameter SFT**: the example below shards across 8 GPUs with FSDP2. Qwen2.5-3B is small enough to also train on a single 80 GB GPU, which runs unsharded (FSDP2 only applies across multiple GPUs).
 - **LoRA / PEFT**: trainable on a single GPU (see the [PEFT variant](#peft-lora-variant) at the end).
 - `glaive_toolcall_en` is small (a few thousand traces), so a full pass is fast.
 
