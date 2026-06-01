@@ -53,7 +53,9 @@ class _ToyMultiVectorBiEncoder(torch.nn.Module):
 def _apply_common_mocks(monkeypatch):
     """Mock CUDA-dependent infrastructure so tests run without a GPU."""
     monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
-    monkeypatch.setattr(am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())}))
+    monkeypatch.setattr(
+        am, "MeshContext", type("MeshContext", (), {"from_meshes": staticmethod(lambda *a, **k: DummyMesh())})
+    )
     monkeypatch.setattr(am.torch.cuda, "current_device", lambda: 0)
 
 
