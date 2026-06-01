@@ -17,11 +17,12 @@
 # GB200-specific deltas vs the generic gptoss_120b_te_deepep.yaml:
 #   - peak_tflops: 2500  (GB200 BF16 dense peak; the generic recipe uses the
 #     H100 989 value, which inflates the reported MFU on Blackwell)
-#   - local_batch_size: 4  (the gb200 ran at 83/192 GB with lbs=1, so there is
-#     ample headroom; lbs=4 cuts the gradient-accumulation micro-batches
-#     16 -> 4 and lowers the per-iteration overhead)
+#   - local_batch_size: 4 with global_batch_size: 640 (the lbs=2 run sat at
+#     107/192 GB, so there is headroom). With dp_size=32 this gives
+#     5 gradient-accumulation micro-batches (640 / (4 * 32) = 5), down from the
+#     lbs=2 run's 8, further lowering per-iteration overhead.
 #
-# 8 nodes x 4 GB200 = 32 GPUs, ep_size=16, GBS=512, seq_len=4096.
+# 8 nodes x 4 GB200 = 32 GPUs, ep_size=16, GBS=640, seq_len=4096.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -37,7 +38,7 @@ benchmark:
 
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 512
+  global_batch_size: 640
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
