@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -226,7 +227,10 @@ class GroupedExperts(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
-        self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
+        # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
+        self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
+        self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -501,6 +505,7 @@ class GroupedExperts(nn.Module):
                     tokens_per_expert,
                     permuted_probs,
                     self.expert_activation_grouped,
+                    use_mxfp8=self.use_mxfp8,
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
@@ -638,7 +643,10 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
-        self.use_torch_mm = backend is not None and backend.experts == "torch_mm"
+        # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
+        # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
+        self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
+        self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -774,6 +782,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         tokens_per_expert_gpu,
                         permuted_probs,
                         self.expert_activation,
+                        use_mxfp8=self.use_mxfp8,
                     )
             else:
                 tokens_per_expert = tokens_per_expert.to("cpu")
@@ -806,13 +815,128 @@ class GroupedExpertsDeepEP(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+# ── torchao MXFP8 grouped-GEMM (experts="torch_mm_mxfp8") ──
+#
+# torchao exposes a drop-in differentiable replacement for torch._grouped_mm that
+# dynamically quantizes both operands to MXFP8 (e4m3 data + e8m0 block scales,
+# block_size=32). It mirrors torch._grouped_mm's contract exactly: 2D activations
+# (M*num_groups, K), 3D [E, K, N] stacked expert weights, int32 `offs` group
+# boundaries — so no transpose is needed for Automodel's gate_and_up_projs
+# ([E, dim, up]) or down_projs ([E, inter, dim]).
+#
+# torchao is unpinned and (when present) comes from the base image rather than the
+# uv lock, so the API generation is resolved defensively at runtime across known
+# versions and normalized to a uniform mxfp8_grouped_mm(A, B, offs) callable. If
+# torchao is missing entirely, the runtime gate falls back to torch._grouped_mm.
+
+_MXFP8_GROUPED_MM = None  # cached uniform callable (set on first resolve)
+_MXFP8_RESOLVED = False  # whether the import ladder has run
+_MXFP8_FALLBACK_WARNED = False  # one-time runtime fallback warning
+_MXFP8_ACTIVE_ANNOUNCED = False  # one-time "mxfp8 active" confirmation
+
+
+def _resolve_mxfp8_grouped_mm():
+    """Resolve a torchao MXFP8 grouped-GEMM callable, normalizing across API generations.
+
+    Returns a callable ``mxfp8_grouped_mm(A, B, offs)`` mirroring ``torch._grouped_mm``,
+    or ``None`` if no supported torchao API is importable. The result is cached.
+    """
+    global _MXFP8_GROUPED_MM, _MXFP8_RESOLVED
+    if _MXFP8_RESOLVED:
+        return _MXFP8_GROUPED_MM
+    _MXFP8_RESOLVED = True
+
+    # (1) current-main: _to_mxfp8_then_scaled_grouped_mm(A, B_t, offs=...) — no scaling arg.
+    try:
+        from torchao.prototype.moe_training import _to_mxfp8_then_scaled_grouped_mm
+
+        def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
+            return _fn(A, B, offs=offs)
+
+        _MXFP8_GROUPED_MM = _impl
+        return _MXFP8_GROUPED_MM
+    except ImportError:
+        pass
+
+    # Blog-era / intermediate generations take a MoEScalingType.MXFP8 argument.
+    try:
+        from torchao.prototype.moe_training.conversion_utils import MoEScalingType
+
+        # (2) intermediate: _quantize_then_scaled_grouped_mm(A, B_t, offs=, scaling_type=)
+        try:
+            from torchao.prototype.moe_training.scaled_grouped_mm import _quantize_then_scaled_grouped_mm
+
+            def _impl(A, B, offs, _fn=_quantize_then_scaled_grouped_mm, _st=MoEScalingType.MXFP8):
+                return _fn(A, B, offs=offs, scaling_type=_st)
+
+            _MXFP8_GROUPED_MM = _impl
+            return _MXFP8_GROUPED_MM
+        except ImportError:
+            pass
+
+        # (3) v0.13-era: _scaled_grouped_mm(A, B_t, offs=, scaling_type=)
+        from torchao.prototype.moe_training import _scaled_grouped_mm
+
+        def _impl(A, B, offs, _fn=_scaled_grouped_mm, _st=MoEScalingType.MXFP8):
+            return _fn(A, B, offs=offs, scaling_type=_st)
+
+        _MXFP8_GROUPED_MM = _impl
+        return _MXFP8_GROUPED_MM
+    except ImportError:
+        pass
+
+    return None
+
+
+def _mxfp8_grouped_mm_or_none():
+    """Return the MXFP8 grouped-GEMM callable iff it is usable on this device.
+
+    Requires CUDA with compute capability >= 10 (GB200/sm_100+) AND a successful
+    torchao import. Otherwise returns ``None`` (callers fall back to
+    ``torch._grouped_mm``). Emits a one-time warning when MXFP8 was requested but is
+    unavailable.
+    """
+    global _MXFP8_FALLBACK_WARNED, _MXFP8_ACTIVE_ANNOUNCED
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+        fn = _resolve_mxfp8_grouped_mm()
+        if fn is not None:
+            if not _MXFP8_ACTIVE_ANNOUNCED:
+                _MXFP8_ACTIVE_ANNOUNCED = True
+                # Positive confirmation so the e2e log unambiguously shows the MXFP8
+                # path engaged (vs. silently falling back to torch._grouped_mm).
+                warnings.warn(
+                    "experts='torch_mm_mxfp8': MXFP8 grouped GEMM active "
+                    "(routing expert GEMMs through torchao.prototype.moe_training).",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+            return fn
+    if not _MXFP8_FALLBACK_WARNED:
+        _MXFP8_FALLBACK_WARNED = True
+        warnings.warn(
+            "experts='torch_mm_mxfp8' requested but MXFP8 grouped GEMM is unavailable "
+            "(requires CUDA compute capability >= 10 and an importable "
+            "torchao.prototype.moe_training; note torchao may be absent from the base "
+            "image). Falling back to torch._grouped_mm.",
+            category=UserWarning,
+            stacklevel=2,
+        )
+    return None
+
+
+def _default_grouped_mm(A, B, offs):
+    """Fallback grouped GEMM (plain ``torch._grouped_mm``) used when MXFP8 is off."""
+    return torch._grouped_mm(A, B, offs=offs)
+
+
 def _torch_mm_experts_fwd(
-    hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn
+    hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn, use_mxfp8=False
 ):
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
-    output1 = torch._grouped_mm(hidden_states, gate_and_up_projs, offs=offs)
+    grouped_mm = (_mxfp8_grouped_mm_or_none() if use_mxfp8 else None) or _default_grouped_mm
+    output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
-    output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+    output2 = grouped_mm(output1, down_projs, offs)
     return output2
 
 
