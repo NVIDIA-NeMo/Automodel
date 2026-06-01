@@ -170,10 +170,17 @@ class PEagleTrainerModule(nn.Module):
     """Draft-side P-EAGLE (parallel-drafting EAGLE-3) trainer module.
 
     P-EAGLE replaces EAGLE-3's autoregressive test-time-training recurrence
-    with *parallel* multi-token prediction: at every base position the draft
-    predicts the next ``num_draft_tokens`` tokens in one shot, conditioning
-    depths ``>= 1`` on fixed learnable placeholders instead of the previous
-    step's own output. For depth ``d``:
+    with *parallel* multi-token prediction. At inference vLLM emits all
+    ``num_draft_tokens`` tokens in a single forward over a flat
+    ``[context, mask_1, .., mask_{K-1}]`` sequence. **This module does not run a
+    single forward at training time** -- it reproduces that exact layout by
+    running ``num_draft_tokens`` sequential ``cache_hidden`` steps that are
+    numerically equivalent to the flat parallel forward (the equivalence is
+    pinned to ~1e-7 by
+    ``test_peagle_parallel_forward_matches_expanded_reference`` and relies on
+    ``LlamaRotaryEmbedding`` honoring the per-depth position offset). Depths
+    ``>= 1`` are conditioned on fixed learnable placeholders instead of the
+    previous step's own output. For depth ``d``:
 
     * depth 0 (next-token prediction) consumes the real token embedding and
       the projected target auxiliary hidden states -- identical to

@@ -54,8 +54,14 @@ def _build_tiny_draft_model(*, parallel_drafting: bool = False, ptd_token_id: in
 
 
 def _vocab_mapping(config: LlamaConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """Realistic shrunk draft vocab: only the selected ids are marked in-vocab.
+
+    A target token whose top-1 id falls outside ``selected_token_ids`` carries
+    no supervision; an all-True mask would hide that draft-vocab-shrinking path.
+    """
     selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
-    selected_token_mask = torch.ones(config.vocab_size, dtype=torch.bool)
+    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
     return selected_token_ids, selected_token_mask
 
 
@@ -70,13 +76,25 @@ def _make_trainer(draft: LlamaEagle3DraftModel, *, num_draft_tokens: int, ptd_to
     )
 
 
-def _random_batch(config: LlamaConfig, *, batch_size: int = 2, seq_len: int = 8) -> dict[str, torch.Tensor]:
+def _random_batch(
+    config: LlamaConfig,
+    *,
+    batch_size: int = 2,
+    seq_len: int = 8,
+    targets_in_draft_vocab: bool = True,
+) -> dict[str, torch.Tensor]:
+    target_logits = torch.randn(batch_size, seq_len, config.vocab_size)
+    if targets_in_draft_vocab:
+        # Bias the target argmax into the draft vocab so supervised positions
+        # survive the realistic (shrunk) selected_token_mask. Pass
+        # ``targets_in_draft_vocab=False`` to exercise out-of-vocab masking.
+        target_logits[..., : config.draft_vocab_size] += 8.0
     return {
         "input_ids": torch.randint(0, config.draft_vocab_size, (batch_size, seq_len)),
         "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
         "loss_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
         "aux_hidden_states": torch.randn(batch_size, seq_len, config.hidden_size * 3),
-        "target_logits": torch.randn(batch_size, seq_len, config.vocab_size),
+        "target_logits": target_logits,
     }
 
 
@@ -326,13 +344,127 @@ def test_peagle_mvp_example_config_resolves_without_ttt_steps():
     from nemo_automodel.components.config.loader import load_yaml_config
 
     cfg_path = os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "examples/speculative/eagle3/llama_peagle_mvp.yaml"
+        os.path.dirname(__file__), "..", "..", "..", "examples/speculative/p-eagle/llama_peagle_mvp.yaml"
     )
     recipe_args = load_yaml_config(cfg_path).recipe_args
 
     assert recipe_args.get("parallel_drafting", False) is True
+    # ptd_token_id is required (no default) and must be a reserved/unused id.
+    assert recipe_args.get("ptd_token_id") is not None
     assert "ttt_steps" not in recipe_args.to_dict()
     # Mirror the recipe's eager-default-safe resolution; must not raise.
     resolved = int(recipe_args.get("num_draft_tokens", recipe_args.get("ttt_steps", 4)))
     assert resolved == int(recipe_args.get("num_draft_tokens"))
     assert resolved >= 1
+
+
+def test_peagle_parallel_forward_matches_expanded_reference():
+    """The cache_hidden K-step training equals a flat expanded parallel forward.
+
+    vLLM P-EAGLE drafts all K tokens in ONE forward over a flat sequence
+    ``[real prefix ..., mask_1, .., mask_{K-1}]`` with plain causal attention.
+    This builds that flat reference and asserts the per-depth logits at the last
+    real position match the cache_hidden per-depth logits the trainer produces,
+    proving the K sequential steps are *numerically equivalent* to the single
+    parallel forward rather than a loose approximation. (Depends on
+    ``LlamaRotaryEmbedding`` honoring the per-depth position offset; without that
+    fix depths >= 1 diverge by ~1e-3.)
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model(parallel_drafting=True, ptd_token_id=7)
+    draft.eval()
+    ptd, k = 7, 4
+    batch_size, seq_len = 2, 6
+
+    real_ids = torch.randint(0, draft.config.vocab_size, (batch_size, seq_len))
+    aux = torch.randn(batch_size, seq_len, draft.config.hidden_size * 3)
+    real_proj = draft.project_hidden_states(aux)
+    mask_proj = draft.masked_projected_hidden()  # [1, H]
+    real_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    # (a) cache_hidden per-depth logits at the last position (what the trainer does).
+    cache_hidden: list[list[torch.Tensor]] = [[], []]
+    cur_ids, cur_proj = real_ids, real_proj
+    cache_logits = []
+    with torch.no_grad():
+        for _ in range(k):
+            hidden = draft(
+                input_ids=cur_ids,
+                projected_hidden_states=cur_proj,
+                attention_mask=real_mask,
+                cache_hidden=cache_hidden,
+            )
+            cache_logits.append(draft.compute_logits(hidden)[:, seq_len - 1])
+            cur_ids = torch.full_like(real_ids, ptd)
+            cur_proj = mask_proj.view(1, 1, -1).expand(batch_size, seq_len, -1)
+
+    # (b) flat expanded reference: one plain-causal forward over
+    # ``[real_0 .. real_{T-1}, mask_1 .. mask_{K-1}]``.
+    flat_ids = torch.cat([real_ids, torch.full((batch_size, k - 1), ptd, dtype=real_ids.dtype)], dim=1)
+    flat_proj = torch.cat([real_proj, mask_proj.view(1, 1, -1).expand(batch_size, k - 1, -1)], dim=1)
+    flat_mask = torch.ones(batch_size, seq_len + k - 1, dtype=torch.long)
+    with torch.no_grad():
+        flat_hidden = draft(
+            input_ids=flat_ids,
+            projected_hidden_states=flat_proj,
+            attention_mask=flat_mask,
+            cache_hidden=[[], []],
+        )
+        flat_logits = draft.compute_logits(flat_hidden)
+    # depth 0 -> last real position; depth d -> mask slot (seq_len - 1 + d).
+    ref_logits = [flat_logits[:, seq_len - 1]] + [flat_logits[:, seq_len - 1 + d] for d in range(1, k)]
+
+    for d in range(k):
+        torch.testing.assert_close(
+            cache_logits[d],
+            ref_logits[d],
+            atol=1e-4,
+            rtol=1e-4,
+            msg=f"depth {d}: cache_hidden logits diverge from the flat expanded reference",
+        )
+
+
+def test_peagle_masks_out_of_draft_vocab_targets():
+    """Targets whose top-1 token is outside the draft vocab must be masked out.
+
+    With a realistic (shrunk) ``selected_token_mask``, positions whose target
+    top token is not in the draft vocab carry no supervision -- the trainer must
+    drop them, exactly like EAGLE-3, via the shared ``_compute_target_distribution``.
+    """
+    draft = _build_tiny_draft_model(parallel_drafting=True, ptd_token_id=7)
+    trainer = _make_trainer(draft, num_draft_tokens=2, ptd_token_id=7)
+
+    torch.manual_seed(0)
+    full = trainer(**_random_batch(draft.config, targets_in_draft_vocab=True)).valid_tokens.item()
+    torch.manual_seed(0)
+    partial = trainer(**_random_batch(draft.config, targets_in_draft_vocab=False)).valid_tokens.item()
+
+    assert full > 0
+    assert partial < full, "out-of-draft-vocab targets are not being masked out"
+
+
+def test_peagle_checkpoint_save_round_trip(tmp_path):
+    """A saved draft carries the vLLM contract: config.json keys + mask_hidden tensor.
+
+    ``save_pretrained`` is a faithful proxy for the recipe's consolidated export:
+    vLLM reads ``ptd_token_id`` from config.json and loads the weight whose key
+    contains ``mask_hidden``. Both must survive serialization.
+    """
+    import json
+
+    from safetensors.torch import load_file
+
+    draft = _build_tiny_draft_model(parallel_drafting=True, ptd_token_id=7)
+    with torch.no_grad():
+        draft.mask_hidden.normal_()
+    draft.save_pretrained(tmp_path)
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["parallel_drafting"] is True
+    assert config["ptd_token_id"] == 7
+
+    sd = load_file(tmp_path / "model.safetensors")
+    mask_keys = [key for key in sd if "mask_hidden" in key]
+    assert mask_keys, f"mask_hidden missing from saved weights: {sorted(sd)}"
+    num_aux = getattr(draft.config, "num_aux_hidden_states", 3)
+    assert tuple(sd[mask_keys[0]].shape) == (1, num_aux * draft.config.target_hidden_size)

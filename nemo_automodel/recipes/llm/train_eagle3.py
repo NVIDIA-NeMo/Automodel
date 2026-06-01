@@ -228,8 +228,31 @@ class TrainEagle3Recipe(BaseRecipe):
         # vLLM >= 0.16 unchanged.
         parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
         draft_config["parallel_drafting"] = parallel_drafting
+        ptd_token_id = None
         if parallel_drafting:
-            draft_config["ptd_token_id"] = int(recipe_cfg.get("ptd_token_id", 0))
+            # ``ptd_token_id`` must be chosen deliberately: it indexes the draft
+            # ``embed_tokens`` table for the masked draft slots and (with frozen
+            # embeddings) that row's vector is the only "mask token" signal. A
+            # silent default (e.g. 0) usually maps to a meaningful token and
+            # pollutes the masked-slot semantics, so require it explicitly and
+            # range-check it. The value is serialized into the draft config so
+            # vLLM reads the same id at serve time.
+            ptd_token_id = recipe_cfg.get("ptd_token_id", None)
+            if ptd_token_id is None:
+                raise ValueError(
+                    "parallel_drafting=True requires recipe_args.ptd_token_id to be set explicitly. "
+                    "Pick a reserved / rarely-used token id for the masked draft slots (e.g. one of "
+                    "Llama-3's reserved special tokens) so the masked-slot embedding does not collide "
+                    "with real content; the same id must be present in the draft config.json vLLM reads "
+                    "at serve time."
+                )
+            ptd_token_id = int(ptd_token_id)
+            if not 0 <= ptd_token_id < target_config.vocab_size:
+                raise ValueError(
+                    f"ptd_token_id={ptd_token_id} is out of range for the target vocab "
+                    f"[0, {target_config.vocab_size}); it indexes the draft embed_tokens table."
+                )
+            draft_config["ptd_token_id"] = ptd_token_id
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -257,7 +280,7 @@ class TrainEagle3Recipe(BaseRecipe):
                 selected_token_ids=selected_token_ids,
                 selected_token_mask=selected_token_mask,
                 num_draft_tokens=int(num_draft_tokens),
-                ptd_token_id=int(recipe_cfg.get("ptd_token_id", 0)),
+                ptd_token_id=ptd_token_id,
             ).to(self.device)
         else:
             trainer_module = Eagle3TrainerModule(

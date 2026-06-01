@@ -2,10 +2,11 @@ recipe: TrainEagle3Recipe
 
 # P-EAGLE (parallel-drafting EAGLE-3) MVP recipe. Trains the same Llama-style
 # EAGLE-3 draft as ``llama_eagle3_mvp_flash_attn.yaml`` but in *parallel
-# drafting* mode: instead of EAGLE-3's autoregressive test-time-training
-# unroll, the draft learns to predict all ``num_draft_tokens`` tokens in a
-# single forward, conditioning the masked multi-token-prediction depths on a
-# learnable ``mask_hidden`` placeholder and the reserved ``ptd_token_id`` token
+# drafting* mode. At inference vLLM emits all ``num_draft_tokens`` tokens in a
+# single forward; training reproduces that layout (the draft conditions the
+# masked multi-token-prediction depths on a learnable ``mask_hidden``
+# placeholder and the reserved ``ptd_token_id`` token) by unrolling the
+# equivalent ``cache_hidden`` steps rather than a literal single forward
 # (https://arxiv.org/abs/2602.01469).
 #
 # IMPORTANT -- inference runtime. As of this writing P-EAGLE inference is only
@@ -53,23 +54,24 @@ recipe_args:
   # trainer to the parallel-drafting trainer and registers the learnable
   # ``mask_hidden`` placeholder on the draft.
   #
-  # ``num_draft_tokens`` is K -- the number of tokens the draft predicts in
-  # one forward (P-EAGLE's analogue of ``ttt_steps``). It must match the
-  # vLLM ``num_speculative_tokens`` used at inference.
+  # ``num_draft_tokens`` is K -- the number of draft tokens (P-EAGLE's analogue
+  # of ``ttt_steps``). It must match the vLLM ``num_speculative_tokens`` used at
+  # inference.
   #
-  # ``ptd_token_id`` is the reserved token id placed at every masked
-  # multi-token-prediction slot; its ``embed_tokens`` row serves as the
-  # masked token embedding. It is written into the draft ``config.json`` and
-  # vLLM reads it back at inference, so the value here and at serve time MUST
-  # be the same. Pick a token that does not carry meaning in your data
-  # (a reserved / rarely-used id). With ``freeze_embeddings: true`` (the
-  # default) the masked token embedding is fixed and the learnable mask
-  # capacity comes entirely from ``mask_hidden``; set ``freeze_embeddings:
-  # false`` to additionally learn the masked token's embedding row.
+  # ``ptd_token_id`` is REQUIRED (no default): the reserved token id placed at
+  # every masked multi-token-prediction slot. Its ``embed_tokens`` row serves as
+  # the masked token embedding, so pick a token that does NOT carry meaning in
+  # your data -- a reserved / unused id, not a frequent token like 0. The recipe
+  # range-checks it and writes it into the draft ``config.json``; vLLM reads it
+  # back at inference, so the value here and at serve time MUST match. The value
+  # below (128002) is one of Llama-3's reserved special tokens; choose a
+  # reserved id for your own tokenizer. With ``freeze_embeddings: true`` (the
+  # default) this row is fixed and the learnable mask capacity comes entirely
+  # from ``mask_hidden``; set ``freeze_embeddings: false`` to also learn it.
   # ----------------------------------------------------------------------
   parallel_drafting: true
   num_draft_tokens: 4
-  ptd_token_id: 0
+  ptd_token_id: 128002
 
 optimizer:
   # The per-depth loss is a weighted mean (``Σ 0.8^i * L_i / Σ 0.8^i``), so LR
