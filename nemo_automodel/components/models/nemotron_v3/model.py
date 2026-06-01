@@ -179,10 +179,17 @@ class NemotronV3Model(nn.Module):
 
         # Non-THD-collater path doesn't emit cu_seqlens — recover it from a
         # 2D indexed attention_mask so mamba's seq_idx derivation has input.
+        # Gated on B==1: cu_seqlens describes sub-sequence boundaries within a
+        # single flattened token stream. At B>1 the rows are independent
+        # sequences (the batch dim already separates them), so cumsum(0) would
+        # be a wrong cross-row global offset. Leave cu_seqlens unset there and
+        # let each consumer treat every row as one sequence (mamba seq_idx
+        # falls back to per-row, the PP seq_idx tail to its no-mask sentinel).
         if (
             "cu_seqlens" not in kwargs
             and attention_mask is not None
             and attention_mask.dim() == 2
+            and attention_mask.shape[0] == 1
             and attention_mask.dtype != torch.bool
         ):
             seq_lens = attention_mask.sum(dim=-1).to(torch.int32)

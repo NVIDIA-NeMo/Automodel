@@ -184,9 +184,12 @@ class TestPipelineStageMetas:
             is_first=False, microbatch_size=2, seq_len=16, dtype=torch.bfloat16
         )
         assert len(l_in) == 1 + D
+        # Final stage appends an int32 [B, S] seq_idx tail: (logits, *mtp_h, seq_idx).
+        assert len(l_out) == 1 + D + 1
         assert l_out[0].shape == (2, 16, cfg.vocab_size)
-        for h in l_out[1:]:
+        for h in l_out[1 : 1 + D]:
             assert h.shape == (2, 16, cfg.hidden_size)
+        assert l_out[-1].shape == (2, 16) and l_out[-1].dtype == torch.int32
 
     def test_no_mtp_arity_is_one(self, backend):
         model, cfg = _make_model(backend)
@@ -295,8 +298,9 @@ class TestPPForward:
         out = model(activation, mtp_embed)
 
         assert isinstance(out, tuple)
-        assert len(out) == 2  # (logits, mtp_per_depth_h[0])
+        assert len(out) == 3  # (logits, mtp_per_depth_h[0], seq_idx)
         assert out[0].shape == (1, 4, cfg.vocab_size)
+        assert out[-1].shape == (1, 4) and out[-1].dtype == torch.int32
         # The MTP head was given the upstream embedding via embed_inputs and
         # NOT via the input_ids/embed_fn path.
         assert "embed_inputs" in captured
@@ -305,7 +309,7 @@ class TestPPForward:
         assert captured.get("embed_fn") is None
 
     def test_final_stage_eval_emits_placeholders(self, backend):
-        """In eval mode, the last stage must keep the (1+D) tuple arity."""
+        """In eval mode, the last stage keeps the (1 + D + seq_idx) tuple arity."""
         D = 1
         model, cfg = _make_model(
             backend,
@@ -327,12 +331,13 @@ class TestPPForward:
             out = model(activation, mtp_embed)
 
         assert isinstance(out, tuple)
-        assert len(out) == 1 + D
-        # Logits live on out[0]; placeholders are empty/zero-shape tensors of
-        # the same hidden shape as the activation.
+        assert len(out) == 1 + D + 1
+        # Logits live on out[0]; placeholders match the activation's hidden shape;
+        # the int32 [B, S] seq_idx tail is last.
         assert out[0].shape == (1, 4, cfg.vocab_size)
-        for ph in out[1:]:
+        for ph in out[1 : 1 + D]:
             assert ph.shape == (1, 4, cfg.hidden_size)
+        assert out[-1].shape == (1, 4) and out[-1].dtype == torch.int32
 
 
 # ---------------------------------------------------------------------------
