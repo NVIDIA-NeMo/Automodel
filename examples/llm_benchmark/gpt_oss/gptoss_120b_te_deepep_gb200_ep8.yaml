@@ -118,6 +118,6 @@ optimizer:
 
 
 ci:
-  time: "00:30:00"
+  time: "00:20:00"
   nodes: 8
   ep_size: 8
