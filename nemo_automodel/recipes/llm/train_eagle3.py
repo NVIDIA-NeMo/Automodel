@@ -245,13 +245,18 @@ class TrainEagle3Recipe(BaseRecipe):
             self.draft_model.freeze_embeddings()
 
         if parallel_drafting:
-            # ``num_draft_tokens`` is P-EAGLE's K (parallel depths). Defaults
-            # to ``ttt_steps`` so the existing K knob carries over.
+            # ``num_draft_tokens`` is P-EAGLE's K (parallel depths). Falls back
+            # to ``ttt_steps`` so an existing EAGLE-3 config's K knob carries
+            # over, else 4. Both fallbacks go through ``.get`` with a literal
+            # default -- a bare ``recipe_cfg.ttt_steps`` here would be evaluated
+            # eagerly (Python always computes the ``dict.get`` default argument)
+            # and raise AttributeError for a P-EAGLE config that omits it.
+            num_draft_tokens = recipe_cfg.get("num_draft_tokens", recipe_cfg.get("ttt_steps", 4))
             trainer_module = PEagleTrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
                 selected_token_mask=selected_token_mask,
-                num_draft_tokens=int(recipe_cfg.get("num_draft_tokens", recipe_cfg.ttt_steps)),
+                num_draft_tokens=int(num_draft_tokens),
                 ptd_token_id=int(recipe_cfg.get("ptd_token_id", 0)),
             ).to(self.device)
         else:

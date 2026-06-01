@@ -24,6 +24,8 @@ vLLM's parallel-drafting runtime (https://github.com/vllm-project/vllm/pull/3288
    while the next-token-prediction depth is byte-identical to EAGLE-3 step 0.
 """
 
+import os
+
 import pytest
 import torch
 from transformers import LlamaConfig
@@ -308,3 +310,29 @@ def test_mask_hidden_state_dict_round_trip():
     missing, unexpected = reloaded.load_state_dict(state, strict=True)
     assert not missing and not unexpected
     torch.testing.assert_close(reloaded.mask_hidden, draft.mask_hidden)
+
+
+def test_peagle_mvp_example_config_resolves_without_ttt_steps():
+    """The committed P-EAGLE example must train without a ``ttt_steps`` key.
+
+    Regression for an eager-default bug in the recipe: resolving
+    ``num_draft_tokens`` via ``recipe_cfg.get("num_draft_tokens", recipe_cfg.ttt_steps)``
+    evaluates ``recipe_cfg.ttt_steps`` unconditionally (Python always computes a
+    ``dict.get`` default argument), raising ``AttributeError`` for a P-EAGLE
+    config that correctly omits ``ttt_steps``. The example must enable parallel
+    drafting, set ``num_draft_tokens``, and NOT carry ``ttt_steps`` -- and the
+    recipe's resolution must not touch the missing key.
+    """
+    from nemo_automodel.components.config.loader import load_yaml_config
+
+    cfg_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "examples/speculative/eagle3/llama_peagle_mvp.yaml"
+    )
+    recipe_args = load_yaml_config(cfg_path).recipe_args
+
+    assert recipe_args.get("parallel_drafting", False) is True
+    assert "ttt_steps" not in recipe_args.to_dict()
+    # Mirror the recipe's eager-default-safe resolution; must not raise.
+    resolved = int(recipe_args.get("num_draft_tokens", recipe_args.get("ttt_steps", 4)))
+    assert resolved == int(recipe_args.get("num_draft_tokens"))
+    assert resolved >= 1
