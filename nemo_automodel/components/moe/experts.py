@@ -933,7 +933,18 @@ def _torch_mm_experts_fwd(
     hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn, use_mxfp8=False
 ):
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
-    grouped_mm = (_mxfp8_grouped_mm_or_none() if use_mxfp8 else None) or _default_grouped_mm
+    mxfp8_grouped_mm = _mxfp8_grouped_mm_or_none() if use_mxfp8 else None
+    if mxfp8_grouped_mm is not None:
+        # torchao's MXFP8 quantizer (mx_tensor.to_mx) asserts both operands are
+        # contiguous, unlike torch._grouped_mm which tolerates non-contiguous inputs.
+        # The stacked expert weights are non-contiguous after DTensor .to_local() (and
+        # the permuted activations after gather), so make both operands contiguous on
+        # the mxfp8 path only. The extra copy is small relative to the grouped GEMM and
+        # never touches the plain torch._grouped_mm fallback.
+        def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
+            return _fn(A.contiguous(), B.contiguous(), offs)
+    else:
+        grouped_mm = _default_grouped_mm
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
