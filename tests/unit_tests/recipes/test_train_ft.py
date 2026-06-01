@@ -496,7 +496,10 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.StatefulRNG", lambda *a, **k: "rng")
-    monkeypatch.setattr("nemo_automodel.recipes._typed_config.LossSpec.build", lambda self: "loss_fn")
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.loss_fn",
+        property(lambda self: SimpleNamespace(build=lambda: "loss_fn")),
+    )
 
     def _stub_build_checkpoint_config(*a, **k):
         cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
