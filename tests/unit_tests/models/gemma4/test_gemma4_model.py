@@ -604,6 +604,52 @@ class TestGemma4ForConditionalGeneration:
             torch.arange(seq, device=device),
         )
 
+    def test_forward_casts_pooled_image_features_to_projector_dtype(self, gemma4_config, backend_config, device):
+        class DtypeCheckingVisionEmbedder(torch.nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+                self.seen_dtype = None
+
+            def forward(self, *, inputs_embeds):
+                self.seen_dtype = inputs_embeds.dtype
+                return self.proj(inputs_embeds)
+
+        model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
+        model = model.to(device).to(torch.float32)
+
+        hidden_size = gemma4_config.text_config.hidden_size
+        embedder = DtypeCheckingVisionEmbedder(hidden_size).to(device).to(torch.bfloat16)
+        model.model.embed_vision = embedder
+
+        batch, seq = 1, 3
+        inputs_embeds = torch.randn(batch, seq, hidden_size, device=device, dtype=torch.float32)
+        pixel_values = torch.randn(batch, 1, device=device, dtype=torch.bfloat16)
+        mm_token_type_ids = torch.tensor([[1, 0, 0]], device=device)
+
+        def fake_get_image_features(pixel_values, image_position_ids=None, return_dict=True):
+            pooled = torch.randn(batch, 1, hidden_size, device=device, dtype=torch.float32)
+            return MagicMock(pooler_output=model.model.embed_vision(inputs_embeds=pooled))
+
+        captured = {}
+
+        def fake_language_model_forward(**kwargs):
+            captured["inputs_embeds"] = kwargs["inputs_embeds"]
+            return MagicMock(last_hidden_state=kwargs["inputs_embeds"])
+
+        with (
+            patch.object(model.model, "get_image_features", side_effect=fake_get_image_features),
+            patch.object(model.model.language_model, "forward", side_effect=fake_language_model_forward),
+        ):
+            model(
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        assert embedder.seen_dtype == torch.bfloat16
+        assert captured["inputs_embeds"].dtype == torch.float32
+
     def test_initialize_weights_dense_only_casts_dtype(self, dense_config, backend_config):
         model = Gemma4ForConditionalGeneration(dense_config, backend=backend_config)
         model.initialize_weights(dtype=torch.float32)
