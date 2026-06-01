@@ -36,6 +36,7 @@ from nemo_automodel.components.flow_matching.adapters import (
     FlowMatchingContext,
     HunyuanAdapter,
 )
+from nemo_automodel.components.flow_matching.adapters.hunyuan import _is_flash_varlen_attention_backend
 
 # =============================================================================
 # Mock Model
@@ -82,6 +83,18 @@ class MockHunyuanModel(nn.Module):
         else:
             output = torch.randn_like(latents)
         return (output,)
+
+
+class TestHunyuanFlashVarlenMaskOptimization:
+    """Test helpers for the Hunyuan flash-varlen mask optimization."""
+
+    def test_flash_varlen_backend_detection(self):
+        class Backend:
+            value = "flash_varlen"
+
+        assert _is_flash_varlen_attention_backend("flash_varlen")
+        assert _is_flash_varlen_attention_backend(Backend())
+        assert not _is_flash_varlen_attention_backend("flash")
 
 
 # =============================================================================
