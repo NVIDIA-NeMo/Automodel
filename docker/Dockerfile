@@ -162,9 +162,24 @@ RUN I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
 
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
-# it. Install explicitly AFTER the sync so it is not pruned. Pin matches
-# docker/common/uv-pytorch.lock; the wheel is py3-none-any (no torch-ABI build).
-RUN pip install --no-cache-dir torchao==0.14.0
+# it. Install explicitly AFTER the sync so it is not pruned.
+#
+# Build FROM SOURCE (not `pip install torchao==0.14.0`): the MXFP8 grouped-GEMM path
+# needs the compiled mxfp8 CUDA kernels (torchao/csrc/cuda/mx_kernels), but PyPI ships
+# only a kernel-less `py3-none-any` wheel and an x86_64-only compiled wheel — no
+# aarch64 wheel and no sdist. On the sbsa/aarch64 build the pip wheel would silently
+# omit the kernels and MXFP8 would fall back to bf16 at runtime. setup.py has no
+# x86-only gate and cross-compiles the sm_100a kernels from the CUDA toolkit version
+# (build_for_sm100a = CUDA>=12.8; base is CUDA 13.x), so source builds on both arches.
+# --no-build-isolation reuses the container's torch ABI (same as the torchcodec rebuild).
+# setup.py hardcodes the sm_100/sm_100a gencode flags and self-gates on CUDA>=12.8, so
+# no TORCH_CUDA_ARCH_LIST override is needed. v0.14.1 is the git tag matching 0.14.0.
+# CUTLASS is a git submodule and the mxfp8 kernels need its headers, so clone with
+# --recurse-submodules explicitly (pip's git+ submodule handling is unreliable).
+RUN git clone --depth 1 --branch v0.14.1 --recurse-submodules --shallow-submodules \
+        https://github.com/pytorch/ao.git /tmp/torchao && \
+    pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
+    rm -rf /tmp/torchao
 
 COPY . /opt/Automodel
 
