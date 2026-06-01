@@ -164,3 +164,143 @@ class Eagle3TrainerModule(nn.Module):
         avg_loss = running_loss / weight_sum
         accuracy = running_correct / running_valid.clamp_min(1.0)
         return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)
+
+
+class PEagleTrainerModule(nn.Module):
+    """Draft-side P-EAGLE (parallel-drafting EAGLE-3) trainer module.
+
+    P-EAGLE replaces EAGLE-3's autoregressive test-time-training recurrence
+    with *parallel* multi-token prediction: at every base position the draft
+    predicts the next ``num_draft_tokens`` tokens in one shot, conditioning
+    depths ``>= 1`` on fixed learnable placeholders instead of the previous
+    step's own output. For depth ``d``:
+
+    * depth 0 (next-token prediction) consumes the real token embedding and
+      the projected target auxiliary hidden states -- identical to
+      ``Eagle3TrainerModule`` step 0;
+    * depths ``1..K-1`` (multi-token prediction) consume the *masked* token
+      ``ptd_token_id`` and the single learnable ``mask_hidden`` placeholder
+      (projected through ``model.fc``), with **no** recurrence -- the inputs
+      are identical across all masked depths and only the supervision target
+      rolls forward.
+
+    The cross-depth attention is the same EAGLE-3 ``cache_hidden``
+    diagonal-extension pattern: depth ``d`` attends to the causal real prefix
+    (the ``T x T`` block over depth-0 keys) plus the same base position at
+    every earlier depth, with RoPE phase ``position + d``. This is exactly
+    what vLLM's parallel-drafting runtime sees at inference -- one base
+    position is expanded per decode step and the KV cache holds committed
+    depth-0 tokens only -- so training through ``cache_hidden`` is numerically
+    faithful to deployment despite running K sequential forwards here (the
+    single-forward parallelism is an inference-time property).
+
+    The draft-vocab projection, ``0.8 ** d`` weighted-mean loss schedule, and
+    accuracy metrics are shared verbatim with :class:`Eagle3TrainerModule`.
+    """
+
+    def __init__(
+        self,
+        draft_model: nn.Module,
+        *,
+        selected_token_ids: torch.Tensor,
+        selected_token_mask: torch.Tensor,
+        num_draft_tokens: int,
+        ptd_token_id: int,
+    ):
+        super().__init__()
+        if not isinstance(num_draft_tokens, int) or num_draft_tokens < 1:
+            raise ValueError(
+                f"PEagleTrainerModule requires num_draft_tokens to be an integer >= 1 "
+                f"(the draft must produce at least one token), got num_draft_tokens={num_draft_tokens!r}."
+            )
+        if getattr(draft_model, "mask_hidden", None) is None:
+            raise ValueError(
+                "PEagleTrainerModule requires the draft model to expose a learnable 'mask_hidden' "
+                "parameter; build the draft with config.parallel_drafting=True."
+            )
+        self.draft_model = draft_model
+        self.register_buffer("selected_token_ids", selected_token_ids, persistent=True)
+        self.register_buffer("selected_token_mask", selected_token_mask, persistent=True)
+        self.num_draft_tokens = num_draft_tokens
+        self.ptd_token_id = int(ptd_token_id)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        aux_hidden_states: torch.Tensor,
+        target_logits: torch.Tensor,
+    ) -> Eagle3StepMetrics:
+        """Run the P-EAGLE parallel-drafting loss for one batch.
+
+        ``attention_mask`` is held constant across depths -- only the
+        supervision (``loss_mask`` / ``position_mask`` / ``target_probs``)
+        rolls forward by one position per depth, mirroring
+        ``Eagle3TrainerModule``. Unlike EAGLE-3 TTT, the per-depth *inputs* at
+        depths ``>= 1`` are the fixed masked token / ``mask_hidden`` placeholder
+        rather than the previous depth's output.
+        """
+        hidden_states = self.draft_model.project_hidden_states(aux_hidden_states)
+        # Single projected ``mask_hidden`` placeholder, broadcast across the
+        # batch / sequence and shared by every masked depth. Computed once: it
+        # is independent of the base position, so all masked depths backprop
+        # into the same parameter through this one projection.
+        mask_hidden = self.draft_model.masked_projected_hidden().to(hidden_states.dtype)
+        masked_hidden_states = mask_hidden.view(1, 1, -1).expand(input_ids.shape[0], input_ids.shape[1], -1)
+        masked_input_ids = torch.full_like(input_ids, self.ptd_token_id)
+
+        target_probs, position_mask = _compute_target_distribution(
+            target_logits=target_logits,
+            selected_token_ids=self.selected_token_ids,
+            selected_token_mask=self.selected_token_mask,
+            loss_mask=loss_mask,
+        )
+
+        running_loss = hidden_states.new_zeros(())
+        running_correct = hidden_states.new_zeros(())
+        running_valid = hidden_states.new_zeros(())
+
+        cur_input_ids = input_ids
+        cur_hidden_states = hidden_states
+        cur_position_mask = position_mask
+        cur_target_probs = target_probs
+
+        # Shared EAGLE-3 TTT KV cache [K_list, V_list]; the attention layer
+        # appends each depth's K/V so depth ``d`` attends to the same base
+        # position at depths ``0..d-1``. Re-created per batch.
+        cache_hidden: list[list[torch.Tensor]] = [[], []]
+
+        weight_sum = sum(0.8**i for i in range(self.num_draft_tokens))
+        for step_idx in range(self.num_draft_tokens):
+            step_hidden = self.draft_model(
+                input_ids=cur_input_ids,
+                projected_hidden_states=cur_hidden_states,
+                attention_mask=attention_mask,
+                cache_hidden=cache_hidden,
+            )
+            logits = self.draft_model.compute_logits(step_hidden)
+            step_loss = masked_soft_cross_entropy(
+                logits=logits,
+                target_probs=cur_target_probs,
+                position_mask=cur_position_mask,
+            )
+            running_loss = running_loss + step_loss * (0.8**step_idx)
+
+            valid_mask = cur_position_mask.squeeze(-1).bool()
+            correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
+            running_correct = running_correct + correct.sum()
+            running_valid = running_valid + valid_mask.sum()
+
+            if step_idx + 1 < self.num_draft_tokens:
+                # Masked depths share fixed inputs (no recurrence): the
+                # ``ptd_token_id`` token embedding and the projected
+                # ``mask_hidden`` placeholder. Only supervision rolls forward.
+                cur_input_ids = masked_input_ids
+                cur_hidden_states = masked_hidden_states
+                cur_position_mask = _shift_left_with_zero(cur_position_mask)
+                cur_target_probs = _shift_left_with_zero(cur_target_probs)
+
+        avg_loss = running_loss / weight_sum
+        accuracy = running_correct / running_valid.clamp_min(1.0)
+        return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)

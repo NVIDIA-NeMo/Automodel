@@ -46,6 +46,7 @@ from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
+    PEagleTrainerModule,
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -216,6 +217,19 @@ class TrainEagle3Recipe(BaseRecipe):
         # T x T causal block (Eagle3LlamaAttention merges FA's softmax_lse
         # with the diagonal-extension columns in log space).
         draft_config["attn_implementation"] = recipe_cfg.get("draft_attn_implementation", "eager")
+        # P-EAGLE (parallel drafting). When enabled, the draft registers a
+        # learnable ``mask_hidden`` placeholder and the trainer predicts all
+        # draft tokens in parallel (masked depths) instead of EAGLE-3's
+        # autoregressive TTT unroll. ``ptd_token_id`` is the reserved token id
+        # placed at masked multi-token-prediction slots; it must be written to
+        # the draft ``config.json`` because vLLM's parallel-drafting runtime
+        # reads ``ptd_token_id`` from there at inference time. Both keys are
+        # serialized into the draft config so the saved checkpoint loads into
+        # vLLM >= 0.16 unchanged.
+        parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
+        draft_config["parallel_drafting"] = parallel_drafting
+        if parallel_drafting:
+            draft_config["ptd_token_id"] = int(recipe_cfg.get("ptd_token_id", 0))
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -230,12 +244,23 @@ class TrainEagle3Recipe(BaseRecipe):
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
 
-        trainer_module = Eagle3TrainerModule(
-            self.draft_model,
-            selected_token_ids=selected_token_ids,
-            selected_token_mask=selected_token_mask,
-            ttt_steps=recipe_cfg.ttt_steps,
-        ).to(self.device)
+        if parallel_drafting:
+            # ``num_draft_tokens`` is P-EAGLE's K (parallel depths). Defaults
+            # to ``ttt_steps`` so the existing K knob carries over.
+            trainer_module = PEagleTrainerModule(
+                self.draft_model,
+                selected_token_ids=selected_token_ids,
+                selected_token_mask=selected_token_mask,
+                num_draft_tokens=int(recipe_cfg.get("num_draft_tokens", recipe_cfg.ttt_steps)),
+                ptd_token_id=int(recipe_cfg.get("ptd_token_id", 0)),
+            ).to(self.device)
+        else:
+            trainer_module = Eagle3TrainerModule(
+                self.draft_model,
+                selected_token_ids=selected_token_ids,
+                selected_token_mask=selected_token_mask,
+                ttt_steps=recipe_cfg.ttt_steps,
+            ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
                 trainer_module,

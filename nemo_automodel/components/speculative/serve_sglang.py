@@ -20,6 +20,13 @@ recipe metadata. This script converts that layout into an HF/SGLang-readable
 ``model/`` directory when needed, then shells out to
 ``python -m sglang.launch_server`` with the right speculative-decoding flags.
 
+NOTE — P-EAGLE (parallel-drafting) heads are NOT servable here. A draft trained
+with ``parallel_drafting: true`` only loads into vLLM's parallel-drafting
+runtime (vLLM >= 0.16); SGLang support is tracked upstream in
+https://github.com/sgl-project/sglang/issues/23171. This script rejects such a
+checkpoint with an actionable error rather than mis-serving it as a plain
+EAGLE-3 head.
+
 NOTE — SGLang is NOT bundled with the NeMo-AutoModel container image and
 is intentionally NOT declared in ``pyproject.toml``. To use this entry
 point, install it yourself into the same environment:
@@ -159,6 +166,30 @@ def _config_needs_rewrite(config_path: Path, algorithm: str) -> bool:
     return config.get("architectures") != [expected]
 
 
+def _raise_if_parallel_drafting(config_path: Path) -> None:
+    """Reject P-EAGLE (parallel-drafting) drafts: SGLang cannot serve them yet.
+
+    A P-EAGLE head carries ``parallel_drafting: true`` (and a ``mask_hidden``
+    tensor) and only loads into vLLM's parallel-drafting runtime
+    (https://github.com/vllm-project/vllm/pull/32887, vLLM >= 0.16). Serving it
+    through SGLang's EAGLE-3 path would silently produce wrong drafts because
+    SGLang ignores ``mask_hidden`` / ``ptd_token_id``. SGLang support is tracked
+    upstream in https://github.com/sgl-project/sglang/issues/23171; until it
+    lands, fail loudly with an actionable message instead.
+    """
+    if not config_path.exists():
+        return
+    with config_path.open("r") as f:
+        config = json.load(f)
+    if config.get("parallel_drafting"):
+        raise ValueError(
+            f"{config_path} is a P-EAGLE (parallel-drafting) draft, which SGLang cannot serve. "
+            "P-EAGLE inference currently requires vLLM >= 0.16 launched with "
+            '--speculative-config \'{"method": "eagle3", "parallel_drafting": true, ...}\'. '
+            "SGLang support is tracked in https://github.com/sgl-project/sglang/issues/23171."
+        )
+
+
 def _infer_num_hidden_layers(state_dict: dict[str, Any]) -> int | None:
     """Infer num_hidden_layers from a state dict by counting unique layer indices."""
     indices = {int(m.group(1)) for key in state_dict if (m := re.search(r"\blayers\.(\d+)\b", key))}
@@ -195,6 +226,7 @@ def _maybe_export_training_checkpoint(
     config_path = checkpoint_dir / "config.json"
     if not draft_model_path.exists() or not config_path.exists():
         return checkpoint_dir, None
+    _raise_if_parallel_drafting(config_path)
 
     export_dir = checkpoint_dir / "model"
     exported_weights = export_dir / "model.safetensors"
@@ -252,6 +284,7 @@ def resolve_draft_artifacts(draft: str, algorithm: str, *, dry_run: bool = False
         if not ((candidate / "config.json").exists() and _has_hf_weight_file(candidate)):
             continue
         config_path = candidate / "config.json"
+        _raise_if_parallel_drafting(config_path)
         if _config_needs_rewrite(config_path, algorithm):
             if dry_run:
                 logger.warning(

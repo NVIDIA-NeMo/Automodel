@@ -66,6 +66,26 @@ behave identically. Enabling them applies the EAGLE-3.1 drafter toggles to
 the Llama-style draft used here; the MLA-backbone Kimi K2.6 draft
 (``Eagle3DeepseekV2ForCausalLM`` in ``lightseekorg/kimi-k2.6-eagle3.1-mla``)
 is a separate architecture and is not covered by this module.
+
+P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
+
+* ``config.parallel_drafting`` (bool, default False) -- when True, the draft
+  registers a single learnable ``mask_hidden`` placeholder of shape
+  ``[1, num_aux_hidden_states * target_hidden_size]`` (the pre-``fc``
+  concatenated-aux dimension). The P-EAGLE trainer feeds this placeholder --
+  projected through the same ``project_hidden_states`` path as real aux states
+  -- at every masked multi-token-prediction depth (``>= 1``), together with the
+  masked token ``config.ptd_token_id``, so the draft learns to predict all K
+  tokens in a single forward instead of autoregressively. The on-disk key is
+  ``mask_hidden``; vLLM's parallel-drafting loader
+  (https://github.com/vllm-project/vllm/pull/32887, released in v0.16.0) reads
+  it by that substring and broadcasts it into every masked slot, so the name
+  must be preserved for the checkpoint to load into vLLM. No extra token
+  parameter is added: the masked token slot reuses
+  ``embed_tokens[config.ptd_token_id]``, matching vLLM's runtime. The flag is
+  inference-architecture-only -- as of this writing P-EAGLE inference is
+  supported by vLLM >= 0.16; SGLang support is tracked upstream in
+  https://github.com/sgl-project/sglang/issues/23171.
 """
 
 from __future__ import annotations
@@ -518,6 +538,20 @@ class LlamaEagle3DraftModel(PreTrainedModel):
         self.model = Eagle3LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
+        # P-EAGLE (parallel drafting): a single learnable placeholder that
+        # substitutes for the target auxiliary hidden states at the masked
+        # multi-token-prediction positions (depths >= 1). It lives at the
+        # *pre-``fc``* concatenated-aux dimension
+        # (``num_aux_hidden_states * target_hidden_size`` == ``model.fc.in_features``)
+        # so it flows through ``project_hidden_states`` -- and ``fc_norm`` when
+        # set -- exactly like a real aux-hidden vector. The on-disk key
+        # ``mask_hidden`` is the contract vLLM's parallel-drafting loader keys
+        # on; do not rename it. Registered only when ``parallel_drafting`` is
+        # set so EAGLE-3 / EAGLE-3.1 checkpoints round-trip with no extra keys.
+        if getattr(config, "parallel_drafting", False):
+            self.mask_hidden = nn.Parameter(torch.empty(1, self.model.fc.in_features))
+            nn.init.normal_(self.mask_hidden, mean=0.0, std=getattr(config, "initializer_range", 0.02))
+
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
@@ -558,6 +592,19 @@ class LlamaEagle3DraftModel(PreTrainedModel):
                 dim=-1,
             )
         return self.model.fc(aux_hidden_states)
+
+    def masked_projected_hidden(self) -> torch.Tensor:
+        """Project the learnable P-EAGLE ``mask_hidden`` placeholder to draft hidden size.
+
+        Returns a ``[1, hidden_size]`` tensor obtained by running the
+        ``[1, num_aux_hidden_states * target_hidden_size]`` placeholder through
+        the same ``project_hidden_states`` path (``fc`` plus optional
+        ``fc_norm``) used for real auxiliary hidden states. The P-EAGLE trainer
+        broadcasts the result across the batch / sequence for every masked
+        multi-token-prediction depth. Only valid when the draft was built with
+        ``config.parallel_drafting=True``.
+        """
+        return self.project_hidden_states(self.mask_hidden)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed input ids with the draft embedding table."""

@@ -80,6 +80,30 @@ def test_resolve_draft_artifacts_rewrites_stale_exported_config(tmp_path: Path):
     assert rewritten["architectures"] == ["LlamaForCausalLMEagle3"]
 
 
+def test_resolve_draft_artifacts_rejects_parallel_drafting_head(tmp_path: Path):
+    """A P-EAGLE (parallel-drafting) head must be rejected with a vLLM-pointing error.
+
+    SGLang cannot serve a ``parallel_drafting: true`` checkpoint; resolving it
+    must fail loudly (pointing at vLLM / issue 23171) rather than mis-serving
+    it through the EAGLE-3 path.
+    """
+    import pytest
+
+    checkpoint_dir = tmp_path / "epoch_0_step_1000"
+    model_dir = checkpoint_dir / "model"
+    model_dir.mkdir(parents=True)
+    config_path = model_dir / "config.json"
+    config_path.write_text(
+        json.dumps({"architectures": ["LlamaForCausalLMEagle3"], "parallel_drafting": True, "ptd_token_id": 0}),
+        encoding="utf-8",
+    )
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    torch.save(torch.arange(4), model_dir / "speculative_token_map.pt")
+
+    with pytest.raises(ValueError, match="P-EAGLE"):
+        resolve_draft_artifacts(str(checkpoint_dir), "EAGLE3")
+
+
 def test_resolve_draft_artifacts_dry_run_does_not_modify_stale_config(tmp_path: Path):
     """dry_run=True must return expected paths but never touch files on disk."""
     checkpoint_dir = tmp_path / "epoch_0_step_1000"
