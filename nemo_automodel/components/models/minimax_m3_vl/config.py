@@ -192,6 +192,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         projector_hidden_act: str = "gelu",
         projector_hidden_size: int = 6144,
         multimodal_projector_bias: bool = True,
+        patch_merge_bias: bool = True,
         vision_feature_layer: int = -1,
         vision_feature_select_strategy: str = "full",
         img_token_compression_config: Optional[dict] = None,
@@ -217,6 +218,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         self.projector_hidden_act = projector_hidden_act
         self.projector_hidden_size = projector_hidden_size
         self.multimodal_projector_bias = multimodal_projector_bias
+        self.patch_merge_bias = patch_merge_bias
         self.vision_feature_layer = vision_feature_layer
         self.vision_feature_select_strategy = vision_feature_select_strategy
         self.img_token_compression_config = img_token_compression_config or {}

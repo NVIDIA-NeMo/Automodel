@@ -171,7 +171,13 @@ class MiniMaxM3VisionTransformer(nn.Module):
 
     @staticmethod
     def _block_diag_mask(grid_thw: list[list[int]], device) -> torch.Tensor:
-        """Bidirectional within each image, no cross-image attention."""
+        """Bidirectional within each image, no cross-image attention.
+
+        Note: this materializes a dense ``[1, 1, total, total]`` mask (O(total^2)
+        memory). It is only built for multi-image batches; single-image inputs use
+        ``attn_mask=None``. For large multi-image batches a cu_seqlens / varlen
+        attention path (as in sglang) would avoid the quadratic mask.
+        """
         seqlens = [int(t * h * w) for t, h, w in grid_thw]
         total = sum(seqlens)
         mask = torch.zeros(1, 1, total, total, dtype=torch.bool, device=device)
@@ -183,6 +189,16 @@ class MiniMaxM3VisionTransformer(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor, grid_thw: list[list[int]]) -> torch.Tensor:
         device = pixel_values.device
+        # Image-only support: video segmentation (_apply_max_frames_limit, which splits
+        # grid_t > vision_segment_max_frames) is not implemented, so reject such inputs
+        # loudly rather than silently producing wrong RoPE positions / masks.
+        max_frames = getattr(self.config, "vision_segment_max_frames", None)
+        if max_frames is not None:
+            assert all(int(t) <= max_frames for t, _, _ in grid_thw), (
+                f"grid_t exceeds vision_segment_max_frames={max_frames}; video temporal "
+                "segmentation is not implemented (MiniMax M3 VL onboarding is image-only)."
+            )
+
         x = self.embeddings(pixel_values)
         x = self.pre_layrnorm(x)
 
@@ -235,18 +251,19 @@ class MiniMaxM3VisionModel(nn.Module):
         *,
         projector_hidden_act: str = "gelu",
         multimodal_projector_bias: bool = True,
+        patch_merge_bias: bool = True,
     ):
         super().__init__()
         self.config = config
         self.vision_model = MiniMaxM3VisionTransformer(config)
-        # projector_hidden_act / multimodal_projector_bias are top-level VL config
-        # fields (not on vision_config), so they are passed in by the wrapper.
+        # projector_hidden_act / multimodal_projector_bias / patch_merge_bias are
+        # top-level VL config fields (not on vision_config), passed in by the wrapper.
         self.multi_modal_projector = MiniMaxVLMultiModalProjector(
             config.hidden_size, text_hidden_size, projector_hidden_size, projector_hidden_act, multimodal_projector_bias
         )
         spatial_merge_size = config.img_token_compression_config.get("spatial_merge_size", 2)
         self.patch_merge_mlp = MiniMaxVLPatchMerger(
-            spatial_merge_size, text_hidden_size, projector_hidden_size, projector_hidden_act, multimodal_projector_bias
+            spatial_merge_size, text_hidden_size, projector_hidden_size, projector_hidden_act, patch_merge_bias
         )
 
     @property

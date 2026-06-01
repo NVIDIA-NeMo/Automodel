@@ -190,6 +190,20 @@ def build_block_sparse_attn_bias(
     return bias.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk]
 
 
+def _padding_mask_to_additive_bias(attention_mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Convert an incoming attention mask to an additive key bias broadcastable to ``ref``.
+
+    Accepts a 2-D ``[B, T]`` keep-mask (1/True = attend) or an already-additive
+    float mask; returns ``0`` where attended and ``-inf`` where masked.
+    """
+    if attention_mask.is_floating_point() and attention_mask.dim() >= 3:
+        return attention_mask.to(ref.dtype)
+    mask = attention_mask
+    if mask.dim() == 2:
+        mask = mask[:, None, None, :]  # [B, 1, 1, T] -> masks padded *keys*
+    return torch.where(mask.bool(), 0.0, float("-inf")).to(dtype=ref.dtype, device=ref.device)
+
+
 class MiniMaxM3Indexer(nn.Module):
     """Lightning indexer (selection-only) for MiniMax M3 sparse-attention layers.
 
@@ -280,6 +294,16 @@ class MiniMaxM3Attention(nn.Module):
         self.is_sparse_attention_layer = is_sparse_attention_layer
         gemma = getattr(config, "use_gemma_norm", False)
 
+        # Fail loudly on unsupported configs: M3 does not implement the attention
+        # output gate, and only per-head QK norm is supported (the only mode the
+        # sparse index branch is valid for).
+        assert not getattr(config, "attention_output_gate", False), (
+            "MiniMax M3 attention_output_gate is not implemented"
+        )
+        qk_norm_type = getattr(config, "qk_norm_type", "per_head")
+        if self.use_qk_norm or is_sparse_attention_layer:
+            assert qk_norm_type == "per_head", f"MiniMax M3 only supports qk_norm_type='per_head', got {qk_norm_type!r}"
+
         self.q_proj = initialize_linear_module(
             backend.linear, config.hidden_size, self.num_heads * self.head_dim, bias=False
         )
@@ -294,21 +318,15 @@ class MiniMaxM3Attention(nn.Module):
         )
 
         if self.use_qk_norm:
-            assert getattr(config, "qk_norm_type", "per_head") == "per_head", "M3 only supports per_head QK norm"
             self.q_norm = MiniMaxM3RMSNorm(self.head_dim, eps=config.rms_norm_eps, gemma=gemma)
             self.k_norm = MiniMaxM3RMSNorm(self.head_dim, eps=config.rms_norm_eps, gemma=gemma)
         else:
             self.q_norm = None
             self.k_norm = None
 
-        if is_sparse_attention_layer:
-            sparse_cfg = config.sparse_attention_config
-            assert getattr(config, "qk_norm_type", "per_head") == "per_head", (
-                "sparse attention requires per_head QK norm"
-            )
-            self.indexer = MiniMaxM3Indexer(config, sparse_cfg, backend)
-        else:
-            self.indexer = None
+        self.indexer = (
+            MiniMaxM3Indexer(config, config.sparse_attention_config, backend) if is_sparse_attention_layer else None
+        )
 
         softmax_scale = self.head_dim**-0.5
         self.attn_module, self.attn_func = initialize_attn_module_and_func(
@@ -350,7 +368,12 @@ class MiniMaxM3Attention(nn.Module):
         if self.indexer is not None:
             if qkv_format != "bshd":
                 raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
-            attention_mask = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+            sparse_bias = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+            # Preserve the caller's padding mask: padded keys must stay masked
+            # rather than becoming eligible for top-k block selection.
+            if attention_mask is not None:
+                sparse_bias = sparse_bias + _padding_mask_to_additive_bias(attention_mask, sparse_bias)
+            attention_mask = sparse_bias
 
         q, k = apply_rotary_emb_qk(
             q,
@@ -403,6 +426,15 @@ class Block(nn.Module):
             is_sparse_attention_layer = sparse_freq is None or sparse_freq[layer_idx] != 0
         else:
             is_sparse_attention_layer = False
+
+        if is_sparse_attention_layer:
+            # MiniMaxM3Indexer only implements the selection-only branch
+            # (disable_index_value=True; no index value/output projections).
+            disable_flags = sparse_cfg.get("sparse_disable_index_value")
+            assert disable_flags is None or disable_flags[layer_idx] != 0, (
+                f"MiniMax M3 sparse layer {layer_idx} has disable_index_value=0 (index value/output "
+                "projections), which is not supported (only the selection-only indexer is implemented)."
+            )
         self.self_attn = MiniMaxM3Attention(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)

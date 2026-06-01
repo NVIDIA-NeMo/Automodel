@@ -130,10 +130,15 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         **kwargs,
     ) -> dict[str, Any]:
         """Convert an HF checkpoint to native format (operates in-place to limit peak memory)."""
+        moe_detected = False
         for key in hf_state_dict.keys():
             if ".block_sparse_moe.experts." in key and key.endswith(".weight"):
                 self._uses_model_prefix = key.startswith("model.")
+                moe_detected = True
                 break
+        if not moe_detected:
+            # Fallback for text-only / pruned checkpoints with no MoE expert keys.
+            self._uses_model_prefix = any(k.startswith("model.") for k in hf_state_dict)
 
         # MTP tensors are converted separately (the transformer_layer is a full
         # decoder block); dropped entirely when the model has no MTP module.

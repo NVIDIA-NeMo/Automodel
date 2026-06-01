@@ -19,10 +19,14 @@ Parity uses an independent CPU transcription of the sglang vision forward
 bidirectional attention, GELU projector, spatial patch merger.
 """
 
+import pytest
 import torch
 import torch.nn.functional as F
 
-from .conftest import IMAGE_TOKEN_INDEX
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLVisionConfig
+from nemo_automodel.components.models.minimax_m3_vl.vision_encoder import MiniMaxM3VisionModel
+
+from .conftest import IMAGE_TOKEN_INDEX, VISION_CONFIG
 
 
 def _rotate_half(x):
@@ -169,3 +173,24 @@ def test_vlm_adapter_roundtrip_and_naming(vlm_model):
     assert set(back.keys()) == set(native.keys())
     for key in native:
         assert torch.allclose(native[key].float(), back[key].float(), atol=1e-6), key
+
+
+def test_video_grid_rejected(vlm_model):
+    # Image-only support: grid_t beyond vision_segment_max_frames must fail loudly
+    # (video temporal segmentation is not implemented).
+    vc = vlm_model.config.vision_config
+    patch_dim = vc.num_channels * vc.img_token_compression_config["temporal_patch_size"] * vc.patch_size**2
+    grid_t = vc.vision_segment_max_frames + 1
+    pixel_values = torch.randn(grid_t * 4 * 4, patch_dim)
+    with pytest.raises(AssertionError):
+        vlm_model.vision_tower(pixel_values, [[grid_t, 4, 4]])
+
+
+def test_patch_merge_bias_independent():
+    # patch_merge_bias is a separate flag from multimodal_projector_bias.
+    vc = MiniMaxM3VLVisionConfig(**VISION_CONFIG)
+    vm = MiniMaxM3VisionModel(
+        vc, text_hidden_size=64, projector_hidden_size=64, multimodal_projector_bias=True, patch_merge_bias=False
+    )
+    assert vm.multi_modal_projector.linear_1.bias is not None
+    assert vm.patch_merge_mlp.linear_1.bias is None

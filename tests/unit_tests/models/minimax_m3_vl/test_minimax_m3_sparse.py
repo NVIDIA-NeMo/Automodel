@@ -18,11 +18,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
     MiniMaxM3Indexer,
+    _padding_mask_to_additive_bias,
     build_block_sparse_attn_bias,
 )
+from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
+from .conftest import SPARSE_ATTENTION_CONFIG, TINY_CFG
 from .test_minimax_m3_parity import _gemma_rmsnorm, _partial_neox_rope, _swiglu_oai
 
 
@@ -197,3 +201,31 @@ def test_sparse_e2e_parity_vs_reference(sparse_model):
     cos = F.cosine_similarity(mine.flatten(), ref.flatten(), dim=0).item()
     assert max_diff < 1e-4, f"max_diff={max_diff}"
     assert cos > 0.9999, f"cos_sim={cos}"
+
+
+def test_padding_mask_to_additive_bias():
+    ref = torch.zeros(2, 4, 5, 5)
+    keep = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]])
+    bias = _padding_mask_to_additive_bias(keep, ref)
+    assert bias.shape == (2, 1, 1, 5)
+    assert bias[0, 0, 0].tolist() == [0.0, 0.0, 0.0, float("-inf"), float("-inf")]
+
+
+def test_sparse_forward_with_padding_mask_is_finite(sparse_model):
+    # The indexer's block-selection bias must be combined with (not overwrite) the
+    # caller's padding mask, so padded keys are never attended.
+    cfg = sparse_model.config
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    attn = torch.ones(2, 16)
+    attn[0, 12:] = 0  # right-pad 4 keys
+    with torch.no_grad():
+        out = sparse_model(ids, attention_mask=attn)
+    assert torch.isfinite(out).all()
+
+
+def test_index_value_branch_rejected(backend):
+    # The indexer only implements the selection-only branch (disable_index_value=True).
+    sa = {**SPARSE_ATTENTION_CONFIG, "sparse_disable_index_value": [0, 0, 0]}
+    cfg = MiniMaxM3VLTextConfig(torch_dtype="float32", **{**TINY_CFG, "sparse_attention_config": sa})
+    with pytest.raises(AssertionError):
+        MiniMaxM3SparseForCausalLM(cfg, backend=backend)
