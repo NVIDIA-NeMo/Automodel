@@ -576,12 +576,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # Build checkpoint config
-        checkpoint_config = self.cfg.checkpoint.build(
-            cache_dir=self.cfg.get("model.cache_dir", None),
-            model_repo_id=_get_model_name(self.cfg.model),
-            is_peft=bool(self.cfg.get("peft", None)),
-        )
+        # Checkpoint config (model-derived fields are filled in by RecipeConfig)
+        checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
             self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)

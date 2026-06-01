@@ -16,17 +16,18 @@
 
 ``CheckpointingConfig`` holds the typed parameters that drive checkpointing
 behaviour and exposes ``.build()`` to construct the :class:`Checkpointer`
-engine (defined in ``checkpointing.py``). ``build_checkpoint_config`` is the
-adapter that assembles a config from the YAML ``checkpoint:`` block.
+engine (defined in ``checkpointing.py``).  Every field has a sensible default
+so the recipe layer can construct it directly from the YAML ``checkpoint:``
+block plus the model-derived ``model_repo_id`` / ``model_cache_dir`` /
+``is_peft`` arguments — there is no separate builder/adapter.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 from huggingface_hub import constants as hf_constants
@@ -39,8 +40,6 @@ if TYPE_CHECKING:
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
-logger = logging.getLogger(__name__)
-
 
 def _is_geq_torch_2_9() -> bool:
     """Check if the current torch version is greater than or equal to 2.9.0."""
@@ -49,16 +48,22 @@ def _is_geq_torch_2_9() -> bool:
 
 @dataclass
 class CheckpointingConfig:
-    """Configuration for checkpointing."""
+    """Configuration for checkpointing.
 
-    enabled: bool
-    checkpoint_dir: str | Path
-    model_save_format: str
-    model_cache_dir: str | Path
-    model_repo_id: str
-    save_consolidated: bool
-    is_peft: bool
-    model_state_dict_keys: list[str] = (
+    Every field has a default so the recipe layer can construct this directly
+    from the YAML ``checkpoint:`` block merged with the model-derived
+    ``model_repo_id`` / ``model_cache_dir`` / ``is_peft`` values.  When
+    ``model_cache_dir`` is ``None`` it falls back to the HF hub cache.
+    """
+
+    enabled: bool = True
+    checkpoint_dir: str | Path = "checkpoints/"
+    model_save_format: str = "safetensors"
+    model_cache_dir: str | Path | None = None
+    model_repo_id: str | None = None
+    save_consolidated: bool = True
+    is_peft: bool = False
+    model_state_dict_keys: list[str] | None = (
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
     )
     is_async: bool = False
@@ -78,7 +83,21 @@ class CheckpointingConfig:
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
 
     def __post_init__(self):
-        """Convert a raw string such as "safetensors" into the right Enum."""
+        """Resolve the cache dir, enforce PEFT constraints, and coerce the save format."""
+        if self.model_cache_dir is None:
+            self.model_cache_dir = hf_constants.HF_HUB_CACHE
+
+        # PEFT checkpointing is not supported for `torch_save`; fall back to the
+        # safetensors default (keeping ``checkpoint_dir``).
+        if self.is_peft and self.model_save_format == "torch_save":
+            logging.warning(
+                "PEFT checkpointing is not supported for `torch_save` format; "
+                "falling back to `safetensors` (preserving `checkpoint_dir`)."
+            )
+            self.model_save_format = "safetensors"
+            self.save_consolidated = True
+
+        # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
         assert self.model_save_format in formats, (
             f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
@@ -126,48 +145,4 @@ class CheckpointingConfig:
         return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
 
 
-def build_checkpoint_config(
-    checkpoint_kwargs: Mapping[str, Any] | None,
-    cache_dir: str | None,
-    model_repo_id: str | None,
-    is_peft: bool,
-) -> CheckpointingConfig:
-    """Build a checkpoint configuration.
-
-    Args:
-        checkpoint_kwargs: Optional keyword overrides from the YAML
-            ``checkpoint:`` block.
-        cache_dir: HF cache directory for the model.
-        model_repo_id: Model repository ID.
-        is_peft: Whether the model uses PEFT.
-
-    Returns:
-        Instantiated ``CheckpointingConfig`` ready for the checkpointer.
-    """
-    ckpt_kwargs = dict(
-        enabled=True,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=True,
-        is_peft=is_peft,
-    )
-    user_cfg = {}
-    if checkpoint_kwargs is not None:
-        user_cfg = dict(checkpoint_kwargs)
-        user_cfg.pop("restore_from", None)
-    if is_peft and user_cfg.get("model_save_format") == "torch_save":
-        logger.warning(
-            "PEFT checkpointing is not supported for `torch_save` format; "
-            "discarding user checkpoint config and using safetensors defaults "
-            "(preserving `checkpoint_dir` if set)."
-        )
-        if "checkpoint_dir" in user_cfg:
-            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
-    else:
-        ckpt_kwargs |= user_cfg
-    return CheckpointingConfig(**ckpt_kwargs)
-
-
-__all__ = ["CheckpointingConfig", "build_checkpoint_config"]
+__all__ = ["CheckpointingConfig"]

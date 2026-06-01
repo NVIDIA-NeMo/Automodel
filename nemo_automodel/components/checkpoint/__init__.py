@@ -16,9 +16,9 @@ from packaging.version import parse as vparse
 
 from ._torch_backports import apply_async_checkpoint_patch as _nemo__apply_async_patch
 from ._torch_backports import apply_patches as _nemo__apply_patches
-from .config import CheckpointingConfig, build_checkpoint_config
+from .config import CheckpointingConfig
 
-__all__ = ["CheckpointingConfig", "build_checkpoint_config"]
+__all__ = ["CheckpointingConfig"]
 
 if vparse(torch.__version__).base_version <= "2.7.1":
     _nemo__apply_patches()

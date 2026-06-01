@@ -32,7 +32,6 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_o
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import (
     _STEP_SCHEDULER_RUNTIME_KEYS,
-    CheckpointSpec,
     _as_dict,
     _callable_and_kwargs,
     _section_kwargs,
@@ -52,10 +51,13 @@ def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
 
 
 def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
-    """Resolve a YAML checkpoint block and build it (mirrors ``RecipeConfig.checkpoint.build``)."""
-    return CheckpointSpec(_as_dict(cfg_ckpt) if cfg_ckpt is not None else None).build(
-        cache_dir=cache_dir, model_repo_id=model_repo_id, is_peft=is_peft
-    )
+    """Resolve a YAML checkpoint block into a ``CheckpointingConfig`` (mirrors ``RecipeConfig.checkpoint``)."""
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+
+    kwargs = _as_dict(cfg_ckpt) if cfg_ckpt is not None else {}
+    kwargs.pop("restore_from", None)
+    derived = {"model_repo_id": model_repo_id, "model_cache_dir": cache_dir, "is_peft": is_peft}
+    return CheckpointingConfig(**{**derived, **kwargs})
 
 
 def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
@@ -1268,19 +1270,17 @@ class TestBuildCheckpointConfig:
         assert config.is_peft is True
 
     def test_build_checkpoint_config_warns_on_peft_with_torch_save(self, caplog):
-        """PEFT + torch_save: warn, discard user ckpt cfg, keep safetensors defaults; preserve checkpoint_dir."""
+        """PEFT + torch_save: warn, fall back to safetensors defaults; preserve checkpoint_dir."""
         from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
             "checkpoint_dir": "/user/ckpt/",
-            # torch_save-specific / incompatible options that must be discarded:
             "save_consolidated": False,
-            "is_async": True,
         }
 
-        with caplog.at_level("WARNING", logger="nemo_automodel.recipes.vlm.finetune"):
+        with caplog.at_level("WARNING"):
             config = build_checkpoint_config(
                 cfg_ckpt=cfg_ckpt,
                 cache_dir=None,
@@ -1288,14 +1288,13 @@ class TestBuildCheckpointConfig:
                 is_peft=True,
             )
 
-        assert any("discarding" in rec.message.lower() for rec in caplog.records)
+        assert any("falling back" in rec.message.lower() for rec in caplog.records)
         assert config.is_peft is True
         assert config.model_save_format == SerializationFormat.SAFETENSORS
         # checkpoint_dir is preserved from the user config
         assert config.checkpoint_dir == "/user/ckpt/"
-        # other user-provided torch_save options are discarded (defaults restored)
+        # save_consolidated is forced back to the safetensors default
         assert config.save_consolidated is True
-        assert config.is_async is False
 
     def test_build_checkpoint_config_uses_hf_hub_cache_when_cache_dir_none(self):
         """Test that HF_HUB_CACHE is used when cache_dir is None."""
@@ -2522,8 +2521,8 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         return cfg
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.CheckpointSpec.build",
-        lambda self, **kw: _stub_build_checkpoint_config(),
+        "nemo_automodel.recipes._typed_config.RecipeConfig.checkpoint",
+        property(lambda self: _stub_build_checkpoint_config()),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.setup_distributed",
