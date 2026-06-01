@@ -86,9 +86,9 @@ automodel --nproc-per-node=8 examples/llm_finetune/minicpm/minicpm5_1b_squad.yam
 
 Refer to the [Installation Guide](../../../guides/installation.md) and [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
-## Fine-Tuning
+## Fine-Tune
 
-See the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
+Refer to the [LLM Fine-Tuning Guide](../../../guides/llm/finetune.md).
 
 ## Hugging Face Model Cards
 
