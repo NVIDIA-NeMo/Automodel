@@ -87,7 +87,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.5.0",
+    "transformers==5.8.1",
     "wandb>=0.26.1",
     "torchao",
     "mlflow",

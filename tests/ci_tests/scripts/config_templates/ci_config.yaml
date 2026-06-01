@@ -86,6 +86,9 @@ env:
   LOCAL_BATCH_SIZE:
     target: step_scheduler.local_batch_size
     phases: [nightly, release, convergence, performance]
+  EP_SIZE:
+    target: distributed.ep_size
+    phases: [nightly, release, convergence, performance]
 
 # Computed dynamic overrides. `format` is str.format() over env vars + built-in `date`.
 computed:

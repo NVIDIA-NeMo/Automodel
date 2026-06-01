@@ -77,6 +77,18 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
 
     def setup(self):
         """Build all training components, then apply dLLM-specific overrides."""
+        # Diffusion-LM training expects the user-specified ``torch_dtype`` to
+        # be honored as the master-weight dtype. AM's default loading path
+        # restores the on-disk dtype after load, which would silently downcast
+        # an fp32 load back to the checkpoint's bf16 and break the standard
+        # mixed-precision recipe (fp32 master + bf16 compute). Disable that
+        # restoration here only — other recipes are unaffected.
+        # ``self.cfg.model`` is a ``ConfigNode``; use attribute access (no
+        # ``__setitem__``) and check ``__dict__`` for explicit user overrides.
+        model_cfg = self.cfg.get("model", None)
+        if model_cfg is not None and "_restore_loaded_dtype" not in model_cfg.__dict__:
+            model_cfg._restore_loaded_dtype = False
+
         # Let parent build model, optimizer, dataloader, scheduler, etc.
         super().setup()
 
@@ -208,6 +220,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         *,
         loss_buffer,
         num_diffusion_tokens,
+        num_ar_tokens=None,
         num_batches,
         is_train: bool = True,
     ):
@@ -261,16 +274,25 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)
+            # Hybrid models (e.g. Nemotron-Labs-Diffusion in block_diff mode)
+            # also return causal_logits for the AR branch of the loss.  When
+            # absent (e.g. pure-MDLM models like LLaDA), the AR branch is
+            # silently skipped by HybridDiffusionLLMLoss / MDLMCrossEntropyLoss.
+            causal_logits = getattr(out, "causal_logits", None)
             del out
 
             # Compute dLLM loss (unified interface via DLLMLossOutput)
+            has_causal = causal_logits is not None
             loss_result = self.dllm_loss_fn(
                 logits=logits,
                 target_ids=clean_input_ids,
                 noise_mask=noise_mask,
                 p_mask=p_mask,
                 loss_mask=loss_mask,
+                loss_mask_ar=loss_mask if has_causal else None,
                 num_diffusion_tokens=num_diffusion_tokens,
+                num_ar_tokens=num_ar_tokens if has_causal else None,
+                causal_logits=causal_logits,
             )
             microbatch_loss = loss_result.total_loss
             dllm_loss = loss_result.dllm_loss.detach().clone()
@@ -304,11 +326,15 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         num_noise_tokens = self._dp_allreduce(torch.tensor(num_noise_tokens, dtype=torch.long)).item()
         num_supervised_tokens = self._dp_allreduce(torch.tensor(num_supervised_tokens, dtype=torch.long)).item()
 
-        # Select denominator based on strategy (MDLM -> supervised, future models may use noise)
+        # Select diffusion-loss denominator based on strategy:
+        # - MDLM (LLaDA) -> supervised
+        # - Hybrid (Nemotron-Labs-Diffusion) -> noise
+        # AR-loss denominator is always supervised (only relevant for Hybrid).
         if self.dllm_strategy.normalization_mode == "noise":
             num_diffusion_tokens = num_noise_tokens
         else:
             num_diffusion_tokens = num_supervised_tokens
+        num_ar_tokens = num_supervised_tokens
 
         loss_buffer = []
 
@@ -328,6 +354,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                 batch,
                 loss_buffer=loss_buffer,
                 num_diffusion_tokens=num_diffusion_tokens,
+                num_ar_tokens=num_ar_tokens,
                 num_batches=num_batches,
             )
 
@@ -344,7 +371,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
             pp_axis_name="pp" if self.pp_enabled else None,
             foreach=True,
-            num_label_tokens=num_diffusion_tokens,
+            num_label_tokens=num_ar_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
         )
 
@@ -460,6 +487,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
                     batch,
                     loss_buffer=loss_buffer,
                     num_diffusion_tokens=num_norm,
+                    num_ar_tokens=num_supervised,
                     num_batches=1,
                     is_train=False,
                 )

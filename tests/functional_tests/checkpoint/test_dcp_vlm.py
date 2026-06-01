@@ -104,76 +104,79 @@ def to_cpu(
 
 def test_vlm_dcp_checkpoint():
     """Tests DCP checkpoint"""
+    # transformers 5.8 flattened SiglipVisionModel: the v5.5 `vision_model.`
+    # wrapper inside Gemma3's vision_tower is gone, so on-disk DCP keys are
+    # now `model.vision_tower.X` rather than `model.vision_tower.X`.
     expected_model_keys = {
-        "model.vision_tower.vision_model.embeddings.patch_embedding.weight": ([576, 3, 14, 14], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.embeddings.patch_embedding.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.embeddings.position_embedding.weight": ([2048, 1152], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.layer_norm1.weight": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.layer_norm1.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.k_proj.weight": (
+        "model.vision_tower.embeddings.patch_embedding.weight": ([576, 3, 14, 14], torch.bfloat16, "cpu"),
+        "model.vision_tower.embeddings.patch_embedding.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.embeddings.position_embedding.weight": ([2048, 1152], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.layer_norm1.weight": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.layer_norm1.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.self_attn.k_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.k_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.v_proj.weight": (
+        "model.vision_tower.encoder.layers.0.self_attn.k_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.self_attn.v_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.v_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight": (
+        "model.vision_tower.encoder.layers.0.self_attn.v_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.weight": (
+        "model.vision_tower.encoder.layers.0.self_attn.q_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.self_attn.out_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.layer_norm2.weight": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.layer_norm2.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight": ([2152, 1152], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.bias": ([2152], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc2.weight": ([576, 4304], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc2.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.layer_norm1.weight": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.layer_norm1.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.k_proj.weight": (
+        "model.vision_tower.encoder.layers.0.self_attn.out_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.layer_norm2.weight": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.layer_norm2.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.mlp.fc1.weight": ([2152, 1152], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.mlp.fc1.bias": ([2152], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.mlp.fc2.weight": ([576, 4304], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.0.mlp.fc2.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.layer_norm1.weight": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.layer_norm1.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.self_attn.k_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.k_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.v_proj.weight": (
+        "model.vision_tower.encoder.layers.1.self_attn.k_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.self_attn.v_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.v_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.q_proj.weight": (
+        "model.vision_tower.encoder.layers.1.self_attn.v_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.self_attn.q_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.q_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.out_proj.weight": (
+        "model.vision_tower.encoder.layers.1.self_attn.q_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.self_attn.out_proj.weight": (
             [576, 1152],
             torch.bfloat16,
             "cpu",
         ),
-        "model.vision_tower.vision_model.encoder.layers.1.self_attn.out_proj.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.layer_norm2.weight": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.layer_norm2.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.mlp.fc1.weight": ([2152, 1152], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.mlp.fc1.bias": ([2152], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.mlp.fc2.weight": ([576, 4304], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.encoder.layers.1.mlp.fc2.bias": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.post_layernorm.weight": ([576], torch.bfloat16, "cpu"),
-        "model.vision_tower.vision_model.post_layernorm.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.self_attn.out_proj.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.layer_norm2.weight": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.layer_norm2.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.mlp.fc1.weight": ([2152, 1152], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.mlp.fc1.bias": ([2152], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.mlp.fc2.weight": ([576, 4304], torch.bfloat16, "cpu"),
+        "model.vision_tower.encoder.layers.1.mlp.fc2.bias": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.post_layernorm.weight": ([576], torch.bfloat16, "cpu"),
+        "model.vision_tower.post_layernorm.bias": ([576], torch.bfloat16, "cpu"),
         "model.multi_modal_projector.mm_input_projection_weight": ([576, 128], torch.bfloat16, "cpu"),
         "model.multi_modal_projector.mm_soft_emb_norm.weight": ([576], torch.bfloat16, "cpu"),
         "model.language_model.embed_tokens.weight": ([131104, 128], torch.bfloat16, "cpu"),

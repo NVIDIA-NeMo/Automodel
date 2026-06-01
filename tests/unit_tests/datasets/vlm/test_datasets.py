@@ -178,8 +178,195 @@ def test_make_medpix_dataset(monkeypatch):
         assert assistant_payload == {"type": "text", "text": src["answer"]}
 
 
+class _FakeHFDataset:
+    """Minimal stand-in for ``datasets.Dataset`` covering the slice of API
+    ``make_tulu3_magicoder_text_mix_dataset`` uses: ``column_names``,
+    ``map(fn, remove_columns=...)``, ``filter(fn)``, and iteration.
+    """
+
+    def __init__(self, rows: List[Dict], column_names: List[str]):
+        self.rows = rows
+        self.column_names = list(column_names)
+
+    def map(self, fn, remove_columns=None):
+        new_rows = [fn(r) for r in self.rows]
+        new_cols = (
+            [c for c in self.column_names if c not in (remove_columns or [])]
+            if remove_columns
+            else list(self.column_names)
+        )
+        if new_rows:
+            new_cols = sorted(set(new_cols) | set(new_rows[0].keys()))
+        return _FakeHFDataset(new_rows, new_cols)
+
+    def filter(self, fn):
+        return _FakeHFDataset([r for r in self.rows if fn(r)], self.column_names)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+
+class TestMakeTulu3MagicoderTextMixDataset:
+    """End-to-end checks for ``make_tulu3_magicoder_text_mix_dataset``.
+
+    The function is intentionally heavy on filtering rules
+    (``max_turns`` cap, missing assistant turn, blank text, invalid role)
+    plus the 80/20 ``interleave_datasets`` mix and a ``limit_total`` cap.
+    The tests below pin each of those branches against fake HF datasets so
+    the recipe-side contract is fixed:
+
+      * Output rows expose exactly one ``conversation`` key and no ``image``
+        entry anywhere (text-only training).
+      * Per-turn ``content`` is the ``[{"type": "text", "text": ...}]`` shape
+        the VLM collate consumes.
+      * Filter rules drop Tulu rows with > ``max_turns`` turns, no assistant
+        turn, empty text, or unknown roles; Magicoder rows with empty
+        ``problem`` or ``solution`` are dropped too.
+      * ``limit_total`` caps the merged stream early.
+    """
+
+    def _patch_loader_and_mixer(self, monkeypatch, tulu_rows, magicoder_rows, mixed_order=None):
+        tulu_cols = list(tulu_rows[0].keys()) if tulu_rows else ["messages"]
+        magicoder_cols = list(magicoder_rows[0].keys()) if magicoder_rows else ["problem", "solution"]
+        tulu_ds = _FakeHFDataset(tulu_rows, tulu_cols)
+        magicoder_ds = _FakeHFDataset(magicoder_rows, magicoder_cols)
+
+        def _fake_load_dataset(name, split, **kwargs):
+            if "tulu" in name:
+                return tulu_ds
+            if "Magicoder" in name or "magicoder" in name:
+                return magicoder_ds
+            raise AssertionError(f"unexpected load_dataset call for {name!r}")
+
+        monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+
+        # ``interleave_datasets`` is imported *inside* the function, so we
+        # patch the underlying ``datasets`` module attribute the import
+        # resolves against.
+        import datasets as _datasets
+
+        def _fake_interleave(parts, probabilities, stopping_strategy, seed):
+            # Deterministic deterministic interleave: concatenate post-filter
+            # rows in (tulu, magicoder) order so tests can assert on row
+            # identity. The real function is randomized; we don't care here.
+            assert stopping_strategy == "all_exhausted"
+            assert sum(probabilities) == pytest.approx(1.0)
+            if mixed_order is not None:
+                # Allow a test to assert ordering. ``mixed_order`` is a list
+                # of (source_idx, row_idx) tuples.
+                rows = [parts[s].rows[r] for s, r in mixed_order]
+            else:
+                rows = []
+                for part in parts:
+                    rows.extend(part.rows)
+            return _FakeHFDataset(rows, ["conversation"])
+
+        monkeypatch.setattr(_datasets, "interleave_datasets", _fake_interleave)
+
+    def test_happy_path_two_sources(self, monkeypatch):
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            },
+        ]
+        magicoder_rows = [{"problem": "p1", "solution": "s1"}]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, magicoder_rows)
+
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+
+        assert len(result) == 2
+        # Every row exposes exactly one ``conversation`` key.
+        assert all(set(r.keys()) == {"conversation"} for r in result)
+        # All content blocks are text-only (no ``image`` entries anywhere).
+        for r in result:
+            for turn in r["conversation"]:
+                for block in turn["content"]:
+                    assert block["type"] == "text"
+
+    def test_tulu_row_exceeding_max_turns_is_dropped(self, monkeypatch):
+        too_long = [
+            {"role": "user", "content": f"u{i}"} if i % 2 == 0 else {"role": "assistant", "content": f"a{i}"}
+            for i in range(6)
+        ]
+        tulu_rows = [{"messages": too_long}]
+        magicoder_rows = [{"problem": "p1", "solution": "s1"}]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, magicoder_rows)
+        result = ds.make_tulu3_magicoder_text_mix_dataset(max_turns=4)
+        # The over-long Tulu row gets filtered; only the Magicoder row survives.
+        assert len(result) == 1
+        # And it must be the Magicoder pair (user "p1" / assistant "s1").
+        conv = result[0]["conversation"]
+        assert conv[0]["content"][0]["text"] == "p1"
+        assert conv[1]["content"][0]["text"] == "s1"
+
+    def test_tulu_row_without_assistant_is_dropped(self, monkeypatch):
+        """At least one assistant turn is required for the chat template to
+        produce a non-empty label sequence."""
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "u1"},
+                    {"role": "user", "content": "u2"},
+                ]
+            }
+        ]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, [])
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+        assert result == []
+
+    def test_tulu_row_with_blank_text_and_unknown_roles_filtered_per_turn(self, monkeypatch):
+        """Per-turn filtering: blanks and roles outside
+        ``{system, user, assistant}`` are skipped, but the surviving turns
+        still build a valid conversation."""
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "tool", "content": "I should be skipped"},
+                    {"role": "user", "content": "   "},  # blank
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, [])
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+        assert len(result) == 1
+        roles = [t["role"] for t in result[0]["conversation"]]
+        assert roles == ["user", "assistant"]
+
+    def test_magicoder_row_with_missing_fields_is_dropped(self, monkeypatch):
+        magicoder_rows = [
+            {"problem": "", "solution": "s"},  # empty problem
+            {"problem": "p", "solution": ""},  # empty solution
+            {"problem": "p2", "solution": "s2"},  # keep
+        ]
+        self._patch_loader_and_mixer(monkeypatch, [], magicoder_rows)
+        result = ds.make_tulu3_magicoder_text_mix_dataset()
+        assert len(result) == 1
+        assert result[0]["conversation"][0]["content"][0]["text"] == "p2"
+
+    def test_limit_total_caps_output(self, monkeypatch):
+        tulu_rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": f"u{i}"},
+                    {"role": "assistant", "content": f"a{i}"},
+                ]
+            }
+            for i in range(5)
+        ]
+        magicoder_rows = [{"problem": f"p{i}", "solution": f"s{i}"} for i in range(5)]
+        self._patch_loader_and_mixer(monkeypatch, tulu_rows, magicoder_rows)
+        result = ds.make_tulu3_magicoder_text_mix_dataset(limit_total=3)
+        assert len(result) == 3
+
+
 def test_make_cv17_dataset(monkeypatch):
     """End-to-end sanity check for `make_cv17_dataset`."""
+
     # Mock dataset with audio data and extra columns to test column removal
     class MockDataset:
         def __init__(self, data):
@@ -197,18 +384,12 @@ def test_make_cv17_dataset(monkeypatch):
 
     fake_audio_data = [
         {
-            "audio": {
-                "array": [0.1, 0.2, 0.3, -0.1, -0.2],
-                "sampling_rate": 16000
-            },
-            "transcription": "Merhaba, nasılsınız?"
+            "audio": {"array": [0.1, 0.2, 0.3, -0.1, -0.2], "sampling_rate": 16000},
+            "transcription": "Merhaba, nasılsınız?",
         },
         {
-            "audio": {
-                "array": [0.5, -0.3, 0.8, 0.2, -0.1],
-                "sampling_rate": 16000
-            },
-            "transcription": "Bu bir test cümlesidir."
+            "audio": {"array": [0.5, -0.3, 0.8, 0.2, -0.1], "sampling_rate": 16000},
+            "transcription": "Bu bir test cümlesidir.",
         },
     ]
 
@@ -374,7 +555,8 @@ class TestConvertSharegptToConversation:
             "images": ["sub/img.jpg"],
         }
         result = ds._convert_sharegpt_to_conversation(
-            example, media_dir="/data/media",
+            example,
+            media_dir="/data/media",
         )
         assert result["conversation"][0]["content"][0] == {
             "type": "image",
@@ -391,7 +573,8 @@ class TestConvertSharegptToConversation:
             "images": ["/abs/path/img.jpg"],
         }
         result = ds._convert_sharegpt_to_conversation(
-            example, media_dir="/data/media",
+            example,
+            media_dir="/data/media",
         )
         assert result["conversation"][0]["content"][0]["image"] == "/abs/path/img.jpg"
 
@@ -478,29 +661,39 @@ class TestMakeMetaDataset:
         # Create data file
         data_file = tmp_path / "train.jsonl"
         data_file.write_text(
-            json.dumps({
-                "messages": [
-                    {"role": "user", "content": "<image>\nWhat is this?"},
-                    {"role": "assistant", "content": "A photo of a cat."},
-                ],
-                "images": ["cat.jpg"],
-            }) + "\n"
-            + json.dumps({
-                "messages": [
-                    {"role": "user", "content": "Hello"},
-                    {"role": "assistant", "content": "Hi there"},
-                ],
-            }) + "\n",
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "<image>\nWhat is this?"},
+                        {"role": "assistant", "content": "A photo of a cat."},
+                    ],
+                    "images": ["cat.jpg"],
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hello"},
+                        {"role": "assistant", "content": "Hi there"},
+                    ],
+                }
+            )
+            + "\n",
         )
 
         # Create meta file
         meta_file = tmp_path / "dataset_info.json"
-        meta_file.write_text(json.dumps({
-            "my_dataset": {
-                "file_name": "train.jsonl",
-                "media_dir": "/data/images",
-            },
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "my_dataset": {
+                        "file_name": "train.jsonl",
+                        "media_dir": "/data/images",
+                    },
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
 
@@ -517,19 +710,27 @@ class TestMakeMetaDataset:
     def test_json_array_file(self, tmp_path):
         """Load from a plain JSON array file."""
         data_file = tmp_path / "train.json"
-        data_file.write_text(json.dumps([
-            {
-                "messages": [
-                    {"role": "user", "content": "Hi"},
-                    {"role": "assistant", "content": "Hello"},
-                ],
-            },
-        ]))
+        data_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "messages": [
+                            {"role": "user", "content": "Hi"},
+                            {"role": "assistant", "content": "Hello"},
+                        ],
+                    },
+                ]
+            )
+        )
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.json"},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.json"},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         assert len(result) == 1
@@ -538,19 +739,26 @@ class TestMakeMetaDataset:
         """Multiple datasets in one meta file are merged."""
         for name in ("a.jsonl", "b.jsonl"):
             (tmp_path / name).write_text(
-                json.dumps({
-                    "messages": [
-                        {"role": "user", "content": f"From {name}"},
-                        {"role": "assistant", "content": "Ok"},
-                    ],
-                }) + "\n",
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"From {name}"},
+                            {"role": "assistant", "content": "Ok"},
+                        ],
+                    }
+                )
+                + "\n",
             )
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "dataset_a": {"file_name": "a.jsonl"},
-            "dataset_b": {"file_name": "b.jsonl"},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "dataset_a": {"file_name": "a.jsonl"},
+                    "dataset_b": {"file_name": "b.jsonl"},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         assert len(result) == 2
@@ -559,19 +767,26 @@ class TestMakeMetaDataset:
         """Only selected datasets are loaded when dataset_names is specified."""
         for name in ("a.jsonl", "b.jsonl"):
             (tmp_path / name).write_text(
-                json.dumps({
-                    "messages": [
-                        {"role": "user", "content": f"From {name}"},
-                        {"role": "assistant", "content": "Ok"},
-                    ],
-                }) + "\n",
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"From {name}"},
+                            {"role": "assistant", "content": "Ok"},
+                        ],
+                    }
+                )
+                + "\n",
             )
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "dataset_a": {"file_name": "a.jsonl"},
-            "dataset_b": {"file_name": "b.jsonl"},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "dataset_a": {"file_name": "a.jsonl"},
+                    "dataset_b": {"file_name": "b.jsonl"},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file), dataset_names=["dataset_a"])
         assert len(result) == 1
@@ -598,18 +813,26 @@ class TestMakeMetaDataset:
         data_file = tmp_path / "train.jsonl"
         lines = []
         for i in range(10):
-            lines.append(json.dumps({
-                "messages": [
-                    {"role": "user", "content": f"Q{i}"},
-                    {"role": "assistant", "content": f"A{i}"},
-                ],
-            }))
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
         data_file.write_text("\n".join(lines) + "\n")
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.jsonl", "sample_ratio": 0.5},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 0.5},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         assert len(result) == 5
@@ -619,18 +842,26 @@ class TestMakeMetaDataset:
         data_file = tmp_path / "train.jsonl"
         lines = []
         for i in range(10):
-            lines.append(json.dumps({
-                "messages": [
-                    {"role": "user", "content": f"Q{i}"},
-                    {"role": "assistant", "content": f"A{i}"},
-                ],
-            }))
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
         data_file.write_text("\n".join(lines) + "\n")
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.jsonl", "sample_ratio": 2.0},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 2.0},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         assert len(result) == 20
@@ -640,18 +871,26 @@ class TestMakeMetaDataset:
         data_file = tmp_path / "train.jsonl"
         lines = []
         for i in range(10):
-            lines.append(json.dumps({
-                "messages": [
-                    {"role": "user", "content": f"Q{i}"},
-                    {"role": "assistant", "content": f"A{i}"},
-                ],
-            }))
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
         data_file.write_text("\n".join(lines) + "\n")
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.jsonl", "sample_ratio": 1.5},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 1.5},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         # 1 full copy (10) + floor(10 * 0.5) = 5 extra = 15
@@ -661,18 +900,25 @@ class TestMakeMetaDataset:
         """Absolute file_name paths are used as-is."""
         data_file = tmp_path / "data.jsonl"
         data_file.write_text(
-            json.dumps({
-                "messages": [
-                    {"role": "user", "content": "Hi"},
-                    {"role": "assistant", "content": "Hello"},
-                ],
-            }) + "\n",
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "Hello"},
+                    ],
+                }
+            )
+            + "\n",
         )
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": str(data_file)},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": str(data_file)},
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         assert len(result) == 1
@@ -681,27 +927,34 @@ class TestMakeMetaDataset:
         """Custom tags mapping works end-to-end through make_meta_dataset."""
         data_file = tmp_path / "train.jsonl"
         data_file.write_text(
-            json.dumps({
-                "conversations": [
-                    {"from": "human", "value": "Hi"},
-                    {"from": "gpt", "value": "Hello"},
-                ],
-            }) + "\n",
+            json.dumps(
+                {
+                    "conversations": [
+                        {"from": "human", "value": "Hi"},
+                        {"from": "gpt", "value": "Hello"},
+                    ],
+                }
+            )
+            + "\n",
         )
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {
-                "file_name": "train.jsonl",
-                "columns": {"messages": "conversations"},
-                "tags": {
-                    "role_tag": "from",
-                    "content_tag": "value",
-                    "user_tag": "human",
-                    "assistant_tag": "gpt",
-                },
-            },
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {
+                        "file_name": "train.jsonl",
+                        "columns": {"messages": "conversations"},
+                        "tags": {
+                            "role_tag": "from",
+                            "content_tag": "value",
+                            "user_tag": "human",
+                            "assistant_tag": "gpt",
+                        },
+                    },
+                }
+            )
+        )
 
         result = ds.make_meta_dataset(str(meta_file))
         conv = result[0]["conversation"]
@@ -720,18 +973,26 @@ class TestMakeMetaDataset:
         data_file = tmp_path / "train.jsonl"
         lines = []
         for i in range(10):
-            lines.append(json.dumps({
-                "messages": [
-                    {"role": "user", "content": f"Q{i}"},
-                    {"role": "assistant", "content": f"A{i}"},
-                ],
-            }))
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
         data_file.write_text("\n".join(lines) + "\n")
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.jsonl"},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl"},
+                }
+            )
+        )
         return meta_file
 
     def test_shard_data_rank0_of_2(self, tmp_path):
@@ -769,18 +1030,26 @@ class TestMakeMetaDataset:
         data_file = tmp_path / "train.jsonl"
         lines = []
         for i in range(10):
-            lines.append(json.dumps({
-                "messages": [
-                    {"role": "user", "content": f"Q{i}"},
-                    {"role": "assistant", "content": f"A{i}"},
-                ],
-            }))
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
         data_file.write_text("\n".join(lines) + "\n")
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.jsonl", "sample_ratio": 0.6},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 0.6},
+                }
+            )
+        )
 
         # sample_ratio=0.6 on 10 items -> 6 items, then rank 0/2 gets 3
         result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=0, world_size=2)
@@ -791,18 +1060,26 @@ class TestMakeMetaDataset:
         data_file = tmp_path / "train.jsonl"
         lines = []
         for i in range(10):
-            lines.append(json.dumps({
-                "messages": [
-                    {"role": "user", "content": f"Q{i}"},
-                    {"role": "assistant", "content": f"A{i}"},
-                ],
-            }))
+            lines.append(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"Q{i}"},
+                            {"role": "assistant", "content": f"A{i}"},
+                        ],
+                    }
+                )
+            )
         data_file.write_text("\n".join(lines) + "\n")
 
         meta_file = tmp_path / "meta.json"
-        meta_file.write_text(json.dumps({
-            "ds1": {"file_name": "train.jsonl", "sample_ratio": 2.0},
-        }))
+        meta_file.write_text(
+            json.dumps(
+                {
+                    "ds1": {"file_name": "train.jsonl", "sample_ratio": 2.0},
+                }
+            )
+        )
 
         # sample_ratio=2.0 on 10 items -> 20 items, then rank 0/2 gets 10
         result = ds.make_meta_dataset(str(meta_file), shard_data=True, rank=0, world_size=2)
@@ -891,12 +1168,17 @@ class TestPreloadMedia:
                 class FakeBatch:
                     def asnumpy(self_inner):
                         return all_frames[list(indices)]
+
                 return FakeBatch()
 
-        fake_decord = type("decord", (), {
-            "VideoReader": FakeVideoReader,
-            "bridge": type("bridge", (), {"set_bridge": staticmethod(lambda x: None)})(),
-        })()
+        fake_decord = type(
+            "decord",
+            (),
+            {
+                "VideoReader": FakeVideoReader,
+                "bridge": type("bridge", (), {"set_bridge": staticmethod(lambda x: None)})(),
+            },
+        )()
         monkeypatch.setitem(__import__("sys").modules, "decord", fake_decord)
 
     def test_video_preloaded_to_pil_frames(self, _mock_decord):
@@ -1015,12 +1297,17 @@ class TestReadVideoFrames:
                 class FakeBatch:
                     def asnumpy(self_inner):
                         return all_frames[list(indices)]
+
                 return FakeBatch()
 
-        fake_decord = type("decord", (), {
-            "VideoReader": FakeVideoReader,
-            "bridge": type("bridge", (), {"set_bridge": staticmethod(lambda x: None)})(),
-        })()
+        fake_decord = type(
+            "decord",
+            (),
+            {
+                "VideoReader": FakeVideoReader,
+                "bridge": type("bridge", (), {"set_bridge": staticmethod(lambda x: None)})(),
+            },
+        )()
         monkeypatch.setitem(__import__("sys").modules, "decord", fake_decord)
 
     def test_returns_pil_images(self):
@@ -1032,18 +1319,26 @@ class TestReadVideoFrames:
 
     def test_respects_max_frames(self):
         """Frame count is clamped to max_frames from processor."""
-        processor = type("P", (), {
-            "video_processor": type("VP", (), {"fps": None, "max_frames": 8, "min_frames": 4})(),
-        })()
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type("VP", (), {"fps": None, "max_frames": 8, "min_frames": 4})(),
+            },
+        )()
         frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 8
 
     def test_respects_fps_sampling(self):
         """Frames are subsampled according to target fps."""
         # 120 frames at 30fps video, target 2fps → interval=15 → 8 frames
-        processor = type("P", (), {
-            "video_processor": type("VP", (), {"fps": 2, "max_frames": None, "min_frames": 4})(),
-        })()
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type("VP", (), {"fps": 2, "max_frames": None, "min_frames": 4})(),
+            },
+        )()
         frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 8
 
@@ -1055,19 +1350,34 @@ class TestReadVideoFrames:
     def test_fps_with_max_frames_clamp(self):
         """fps sampling + max_frames clamp work together."""
         # 120 frames at 30fps, target 10fps → interval=3 → 40 frames, clamp to 16
-        processor = type("P", (), {
-            "video_processor": type("VP", (), {"fps": 10, "max_frames": 16, "min_frames": 4})(),
-        })()
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type("VP", (), {"fps": 10, "max_frames": 16, "min_frames": 4})(),
+            },
+        )()
         frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 16
 
     def test_explicit_frame_indices(self):
         """Explicit frame_indices overrides processor fps/max_frames, padded to even."""
-        processor = type("P", (), {
-            "video_processor": type("VP", (), {
-                "fps": 2, "max_frames": 4, "min_frames": 2, "temporal_patch_size": 2,
-            })(),
-        })()
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type(
+                    "VP",
+                    (),
+                    {
+                        "fps": 2,
+                        "max_frames": 4,
+                        "min_frames": 2,
+                        "temporal_patch_size": 2,
+                    },
+                )(),
+            },
+        )()
         indices = [0, 15, 30, 45, 60]
         frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor, frame_indices=indices)
         # 5 frames → padded to 6 (next even)
@@ -1086,11 +1396,22 @@ class TestReadVideoFrames:
 
     def test_temporal_patch_size_alignment(self):
         """Frame count is aligned to temporal_patch_size from processor."""
-        processor = type("P", (), {
-            "video_processor": type("VP", (), {
-                "fps": None, "max_frames": None, "min_frames": 4, "temporal_patch_size": 4,
-            })(),
-        })()
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type(
+                    "VP",
+                    (),
+                    {
+                        "fps": None,
+                        "max_frames": None,
+                        "min_frames": 4,
+                        "temporal_patch_size": 4,
+                    },
+                )(),
+            },
+        )()
         # 120 frames, no fps sampling → 120 frames, 120 % 4 == 0, no padding
         frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) % 4 == 0
@@ -1107,11 +1428,22 @@ class TestReadVideoFrames:
         # max_frames=5 → min(12,5)=5, temporal_patch_size=4
         # Round UP: 5 → 8 (next multiple of 4)
         # Round DOWN would give: 5 → 4
-        processor = type("P", (), {
-            "video_processor": type("VP", (), {
-                "fps": 3, "max_frames": 5, "min_frames": 2, "temporal_patch_size": 4,
-            })(),
-        })()
+        processor = type(
+            "P",
+            (),
+            {
+                "video_processor": type(
+                    "VP",
+                    (),
+                    {
+                        "fps": 3,
+                        "max_frames": 5,
+                        "min_frames": 2,
+                        "temporal_patch_size": 4,
+                    },
+                )(),
+            },
+        )()
         frames = vlm_utils._read_video_frames("/fake.mp4", processor=processor)
         assert len(frames) == 8  # rounded UP from 5 to 8, not down to 4
 
@@ -1446,9 +1778,7 @@ def test_make_hf_audio_asr_dataset_module_does_not_import_torchcodec():
 def test_make_hf_audio_asr_dataset_resamples_when_sr_differs(monkeypatch):
     """When source SR != target SR, the waveform is resampled and stays float32 mono."""
     wav = _make_wav_bytes(sampling_rate=8000, duration_seconds=0.25)
-    fake_rows = _SyntheticHFRows(
-        [{"audio": {"bytes": wav, "path": None}, "text": "你好"}]
-    )
+    fake_rows = _SyntheticHFRows([{"audio": {"bytes": wav, "path": None}, "text": "你好"}])
     monkeypatch.setattr(ds, "load_dataset", lambda *a, **kw: fake_rows)
 
     rows = ds.make_hf_audio_asr_dataset(
