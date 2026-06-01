@@ -462,30 +462,15 @@ def test_extract_eval_samples_args_already_dict():
     assert samples[0]["gt_tool_calls"] == [{"name": "f", "arguments": {"a": 1}}]
 
 
-def test_mask_labels_to_last_turn_keeps_only_final_run():
-    # Two supervised assistant runs separated by an ignored (user/tool) run.
-    labels = [-100, 1, 2, -100, -100, 3, 4, -100]
-    agent_chat._mask_labels_to_last_turn(labels)
-    assert labels == [-100, -100, -100, -100, -100, 3, 4, -100]
+def test_format_example_forwards_train_on_last_turn_only(monkeypatch):
+    # The last-turn restriction now lives in ``format_chat_template`` so it acts
+    # on the hole-free assistant mask before reasoning_content is masked.
+    # ``_format_example`` must forward the flag rather than post-process labels.
+    captured = {}
 
-
-def test_mask_labels_to_last_turn_single_run_unchanged():
-    labels = [-100, -100, 5, 6, 7]
-    agent_chat._mask_labels_to_last_turn(labels)
-    assert labels == [-100, -100, 5, 6, 7]
-
-
-def test_mask_labels_to_last_turn_no_supervised_tokens_is_noop():
-    labels = [-100, -100, -100]
-    agent_chat._mask_labels_to_last_turn(labels)
-    assert labels == [-100, -100, -100]
-
-
-def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch):
-    # ``labels`` carry two supervised assistant runs; with the flag set only
-    # the final run survives. Without it, both runs stay supervised.
     def fake_format_chat_template(**kwargs):
-        return {"input_ids": [10, 11, 12, 13, 14, 15], "labels": [-100, 1, -100, -100, 2, 3]}
+        captured.update(kwargs)
+        return {"input_ids": [10, 11], "labels": [-100, 1]}
 
     monkeypatch.setattr(agent_chat, "format_chat_template", fake_format_chat_template)
 
@@ -495,11 +480,11 @@ def test_format_example_train_on_last_turn_only_masks_earlier_turns(monkeypatch)
 
     example = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "x"}]}
 
-    kept = agent_chat._format_example(example, Tok(), 0, 0)
-    assert kept["labels"] == [-100, 1, -100, -100, 2, 3]
+    agent_chat._format_example(example, Tok(), 0, 0)
+    assert captured["train_on_last_turn_only"] is False
 
-    masked = agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
-    assert masked["labels"] == [-100, -100, -100, -100, 2, 3]
+    agent_chat._format_example(example, Tok(), 0, 0, train_on_last_turn_only=True)
+    assert captured["train_on_last_turn_only"] is True
 
 
 def test_convert_messages_preserves_assistant_reasoning_content():
