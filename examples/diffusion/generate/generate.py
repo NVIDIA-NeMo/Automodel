@@ -266,10 +266,30 @@ def load_lora_weights_into_pipeline(pipe, cfg):
         raise FileNotFoundError(f"LoRA weights directory not found: {lora_path}")
 
     with open(lora_path / "adapter_config.json") as f:
-        peft_config = PeftConfig.from_dict(json.load(f))
-    apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+        peft_config_dict = json.load(f)
+    if "dim" not in peft_config_dict and "r" in peft_config_dict:
+        peft_config_dict["dim"] = peft_config_dict["r"]
+    if "alpha" not in peft_config_dict and "lora_alpha" in peft_config_dict:
+        peft_config_dict["alpha"] = peft_config_dict["lora_alpha"]
+    if "dropout" not in peft_config_dict and "lora_dropout" in peft_config_dict:
+        peft_config_dict["dropout"] = peft_config_dict["lora_dropout"]
+
+    peft_config = PeftConfig.from_dict(peft_config_dict)
+    num_lora_modules = apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+    if num_lora_modules == 0:
+        raise RuntimeError(f"No transformer modules matched LoRA config from {lora_path / 'adapter_config.json'}")
+
     state_dict = load_file(lora_path / "adapter_model.safetensors", device="cuda")
-    pipe.transformer.load_state_dict(state_dict, strict=False)
+    state_dict = {key.removeprefix("base_model.model."): value for key, value in state_dict.items()}
+    load_result = pipe.transformer.load_state_dict(state_dict, strict=False)
+    missing_lora_keys = sorted(key for key in load_result.missing_keys if ".lora_" in key)
+    unexpected_lora_keys = sorted(key for key in load_result.unexpected_keys if ".lora_" in key)
+    if missing_lora_keys or unexpected_lora_keys:
+        raise RuntimeError(
+            "LoRA checkpoint did not load cleanly. "
+            f"missing_lora_keys={missing_lora_keys[:10]}, unexpected_lora_keys={unexpected_lora_keys[:10]}"
+        )
+    logger.info("Loaded LoRA adapter from %s (%d modules, %d tensors)", lora_path, num_lora_modules, len(state_dict))
 
 
 def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):

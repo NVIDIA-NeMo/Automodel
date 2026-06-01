@@ -12,30 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal Llama-only EAGLE-1 training recipe."""
+"""EAGLE-1 / EAGLE-2 training recipe for Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import pathlib
 from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig, LlamaConfig
+from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    CheckpointingConfig,
+    save_config,
+)
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
-from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
-from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes.base_recipe import (
+    BaseRecipe,
+    _find_latest_checkpoint,
+    _is_checkpoint_model_config_compatible,
+    _resolve_restore_from_to_ckpt_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +63,7 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
 
 
 class TrainEagle1Recipe(BaseRecipe):
-    """Recipe for minimal Llama-only EAGLE-1 training."""
+    """Recipe for EAGLE-1 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -69,22 +84,49 @@ class TrainEagle1Recipe(BaseRecipe):
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
         architectures = getattr(target_config, "architectures", []) or []
-        if "LlamaForCausalLM" not in architectures:
-            raise ValueError(f"TrainEagle1Recipe currently supports only LlamaForCausalLM, got {architectures}")
-        if not isinstance(target_config, LlamaConfig):
-            raise ValueError(f"Expected LlamaConfig for EAGLE-1 training, got {type(target_config).__name__}")
+        # Dispatch via the eagle registry. New architectures are added by
+        # appending to ``_DENSE_ARCHITECTURES`` (or registering a custom
+        # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
+        # no recipe change required.
+        draft_spec = resolve_eagle1_draft_spec(architectures)
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
+
+        # Optional ``distributed:`` YAML section. Required for targets that
+        # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). Absent =>
+        # original single-GPU-per-rank behavior, preserved for 8B-class dense.
+        # ``force_hf`` opt-in; see the train_eagle3 recipe for rationale.
+        target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
-            force_hf=True,
-        ).to(self.device)
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        self.dist_setup = None
+        self.distributed_config = None
+        self.device_mesh = None
+        self.moe_mesh = None
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
+            self.distributed_config = self.dist_setup.strategy_config
+            self.device_mesh = self.dist_setup.device_mesh
+            self.moe_mesh = self.dist_setup.moe_mesh
+            target_kwargs.update(
+                distributed_config=self.distributed_config,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                moe_config=self.dist_setup.moe_config,
+                activation_checkpointing=self.dist_setup.activation_checkpointing,
+            )
+        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if self.dist_setup is None:
+            # ``nn.Module.to`` is in-place; reassigning ``self.target_model``
+            # would re-trigger ``BaseRecipe.__setattr__`` state-tracking and
+            # raise ``RuntimeError: State key 'target_model' is already tracked``.
+            self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagleTargetModel(self.target_model)
 
@@ -116,9 +158,11 @@ class TrainEagle1Recipe(BaseRecipe):
         draft_config = target_config.to_dict()
         draft_config["architectures"] = ["LlamaEagleDraftModel"]
         draft_config["draft_num_hidden_layers"] = int(recipe_cfg.get("draft_num_hidden_layers", 1))
-        self.draft_model = LlamaEagleDraftModel(LlamaConfig.from_dict(draft_config)).to(
-            device=self.device, dtype=self.compute_dtype
-        )
+        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
+        # so architecture-specific defaults like attention_bias and head_dim
+        # flow into the draft.
+        draft_config_obj = type(target_config).from_dict(draft_config)
+        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
@@ -174,6 +218,51 @@ class TrainEagle1Recipe(BaseRecipe):
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
+        self._resume_epoch = 0
+
+        self.rng = StatefulRNG(
+            seed=int(recipe_cfg.get("shuffle_seed", 42)),
+            ranked=self.dist_env.world_size > 1,
+        )
+        self._build_checkpointer(target_path)
+        self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+    def _build_checkpointer(self, target_path: str) -> None:
+        """Build the checkpointer using the same plumbing as the standard recipes."""
+        ckpt_cfg = self.cfg.get("checkpoint", None)
+        default_dir = str(self.output_dir / "checkpoints")
+        # EAGLE recipes construct the draft model directly and bypass
+        # `apply_model_infrastructure`, which is where `_pre_shard_hf_state_dict_keys`
+        # would normally be attached. Capture the pre-shard keys here so the
+        # consolidated-safetensors path in `_maybe_build_consolidated_index`
+        # has something to diff against instead of `None`.
+        draft_state_dict_keys = list(self.draft_model.state_dict().keys())
+        ckpt_kwargs = dict(
+            enabled=True,
+            checkpoint_dir=default_dir,
+            model_save_format="safetensors",
+            model_repo_id=str(target_path),
+            model_cache_dir=hf_constants.HF_HUB_CACHE,
+            save_consolidated=True,
+            is_peft=False,
+            model_state_dict_keys=draft_state_dict_keys,
+        )
+        if ckpt_cfg is not None:
+            user_cfg = ckpt_cfg.to_dict() if hasattr(ckpt_cfg, "to_dict") else dict(ckpt_cfg)
+            user_cfg.pop("restore_from", None)
+            ckpt_kwargs.update(user_cfg)
+        if ckpt_kwargs.get("model_state_dict_keys") is None:
+            ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
+
+        self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
+        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        self.checkpointer = Checkpointer(
+            config=self.checkpoint_config,
+            dp_rank=dp_rank,
+            tp_rank=0,
+            pp_rank=0,
+            moe_mesh=None,
+        )
 
     def _module(self):
         return (
@@ -182,14 +271,168 @@ class TrainEagle1Recipe(BaseRecipe):
             else self.trainer_module
         )
 
-    def _save_checkpoint(self, name: str):
-        if not self.dist_env.is_main:
+    def save_checkpoint(
+        self,
+        epoch: int,
+        step: int,
+        train_loss: float | None = None,
+        val_loss: dict[str, float] | None = None,
+        best_metric_key: str = "default",
+    ) -> None:
+        """Persist draft model, optimizer, scheduler, RNG, and EAGLE meta.
+
+        Overrides ``BaseRecipe.save_checkpoint`` because EAGLE recipes hold multiple
+        ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
+        the draft) — only ``draft_model`` should be persisted as the main model.
+        """
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None or not checkpointer.config.enabled:
             return
-        save_dir = self.output_dir / name
-        save_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(self._module().draft_model.state_dict(), save_dir / "draft_model.pt")
-        self._module().draft_model.config.save_pretrained(save_dir)
-        torch.save({"global_step": self.runtime.global_step}, save_dir / "eagle1_meta.pt")
+        self.checkpointer.async_wait()
+
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
+        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+
+        ckpt_root = self.checkpoint_config.checkpoint_dir
+        path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
+        is_dist_initialized = dist.is_initialized()
+        is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
+        best_val_metric = (
+            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
+        )
+
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            setattr(self, "_last_pending_checkpoint_dir", None)
+            if is_dist_initialized:
+                dist.barrier()
+
+        if prev_best_pending is not None:
+            if is_rank_0 and prev_best_pending.get("val") is not None:
+                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
+            setattr(self, "_last_pending_best_checkpoint_info", None)
+            if is_dist_initialized:
+                dist.barrier()
+
+        if is_rank_0:
+            if os.path.exists(path):
+                raise FileExistsError(f"Checkpoint directory {path} already exists")
+            os.makedirs(path, exist_ok=True)
+            loss_dict: dict[str, float] = {}
+            if train_loss is not None:
+                loss_dict["train_loss"] = float(train_loss)
+            if val_loss:
+                for k, v in val_loss.items():
+                    loss_dict[k] = float(v)
+            if loss_dict:
+                with open(os.path.join(path, "losses.json"), "w") as f:
+                    json.dump(loss_dict, f)
+        if is_dist_initialized:
+            dist.barrier()
+
+        draft_model = self._module().draft_model
+        self.checkpointer.save_model(draft_model, path, tokenizer=self.tokenizer)
+        self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
+        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+
+        if is_rank_0:
+            self._save_extra_state(path, epoch=epoch)
+            try:
+                save_config(self.cfg.raw_config, path)
+            except (AttributeError, OSError) as e:
+                logger.warning("Failed to save config snapshot: %s", e)
+        if is_dist_initialized:
+            dist.barrier()
+
+        if getattr(self.checkpointer.config, "is_async", False):
+            setattr(self, "_last_pending_checkpoint_dir", path)
+            if best_val_metric is not None:
+                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+        else:
+            if is_rank_0:
+                self._update_latest_symlink(path)
+                if best_val_metric is not None:
+                    self._update_best_symlink(path, float(best_val_metric))
+            if is_dist_initialized:
+                dist.barrier()
+
+    def _save_extra_state(self, path: str, epoch: int) -> None:
+        """Persist EAGLE-recipe-specific scalars. Subclasses extend this."""
+        torch.save(
+            {"global_step": self.runtime.global_step, "epoch": int(epoch)},
+            os.path.join(path, "eagle_meta.pt"),
+        )
+
+    def load_checkpoint(self, restore_from: str | None = None) -> None:
+        """Resolve and restore a checkpoint produced by ``save_checkpoint``.
+
+        Restores the draft model, optimizer, LR scheduler, RNG, and ``global_step``.
+        Target model weights are NOT restored — they are re-loaded from the HF hub on
+        each run because the target is frozen.
+        """
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None or not checkpointer.config.enabled:
+            return
+        is_rank_0 = (not dist.is_initialized()) or dist.get_rank() == 0
+        ckpt_root = self.checkpoint_config.checkpoint_dir
+
+        if restore_from:
+            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            if ckpt_dir is None:
+                if is_rank_0:
+                    logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
+                return
+            if not os.path.isdir(ckpt_dir):
+                raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
+        else:
+            auto = _find_latest_checkpoint(ckpt_root)
+            if auto is None:
+                return
+            ckpt_dir = str(auto)
+
+        ok, reason = _is_checkpoint_model_config_compatible(self.cfg, ckpt_dir)
+        if not ok:
+            if not restore_from:
+                if is_rank_0:
+                    logger.warning(
+                        "Auto-detected checkpoint at %s is incompatible with current model configuration: %s. "
+                        "Skipping restore.",
+                        ckpt_dir,
+                        reason,
+                    )
+                return
+            if is_rank_0:
+                logger.warning(
+                    "Checkpoint at %s may be incompatible with current model configuration: %s. "
+                    "Proceeding with restore anyway.",
+                    ckpt_dir,
+                    reason,
+                )
+
+        if is_rank_0:
+            logger.info("Resuming from checkpoint: %s", ckpt_dir)
+
+        draft_model = self._module().draft_model
+        self.checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))
+        self.checkpointer.load_optimizer(self.optimizer, draft_model, ckpt_dir, self.lr_scheduler)
+        try:
+            self.checkpointer.load_on_dp_ranks(self.rng, "rng", ckpt_dir)
+        except FileNotFoundError:
+            logger.warning("RNG state not found in %s; continuing without restoring RNG.", ckpt_dir)
+
+        self._load_extra_state(ckpt_dir)
+
+    def _load_extra_state(self, ckpt_dir: str) -> None:
+        """Restore EAGLE-recipe-specific scalars. Subclasses extend this."""
+        meta_path = os.path.join(ckpt_dir, "eagle_meta.pt")
+        if not os.path.exists(meta_path):
+            legacy = os.path.join(ckpt_dir, "eagle1_meta.pt")
+            meta_path = legacy if os.path.exists(legacy) else meta_path
+        if os.path.exists(meta_path):
+            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            self.runtime.global_step = int(meta.get("global_step", 0))
+            self._resume_epoch = int(meta.get("epoch", 0))
 
     def _run_eval(self):
         if self.val_dataloader is None:
@@ -230,12 +473,18 @@ class TrainEagle1Recipe(BaseRecipe):
     def run_train_validation_loop(self):
         """Run the training loop."""
         self.trainer_module.train()
-        for epoch_idx in range(self.num_epochs):
+        start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
+        if start_epoch >= self.num_epochs:
+            if self.dist_env.is_main:
+                logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+            return
+        for epoch_idx in range(start_epoch, self.num_epochs):
             if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch_idx)
 
             running_loss = 0.0
             running_acc = 0.0
+            epoch_loss = 0.0
             micro_step = 0
             completed_steps = 0
             last_batch_idx = -1
@@ -260,6 +509,7 @@ class TrainEagle1Recipe(BaseRecipe):
 
                 running_loss += metrics.loss.detach().item()
                 running_acc += metrics.accuracy.detach().item()
+                epoch_loss += metrics.loss.detach().item()
                 micro_step += 1
 
                 if micro_step % self.grad_accumulation_steps == 0:
@@ -299,16 +549,24 @@ class TrainEagle1Recipe(BaseRecipe):
                     msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
                 logger.info(msg)
 
-            checkpoint_name = f"epoch_{epoch_idx + 1}"
             if last_batch_idx >= 0:
-                self._save_checkpoint(checkpoint_name)
+                avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
+                self.save_checkpoint(
+                    epoch=epoch_idx + 1,
+                    step=self.runtime.global_step,
+                    train_loss=avg_loss,
+                    val_loss=eval_metrics,
+                    best_metric_key="val_loss",
+                )
 
 
 def main(config_path: str | None = None):
     """Entrypoint for ``TrainEagle1Recipe``."""
-    if config_path is None:
-        raise ValueError("config_path is required for TrainEagle1Recipe")
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainEagle1Recipe(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()
