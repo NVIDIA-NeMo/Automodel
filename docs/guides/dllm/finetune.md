@@ -11,7 +11,7 @@ NeMo AutoModel currently supports the following dLLM model families:
 
 - **LLaDA / LLaDA2 (MDLM)** — Bidirectional masked diffusion. The model receives corrupted tokens and predicts the clean token at each masked position (see [LLaDA2 paper](https://arxiv.org/abs/2602.08676)).
 - **Nemotron-Labs-Diffusion (Hybrid)** — Combines diffusion with an autoregressive loss. During training, the model processes clean tokens plus a `masked_indices` sidecar and learns both a diffusion objective and an AR objective simultaneously.
-- **DFlash** — Speculative block diffusion. A small draft model proposes tokens for a block conditioned on frozen target LM hidden states; a decay-weighted loss trains it to predict the target's distribution (see [DFlash paper](https://arxiv.org/abs/2602.17270)).
+- **DFlash** — Speculative block diffusion. A small draft model proposes tokens for a block conditioned on frozen target LM hidden states; a decay-weighted loss trains it to predict the target's distribution (see [DFlash paper](https://arxiv.org/abs/2602.06036)).
 
 ### Workflow Overview
 
