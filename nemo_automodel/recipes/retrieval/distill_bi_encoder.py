@@ -34,6 +34,26 @@ def _build_or_none(cfg_section):
     return cfg_section
 
 
+def _cfg_get_path(cfg, path: str, default=None):
+    """Read either OmegaConf-style dotted keys or nested dict/config values."""
+    try:
+        value = cfg.get(path, None)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+
+    cur = cfg
+    for part in path.split("."):
+        if cur is None:
+            return default
+        try:
+            cur = cur.get(part, None)
+        except Exception:
+            cur = getattr(cur, part, None)
+    return default if cur is None else cur
+
+
 def _move_to_device(batch: dict, device: torch.device) -> dict:
     out = {}
     for key, value in batch.items():
@@ -196,16 +216,28 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
                 model_target or "<unknown>",
             )
 
-        with torch.random.fork_rng(enabled=False):
-            self.teacher_model = self.cfg.teacher_model.instantiate(
-                device_mesh=self.device_mesh,
-                moe_mesh=self.moe_mesh,
-                distributed_config=self.distributed_config,
-                peft_config=None,
+        self.teacher_embeddings_cache = _cfg_get_path(self.cfg, "dataloader.collate_fn.teacher_embeddings_cache", None)
+        if self.teacher_embeddings_cache is None:
+            self.teacher_embeddings_cache = _cfg_get_path(self.cfg, "teacher_embeddings_cache", None)
+        self.use_cached_teacher = bool(self.teacher_embeddings_cache)
+
+        self.teacher_model = None
+        if self.use_cached_teacher:
+            logger.info(
+                "Using cached teacher embeddings from %s; live teacher model will not be built.",
+                self.teacher_embeddings_cache,
             )
-        self.teacher_model.eval()
-        for param in self.teacher_model.parameters():
-            param.requires_grad_(False)
+        else:
+            with torch.random.fork_rng(enabled=False):
+                self.teacher_model = self.cfg.teacher_model.instantiate(
+                    device_mesh=self.device_mesh,
+                    moe_mesh=self.moe_mesh,
+                    distributed_config=self.distributed_config,
+                    peft_config=None,
+                )
+            self.teacher_model.eval()
+            for param in self.teacher_model.parameters():
+                param.requires_grad_(False)
 
         self.distill_loss = _build_or_none(self.cfg.get("distill_loss", None))
         self.mse_loss = _build_or_none(self.cfg.get("mse_loss", None))
@@ -241,13 +273,18 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             raise ValueError(
                 "intermediate_loss_weight > 0 requires non-empty layer_pairs in config"
             )
+        if self.use_cached_teacher and self.loss_weights["intermediate"] > 0:
+            raise ValueError(
+                "intermediate_loss_weight > 0 is not supported with cached teacher embeddings; "
+                "cached teacher stores pooled embeddings only. Disable intermediate loss or use a live teacher."
+            )
 
         if self.loss_weights["intermediate"] > 0:
             student_layers = sorted({s for s, _ in self.layer_pairs})
             teacher_layers = sorted({t for _, t in self.layer_pairs})
             if hasattr(self.model_parts[0], "attach_intermediate_capture"):
                 self.model_parts[0].attach_intermediate_capture(student_layers)
-            if hasattr(self.teacher_model, "attach_intermediate_capture"):
+            if self.teacher_model is not None and hasattr(self.teacher_model, "attach_intermediate_capture"):
                 self.teacher_model.attach_intermediate_capture(teacher_layers)
 
         projection_lr = self.cfg.get("projection_lr", None)
@@ -368,14 +405,43 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
                 s_n_pool, _, _ = student_model(n_batch)
                 s_n_pool = s_n_pool.view(bsz, num_neg, s_n_pool.shape[-1])
 
-            with torch.no_grad():
-                t_q_pool, t_q_inter = self.teacher_model(q_batch)
-                t_d_pool, t_d_inter = self.teacher_model(d_batch)
+            if self.use_cached_teacher:
+                if "t_q_pool" not in batch or "t_d_pool" not in batch:
+                    raise RuntimeError(
+                        "Cached teacher mode is enabled, but the batch does not contain "
+                        "'t_q_pool'/'t_d_pool'. Set dataloader.collate_fn.teacher_embeddings_cache "
+                        "to a valid cache directory."
+                    )
+                t_q_pool = batch["t_q_pool"].float()
+                t_d_pool = batch["t_d_pool"].float()
+                t_q_inter = {}
+                t_d_inter = {}
                 t_n_pool = None
-                if n_batch is not None and self.loss_weights["nce_kd"] > 0:
-                    bsz, num_neg = n_mask.shape
-                    t_n_pool, _ = self.teacher_model(n_batch)
-                    t_n_pool = t_n_pool.view(bsz, num_neg, t_n_pool.shape[-1])
+                if n_mask is not None and self.loss_weights["nce_kd"] > 0:
+                    if "t_n_pool" not in batch:
+                        raise RuntimeError(
+                            "Cached InfoNCE distillation requires batch['t_n_pool']; "
+                            "set dataloader.collate_fn.teacher_embeddings_cache."
+                        )
+                    t_n_pool = batch["t_n_pool"].float()
+                if (self.loss_weights["distill"] > 0 or self.loss_weights["mse"] > 0) and (
+                    t_q_pool.shape[-1] != s_q_proj.shape[-1] or t_d_pool.shape[-1] != s_d_proj.shape[-1]
+                ):
+                    raise RuntimeError(
+                        "Cached teacher embedding dim does not match student projection dim: "
+                        f"t_q={tuple(t_q_pool.shape)}, s_q_proj={tuple(s_q_proj.shape)}, "
+                        f"t_d={tuple(t_d_pool.shape)}, s_d_proj={tuple(s_d_proj.shape)}. "
+                        "Set model.teacher_hidden_size to the cache embedding dimension."
+                    )
+            else:
+                with torch.no_grad():
+                    t_q_pool, t_q_inter = self.teacher_model(q_batch)
+                    t_d_pool, t_d_inter = self.teacher_model(d_batch)
+                    t_n_pool = None
+                    if n_batch is not None and self.loss_weights["nce_kd"] > 0:
+                        bsz, num_neg = n_mask.shape
+                        t_n_pool, _ = self.teacher_model(n_batch)
+                        t_n_pool = t_n_pool.view(bsz, num_neg, t_n_pool.shape[-1])
 
             zero = s_q_proj.new_zeros(())
             l_distill = self.distill_loss(s_q_proj, t_q_pool, s_d_proj, t_d_pool) if self.loss_weights["distill"] > 0 else zero

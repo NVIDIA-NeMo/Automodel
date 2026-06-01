@@ -69,7 +69,7 @@ dataloader:
     do_shuffle: true
     data_type: train
     data_dir_list:
-      # --- Multilingual: MIRACL (16 languages) -------------------------------
+      # latest blend shared by Yauhen on 2026-05-28
       - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ar_unrolled_8B_ragas2_scores_1_2.json
       - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_bn_unrolled_8B_ragas2_scores_1_2.json
       - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_en_unrolled_8B_ragas2_scores_1_2.json
@@ -86,7 +86,6 @@ dataloader:
       - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_te_unrolled_8B_ragas2_scores_1_2.json
       - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_th_unrolled_8B_ragas2_scores_1_2.json
       - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_zh_unrolled_8B_ragas2_scores_1_2.json
-      # --- English general retrieval (training-only; not in RTEB-QUICK eval) -
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mldr_en_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hotpotqa_remined_querymask_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/nq_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
@@ -94,28 +93,17 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/stackexchange_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hover_remined_querymask_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/combined_synthinstrshortlong_remined_querymask_qwen3_8B_0_95_perc_20260523.json
-      # --- Finance ----------------------------------------------------------
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/tatqa_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hc3finance_eval_like_qwen35_v3_3200_20260524_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_fresh_20260522_110925_autoresearch_iter_006_financebenchretrieval_alt_model_sdg_qwen3_8B_0_95_perc.json
-      # --- Healthcare -------------------------------------------------------
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/pubmedqa_pqa_labeled_train_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/medquad_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_gemma_noisy_1600_20260524_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_qwen235b_noisy_2400_20260525_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/curev1_autoresearch_20260523_iter_006_curev1_eval_like_seed_sdg_qwen3_8B_0_95_perc.json
-      # --- Multilingual: JaQuAD ---------------------------------------------
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/jaquad_qwen3_8B_0_95_perc.json
-      # --- Code: CoIR family ------------------------------------------------
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisql_sql_retrieval_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_synthetic_text2sql_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_cosqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_stackoverflow_qa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_codetrans_dl_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_codetrans_contest_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/swebench_qwen3_8B_0_95_perc.json
-      # --- Legal: AILA Statutes / AILA Casedocs / Legal Summarization / LegalQuAD
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_fresh_20260520_112309_zenodo_gemma_sdg_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_eval_like_gptoss_1600_20260520_132700_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_eval_like_gptoss_3200_20260520_181200_qwen3_8B_0_95_perc.json
@@ -127,7 +115,6 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legalquad_eval_like_gptoss_1600_20260522_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legalquad_eval_like_gemma_shortq_1200_20260522_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legalquad_qwen35_shortq_len90_subset_20260522_qwen3_8B_0_95_perc.json
-      # --- Code: HumanEval / AppsRetrieval / FreshStack / MBPP / DS1000 -----
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/humaneval_eval_like_qwen_next_func_3200_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/humaneval_eval_like_gptoss_func_2400_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_eval_like_qwen_next_2400_20260522_qwen3_8B_0_95_perc.json
@@ -140,9 +127,15 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/freshstack_fresh_20260522_142915_eval_like_qwen3next_fullctx_1600_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mbppretrieval_function_qwen_next_3200_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mbppretrieval_function_gptoss_2400_20260523_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hc3finance_eval_like_qwen35_v3_3200_20260524_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_scistack_qwen_next_3200_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_scistack_gptoss_2400_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_longquery_qwen_next_3200_20260523_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_gemma_noisy_1600_20260524_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_qwen235b_noisy_2400_20260525_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_fresh_20260522_110925_autoresearch_iter_006_financebenchretrieval_alt_model_sdg_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/curev1_autoresearch_20260523_iter_006_curev1_eval_like_seed_sdg_qwen3_8B_0_95_perc.json
+
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderDistillCollator
     q_max_len: 512
@@ -151,11 +144,6 @@ dataloader:
     query_prefix: "query:"
     passage_prefix: "passage:"
     pad_to_multiple_of: 8
-    # Optional: use precomputed teacher embeddings instead of a live teacher
-    # forward. The cache must be produced by
-    # ministral3_distillation/scripts/precompute_teacher_embeddings.py and
-    # contain index.json, manifest.json, queries.npy, and docs.npy.
-    # teacher_embeddings_cache: /path/to/qwen3_8b_teacher_cache
   shuffle: true
   num_workers: 2
 
