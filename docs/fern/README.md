@@ -22,7 +22,8 @@ First time on this machine:
 
 ```bash
 # All Make targets live in docs/fern/Makefile — run them from this directory
-# (`cd docs/fern && make <target>`) or from anywhere with `make -C docs/fern <target>`.
+# (`cd docs/fern && make <target>`), from the docs/ folder via the forwarder
+# (`cd docs && make <target>`), or from anywhere with `make -C docs/fern <target>`.
 
 # 1. Install the Fern CLI globally (one-time)
 npm install -g fern-api
