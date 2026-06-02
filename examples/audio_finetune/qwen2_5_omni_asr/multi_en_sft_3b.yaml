@@ -30,7 +30,10 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  # Generous timeout: the first run materializes + caches the ~500k-sample mix
+  # (per-rank, serialized by the HF cache lock). Pre-warm the cache once (single
+  # process) so subsequent launches build in seconds. See the guide.
+  timeout_minutes: 60
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
@@ -60,6 +63,11 @@ distributed:
   cp_size: 1
   pp_size: 1
   sequence_parallel: false
+  # GBS 64 / (LBS 4 x 8 GPUs) = 2 grad-accum microbatches. The bundled torch 2.11
+  # FSDP2 build crashes in the deferred-grad-sync path on non-final microbatches
+  # (AttributeError: 'FSDPParam' has no attribute '_unsharded_param'), so sync
+  # gradients every microbatch instead of deferring.
+  defer_fsdp_grad_sync: false
 
 # Full fine-tune: audio tower + language model trainable; vision tower frozen
 # (we never feed images on these English ASR corpora).
