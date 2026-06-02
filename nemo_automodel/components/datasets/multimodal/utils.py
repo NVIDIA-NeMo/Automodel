@@ -41,6 +41,7 @@ def patchify(image, patch_size):
 
 
 def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_patches_per_side):
+    """Return flattened 2D patch position IDs by direct grid extrapolation."""
     num_patches_h, num_patches_w = img_h // patch_size, img_w // patch_size
     coords_h = torch.arange(0, num_patches_h)
     coords_w = torch.arange(0, num_patches_w)
@@ -49,6 +50,7 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
 
 
 def get_flattened_position_ids_interpolate(img_h, img_w, patch_size, max_num_patches_per_side):
+    """Return flattened 2D patch position IDs by interpolating to the max grid."""
     num_patches_h, num_patches_w = img_h // patch_size, img_w // patch_size
     boundaries = torch.arange(1 / max_num_patches_per_side, 1.0, 1 / max_num_patches_per_side)
     fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / num_patches_h)
@@ -88,6 +90,7 @@ def prepare_attention_mask_per_sample(split_lens, attn_modes, device="cpu"):
 
 
 def split_integer_exp_decay(S, ng_sample_decay=1.0):
+    """Split an integer into random positive chunks with optional exponential decay."""
     if ng_sample_decay == 1.0:
         N = random.randint(1, S)
     else:
@@ -100,6 +103,7 @@ def split_integer_exp_decay(S, ng_sample_decay=1.0):
 
 
 def pil_img2rgb(image):
+    """Convert a PIL image to RGB, compositing transparent pixels on white."""
     if image.mode == "RGBA" or image.info.get("transparency", None) is not None:
         image = image.convert("RGBA")
         white = Image.new(mode="RGB", size=image.size, color=(255, 255, 255))
@@ -157,6 +161,7 @@ def add_special_tokens(tokenizer):
 
 
 def len2weight(x, loss_reduction="square"):
+    """Convert a sequence length into BAGEL's per-sample loss weight."""
     if x == 0:
         return x
     if loss_reduction == "token":

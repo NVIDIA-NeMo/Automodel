@@ -351,6 +351,8 @@ class SiglipFlashAttention2(SiglipAttention):
 # MLP + encoder block.
 # ---------------------------------------------------------------------------
 class SiglipMLP(nn.Module):
+    """SigLIP vision MLP block used inside the BAGEL NaViT encoder."""
+
     def __init__(self, config: SiglipVisionConfig) -> None:
         super().__init__()
         self.config = config
@@ -366,6 +368,8 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
+    """SigLIP NaViT encoder layer with packed flash attention."""
+
     def __init__(self, config: SiglipVisionConfig) -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -405,6 +409,8 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
+    """Stack of SigLIP NaViT encoder layers."""
+
     def __init__(self, config: SiglipVisionConfig) -> None:
         super().__init__()
         self.config = config
@@ -438,6 +444,8 @@ class SiglipEncoder(nn.Module):
 # Top-level vision transformer.
 # ---------------------------------------------------------------------------
 class SiglipVisionTransformer(nn.Module):
+    """BAGEL SigLIP vision transformer over packed patch embeddings."""
+
     def __init__(self, config: SiglipVisionConfig) -> None:
         super().__init__()
         self.config = config

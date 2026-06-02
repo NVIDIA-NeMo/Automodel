@@ -42,6 +42,7 @@ from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimod
 
 
 def main(config: str = "examples/multimodal_finetune/bagel/bagel_sft.yaml") -> None:
+    """Run the multimodal fine-tuning recipe from a YAML config."""
     cfg = parse_args_and_load_config(config)
     recipe = FinetuneRecipeForMultimodal(cfg)
     recipe.setup()

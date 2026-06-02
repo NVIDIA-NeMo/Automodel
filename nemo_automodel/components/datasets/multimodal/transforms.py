@@ -23,10 +23,25 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as F
+
+
+@lru_cache(maxsize=1)
+def _require_torchvision():
+    try:
+        from torchvision import transforms
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms import functional as F
+    except ModuleNotFoundError as exc:
+        if exc.name != "torchvision":
+            raise
+        raise ModuleNotFoundError(
+            "torchvision is required to use BAGEL multimodal image transforms. "
+            "Install the appropriate optional dependency before constructing these datasets."
+        ) from exc
+    return transforms, InterpolationMode, F
 
 
 class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
@@ -47,10 +62,13 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
         min_size: int,
         stride: int,
         max_pixels: int,
-        interpolation=InterpolationMode.BICUBIC,
+        interpolation=None,
         antialias=True,
     ):
         super().__init__()
+        if interpolation is None:
+            _, interpolation_mode, _ = _require_torchvision()
+            interpolation = interpolation_mode.BICUBIC
         self.max_size = max_size
         self.min_size = min_size
         self.stride = stride
@@ -86,7 +104,8 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             scale = self.max_size / max(new_width, new_height)
             new_width, new_height = self._apply_scale(new_width, new_height, scale)
 
-        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
+        _, _, functional = _require_torchvision()
+        return functional.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
 
 
 class ImageTransform:
@@ -106,6 +125,7 @@ class ImageTransform:
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
     ):
+        tv_transforms, _, _ = _require_torchvision()
         self.stride = image_stride
 
         self.resize_transform = MaxLongEdgeMinShortEdgeResize(
@@ -114,8 +134,8 @@ class ImageTransform:
             stride=image_stride,
             max_pixels=max_pixels,
         )
-        self.to_tensor_transform = transforms.ToTensor()
-        self.normalize_transform = transforms.Normalize(mean=list(image_mean), std=list(image_std), inplace=True)
+        self.to_tensor_transform = tv_transforms.ToTensor()
+        self.normalize_transform = tv_transforms.Normalize(mean=list(image_mean), std=list(image_std), inplace=True)
 
     def __call__(self, img, img_num=1):
         img = self.resize_transform(img, img_num=img_num)

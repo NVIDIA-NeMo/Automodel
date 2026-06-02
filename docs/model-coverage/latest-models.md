@@ -2,7 +2,7 @@
 
 A reverse-chronological log of every model added to NeMo AutoModel. The **Recipe** column links to a working example YAML you can run immediately.
 
-See the [Model Coverage Overview](overview.md) for release summaries, and the [LLM](llm/index.md) / [VLM](vlm/index.md) / [Omni](omni/index.md) / [Diffusion](diffusion/index.md) pages for the full architecture listings.
+See the [Model Coverage Overview](overview.md) for release summaries, and the [LLM](llm/index.md) / [VLM](vlm/index.md) / [Multimodal](multimodal/index.md) / [Omni](omni/index.md) / [Diffusion](diffusion/index.md) pages for the full architecture listings.
 
 | Date | Model | HF Model ID | Modality | Recipe | Try on Brev |
 |------|-------|-------------|----------|--------|------|

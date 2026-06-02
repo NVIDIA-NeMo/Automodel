@@ -1084,6 +1084,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
 
 
 def main(config_path: Optional[str] = None) -> None:
+    """Run the BAGEL multimodal training recipe from a YAML config path."""
     if config_path is None:
         config_path = "examples/multimodal_finetune/bagel/bagel_sft.yaml"
     cfg = parse_args_and_load_config(config_path)

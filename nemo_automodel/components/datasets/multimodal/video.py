@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
 
 
 def get_frame_indices(num_frames, vlen, sample="rand", fix_start=None, input_fps=1, max_num_frames=-1):
+    """Select frame indices from a video according to BAGEL sampling mode."""
     if sample in ["rand", "middle"]:  # uniform sampling
         acc_samples = min(num_frames, vlen)
         intervals = np.linspace(start=0, stop=vlen, num=acc_samples + 1).astype(int)
@@ -80,6 +81,7 @@ def get_frame_indices(num_frames, vlen, sample="rand", fix_start=None, input_fps
 
 
 def read_frames_decord(video_path, num_frames, sample="rand", fix_start=None, clip=None, min_num_frames=4):
+    """Read sampled frames from a video file with decord."""
     if decord is None:
         raise RuntimeError("decord is required to read video files; install decord to enable video sampling.")
     video_reader = decord.VideoReader(video_path, num_threads=1)
@@ -102,15 +104,18 @@ def read_frames_decord(video_path, num_frames, sample="rand", fix_start=None, cl
 
 
 def extract_frame_number(filename):
+    """Extract the numeric frame suffix used by BAGEL frame-folder samples."""
     match = re.search(r"_(\d+).jpg$", filename)
     return int(match.group(1)) if match else -1
 
 
 def sort_frames(frame_paths):
+    """Sort frame paths by their numeric frame suffix."""
     return sorted(frame_paths, key=lambda x: extract_frame_number(os.path.basename(x)))
 
 
 def read_frames_folder(video_path, num_frames, sample="rand", fix_start=None, min_num_frames=4):
+    """Read sampled frames from a directory of extracted frame images."""
     image_list = sort_frames(list(os.listdir(video_path)))
     frames = []
     for image in image_list:

@@ -280,6 +280,8 @@ class NaiveCache:
 
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
+    """BAGEL packed decoder output with optional past key-value cache."""
+
     packed_query_sequence: torch.FloatTensor = None
     past_key_values: Optional[NaiveCache] = None
 

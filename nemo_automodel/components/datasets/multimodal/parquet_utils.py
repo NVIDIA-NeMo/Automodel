@@ -86,14 +86,17 @@ def get_parquet_data_paths(data_dir_list, num_sampled_data_paths, rank=0, world_
 
 # NOTE: customize these three functions for your cluster if you want HDFS.
 def get_hdfs_host():  # pragma: no cover - cluster hook
+    """Return the HDFS host URI used by BAGEL parquet readers."""
     return "hdfs://xxx"
 
 
 def get_hdfs_block_size():  # pragma: no cover - cluster hook
+    """Return the HDFS read buffer size for pyarrow."""
     return 134217728
 
 
 def get_hdfs_extra_conf():  # pragma: no cover - cluster hook
+    """Return optional pyarrow HDFS configuration overrides."""
     return None
 
 
@@ -119,5 +122,6 @@ def init_arrow_pf_fs(parquet_file_path):
 
 
 def hdfs_ls_cmd(dir):  # pragma: no cover - cluster hook
+    """List HDFS parquet directory entries with the native hdfs CLI."""
     result = subprocess.run(["hdfs", "dfs", "ls", dir], capture_output=True, text=True).stdout
     return ["hdfs://" + i.split("hdfs://")[-1].strip() for i in result.split("\n") if "hdfs://" in i]

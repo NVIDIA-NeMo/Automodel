@@ -250,6 +250,7 @@ Overview <model-coverage/overview.md>
 Release Log <model-coverage/latest-models.md>
 Large Language Models <model-coverage/llm/index.md>
 Vision Language Models <model-coverage/vlm/index.md>
+Multimodal <model-coverage/multimodal/index.md>
 Omni <model-coverage/omni/index.md>
 Diffusion <model-coverage/diffusion/index.md>
 Embedding Models <model-coverage/embedding/index.md>
