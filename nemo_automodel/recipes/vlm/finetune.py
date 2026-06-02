@@ -758,6 +758,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
+        # MagiAttention (FFA) backend for the language backbone. Enabled via
+        # model.attn_implementation="magi"; the vision tower falls back to SDPA.
+        self.magi_enabled = str(self.cfg.get("model.attn_implementation", "")) == "magi"
+        self.magi_cp_group = None
+        if self.magi_enabled:
+            from nemo_automodel.components.distributed.magi_attn_utils import (
+                get_cp_group,
+                register_magi_attention,
+            )
+
+            register_magi_attention()
+            self.magi_cp_group = get_cp_group(self.device_mesh)
+            logging.info(
+                "MagiAttention enabled for VLM language backbone (cp_size=%d).",
+                self.magi_cp_group.size() if self.magi_cp_group is not None else 1,
+            )
+
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
@@ -1096,7 +1113,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     if k != "input_ids":
                         batch.pop(k, None)
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        if getattr(self, "magi_enabled", False):
+            # MagiAttention manages the language-backbone attention itself; skip the
+            # torch-native DTensor CP context. Build the dist-attn key + stamp cp_group
+            # on the LM attention modules (vision tower stays on SDPA).
+            from nemo_automodel.components.distributed.magi_attn_utils import magi_prepare_vlm
+
+            batch, _magi_key = magi_prepare_vlm(self.model_parts[0], batch, self.magi_cp_group)
+            train_ctx = nullcontext
+        else:
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:

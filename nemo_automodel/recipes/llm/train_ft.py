@@ -932,6 +932,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
+        # MagiAttention (FFA / context-parallel) backend. Enabled when the model is
+        # configured with attn_implementation="magi". Registers the HF attention
+        # backend before the model is built and resolves the CP process group.
+        self.magi_enabled = str(self.cfg.get("model.attn_implementation", "")) == "magi"
+        self.magi_cp_group = None
+        if self.magi_enabled:
+            from nemo_automodel.components.distributed.magi_attn_utils import (
+                get_cp_group,
+                register_magi_attention,
+            )
+
+            register_magi_attention()
+            self.magi_cp_group = get_cp_group(self.device_mesh)
+            logging.info(
+                "MagiAttention enabled (cp_size=%d).",
+                self.magi_cp_group.size() if self.magi_cp_group is not None else 1,
+            )
+
         if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
             suppress_wandb_log_messages()
             run = build_wandb(self.cfg)
@@ -1373,16 +1391,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        train_ctx, batch = make_cp_batch_and_ctx(
-            self.device_mesh,
-            batch,
-            use_te=_uses_te_dot_product_attention(
-                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+        if getattr(self, "magi_enabled", False):
+            # MagiAttention does its own CP sharding (sequence dispatch) inside
+            # magi_prepare_batch; skip the torch-native DTensor CP context here.
+            train_ctx = nullcontext
+        else:
+            train_ctx, batch = make_cp_batch_and_ctx(
+                self.device_mesh,
+                batch,
+                use_te=_uses_te_dot_product_attention(
+                    self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+                )
+                and _uses_thd_collater(self.cfg.dataloader),
+                padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+                num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
             )
-            and _uses_thd_collater(self.cfg.dataloader),
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
-        )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
@@ -1437,8 +1460,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else nullcontext()
             )
             with train_ctx(), sync_ctx, fp8_ctx:
+                magi_active = getattr(self, "magi_enabled", False)
+                if magi_active:
+                    # MagiAttention: dispatch the packed sequence across the CP group,
+                    # run the forward through the FFA kernel, then undispatch the
+                    # logits back to the global sequence before the loss so the loss
+                    # is numerically identical to a non-CP run.
+                    from nemo_automodel.components.distributed.magi_attn_utils import (
+                        magi_prepare_batch,
+                        magi_undispatch_logits,
+                    )
+
+                    batch, _magi_key = magi_prepare_batch(model, batch, self.magi_cp_group)
                 batch = filter_forward_kwargs(model, batch)
-                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy) and not magi_active:
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
                     if "hidden_states" not in out:
@@ -1448,12 +1483,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
+                logits = getattr(out, "logits", out)
+                if magi_active:
+                    logits = magi_undispatch_logits(logits, self.magi_cp_group)
+
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=getattr(out, "logits", out),
+                    logits=logits,
                     labels=labels,
                     model=model,
-                    hidden_states=get_final_hidden_states(out),
+                    hidden_states=None if magi_active else get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
