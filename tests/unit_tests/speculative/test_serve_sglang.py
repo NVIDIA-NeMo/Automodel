@@ -203,6 +203,44 @@ def test_export_patches_num_hidden_layers_from_state_dict(tmp_path: Path, monkey
     assert exported_config["architectures"] == ["LlamaForCausalLMEagle3"]
 
 
+def test_resolve_draft_artifacts_regenerates_token_map_from_sibling_eagle_meta(tmp_path: Path):
+    """A freshly-trained consolidated ``model/`` dir has no token map yet.
+
+    The recipe writes the vocab metadata as ``eagle_meta.pt`` next to the
+    ``model/`` dir; ``resolve_draft_artifacts`` must regenerate
+    ``speculative_token_map.pt`` from it rather than bailing out.
+    """
+    checkpoint_dir = tmp_path / "epoch_0_step_1000"
+    model_dir = checkpoint_dir / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}), encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    # Recipe-native metadata filename (NOT the legacy ``eagle3_meta.pt``).
+    torch.save({"selected_token_ids": torch.tensor([3, 7, 9])}, checkpoint_dir / "eagle_meta.pt")
+
+    resolved_model, resolved_token_map = resolve_draft_artifacts(str(checkpoint_dir), "EAGLE3")
+
+    token_map_path = model_dir / "speculative_token_map.pt"
+    assert resolved_model == str(model_dir)
+    assert resolved_token_map == str(token_map_path)
+    assert token_map_path.exists()
+    torch.testing.assert_close(torch.load(token_map_path), torch.tensor([3, 7, 9]))
+
+
+def test_resolve_draft_artifacts_missing_token_map_and_meta_returns_none(tmp_path: Path):
+    """EAGLE3 model dir with neither a token map nor any sibling meta: warn and return None."""
+    checkpoint_dir = tmp_path / "epoch_0_step_1000"
+    model_dir = checkpoint_dir / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}), encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+
+    resolved_model, resolved_token_map = resolve_draft_artifacts(str(checkpoint_dir), "EAGLE3")
+
+    assert resolved_model == str(model_dir)
+    assert resolved_token_map is None
+
+
 def test_build_sglang_argv_exports_recipe_checkpoint_and_passes_token_map(
     tmp_path: Path,
     monkeypatch,

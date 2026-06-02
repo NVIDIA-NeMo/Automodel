@@ -30,6 +30,9 @@ configs:
   - mistral/ministral3_3b_squad_peft.yaml
   - mistral/mixtral-8x7b-v0-1_squad.yaml
   - mistral/mixtral-8x7b-v0-1_squad_peft.yaml
+  - minicpm/minicpm5_1b_hellaswag_peft.yaml
+  - minicpm/minicpm5_1b_squad.yaml
+  - minicpm/minicpm5_1b_squad_peft.yaml
   - moonlight/moonlight_16b_te.yaml
   - moonlight/moonlight_16b_te_packed_sequence.yaml
   - nemotron/llama3_3_nemotron_super_49B_squad.yaml

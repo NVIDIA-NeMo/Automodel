@@ -204,6 +204,11 @@ class LlamaRotaryEmbedding(nn.Module):
             # TE fused rope expects raw angles in [seq, 1, 1, head_dim] format
             self._freqs_cache = emb.to(self.dtype).unsqueeze(1).unsqueeze(1).contiguous()
 
+    def _ensure_cache(self, seq_len: int, device: torch.device) -> None:
+        """Build or grow the cos/sin cache so it covers positions ``[0, seq_len)``."""
+        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
+            self._build_cache(seq_len, device)
+
     @torch.no_grad()
     def forward(
         self,
@@ -212,14 +217,20 @@ class LlamaRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (cos, sin) for the given positions.
 
-        ``cos`` / ``sin`` are gathered by the *values* in ``position_ids``, so
-        non-contiguous positions receive the correct rotary phase: EAGLE TTT
-        depth offsets (``arange(seq_len) + step_idx``), packed sequences, and
-        context parallelism all pass ``position_ids != arange(seq_len)``. The
-        earlier implementation returned ``cos_cache[:seq_len]``, which keyed
-        only on the sequence *length* and silently ignored the position values.
-        For the common ``position_ids == arange(seq_len)`` case the gather is
-        numerically identical to that slice.
+        In the non-fused path ``cos`` / ``sin`` are gathered by the *values* in
+        ``position_ids``, so non-contiguous positions receive the correct rotary
+        phase: EAGLE TTT depth offsets (``arange(seq_len) + step_idx``), packed
+        sequences, and context parallelism all pass
+        ``position_ids != arange(seq_len)``. The earlier implementation returned
+        ``cos_cache[:seq_len]``, which keyed only on the sequence *length* and
+        silently ignored the position values. For the common
+        ``position_ids == arange(seq_len)`` case the gather is numerically
+        identical to that slice.
+
+        The fused TE path (``rope_fusion=True``) consumes raw angles indexed by
+        sequence position and assumes contiguous ``[0, seq_len)`` positions, so
+        it keeps the legacy contiguous slice and does NOT honor non-contiguous
+        ``position_ids``.
 
         Args:
             x: Input tensor (used for device and dtype)
@@ -228,22 +239,23 @@ class LlamaRotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) tensors [batch, seq_len, head_dim]
         """
-        # Size the cache to the highest requested position. ``position_ids`` can
-        # exceed its own length (e.g. EAGLE TTT passes ``arange(seq_len) + k``),
-        # so ``seq_len`` alone is not a safe upper bound.
-        needed = max(int(position_ids.max().item()) + 1, position_ids.shape[-1])
-        if self._cos_cache is None or needed > self.max_seq_len_cached:
-            self._build_cache(needed, x.device)
-
         if self.rope_fusion:
-            # The fused TE kernel consumes raw angles indexed by sequence
-            # position and assumes contiguous ``[0, seq_len)`` positions; keep
-            # the legacy contiguous slice for that path.
+            # The fused TE kernel indexes raw angles by sequence position and
+            # assumes contiguous ``[0, seq_len)`` positions, so it only needs the
+            # cache sized to ``seq_len`` -- and must avoid the ``position_ids``
+            # host-device sync below on this default GPU training path.
             seq_len = position_ids.shape[-1]
+            self._ensure_cache(seq_len, x.device)
             cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             return cos, sin, self._freqs_cache[:seq_len]
 
+        # Non-fused: gather per-position. Size the cache to the highest requested
+        # position -- ``position_ids`` can exceed its own length (e.g. EAGLE TTT
+        # passes ``arange(seq_len) + k``), so ``seq_len`` alone is not a safe
+        # upper bound. This ``.item()`` sync only runs on the non-fused path.
+        needed = max(int(position_ids.max().item()) + 1, position_ids.shape[-1])
+        self._ensure_cache(needed, x.device)
         # Gather per-position; identical to ``cos_cache[:seq_len]`` for arange.
         cos = self._cos_cache[position_ids]
         sin = self._sin_cache[position_ids]

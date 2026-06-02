@@ -20,6 +20,8 @@ EAGLE TTT depth offsets (``arange + step_idx``), packed sequences, context
 parallelism -- silently receive the wrong rotary phase.
 """
 
+from unittest.mock import patch
+
 import torch
 from transformers import LlamaConfig
 
@@ -96,3 +98,53 @@ def test_rope_position_exceeding_seq_len_grows_cache():
     assert cos.shape == (1, 2, 8)
     cos_ref = rope(x, torch.tensor([[40]]))[0][0, 0]
     torch.testing.assert_close(cos[0, 1], cos_ref)
+
+
+def test_rope_fused_path_uses_contiguous_slice_and_returns_freqs():
+    """The fused TE path returns ``(cos, sin, freqs)`` from the contiguous slice.
+
+    The fused kernel indexes raw angles by sequence position and assumes
+    contiguous ``[0, seq_len)`` positions. It therefore keeps the legacy slice
+    and -- by design -- does NOT honor a non-contiguous ``position_ids`` offset
+    (packed sequences / context parallelism are not corrected on this path).
+    """
+    rope = _build_rope()
+    rope.rope_fusion = True
+    rope._cos_cache = rope._sin_cache = rope._freqs_cache = None
+    rope.max_seq_len_cached = 0
+    x = torch.zeros(1, 1, 8)
+    n, k = 6, 3
+    base = torch.arange(n).unsqueeze(0)
+
+    out0 = rope(x, base)
+    outk = rope(x, base + k)
+    assert len(out0) == 3 and len(outk) == 3
+    cos0, sin0, freqs0 = out0
+    cosk, _, freqsk = outk
+    assert cos0.shape == (1, n, 8)
+    assert freqs0.shape == (n, 1, 1, 8)
+    # The offset is intentionally ignored on the fused path: same slice [:n].
+    torch.testing.assert_close(cos0, cosk)
+    torch.testing.assert_close(freqs0, freqsk)
+
+
+def test_rope_fused_path_does_not_sync_on_position_values():
+    """The fused path must size the cache by ``seq_len``, never by ``position_ids.max()``.
+
+    Calling ``.max()/.item()`` on ``position_ids`` forces a host-device sync (and
+    a ``torch.compile`` graph break) on every step of the default GPU+TE training
+    path. The fused branch only needs ``seq_len``, so it must not touch the
+    position values' ``.max()``.
+    """
+    rope = _build_rope()
+    rope.rope_fusion = True
+    rope._cos_cache = rope._sin_cache = rope._freqs_cache = None
+    rope.max_seq_len_cached = 0
+    x = torch.zeros(1, 1, 8)
+
+    def _no_max(*args, **kwargs):
+        raise AssertionError("fused path must not call position_ids.max()")
+
+    with patch.object(torch.Tensor, "max", _no_max):
+        cos, sin, freqs = rope(x, torch.arange(6).unsqueeze(0))
+    assert cos.shape == (1, 6, 8)

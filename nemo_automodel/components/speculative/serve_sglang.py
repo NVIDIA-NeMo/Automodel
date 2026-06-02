@@ -15,9 +15,13 @@
 """Serve an Automodel-trained EAGLE / EAGLE-3 drafter with SGLang.
 
 The EAGLE drafter checkpoints produced by the EAGLE recipes
-(``recipes/llm/train_eagle{1,2,3}.py``) are saved as ``draft_model.pt`` plus
-recipe metadata. This script converts that layout into an HF/SGLang-readable
-``model/`` directory when needed, then shells out to
+(``recipes/llm/train_eagle{1,2,3}.py``) are written by the consolidated
+checkpointer as an HF-style ``model/`` directory (``model.safetensors`` +
+``config.json``) inside each ``epoch_<E>_step_<S>/`` checkpoint, alongside the
+EAGLE-3 vocab metadata (``eagle_meta.pt``). This script resolves that directory
+(regenerating SGLang's speculative token map from the metadata when needed) --
+and still accepts an older ``draft_model.pt`` layout as a fallback for
+hand-exported checkpoints -- then shells out to
 ``python -m sglang.launch_server`` with the right speculative-decoding flags.
 
 NOTE — P-EAGLE (parallel-drafting) heads are NOT servable here. A draft trained
@@ -205,15 +209,36 @@ def _regenerate_token_map(meta_path: Path, token_map_path: Path) -> None:
     torch.save(selected_token_ids.cpu(), token_map_path)
 
 
+def _find_eagle_meta(checkpoint_dir: Path) -> Path | None:
+    """Return the EAGLE-3 vocab-metadata file in ``checkpoint_dir``, if present.
+
+    The recipes write the metadata as ``eagle_meta.pt``; older hand-exported
+    checkpoints used ``eagle3_meta.pt``. Prefer the current name and fall back to
+    the legacy one, mirroring the recipe's own loader (``_load_extra_state`` in
+    ``recipes/llm/train_eagle3.py``).
+    """
+    for name in ("eagle_meta.pt", "eagle3_meta.pt"):
+        candidate = checkpoint_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _maybe_export_training_checkpoint(
     checkpoint_dir: Path, algorithm: str, *, dry_run: bool = False
 ) -> tuple[Path, Path | None]:
-    """Convert recipe-native EAGLE checkpoints into an HF/SGLang-readable directory.
+    """Export a legacy bare ``draft_model.pt`` checkpoint into an HF/SGLang ``model/`` directory.
+
+    The standard recipe output is already a consolidated ``model/`` directory and
+    is resolved directly by ``resolve_draft_artifacts``; this is the fallback for
+    the older layout where the draft weights were hand-saved as a bare
+    ``draft_model.pt``. When ``checkpoint_dir`` has no ``draft_model.pt`` +
+    ``config.json`` it is returned unchanged (the ``model/`` path handles it).
 
     Args:
-        checkpoint_dir: Recipe checkpoint dir, expected to contain
-            ``draft_model.pt`` and ``config.json`` (and ``eagle3_meta.pt`` for
-            EAGLE-3).
+        checkpoint_dir: A dir holding a legacy ``draft_model.pt`` + ``config.json``
+            (and ``eagle_meta.pt`` for EAGLE-3, or the legacy ``eagle3_meta.pt``);
+            otherwise this is a no-op.
         algorithm: Speculative algorithm name, used to pick the right
             SGLang architecture and to decide whether a token map is needed.
         dry_run: When True, return the paths that *would* be produced
@@ -232,7 +257,8 @@ def _maybe_export_training_checkpoint(
     exported_weights = export_dir / "model.safetensors"
     exported_config = export_dir / "config.json"
     token_map_path: Path | None = None
-    if algorithm == "EAGLE3" and (checkpoint_dir / "eagle3_meta.pt").exists():
+    meta_path = _find_eagle_meta(checkpoint_dir) if algorithm == "EAGLE3" else None
+    if meta_path is not None:
         token_map_path = export_dir / "speculative_token_map.pt"
 
     if dry_run:
@@ -251,7 +277,7 @@ def _maybe_export_training_checkpoint(
         num_hidden_layers = _infer_num_hidden_layers(state_dict)
         _rewrite_config_for_sglang(config_path, exported_config, algorithm, num_hidden_layers=num_hidden_layers)
     if token_map_path is not None and not token_map_path.exists():
-        _regenerate_token_map(checkpoint_dir / "eagle3_meta.pt", token_map_path)
+        _regenerate_token_map(meta_path, token_map_path)
     return export_dir, token_map_path
 
 
@@ -300,20 +326,21 @@ def resolve_draft_artifacts(draft: str, algorithm: str, *, dry_run: bool = False
         if token_map_path.exists() or algorithm != "EAGLE3":
             return str(candidate), str(token_map_path) if token_map_path.exists() else None
         # EAGLE3 + already-exported model dir but token map missing: try to
-        # regenerate it from a sibling ``eagle3_meta.pt`` (one level up if the
+        # regenerate it from a sibling ``eagle_meta.pt`` (one level up if the
         # user pointed at the inner ``model/`` directory).
         parent = candidate.parent if candidate.name == "model" else candidate
-        meta_path = parent / "eagle3_meta.pt"
-        if meta_path.exists():
+        meta_path = _find_eagle_meta(parent)
+        if meta_path is not None:
             if dry_run:
                 return str(candidate), str(token_map_path)
             _regenerate_token_map(meta_path, token_map_path)
             return str(candidate), str(token_map_path)
         logger.warning(
             "EAGLE3 model dir %s is missing speculative_token_map.pt and no sibling "
-            "eagle3_meta.pt was found at %s; SGLang will fail to start without a token map.",
+            "eagle_meta.pt / eagle3_meta.pt was found in %s; SGLang will fail to start "
+            "without a token map.",
             candidate,
-            meta_path,
+            parent,
         )
         return str(candidate), None
 
