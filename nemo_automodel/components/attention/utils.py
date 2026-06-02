@@ -191,8 +191,15 @@ def preprocess_args_and_kwargs_for_attn(
         v = v.transpose(1, 2).contiguous()
     elif attn_impl == "magi":
         # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
-        # directly (no transpose); the FFA kernel handles causal masking + GQA.
+        # directly (no transpose). Forward the genuine mask metadata so the FFA key
+        # matches what the other backends would build: an explicit ``magi_attn_spec``
+        # (arbitrary AttnSlice mask, e.g. a prefix tree) takes priority, else
+        # ``cu_seqlens`` selects a varlen/block-diagonal (packed) mask; absence of
+        # both means a single causal sequence.
         attn_kwargs = {}
+        for _k in ("magi_attn_spec", "cu_seqlens", "cu_seqlens_q", "window_size"):
+            if kwargs.get(_k) is not None:
+                attn_kwargs[_k] = kwargs[_k]
     else:  # sdpa
         attn_kwargs = {}
         # Transpose for SDPA

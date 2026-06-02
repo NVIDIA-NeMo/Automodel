@@ -301,7 +301,30 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):
             qf, kf, vf = q, k, v
         dtype = qf.dtype
         qf, kf, vf = (e.to(torch.bfloat16).contiguous() for e in (qf, kf, vf))
-        spec = get_active_attn_spec()
+        # Resolve the mask, preferring per-call args over module-global state:
+        #   1. explicit ``magi_attn_spec`` (arbitrary AttnSlice mask, e.g. prefix tree)
+        #   2. ``cu_seqlens`` -> varlen/block-diagonal (packed sequences)
+        #   3. the active spec set out-of-band via set_active_attn_spec()
+        #   4. fallback: a single causal sequence
+        # Sliding-window attention is not wired into the magi key yet; fail loudly
+        # rather than silently computing full causal. (-1, 0)/(-1, -1) == "no window".
+        win = call_kwargs.get("window_size")
+        if win is not None:
+            left = win[0] if isinstance(win, (tuple, list)) else win
+            right = win[1] if isinstance(win, (tuple, list)) and len(win) > 1 else 0
+            if (left is not None and left >= 0) or (right is not None and right > 0):
+                raise NotImplementedError(
+                    "magi attention does not yet support sliding-window masks; "
+                    "pass an explicit magi_attn_spec or use a non-windowed config."
+                )
+        spec = call_kwargs.get("magi_attn_spec")
+        if spec is None:
+            cu = call_kwargs.get("cu_seqlens", call_kwargs.get("cu_seqlens_q"))
+            if cu is not None and int(cu.numel()) > 2:
+                seqlens = (cu[1:] - cu[:-1]).tolist()
+                spec = AttnMaskSpec.varlen(seqlens, causal=True)
+        if spec is None:
+            spec = get_active_attn_spec()
         if spec is not None:
             key = _flex_key_for(
                 cp_group, spec, num_heads_q=qf.shape[1],
