@@ -14,6 +14,7 @@
 
 import json
 import logging
+import os
 import pathlib
 
 import torch
@@ -29,6 +30,44 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu, get_flops
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 logger = logging.getLogger(__name__)
+
+_MXFP8_GRADCHECK_DONE = {"after_backward": False, "after_step": False}
+
+
+def _mxfp8_gradcheck_global(model_parts, stage):
+    """One-time rank0 global non-finite localizer (env DEBUG_MXFP8_GRADCHECK).
+
+    stage='after_backward' scans every param's .grad; stage='after_step' scans every
+    param's .data. Logs the FIRST non-finite param name (or 'all finite'). Pinpoints
+    whether the nan is born in a gradient (which param: expert wgrad vs router vs attn)
+    or only in the weights after the optimizer step. No-op unless the flag is set.
+    """
+    if os.environ.get("DEBUG_MXFP8_GRADCHECK") != "True" or _MXFP8_GRADCHECK_DONE.get(stage):
+        return
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    first_bad = None
+    for mp in model_parts:
+        for name, p in mp.named_parameters():
+            t = p.grad if stage == "after_backward" else p.data
+            if t is None:
+                continue
+            tt = t.to_local() if hasattr(t, "to_local") else t
+            if not torch.isfinite(tt).all():
+                first_bad = name
+                break
+        if first_bad is not None:
+            break
+    _MXFP8_GRADCHECK_DONE[stage] = True
+    if first_bad is None:
+        logger.warning(f"[DEBUG_MXFP8_GRADCHECK] {stage}: all params finite")
+    else:
+        logger.warning(f"[DEBUG_MXFP8_GRADCHECK] {stage}: FIRST non-finite param = {first_bad}")
 
 
 def _infer_vocab_size(model_cfg):
@@ -301,11 +340,20 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
 
+                # DEBUG_MXFP8_GRADCHECK: global non-finite localizer (one-time, rank0).
+                # After backward, find the FIRST param with a non-finite GRAD (catches the
+                # weight-grad / wgrad, router, attn, embeddings — not just the expert
+                # dgrad). After opt.step, find the FIRST param whose DATA went non-finite
+                # (optimizer). Pinpoints exactly where the nan is born. No-op unless set.
+                _mxfp8_gradcheck_global(self.model_parts, stage="after_backward")
+
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
+
+                _mxfp8_gradcheck_global(self.model_parts, stage="after_step")
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
