@@ -5,7 +5,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo AutoModel
-To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by using:
+To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by running:
 
 ```bash
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
@@ -15,7 +15,7 @@ For other installation options (for example, uv), refer to the [NeMo AutoModel I
 
 ## Supported Models
 
-NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. See [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
+NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transformers/v3.5.1/model_doc/auto.html#automodelforcausallm) in the [Text Generation](https://huggingface.co/models?pipeline_tag=text-generation&sort=trending) category. During preprocessing, it uses `transformers.AutoTokenizer`, which is sufficient for most LLM cases. If your model requires custom text handling, override the tokenizer in your recipe YAML or provide a custom dataset `_target_`. Refer to [LLM datasets](../../guides/llm/dataset.md) and [dataset overview](../../guides/dataset-overview.md).
 
 | Owner | Model Family | Architectures |
 |---|---|---|
@@ -64,7 +64,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | InternLM | [InternLM](internlm/internlm.md) | `InternLMForCausalLM`, `InternLM2ForCausalLM`, `InternLM3ForCausalLM` |
 | Inception AI | [Jais](inceptionai/jais.md) | `JAISLMHeadModel` |
 | MiniMax | [MiniMax-M2](minimax/minimax-m2.md) | `MiniMaxM2ForCausalLM` |
-| OpenBMB | [MiniCPM](openbmb/minicpm.md) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM` |
+| OpenBMB | [MiniCPM](openbmb/minicpm.md) | `MiniCPMForCausalLM`, `MiniCPM3ForCausalLM`, `MiniCPM5ForCausalLM` |
 | Moonshot AI | [Moonlight](moonshotai/moonlight.md) | `DeepseekV3ForCausalLM` |
 | ByteDance Seed | [Seed](bytedance-seed/seed.md) | `Qwen2ForCausalLM` |
 | Upstage | [Solar](upstage/solar.md) | `SolarForCausalLM` |
@@ -79,7 +79,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 
 ## Fine-Tune LLMs with NeMo AutoModel
 
-The models listed above can be fine-tuned using NeMo AutoModel. We support two primary fine-tuning approaches:
+The models listed above can be fine-tuned using NeMo AutoModel. NeMo AutoModel supports two primary fine-tuning approaches:
 
 1. **Parameter-Efficient Fine-Tuning (PEFT)**: Updates only a small subset of parameters (typically <1%) using techniques like Low-Rank Adaptation (LoRA).
 2. **Supervised Fine-Tuning (SFT)**: Updates all or most model parameters for deeper adaptation.
