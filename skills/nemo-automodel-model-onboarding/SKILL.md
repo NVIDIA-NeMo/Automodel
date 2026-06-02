@@ -271,6 +271,14 @@ param's original HF dtype and uses it as a fallback, but that recording is skipp
 quantized, from-scratch, and odd-checkpoint paths — so the explicit pin is the only signal
 that holds across every path.
 
+**Frozen submodules** (e.g. a frozen vision tower in a VLM) are excluded from FSDP wrapping
+and therefore never receive the FSDP compute-dtype cast. To avoid a frozen-fp32 module
+feeding bf16 trainable modules (a dtype-mismatch matmul at the seam), every maximal
+fully-frozen, non-sharded submodule is automatically cast to `mp_policy.param_dtype` (bf16)
+after materialization and checkpoint loading. This is safe because frozen modules are never
+updated. If a *frozen* part is also numerically sensitive and must compute in fp32, list it
+in `_keep_in_fp32_modules_strict` — the cast honors those keywords and leaves them fp32.
+
 ---
 
 ## Phase 3: Onboarding Example Config
