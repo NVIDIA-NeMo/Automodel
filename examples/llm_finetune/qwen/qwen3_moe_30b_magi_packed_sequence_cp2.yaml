@@ -19,7 +19,7 @@
 # Qwen3-30B-A3B finetune with the MagiAttention (FFA) backend and THD sequence
 # packing, WITH context parallelism (cp_size=2). Identical to
 # qwen3_moe_30b_magi_packed_sequence.yaml except cp_size=2 (EP and CP overlap on the
-# device mesh, so ep_size stays 8 — same EP/DP layout as cp1), giving a clean
+# device mesh, so ep_size stays 8 -- same EP/DP layout as cp1), giving a clean
 # cp1-vs-cp2 convergence comparison on identical data.
 #
 # MagiAttention provides context parallelism via its own load-balancing dispatch:
@@ -27,12 +27,15 @@
 # (GroupCast/GroupReduce) inside the FFA kernel, and labels are sharded so the loss
 # is computed per-shard and reduced across CP. This matches the cp_size=1 result.
 #
+# MoE backend matches the other Qwen3-MoE / Moonlight examples (DeepEP dispatcher,
+# grouped expert GEMM); only the attention backend is swapped to magi.
+#
 # Notes for the magi backend:
 #   * local_batch_size must be 1. MagiAttention operates on a single flat (varlen)
 #     THD sequence with no batch dimension, so this integration packs the batch into
 #     that one sequence rather than using an outer batch dim. This is the integration
-#     mapping (and the idiomatic magi usage), not a hardware/kernel limit -- raise
-#     throughput via packed_sequence_size, not local_batch_size.
+#     mapping (and the idiomatic magi usage), not a kernel limit -- raise throughput
+#     via packed_sequence_size, not local_batch_size.
 #   * backend.rope_fusion must be false: under CP the sequence is dispatched
 #     (permuted), so RoPE is applied with the dispatched positions (get_position_ids),
 #     which the fused TE rope path cannot honor.
@@ -60,10 +63,10 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: magi              # MagiAttention Flex-Flash-Attention backend
-    linear: torch
-    rms_norm: torch
-    experts: torch
-    dispatcher: torch
+    linear: te
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: deepep
     rope_fusion: false      # required for magi CP (positional RoPE on dispatched layout)
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true

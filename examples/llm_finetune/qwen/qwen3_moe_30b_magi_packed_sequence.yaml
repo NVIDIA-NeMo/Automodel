@@ -21,12 +21,15 @@
 # into one sequence; the packer's cu_seqlens flows to the magi attn_func, which
 # builds a per-document (block-diagonal) varlen mask via Flex-Flash-Attention.
 #
+# MoE backend matches the other Qwen3-MoE / Moonlight examples (DeepEP dispatcher,
+# grouped expert GEMM); only the attention backend is swapped to magi.
+#
 # Notes for the magi backend:
 #   * local_batch_size must be 1. MagiAttention operates on a single flat (varlen)
 #     THD sequence with no batch dimension, so this integration packs the batch into
 #     that one sequence rather than using an outer batch dim. This is the integration
-#     mapping (and the idiomatic magi usage), not a hardware/kernel limit -- raise
-#     throughput via packed_sequence_size, not local_batch_size.
+#     mapping (and the idiomatic magi usage), not a kernel limit -- raise throughput
+#     via packed_sequence_size, not local_batch_size.
 #   * backend.rope_fusion must be false: magi applies RoPE positionally with the
 #     dispatched positions; the fused TE rope path is bypassed.
 # Pair this with qwen3_moe_30b_magi_packed_sequence_cp2.yaml to compare cp1 vs cp2.
@@ -54,10 +57,10 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: magi              # MagiAttention Flex-Flash-Attention backend
-    linear: torch
-    rms_norm: torch
-    experts: torch
-    dispatcher: torch
+    linear: te
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: deepep
     rope_fusion: false      # required for magi (non-fused, positional RoPE)
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
