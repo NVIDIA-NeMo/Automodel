@@ -875,12 +875,29 @@ def _resolve_mxfp8_grouped_mm():
     # wgrad -> NaN weights -> iter-1 nan. wgrad_with_hp=True is torchao's documented combo
     # with MXTensor inputs and avoids that path. (Older gens lacking the kwarg fall back.)
     try:
+        import inspect
+
         from torchao.prototype.moe_training import _to_mxfp8_then_scaled_grouped_mm
 
-        def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
-            try:
+        # Resolve ONCE whether this torchao build accepts wgrad_with_hp (don't per-call
+        # try/except, which would silently swallow unrelated TypeErrors). Log loudly so
+        # the trace shows whether the hp-wgrad path actually took effect.
+        _has_wgrad_hp = "wgrad_with_hp" in inspect.signature(_to_mxfp8_then_scaled_grouped_mm).parameters
+        warnings.warn(
+            f"experts='torch_mm_mxfp8': torchao _to_mxfp8_then_scaled_grouped_mm "
+            f"wgrad_with_hp supported={_has_wgrad_hp} -> "
+            f"{'using wgrad_with_hp=True (hp weight-grad)' if _has_wgrad_hp else 'NOT applied (kwarg absent in this build)'}",
+            category=UserWarning,
+            stacklevel=2,
+        )
+
+        if _has_wgrad_hp:
+
+            def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
                 return _fn(A, B, offs=offs, wgrad_with_hp=True)
-            except TypeError:
+        else:
+
+            def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
                 return _fn(A, B, offs=offs)
 
         _MXFP8_GROUPED_MM = _impl
