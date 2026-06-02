@@ -216,7 +216,11 @@ def load_eagle3_token_mapping(
     if not os.path.exists(path):
         return None
     try:
-        data = torch.load(path, map_location="cpu", weights_only=False)
+        # The payload is only ``{Tensor, int}``, so the safe loader suffices and
+        # avoids pickle's arbitrary-code-execution vector even though this path
+        # is user-controlled. Any load failure (legacy/foreign file) falls
+        # through to the rebuild below.
+        data = torch.load(path, map_location="cpu", weights_only=True)
     except Exception as exc:  # pragma: no cover - corrupted / foreign file -> rebuild
         logger.warning("Failed to load EAGLE-3 token map from %s (%s); rebuilding.", path, exc)
         return None
