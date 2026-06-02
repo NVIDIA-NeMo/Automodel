@@ -119,9 +119,16 @@ dataset = make_agent_chat_dataset(
 )
 
 sample = dataset[0]
-print("keys:", list(sample.keys()))                       # input_ids, labels, attention_mask
+print("keys:", list(sample.keys()))                       # input_ids, labels, attention_mask, ___PAD_TOKEN_IDS___
 supervised = sum(1 for x in sample["labels"] if x != -100)
 print(f"supervised tokens: {supervised} / {len(sample['labels'])}")
+```
+
+This prints (the dataset injects a 4th `___PAD_TOKEN_IDS___` key alongside the standard three):
+
+```text
+keys: ['input_ids', 'labels', 'attention_mask', '___PAD_TOKEN_IDS___']
+supervised tokens: 127 / 502
 ```
 
 Only the assistant/tool-call spans are supervised; the user prompt and tool responses are `-100` in `labels`.
@@ -160,7 +167,29 @@ with torch.inference_mode():
 print(tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
 
-The base model typically answers in prose or emits a wrongly-named / malformed call instead of a clean `get_stock_price(symbol="AAPL")` tool call.
+Greedy decoding (`do_sample=False`) on base Qwen2.5-3B answers in prose, then hallucinates an HTML page and repeats it until the 256-token budget runs out:
+
+```text
+I'm looking up Apple's stock price. 🚀
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Stock Price Lookup</title>
+</head>
+<body>
+  <h1>Stock Price Lookup</h1>
+  <p>Apple's stock price is $135.00.</p>
+</body>
+</html>
+
+... (the HTML block repeats until the token budget is exhausted)
+```
+
+Instead of a clean `get_stock_price(symbol="AAPL")` tool call, the base model answers in prose and fabricates content — exactly the failure fine-tuning fixes.
+
+<Note>
+Greedy output is deterministic for a given model snapshot + Transformers version, so you may see slight variation from the trace above.
+</Note>
 
 <Note>
 For a rigorous, repeatable score, NeMo AutoModel ships a generation-based **tool-call accuracy** evaluator (`nemo_automodel.components.eval.tool_call_evaluator.ToolCallAccuracyEvaluator`) that builds held-out prompts with `make_agent_chat_eval_samples`, parses generated tool calls with `nemo_automodel.components.eval.tool_call_parser`, and compares against the ground-truth calls. Step 4 wires it to run automatically during training.
