@@ -232,6 +232,7 @@ class GroupedExperts(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        self.compile_experts = backend is not None and backend.compile_experts
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -495,7 +496,7 @@ class GroupedExperts(nn.Module):
                 # Apply bias manually after each grouped GEMM via _apply_bias.
                 # _select_grouped_mm routes through torchao MXFP8 (with the contiguous-
                 # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
-                grouped_mm = _select_grouped_mm(self.use_mxfp8)
+                grouped_mm = _select_grouped_mm(self.use_mxfp8, self.compile_experts)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
@@ -510,6 +511,7 @@ class GroupedExperts(nn.Module):
                     permuted_probs,
                     self.expert_activation_grouped,
                     use_mxfp8=self.use_mxfp8,
+                    compile_experts=self.compile_experts,
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
@@ -651,6 +653,7 @@ class GroupedExpertsDeepEP(nn.Module):
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
         self.use_mxfp8 = backend is not None and backend.experts == "torch_mm_mxfp8"
+        self.compile_experts = backend is not None and backend.compile_experts
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
         self.dispatcher_backend = dispatcher_backend
@@ -773,7 +776,7 @@ class GroupedExpertsDeepEP(nn.Module):
                     # _select_grouped_mm routes through torchao MXFP8 (with the contiguous-
                     # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
                     offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-                    grouped_mm = _select_grouped_mm(self.use_mxfp8)
+                    grouped_mm = _select_grouped_mm(self.use_mxfp8, self.compile_experts)
                     output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
@@ -790,6 +793,7 @@ class GroupedExpertsDeepEP(nn.Module):
                         permuted_probs,
                         self.expert_activation,
                         use_mxfp8=self.use_mxfp8,
+                        compile_experts=self.compile_experts,
                     )
             else:
                 tokens_per_expert = tokens_per_expert.to("cpu")
@@ -841,6 +845,7 @@ _MXFP8_RESOLVED = False  # whether the import ladder has run
 _MXFP8_FALLBACK_WARNED = False  # one-time runtime fallback warning
 _MXFP8_ACTIVE_ANNOUNCED = False  # one-time "mxfp8 active" confirmation
 _MXFP8_TIMING_LOGGED = False  # one-time DEBUG_MXFP8_TIMING split log
+_COMPILED_GROUPED_MM = {}  # compile_experts: mxfp8_active(bool) -> torch.compile(grouped_mm), built once
 
 
 def _resolve_mxfp8_grouped_mm():
@@ -947,7 +952,7 @@ def _mxfp8_weight_relayout(B):
     return B.transpose(-2, -1).contiguous().transpose(-2, -1)
 
 
-def _select_grouped_mm(use_mxfp8):
+def _select_grouped_mm(use_mxfp8, compile_experts=False):
     """Return the grouped-GEMM callable ``grouped_mm(A, B, offs)`` for the expert GEMMs.
 
     When ``use_mxfp8`` and the torchao MXFP8 kernel is usable on this device, returns a
@@ -956,14 +961,31 @@ def _select_grouped_mm(use_mxfp8):
     and routes through it. Otherwise returns the plain ``torch._grouped_mm`` fallback,
     leaving the bf16 path byte-identical. Shared by the no-bias helper and the inline
     bias paths so dispatch + relayout are defined once.
+
+    When ``compile_experts`` is set, the returned callable is torch.compile'd (built once
+    and cached). This compiles ONLY the local expert grouped-GEMM compute — for mxfp8,
+    fusing the to_mx quant into the scaled grouped GEMM — and leaves the dispatch /
+    all-to-all (which lives outside this callable) eager, so the hybridep collective is
+    never traced. Applies to both bf16 and mxfp8.
     """
     mxfp8_grouped_mm = _mxfp8_grouped_mm_or_none() if use_mxfp8 else None
-    if mxfp8_grouped_mm is None:
-        return _default_grouped_mm
+    mxfp8_active = mxfp8_grouped_mm is not None
+    if not mxfp8_active:
+        grouped_mm = _default_grouped_mm
+    else:
 
-    def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
-        return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
+        def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
+            return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
 
+    if compile_experts:
+        # Cache the compiled callable on the behavior key (mxfp8 active or not) — NOT on
+        # id(grouped_mm), since the mxfp8 wrapper is a fresh closure each call. This builds
+        # the compiled grouped GEMM exactly once per branch (no per-step recompiles).
+        compiled = _COMPILED_GROUPED_MM.get(mxfp8_active)
+        if compiled is None:
+            compiled = torch.compile(grouped_mm)
+            _COMPILED_GROUPED_MM[mxfp8_active] = compiled
+        return compiled
     return grouped_mm
 
 
@@ -1000,17 +1022,26 @@ def _log_mxfp8_timing_once(A, B, offs, mxfp8_grouped_mm):
 
 
 def _torch_mm_experts_fwd(
-    hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn, use_mxfp8=False
+    hidden_states,
+    gate_and_up_projs,
+    down_projs,
+    tokens_per_expert,
+    permuted_probs,
+    activation_fn,
+    use_mxfp8=False,
+    compile_experts=False,
 ):
     # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
     # operand it quantizes, unlike torch._grouped_mm. _select_grouped_mm returns a wrapper
     # that makes A contiguous and relays out B (so its transpose is contiguous, the layout
     # torchao wants); when mxfp8 is off it returns plain torch._grouped_mm (byte-identical).
+    # compile_experts torch.compile's the grouped GEMM (built once); dispatch stays eager.
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
-    grouped_mm = _select_grouped_mm(use_mxfp8)
+    grouped_mm = _select_grouped_mm(use_mxfp8, compile_experts)
     timing = (
         use_mxfp8
-        and grouped_mm is not _default_grouped_mm
+        and not compile_experts
+        and _mxfp8_grouped_mm_or_none() is not None
         and os.environ.get("DEBUG_MXFP8_TIMING") == "True"
         and not _MXFP8_TIMING_LOGGED
         and (not dist.is_initialized() or dist.get_rank() == 0)
