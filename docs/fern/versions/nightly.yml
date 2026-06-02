@@ -154,6 +154,8 @@ navigation:
             path: ../../model-coverage/llm/parasail-ai/gritlm.mdx
           - page: "Hy3-preview"
             path: ../../model-coverage/llm/tencent/hy3.mdx
+          - page: "Hy-MT2"
+            path: ../../model-coverage/llm/tencent/hy-mt2.mdx
           - page: "MiMo-V2-Flash"
             path: ../../model-coverage/llm/xiaomimimo/mimo-v2-flash.mdx
           - page: "Ling 2.0"
@@ -194,6 +196,8 @@ navigation:
             path: ../../model-coverage/vlm/huggingface/smolvlm.mdx
           - page: "LLaVA"
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
+          - page: "Step-3.7-Flash"
+            path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
       - section: "Omni Models"
         slug: omni
         contents:
@@ -202,6 +206,8 @@ navigation:
             slug: overview
           - page: "Qwen3-Omni"
             path: ../../model-coverage/omni/qwen/qwen3-omni.mdx
+          - page: "Qwen2.5-Omni"
+            path: ../../model-coverage/omni/qwen/qwen2-5-omni.mdx
           - page: "Phi-4-multimodal"
             path: ../../model-coverage/omni/microsoft/phi4-multimodal.mdx
           - page: "Nemotron-Omni"
@@ -252,6 +258,9 @@ navigation:
       - page: "Function Calling with NeMo AutoModel using FunctionGemma"
         path: ../../guides/llm/toolcalling.mdx
         slug: function-calling
+      - page: "Multi-Turn Agent (Tool-Calling) SFT with NeMo AutoModel"
+        path: ../../guides/llm/agent-sft.mdx
+        slug: agent-sft
       - page: "Knowledge Distillation with NeMo AutoModel"
         path: ../../guides/llm/knowledge-distillation.mdx
         slug: knowledge-distillation
@@ -288,12 +297,18 @@ navigation:
       - page: "Mistral Medium 3.5 VL"
         path: ../../guides/vlm/mistral-medium-3-5.mdx
         slug: mistral-medium-3-5
+      - page: "Fine-Tune Step-3.7-Flash"
+        path: ../../guides/vlm/step-3-7.mdx
+        slug: step-3-7
       - page: "Fine-Tune Qwen3-Omni for ASR"
         path: ../../guides/audio/qwen3-omni-asr.mdx
         slug: qwen3-omni-asr
       - page: "Diffusion Model Fine-Tuning with NeMo AutoModel"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
+      - page: "Train an EAGLE Drafter for Speculative Decoding"
+        path: ../../guides/speculative/eagle.mdx
+        slug: eagle-speculative-decoding
       - page: "dLLM Fine-Tuning"
         path: ../../guides/dllm/finetune.mdx
         slug: dllm-fine-tuning
@@ -360,6 +375,9 @@ navigation:
       - page: "FP8 Training in NeMo AutoModel"
         path: ../../guides/fp8-training.mdx
         slug: fp8-training
+      - page: "Mixed-Precision Training"
+        path: ../../guides/mixed-precision-training.mdx
+        slug: mixed-precision-training
       - page: "MLflow Logging in NeMo AutoModel"
         path: ../../guides/mlflow-logging.mdx
         slug: mlflow-logging

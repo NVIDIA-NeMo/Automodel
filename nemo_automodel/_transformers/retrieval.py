@@ -167,7 +167,7 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
             sequence_lengths = attention_mask.sum(dim=1) - 1
             batch_size = last_hidden.shape[0]
             emb = last_hidden[torch.arange(batch_size, device=last_hidden.device), sequence_lengths]
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "multi_vector"}:
         emb = last_hidden
     else:
         raise ValueError(f"pool_type {pool_type} not supported")
@@ -359,12 +359,14 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        detach_distributed_inbatch_negatives: bool = True,
     ):
         super().__init__()
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
+        self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
 
     @classmethod
     def build(
@@ -374,6 +376,7 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -393,6 +396,7 @@ class BiEncoderModel(nn.Module):
             pooling=pooling,
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+            detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
 
     def save_pretrained(self, save_directory: str, **kwargs):

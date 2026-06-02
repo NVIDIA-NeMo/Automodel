@@ -197,22 +197,35 @@ def apply_ac(
             else:
                 raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
 
+    def _is_router_projection(func, args) -> bool:
+        aten = torch.ops.aten
+        mm = getattr(getattr(aten, "mm", None), "default", None)
+        addmm = getattr(getattr(aten, "addmm", None), "default", None)
+        linear = getattr(getattr(aten, "linear", None), "default", None)
+        if func == mm:
+            return len(args) == 2 and args[1].shape == (hidden_size, num_experts)
+        if func == addmm:
+            return len(args) >= 3 and args[2].shape == (hidden_size, num_experts)
+        if func == linear:
+            return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
+        return False
+
     def _custom_policy(ctx, func, *args, **kwargs):
-        if func == torch.ops.aten.mm.default:
-            if len(args) == 2 and (args[1].shape == (hidden_size, num_experts)):
-                return CheckpointPolicy.MUST_SAVE
-            else:
-                return CheckpointPolicy.PREFER_RECOMPUTE
-        else:
-            return CheckpointPolicy.PREFER_RECOMPUTE
+        if _is_router_projection(func, args):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
 
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-        if ignore_router:
+        if ignore_router and hasattr(block, "set_activation_checkpointing"):
+            block.set_activation_checkpointing(True)
+        elif ignore_router:
             block = ptd_checkpoint_wrapper(
-                block, preserve_rng_state=True, context_fn=selective_checkpointing_context_fn
+                block,
+                preserve_rng_state=True,
+                context_fn=selective_checkpointing_context_fn,
             )
         else:
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
@@ -348,9 +361,9 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     _model._cp_enabled = True
 
     for _, block in _model.layers.named_children():
-        layer_type = getattr(block, "layer_type", "full_attention")
+        layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
-        if layer_type == "full_attention":
+        if layer_type in ("full_attention", "sliding_attention"):
             attn_module = block.self_attn.attn_module
             if not isinstance(attn_module, DotProductAttention):
                 logger.warning(
@@ -358,11 +371,12 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     type(attn_module).__name__,
                 )
                 continue
+            attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
             attn_module.set_context_parallel_group(
                 cp_mesh.get_group(),
                 torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
                 _get_cp_stream(),
-                cp_comm_type=cp_comm_type,
+                cp_comm_type=attn_cp_comm_type,
             )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel

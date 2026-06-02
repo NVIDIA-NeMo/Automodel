@@ -11,6 +11,25 @@ hand.
 
 ---
 
+## Skills
+
+Coding guidelines and operational procedures are organized as agent skills in
+two locations:
+
+- `skills/` -- customer-facing operational skills for using NeMo AutoModel
+  (`nemo-automodel-distributed-training`, `nemo-automodel-launcher-config`,
+  `nemo-automodel-model-onboarding`, `nemo-automodel-recipe-development`)
+- `.agents/contributor-skills/` -- contributor-facing development guidelines
+  (`build-and-dependency`, `cicd`, `fern-docs`, `linting-and-formatting`,
+  `parity-testing`, `testing`)
+
+All skills are symlinked into `.claude/skills/` for unified discovery.
+Contributor skills are intentionally kept outside the public `skills/` catalog
+sync path. Always read the relevant `SKILL.md` before starting any task it
+covers; skills are mandatory context, not optional background reading.
+
+---
+
 ## Coding Style
 
 - **Explicit over implicit.** Inline logic where possible; avoid hiding behavior
@@ -204,21 +223,22 @@ with manual construction unless there is a strong reason.
 
 ## Available Skills
 
-The `skills/` directory contains focused guides for common tasks. Each skill
-file gives step-by-step instructions an AI agent can follow.
+Skill files give step-by-step instructions an AI agent can follow. Public
+catalog skills live in `skills/`; contributor workflow skills live in
+`.agents/contributor-skills/`.
 
-| # | Skill                    | Directory                  | Description                                      |
-|---|--------------------------|----------------------------|--------------------------------------------------|
-| 1 | model-onboarding         | `model-onboarding`         | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family |
-| 2 | recipe-development       | `recipe-development`       | Create and modify training/eval recipes           |
-| 3 | distributed-training     | `distributed-training`     | FSDP2, HSDP, pipeline parallelism, context parallelism |
-| 4 | parity-testing           | `parity-testing`           | Verify numerical correctness against reference implementations |
-| 5 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
-| 6 | linting-and-formatting   | `linting-and-formatting`   | ruff rules, type hints, docstrings, copyright headers, code review checklist |
-| 7 | build-and-dependency     | `build-and-dependency`     | Container setup, uv package management, environment variables, CLI usage |
-| 8 | cicd                     | `cicd`                     | Commit/PR workflow, CI trigger mechanism, failure investigation |
-| 9 | testing                  | `testing`                  | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
-| 10 | fern-docs               | `fern-docs`                | Maintain the Fern docs site under `docs/` (MDX content) + `docs/fern/` (infra) — pages, slugs, redirects, version aliases, library reference |
+| # | Skill | Location | Description |
+|---|---|---|---|
+| 1 | nemo-automodel-model-onboarding | `skills/nemo-automodel-model-onboarding` | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family |
+| 2 | nemo-automodel-recipe-development | `skills/nemo-automodel-recipe-development` | Create and modify training/eval recipes |
+| 3 | nemo-automodel-distributed-training | `skills/nemo-automodel-distributed-training` | FSDP2, HSDP, pipeline parallelism, context parallelism |
+| 4 | nemo-automodel-launcher-config | `skills/nemo-automodel-launcher-config` | Slurm and SkyPilot job submission setup |
+| 5 | parity-testing           | `.agents/contributor-skills/parity-testing`   | Verify numerical correctness against reference implementations |
+| 6 | linting-and-formatting   | `.agents/contributor-skills/linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
+| 7 | build-and-dependency     | `.agents/contributor-skills/build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
+| 8 | cicd                     | `.agents/contributor-skills/cicd`             | Commit/PR workflow, CI trigger mechanism, failure investigation |
+| 9 | testing                  | `.agents/contributor-skills/testing`          | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
+| 10 | fern-docs               | `.agents/contributor-skills/fern-docs`        | Maintain the Fern docs site under `docs/` (MDX content) + `docs/fern/` (infra) — pages, slugs, redirects, version aliases, library reference |
 
 **Always read the relevant `SKILL.md` before starting any task it covers —
 skills are mandatory context, not optional background reading.**

@@ -14,9 +14,12 @@
 
 
 
-# To run this recipe:
-#   automodel examples/llm_pretrain/deepseekv3_pretrain.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# To run this recipe on Slurm:
+#   cp slurm.sub my_cluster.sub
+#   # In my_cluster.sub, set CONFIG to this file and request 16 nodes x 8 GPUs.
+#   sbatch my_cluster.sub
+# This config uses pp_size=8, dp_size=16, and ep_size=16, so the configured
+# world size is 128 GPUs.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -39,6 +42,10 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  # Precision note: this config intentionally keeps the default bf16 training
+  # dtype. See docs/guides/mixed-precision-training.md for the fp32 optimizer-state
+  # options. We will update this path once DeepSeek can be validated cleanly;
+  # current attempts fail in DeepEP dispatch before we can compare memory.
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
@@ -145,4 +152,3 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 500
   min_lr: 0.0
-

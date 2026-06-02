@@ -52,6 +52,12 @@ def collect_matrix(automodel_dir: Path) -> list[tuple[str, str]]:
         scope = recipe_list.stem[: -len("_recipes")]
         matrix.add((folder, scope))
 
+    # Also exercise every config folder with scope=nightly so folders without a
+    # nightly_recipes.yml hit the empty-pipeline path.
+    for config_dir in configs_root.iterdir():
+        if config_dir.is_dir():
+            matrix.add((config_dir.name, "nightly"))
+
     return sorted(matrix)
 
 

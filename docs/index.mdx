@@ -5,7 +5,7 @@ description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source traini
 import { Tag } from "@/components/Tag";
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training; no checkpoint conversion and no boilerplate.
-**Quick links:** [🤗 HF Compatible](/get-started/hf-compatibility) | [🚀 Performance](/performance/performance-summary) | [📐 Scalability](/get-started/key-features) | [🎯 SFT & PEFT](/recipes-e2e-examples/sft-peft) | [🎨 Diffusion](/recipes-e2e-examples/diffusion-fine-tuning) | [👁️ VLM](/recipes-e2e-examples/gemma-4)
+**Quick links:** [🤗 HF Compatible](/get-started/hf-compatibility) | [🚀 Performance](/performance/performance-summary) | [📐 Scalability](/get-started/key-features) | [🎯 SFT & PEFT](/recipes-e2e-examples/sft-peft) | [🎨 Diffusion](/recipes-e2e-examples/diffusion-fine-tuning) | [👁️ VLM](/recipes-e2e-examples/gemma-4) | [🌐 Omni](/recipes-e2e-examples/gemma-3-3n) | [🌊 dLLM](/recipes-e2e-examples/dllm-fine-tuning)
 
 <Cards>
 <Card title="About" href="/get-started/about">
@@ -44,7 +44,10 @@ New models are added regularly. Pick a model below to start fine-tuning, or see 
 
 | Date | Modality | Model |
 |------|----------|-------|
+| 2026-05-19 | LLM | Ling 2.0 ([recipes](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune/ling)) |
 | 2026-05-18 | Audio | Qwen3-Omni ASR ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/audio_finetune/qwen3_omni_asr/ami_sft.yaml)) |
+| 2026-05-17 | LLM | ERNIE 4.5 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml)) |
+| 2026-05-17 | LLM | MiMo-V2-Flash ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mimo_v2_flash/mimo_v2_flash_hellaswag.yaml)) |
 | 2026-04-07 | LLM | [GLM-5.1](https://github.com/NVIDIA-NeMo/Automodel/discussions/1719) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.1_hellaswag_pp.yaml)) |
 | 2026-04-02 | VLM | Gemma 4 ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_4b.yaml)) |
 | 2026-03-16 | VLM | [Mistral Small 4](https://github.com/NVIDIA-NeMo/Automodel/discussions/1558) ([recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral4/mistral4_medpix.yaml)) |
@@ -65,6 +68,7 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 | **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](/recipes-e2e-examples/dllm-fine-tuning)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](/recipes-e2e-examples/diffusion-fine-tuning)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](/recipes-e2e-examples/qwen3-5-vl)                |
+| **Fine-tune agentic VLM-MoE** | You need image/video context for agentic developer workflows                       | Image / video + text dataset                      | VLM (MoE) | [Fine-tune Step-3.7-Flash](/recipes-e2e-examples/step-3-7)        |
 | **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](/recipes-e2e-examples/qwen3-omni-asr) |
 | **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Tag variant="info">Coming Soon</Tag>                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](/recipes-e2e-examples/large-moe-fine-tuning)         |
@@ -101,6 +105,11 @@ Torch-native pipelining composable with FSDP2 and DTensor.
 <Card title="FP8 Training" href="/development/fp8-training">
 Mixed-precision FP8 training with torchao.
 <Tag variant="secondary">FP8</Tag> <Tag variant="secondary">mixed-precision</Tag>
+</Card>
+
+<Card title="Mixed-Precision Training" href="/development/mixed-precision-training">
+fp32 master weights, bf16 compute, and the precision traps to avoid.
+<Tag variant="secondary">bf16</Tag> <Tag variant="secondary">mixed-precision</Tag>
 </Card>
 
 <Card title="Checkpointing" href="/development/checkpointing">

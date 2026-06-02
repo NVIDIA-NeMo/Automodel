@@ -12,7 +12,7 @@ NVIDIA branding (logos, favicon, footer, fonts, NVIDIA-green CSS, OneTrust JS) c
 |---|---|
 | Published site | https://docs.nvidia.com/nemo/automodel |
 | Fern dashboard | https://dashboard.buildwithfern.com (NVIDIA org) |
-| Skill for agents | [`../../skills/fern-docs/SKILL.md`](../../skills/fern-docs/SKILL.md) |
+| Skill for agents | [`../../.agents/contributor-skills/fern-docs/SKILL.md`](../../.agents/contributor-skills/fern-docs/SKILL.md) |
 | CI workflows | [`../../.github/workflows/fern-docs-*.yml`](../../.github/workflows/) |
 | Make targets | [`./Makefile`](./Makefile) |
 

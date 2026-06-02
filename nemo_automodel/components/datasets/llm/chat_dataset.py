@@ -273,13 +273,57 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return norm
 
 
+# ShareGPT ``from`` role -> OpenAI ``role``. Covers the plain-chat roles that
+# datasets such as PerfectBlend ship under a ``conversations`` column. Tool-call
+# agent traces (``function_call`` / ``observation`` / ``tool_call``) are out of
+# scope here -- use the agent SFT dataset (``make_agent_chat_dataset``) for those.
+_SHAREGPT_ROLE_MAP = {
+    "system": "system",
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "chatgpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
+}
+
+
+def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
+    """Convert a ShareGPT ``conversations`` list to OpenAI ``messages``.
+
+    ShareGPT-style rows store turns as ``{"from": <role>, "value": <text>}`` under
+    a ``conversations`` column instead of OpenAI ``{"role", "content"}`` under
+    ``messages``. Map the common plain-chat roles so such datasets load without a
+    manual rename. Raises on an unsupported role rather than guessing.
+    """
+    if not isinstance(conversations, list):
+        raise ValueError(f"`conversations` must be a list of turns, got {type(conversations).__name__}")
+    messages: List[Dict[str, Any]] = []
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            raise ValueError(f"Each `conversations` turn must be a dict, got {type(turn).__name__}")
+        src_role = turn.get("from", turn.get("role"))
+        role = _SHAREGPT_ROLE_MAP.get(src_role)
+        if role is None:
+            raise ValueError(
+                f"Unsupported ShareGPT role {src_role!r} in `conversations`. Supported plain-chat "
+                f"roles: {sorted(_SHAREGPT_ROLE_MAP)}. For tool-calling traces use the agent SFT "
+                "dataset (make_agent_chat_dataset)."
+            )
+        messages.append({"role": role, "content": turn.get("value", turn.get("content", ""))})
+    return messages
+
+
 class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
-    This class expects each row to contain a `messages` list in OpenAI chat format,
-    potentially including tool calls and tool responses. The datasetformats the
-    conversation via the tokenizer's chat template to produce `input_ids`, `labels`,
-    and `attention_mask` suitable for SFT.
+    Each row should contain a `messages` list in OpenAI chat format (`role` /
+    `content`), potentially including tool calls and tool responses. Rows that
+    instead carry a ShareGPT `conversations` list (`from` / `value`, as used by
+    PerfectBlend and similar) are auto-converted, so no manual column rename is
+    needed. The conversation is formatted via the tokenizer's chat template to
+    produce `input_ids`, `labels`, and `attention_mask` suitable for SFT.
     """
 
     def __init__(
@@ -355,12 +399,29 @@ class ChatDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
         messages = row.get("messages")
+        if messages is None and row.get("conversations") is not None:
+            # ShareGPT layout (PerfectBlend etc.): convert {from, value} turns to
+            # OpenAI {role, content} so no manual column rename is needed.
+            messages = _conversations_to_messages(row["conversations"])
         if not isinstance(messages, list):
-            raise ValueError("Each sample must contain a `messages` list in OpenAI format")
+            raise ValueError(
+                "Each sample must contain a `messages` list (OpenAI format) or a `conversations` list (ShareGPT format)"
+            )
 
         normalized = _normalize_messages(messages)
         tools = row.get("tools")
+        if isinstance(tools, str):
+            # JSONL-stored datasets often serialize the `tools` field as a JSON
+            # string. Parse it so the chat template receives the tool defs;
+            # silently dropping them would leave the assistant tool_calls
+            # without a matching schema and corrupt the training signal.
+            try:
+                tools = json.loads(tools)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"`tools` is a string but not valid JSON: {e}") from e
         if tools is not None and not isinstance(tools, list):
+            raise ValueError(f"`tools` must be a list or JSON-encoded list, got {type(tools).__name__}")
+        if isinstance(tools, list) and len(tools) == 0:
             tools = None
 
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
