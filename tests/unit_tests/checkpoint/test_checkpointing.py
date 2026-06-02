@@ -12,35 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import os
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 import yaml
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-from contextlib import ExitStack
 from nemo_automodel.components.checkpoint._backports.hf_storage import _DIFFUSERS_INDEX_FN
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
+    _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
     _reinit_non_persistent_buffers,
     _summarize_state_dict_key_diff,
+    is_cloud_path,
+    save_config,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
 from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
-)
-from nemo_automodel.components.checkpoint.checkpointing import (
-    is_cloud_path,
-    _ensure_msc_available,
-    _ensure_dirs,
-    save_config,
 )
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
@@ -1486,6 +1485,36 @@ class TestDoSavePEFT:
 
         opened_path = mock_msc.open.call_args[0][0]
         assert opened_path == "msc://mybucket/run7/step-500/model/adapter_model.safetensors"
+
+    def test_peft_cloud_sync_writes_valid_safetensors(self):
+        """PEFT + cloud + sync: bytes written to the msc.open handle must round-trip via safetensors.
+
+        Regression test: ``save_file`` only accepts a filesystem path, so the cloud branch must
+        serialize to bytes and write them to the handle. ``save_file`` is intentionally NOT patched
+        here so the real serializer runs against a real in-memory buffer; this would raise a
+        TypeError on the previous ``save_file(state_dict, f)`` implementation.
+        """
+        ckptr = _make_ckptr(is_peft=True, is_async=False)
+        sd = {"lora.weight": torch.arange(4, dtype=torch.float32)}
+
+        buf = io.BytesIO()
+        mock_ctx = MagicMock(__enter__=MagicMock(return_value=buf),
+                             __exit__=MagicMock(return_value=False))
+
+        with _cloud_patches():
+            with patch("nemo_automodel.components.checkpoint.checkpointing.msc") as mock_msc, \
+                 patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp, \
+                 patch("torch.distributed.is_initialized", return_value=False):
+                mock_msc.open.return_value = mock_ctx
+                Checkpointer._do_save(ckptr, sd, CLOUD_PATH_MODEL)
+
+        mock_msc.open.assert_called_once()
+        mock_dcp.save.assert_not_called()
+        mock_dcp.async_save.assert_not_called()
+
+        from safetensors.torch import load as _st_load
+        restored = _st_load(buf.getvalue())
+        assert torch.equal(restored["lora.weight"], sd["lora.weight"])
 
 class TestDoLoadFullSFT:
     """Tests that _do_load correctly routes full-SFT loads for DCP and safetensors formats on cloud and local paths."""

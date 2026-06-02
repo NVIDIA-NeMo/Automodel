@@ -42,6 +42,7 @@ except ImportError:
 from packaging.version import parse
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
+from safetensors.torch import save as safetensors_save
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -85,6 +86,56 @@ def _ensure_msc_available() -> None:
             "Install it with: pip install multi-storage-client "
             "--index-url https://pypi.nvidia.com"
         )
+
+
+def _adapter_path(checkpoint_dir: str) -> str:
+    """Return the PEFT adapter safetensors path inside a checkpoint dir (local or ``msc://``)."""
+    if is_cloud_path(checkpoint_dir):
+        return checkpoint_dir.rstrip("/") + "/adapter_model.safetensors"
+    return os.path.join(checkpoint_dir, "adapter_model.safetensors")
+
+
+def _save_safetensors(state_dict: dict[str, torch.Tensor], path: str) -> None:
+    """Write a safetensors file to a local path or an ``msc://`` cloud path.
+
+    For cloud paths the tensors are serialized to bytes and streamed to the MSC
+    file handle, since ``save_file`` only accepts a local filesystem path.
+    """
+    if is_cloud_path(path):
+        _ensure_msc_available()
+        with msc.open(path, "wb") as f:
+            f.write(safetensors_save(state_dict))
+    else:
+        save_file(state_dict, path)
+
+
+def _load_safetensors(path: str) -> dict[str, torch.Tensor]:
+    """Read a safetensors file from a local path or an ``msc://`` cloud path."""
+    if is_cloud_path(path):
+        _ensure_msc_available()
+        with msc.open(path, "rb") as f:
+            return safetensors_load(f.read())
+    return load_file(path)
+
+
+def _maybe_msc_reader(
+    path: str, storage_reader: Optional[_HuggingFaceStorageReader]
+) -> Optional[_HuggingFaceStorageReader]:
+    """Return an MSC filesystem reader for ``msc://`` paths, else the given reader."""
+    if storage_reader is None and is_cloud_path(path):
+        _ensure_msc_available()
+        return msc.torch.MultiStorageFileSystemReader(path)
+    return storage_reader
+
+
+def _maybe_msc_writer(
+    path: str, storage_writer: Optional[_HuggingFaceStorageWriter]
+) -> Optional[_HuggingFaceStorageWriter]:
+    """Return an MSC filesystem writer for ``msc://`` paths, else the given writer."""
+    if storage_writer is None and is_cloud_path(path):
+        _ensure_msc_available()
+        return msc.torch.MultiStorageFileSystemWriter(path)
+    return storage_writer
 
 
 def _is_geq_torch_2_9() -> bool:
@@ -846,18 +897,9 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT loading is broadcasted from rank0 so it is a special case
         if self.config.is_peft and is_model and (not is_init_step):
-            if is_cloud_path(path):
-                _ensure_msc_available()
-                adapter_path = path.rstrip("/") + "/adapter_model.safetensors"
-                with msc.open(adapter_path, "rb") as f:
-                    data = f.read()
-                state_dict = safetensors_load(data)
-            else:
-                state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+            state_dict = _load_safetensors(_adapter_path(path))
         else:
-            if is_cloud_path(path) and storage_reader is None:
-                _ensure_msc_available()
-                storage_reader = msc.torch.MultiStorageFileSystemReader(path)
+            storage_reader = _maybe_msc_reader(path, storage_reader)
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader)
         return state_dict
 
@@ -883,13 +925,7 @@ class Checkpointer:
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                if is_cloud_path(path):
-                    _ensure_msc_available()
-                    adapter_path = path.rstrip("/") + "/adapter_model.safetensors"
-                    with msc.open(adapter_path, "wb") as f:
-                        save_file(state_dict, f)
-                else:
-                    save_file(state_dict, os.path.join(path, "adapter_model.safetensors"))
+                _save_safetensors(state_dict, _adapter_path(path))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
             return
@@ -898,9 +934,7 @@ class Checkpointer:
         planner = dcp.DefaultSavePlanner(enable_plan_caching=True)
 
         # Routes to MSC storage write for cloud paths
-        if is_cloud_path(path) and storage_writer is None:
-            _ensure_msc_available()
-            storage_writer = msc.torch.MultiStorageFileSystemWriter(path)
+        storage_writer = _maybe_msc_writer(path, storage_writer)
 
         if self.config.is_async:
             ctx = self._model_ctx if is_model else self._optim_ctx
