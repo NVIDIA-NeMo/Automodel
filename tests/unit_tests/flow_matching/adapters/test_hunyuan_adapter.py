@@ -36,6 +36,7 @@ from nemo_automodel.components.flow_matching.adapters import (
     FlowMatchingContext,
     HunyuanAdapter,
 )
+from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
 from nemo_automodel.components.flow_matching.adapters.hunyuan import _is_flash_varlen_attention_backend
 
 # =============================================================================
@@ -95,6 +96,144 @@ class TestHunyuanFlashVarlenMaskOptimization:
         assert _is_flash_varlen_attention_backend("flash_varlen")
         assert _is_flash_varlen_attention_backend(Backend())
         assert not _is_flash_varlen_attention_backend("flash")
+
+    def test_enable_flash_varlen_mask_optimization_returns_false_when_diffusers_imports_fail(self, monkeypatch):
+        monkeypatch.setattr(hunyuan_module, "safe_import_from", lambda *_args: (False, None))
+
+        assert not hunyuan_module.enable_hunyuan_flash_varlen_mask_optimization()
+
+    def test_enable_flash_varlen_mask_optimization_is_idempotent_and_preserves_fallback(self, monkeypatch):
+        class FakeProcessor:
+            def __call__(
+                self,
+                attn,
+                hidden_states,
+                encoder_hidden_states=None,
+                attention_mask=None,
+                image_rotary_emb=None,
+            ):
+                self.original_call_count = getattr(self, "original_call_count", 0) + 1
+                return hidden_states + 1, encoder_hidden_states
+
+        def fake_dispatch_attention_fn(*_args, **_kwargs):
+            raise AssertionError("dispatch_attention_fn should not be called for fallback paths")
+
+        def fake_apply_rotary_emb(tensor, *_args, **_kwargs):
+            return tensor
+
+        def fake_safe_import_from(module_name, symbol_name):
+            symbols = {
+                (
+                    "diffusers.models.transformers.transformer_hunyuan_video15",
+                    "HunyuanVideo15AttnProcessor2_0",
+                ): FakeProcessor,
+                ("diffusers.models.attention_dispatch", "dispatch_attention_fn"): fake_dispatch_attention_fn,
+                ("diffusers.models.embeddings", "apply_rotary_emb"): fake_apply_rotary_emb,
+            }
+            return True, symbols[(module_name, symbol_name)]
+
+        monkeypatch.setattr(hunyuan_module, "safe_import_from", fake_safe_import_from)
+
+        assert hunyuan_module.enable_hunyuan_flash_varlen_mask_optimization()
+        original_call = FakeProcessor._nemo_original_call
+        patched_call = FakeProcessor.__call__
+        assert hunyuan_module.enable_hunyuan_flash_varlen_mask_optimization()
+        assert FakeProcessor._nemo_original_call is original_call
+        assert FakeProcessor.__call__ is patched_call
+
+        processor = FakeProcessor()
+        processor._attention_backend = "flash"
+        hidden_states = torch.zeros(1, 2, 4)
+
+        out, _ = processor(None, hidden_states, attention_mask=torch.ones(1, 2, dtype=torch.bool))
+        assert torch.equal(out, hidden_states + 1)
+        assert processor.original_call_count == 1
+
+        processor._attention_backend = "flash_varlen"
+        out, _ = processor(None, hidden_states, attention_mask=None)
+        assert torch.equal(out, hidden_states + 1)
+        assert processor.original_call_count == 2
+
+    def test_flash_varlen_mask_optimized_call_dispatches_with_padded_mask(self, monkeypatch):
+        class FakeProcessor:
+            def __call__(self, *_args, **_kwargs):
+                raise AssertionError("original call should not run for flash_varlen with an attention mask")
+
+        class FakeAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = 2
+                self.to_q = nn.Linear(4, 4, bias=False)
+                self.to_k = nn.Linear(4, 4, bias=False)
+                self.to_v = nn.Linear(4, 4, bias=False)
+                self.add_q_proj = nn.Linear(4, 4, bias=False)
+                self.add_k_proj = nn.Linear(4, 4, bias=False)
+                self.add_v_proj = nn.Linear(4, 4, bias=False)
+                self.norm_q = nn.Identity()
+                self.norm_k = nn.Identity()
+                self.norm_added_q = nn.Identity()
+                self.norm_added_k = nn.Identity()
+                self.to_out = nn.ModuleList([nn.Identity(), nn.Identity()])
+                self.to_add_out = nn.Identity()
+
+        dispatch_calls = {}
+        rotary_calls = []
+
+        def fake_dispatch_attention_fn(query, key, value, **kwargs):
+            dispatch_calls["query_shape"] = query.shape
+            dispatch_calls["key_shape"] = key.shape
+            dispatch_calls["value_shape"] = value.shape
+            dispatch_calls.update(kwargs)
+            return value
+
+        def fake_apply_rotary_emb(tensor, image_rotary_emb, sequence_dim):
+            rotary_calls.append((image_rotary_emb, sequence_dim))
+            return tensor
+
+        def fake_safe_import_from(module_name, symbol_name):
+            symbols = {
+                (
+                    "diffusers.models.transformers.transformer_hunyuan_video15",
+                    "HunyuanVideo15AttnProcessor2_0",
+                ): FakeProcessor,
+                ("diffusers.models.attention_dispatch", "dispatch_attention_fn"): fake_dispatch_attention_fn,
+                ("diffusers.models.embeddings", "apply_rotary_emb"): fake_apply_rotary_emb,
+            }
+            return True, symbols[(module_name, symbol_name)]
+
+        monkeypatch.setattr(hunyuan_module, "safe_import_from", fake_safe_import_from)
+        assert hunyuan_module.enable_hunyuan_flash_varlen_mask_optimization()
+
+        processor = FakeProcessor()
+        processor._attention_backend = "flash_varlen"
+        processor._parallel_config = "parallel-config"
+        hidden_states = torch.randn(2, 3, 4)
+        encoder_hidden_states = torch.randn(2, 2, 4)
+        attention_mask = torch.tensor([[True, False, True], [False, True, True]])
+        image_rotary_emb = object()
+
+        hidden_out, encoder_out = processor(
+            FakeAttention(),
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        assert hidden_out.shape == hidden_states.shape
+        assert encoder_out.shape == encoder_hidden_states.shape
+        assert dispatch_calls["query_shape"] == (2, 5, 2, 2)
+        assert dispatch_calls["key_shape"] == (2, 5, 2, 2)
+        assert dispatch_calls["value_shape"] == (2, 5, 2, 2)
+        assert dispatch_calls["attn_mask"].dtype is torch.bool
+        assert dispatch_calls["attn_mask"].shape == (2, 5)
+        assert dispatch_calls["attn_mask"][:, :2].all()
+        assert torch.equal(dispatch_calls["attn_mask"][:, 2:], attention_mask)
+        assert dispatch_calls["dropout_p"] == 0.0
+        assert dispatch_calls["is_causal"] is False
+        assert dispatch_calls["backend"] == "flash_varlen"
+        assert dispatch_calls["parallel_config"] == "parallel-config"
+        assert rotary_calls == [(image_rotary_emb, 1), (image_rotary_emb, 1)]
 
 
 # =============================================================================
