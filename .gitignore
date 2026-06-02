@@ -189,7 +189,3 @@ skypilot_jobs/
 fern/product-docs/
 
 training_logs/
-
-# Local agent tooling / state (Codex CLI, Humanize RLCR + BitLesson)
-.codex
-.humanize/
