@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import warnings
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -833,6 +834,7 @@ _MXFP8_GROUPED_MM = None  # cached uniform callable (set on first resolve)
 _MXFP8_RESOLVED = False  # whether the import ladder has run
 _MXFP8_FALLBACK_WARNED = False  # one-time runtime fallback warning
 _MXFP8_ACTIVE_ANNOUNCED = False  # one-time "mxfp8 active" confirmation
+_MXFP8_TIMING_LOGGED = False  # one-time DEBUG_MXFP8_TIMING split log
 
 
 def _resolve_mxfp8_grouped_mm():
@@ -929,6 +931,48 @@ def _default_grouped_mm(A, B, offs):
     return torch._grouped_mm(A, B, offs=offs)
 
 
+def _mxfp8_weight_relayout(B):
+    """Lay the [E,K,N] expert weight out so its (-2,-1) transpose is contiguous.
+
+    torchao's MXFP8 quantizer calls ``to_mx(B.transpose(-2,-1))`` and strictly asserts
+    the input is contiguous, so the weight must be stored as [E,N,K]-contiguous (viewed
+    as [E,K,N]) — also the column-major B_t layout torchao's grouped GEMM wants.
+    """
+    return B.transpose(-2, -1).contiguous().transpose(-2, -1)
+
+
+def _log_mxfp8_timing_once(A, B, offs, mxfp8_grouped_mm):
+    """One-time rank-0 timing split (relayout vs torchao call) for DEBUG_MXFP8_TIMING.
+
+    Localizes the MXFP8 perf cost: separately times the weight relayout copy and the
+    torchao quantize+grouped-GEMM call via CUDA events, logs both (ms) with operand
+    shapes/contiguity. Re-runs one GEMM purely to measure; only invoked when the env
+    flag is set, so the production path never pays this synchronize.
+    """
+    global _MXFP8_TIMING_LOGGED
+    relayout_start, relayout_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    gemm_start, gemm_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    relayout_start.record()
+    A_c = A.contiguous()
+    B_t_contig = _mxfp8_weight_relayout(B)
+    relayout_end.record()
+    gemm_start.record()
+    mxfp8_grouped_mm(A_c, B_t_contig, offs)
+    gemm_end.record()
+    torch.cuda.synchronize()
+    _MXFP8_TIMING_LOGGED = True
+    warnings.warn(
+        "[DEBUG_MXFP8_TIMING] gate_up GEMM: "
+        f"relayout={relayout_start.elapsed_time(relayout_end):.3f}ms "
+        f"torchao_grouped_mm={gemm_start.elapsed_time(gemm_end):.3f}ms | "
+        f"A{tuple(A.shape)} contig={A.is_contiguous()} "
+        f"B{tuple(B.shape)} contig={B.is_contiguous()} "
+        f"B_t_contig.transpose contig={B_t_contig.transpose(-2, -1).is_contiguous()}",
+        category=UserWarning,
+        stacklevel=2,
+    )
+
+
 def _torch_mm_experts_fwd(
     hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn, use_mxfp8=False
 ):
@@ -942,20 +986,26 @@ def _torch_mm_experts_fwd(
         #   * activation A: to_mx(A, ...) directly  -> A must be contiguous (2D row-major).
         #   * weight B[E,K,N]: to_mx(B.transpose(-2,-1), ...) -> torchao transposes to
         #     [E,N,K] FIRST, so B.contiguous() (row-major [E,K,N]) is NOT enough: its
-        #     transpose is non-contiguous and trips the assert. Give B a layout whose
-        #     transpose is contiguous via .transpose(-2,-1).contiguous().transpose(-2,-1)
-        #     (i.e. [E,N,K]-contiguous storage viewed as [E,K,N]) — which is also the
-        #     column-major B_t layout torchao's grouped GEMM ultimately wants.
+        #     transpose is non-contiguous and trips the assert. _mxfp8_weight_relayout
+        #     gives B the [E,N,K]-contiguous (viewed [E,K,N]) layout torchao wants.
         # Values/shape are unchanged (only strides), so the GEMM result is identical.
         # mxfp8 path only; never perturbs the torch._grouped_mm fallback.
+        timing = (
+            os.environ.get("DEBUG_MXFP8_TIMING") == "True"
+            and not _MXFP8_TIMING_LOGGED
+            and (not dist.is_initialized() or dist.get_rank() == 0)
+        )
+
         def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
-            B_t_contig = B.transpose(-2, -1).contiguous().transpose(-2, -1)
-            return _fn(A.contiguous(), B_t_contig, offs)
+            return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
     else:
         grouped_mm = _default_grouped_mm
+        timing = False
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
+    if timing:
+        _log_mxfp8_timing_once(hidden_states, gate_and_up_projs, offs, mxfp8_grouped_mm)
     return output2
 
 
