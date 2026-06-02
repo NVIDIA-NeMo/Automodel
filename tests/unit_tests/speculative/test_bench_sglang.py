@@ -22,6 +22,7 @@ is tested directly.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -335,3 +336,115 @@ def test_fetch_server_info_non_200_returns_none(monkeypatch):
     session = _FakeSession(get_response=_FakeResponse(404, text="nope"))
     _patch_aiohttp(monkeypatch, session)
     assert asyncio.run(bench_sglang._fetch_server_info("http://localhost:30000", timeout_s=1.0)) is None
+
+
+def test_fetch_server_info_transport_error_returns_none(monkeypatch):
+    # A connection failure is best-effort: log and return None, never raise.
+    class _BoomSession(_FakeSession):
+        def get(self, url, *, timeout=None):
+            raise RuntimeError("connection refused")
+
+    _patch_aiohttp(monkeypatch, _BoomSession())
+    assert asyncio.run(bench_sglang._fetch_server_info("http://x", timeout_s=1.0)) is None
+
+
+# ---------------------------------------------------------------------------
+# Prompt loading, the async driver (_run), and the CLI (main)
+# ---------------------------------------------------------------------------
+
+
+def _run_args(**over):
+    base = dict(
+        server="http://localhost:30000",
+        baseline_server=None,
+        model="m",
+        input_data="data",
+        split="train",
+        dataset_name=None,
+        shuffle_seed=None,
+        messages_column="messages",
+        num_prompts=4,
+        concurrency=2,
+        max_new_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        num_steps=None,
+        timeout_s=1.0,
+        max_retries=0,
+        output_json=None,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_load_prompts_caps_and_drops_unusable(monkeypatch):
+    rows = [{"messages": "a"}, {"messages": "b"}, {"messages": "c"}]
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages",
+        lambda *a, **k: rows,
+    )
+    # "b" yields no usable prompt and must be skipped; the cap stops at 2.
+    monkeypatch.setattr(
+        bench_sglang,
+        "_extract_prompt_messages",
+        lambda m: None if m == "b" else [{"role": "user", "content": m}],
+    )
+    prompts = bench_sglang._load_prompts(_run_args(num_prompts=2))
+    assert prompts == [[{"role": "user", "content": "a"}], [{"role": "user", "content": "c"}]]
+
+
+def test_run_happy_path_prints_and_writes_json(monkeypatch, tmp_path):
+    monkeypatch.setattr(bench_sglang, "_load_prompts", lambda args: [[{"role": "user", "content": "hi"}]])
+
+    async def _fake_workload(server, prompts, gen_cfg, **kwargs):
+        return WorkloadResult(wall_clock_s=2.0, output_tokens=100, completed=1, failed=0)
+
+    async def _fake_info(server, *, timeout_s):
+        return _server_info(3.5, 4)
+
+    monkeypatch.setattr(bench_sglang, "_run_workload", _fake_workload)
+    monkeypatch.setattr(bench_sglang, "_fetch_server_info", _fake_info)
+
+    out = tmp_path / "metrics.json"
+    rc = asyncio.run(bench_sglang._run(_run_args(output_json=str(out))))
+    assert rc == 0
+    assert json.loads(out.read_text())["accept_length"] == 3.5
+
+
+def test_run_returns_1_when_no_prompts(monkeypatch):
+    monkeypatch.setattr(bench_sglang, "_load_prompts", lambda args: [])
+    assert asyncio.run(bench_sglang._run(_run_args())) == 1
+
+
+def test_run_with_baseline_and_missing_accept_length(monkeypatch):
+    monkeypatch.setattr(bench_sglang, "_load_prompts", lambda args: [[{"role": "user", "content": "x"}]])
+    servers: list[str] = []
+
+    async def _fake_workload(server, prompts, gen_cfg, **kwargs):
+        servers.append(server)
+        return WorkloadResult(wall_clock_s=1.0, output_tokens=10, completed=1, failed=0)
+
+    async def _fake_info(server, *, timeout_s):
+        return None  # server_info unavailable -> accept_length stays None (warning path)
+
+    monkeypatch.setattr(bench_sglang, "_run_workload", _fake_workload)
+    monkeypatch.setattr(bench_sglang, "_fetch_server_info", _fake_info)
+
+    rc = asyncio.run(bench_sglang._run(_run_args(baseline_server="http://localhost:30001")))
+    assert rc == 0
+    # Both the spec server and the baseline server were benchmarked.
+    assert servers == ["http://localhost:30000", "http://localhost:30001"]
+
+
+def test_main_builds_parser_and_dispatches(monkeypatch):
+    seen = {}
+
+    async def _fake_run(args):
+        seen["server"] = args.server
+        seen["model"] = args.model
+        return 0
+
+    monkeypatch.setattr(bench_sglang, "_run", _fake_run)
+    rc = bench_sglang.main(["--server", "http://localhost:30000", "--model", "m", "--input-data", "d"])
+    assert rc == 0
+    assert seen == {"server": "http://localhost:30000", "model": "m"}
