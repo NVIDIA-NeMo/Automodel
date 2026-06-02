@@ -43,7 +43,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: final
+  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   strategy: fsdp2

@@ -327,8 +327,6 @@ class BaseRecipe:
             torch.distributed.barrier()
 
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
 
         for key in sorted(self.__dict__["__state_tracked"]):
             if is_model(getattr(self, key)):
@@ -355,13 +353,7 @@ class BaseRecipe:
         # For multi-stage PP models, use checkpointer directly to handle all parts
         # For single models, use save_pretrained for HF-compatible API
         if isinstance(model, list) and len(model) > 1:
-            self.checkpointer.save_model(
-                model,
-                path,
-                peft_config=self.peft_config,
-                tokenizer=tokenizer,
-                is_final_checkpoint=is_final_checkpoint,
-            )
+            self.checkpointer.save_model(model, path, peft_config=self.peft_config, tokenizer=tokenizer)
         else:
             unwrapped_model = model[0] if isinstance(model, list) else model
             # Unwrap DDP if present
@@ -379,23 +371,14 @@ class BaseRecipe:
                         checkpointer=self.checkpointer,
                         tokenizer=tokenizer,
                         peft_config=self.peft_config,
-                        is_final_checkpoint=is_final_checkpoint,
                     )
                 else:
                     self.checkpointer.save_model(
-                        model=unwrapped_model,
-                        weights_path=path,
-                        peft_config=self.peft_config,
-                        tokenizer=tokenizer,
-                        is_final_checkpoint=is_final_checkpoint,
+                        model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
                     )
             else:
                 self.checkpointer.save_model(
-                    model=unwrapped_model,
-                    weights_path=path,
-                    peft_config=self.peft_config,
-                    tokenizer=tokenizer,
-                    is_final_checkpoint=is_final_checkpoint,
+                    model=unwrapped_model, weights_path=path, peft_config=self.peft_config, tokenizer=tokenizer
                 )
 
         # Sync before checkpointing for Dion

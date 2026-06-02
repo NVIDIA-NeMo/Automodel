@@ -13,25 +13,19 @@
 # limitations under the License.
 
 import json
-import logging
 import os
 from unittest.mock import MagicMock
 
 import pytest
-import torch
-from safetensors.torch import load_file, save_file
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
-    consolidate_safetensors_files,
-    resolve_dtype_cast,
 )
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _DIFFUSERS_INDEX_FN,
     _HuggingFaceStorageWriter,
     _maybe_rename_index_for_diffusers,
 )
-from nemo_automodel.components.checkpoint._backports.hf_utils import CUSTOM_METADATA_KEY
 
 
 @pytest.mark.run_only_on("CPU")
@@ -71,225 +65,6 @@ def test_write_scalar_tensor(tmp_path):
     written = output_file.read_bytes()
     assert written == sub_tensor_bytes
     assert os.path.getsize(output_file) == element_size
-
-
-@pytest.mark.run_only_on("CPU")
-def test_consolidate_casts_float_tensors_only_when_cast_dtype_is_set(tmp_path, caplog):
-    input_dir = tmp_path / "input"
-    output_dir = tmp_path / "output"
-    input_dir.mkdir()
-    output_dir.mkdir()
-
-    tensors = {
-        "float_weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
-        "int_weight": torch.arange(4, dtype=torch.int64),
-    }
-    dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
-    save_file(
-        tensors,
-        input_dir / "model-00001-of-00001.safetensors",
-        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
-    )
-    caplog.set_level(logging.INFO)
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={"float_weight": 1, "int_weight": 1},
-        cast_dtype=torch.bfloat16,
-    )
-
-    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
-    assert output_tensors["float_weight"].dtype is torch.bfloat16
-    assert output_tensors["int_weight"].dtype is torch.int64
-    torch.testing.assert_close(output_tensors["float_weight"], tensors["float_weight"].to(torch.bfloat16))
-    torch.testing.assert_close(output_tensors["int_weight"], tensors["int_weight"])
-
-    with open(output_dir / "model.safetensors.index.json", "r") as f:
-        index = json.load(f)
-    expected_total_size = tensors["float_weight"].numel() * 2 + tensors["int_weight"].numel() * 8
-    assert index["metadata"]["total_size"] == expected_total_size
-    assert "Requested cast dtype torch.bfloat16 for consolidation." in caplog.text
-    assert "tensors already in this dtype, FP8 tensors, and non-floating tensors are unchanged." in caplog.text
-
-
-@pytest.mark.run_only_on("CPU")
-def test_consolidate_cast_dtype_does_not_cast_fp8_tensors(tmp_path):
-    input_dir = tmp_path / "input"
-    output_dir = tmp_path / "output"
-    input_dir.mkdir()
-    output_dir.mkdir()
-
-    tensors = {
-        "fp8_weight": torch.arange(4, dtype=torch.float32).to(torch.float8_e4m3fn),
-        "fp32_weight": torch.arange(4, dtype=torch.float32),
-    }
-    dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
-    save_file(
-        tensors,
-        input_dir / "model-00001-of-00001.safetensors",
-        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
-    )
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={"fp8_weight": 1, "fp32_weight": 1},
-        cast_dtype=torch.bfloat16,
-    )
-
-    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
-    assert output_tensors["fp8_weight"].dtype is torch.float8_e4m3fn
-    assert output_tensors["fp32_weight"].dtype is torch.bfloat16
-    torch.testing.assert_close(output_tensors["fp8_weight"].to(torch.float32), tensors["fp8_weight"].to(torch.float32))
-    torch.testing.assert_close(output_tensors["fp32_weight"], tensors["fp32_weight"].to(torch.bfloat16))
-
-
-@pytest.mark.run_only_on("CPU")
-def test_consolidate_preserves_original_hf_float_dtypes_when_available(tmp_path):
-    input_dir = tmp_path / "input"
-    output_dir = tmp_path / "output"
-    input_dir.mkdir()
-    output_dir.mkdir()
-
-    tensors = {
-        "bf16_weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
-        "fp32_weight": torch.arange(4, dtype=torch.float32),
-        "missing_original_dtype": torch.arange(2, dtype=torch.float32),
-    }
-    dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
-    save_file(
-        tensors,
-        input_dir / "model-00001-of-00001.safetensors",
-        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
-    )
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={name: 1 for name in tensors},
-        fqn_to_dtype_mapping={"bf16_weight": "BF16", "fp32_weight": "F32"},
-    )
-
-    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
-    assert output_tensors["bf16_weight"].dtype is torch.bfloat16
-    assert output_tensors["fp32_weight"].dtype is torch.float32
-    assert output_tensors["missing_original_dtype"].dtype is torch.float32
-    torch.testing.assert_close(output_tensors["bf16_weight"], tensors["bf16_weight"].to(torch.bfloat16))
-    torch.testing.assert_close(output_tensors["fp32_weight"], tensors["fp32_weight"])
-    torch.testing.assert_close(output_tensors["missing_original_dtype"], tensors["missing_original_dtype"])
-
-    with open(output_dir / "model.safetensors.index.json", "r") as f:
-        index = json.load(f)
-    expected_total_size = (
-        tensors["bf16_weight"].numel() * 2
-        + tensors["fp32_weight"].numel() * 4
-        + tensors["missing_original_dtype"].numel() * 4
-    )
-    assert index["metadata"]["total_size"] == expected_total_size
-
-
-@pytest.mark.run_only_on("CPU")
-def test_consolidate_keeps_saved_dtype_when_original_hf_dtype_metadata_is_missing(tmp_path):
-    input_dir = tmp_path / "input"
-    output_dir = tmp_path / "output"
-    input_dir.mkdir()
-    output_dir.mkdir()
-
-    tensors = {
-        "fp32_weight": torch.arange(4, dtype=torch.float32),
-        "bf16_weight": torch.arange(4, dtype=torch.bfloat16),
-    }
-    dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
-    save_file(
-        tensors,
-        input_dir / "model-00001-of-00001.safetensors",
-        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
-    )
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={name: 1 for name in tensors},
-    )
-
-    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
-    assert output_tensors["fp32_weight"].dtype is torch.float32
-    assert output_tensors["bf16_weight"].dtype is torch.bfloat16
-    torch.testing.assert_close(output_tensors["fp32_weight"], tensors["fp32_weight"])
-    torch.testing.assert_close(output_tensors["bf16_weight"], tensors["bf16_weight"])
-
-
-@pytest.mark.run_only_on("CPU")
-def test_consolidate_ignores_mapping_keys_missing_from_input_shards(tmp_path, caplog):
-    input_dir = tmp_path / "input"
-    output_dir = tmp_path / "output"
-    input_dir.mkdir()
-    output_dir.mkdir()
-
-    tensors = {"transformer.wte.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2)}
-    dcp_metadata = {"transformer.wte.weight": {"saved_offsets": [0, 0]}}
-    save_file(
-        tensors,
-        input_dir / "model-00001-of-00001.safetensors",
-        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
-    )
-    caplog.set_level(logging.WARNING)
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={"transformer.wte.weight": 1, "lm_head.weight": 1},
-    )
-
-    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
-    assert set(output_tensors) == {"transformer.wte.weight"}
-    torch.testing.assert_close(output_tensors["transformer.wte.weight"], tensors["transformer.wte.weight"])
-
-    with open(output_dir / "model.safetensors.index.json", "r") as f:
-        index = json.load(f)
-    assert index["weight_map"] == {"transformer.wte.weight": "model-00001-of-00001.safetensors"}
-    assert index["metadata"]["total_size"] == tensors["transformer.wte.weight"].numel() * 4
-    assert "Ignoring 1 tensor(s) from the consolidation shard mapping" in caplog.text
-    assert "lm_head.weight" in caplog.text
-
-
-@pytest.mark.run_only_on("CPU")
-def test_consolidate_keeps_float_when_original_dtype_is_quantized(tmp_path, caplog):
-    input_dir = tmp_path / "input"
-    output_dir = tmp_path / "output"
-    input_dir.mkdir()
-    output_dir.mkdir()
-
-    tensors = {"weight": torch.arange(4, dtype=torch.float32)}
-    dcp_metadata = {"weight": {"saved_offsets": [0]}}
-    save_file(
-        tensors,
-        input_dir / "model-00001-of-00001.safetensors",
-        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
-    )
-    caplog.set_level(logging.WARNING)
-
-    consolidate_safetensors_files(
-        input_dir=str(input_dir),
-        output_dir=str(output_dir),
-        fqn_to_index_mapping={"weight": 1},
-        fqn_to_dtype_mapping={"weight": "F8_E4M3"},
-    )
-
-    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
-    assert output_tensors["weight"].dtype is torch.float32
-    torch.testing.assert_close(output_tensors["weight"], tensors["weight"])
-    assert "Original checkpoint tensor(s) were quantized or packed" in caplog.text
-    assert "weight: original F8_E4M3, saved F32" in caplog.text
-
-
-def test_resolve_dtype_cast_accepts_aliases_and_none():
-    assert resolve_dtype_cast(None) is None
-    assert resolve_dtype_cast("") is None
-    assert resolve_dtype_cast("none") is None
-    assert resolve_dtype_cast("bf16") is torch.bfloat16
-    assert resolve_dtype_cast("torch.float16") is torch.float16
 
 
 # =============================================================================

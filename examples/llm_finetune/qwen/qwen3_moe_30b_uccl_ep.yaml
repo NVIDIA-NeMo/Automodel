@@ -56,7 +56,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
-  save_consolidated: final
+  save_consolidated: true
 
 distributed:
   strategy: fsdp2

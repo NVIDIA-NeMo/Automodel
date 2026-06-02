@@ -60,7 +60,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # LoRA only supports safetensors format
-  save_consolidated: false
+  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
 
 distributed:
   strategy: fsdp2

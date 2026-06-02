@@ -291,7 +291,7 @@ distributed:
 
 checkpoint:
   model_save_format: safetensors
-  save_consolidated: final
+  save_consolidated: true
 ```
 
 ### How it works
@@ -462,8 +462,7 @@ scaling dimension:
    (`interleaved_1f1b`) and smaller microbatches to reduce bubble time.
 
 4. **FSDP2 requires DTensor-aware state dict saving.** Use `safetensors` with
-   `save_consolidated: final` for final HF export, or `save_consolidated: false`
-   plus the generated `model/consolidate.sh` helper for offline export.
+   `save_consolidated: true` for checkpoint compatibility.
 
 5. **CP requires compatible attention.** SDPA (Flash Attention or Efficient
    Attention) or TE attention only. `SDPBackend.MATH` is not compatible with

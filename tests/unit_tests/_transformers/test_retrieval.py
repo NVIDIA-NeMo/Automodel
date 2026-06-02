@@ -15,7 +15,6 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -76,25 +75,6 @@ def _assert_state_dict_equal(expected: dict[str, torch.Tensor], actual: dict[str
 def _assert_no_language_model_prefix(model: nn.Module) -> None:
     for key in model.state_dict():
         assert not key.startswith("language_model."), f"VLM prefix in key: {key}"
-
-
-@pytest.mark.parametrize(("kwargs", "expected_is_final"), [({}, False), ({"is_final_checkpoint": True}, True)])
-def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, expected_is_final):
-    """Direct retrieval saves default to non-final unless the caller says otherwise."""
-    from nemo_automodel._transformers.retrieval import save_encoder_pretrained
-
-    model = nn.Module()
-    checkpointer = MagicMock()
-
-    save_encoder_pretrained(model, str(tmp_path), checkpointer=checkpointer, **kwargs)
-
-    checkpointer.save_model.assert_called_once_with(
-        model=model,
-        weights_path=str(tmp_path),
-        peft_config=None,
-        tokenizer=None,
-        is_final_checkpoint=expected_is_final,
-    )
 
 
 def test_extract_submodel_unsupported_embedding_from_local_vlm(tmp_path):

@@ -17,13 +17,13 @@ All configs use `chat_template.jinja`, `seq_length: 2048`, `betas: [0.9, 0.95]`,
 **Important notes:**
 - Moonlight uses a custom TikToken-based tokenizer with special tokens `<|im_system|>`, `<|im_user|>`, `<|im_assistant|>`, `<|im_middle|>`, `<|im_end|>` — different from Qwen's `<|im_start|>/<|im_end|>` pattern.
 - The chat template (`chat_template.jinja`) uses `{% generation %}` tags to supervise only the assistant response content + `<|im_end|>`.
-- The TikToken tokenizer is automatically converted to a native HF tokenizer at load time using `_try_convert_tiktoken_to_native`, enabling native `char_to_token()` support for `{% generation %}` mask computation.
+- The TikToken tokenizer is automatically converted to a native HF tokenizer at load time via `_try_convert_tiktoken_to_native`, enabling native `char_to_token()` support for `{% generation %}` mask computation.
 - `first_k_dense_replace: 1` — only layer 0 is dense, layers 1-26 are MoE.
 - `n_group: 1`, `topk_group: 1` — no expert grouping (unlike DeepSeek V3 which uses grouped routing).
 - `local_batch_size: 4` for both optimizers. Dataset must be pre-filtered to `seq_length=2048` to avoid OOM from variable-length batching with the large vocabulary (163840).
 - Both optimizers use `fp32_upcast: true` for FP32 loss upcasting.
 
-## Pre-Filter Data
+## Data Pre-filtering
 
 Moonlight's large vocabulary (163840) makes cross_entropy memory-intensive. Pre-filter to remove sequences exceeding `seq_length=2048`:
 
@@ -31,13 +31,13 @@ Moonlight's large vocabulary (163840) makes cross_entropy memory-intensive. Pre-
 MODEL=moonshotai/Moonlight-16B-A3B SEQ_LENGTH=2048 bash examples/convergence/tulu3/data/prefilter.sh
 ```
 
-Kept 899,643 / 939,343 samples (4.2% removed). Pass the cached path using the CLI:
+Kept 899,643 / 939,343 samples (4.2% removed). Pass the cached path via CLI:
 
 ```bash
 CACHED="<path-to-prefiltered-dataset>"
 ```
 
-## Train
+## Training
 
 ```bash
 source /opt/venv/bin/activate
@@ -52,12 +52,10 @@ torchrun --nproc-per-node 8 --tee 3 examples/llm_finetune/finetune.py \
     --wandb.project tulu3-convergence --wandb.entity Nemo-automodel --wandb.name moonlight-16b-flashoptim --wandb.dir /tmp/wandb
 ```
 
-## Evaluate
+## Eval
 
 ```bash
-CKPT_ROOT="$(readlink -f checkpoints_convergence/moonlight_16b_flashoptim/LATEST)"
-bash "$CKPT_ROOT/model/consolidate.sh"
-CKPT="$CKPT_ROOT/model/consolidated"
+CKPT="$(readlink -f checkpoints_convergence/moonlight_16b_flashoptim/LATEST)/model/consolidated"
 
 bash examples/convergence/tulu3/eval/run_eval.sh \
     --model-path "$CKPT" \
@@ -129,8 +127,8 @@ MoE load balancing is healthy: zero dead experts, diversity ~0.89 (1.0=uniform),
 - [x] Baselines established (pretrained model eval)
 - [x] Truncation rates checked, data pre-filtered and cached (4.2% removed)
 - [x] Data validation passes (5/5 assertions)
-- [x] Model verification passes (cosine sim > 0.99 vs. HF)
+- [x] Model verification passes (cosine sim > 0.99 vs HF)
 - [x] Training converges (loss decreasing, no NaN)
 - [x] SFT eval results (FlashAdamW + TE FusedAdam)
-- [x] Inference quality analysis (all 4 failure modes vs. baseline)
+- [x] Inference quality analysis (all 4 failure modes vs baseline)
 - [x] Results tables filled in

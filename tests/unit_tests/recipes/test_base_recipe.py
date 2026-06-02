@@ -27,7 +27,7 @@ try:
     import expecttest
 
     HAS_ET = True
-except Exception:
+except:
     HAS_ET = False
 
 
@@ -59,25 +59,16 @@ def _patch_checkpoint_ops(monkeypatch):
             self.pp_rank = pp_rank
             self.moe_mesh = moe_mesh
 
-        def save_model(
-            self,
-            model=None,
-            weights_path=None,
-            peft_config=None,
-            tokenizer=None,
-            is_final_checkpoint=False,
-        ):
+        def save_model(self, model=None, weights_path=None, peft_config=None, tokenizer=None):
             """Save model state dict."""
-            del peft_config, tokenizer, is_final_checkpoint
             if model is None:
                 return
             model_dir = os.path.join(weights_path, "model")
             os.makedirs(model_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(model_dir, "model.pt"))
 
-        def load_model(
-            self, model, model_path, is_init_step=False, use_checkpoint_id=True, key_mapping=None, quantization=False
-        ):
+        def load_model(self, model, model_path, is_init_step=False, use_checkpoint_id=True,
+                      key_mapping=None, quantization=False):
             """Load model state dict."""
             if model is None:
                 return
@@ -239,10 +230,8 @@ def test_save_and_load_roundtrip(tmp_path, symlink_supported, monkeypatch):
 
     # Patch os.symlink to raise OSError if symlink_supported is False
     if not symlink_supported:
-
         def raise_os_error(*args, **kwargs):
             raise OSError("Symlink not supported")
-
         monkeypatch.setattr(os, "symlink", raise_os_error)
 
     # Save checkpoint.
@@ -451,13 +440,10 @@ def test_load_checkpoint_autodetect_skips_peft_mismatch(tmp_path):
     full model). Auto-detect should skip such checkpoints.
     """
     # Save a checkpoint WITH a peft section in config
-    recipe_peft = _ToyRecipe(
-        tmp_path,
-        cfg_dict={
-            "model": {"pretrained_model_name_or_path": "toy/model-a"},
-            "peft": {"dim": 8, "alpha": 32},
-        },
-    )
+    recipe_peft = _ToyRecipe(tmp_path, cfg_dict={
+        "model": {"pretrained_model_name_or_path": "toy/model-a"},
+        "peft": {"dim": 8, "alpha": 32},
+    })
     x = torch.randn(4, 2)
     loss = recipe_peft.model(x).sum()
     loss.backward()
@@ -465,12 +451,9 @@ def test_load_checkpoint_autodetect_skips_peft_mismatch(tmp_path):
     recipe_peft.save_checkpoint(epoch=0, step=100, train_loss=float(loss.item()))
 
     # Create a new recipe WITHOUT peft (same model architecture)
-    recipe_no_peft = _ToyRecipe(
-        tmp_path,
-        cfg_dict={
-            "model": {"pretrained_model_name_or_path": "toy/model-a"},
-        },
-    )
+    recipe_no_peft = _ToyRecipe(tmp_path, cfg_dict={
+        "model": {"pretrained_model_name_or_path": "toy/model-a"},
+    })
     weight_before_load = recipe_no_peft.model.weight.clone()
 
     # Auto-detect should skip because PEFT mismatch

@@ -1,8 +1,8 @@
-# Add a New Model to the Convergence Pipeline
+# Adding a New Model to the Convergence Pipeline
 
 This guide walks through adding a new model to the Tulu-3 convergence pipeline. We use Qwen3-4B as the running example.
 
-## Create a Model Directory
+## 1. Create a Model Directory
 
 ```
 models/<model-name>/
@@ -12,7 +12,7 @@ models/<model-name>/
   <model>_cp1_te_fusedadam.yaml # TE FusedAdam config
 ```
 
-## Get the Chat Template
+## 2. Get the Chat Template
 
 Thinking models need a custom chat template that strips `<think>` tags from training labels. Without it, SFT on non-reasoning data produces high death loop rates.
 
@@ -24,7 +24,7 @@ print(tokenizer.chat_template)
 
 Save as `models/<model-name>/chat_template.jinja`. The key modification: wrap thinking content in `{% generation %}` / `{% endgeneration %}` tags so it appears in training but the model learns to produce direct answers.
 
-## Establish Baselines
+## 3. Establish Baselines
 
 Run eval on the **pretrained model** (no SFT) before doing anything else:
 
@@ -46,7 +46,7 @@ python inference/analyze_quality.py /tmp/eval_baseline/ --export /tmp/baseline_q
 
 Record the baseline numbers — IFEval accuracy, death loop rate, abrupt ending rate.
 
-## Check Truncation and Pre-Filter
+## 4. Check Truncation and Pre-filter
 
 ```bash
 python data/check_truncation.py \
@@ -65,10 +65,9 @@ python data/prefilter_dataset.py \
     --cache_dir /tmp/tulu3_filtered
 ```
 
-The cached Parquet directory is passed to training using `--dataset.path_or_dataset_id`.
+The cached Parquet directory is passed to training via `--dataset.path_or_dataset_id`.
 
-## Write Training Configs
-
+## 5. Write Training Configs
 
 Start from an existing config (e.g., `models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml`).
 
@@ -79,7 +78,7 @@ Start from an existing config (e.g., `models/qwen3-4b/qwen3_4b_cp1_flashoptim.ya
 
 **Consider changing:**
 - `dataset.seq_length` — based on truncation analysis
-- `step_scheduler.local_batch_size` — based on GPU memory. Use 2 for TE FusedAdam because FP32 master weights need more memory.
+- `step_scheduler.local_batch_size` — based on GPU memory. Use 2 for TE FusedAdam (FP32 master weights need more memory for checkpoint consolidation)
 - `distributed.cp_size` / `ep_size` — based on model size and architecture
 - `optimizer.lr` — 1e-5 is a good starting point
 
@@ -89,7 +88,7 @@ Start from an existing config (e.g., `models/qwen3-4b/qwen3_4b_cp1_flashoptim.ya
 - Add `model.backend.rms_norm: torch_fp32` for numerical stability
 - Set `model.backend.rope_fusion: false` if using CP
 
-## Validate Data Pipeline
+## 6. Validate Data Pipeline
 
 ```bash
 python data/validate_data.py \
@@ -106,7 +105,7 @@ All 5 assertions must pass:
 - `no_eos_in_padding` — no eos_token_id in padding positions
 - `eos_in_content` — eos_token_id present in content
 
-## Run Model Verification
+## 7. Run Model Verification
 
 Compare your NeMo implementation against HF Transformers before training:
 
@@ -119,7 +118,7 @@ python model-verification/compare_activations.py \
 
 All decoder layers should have cosine similarity > 0.99. If not, investigate weight loading, RoPE, or normalization differences.
 
-## Train
+## 8. Train
 
 ```bash
 CACHED=/tmp/tulu3_filtered/<cached_dir>
@@ -136,16 +135,14 @@ torchrun --nproc-per-node 8 --tee 3 \
 
 Monitor: loss should decrease from ~0.8 to ~0.5-0.6 over 1000 steps. Watch for NaN/Inf in loss or grad_norm.
 
-**Important:** Use absolute paths for `--checkpoint.checkpoint_dir`. If using TE FusedAdam, set `local_batch_size: 2` to leave memory headroom for optimizer state.
+**Important:** Use absolute paths for `--checkpoint.checkpoint_dir`. If using TE FusedAdam, set `local_batch_size: 2` to leave memory headroom for checkpoint consolidation.
 
-## Evaluate
+## 9. Evaluate
 
 Run IFEval with thinking off and on:
 
 ```bash
-CKPT_ROOT="$(readlink -f checkpoints/<run>/LATEST)"
-bash "$CKPT_ROOT/model/consolidate.sh"
-CKPT="$CKPT_ROOT/model/consolidated"
+CKPT="$(readlink -f checkpoints/<run>/LATEST)/model/consolidated"
 
 bash eval/run_eval.sh \
     --model-path "$CKPT" \
@@ -165,7 +162,7 @@ bash eval/run_eval.sh \
 
 **Important:** Use `readlink -f` to resolve LATEST symlink. Use absolute paths. For dense models, use `--dp-size 1`.
 
-## Run Inference Quality Analysis
+## 10. Run Inference Quality Analysis
 
 ```bash
 python inference/analyze_quality.py \
@@ -179,11 +176,11 @@ python inference/analyze_quality.py \
 
 Compare against baselines (step 3). Check all 4 failure modes:
 - **Death loop** — should be < 20%, ideally < 10%
-- **Abrupt ending** — should improve significantly vs. pretrained baseline
+- **Abrupt ending** — should improve significantly vs pretrained baseline
 - **Missing EOS** — should be 0%
 - **Empty response** — should be 0%
 
-## Write the Model README
+## 11. Write the Model README
 
 Create `models/<model-name>/README.md` with:
 - Model details (size, architecture, parallelism)

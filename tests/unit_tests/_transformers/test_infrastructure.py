@@ -150,34 +150,6 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
 class TestApplyModelInfrastructurePostShardInit:
     """Tests for initialize_model_weights being called in apply_model_infrastructure."""
 
-    def test_load_only_checkpointer_disables_consolidated_export(self):
-        """Infrastructure checkpointer loads base weights only and should not warn about consolidated saves."""
-        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
-
-        model = _DummyModel()
-
-        with (
-            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
-            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
-            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
-            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
-            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
-        ):
-            mock_ckpt = MockCheckpointer.return_value
-            mock_ckpt.config = MagicMock()
-            mock_ckpt.config.dequantize_base_checkpoint = False
-
-            apply_model_infrastructure(
-                model=model,
-                is_meta_device=True,
-                device=torch.device("cpu"),
-                load_base_model=True,
-                pretrained_model_name_or_path="test/model",
-            )
-
-        checkpoint_config = MockCheckpointer.call_args.args[0]
-        assert checkpoint_config.save_consolidated.value == "false"
-
     def test_from_config_meta_calls_initialize_model_weights(self):
         """from_config path (load_base_model=False) on meta device should call initialize_model_weights."""
         _, mock_ckpt = _run_apply_model_infrastructure(is_meta_device=True, load_base_model=False)
