@@ -2,7 +2,6 @@
 title: "NeMo AutoModel Documentation"
 description: "NeMo AutoModel is a PyTorch DTensor-native SPMD open-source training library for scalable LLM and VLM training and fine-tuning with day-0 Hugging Face model support"
 ---
-import { Tag } from "@/components/Tag";
 
 PyTorch-native training that scales from 1 GPU to thousands with a single config change. Load any Hugging Face model, point at your data, and start training -- no checkpoint conversion, no boilerplate.
 **Quick links:** [🤗 HF Compatible](/get-started/hf-compatibility) | [🚀 Performance](/performance/performance-summary) | [📐 Scalability](/get-started/key-features) | [🎯 SFT & PEFT](/recipes-e2e-examples/sft-peft) | [🎨 Diffusion](/recipes-e2e-examples/diffusion-fine-tuning) | [👁️ VLM](/recipes-e2e-examples/gemma-4)
@@ -64,7 +63,7 @@ Find the right guide for your task -- fine-tuning, pretraining, distillation, di
 | **Fine-tune dLLM**          | You want to fine-tune a diffusion language model (e.g., LLaDA) using masked denoising | Instruction / chat dataset                        | dLLM      | [Fine-tune dLLM](/recipes-e2e-examples/dllm-fine-tuning)                 |
 | **Fine-tune Diffusion**     | You want to fine-tune a diffusion model for image or video generation               | Video / Image dataset                             | Diffusion | [Fine-tune Diffusion](/recipes-e2e-examples/diffusion-fine-tuning)       |
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](/recipes-e2e-examples/qwen3-5-vl)                |
-| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Tag variant="info">Coming Soon</Tag>                                   |
+| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Badge intent="info">Coming Soon</Badge>                                   |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](/recipes-e2e-examples/large-moe-fine-tuning)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](/recipes-e2e-examples/deepseek-v4-flash)   |
 | **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](/recipes-e2e-examples/hy3-preview)                |
@@ -93,32 +92,32 @@ Parallelism, precision, checkpointing strategies and experiment tracking.
 <Cards>
 <Card title="Pipeline Parallelism" href="/development/pipeline-parallelism">
 Torch-native pipelining composable with FSDP2 and DTensor.
-<Tag variant="secondary">3d-parallelism</Tag>
+<Badge>3d-parallelism</Badge>
 </Card>
 
 <Card title="FP8 Training" href="/development/fp8-training">
 Mixed-precision FP8 training with torchao.
-<Tag variant="secondary">FP8</Tag> <Tag variant="secondary">mixed-precision</Tag>
+<Badge>FP8</Badge> <Badge>mixed-precision</Badge>
 </Card>
 
 <Card title="Checkpointing" href="/development/checkpointing">
 Distributed checkpoints with SafeTensors output.
-<Tag variant="secondary">DCP</Tag> <Tag variant="secondary">safetensors</Tag>
+<Badge>DCP</Badge> <Badge>safetensors</Badge>
 </Card>
 
 <Card title="Gradient Checkpointing" href="/development/gradient-checkpointing">
 Trade compute for memory with activation checkpointing.
-<Tag variant="secondary">memory-efficiency</Tag>
+<Badge>memory-efficiency</Badge>
 </Card>
 
 <Card title="Quantization-Aware Training" href="/recipes-e2e-examples/qat">
 Train with quantization for deployment-ready models.
-<Tag variant="secondary">QAT</Tag>
+<Badge>QAT</Badge>
 </Card>
 
 <Card title="Experiment Tracking" href="/development/mlflow-logging">
 Track experiments and metrics with MLflow and Wandb.
-<Tag variant="secondary">MLflow</Tag> <Tag variant="secondary">Wandb</Tag>
+<Badge>MLflow</Badge> <Badge>Wandb</Badge>
 </Card>
 
 </Cards>
