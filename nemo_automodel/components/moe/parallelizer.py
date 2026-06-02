@@ -296,6 +296,21 @@ def apply_fsdp(
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
             )
+        elif isinstance(moe_module, MoE) and ep_enabled and isinstance(moe_module.experts, GroupedExpertsTE):
+            # ep == world (no ep_shard dim) so the ep_shard-gated wrap above does not
+            # fire. The experts="te" path (GroupedExpertsTE) is the only one apply_ep
+            # leaves un-DTensor-wrapped (the torchao / gmm path DTensor-wraps its expert
+            # params directly in ExpertParallel._partition_fn). Without a wrap here the TE
+            # expert params stay plain torch.Tensors while the rest of the model is
+            # DTensor, and the foreach optimizer fails ("mixed torch.Tensor and DTensor").
+            # FSDP-wrap them on the dp/fsdp mesh so they become DTensor. Only fires when
+            # ep_shard_enabled is False, so the ep_shard path (e.g. gpt-oss ep<world) is
+            # untouched.
+            fully_shard(
+                moe_module.experts,
+                mesh=fsdp_mesh,
+                reshard_after_forward=reshard_after_forward,
+            )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
         # from FSDP for the transformer block.
