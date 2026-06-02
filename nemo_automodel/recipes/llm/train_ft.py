@@ -918,6 +918,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         self.cfg = cfg
 
+    def _shard_tool_call_eval_across_dp(self):
+        """Shard tool-call eval samples across DP ranks when it is safe to do so.
+
+        Each DP rank then scores a disjoint subset instead of every rank
+        redundantly scoring the full set. Only safe when the model is replicated
+        per rank (DDP); a ``sample_shard`` already set from YAML is left untouched.
+        """
+        if self.tool_call_evaluator.sample_shard is None:
+            self.tool_call_evaluator.sample_shard = _dp_eval_sample_shard(
+                self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
+            )
+
     # ------------------ build phase ------------------
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -1140,14 +1152,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
         if tool_call_eval_cfg is not None:
             self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
-            # Shard eval samples across DP ranks so each scores a disjoint subset
-            # instead of every rank redundantly scoring the full set. Only safe
-            # when the model is replicated per rank (DDP); a YAML-set sample_shard
-            # is left untouched.
-            if self.tool_call_evaluator.sample_shard is None:
-                self.tool_call_evaluator.sample_shard = _dp_eval_sample_shard(
-                    self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
-                )
+            self._shard_tool_call_eval_across_dp()
         self._warned_tool_call_eval_skipped = False
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler

@@ -2012,6 +2012,40 @@ class TestDpEvalSampleShard:
         assert _dp_eval_sample_shard(MegatronFSDPConfig(), 1, 4) is None
 
 
+class TestShardToolCallEvalAcrossDp:
+    """`_shard_tool_call_eval_across_dp` wires the DP shard onto the evaluator
+    during setup: injected only for DDP, and never overriding a YAML-set shard."""
+
+    def _recipe(self, distributed_config, evaluator, dp_rank=1, dp_size=4):
+        recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+        recipe.tool_call_evaluator = evaluator
+        recipe.distributed_config = distributed_config
+        recipe._get_dp_rank = lambda: dp_rank
+        recipe._get_dp_group_size = lambda: dp_size
+        return recipe
+
+    def test_ddp_injects_shard(self):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        ev = _FakeToolCallEvaluator(sample_shard=None)
+        self._recipe(DDPConfig(), ev, dp_rank=1, dp_size=4)._shard_tool_call_eval_across_dp()
+        assert ev.sample_shard == (1, 4)
+
+    def test_fsdp2_leaves_shard_none(self):
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        ev = _FakeToolCallEvaluator(sample_shard=None)
+        self._recipe(FSDP2Config(), ev)._shard_tool_call_eval_across_dp()
+        assert ev.sample_shard is None
+
+    def test_yaml_set_shard_is_untouched(self):
+        from nemo_automodel.components.distributed.config import DDPConfig
+
+        ev = _FakeToolCallEvaluator(sample_shard=(0, 2))
+        self._recipe(DDPConfig(), ev, dp_rank=1, dp_size=4)._shard_tool_call_eval_across_dp()
+        assert ev.sample_shard == (0, 2)  # explicit YAML shard preserved
+
+
 class _FakeToolCallEvaluator:
     """Stand-in for ToolCallAccuracyEvaluator: returns canned metrics (or raises)
     so ``_run_validation_epoch``'s reduction can be tested without generation."""
