@@ -872,7 +872,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_save_format=checkpoint_cfg.get("model_save_format"),
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
-            save_consolidated=checkpoint_cfg.get("save_consolidated", False),
+            save_consolidated=checkpoint_cfg.get("save_consolidated"),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),

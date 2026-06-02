@@ -18,7 +18,7 @@ Scans every example YAML under ``examples/``, extracts the HF model IDs from
 ``pretrained_model_name_or_path`` fields, resolves each ID to an architecture
 via ``AutoConfig.from_pretrained`` (config.json only — no GPU allocation, no
 weight download), then asserts every resolved architecture is mentioned in at
-least one ``docs/model-coverage/*.md`` file.
+least one ``docs/model-coverage/*.mdx`` file.
 
 This complements ``test_doc_coverage.py`` which only covers archs registered
 in ``MODEL_ARCH_MAPPING``. Many recipes fine-tune HF-native archs (e.g.,
@@ -49,7 +49,10 @@ from typing import Iterable
 import pytest
 import yaml
 
-from tests.unit_tests._transformers.test_doc_coverage import _DOC_ARCH_ALIASES
+from tests.unit_tests._transformers.test_doc_coverage import (
+    _DOC_ARCH_ALIASES,
+    _model_coverage_doc_contents,
+)
 
 
 def _repo_root() -> pathlib.Path:
@@ -143,7 +146,7 @@ def _arch_is_documented(arch: str, md_contents: list[str]) -> bool:
 
 def test_recipe_archs_have_doc_coverage():
     """Every arch referenced by an example YAML recipe must appear in at least
-    one ``docs/model-coverage/*.md`` file.
+    one ``docs/model-coverage/*.mdx`` file.
 
     Disabled by default — CI workers run with ``HF_HUB_OFFLINE=1`` and cannot
     fetch ``config.json`` from the hub, so this test would just emit a long
@@ -170,7 +173,7 @@ def test_recipe_archs_have_doc_coverage():
     model_ids = _collect_recipe_model_ids(examples_dir)
     assert model_ids, "No pretrained_model_name_or_path values found in examples/*.yaml"
 
-    md_contents = [p.read_text(encoding="utf-8") for p in docs_dir.rglob("*.md")]
+    md_contents = _model_coverage_doc_contents(docs_dir)
 
     resolved: dict[str, list[str]] = {}
     unresolved: list[str] = []
@@ -200,8 +203,8 @@ def test_recipe_archs_have_doc_coverage():
             "docs/model-coverage/:\n"
             f"{details}\n\n"
             "Fix by either:\n"
-            "  1. Adding a new .md file under docs/model-coverage/, or\n"
-            "  2. Updating an existing .md file to mention the arch name, or\n"
+            "  1. Adding a new .mdx file under docs/model-coverage/, or\n"
+            "  2. Updating an existing .mdx file to mention the arch name, or\n"
             "  3. Adding an entry to _DOC_ARCH_ALIASES in test_doc_coverage.py "
             "with a comment explaining the mismatch."
         )
@@ -247,8 +250,8 @@ def _expected_doc_slug(hf_org: str) -> str:
 
 def test_recipe_model_ids_live_under_publishing_org_dir():
     """When a recipe's HF model ID is documented in ``docs/model-coverage/``,
-    the hosting ``.md`` file must live under the HF publisher's org
-    subdirectory (``docs/model-coverage/<modality>/<org_slug>/<model>.md``).
+    the hosting ``.mdx`` file must live under the HF publisher's org
+    subdirectory (``docs/model-coverage/<modality>/<org_slug>/<model>.mdx``).
 
     ``org_slug`` is the HF org prefix lowercased, or mapped via
     ``_HF_ORG_TO_DOC_SLUG`` for rebrands / legitimate shared-family pages.
@@ -271,14 +274,15 @@ def test_recipe_model_ids_live_under_publishing_org_dir():
     model_ids = _collect_recipe_model_ids(root / "examples")
     assert model_ids, "YAML scanner returned no HF model IDs"
 
-    # Only consider model-card files at depth <modality>/<org>/<name>.md.
-    # Navigation pages (top-level ``latest-models.md``, per-modality
-    # ``index.md``, etc.) legitimately cross-reference HF IDs from many orgs.
+    # Only consider model-card files at depth <modality>/<org>/<name>.mdx.
+    # Navigation pages (top-level ``latest-models.mdx``, per-modality
+    # ``index.mdx``, etc.) legitimately cross-reference HF IDs from many orgs.
     md_texts: list[tuple[pathlib.Path, str]] = []
-    for md in docs_dir.rglob("*.md"):
-        if len(md.relative_to(docs_dir).parts) != 3:
-            continue
-        md_texts.append((md, md.read_text(encoding="utf-8")))
+    for ext in ("*.md", "*.mdx"):
+        for md in docs_dir.rglob(ext):
+            if len(md.relative_to(docs_dir).parts) != 3:
+                continue
+            md_texts.append((md, md.read_text(encoding="utf-8")))
 
     offenders: list[tuple[str, str, str]] = []
     for mid in sorted(model_ids):
@@ -293,7 +297,7 @@ def test_recipe_model_ids_live_under_publishing_org_dir():
             continue
 
         # Pass if AT LEAST ONE mention is under the expected org slug —
-        # cross-references on sibling pages (e.g., Moonlight on deepseek-v3.md
+        # cross-references on sibling pages (e.g., Moonlight on deepseek-v3.mdx
         # for shared-arch context) are fine as long as a properly-placed
         # primary card exists.
         if any(md.parent.name == expected_slug for md in mentioning):
@@ -313,7 +317,7 @@ def test_recipe_model_ids_live_under_publishing_org_dir():
             f"{details}\n\n"
             "Fix by either:\n"
             "  1. Moving the model card to "
-            "docs/model-coverage/<modality>/<org_slug>/<model>.md (preferred), "
+            "docs/model-coverage/<modality>/<org_slug>/<model>.mdx (preferred), "
             "or\n"
             "  2. Adding a ``<HF_ORG>: <doc_slug>`` entry to "
             "_HF_ORG_TO_DOC_SLUG with a comment explaining the rebrand / "
