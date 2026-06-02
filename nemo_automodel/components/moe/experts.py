@@ -986,40 +986,44 @@ def _mxfp8_weight_relayout(B):
     return B.transpose(-2, -1).contiguous().transpose(-2, -1)
 
 
-_MXFP8_GRAD_LOGGED = False  # one-time DEBUG_MXFP8_GRADCHECK report
+_MXFP8_GRAD_LOGGED = set()  # DEBUG_MXFP8_GRADCHECK: labels already reported (per-GEMM)
 
 
 def _mxfp8_gradcheck_hooks(A, out):
-    """Attach one-time backward finiteness probes (DEBUG_MXFP8_GRADCHECK).
+    """Attach per-GEMM backward finiteness probes (DEBUG_MXFP8_GRADCHECK).
 
-    gpt-oss nans at iter 1 (iter-0 forward is sane), so the suspect is torchao's MXFP8
-    BACKWARD grad-quant overflowing the first large gradient. This logs, on rank0 the
-    first time, whether grad_output entering torchao's backward is finite and whether the
-    grad propagated back to the activation operand A (i.e. AFTER torchao's backward quant)
-    is finite. grad_output finite + A.grad non-finite => the backward mxfp8 quant is the
-    source. No-op unless the env flag is set.
+    For EACH expert GEMM (distinguished by N = weight out-dim, e.g. gate_up vs down),
+    log on rank0 the first time: whether grad_output entering torchao's MXFP8 backward is
+    finite, and whether the activation grad (grad_input / dgrad, AFTER torchao's backward
+    quant) is finite. grad_output finite + dgrad non-finite => the backward quant
+    (dgrad GEMM, which always quantizes grad_output) is the source. Pairs with the global
+    param-grad scan (which catches the wgrad). No-op unless the env flag is set.
     """
     if os.environ.get("DEBUG_MXFP8_GRADCHECK") != "True":
         return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
+    label = f"N={out.shape[-1]}"  # gate_up and down GEMMs differ in output dim
 
-    def _out_hook(g):
-        global _MXFP8_GRAD_LOGGED
-        if not _MXFP8_GRAD_LOGGED:
+    def _out_hook(g, _label=label):
+        key = (_label, "grad_output")
+        if key not in _MXFP8_GRAD_LOGGED:
+            _MXFP8_GRAD_LOGGED.add(key)
             warnings.warn(
-                f"[DEBUG_MXFP8_GRADCHECK] grad_output into torchao backward finite={torch.isfinite(g).all().item()}",
+                f"[DEBUG_MXFP8_GRADCHECK] {_label} grad_output into torchao backward "
+                f"finite={torch.isfinite(g).all().item()}",
                 category=UserWarning,
                 stacklevel=2,
             )
         return g
 
-    def _a_hook(g):
-        global _MXFP8_GRAD_LOGGED
-        if not _MXFP8_GRAD_LOGGED:
-            _MXFP8_GRAD_LOGGED = True
+    def _a_hook(g, _label=label):
+        key = (_label, "dgrad")
+        if key not in _MXFP8_GRAD_LOGGED:
+            _MXFP8_GRAD_LOGGED.add(key)
             warnings.warn(
-                f"[DEBUG_MXFP8_GRADCHECK] A.grad after torchao backward finite={torch.isfinite(g).all().item()}",
+                f"[DEBUG_MXFP8_GRADCHECK] {_label} dgrad (grad_input after torchao backward) "
+                f"finite={torch.isfinite(g).all().item()}",
                 category=UserWarning,
                 stacklevel=2,
             )
