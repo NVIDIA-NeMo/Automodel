@@ -22,7 +22,11 @@
 # builds a per-document (block-diagonal) varlen mask via Flex-Flash-Attention.
 #
 # Notes for the magi backend:
-#   * local_batch_size must be 1 (magi consumes one packed sequence per micro-step).
+#   * local_batch_size must be 1. MagiAttention operates on a single flat (varlen)
+#     THD sequence with no batch dimension, so this integration packs the batch into
+#     that one sequence rather than using an outer batch dim. This is the integration
+#     mapping (and the idiomatic magi usage), not a hardware/kernel limit -- raise
+#     throughput via packed_sequence_size, not local_batch_size.
 #   * backend.rope_fusion must be false: magi applies RoPE positionally with the
 #     dispatched positions; the fused TE rope path is bypassed.
 # Pair this with qwen3_moe_30b_magi_packed_sequence_cp2.yaml to compare cp1 vs cp2.
@@ -31,7 +35,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 8
-  local_batch_size: 1        # magi requires one packed sequence per micro-step
+  local_batch_size: 1        # magi uses one flat varlen sequence per micro-step (no batch dim); pack via packed_sequence_size
   ckpt_every_steps: 500
   num_epochs: 2
 

@@ -493,8 +493,11 @@ def magi_prepare_batch(
     input_ids = batch["input_ids"]
     if input_ids.dim() != 2 or input_ids.shape[0] != 1:
         raise ValueError(
-            f"magi attention requires batch_size==1 packed sequences, got input_ids shape {tuple(input_ids.shape)}. "
-            "Set step_scheduler.local_batch_size=1 (and use packing / do_not_pad)."
+            f"this integration maps magi to a single flat (varlen) sequence per micro-step "
+            f"(local_batch_size=1), got input_ids shape {tuple(input_ids.shape)}. "
+            "Set step_scheduler.local_batch_size=1 and pack the batch via packed_sequence "
+            "(magi itself has no batch dim; an outer batch>1 would need a block-diagonal "
+            "varlen pack over the batch elements, which is not wired yet)."
         )
     device = input_ids.device
     seqlen = input_ids.shape[1]
