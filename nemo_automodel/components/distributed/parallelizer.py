@@ -271,6 +271,29 @@ def _make_selective_checkpoint_context_fn():
     return selective_checkpointing_context_fn
 
 
+# Marker set on whole-block selective-AC wrappers so the per-layer compile step
+# compiles the wrapper itself (compile OUTER, SAC INNER) instead of unwrapping
+# to the inner decoder layer. Compiling outer lets AOT autograd's partitioner
+# read the SAC recompute tags; compiling inner would hide every aten op behind a
+# single compiled HOP and collapse selective recompute into full recompute.
+_SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+
+
+def _disable_dynamo_lru_cache() -> None:
+    """Best-effort disable of TorchDynamo's LRU cache for selective AC + compile.
+
+    With multiple pipeline microbatches, dynamo may compile a second graph with
+    dynamic shapes and then select it over the static graph whose compiled-HOP
+    output SAC cached for microbatch 0, tripping a missing-symint assertion.
+    Selecting graphs in insertion order avoids this. Mirrors TorchTitan. The
+    underlying API is private, so failures are swallowed.
+    """
+    try:
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
+    except (AttributeError, RuntimeError):
+        logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
+
+
 def _apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool) -> None:
     """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
 
@@ -436,6 +459,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         pass
 
             if _is_selective_activation_checkpointing(activation_checkpointing) and not _has_kv_sharing:
+                # With compile, the per-layer compile step (run after sharding)
+                # compiles these wrappers OUTER so the SAC policy is traced and
+                # respected by the partitioner; disable dynamo's LRU cache to
+                # keep graph selection stable across pipeline microbatches.
+                if enable_compile:
+                    _disable_dynamo_lru_cache()
                 context_fn = _make_selective_checkpoint_context_fn()
                 for i, layer in enumerate(layers):
                     wrapped_layer = checkpoint_wrapper(
@@ -444,6 +473,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         context_fn=context_fn,
                         preserve_rng_state=True,
                     )
+                    setattr(wrapped_layer, _SELECTIVE_AC_WRAPPER_FLAG, True)
                     if not _replace_child_module(model, layer, wrapped_layer):
                         logger.warning("Could not replace layer %d with selective activation checkpoint wrapper.", i)
                     layers[i] = wrapped_layer
@@ -934,6 +964,12 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     and mlp before FSDP2 sharding (done in DefaultParallelizationStrategy).  This
     function only handles the compile step.
 
+    Whole-block selective-AC wrappers (tagged with ``_SELECTIVE_AC_WRAPPER_FLAG``)
+    are compiled OUTER -- the wrapper itself is compiled so the selective policy
+    is traced and the partitioner honors its recompute tags. Other layer-level
+    CheckpointWrappers (e.g. the PP path) are unwrapped and the decoder layer is
+    compiled directly.
+
     nn.Module.compile() is used instead of torch.compile() to compile in-place without
     introducing an _orig_mod wrapper, which would add a key prefix and break checkpoint
     loading.
@@ -948,14 +984,24 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     compiled_count = 0
     compiled_modules: set[int] = set()
 
+    def _compile_target(layer: nn.Module) -> nn.Module:
+        # Whole-block selective-AC wrappers must be compiled OUTER so the SAC
+        # policy is traced and the partitioner honors its recompute tags.
+        # Other CheckpointWrappers (e.g. PP full-layer wrap with sub-module AC
+        # inside) are unwrapped so the decoder layer is compiled directly.
+        if isinstance(layer, CheckpointWrapper):
+            if getattr(layer, _SELECTIVE_AC_WRAPPER_FLAG, False):
+                return layer
+            return layer._checkpoint_wrapped_module
+        return layer
+
     def _compile_module_list(module_list: nn.ModuleList | nn.ModuleDict) -> None:
         nonlocal compiled_count
         # PP converts model.model.layers from nn.ModuleList to nn.ModuleDict (str keys).
         # enumerate(nn.ModuleDict) yields string keys, not modules -- use .items() instead.
         items = module_list.items() if isinstance(module_list, nn.ModuleDict) else enumerate(module_list)
         for _, layer in items:
-            # Unwrap any layer-level checkpoint wrapper (PP path) to reach the actual decoder layer.
-            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            actual_layer = _compile_target(layer)
             module_id = id(actual_layer)
             if module_id in compiled_modules:
                 continue
@@ -979,7 +1025,7 @@ def _apply_per_layer_compile(model: nn.Module) -> None:
     else:
         logger.warning("_apply_per_layer_compile: using heuristic layer extraction")
         for layer in _extract_model_layers(model):
-            actual_layer = layer._checkpoint_wrapped_module if isinstance(layer, CheckpointWrapper) else layer
+            actual_layer = _compile_target(layer)
             module_id = id(actual_layer)
             if module_id in compiled_modules:
                 continue

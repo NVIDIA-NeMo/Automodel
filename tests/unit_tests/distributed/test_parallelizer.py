@@ -1412,12 +1412,16 @@ class TestActivationCheckpointingKVSharing:
             fake_checkpoint_wrapper,
         )
 
+        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_WRAPPER_FLAG
+
         model = _make_model_for_ac(num_kv_shared_layers=0)
         self._run_parallelize(model, activation_checkpointing="selective")
 
         assert len(calls) == len(model.model.layers)
         for layer in model.model.layers:
             assert isinstance(layer, self._Wrapped)
+            # Wrapper is tagged so the per-layer compile step compiles it OUTER.
+            assert getattr(layer, _SELECTIVE_AC_WRAPPER_FLAG, False) is True
         for _, kwargs in calls:
             assert kwargs["checkpoint_impl"] == CheckpointImpl.NO_REENTRANT
             assert kwargs["preserve_rng_state"] is True
@@ -1622,6 +1626,81 @@ class TestSelectiveCheckpointNumerics:
     def test_gradients_match_with_even_matmul_count(self):
         """Even matmul count is the easy case and must also stay correct."""
         self._assert_grads_match_baseline(num_linears=4)
+
+
+class TestSelectiveCheckpointCompile:
+    """``_apply_per_layer_compile`` must compile selective-AC wrappers OUTER.
+
+    Selective AC wraps the whole block, so torch.compile must compile the
+    wrapper (not the unwrapped inner layer) for the partitioner to honor the
+    SAC recompute tags. Non-selective layer-level wrappers (PP path) are still
+    unwrapped and the decoder layer is compiled directly.
+    """
+
+    class _Block(nn.Module):
+        def __init__(self, dim: int = 8):
+            super().__init__()
+            self.fc = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    def _build_model(self, *, tag: bool):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_WRAPPER_FLAG
+
+        layers = nn.ModuleList()
+        for _ in range(2):
+            wrapper = checkpoint_wrapper(self._Block(), checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            if tag:
+                setattr(wrapper, _SELECTIVE_AC_WRAPPER_FLAG, True)
+            layers.append(wrapper)
+        inner = nn.Module()
+        inner.layers = layers
+        model = nn.Module()
+        model.model = inner
+        return model
+
+    def _run_compile(self, model, monkeypatch):
+        import nemo_automodel.components.distributed.parallelizer as parallelizer
+
+        monkeypatch.setattr(parallelizer, "_patch_dtensor_spec_hash_for_symint", lambda: None)
+        compiled = []
+        monkeypatch.setattr(torch.nn.Module, "compile", lambda self, *a, **k: compiled.append(self))
+        parallelizer._apply_per_layer_compile(model)
+        return compiled
+
+    def test_tagged_selective_wrapper_compiled_outer(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._build_model(tag=True)
+        compiled = self._run_compile(model, monkeypatch)
+
+        assert len(compiled) == 2
+        for m in compiled:
+            assert isinstance(m, CheckpointWrapper), "selective wrapper must be compiled, not unwrapped"
+
+    def test_untagged_wrapper_compiled_inner(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._build_model(tag=False)
+        compiled = self._run_compile(model, monkeypatch)
+
+        assert len(compiled) == 2
+        for m in compiled:
+            assert not isinstance(m, CheckpointWrapper)
+            assert isinstance(m, self._Block), "non-selective wrapper must be unwrapped before compile"
+
+    def test_disable_dynamo_lru_cache_is_best_effort(self, monkeypatch):
+        """Missing private dynamo API must not raise."""
+        import nemo_automodel.components.distributed.parallelizer as parallelizer
+
+        monkeypatch.delattr(torch._C._dynamo.eval_frame, "_set_lru_cache", raising=False)
+        parallelizer._disable_dynamo_lru_cache()  # should not raise
 
 
 class TestSelectiveCheckpointSaveOps:
