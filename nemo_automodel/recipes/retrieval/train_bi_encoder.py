@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -295,10 +296,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logger=logger,
         )
 
+        # Might be tokenizer or processor (for VLMs)
         self.tokenizer = self.cfg.tokenizer.instantiate()
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.padding_side = "left"
+        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = self.tokenizer.eos_token
+            tokenizer.padding_side = "left"
 
         self.dataloader = build_dataloader(
             self.cfg.dataloader,
