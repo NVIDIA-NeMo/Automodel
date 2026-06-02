@@ -36,8 +36,6 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
-from megatron_fsdp import MegatronFSDP
-from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
@@ -97,6 +95,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+try:
+    from megatron_fsdp import MegatronFSDP
+    from megatron_fsdp.fully_shard import fully_shard_optimizer
+except (ImportError, FileNotFoundError, OSError):
+    MegatronFSDP = None
+    fully_shard_optimizer = None
+
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
@@ -126,6 +131,7 @@ def build_model(
     pipeline_config=None,
     cfg_moe=None,
     activation_checkpointing=False,
+    cfg_quantization=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -161,6 +167,11 @@ def build_model(
             kwargs["fp8_config"] = fp8_config
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
         # Check if using NeMoAutoModel
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
@@ -829,6 +840,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
+            cfg_quantization=self.cfg.get("quantization", None),
             device_mesh=self.device_mesh,
             moe_mesh=self.moe_mesh,
             distributed_config=self.distributed_config,
