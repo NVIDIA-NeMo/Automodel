@@ -22,10 +22,11 @@ lazily with ``soundfile`` inside the shared
 (so no ``torchcodec`` dependency is pulled in).
 
 This is the first-class port of the ``result/data/build_train_mix.py`` prototype.
-The key difference from the prototype: the prototype resampled with
-``Audio(sampling_rate=...)`` (HuggingFace default decoding → ``torchcodec``),
-whereas this builder keeps ``Audio(decode=False)`` and lets resampling happen in
-the soundfile decode path inside the lazy transform.
+The key difference from the prototype: the prototype resampled by casting the audio
+column to a decoding ``Audio`` feature with a target sampling rate (which triggers
+HuggingFace's default decoding path and pulls in ``torchcodec``), whereas this builder
+keeps a non-decoding ``Audio(decode=False)`` cast and lets resampling happen in the
+soundfile decode path inside the lazy transform.
 """
 
 import logging

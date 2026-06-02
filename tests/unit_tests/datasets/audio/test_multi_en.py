@@ -220,6 +220,19 @@ def test_default_sources_are_the_six_corpus_mix():
     assert by_name["gigaspeech_s"].trust_remote_code is True
 
 
+def test_new_audio_modules_have_no_forbidden_audio_cast_literal():
+    """AC-2 negative check: new audio modules must not contain the forbidden
+    ``Audio(sampling_rate=...)`` / ``Audio(decode=True)`` callable pattern anywhere
+    in their source text (only the non-decoding ``Audio(decode=False)`` is allowed)."""
+    import re
+
+    forbidden = re.compile(r"Audio\s*\(\s*sampling_rate|Audio\s*\(\s*decode\s*=\s*True")
+    for mod in (me, ds_mod):
+        with open(mod.__file__, encoding="utf-8") as fh:
+            source = fh.read()
+        assert not forbidden.search(source), f"forbidden Audio(...) cast pattern found in {mod.__file__}"
+
+
 def test_coerce_source_accepts_source_and_mapping():
     """`_coerce_source` passes Source through and builds Source from a dict; rejects junk."""
     src = me.Source("a", "repo/a", None, "train", "text")
