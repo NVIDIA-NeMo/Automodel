@@ -15,9 +15,11 @@
 
 # Workflow 1 of 2 for Fern doc previews.
 #
-# Collects the docs/fern/ sources and PR metadata from the (possibly untrusted) PR
-# branch and uploads them as an artifact. No secrets are used here, so this is
-# safe to run on fork PRs via the regular pull_request trigger.
+# Collects the docs/ sources (Fern config under docs/fern/ AND the nightly MDX
+# content at the docs/ top level, which nightly.yml references via ../../) plus
+# PR metadata from the (possibly untrusted) PR branch and uploads them as an
+# artifact. No secrets are used here, so this is safe to run on fork PRs via
+# the regular pull_request trigger.
 #
 # The companion workflow (fern-docs-preview-comment.yml) picks up the artifact,
 # builds the preview with DOCS_FERN_TOKEN, and posts the PR comment.
@@ -27,7 +29,7 @@ name: "Preview Fern Docs: Build"
 on:
   pull_request:
     paths:
-      - 'docs/fern/**'
+      - 'docs/**'
       - '.github/workflows/fern-docs-preview-build.yml'
 
 permissions:
@@ -57,7 +59,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fern-preview
+          # Upload the whole docs/ tree: the Fern build (run from docs/fern/)
+          # resolves nightly page paths via ../../<rel>.mdx into docs/, so the
+          # content pages must travel with the config.
           path: |
-            docs/fern/
+            docs/
             preview-metadata/
           retention-days: 1

@@ -25,7 +25,7 @@ on:
     branches:
       - "pull-request/[0-9]+"
     paths:
-      - 'docs/fern/**'
+      - 'docs/**'
       - '.github/workflows/fern-docs-ci.yml'
 
 permissions:
