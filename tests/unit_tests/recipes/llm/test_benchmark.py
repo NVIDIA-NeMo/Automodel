@@ -26,8 +26,13 @@ class ConfigNamespace(SimpleNamespace):
     """A SimpleNamespace that also supports dict-like .get() method."""
 
     def get(self, key, default=None):
-        """Get attribute with a default value like a dict."""
-        return getattr(self, key, default)
+        """Get attribute with a default, supporting dotted keys (like ConfigNode/RecipeConfig.get)."""
+        obj = self
+        for part in key.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return default
+        return obj
 
 
 @pytest.fixture
