@@ -867,12 +867,21 @@ def _resolve_mxfp8_grouped_mm():
         return _MXFP8_GROUPED_MM
     _MXFP8_RESOLVED = True
 
-    # (1) current-main: _to_mxfp8_then_scaled_grouped_mm(A, B_t, offs=...) — no scaling arg.
+    # (1) current-main / v0.17.0: _to_mxfp8_then_scaled_grouped_mm(A, B_t, offs=...).
+    # wgrad_with_hp=True keeps the WEIGHT-GRADIENT GEMM in high precision instead of
+    # re-quantizing grad_output to MXFP8 twice. torchao v0.17.0's e8m0 block-scale has
+    # incomplete nan/inf handling on the backward grad-quant (acknowledged TODO); the
+    # large first-step grad of gpt-oss (bias + clamped swiglu) saturates a block -> NaN
+    # wgrad -> NaN weights -> iter-1 nan. wgrad_with_hp=True is torchao's documented combo
+    # with MXTensor inputs and avoids that path. (Older gens lacking the kwarg fall back.)
     try:
         from torchao.prototype.moe_training import _to_mxfp8_then_scaled_grouped_mm
 
         def _impl(A, B, offs, _fn=_to_mxfp8_then_scaled_grouped_mm):
-            return _fn(A, B, offs=offs)
+            try:
+                return _fn(A, B, offs=offs, wgrad_with_hp=True)
+            except TypeError:
+                return _fn(A, B, offs=offs)
 
         _MXFP8_GROUPED_MM = _impl
         return _MXFP8_GROUPED_MM
