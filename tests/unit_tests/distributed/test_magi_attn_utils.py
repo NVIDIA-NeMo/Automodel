@@ -22,8 +22,11 @@ CPU CI runner. The FFA kernel parity tests at the bottom are gated behind CUDA +
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.nn as nn
 
 import nemo_automodel.components.distributed.magi_attn_utils as mu
 from nemo_automodel.components.distributed.magi_attn_utils import AttnMaskSpec, MagiState, setup_magi
@@ -45,6 +48,35 @@ class _FakeGroup:
 
     def size(self):
         return self._size
+
+
+class _FakeMesh:
+    """Stand-in for a DeviceMesh exposing ``mesh_dim_names`` and ``mesh["cp"]``."""
+
+    def __init__(self, dim_names, group=None):
+        self.mesh_dim_names = dim_names
+        self._group = group
+
+    def __getitem__(self, name):
+        assert name == "cp"
+        return SimpleNamespace(get_group=lambda: self._group)
+
+
+class _FakeAttention(nn.Module):
+    """Module whose class name contains 'Attention' (matched by the stampers)."""
+
+
+class _LM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = _FakeAttention()
+
+
+class _VLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = _LM()
+        self.visual = nn.Linear(4, 4)  # vision tower: must NOT be stamped
 
 
 # --------------------------------------------------------------------------- #
@@ -147,6 +179,117 @@ class TestSetupMagi:
         assert st.enabled and st.custom and not st.hf_dispatch
         assert st.cp_size == 2
         assert active == [grp]  # custom path wires the active cp_group
+
+
+# --------------------------------------------------------------------------- #
+# CPU-coverable helpers (no GPU / no magi_attention package)
+# --------------------------------------------------------------------------- #
+class TestGetCpGroup:
+    def test_none_mesh(self):
+        assert mu.get_cp_group(None) is None
+
+    def test_mesh_without_cp_dim(self):
+        assert mu.get_cp_group(_FakeMesh(("dp", "tp"))) is None
+
+    def test_mesh_with_cp_dim(self):
+        grp = object()
+        assert mu.get_cp_group(_FakeMesh(("dp", "cp"), grp)) is grp
+
+
+class TestGetHeadConfig:
+    def test_plain_llm_config(self):
+        cfg = SimpleNamespace(num_attention_heads=32, num_key_value_heads=8, head_dim=128)
+        assert mu._get_head_config(SimpleNamespace(config=cfg)) == (32, 8, 128)
+
+    def test_head_dim_derived_from_hidden_size(self):
+        cfg = SimpleNamespace(num_attention_heads=16, hidden_size=2048, head_dim=None)
+        # no num_key_value_heads -> falls back to num_attention_heads; head_dim = 2048/16.
+        assert mu._get_head_config(SimpleNamespace(config=cfg)) == (16, 16, 128)
+
+    def test_vlm_uses_text_config(self):
+        text = SimpleNamespace(num_attention_heads=24, num_key_value_heads=4, head_dim=64)
+        outer = SimpleNamespace(text_config=text)  # no top-level num_attention_heads
+        assert mu._get_head_config(SimpleNamespace(config=outer)) == (24, 4, 64)
+
+
+class TestStampCpGroup:
+    def test_set_cp_group_on_all_attention(self):
+        model = _VLM()
+        sentinel = object()
+        mu._set_cp_group_on_attention(model, sentinel)
+        # every "*Attention" module is stamped, regardless of subtree.
+        assert model.language_model.self_attn.cp_group is sentinel
+        assert not hasattr(model.visual, "cp_group")
+
+    def test_iter_language_model_attention_skips_vision(self):
+        model = _VLM()
+        mods = list(mu._iter_language_model_attention(model))
+        assert mods == [model.language_model.self_attn]
+
+
+class TestMagiPrepareVlm:
+    """magi_prepare_vlm is pure Python (no magi import) for the cp_size==1 path."""
+
+    def test_stamps_language_backbone_only(self):
+        model = _VLM()
+        batch = {"input_ids": torch.zeros(1, 8, dtype=torch.long)}
+        out_batch, key = mu.magi_prepare_vlm(model, batch, cp_group=None)
+        assert key is None
+        assert out_batch is batch
+        attn = model.language_model.self_attn
+        assert attn.cp_group is None and attn._magi_self_key is True
+        assert not hasattr(model.visual, "cp_group")
+
+    def test_rejects_batch_dim_gt_1(self):
+        model = _VLM()
+        with pytest.raises(ValueError, match=r"\[1, S\]"):
+            mu.magi_prepare_vlm(model, {"input_ids": torch.zeros(2, 8, dtype=torch.long)}, cp_group=None)
+
+    def test_rejects_cp_gt_1(self):
+        model = _VLM()
+        with pytest.raises(NotImplementedError, match="cp_size==1"):
+            mu.magi_prepare_vlm(model, {"input_ids": torch.zeros(1, 8, dtype=torch.long)}, cp_group=_FakeGroup(2))
+
+
+class TestMagiStateVlmBatch:
+    def test_prepare_vlm_batch_non_custom_stamps_backbone(self):
+        model = _VLM()
+        st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
+        train_ctx, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+        from contextlib import nullcontext
+
+        assert train_ctx is nullcontext
+        assert model.language_model.self_attn._magi_self_key is True
+
+    def test_prepare_vlm_batch_custom_is_noop(self):
+        # custom VLMs use the factory attn_func (active cp_group); no stamping here.
+        model = _VLM()
+        st = MagiState(enabled=True, custom=True)
+        _, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+        assert not hasattr(model.language_model.self_attn, "_magi_self_key")
+
+
+class TestActiveStateAccessors:
+    def test_attn_spec_roundtrip(self):
+        spec = AttnMaskSpec.causal(4)
+        mu.set_active_attn_spec(spec)
+        try:
+            assert mu.get_active_attn_spec() is spec
+        finally:
+            mu.set_active_attn_spec(None)
+        assert mu.get_active_attn_spec() is None
+
+    def test_cp_group_roundtrip(self):
+        grp = object()
+        mu.set_active_cp_group(grp)
+        try:
+            assert mu.get_active_cp_group() is grp
+        finally:
+            mu.set_active_cp_group(None)
+        assert mu.get_active_cp_group() is None
+
+    def test_is_magi_available_returns_bool(self):
+        assert isinstance(mu.is_magi_available(), bool)
 
 
 # --------------------------------------------------------------------------- #

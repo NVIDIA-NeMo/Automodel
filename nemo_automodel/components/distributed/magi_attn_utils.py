@@ -168,17 +168,19 @@ class AttnMaskSpec:
                 rect = (q_rng, q_rng, "causal")
                 if rect not in seen:
                     seen.add(rect)
-                    q_ranges.append(list(q_rng)); k_ranges.append(list(q_rng)); mask_types.append("causal")
+                    q_ranges.append(list(q_rng))
+                    k_ranges.append(list(q_rng))
+                    mask_types.append("causal")
                 # ancestors -> full
                 for anc in path[:pos]:
                     k_rng = (offsets[anc], offsets[anc] + node_lengths[anc])
                     rect = (q_rng, k_rng, "full")
                     if rect not in seen:
                         seen.add(rect)
-                        q_ranges.append(list(q_rng)); k_ranges.append(list(k_rng)); mask_types.append("full")
-        sample_token_ranges = [
-            [[offsets[n], offsets[n] + node_lengths[n]] for n in path] for path in sample_paths
-        ]
+                        q_ranges.append(list(q_rng))
+                        k_ranges.append(list(k_rng))
+                        mask_types.append("full")
+        sample_token_ranges = [[[offsets[n], offsets[n] + node_lengths[n]] for n in path] for path in sample_paths]
         return cls(q_ranges, k_ranges, mask_types, total), sample_token_ranges
 
 
@@ -220,8 +222,11 @@ def _flex_key_for(cp_group, spec, *, num_heads_q, num_heads_kv, head_dim):
     if cached is not None and cached[0] == fp:
         return cached[1]
     key = build_flex_key(
-        spec, num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
-        head_dim=head_dim, cp_group=cp_group,
+        spec,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
+        cp_group=cp_group,
     )
     _FLEX_KEY_CACHE[id(cp_group)] = (fp, key)
     return key
@@ -259,8 +264,12 @@ def _self_key_for(cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, devi
         except Exception:
             pass
     key = _build_self_key(
-        cp_group, seqlen=seqlen, num_heads_q=num_heads_q,
-        num_heads_kv=num_heads_kv, head_dim=head_dim, device=device,
+        cp_group,
+        seqlen=seqlen,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
+        device=device,
     )
     _MAGI_SELF_KEY_LEN[id(cp_group)] = seqlen
     return key
@@ -285,7 +294,6 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):
             FFA when None); forwarded so non-default scales stay correct.
     """
     from einops import rearrange
-
     from magi_attention.api import calc_attn, get_most_recent_key
 
     def magi_attn_func(q, k, v, **call_kwargs):
@@ -340,13 +348,20 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):
             spec = get_active_attn_spec()
         if spec is not None:
             key = _flex_key_for(
-                cp_group, spec, num_heads_q=qf.shape[1],
-                num_heads_kv=kf.shape[1], head_dim=qf.shape[2],
+                cp_group,
+                spec,
+                num_heads_q=qf.shape[1],
+                num_heads_kv=kf.shape[1],
+                head_dim=qf.shape[2],
             )
         else:
             key = _self_key_for(
-                cp_group, seqlen=qf.shape[0], num_heads_q=qf.shape[1],
-                num_heads_kv=kf.shape[1], head_dim=qf.shape[2], device=qf.device,
+                cp_group,
+                seqlen=qf.shape[0],
+                num_heads_q=qf.shape[1],
+                num_heads_kv=kf.shape[1],
+                head_dim=qf.shape[2],
+                device=qf.device,
             )
         o = calc_attn(qf, kf, vf, key, softmax_scale=softmax_scale)[0].to(dtype)
         if bshd:
@@ -374,9 +389,8 @@ def register_magi_attention() -> None:
         return
 
     from einops import rearrange
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
     from magi_attention.api import calc_attn, get_most_recent_key
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     def magi_attention_forward(
         module: torch.nn.Module,
@@ -399,8 +413,15 @@ def register_magi_attention() -> None:
             from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
             return sdpa_attention_forward(
-                module, query, key, value, attention_mask,
-                dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs,
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                is_causal=is_causal,
+                **kwargs,
             )
 
         if getattr(module, "_magi_self_key", False):
@@ -408,8 +429,12 @@ def register_magi_attention() -> None:
             # known here (query dim 2: [b, nh, s, hd]) and may differ from input_ids
             # length. Build a no-dispatch causal key matching the actual q length.
             magi_attn_key = _self_key_for(
-                cp_group, seqlen=query.shape[2], num_heads_q=query.shape[1],
-                num_heads_kv=key.shape[1], head_dim=query.shape[3], device=query.device,
+                cp_group,
+                seqlen=query.shape[2],
+                num_heads_q=query.shape[1],
+                num_heads_kv=key.shape[1],
+                head_dim=query.shape[3],
+                device=query.device,
             )
         else:
             magi_attn_key = get_most_recent_key(cp_group)
@@ -421,8 +446,7 @@ def register_magi_attention() -> None:
         # backward kernel reads the saved q/k/v assuming contiguous strides — a
         # non-contiguous tensor yields nan gradients (forward is unaffected).
         q, k, v = (
-            rearrange(e, "b nh s hd -> (b s) nh hd").to(torch.bfloat16).contiguous()
-            for e in (query, key, value)
+            rearrange(e, "b nh s hd -> (b s) nh hd").to(torch.bfloat16).contiguous() for e in (query, key, value)
         )
         o = calc_attn(q, k, v, magi_attn_key)[0]
         # ((b s), nh, hd) -> (b, s, nh*hd)
@@ -506,9 +530,7 @@ def magi_prepare_batch(
     seqlen = input_ids.shape[1]
     cp_size = cp_group.size() if cp_group is not None else 1
 
-    num_heads_q, num_heads_kv, head_dim = _get_head_config(
-        model.module if hasattr(model, "module") else model
-    )
+    num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
 
     # Single full causal sequence -> cu_seqlens = [0, S].
     cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
@@ -559,12 +581,13 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):
     cu = batch["cu_seqlens"]
     seqlens = (cu[1:] - cu[:-1]).tolist()
     spec = AttnMaskSpec.varlen(seqlens, causal=True)
-    num_heads_q, num_heads_kv, head_dim = _get_head_config(
-        model.module if hasattr(model, "module") else model
-    )
+    num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
     key = build_flex_key(
-        spec, num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
-        head_dim=head_dim, cp_group=cp_group,
+        spec,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
+        cp_group=cp_group,
     )
     input_ids = batch["input_ids"].reshape(-1)  # global flat [T]
     local_input = dispatch(input_ids, key=key)
@@ -642,9 +665,7 @@ def magi_prepare_vlm(
     return batch, None
 
 
-def magi_undispatch_logits(
-    logits: torch.Tensor, cp_group: Optional[dist.ProcessGroup]
-) -> torch.Tensor:
+def magi_undispatch_logits(logits: torch.Tensor, cp_group: Optional[dist.ProcessGroup]) -> torch.Tensor:
     """Gather sharded/padded logits back to the global, unpadded sequence.
 
     Args:

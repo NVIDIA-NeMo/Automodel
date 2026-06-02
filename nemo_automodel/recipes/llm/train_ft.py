@@ -63,10 +63,10 @@ from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPret
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
 from nemo_automodel.components.distributed.config import FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
-from nemo_automodel.components.distributed.magi_attn_utils import setup_magi
 from nemo_automodel.components.distributed.init_utils import (
     initialize_distributed,
 )
+from nemo_automodel.components.distributed.magi_attn_utils import setup_magi
 from nemo_automodel.components.distributed.megatron_fsdp import fully_shard_optimizer
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
