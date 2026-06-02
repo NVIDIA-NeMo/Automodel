@@ -43,6 +43,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
+from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForConditionalGeneration,
 )
@@ -110,6 +111,206 @@ import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _resolve_torch_op(namespace: str, name: str, overload: str = "default"):
+    """Resolve ``torch.ops.<namespace>.<name>.<overload>``, or ``None`` if absent."""
+    ns = getattr(torch.ops, namespace, None)
+    packet = getattr(ns, name, None) if ns is not None else None
+    return getattr(packet, overload, None) if packet is not None else None
+
+
+def _resolve_op_attr(root: object, dotted_path: str):
+    """Resolve a dotted attribute path from ``root``, or ``None`` if any part is absent.
+
+    Used for ops that live outside ``torch.ops`` (higher-order ops, optional
+    custom backends such as DeepEP/HybridEP). Missing namespaces/ops raise
+    ``AttributeError`` on access, so they are swallowed and reported as ``None``.
+    """
+    obj = root
+    try:
+        for part in dotted_path.split("."):
+            obj = getattr(obj, part)
+    except AttributeError:
+        return None
+    return obj
+
+
+def _existing_ops(*ops):
+    return frozenset(op for op in ops if op is not None)
+
+
+# Matmul ops whose activations alternate between save and recompute (every other
+# one is saved). Following TorchTitan, only plain ``mm`` and ``linear`` alternate;
+# ``addmm``/``bmm`` stay in the always-save set built below.
+_SELECTIVE_AC_MATMUL_OPS = _existing_ops(
+    _resolve_torch_op("aten", "mm"),
+    _resolve_torch_op("aten", "linear"),
+)
+
+
+def _default_compute_intensive_ops() -> tuple:
+    """Compute-intensive aten ops from PyTorch's partitioner, or ``()`` if unavailable.
+
+    Mirrors TorchTitan: seeding from PyTorch's own ``compute_intensive_ops`` list
+    keeps the save-set in sync with upstream rather than relying on a frozen,
+    hand-maintained list. ``torch._functorch.partitioners`` is a private API, so
+    any failure falls back to the curated supplement in
+    :func:`_build_selective_ac_save_ops`.
+    """
+    try:
+        from torch._functorch.partitioners import get_default_op_list
+
+        return tuple(op.default for op in get_default_op_list().compute_intensive_ops)
+    except (ImportError, AttributeError):
+        return ()
+
+
+def _build_selective_ac_save_ops() -> frozenset:
+    """Build the set of ops whose activations are always saved under selective AC.
+
+    The set is seeded from PyTorch's compute-intensive op list and supplemented
+    with attention variants, low-precision/reduction ops, the compiled HOP, and
+    communication collectives whose outputs are expensive to recompute.
+    """
+    save_ops = set(_default_compute_intensive_ops())
+
+    # Compute ops the partitioner list may not classify as compute-intensive.
+    compute_ops = _existing_ops(
+        _resolve_torch_op("aten", "mm"),
+        _resolve_torch_op("aten", "addmm"),
+        _resolve_torch_op("aten", "bmm"),
+        _resolve_torch_op("aten", "linear"),
+        _resolve_torch_op("aten", "_scaled_mm"),
+        _resolve_torch_op("aten", "_scaled_dot_product_cudnn_attention"),
+        _resolve_torch_op("aten", "_scaled_dot_product_efficient_attention"),
+        _resolve_torch_op("aten", "_scaled_dot_product_flash_attention"),
+        _resolve_torch_op("aten", "_scaled_dot_product_flash_attention_for_cpu"),
+        _resolve_torch_op("aten", "_scaled_dot_product_fused_attention_overrideable"),
+        _resolve_torch_op("aten", "scaled_dot_product_attention"),
+        _resolve_torch_op("aten", "_flex_attention"),
+        # topk is saved to keep MoE expert assignments stable across recompute;
+        # max is saved for low-precision scaling factors.
+        _resolve_torch_op("aten", "topk"),
+        _resolve_torch_op("aten", "max"),
+        # FlexAttention HOP and the inductor compiled-graph HOP (present only when
+        # torch.compile is used); custom torch_attn varlen backend.
+        _resolve_op_attr(torch, "_higher_order_ops.flex_attention"),
+        _resolve_op_attr(torch, "_higher_order_ops.inductor_compiled_code"),
+        _resolve_op_attr(torch.ops, "torch_attn._varlen_attn.default"),
+    )
+
+    # Communication ops whose outputs should be saved to avoid re-communication.
+    comm_ops = _existing_ops(
+        _resolve_torch_op("aten", "all_to_all_single"),
+        _resolve_torch_op("aten", "reduce_scatter_tensor"),
+        _resolve_torch_op("_c10d_functional", "all_to_all_single"),
+        _resolve_torch_op("_c10d_functional", "reduce_scatter_tensor"),
+        # Optional expert-parallel comm backends.
+        _resolve_op_attr(torch.ops, "deepep.dispatch.default"),
+        _resolve_op_attr(torch.ops, "deepep.combine.default"),
+        _resolve_op_attr(torch.ops, "hybridep.dispatch.default"),
+        _resolve_op_attr(torch.ops, "hybridep.combine.default"),
+    )
+
+    save_ops.update(compute_ops)
+    save_ops.update(comm_ops)
+    return frozenset(save_ops)
+
+
+_SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
+
+_SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten", "_to_copy")
+
+
+def _is_selective_activation_checkpointing(activation_checkpointing: object) -> bool:
+    return (
+        isinstance(activation_checkpointing, str) and activation_checkpointing.lower().replace("-", "_") == "selective"
+    )
+
+
+def _is_cuda_to_cpu_copy(func, args, kwargs) -> bool:
+    if func != _SELECTIVE_AC_TO_COPY_OP or not args:
+        return False
+    tensor = args[0]
+    src_device = getattr(tensor, "device", None)
+    target_device = kwargs.get("device")
+    if target_device is None:
+        return False
+    try:
+        target_device = torch.device(target_device)
+    except (TypeError, RuntimeError):
+        return False
+    return getattr(src_device, "type", None) == "cuda" and target_device.type == "cpu"
+
+
+def _make_selective_checkpoint_context_fn():
+    """Build a TorchTitan-style selective activation checkpointing context."""
+
+    def selective_checkpointing_context_fn():
+        # Count matmuls separately for the forward and recompute passes. torch
+        # calls ``context_fn`` once per checkpointed region, so a single shared
+        # counter would continue from the forward count into recompute and flip
+        # the save/recompute parity whenever the region has an odd number of
+        # matmuls. Keying on ``ctx.is_recompute`` resets each pass to 0 so the
+        # same matmul gets the same decision in both passes.
+        mm_counts = {False: 0, True: 0}
+
+        def selective_checkpointing_policy(ctx, func, *args, **kwargs):
+            if func in _SELECTIVE_AC_MATMUL_OPS:
+                mm_counts[ctx.is_recompute] += 1
+                if mm_counts[ctx.is_recompute] % 2 == 0:
+                    return CheckpointPolicy.PREFER_RECOMPUTE
+                return CheckpointPolicy.MUST_SAVE
+            if func in _SELECTIVE_AC_MUST_SAVE_OPS or _is_cuda_to_cpu_copy(func, args, kwargs):
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
+        return create_selective_checkpoint_contexts(selective_checkpointing_policy)
+
+    return selective_checkpointing_context_fn
+
+
+def _apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool) -> None:
+    """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
+
+    This is the sub-module granularity path used both as the default
+    (non-compile) behavior and as the fallback for selective activation
+    checkpointing on KV-shared models, which cannot checkpoint the whole block.
+
+    ``self_attn`` is skipped for KV-shared models: recomputing attention during
+    backward would double-write to the ``DynamicCache``, corrupting the K/V
+    entries that later shared layers depend on.
+
+    Args:
+        layers: Transformer decoder layers to wrap (mutated in place).
+        has_kv_sharing: Whether the model reuses K/V across layers via the cache.
+    """
+    for layer in layers:
+        if hasattr(layer, "mlp"):
+            layer.mlp = checkpoint_wrapper(layer.mlp)  # type: ignore
+        if hasattr(layer, "self_attn") and not has_kv_sharing:
+            layer.self_attn = checkpoint_wrapper(layer.self_attn)  # type: ignore
+        if hasattr(layer, "input_layernorm"):
+            layer.input_layernorm = checkpoint_wrapper(layer.input_layernorm)  # type: ignore
+        if hasattr(layer, "post_attention_layernorm"):
+            layer.post_attention_layernorm = checkpoint_wrapper(layer.post_attention_layernorm)  # type: ignore
+
+
+def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Module) -> bool:
+    """Replace ``target`` with ``replacement`` in ``root``'s module tree."""
+    for name, child in root.named_children():
+        if child is target:
+            if isinstance(root, nn.ModuleList):
+                root[int(name)] = replacement
+            elif isinstance(root, nn.ModuleDict):
+                root[name] = replacement
+            else:
+                setattr(root, name, replacement)
+            return True
+        if _replace_child_module(child, target, replacement):
+            return True
+    return False
 
 
 class ParallelizationStrategy(ABC):
@@ -218,7 +419,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception as e:
                         logger.warning(f"Could not enable symmetric memory for TP group: {e}")
 
-        # Apply activation checkpointing to linear layers if requested
+        # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
             # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
             # earlier layers to later layers through the DynamicCache.  Disabling
@@ -234,7 +435,25 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     except Exception:
                         pass
 
-            if enable_compile:
+            if _is_selective_activation_checkpointing(activation_checkpointing) and not _has_kv_sharing:
+                context_fn = _make_selective_checkpoint_context_fn()
+                for i, layer in enumerate(layers):
+                    wrapped_layer = checkpoint_wrapper(
+                        layer,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                        context_fn=context_fn,
+                        preserve_rng_state=True,
+                    )
+                    if not _replace_child_module(model, layer, wrapped_layer):
+                        logger.warning("Could not replace layer %d with selective activation checkpoint wrapper.", i)
+                    layers[i] = wrapped_layer
+            elif _is_selective_activation_checkpointing(activation_checkpointing):
+                logger.warning(
+                    "Selective activation checkpointing is not supported for KV-shared models; "
+                    "falling back to the existing activation checkpointing behavior."
+                )
+                _apply_submodule_checkpointing(layers, _has_kv_sharing)
+            elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
@@ -266,24 +485,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 if _use_hf_native_grad_ckpt:
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
                 else:
-                    for i, layer in enumerate(layers):
-                        if hasattr(layer, "mlp"):
-                            layers[i].mlp = checkpoint_wrapper(layers[i].mlp)
-                        # Skip self_attn checkpointing for KV-shared models:
-                        # recomputation would double-write to the DynamicCache,
-                        # corrupting K/V entries that shared layers depend on.
-                        if hasattr(layer, "self_attn") and not _has_kv_sharing:
-                            layers[i].self_attn = checkpoint_wrapper(layers[i].self_attn)  # type: ignore
-
-                        if hasattr(layer, "input_layernorm"):
-                            layers[i].input_layernorm = checkpoint_wrapper(
-                                layers[i].input_layernorm  # type: ignore
-                            )
-
-                        if hasattr(layer, "post_attention_layernorm"):
-                            layers[i].post_attention_layernorm = checkpoint_wrapper(
-                                layers[i].post_attention_layernorm  # type: ignore
-                            )
+                    _apply_submodule_checkpointing(layers, _has_kv_sharing)
 
         # Set up mixed precision policy
         if not mp_policy:

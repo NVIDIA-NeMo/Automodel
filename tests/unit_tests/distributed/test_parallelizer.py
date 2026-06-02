@@ -1397,6 +1397,44 @@ class TestActivationCheckpointingKVSharing:
             assert not isinstance(layer.self_attn, self._Wrapped)
         assert model.config.use_cache is True  # untouched
 
+    def test_selective_checkpointing_wraps_whole_layers(self, monkeypatch):
+        """Selective activation checkpointing wraps full transformer blocks."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
+        calls = []
+
+        def fake_checkpoint_wrapper(module, **kwargs):
+            calls.append((module, kwargs))
+            return self._Wrapped(module)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            fake_checkpoint_wrapper,
+        )
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        self._run_parallelize(model, activation_checkpointing="selective")
+
+        assert len(calls) == len(model.model.layers)
+        for layer in model.model.layers:
+            assert isinstance(layer, self._Wrapped)
+        for _, kwargs in calls:
+            assert kwargs["checkpoint_impl"] == CheckpointImpl.NO_REENTRANT
+            assert kwargs["preserve_rng_state"] is True
+            assert callable(kwargs["context_fn"])
+
+    def test_selective_checkpointing_kv_sharing_falls_back_to_submodule_wrapping(self):
+        """KV-shared models cannot checkpoint the whole block because attention mutates cache."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=20)
+        self._run_parallelize(model, activation_checkpointing="selective")
+
+        for layer in model.model.layers:
+            assert not isinstance(layer, self._Wrapped)
+            assert isinstance(layer.mlp, self._Wrapped)
+            assert not isinstance(layer.self_attn, self._Wrapped)
+            assert isinstance(layer.input_layernorm, self._Wrapped)
+            assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
     # ------------------------------------------------------------------ #
     # HF native gradient-checkpointing path
     # ------------------------------------------------------------------ #
@@ -1518,6 +1556,126 @@ class TestActivationCheckpointingKVSharing:
         model.gradient_checkpointing_enable.assert_called_once_with(
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
+
+
+class TestSelectiveCheckpointNumerics:
+    """Real forward/backward parity for the selective-AC op policy.
+
+    These tests use the *real* torch checkpoint primitives (no mocked
+    ``checkpoint_wrapper``) so they exercise the policy returned by
+    ``_make_selective_checkpoint_context_fn``. The policy saves every other
+    matmul, so the per-pass matmul counter must be keyed on
+    ``ctx.is_recompute``. A single shared counter continues from the forward
+    count into recompute and flips the save/recompute parity whenever a region
+    has an odd number of matmuls, silently corrupting gradients.
+    """
+
+    class _MatmulBlock(nn.Module):
+        def __init__(self, dim: int, num_linears: int):
+            super().__init__()
+            self.linears = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_linears)])
+
+        def forward(self, x):
+            for linear in self.linears:
+                x = torch.relu(linear(x))
+            return x
+
+    def _assert_grads_match_baseline(self, num_linears: int):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.parallelizer import (
+            _make_selective_checkpoint_context_fn,
+        )
+
+        torch.manual_seed(0)
+        dim = 8
+        baseline = self._MatmulBlock(dim, num_linears)
+
+        wrapped_inner = self._MatmulBlock(dim, num_linears)
+        wrapped_inner.load_state_dict(baseline.state_dict())
+        wrapped = checkpoint_wrapper(
+            wrapped_inner,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=_make_selective_checkpoint_context_fn(),
+            preserve_rng_state=True,
+        )
+
+        x = torch.randn(4, dim)
+
+        out_base = baseline(x.clone())
+        out_base.sum().backward()
+
+        out_wrapped = wrapped(x.clone())
+        out_wrapped.sum().backward()
+
+        torch.testing.assert_close(out_wrapped, out_base)
+        for (name, p_base), (_, p_wrap) in zip(baseline.named_parameters(), wrapped_inner.named_parameters()):
+            torch.testing.assert_close(p_wrap.grad, p_base.grad, msg=f"grad mismatch for {name}")
+
+    def test_gradients_match_with_odd_matmul_count(self):
+        """Regression: an odd number of matmuls must not flip recompute parity."""
+        self._assert_grads_match_baseline(num_linears=3)
+
+    def test_gradients_match_with_even_matmul_count(self):
+        """Even matmul count is the easy case and must also stay correct."""
+        self._assert_grads_match_baseline(num_linears=4)
+
+
+class TestSelectiveCheckpointSaveOps:
+    """Tests for the TorchTitan-style save-op set used by selective AC."""
+
+    def test_matmul_ops_are_mm_and_linear_only(self):
+        """Only mm and linear alternate; addmm/bmm are always saved."""
+        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_MATMUL_OPS
+
+        assert _SELECTIVE_AC_MATMUL_OPS == frozenset({torch.ops.aten.mm.default, torch.ops.aten.linear.default})
+
+    def test_save_ops_include_compute_and_comm_ops(self):
+        """The save-set covers matmuls, attention, and communication collectives."""
+        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_MUST_SAVE_OPS
+
+        expected = [
+            torch.ops.aten.mm.default,
+            torch.ops.aten.addmm.default,
+            torch.ops.aten.bmm.default,
+            torch.ops.aten.linear.default,
+            torch.ops.aten._scaled_dot_product_flash_attention.default,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            torch.ops._c10d_functional.all_to_all_single.default,
+        ]
+        for op in expected:
+            assert op in _SELECTIVE_AC_MUST_SAVE_OPS, f"{op} missing from save-op set"
+
+    def test_save_ops_seeded_from_partitioner(self):
+        """The set is seeded from PyTorch's compute-intensive op list, not hardcoded."""
+        from nemo_automodel.components.distributed.parallelizer import _default_compute_intensive_ops
+
+        seeded = _default_compute_intensive_ops()
+        assert isinstance(seeded, tuple)
+        # mm is compute-intensive in every supported torch version.
+        assert torch.ops.aten.mm.default in seeded
+
+    def test_build_save_ops_falls_back_without_partitioner(self, monkeypatch):
+        """If the private partitioner API is unavailable, the curated supplement still applies."""
+        import nemo_automodel.components.distributed.parallelizer as parallelizer
+
+        monkeypatch.setattr(parallelizer, "_default_compute_intensive_ops", lambda: ())
+        save_ops = parallelizer._build_selective_ac_save_ops()
+        # Curated supplement still provides the core matmul + attention ops.
+        assert torch.ops.aten.mm.default in save_ops
+        assert torch.ops.aten.addmm.default in save_ops
+        assert torch.ops.aten.bmm.default in save_ops
+        assert torch.ops.aten._scaled_dot_product_flash_attention.default in save_ops
+
+    def test_resolve_op_attr_returns_none_for_missing(self):
+        """Optional/absent ops resolve to None instead of raising."""
+        from nemo_automodel.components.distributed.parallelizer import _resolve_op_attr
+
+        assert _resolve_op_attr(torch.ops, "definitely_not_a_namespace.foo.default") is None
+        assert _resolve_op_attr(torch, "_higher_order_ops.flex_attention") is not None
 
 
 class TestExtractModelLayers:

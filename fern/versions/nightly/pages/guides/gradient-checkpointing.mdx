@@ -26,12 +26,23 @@ distributed:
   ...
 ```
 
+For FSDP2, `activation_checkpointing` also accepts explicit policy strings:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: selective
+```
+
+Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on non-EP FSDP2 configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
+
 ### Configure Programmatically
 ```python
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 
 config = FSDP2Config(activation_checkpointing=True)
+# Use activation_checkpointing="selective" for FSDP2 selective checkpointing.
 # device_mesh is created elsewhere (e.g. by the recipe via setup_distributed)
 manager = FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
 model = manager.parallelize(model)

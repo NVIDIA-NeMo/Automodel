@@ -250,6 +250,28 @@ class TestActivationCheckpointingRouting:
         result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": True})
         assert result["strategy_config"].activation_checkpointing is True
 
+    def test_selective_routes_to_fsdp2_strategy_when_no_ep(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 1})
+        assert result["strategy_config"].activation_checkpointing == "selective"
+        assert result["activation_checkpointing"] == "selective"
+
+    def test_full_string_routes_as_true(self):
+        result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "full"})
+        assert result["strategy_config"].activation_checkpointing is True
+        assert result["activation_checkpointing"] is True
+
+    def test_selective_rejected_for_ep(self):
+        with pytest.raises(ValueError, match="non-EP FSDP2"):
+            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2})
+
+    def test_selective_rejected_for_non_fsdp2(self):
+        with pytest.raises(ValueError, match="non-EP FSDP2"):
+            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+
+    def test_unknown_activation_checkpointing_mode_rejected(self):
+        with pytest.raises(ValueError, match="activation_checkpointing"):
+            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "sometimes"})
+
 
 # ---------------------------------------------------------------------------
 # Validation errors surfaced through dict parsing
