@@ -52,8 +52,11 @@ message with parallel ``tool_calls``; the following ``tool_response``
 entries are paired with those calls in order.
 """
 
+from __future__ import annotations
+
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from datasets import load_dataset
@@ -537,3 +540,48 @@ def make_agent_chat_dataset(
         drop_history_reasoning_content=drop_history_reasoning_content,
     )
     return LazyMappedDataset(dataset, fmt_fn)
+
+
+@dataclass
+class AgentChatConfig:
+    """Construction-time configuration for the agent chat dataset (tokenizer is a build arg).
+
+    Exactly one of ``dataset_name`` or ``path`` must be set when calling :func:`build`.
+    """
+
+    dataset_name: Optional[str] = None
+    """HF Hub dataset id, e.g. ``llamafactory/glaive_toolcall_en``."""
+    path: Optional[Union[str, List[str]]] = None
+    """Local JSON/JSONL file path or list of paths."""
+    split: str = "train"
+    """Dataset split (only used with ``dataset_name``)."""
+    seq_length: Optional[int] = None
+    """Optional max sequence length for the tokenizer."""
+    limit_dataset_samples: Optional[int] = None
+    """If set, keep only the first N examples."""
+    padding: Union[str, bool] = False
+    """Padding strategy forwarded to the tokenizer."""
+    truncation: Union[str, bool] = False
+    """Truncation strategy forwarded to the tokenizer."""
+    mask_reasoning_content: bool = False
+    """If True, exclude assistant ``reasoning_content`` tokens from the loss."""
+    train_on_last_turn_only: bool = False
+    """If True, supervise only the final assistant turn of each dialogue."""
+    drop_history_reasoning_content: bool = False
+    """If True, strip ``reasoning_content`` from all but the final assistant turn."""
+
+    def build(self, *, tokenizer) -> LazyMappedDataset:
+        """Build the agent chat :class:`LazyMappedDataset` from this :class:`AgentChatConfig` and a runtime tokenizer."""
+        return make_agent_chat_dataset(
+            tokenizer,
+            dataset_name=self.dataset_name,
+            path=self.path,
+            split=self.split,
+            seq_length=self.seq_length,
+            limit_dataset_samples=self.limit_dataset_samples,
+            padding=self.padding,
+            truncation=self.truncation,
+            mask_reasoning_content=self.mask_reasoning_content,
+            train_on_last_turn_only=self.train_on_last_turn_only,
+            drop_history_reasoning_content=self.drop_history_reasoning_content,
+        )

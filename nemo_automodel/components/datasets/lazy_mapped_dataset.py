@@ -15,12 +15,29 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LazyMappedDatasetConfig:
+    """Construction-time configuration for :class:`LazyMappedDataset`.
+
+    ``dataset`` and ``map_fn`` are runtime objects rather than serializable
+    config, so they are passed to :meth:`from_config` directly.
+    """
+
+    cache_size: int | None = 10000
+    """Number of processed items to cache (``0`` disables caching, ``None`` caches all)."""
+
+    def build(self, *, dataset, map_fn) -> "LazyMappedDataset":
+        """Build a :class:`LazyMappedDataset` from this :class:`LazyMappedDatasetConfig` and runtime ``dataset``/``map_fn``."""
+        return LazyMappedDataset(dataset=dataset, map_fn=map_fn, cache_size=self.cache_size)
 
 
 class LazyMappedDataset(Dataset):

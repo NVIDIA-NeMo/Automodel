@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import json
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
@@ -23,6 +26,16 @@ from torch.utils.data import Dataset
 from .multi_tier_bucketing import MultiTierBucketCalculator
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BaseMultiresolutionDatasetConfig:
+    """Construction-time configuration for :class:`BaseMultiresolutionDataset`."""
+
+    cache_dir: str
+    """Directory containing preprocessed cache (metadata.json + shards)."""
+    quantization: int = 64
+    """Resolution quantization factor (64 for images, 8 for video)."""
 
 
 class BaseMultiresolutionDataset(Dataset, ABC):

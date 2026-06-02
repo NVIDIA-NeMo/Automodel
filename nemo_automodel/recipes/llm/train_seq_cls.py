@@ -37,8 +37,8 @@ from nemo_automodel.recipes._dist_setup import setup_distributed
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
+    _build_tokenizer,
     _get_model_name,
-    build_dataloader,
     build_model,
 )
 
@@ -121,37 +121,21 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
-        self.dataloader, self.tokenizer = build_dataloader(
-            self.cfg.dataset,
-            self.cfg.dataloader,
-            self.cfg.model,
-            cfg_ps=None,
-            seed=self.cfg.get("seed", 42),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-            max_steps=self.cfg.get("step_scheduler.max_steps", None),
-            val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+        _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+        loader_runtime = dict(
+            tokenizer=self.tokenizer,
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             pp_enabled=False,
+            model=model,
+            cp_size=self.cfg.get("distributed.cp_size", 1),
         )
+        self.dataloader = self.cfg.dataloader.build(**loader_runtime)
 
         self.val_dataloader = None
-        if "validation_dataset" in self.cfg:
-            self.val_dataloader, _ = build_dataloader(
-                self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
-                self.cfg.model,
-                cfg_ps=None,
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                global_batch_size=self.cfg.get("step_scheduler.global_batch_size", 1),
-                max_steps=self.cfg.get("step_scheduler.max_steps", None),
-                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                pp_enabled=False,
-            )
+        val_configs = self.cfg.validation_dataloaders
+        if val_configs:
+            self.val_dataloader = next(iter(val_configs.values())).build(**loader_runtime)
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         self.step_scheduler = self.cfg.step_scheduler.build(

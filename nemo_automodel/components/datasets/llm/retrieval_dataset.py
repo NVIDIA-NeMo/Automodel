@@ -780,6 +780,47 @@ def make_retrieval_dataset(
     return dataset
 
 
+@dataclass
+class RetrievalDatasetConfig:
+    """Construction-time configuration for the retrieval dataset."""
+
+    data_dir_list: Union[List[DataEntry], DataEntry] = None
+    """Path(s) to JSON file(s), ``hf://`` URIs, or dict entries with path and num_samples."""
+    model_type: str = "bi_encoder"
+    """``bi_encoder`` or ``cross_encoder``."""
+    data_type: str = "train"
+    """Type of data (``train`` or ``eval``)."""
+    n_passages: int = 5
+    """Number of passages (1 positive + n-1 negatives)."""
+    eval_negative_size: Optional[int] = None
+    """Number of negative documents for evaluation."""
+    seed: int = 42
+    """Random seed for shuffling / sampling."""
+    do_shuffle: bool = False
+    """Shuffle dataset rows before subset selection (only when ``max_train_samples`` is set)."""
+    max_train_samples: Optional[int] = None
+    """Maximum number of training samples to use."""
+    train_data_select_offset: int = 0
+    """Offset for selecting training samples."""
+    use_dataset_instruction: bool = False
+    """Whether to use the instruction from the dataset's metadata."""
+
+    def build(self) -> Dataset:
+        """Build the retrieval :class:`~datasets.Dataset` from this :class:`RetrievalDatasetConfig`."""
+        return make_retrieval_dataset(
+            data_dir_list=self.data_dir_list,
+            model_type=self.model_type,
+            data_type=self.data_type,
+            n_passages=self.n_passages,
+            eval_negative_size=self.eval_negative_size,
+            seed=self.seed,
+            do_shuffle=self.do_shuffle,
+            max_train_samples=self.max_train_samples,
+            train_data_select_offset=self.train_data_select_offset,
+            use_dataset_instruction=self.use_dataset_instruction,
+        )
+
+
 if __name__ == "__main__":
     import argparse
 
