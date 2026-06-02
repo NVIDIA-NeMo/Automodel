@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,56 +23,55 @@ import nemo_automodel.components.datasets.audio.datasets as ds
 
 
 def test_make_cv17_dataset(monkeypatch):
-    """End-to-end sanity check for `make_cv17_dataset`."""
+    """`make_cv17_dataset` decodes torchcodec-free via soundfile and is lazy.
 
-    # Mock dataset with audio data and extra columns to test column removal
-    class MockDataset:
-        def __init__(self, data):
-            self.data = data
-            self.column_names = ["audio", "transcription", "extra_col1", "extra_col2", "unwanted_col"]
+    Audio cells are stored as ``Audio(decode=False)``-style ``{bytes,path}`` structs;
+    extra columns are dropped; no audio is decoded at construction (only on access).
+    """
+    wav = _make_wav_bytes()
+    transcripts = ["Merhaba, nasılsınız?", "Bu bir test cümlesidir."]
+    fake_rows = _SyntheticHFRows(
+        [
+            {"audio": {"bytes": wav, "path": None}, "transcription": transcripts[0], "extra_col": "drop-me"},
+            {"audio": {"bytes": wav, "path": None}, "transcription": transcripts[1], "extra_col": "drop-me"},
+        ]
+    )
+    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: fake_rows)
 
-        def remove_columns(self, columns_to_remove):
-            # Simulate column removal
-            expected_removed = ["extra_col1", "extra_col2", "unwanted_col"]
-            assert set(columns_to_remove) == set(expected_removed)
-            return self.data
+    decode_calls = []
+    original_decode = ds._decode_audio_cell_to_mono_float32
 
-        def __iter__(self):
-            return iter(self.data)
+    def _spy(audio_cell, target_sampling_rate):
+        decode_calls.append(target_sampling_rate)
+        return original_decode(audio_cell, target_sampling_rate)
 
-    fake_audio_data = [
-        {
-            "audio": {"array": [0.1, 0.2, 0.3, -0.1, -0.2], "sampling_rate": 16000},
-            "transcription": "Merhaba, nasılsınız?",
-        },
-        {
-            "audio": {"array": [0.5, -0.3, 0.8, 0.2, -0.1], "sampling_rate": 16000},
-            "transcription": "Bu bir test cümlesidir.",
-        },
-    ]
-
-    mock_dataset = MockDataset(fake_audio_data)
-
-    # Patch `load_dataset` so no network call is issued
-    monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: mock_dataset)
+    monkeypatch.setattr(ds, "_decode_audio_cell_to_mono_float32", _spy)
 
     result = ds.make_cv17_dataset()
 
-    assert len(result) == len(fake_audio_data)
-    for sample, src in zip(result, fake_audio_data, strict=True):
+    # Lazy: nothing decoded at construction; len is O(1).
+    assert decode_calls == []
+    assert len(result) == 2
+
+    for i, transcript in enumerate(transcripts):
+        sample = result[i]
         assert set(sample.keys()) == {"conversation", "audio"}
 
-        # Test conversation structure
         conversation = sample["conversation"]
         assert len(conversation) == 2
         assert conversation[0]["role"] == "user"
         assert conversation[1]["role"] == "assistant"
-        assert conversation[1]["content"] == src["transcription"]
+        assert conversation[1]["content"] == transcript
 
-        # Test audio tuple
+        # Audio decoded via soundfile into a (float32 mono waveform, sr) tuple.
         audio_array, sampling_rate = sample["audio"]
-        assert audio_array == src["audio"]["array"]
-        assert sampling_rate == src["audio"]["sampling_rate"]
+        assert isinstance(audio_array, _np.ndarray)
+        assert audio_array.dtype == _np.float32
+        assert audio_array.ndim == 1
+        assert sampling_rate == 16000
+
+    # Two accesses → two decodes (no caching at this layer).
+    assert len(decode_calls) == 2
 
 
 # ---------------------------------------------------------------------------

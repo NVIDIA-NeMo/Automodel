@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -218,3 +218,62 @@ def test_default_sources_are_the_six_corpus_mix():
     # Data-mix hard numbers (prototype fidelity).
     assert by_name["voxpopuli_en"].limit == 4000
     assert by_name["gigaspeech_s"].trust_remote_code is True
+
+
+def test_coerce_source_accepts_source_and_mapping():
+    """`_coerce_source` passes Source through and builds Source from a dict; rejects junk."""
+    src = me.Source("a", "repo/a", None, "train", "text")
+    assert me._coerce_source(src) is src
+
+    coerced = me._coerce_source(
+        {"name": "b", "repo": "repo/b", "config": "cfg", "split": "train", "text_col": "sentence", "limit": 7}
+    )
+    assert isinstance(coerced, me.Source)
+    assert (coerced.name, coerced.repo, coerced.config, coerced.text_col, coerced.limit) == (
+        "b",
+        "repo/b",
+        "cfg",
+        "sentence",
+        7,
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="unknown Source field"):
+        me._coerce_source({"name": "c", "repo": "r", "config": None, "split": "train", "text_col": "t", "bogus": 1})
+    with pytest.raises(TypeError, match="must be a Source or mapping"):
+        me._coerce_source(["not", "a", "mapping"])
+
+
+def test_dict_sources_override_is_executable(monkeypatch):
+    """A YAML/CLI-shaped `dataset.sources` override (list of dicts) builds the mix.
+
+    The recipe config loader passes nested ``dataset.sources`` entries as plain dicts,
+    so the builder must accept dict source specs, not just ``Source`` instances.
+    """
+    wav = _make_wav_bytes()
+    # YAML/CLI shape: a list of plain dicts (e.g. to trim the mix to non-gated sources).
+    dict_sources = [
+        {"name": "ami_ihm", "repo": "edinburghcstr/ami", "config": "ihm", "split": "train[:2]", "text_col": "text"},
+    ]
+    _install_fake_load_dataset(
+        monkeypatch,
+        {
+            "edinburghcstr/ami": (
+                "text",
+                [
+                    {"audio": {"bytes": wav, "path": None}, "text": "first row"},
+                    {"audio": {"bytes": wav, "path": None}, "text": "second row"},
+                ],
+            )
+        },
+    )
+
+    mixed = me.build_multi_en_source_mix(sources=dict_sources, shuffle_seed=None, min_audio_duration_seconds=None)
+    assert set(mixed.column_names) == {"audio", "text", "source"}
+    assert sorted(mixed["source"]) == ["ami_ihm", "ami_ihm"]
+    assert set(mixed["text"]) == {"FIRST ROW", "SECOND ROW"}
+
+    # And end-to-end through the public builder (lazy transform attached).
+    dataset = me.make_multi_en_asr_dataset(sources=dict_sources, shuffle_seed=None, min_audio_duration_seconds=None)
+    assert list(dataset[0].keys()) == ["conversation"]

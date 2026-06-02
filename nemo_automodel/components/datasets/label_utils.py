@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def default_stop_tokens(processor) -> Iterable[str]:
+def default_stop_tokens(processor: Any) -> Iterable[str]:
     """Return default generation stop tokens for a processor tokenizer."""
     tokenizer = getattr(processor, "tokenizer", None)
     eos_token = getattr(tokenizer, "eos_token", None) if tokenizer is not None else None
@@ -84,7 +84,7 @@ def _decode_single_token(tokenizer, token_id: int) -> str:
 def build_labels(
     input_ids_batch: torch.Tensor,
     conversations: Sequence[Sequence[Dict[str, Any]]],
-    processor,
+    processor: Any,
 ) -> torch.Tensor:
     """Construct label and optional loss-mask tensors aligned to assistant responses."""
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -338,7 +338,7 @@ def _build_labels_from_markers(
 def build_labels_from_template(
     input_ids_batch: torch.Tensor,
     conversations: Sequence[Sequence[Dict[str, Any]]],
-    processor,
+    processor: Any,
 ) -> torch.Tensor:
     """Build training labels by scanning ``input_ids`` for chat-template role markers.
 

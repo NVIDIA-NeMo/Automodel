@@ -191,7 +191,7 @@ def _mock_build_labels(input_ids, conversations, processor):
     # so that labels survive truncation to ml=32 from seq=64.
     seq = input_ids.shape[1]
     labels = torch.full_like(input_ids, -100)
-    labels[:, seq // 4:] = input_ids[:, seq // 4:]
+    labels[:, seq // 4 :] = input_ids[:, seq // 4 :]
     return labels
 
 

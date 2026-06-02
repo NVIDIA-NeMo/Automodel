@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,10 +30,11 @@ the soundfile decode path inside the lazy transform.
 
 import logging
 import re
-from dataclasses import dataclass
-from typing import List, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+from typing import Any
 
-from datasets import Audio, concatenate_datasets, load_dataset
+from datasets import Audio, Dataset, concatenate_datasets, load_dataset
 
 from nemo_automodel.components.datasets.audio.datasets import (
     _attach_asr_transform,
@@ -86,18 +87,50 @@ class Source:
 
     name: str  # label written into the "source" column
     repo: str
-    config: Optional[str]
+    config: str | None
     split: str
     text_col: str  # column holding the transcript in this repo
-    limit: Optional[int] = None  # keep only the first N examples
+    limit: int | None = None  # keep only the first N examples
     trust_remote_code: bool = False
-    known_count: Optional[int] = None  # from metadata, for reporting only
+    known_count: int | None = None  # from metadata, for reporting only
+
+
+def _coerce_source(spec: "Source | Mapping[str, Any]") -> "Source":
+    """Coerce a YAML/CLI source spec into a :class:`Source`.
+
+    The recipe config loader passes nested ``dataset.sources`` entries as plain
+    dicts, so a ``Source`` override written in YAML/CLI arrives here as a mapping.
+    Pass-through for existing :class:`Source` instances.
+
+    Args:
+        spec: A :class:`Source` or a mapping with keys matching its fields
+            (``name``, ``repo``, ``config``, ``split``, ``text_col`` are required;
+            ``limit``, ``trust_remote_code``, ``known_count`` are optional).
+
+    Returns:
+        A :class:`Source` instance.
+
+    Raises:
+        TypeError: If ``spec`` is neither a :class:`Source` nor a mapping.
+        ValueError: If the mapping contains keys that are not ``Source`` fields.
+    """
+    if isinstance(spec, Source):
+        return spec
+    if hasattr(spec, "to_dict"):  # tolerate config-node objects that expose to_dict()
+        spec = spec.to_dict()
+    if isinstance(spec, Mapping):
+        allowed = {f.name for f in fields(Source)}
+        unknown = set(spec) - allowed
+        if unknown:
+            raise ValueError(f"unknown Source field(s) {sorted(unknown)}; allowed: {sorted(allowed)}")
+        return Source(**dict(spec))
+    raise TypeError(f"source spec must be a Source or mapping, got {type(spec).__name__}: {spec!r}")
 
 
 # Composition (matches result/data/build_train_mix.py exactly). gigaspeech and
 # spgispeech are gated on the Hub: accept their terms (and, for gigaspeech, allow
 # trust_remote_code) before launching, or pass a trimmed ``sources`` list.
-SOURCES: List[Source] = [
+SOURCES: list[Source] = [
     Source("ami_ihm", "edinburghcstr/ami", "ihm", "train", "text", known_count=108_502),
     Source("earnings22", "sanchit-gandhi/earnings22_split", None, "train", "sentence", known_count=52_006),
     Source("voxpopuli_en", "facebook/voxpopuli", "en", "train", "normalized_text", limit=4_000, known_count=4_000),
@@ -115,7 +148,7 @@ SOURCES: List[Source] = [
 ]
 
 
-def _load_and_normalize_source(src: Source, *, audio_column: str, text_column: str):
+def _load_and_normalize_source(src: Source, *, audio_column: str, text_column: str) -> Dataset:
     """Load one source and normalise it to ``{audio (decode=False), text, source}``.
 
     No audio is decoded: the audio column is cast with ``Audio(decode=False)`` and
@@ -155,12 +188,12 @@ def _load_and_normalize_source(src: Source, *, audio_column: str, text_column: s
 
 def build_multi_en_source_mix(
     *,
-    sources: Optional[List[Source]] = None,
+    sources: list[Source | Mapping[str, Any]] | None = None,
     audio_column: str = "audio",
     text_column: str = "text",
-    shuffle_seed: Optional[int] = 42,
-    min_audio_duration_seconds: Optional[float] = 1.0,
-):
+    shuffle_seed: int | None = 42,
+    min_audio_duration_seconds: float | None = 1.0,
+) -> Dataset:
     """Build the concatenated ``{audio, text, source}`` mix (before the ASR transform).
 
     Exposed separately from :func:`make_multi_en_asr_dataset` so the mix
@@ -182,8 +215,8 @@ def build_multi_en_source_mix(
         A map-style HuggingFace ``Dataset`` with columns
         ``{audio (decode=False), text, source}``.
     """
-    sources = list(sources) if sources is not None else list(SOURCES)
-    parts = [_load_and_normalize_source(s, audio_column=audio_column, text_column=text_column) for s in sources]
+    specs = [_coerce_source(s) for s in sources] if sources is not None else list(SOURCES)
+    parts = [_load_and_normalize_source(s, audio_column=audio_column, text_column=text_column) for s in specs]
 
     mixed = concatenate_datasets(parts)
     if shuffle_seed is not None:
@@ -198,14 +231,14 @@ def build_multi_en_source_mix(
 def make_multi_en_asr_dataset(
     *,
     sampling_rate: int = TARGET_SAMPLING_RATE,
-    system_prompt: Optional[str] = None,
-    user_prompt: Optional[str] = DEFAULT_USER_PROMPT,
-    min_audio_duration_seconds: Optional[float] = 1.0,
-    shuffle_seed: Optional[int] = 42,
-    sources: Optional[List[Source]] = None,
+    system_prompt: str | None = None,
+    user_prompt: str | None = DEFAULT_USER_PROMPT,
+    min_audio_duration_seconds: float | None = 1.0,
+    shuffle_seed: int | None = 42,
+    sources: list[Source | Mapping[str, Any]] | None = None,
     audio_column: str = "audio",
     text_column: str = "text",
-):
+) -> Dataset:
     """Build the multi-source English ASR training dataset for Qwen-Omni.
 
     Mixes the six public corpora in :data:`SOURCES` (or a caller-supplied subset),

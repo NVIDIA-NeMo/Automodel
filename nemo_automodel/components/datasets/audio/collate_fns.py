@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -117,7 +117,7 @@ def _conversation_ends_with_assistant_text(conversation: Sequence[Dict[str, Any]
 
 def qwen3_omni_asr_collate_fn(
     examples: Sequence[Dict[str, Any]],
-    processor,
+    processor: Any,
 ) -> Dict[str, torch.Tensor]:
     """Collate Qwen3-Omni ASR conversations into model inputs without ``qwen_omni_utils``.
 
@@ -199,7 +199,7 @@ def qwen3_omni_asr_collate_fn(
 
 def qwen2_5_omni_asr_collate_fn(
     examples: Sequence[Dict[str, Any]],
-    processor,
+    processor: Any,
 ) -> Dict[str, torch.Tensor]:
     """Collate Qwen2.5-Omni ASR conversations.
 

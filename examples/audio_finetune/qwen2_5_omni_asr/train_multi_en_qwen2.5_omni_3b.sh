@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Launch single-node 8-GPU ASR fine-tuning of Qwen/Qwen2.5-Omni-3B on the
 # six-corpus English mix (AMI + earnings22 + voxpopuli_en + gigaspeech +

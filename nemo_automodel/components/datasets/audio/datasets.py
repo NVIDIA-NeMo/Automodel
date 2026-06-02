@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,35 +22,74 @@ usable inside environments that do not ship ``torchcodec``.
 
 import io
 import logging
+from typing import Any
 
 import numpy as np
 import soundfile as sf
-from datasets import Audio, load_dataset
+from datasets import Audio, Dataset, load_dataset
 
 logger = logging.getLogger(__name__)
 
 
-def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
-    """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
-    all_columns = dataset.column_names
-    columns_to_remove = [col for col in all_columns if col not in ["audio", "transcription"]]
-    dataset = dataset.remove_columns(columns_to_remove)
+def make_cv17_dataset(
+    path_or_dataset: str = "ysdede/commonvoice_17_tr_fixed",
+    split: str = "train",
+    *,
+    sampling_rate: int = 16000,
+    audio_column: str = "audio",
+    text_column: str = "transcription",
+    **load_kwargs: Any,
+) -> Dataset:
+    """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning.
 
-    def format(example):
-        return {
-            "conversation": [
-                {"role": "user", "content": "<|endoftext11|>Transcribe the Turkish audio clip."},
-                {"role": "assistant", "content": example["transcription"]},
-            ],
-            "audio": (example["audio"]["array"], example["audio"]["sampling_rate"]),
-        }
+    Torchcodec-free: the audio column is cast with ``Audio(decode=False)`` and
+    decoded lazily via ``soundfile`` (``_decode_audio_cell_to_mono_float32``) inside
+    a ``with_transform`` callback, so no audio is decoded at construction time. Each
+    accessed item is ``{"conversation": [...], "audio": (waveform, sampling_rate)}``,
+    matching what :func:`phi4_mm_collate_fn` consumes.
 
-    ret = [format(example) for example in dataset]
-    return ret
+    Args:
+        path_or_dataset: HuggingFace dataset id or local path.
+        split: Dataset split to load.
+        sampling_rate: Target sampling rate in Hz for the decoded waveform.
+        audio_column: Name of the audio column.
+        text_column: Name of the transcript column.
+        **load_kwargs: Forwarded to ``datasets.load_dataset``.
+
+    Returns:
+        A HuggingFace ``Dataset`` with a lazy decode transform attached.
+
+    Raises:
+        ValueError: When ``audio_column`` or ``text_column`` is missing.
+    """
+    dataset = load_dataset(path_or_dataset, split=split, **load_kwargs)
+    if audio_column not in dataset.column_names:
+        raise ValueError(f"audio_column={audio_column!r} not found in dataset columns: {dataset.column_names}")
+    if text_column not in dataset.column_names:
+        raise ValueError(f"text_column={text_column!r} not found in dataset columns: {dataset.column_names}")
+
+    dataset = dataset.cast_column(audio_column, Audio(decode=False))
+    keep = {audio_column, text_column}
+    dataset = dataset.remove_columns([c for c in dataset.column_names if c not in keep])
+
+    def _format(batch: dict[str, list]) -> dict[str, list]:
+        conversations = []
+        audios = []
+        for audio_cell, transcription in zip(batch[audio_column], batch[text_column]):
+            waveform, sr = _decode_audio_cell_to_mono_float32(audio_cell, sampling_rate)
+            conversations.append(
+                [
+                    {"role": "user", "content": "<|endoftext11|>Transcribe the Turkish audio clip."},
+                    {"role": "assistant", "content": transcription},
+                ]
+            )
+            audios.append((waveform, sr))
+        return {"conversation": conversations, "audio": audios}
+
+    return dataset.with_transform(_format)
 
 
-def _decode_audio_cell_to_mono_float32(audio_cell, target_sampling_rate):
+def _decode_audio_cell_to_mono_float32(audio_cell: dict[str, Any], target_sampling_rate: int) -> tuple[np.ndarray, int]:
     """Decode a HuggingFace ``Audio(decode=False)`` cell to a 1-D float32 waveform.
 
     Avoids ``torchcodec`` by using ``soundfile`` for both byte and path branches,
@@ -95,15 +134,15 @@ def _decode_audio_cell_to_mono_float32(audio_cell, target_sampling_rate):
 
 
 def _build_asr_conversation(
-    waveform,
-    transcript,
+    waveform: np.ndarray,
+    transcript: str,
     *,
-    system_prompt,
-    user_prompt,
-    has_system,
-    has_user_text,
-):
-    """Assemble the Qwen3-Omni ASR chat-template conversation for one sample."""
+    system_prompt: str | None,
+    user_prompt: str | None,
+    has_system: bool,
+    has_user_text: bool,
+) -> list[dict[str, Any]]:
+    """Assemble the Qwen-Omni ASR chat-template conversation for one sample."""
     conversation = []
     if has_system:
         conversation.append({"role": "system", "content": system_prompt})
@@ -118,7 +157,7 @@ def _build_asr_conversation(
     return conversation
 
 
-def _filter_nonempty_text(dataset, text_column):
+def _filter_nonempty_text(dataset: Dataset, text_column: str) -> Dataset:
     """Drop rows whose ``text_column`` is empty or whitespace (Arrow-level, no decode)."""
     return dataset.filter(
         lambda batch: [bool(t) and bool(t.strip()) for t in batch[text_column]],
@@ -126,7 +165,7 @@ def _filter_nonempty_text(dataset, text_column):
     )
 
 
-def _filter_min_audio_duration(dataset, audio_column, min_audio_duration_seconds):
+def _filter_min_audio_duration(dataset: Dataset, audio_column: str, min_audio_duration_seconds: float) -> Dataset:
     """Drop rows shorter than ``min_audio_duration_seconds`` via header-only ``sf.info``.
 
     Uses ``soundfile.info`` (header read, no PCM decode) on the ``Audio(decode=False)``
@@ -151,14 +190,14 @@ def _filter_min_audio_duration(dataset, audio_column, min_audio_duration_seconds
 
 
 def _attach_asr_transform(
-    dataset,
+    dataset: Dataset,
     *,
-    audio_column="audio",
-    text_column="text",
-    sampling_rate=16000,
-    system_prompt=None,
-    user_prompt=None,
-):
+    audio_column: str = "audio",
+    text_column: str = "text",
+    sampling_rate: int = 16000,
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
+) -> Dataset:
     """Attach the lazy decode-and-build-conversation transform to an ASR dataset.
 
     The dataset must already expose an ``audio_column`` cast with
@@ -220,18 +259,18 @@ def _attach_asr_transform(
 
 
 def make_hf_audio_asr_dataset(
-    path_or_dataset,
-    split="train",
-    name=None,
-    sampling_rate=16000,
-    system_prompt=None,
-    user_prompt=None,
-    audio_column="audio",
-    text_column="text",
-    drop_empty_text=True,
-    min_audio_duration_seconds=None,
-    **load_kwargs,
-):
+    path_or_dataset: str,
+    split: str = "train",
+    name: str | None = None,
+    sampling_rate: int = 16000,
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
+    audio_column: str = "audio",
+    text_column: str = "text",
+    drop_empty_text: bool = True,
+    min_audio_duration_seconds: float | None = None,
+    **load_kwargs: Any,
+) -> Dataset:
     """Lazy HuggingFace audio→text dataset builder for Qwen-Omni ASR fine-tuning.
 
     Loads any HuggingFace ASR dataset that exposes an audio column (``Audio``
