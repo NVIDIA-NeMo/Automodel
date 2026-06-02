@@ -274,7 +274,13 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
                         df = fr.read_row_group(row_group_id).to_pandas()
                         df = df.iloc[row_start_id:]
                     except Exception as e:
-                        logger.warning("Error %s in rg#%s, %s", e, row_group_id, parquet_file_path)
+                        self._log_drop(
+                            "parquet_row_group_parse",
+                            "error %s in rg#%s, %s",
+                            e,
+                            row_group_id,
+                            parquet_file_path,
+                        )
                         continue
 
                     for row_idx, row in df.iterrows():
@@ -288,7 +294,13 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
                                 "dataset_name": self.dataset_name,
                             }
                         except Exception as e:
-                            logger.warning("Error %s in rg#%s, %s", e, row_group_id, parquet_file_path)
+                            self._log_drop(
+                                "parquet_row_parse",
+                                "error %s in rg#%s, %s",
+                                e,
+                                row_group_id,
+                                parquet_file_path,
+                            )
                             continue
                         self._set_worker_resume_data_status(worker_id, [global_row_group_idx, row_idx])
                         yield data

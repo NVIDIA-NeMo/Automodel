@@ -174,7 +174,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                             else:
                                 raise ValueError("Cannot find <video> in the conversation!")
                 except Exception:
-                    logger.exception("Failed to parse multimodal JSONL row for dataset %s", self.dataset_name)
+                    self._log_drop("jsonl_parse", "failed to parse multimodal JSONL row", exc_info=True)
                     continue
 
                 if raw_images:
@@ -213,7 +213,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
 
                 has_loss = [item["loss"] for item in sequence_plan]
                 if sum(has_loss) == 0:
-                    logger.warning("Skipping sample without loss labels in dataset %s", self.dataset_name)
+                    self._log_drop("no_loss_labels", "skipping sample without loss labels")
                     continue
 
                 self._set_worker_resume_data_status(worker_id, row_idx)
@@ -319,7 +319,13 @@ class T2IIterableDataset(DistributedIterableDataset):
                                 image_byte = row["image"]
                                 image = pil_img2rgb(Image.open(io.BytesIO(image_byte)))
                             except Exception as e:
-                                logger.warning("Error %s in rg#%s, %s", e, row_group_id, parquet_file_path)
+                                self._log_drop(
+                                    "t2i_image_parse",
+                                    "error %s in rg#%s, %s",
+                                    e,
+                                    row_group_id,
+                                    parquet_file_path,
+                                )
                                 continue
                             image_tensor = self.transform(image)
                             height, width = image_tensor.shape[1:]
@@ -329,12 +335,20 @@ class T2IIterableDataset(DistributedIterableDataset):
                                 caption_dict = row["captions"]
                                 caption_dict = json.loads(caption_dict)
                             except Exception as e:
-                                logger.warning("Error %s in rg#%s, %s", e, row_group_id, parquet_file_path)
+                                self._log_drop(
+                                    "t2i_caption_parse",
+                                    "error %s in rg#%s, %s",
+                                    e,
+                                    row_group_id,
+                                    parquet_file_path,
+                                )
                                 continue
 
                             caps_token = [self.tokenizer.encode(v) for _, v in caption_dict.items()]
                             if len(caps_token) == 0:
-                                logger.warning("No caption in rg#%s, %s", row_group_id, parquet_file_path)
+                                self._log_drop(
+                                    "t2i_no_caption", "no caption in rg#%s, %s", row_group_id, parquet_file_path
+                                )
                                 caption_token = self.tokenizer.encode(" ")
                             else:
                                 caption_token = random.choice(caps_token)

@@ -23,9 +23,12 @@
 from __future__ import annotations
 
 import copy
+import logging
 import random
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class DistributedIterableDataset(torch.utils.data.IterableDataset):
@@ -46,6 +49,23 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
         self.data_paths = None
         self.data_status = None
         self._resume_data_status = None
+        self.num_files_per_rank = 0
+        self.data_paths_per_rank = []
+        self._drop_counters = {}
+
+    def _log_drop(self, reason, message, *args, every=100, exc_info=False):
+        count = self._drop_counters.get(reason, 0) + 1
+        self._drop_counters[reason] = count
+        if count <= 3 or count % every == 0:
+            module_logger = logging.getLogger(type(self).__module__)
+            module_logger.warning(
+                "%s drop[%s]=%d: " + message,
+                self.dataset_name,
+                reason,
+                count,
+                *args,
+                exc_info=exc_info,
+            )
 
     def set_data_status(self, data_status):
         self.data_status = copy.deepcopy(data_status)
@@ -78,6 +98,8 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
     def set_epoch(self, seed=42):
         if self.data_paths is None:
             return
+        if len(self.data_paths) == 0:
+            raise ValueError(f"Dataset {self.dataset_name} has no data paths to shard.")
 
         if isinstance(self.data_paths[0], tuple):
             data_paths = sorted(self.data_paths, key=lambda x: (x[0], x[1]))
@@ -90,10 +112,26 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
         self.rng.shuffle(data_paths)
 
         num_files_per_rank = len(data_paths) // self.world_size
+        if num_files_per_rank == 0:
+            raise ValueError(
+                f"Dataset {self.dataset_name} has {len(data_paths)} data path(s), fewer than world_size="
+                f"{self.world_size}; at least one rank would receive no data."
+            )
+        dropped_tail = len(data_paths) % self.world_size
+        if dropped_tail:
+            logger.warning(
+                "Dataset %s is dropping %d tail data path(s) during rank sharding (num_paths=%d, world_size=%d).",
+                self.dataset_name,
+                dropped_tail,
+                len(data_paths),
+                self.world_size,
+            )
         local_start = self.local_rank * num_files_per_rank
         local_end = (self.local_rank + 1) * num_files_per_rank
         self.num_files_per_rank = num_files_per_rank
         self.data_paths_per_rank = data_paths[local_start:local_end]
+        if len(self.data_paths_per_rank) == 0:
+            raise ValueError(f"Dataset {self.dataset_name} assigned no data paths to rank {self.local_rank}.")
 
     def get_data_paths_per_worker(self):
         if self.data_paths is None:
@@ -106,9 +144,29 @@ class DistributedIterableDataset(torch.utils.data.IterableDataset):
 
         worker_id = info.id
         num_files_per_worker = self.num_files_per_rank // info.num_workers
+        if num_files_per_worker == 0:
+            raise ValueError(
+                f"Dataset {self.dataset_name} rank {self.local_rank} has {self.num_files_per_rank} data path(s) "
+                f"for {info.num_workers} worker(s); at least one worker would receive no data."
+            )
+        dropped_tail = self.num_files_per_rank % info.num_workers
+        if dropped_tail and worker_id == 0:
+            logger.warning(
+                "Dataset %s rank %s is dropping %d tail data path(s) during worker sharding "
+                "(paths_per_rank=%d, num_workers=%d).",
+                self.dataset_name,
+                self.local_rank,
+                dropped_tail,
+                self.num_files_per_rank,
+                info.num_workers,
+            )
         start = num_files_per_worker * worker_id
         end = num_files_per_worker * (worker_id + 1)
         data_paths_per_worker = self.data_paths_per_rank[start:end]
+        if len(data_paths_per_worker) == 0:
+            raise ValueError(
+                f"Dataset {self.dataset_name} assigned no data paths to rank {self.local_rank} worker {worker_id}."
+            )
 
         return data_paths_per_worker[::-1], worker_id
 

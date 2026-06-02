@@ -131,10 +131,17 @@ class PackedDataset(torch.utils.data.IterableDataset):
         self._resume_buffer = []
         self._resume_sequence_status = self.set_sequence_status()
         self._yielded_batches = 0
+        self._drop_counters = {}
         if self.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
         else:
             self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
+
+    def _log_drop(self, reason, message, *args, every=100):
+        count = self._drop_counters.get(reason, 0) + 1
+        self._drop_counters[reason] = count
+        if count <= 3 or count % every == 0:
+            logger.warning("PackedDataset drop[%s]=%d: " + message, reason, count, *args)
 
     def _rng_state_dict(self):
         return {
@@ -392,7 +399,9 @@ class PackedDataset(torch.utils.data.IterableDataset):
                                 batch_data_indexes.append(sample["data_indexes"])
                                 break
                             else:
-                                logger.warning("Skipping sample with length %s", num_tokens)
+                                self._log_drop(
+                                    "overlength_mandatory_sample", "skipping sample with length %s", num_tokens
+                                )
                                 continue
 
             if sequence_status["curr"] < self.prefer_buffer_before and len(buffer) > 0:
@@ -410,7 +419,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
             num_tokens = sample["num_tokens"] + 2 * len(sample["sequence_plan"])
             if num_tokens > self.max_num_tokens_per_sample:
-                logger.warning("Skipping sample with length %s", num_tokens)
+                self._log_drop("overlength_sample", "skipping sample with length %s", num_tokens)
                 continue
 
             if sequence_status["curr"] + num_tokens > self.max_num_tokens:

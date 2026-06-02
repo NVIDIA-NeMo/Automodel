@@ -829,6 +829,9 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         # BAGEL-style reductions, one per loss type:
         #   ce  : per-token CE  -> ce.sum()           * world_size / num_ce_tokens_global
         #   mse : per-token MSE (mean over patch dim) -> mse.mean(-1).sum() * world_size / num_mse_tokens_global
+        # For gradient accumulation, the caller passes token counts summed over
+        # the whole optimizer step so unequal packed microbatches stay
+        # token-weighted instead of each contributing an independent mean.
         # After FSDP's bf16 mean-grad all-reduce, the effective gradient is
         # the per-token-averaged loss gradient on each side.
         ws = self.dist_env.world_size
@@ -866,8 +869,9 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a training step; supports grad accumulation trivially.
 
-        We re-derive ``num_ce_tokens_global`` per micro-batch because BAGEL
-        packs to a variable total token count per micro-batch.
+        BAGEL packs variable token counts per microbatch. For gradient
+        accumulation, normalize each CE/MSE contribution by the token count
+        over the whole optimizer step, not by each microbatch independently.
         """
         device = self.dist_env.device
         loss_buffer: List[Dict[str, Optional[torch.Tensor]]] = []
@@ -876,7 +880,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         total_mse_tokens = 0
 
         num_batches = len(batches)
-        for i, batch in enumerate(batches):
+        for batch in batches:
             # Pre-allreduce token counts for this micro-batch.
             raw = batch.to_dict()
             num_ce_local = int(raw["ce_loss_indexes"].numel()) if "ce_loss_indexes" in raw else 0
@@ -892,12 +896,13 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             total_mse_tokens += num_mse_global
             total_tokens += seq_len_global
 
+        for i, batch in enumerate(batches):
             self._forward_backward_step(
                 i,
                 batch,
                 loss_buffer=loss_buffer,
-                num_ce_tokens_global=num_ce_global,
-                num_mse_tokens_global=num_mse_global,
+                num_ce_tokens_global=total_ce_tokens,
+                num_mse_tokens_global=total_mse_tokens,
                 num_batches=num_batches,
             )
 

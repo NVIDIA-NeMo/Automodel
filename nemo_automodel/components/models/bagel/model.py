@@ -246,12 +246,21 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             if hasattr(module, "_is_hf_initialized"):
                 module._is_hf_initialized = False
 
-        self.model.language_model.apply(_mark_hf_uninitialized)
-        self.model.language_model.initialize_weights()
+        def _initialize_hf_subtree(module: nn.Module, name: str) -> None:
+            module.apply(_mark_hf_uninitialized)
+            if hasattr(module, "post_init"):
+                module.post_init()
+            elif hasattr(module, "init_weights"):
+                module.init_weights()
+            elif hasattr(module, "_init_weights"):
+                module.apply(module._init_weights)
+            else:
+                raise AttributeError(f"{name} does not provide a HF-compatible weight initializer")
+
+        _initialize_hf_subtree(self.model.language_model, "language_model")
 
         if self.config.visual_und:
-            self.model.vit_model.apply(_mark_hf_uninitialized)
-            self.model.vit_model.initialize_weights()
+            _initialize_hf_subtree(self.model.vit_model, "vit_model")
 
         def _init_bagel_module(module: nn.Module) -> None:
             if isinstance(module, BagelGridPositionEmbedding):
