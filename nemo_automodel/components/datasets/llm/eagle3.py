@@ -58,6 +58,26 @@ def build_eagle3_dataloader(
         unshifted=True,
     )
     sampler = DistributedSampler(dataset, shuffle=shuffle) if distributed else None
+
+    # The EAGLE recipes load the target model onto CUDA before iterating, so the
+    # CUDA context is already initialized by the time these workers spawn. Two
+    # defaults are unsafe in that state and must be overridden when
+    # ``num_workers > 0``:
+    #   * ``fork`` (the Linux default start method) hands each worker a copy of
+    #     the parent's live CUDA context, which is invalid in the child and
+    #     aborts the worker with ``cudaErrorInitializationError`` -> SIGABRT.
+    #     ``forkserver`` starts workers from a clean process with no inherited
+    #     CUDA context.
+    #   * Without ``persistent_workers`` the pool is torn down and re-forked at
+    #     every epoch boundary -- exactly when the abort surfaced (the first
+    #     epoch ran fine). Keeping workers alive across epochs removes that
+    #     re-fork entirely.
+    worker_kwargs: dict[str, Any] = {}
+    if num_workers > 0:
+        worker_kwargs["persistent_workers"] = True
+        if torch.cuda.is_available():
+            worker_kwargs["multiprocessing_context"] = "forkserver"
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -67,6 +87,7 @@ def build_eagle3_dataloader(
         pin_memory=torch.cuda.is_available(),
         collate_fn=_stack_batch,
         drop_last=False,
+        **worker_kwargs,
     )
 
 
