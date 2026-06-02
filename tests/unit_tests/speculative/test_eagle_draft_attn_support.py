@@ -70,5 +70,9 @@ def test_eagle3_draft_constructs_with_flash_attention_2():
 
 def test_eagle1_2_draft_does_not_claim_flash_attn():
     # EAGLE-1/2 attention is eager-only; advertising FA2 would let transformers
-    # dispatch a backend the layer cannot run.
-    assert LlamaEagleDraftModel._supports_flash_attn is False
+    # dispatch a backend the layer cannot run. EAGLE-3 opts in via a class-level
+    # override; EAGLE-1/2 must not declare its own override (it inherits the base
+    # PreTrainedModel default, which is a property in current transformers and so
+    # cannot be compared by value at the class level).
+    assert LlamaEagle3DraftModel.__dict__.get("_supports_flash_attn") is True
+    assert "_supports_flash_attn" not in LlamaEagleDraftModel.__dict__
