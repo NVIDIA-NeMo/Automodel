@@ -193,12 +193,18 @@ class MiniMaxM3TextModel(nn.Module):
         buffer_device = buffer_device or torch.device(
             f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
         )
+        # embed_tokens / norm / layers can be None under meta-device + PP/sharded
+        # init (the framework calls init_weights tolerating absent modules), so
+        # guard each (matching minimax_m2 / step3p7).
         with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight)
-            self.norm.reset_parameters()
+            if self.embed_tokens is not None:
+                nn.init.normal_(self.embed_tokens.weight)
+            if self.norm is not None:
+                self.norm.reset_parameters()
             self.rotary_emb.device = buffer_device
         for layer in self.layers.values():
-            layer.init_weights(buffer_device=buffer_device)
+            if layer is not None:
+                layer.init_weights(buffer_device=buffer_device)
         if self.mtp is not None:
             self.mtp.init_weights(buffer_device)
 
@@ -235,6 +241,10 @@ class MiniMaxM3TextModel(nn.Module):
 
 class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Standalone M3 text backbone for causal LM (Stage 1 parity target)."""
+
+    # The state-dict adapter loads every tensor from the checkpoint, so skip HF
+    # random init on load (also avoids DTensor-collective hangs under sharding/PP).
+    _skip_init_weights_on_load = True
 
     @classmethod
     def from_config(
@@ -343,6 +353,18 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     the text embeddings at ``image_token_index`` / ``video_token_index``
     positions, then run through the (sparse/dense MoE) language model + lm_head.
     """
+
+    # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
+    # features) instead of letting patch_hf_model_for_pp swap in the generic
+    # CausalLM forward (which would drop pixel_values). MTP per-depth outputs are
+    # logits (shared lm_head); rotary buffers stay fp32.
+    _keep_in_fp32_modules = ["rotary_emb"]
+    _pp_keep_self_forward: bool = True
+    mtp_outputs_are_logits = True
+    # The state-dict adapter fully populates every tensor from the checkpoint
+    # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
+    # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
+    _skip_init_weights_on_load = True
 
     @classmethod
     def from_config(
@@ -477,10 +499,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         )
         with buffer_device:
             self.model.init_weights(buffer_device=buffer_device)
-            final_out_std = self.config.text_config.hidden_size**-0.5
-            nn.init.trunc_normal_(
-                self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
-            )
+            if self.lm_head is not None:
+                final_out_std = self.config.text_config.hidden_size**-0.5
+                nn.init.trunc_normal_(
+                    self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
+                )
         cast_model_to_dtype(self, dtype)
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
