@@ -496,12 +496,16 @@ class GroupedExperts(nn.Module):
                 # Apply bias manually after each grouped GEMM via _apply_bias.
                 # _select_grouped_mm routes through torchao MXFP8 (with the contiguous-
                 # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
+                # MXFP8 path: bias-add + activation in fp32 (see _mxfp8_pre_bias) to avoid
+                # the bf16-bias + re-quantize blowup; bf16 path stays byte-identical.
                 grouped_mm = _select_grouped_mm(self.use_mxfp8, self.compile_experts)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
-                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                output1 = _apply_bias(_mxfp8_pre_bias(output1, self.use_mxfp8), gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
-                output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
+                output2 = _apply_bias(
+                    _mxfp8_pre_bias(output2, self.use_mxfp8), down_proj_bias, tokens_per_expert, permuted_probs
+                )
             else:
                 output2 = _torch_mm_experts_fwd(
                     permuted_x,
@@ -779,11 +783,21 @@ class GroupedExpertsDeepEP(nn.Module):
                     grouped_mm = _select_grouped_mm(self.use_mxfp8, self.compile_experts)
                     output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
-                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
+                    # MXFP8 path: add the bias and run the activation in FP32. torchao's
+                    # MXFP8 GEMM returns bf16; adding a bf16 bias and re-quantizing the
+                    # result to MXFP8 for the down GEMM is numerically fragile (the bias
+                    # can shift the per-block amax so the e8m0 scale overflows -> nan, seen
+                    # on gpt-oss). Doing the bias+activation in fp32 and casting back only
+                    # before the next quant keeps the values in range. bf16 path unchanged.
+                    output1 = _apply_bias(
+                        _mxfp8_pre_bias(output1, self.use_mxfp8), gate_up_proj_bias, tokens_per_expert
+                    )
                     output1 = self.expert_activation(output1, permuted_probs)
                     output2 = grouped_mm(output1, down_projs, offs)
                     down_bias = self.down_proj_bias.to_local()
-                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
+                    output2 = _apply_bias(
+                        _mxfp8_pre_bias(output2, self.use_mxfp8), down_bias, tokens_per_expert, permuted_probs
+                    )
                 else:
                     output2 = _torch_mm_experts_fwd(
                         permuted_local_hidden_states,
@@ -950,6 +964,18 @@ def _mxfp8_weight_relayout(B):
     as [E,K,N]) — also the column-major B_t layout torchao's grouped GEMM wants.
     """
     return B.transpose(-2, -1).contiguous().transpose(-2, -1)
+
+
+def _mxfp8_pre_bias(value, use_mxfp8):
+    """Upcast an MXFP8 grouped-GEMM output to fp32 before bias-add + activation.
+
+    Only on the mxfp8 path: the bias-add and activation then run in fp32, and the
+    result is cast back to bf16 only when it is re-quantized for the next GEMM. This
+    avoids the bf16-bias + re-quantize precision/scale blowup that nan'd gpt-oss
+    (expert_bias=True). On the bf16 path this is an identity (returns ``value``
+    unchanged), so that path stays byte-identical.
+    """
+    return value.float() if use_mxfp8 else value
 
 
 def _select_grouped_mm(use_mxfp8, compile_experts=False):
