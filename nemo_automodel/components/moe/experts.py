@@ -493,10 +493,13 @@ class GroupedExperts(nn.Module):
                 # torch._grouped_mm does not support bias yet (raises
                 # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                 # Apply bias manually after each grouped GEMM via _apply_bias.
-                output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
+                # _select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+                # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
+                grouped_mm = _select_grouped_mm(self.use_mxfp8)
+                output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
-                output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+                output2 = grouped_mm(output1, down_projs, offs)
                 output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
             else:
                 output2 = _torch_mm_experts_fwd(
@@ -767,12 +770,15 @@ class GroupedExpertsDeepEP(nn.Module):
                     # torch._grouped_mm does not support bias yet (raises
                     # "RuntimeError: Bias not supported yet" as of PyTorch 2.10).
                     # Apply bias manually after each grouped GEMM via _apply_bias.
+                    # _select_grouped_mm routes through torchao MXFP8 (with the contiguous-
+                    # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
                     offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
-                    output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
+                    grouped_mm = _select_grouped_mm(self.use_mxfp8)
+                    output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
                     output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                     output1 = self.expert_activation(output1, permuted_probs)
-                    output2 = torch._grouped_mm(output1, down_projs, offs=offs)
+                    output2 = grouped_mm(output1, down_projs, offs)
                     down_bias = self.down_proj_bias.to_local()
                     output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
                 else:
@@ -941,6 +947,26 @@ def _mxfp8_weight_relayout(B):
     return B.transpose(-2, -1).contiguous().transpose(-2, -1)
 
 
+def _select_grouped_mm(use_mxfp8):
+    """Return the grouped-GEMM callable ``grouped_mm(A, B, offs)`` for the expert GEMMs.
+
+    When ``use_mxfp8`` and the torchao MXFP8 kernel is usable on this device, returns a
+    wrapper that makes both operands contiguous in the layout torchao requires (A
+    contiguous; B relaid out so its transpose is contiguous — see _mxfp8_weight_relayout)
+    and routes through it. Otherwise returns the plain ``torch._grouped_mm`` fallback,
+    leaving the bf16 path byte-identical. Shared by the no-bias helper and the inline
+    bias paths so dispatch + relayout are defined once.
+    """
+    mxfp8_grouped_mm = _mxfp8_grouped_mm_or_none() if use_mxfp8 else None
+    if mxfp8_grouped_mm is None:
+        return _default_grouped_mm
+
+    def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
+        return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
+
+    return grouped_mm
+
+
 def _log_mxfp8_timing_once(A, B, offs, mxfp8_grouped_mm):
     """One-time rank-0 timing split (relayout vs torchao call) for DEBUG_MXFP8_TIMING.
 
@@ -976,36 +1002,24 @@ def _log_mxfp8_timing_once(A, B, offs, mxfp8_grouped_mm):
 def _torch_mm_experts_fwd(
     hidden_states, gate_and_up_projs, down_projs, tokens_per_expert, permuted_probs, activation_fn, use_mxfp8=False
 ):
+    # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
+    # operand it quantizes, unlike torch._grouped_mm. _select_grouped_mm returns a wrapper
+    # that makes A contiguous and relays out B (so its transpose is contiguous, the layout
+    # torchao wants); when mxfp8 is off it returns plain torch._grouped_mm (byte-identical).
     offs = tokens_per_expert.cumsum(dim=0).to(torch.int32)
-    mxfp8_grouped_mm = _mxfp8_grouped_mm_or_none() if use_mxfp8 else None
-    if mxfp8_grouped_mm is not None:
-        # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous()
-        # on each operand it quantizes, unlike torch._grouped_mm which tolerates
-        # non-contiguous inputs. The two operands need DIFFERENT layouts because torchao
-        # quantizes them differently (scaled_grouped_mm._MXFP8GroupedMM.forward):
-        #   * activation A: to_mx(A, ...) directly  -> A must be contiguous (2D row-major).
-        #   * weight B[E,K,N]: to_mx(B.transpose(-2,-1), ...) -> torchao transposes to
-        #     [E,N,K] FIRST, so B.contiguous() (row-major [E,K,N]) is NOT enough: its
-        #     transpose is non-contiguous and trips the assert. _mxfp8_weight_relayout
-        #     gives B the [E,N,K]-contiguous (viewed [E,K,N]) layout torchao wants.
-        # Values/shape are unchanged (only strides), so the GEMM result is identical.
-        # mxfp8 path only; never perturbs the torch._grouped_mm fallback.
-        timing = (
-            os.environ.get("DEBUG_MXFP8_TIMING") == "True"
-            and not _MXFP8_TIMING_LOGGED
-            and (not dist.is_initialized() or dist.get_rank() == 0)
-        )
-
-        def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
-            return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
-    else:
-        grouped_mm = _default_grouped_mm
-        timing = False
+    grouped_mm = _select_grouped_mm(use_mxfp8)
+    timing = (
+        use_mxfp8
+        and grouped_mm is not _default_grouped_mm
+        and os.environ.get("DEBUG_MXFP8_TIMING") == "True"
+        and not _MXFP8_TIMING_LOGGED
+        and (not dist.is_initialized() or dist.get_rank() == 0)
+    )
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
     output2 = grouped_mm(output1, down_projs, offs)
     if timing:
-        _log_mxfp8_timing_once(hidden_states, gate_and_up_projs, offs, mxfp8_grouped_mm)
+        _log_mxfp8_timing_once(hidden_states, gate_and_up_projs, offs, _mxfp8_grouped_mm_or_none())
     return output2
 
 
