@@ -22,22 +22,28 @@ would otherwise compute on the fly.
 
 from __future__ import annotations
 
+import json
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import LlamaConfig
 
+from nemo_automodel.components.datasets.llm import eagle3_cache as ec
 from nemo_automodel.components.datasets.llm.eagle3_cache import (
     CACHE_KEYS,
     CachedEagle3Dataset,
     build_cached_eagle3_dataloader,
+    existing_shard_indices,
+    manifest_path,
     read_manifest,
     read_target_embeddings,
     write_manifest,
     write_shard,
     write_target_embeddings,
 )
+from nemo_automodel.components.speculative import precompute_eagle3 as pe
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule, _compute_target_distribution
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.precompute_eagle3 import _build_parser, _compute_batch_cache, _validate_args
@@ -298,3 +304,186 @@ def test_parser_requires_core_args():
         ["--target-model", "m", "--input-data", "d", "--output-dir", "o", "--shard-size", "8", "--batch-size", "4"]
     )
     assert args.shard_size == 8 and args.batch_size == 4
+
+
+# ---------------------------------------------------------------------------
+# Producer end-to-end (`precompute_eagle3.main`) with the target/data faked,
+# so the orchestration loop -- token-map scan, shard flushing, trailing
+# partial shard, manifest, and the resume skip path -- runs on CPU.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTargetModel:
+    def __init__(self):
+        self.config = SimpleNamespace(vocab_size=_VOCAB, hidden_size=_HIDDEN)
+        self._embed = SimpleNamespace(weight=torch.randn(_VOCAB, _HIDDEN))
+
+    def to(self, device):
+        return self
+
+    def get_input_embeddings(self):
+        return self._embed
+
+
+class _FakeWrapper:
+    def __init__(self, model, aux_layer_ids=None):
+        self.aux_layer_ids = list(aux_layer_ids) if aux_layer_ids else [0, 1, 2]
+
+    def generate_batch(self, *, input_ids, attention_mask, loss_mask):
+        b, s = input_ids.shape
+        return SimpleNamespace(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            aux_hidden_states=torch.randn(b, s, _HIDDEN * len(self.aux_layer_ids)),
+            logits=torch.randn(b, s, _VOCAB),
+        )
+
+
+class _FakeDS:
+    def __init__(self, n):
+        self._n = n
+
+    def __len__(self):
+        return self._n
+
+
+class _FakeLoader:
+    def __init__(self, batches, num_samples):
+        self._batches = batches
+        self.dataset = _FakeDS(num_samples)
+
+    def __iter__(self):
+        return iter(self._batches)
+
+
+def _patch_producer(monkeypatch, *, num_samples, batch_size, seq_len=6):
+    """Patch the producer's model/tokenizer/dataloader so ``main`` runs on CPU."""
+    ids = torch.arange(_DRAFT_VOCAB, dtype=torch.long)
+    mask = torch.zeros(_VOCAB, dtype=torch.bool)
+    mask[ids] = True
+    batches, remaining = [], num_samples
+    while remaining > 0:
+        b = min(batch_size, remaining)
+        batches.append(
+            {
+                "input_ids": torch.randint(0, _VOCAB, (b, seq_len)),
+                "attention_mask": torch.ones(b, seq_len, dtype=torch.long),
+                "loss_mask": torch.ones(b, seq_len, dtype=torch.long),
+            }
+        )
+        remaining -= b
+    loader = _FakeLoader(batches, num_samples)
+    monkeypatch.setattr(pe, "NeMoAutoTokenizer", SimpleNamespace(from_pretrained=lambda *a, **k: SimpleNamespace()))
+    monkeypatch.setattr(
+        pe, "NeMoAutoModelForCausalLM", SimpleNamespace(from_pretrained=lambda *a, **k: _FakeTargetModel())
+    )
+    monkeypatch.setattr(pe, "HFEagle3TargetModel", _FakeWrapper)
+    monkeypatch.setattr(pe, "build_eagle3_dataloader", lambda **k: loader)
+    monkeypatch.setattr(pe, "build_eagle3_token_mapping", lambda *a, **k: (ids, mask))
+
+
+def _producer_argv(out_dir, *, extra=None):
+    argv = [
+        "--target-model",
+        "fake-target",
+        "--input-data",
+        "fake-data",
+        "--output-dir",
+        str(out_dir),
+        "--device",
+        "cpu",
+        "--batch-size",
+        "2",
+        "--shard-size",
+        "2",
+        "--draft-vocab-size",
+        str(_DRAFT_VOCAB),
+        "--seq-length",
+        "6",
+    ]
+    return argv + (extra or [])
+
+
+def test_producer_main_writes_full_sharded_cache(monkeypatch, tmp_path):
+    # 5 samples, shard_size 2 -> shards 0,1 full + shard 2 trailing partial.
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+
+    manifest = read_manifest(str(tmp_path))
+    assert manifest["num_samples"] == 5
+    assert manifest["draft_vocab_size"] == _DRAFT_VOCAB
+    assert manifest["aux_hidden_dim"] == _HIDDEN * 3
+    assert sorted(existing_shard_indices(str(tmp_path))) == [0, 1, 2]
+
+    ds = CachedEagle3Dataset(str(tmp_path))
+    assert len(ds) == 5
+    assert set(ds[0]) == set(CACHE_KEYS)
+    # negative index wraps; out-of-range raises (CachedEagle3Dataset.__getitem__).
+    torch.testing.assert_close(ds[-1]["input_ids"], ds[4]["input_ids"])
+    with pytest.raises(IndexError):
+        ds[99]
+
+
+def test_producer_main_resume_skips_existing_shards(monkeypatch, tmp_path):
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    shard0 = os.path.join(str(tmp_path), "shard-000000.safetensors")
+    mtime_before = os.path.getmtime(shard0)
+
+    # Re-running without --resume must refuse to clobber an existing cache.
+    with pytest.raises(ValueError, match="already has shards"):
+        pe.main(_producer_argv(tmp_path))
+
+    # With --resume every shard is already present, so the loop takes the skip
+    # branch and rewrites nothing.
+    _patch_producer(monkeypatch, num_samples=5, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path, extra=["--resume"])) == 0
+    assert sorted(existing_shard_indices(str(tmp_path))) == [0, 1, 2]
+    assert os.path.getmtime(shard0) == mtime_before
+
+
+# ---------------------------------------------------------------------------
+# Error / edge branches in eagle3_cache and the trainer module.
+# ---------------------------------------------------------------------------
+
+
+def test_producer_main_exact_multiple_no_trailing_shard(monkeypatch, tmp_path):
+    # 4 samples, shard_size 2 -> two full shards and a no-op trailing flush
+    # (buffered == 0), so no extra partial shard is written.
+    _patch_producer(monkeypatch, num_samples=4, batch_size=2)
+    assert pe.main(_producer_argv(tmp_path)) == 0
+    assert sorted(existing_shard_indices(str(tmp_path))) == [0, 1]
+    assert read_manifest(str(tmp_path))["num_samples"] == 4
+
+
+def test_existing_shard_indices_returns_empty_for_missing_dir(tmp_path):
+    assert existing_shard_indices(str(tmp_path / "does-not-exist")) == set()
+
+
+def test_read_manifest_missing_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="manifest not found"):
+        read_manifest(str(tmp_path))
+
+
+def test_read_manifest_wrong_format_version_raises(tmp_path):
+    with open(manifest_path(str(tmp_path)), "w") as f:
+        json.dump({"format_version": 999, "num_samples": 1, "shard_size": 1}, f)
+    with pytest.raises(ValueError, match="format_version"):
+        read_manifest(str(tmp_path))
+
+
+def test_write_shard_missing_fields_raises(tmp_path):
+    with pytest.raises(ValueError, match="missing required cache fields"):
+        write_shard(str(tmp_path), 0, {"input_ids": torch.zeros(1, 1, dtype=torch.long)})
+
+
+def test_load_safetensors_missing_raises(monkeypatch):
+    monkeypatch.setattr(ec, "safe_import_from", lambda *a, **k: (False, None))
+    with pytest.raises(ImportError, match="safetensors"):
+        ec._load_safetensors()
+
+
+def test_trainer_module_rejects_nonpositive_ttt_steps():
+    with pytest.raises(ValueError, match="ttt_steps"):
+        _build_module(ttt_steps=0)

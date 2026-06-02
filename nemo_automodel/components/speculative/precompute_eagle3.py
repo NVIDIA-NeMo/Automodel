@@ -124,9 +124,13 @@ def _run(args: argparse.Namespace) -> int:
     _validate_args(args)
     cache_dtype = DTYPE_MAP[args.dtype]
 
-    existing = existing_shard_indices(args.output_dir) if args.resume else set()
-    if existing and not args.resume:
+    # Probe for pre-existing shards regardless of ``--resume`` so the
+    # clobber guard can actually fire; only treat them as skippable when
+    # resuming.
+    present = existing_shard_indices(args.output_dir)
+    if present and not args.resume:
         raise ValueError(f"{args.output_dir} already has shards; pass --resume to continue or use a fresh dir.")
+    existing = present if args.resume else set()
     if existing:
         logger.info("Resume: %d shard(s) already present, will be skipped.", len(existing))
 
