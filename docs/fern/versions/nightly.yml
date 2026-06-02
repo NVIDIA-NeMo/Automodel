@@ -1,4 +1,10 @@
 navigation:
+  # Version-root landing page. slug: "" mounts index.mdx at the version root
+  # (/nightly) so it renders directly instead of auto-redirecting to the first
+  # section page — matching the old Sphinx site's /latest/index.html landing.
+  - page: "NeMo AutoModel Documentation"
+    path: ../../index.mdx
+    slug: ""
   - section: "Get Started"
     contents:
       - page: "About NeMo AutoModel"
@@ -352,7 +358,7 @@ navigation:
       - page: "Run on a Cluster"
         path: ../../launcher/slurm.mdx
         slug: slurm-cluster
-      - page: "Run with NeMo Run"
+      - page: "Run with NeMo-Run"
         path: ../../launcher/nemo-run.mdx
         slug: nemo-run
       - page: "Run on Any Cloud with SkyPilot"

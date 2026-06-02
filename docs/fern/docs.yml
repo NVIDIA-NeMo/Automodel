@@ -3,10 +3,11 @@ instances:
   custom-domain: docs.nvidia.com/nemo/automodel
 title: NVIDIA NeMo AutoModel
 
-# No landing-page / Home nav entry needed: Fern auto-redirects each version
-# root (e.g. /nemo/automodel/v0.4) to the FIRST page in that version's nav
-# (a 307), and our first page is "About NeMo AutoModel". So /v0.4,
-# /latest, /nightly all land on /<version>/get-started/about automatically.
+# Version-root landing: each version YAML's first nav entry is the index page
+# mounted with slug: "" (e.g. docs/index.mdx for nightly), so /nemo/automodel/v0.4,
+# /latest, and /nightly render the documentation landing page directly — matching
+# the old Sphinx site's /latest/index.html. The /<version>/index.html redirect
+# rules below point at the bare version root, which now serves that landing page.
 
 # Inherit NVIDIA branding (footer, colors, layout, fonts, NVIDIA logos+favicon,
 # OneTrust JS, theme CSS) from the central control repo at
