@@ -10,7 +10,7 @@ dist_env:
   timeout_minutes: 30
 
 model:
-  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
   # Required when peft block is present — triggers QKV unfuse before injection
   # and is passed to auto_diffusion_pipeline for model-specific setup.
   model_type: "wan"
@@ -27,9 +27,7 @@ peft:
   dropout: 0.0
   target_modules:
     - "*.to_q"
-    - "*.to_k"
     - "*.to_v"
-    - "*.to_out.0"
 
 optim:
   learning_rate: 5e-6
@@ -51,6 +49,7 @@ fsdp:
   pp_size: 1
   dp_replicate_size: 1
   dp_size: 8
+  activation_checkpointing: false
 
 flow_matching:
   adapter_type: "simple"

@@ -10,7 +10,7 @@ dist_env:
   timeout_minutes: 30
 
 model:
-  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
   mode: finetune  # "finetune" loads pretrained weights, "pretrain" initializes random weights
 
 step_scheduler:
@@ -72,6 +72,7 @@ fsdp:
   pp_size: 1
   dp_replicate_size: 1
   dp_size: 8
+  activation_checkpointing: false
   defer_fsdp_grad_sync: true
   enable_fsdp2_prefetch: true
   fsdp2_backward_prefetch_depth: 2
