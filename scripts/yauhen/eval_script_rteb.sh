@@ -1,13 +1,38 @@
 #!/bin/bash
 set -euo pipefail
 
+# python3 submit_nemo_run.py \
+#     --experiment_name eval_FA2_distill_2b \
+#     --num_nodes 1 \
+#     --checkpoint_directory /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints \
+#     --container_image /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh \
+#     --train_script ./scripts/yauhen/train_biencoder.sh \
+#     --yaml_config examples/retrieval/bi_encoder/ministral3b_instruct_release.yaml \
+#     --eval_script ./scripts/yauhen/eval_script_rteb.sh \
+#     --eval_datasets RTEB vidore_v3_complex_ocr text_embedding_eval MMTEB_RETRIEVAL_QUICK MTEB_ENG_RETRIEVAL \
+#     --more_train_args " \
+#         --optimizer.lr 2.0e-6 \
+#         --model.pooling last \
+#     " \
+#     --more_eval_args " \
+#         --max_length 4096 \
+#         --batch_size 4 \
+#         --pooling avg \
+#         --padding_side left \
+#         --precision bf16 \
+#         --attn_implementation flash_attention_2 \
+#         --model_name_or_path /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints/rteb-mse-w1-new-gbs256-8nodes-hardnegs-lr1e4-tnp10 \
+#     " \
+#     --num_training_rounds 0
+
 
 cd "/lustre/fs12/portfolios/llmservice/users/$SLURM_JOB_USER/git/nemo-retriever-research"
 
 echo "$HF_HOME"
 echo "$@"
 
-/opt/venv/bin/python -m pip install beir==2.0.0 mteb[xet]==2.10.0 polars==1.35.2
+# /opt/venv/bin/python -m pip install beir==2.0.0 mteb[xet]==2.10.0 polars==1.35.2
+/opt/venv/bin/python -m pip install beir==2.0.0 polars==1.35.2 -e "/lustre/fsw/portfolios/llmservice/users/ybabakhin/git/codex/mteb"
 # On top of 25.11 image
 # /opt/venv/bin/python -m pip install "sentence-transformers>=2.0.0,<4.0.0" beir==2.0.0 mteb[xet]==2.10.0 polars==1.35.2
 # /opt/venv/bin/python -m pip install --upgrade peft
@@ -21,6 +46,20 @@ echo "Detected $NUM_GPUS GPUs"
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
+model_log_suffix() {
+    local model_path="${1%/}"
+    local name
+    name="$(basename "$model_path")"
+
+    while [[ "$name" == "consolidated" || "$name" == "model" || "$name" == "LATEST" ]]; do
+        model_path="$(dirname "$model_path")"
+        name="$(basename "$model_path")"
+    done
+
+    name="${name//[^A-Za-z0-9_.-]/_}"
+    printf "_%s" "$name"
+}
+
 # Parse --eval_type and --model_name_or_path from arguments, pass everything else through
 EVAL_TYPE="mteb"
 MODEL_SUFFIX=""
@@ -32,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --model_name_or_path)
-            MODEL_SUFFIX="_$(basename "$2")"
+            MODEL_SUFFIX="$(model_log_suffix "$2")"
             PASS_THROUGH_ARGS+=("$1" "$2")
             shift 2
             ;;
@@ -120,7 +159,7 @@ case "$EVAL_TYPE" in
             --part="$i" \
             --total_parts="$NUM_GPUS" \
             --max_length 4096 \
-            --embedding_dim 16384 \
+            --embedding_dim 4096 \
             --batch_size 4 \
             --model_type HF \
             --precision bf16 \
@@ -140,7 +179,7 @@ case "$EVAL_TYPE" in
         torchrun --nproc_per_node="$NUM_GPUS" --master_port=29510 \
             src/nemo_retriever_research/evaluation/embedding_eval.py \
             --max_length 4096 \
-            --embedding_dim 16384 \
+            --embedding_dim 4096 \
             --batch_size 4 \
             --model_type HF \
             --precision bf16 \
