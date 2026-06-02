@@ -50,6 +50,7 @@ from nemo_automodel.components.training.step_scheduler import StepSchedulerConfi
 if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
@@ -91,6 +92,19 @@ def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
     if hasattr(cfg, "instantiate"):
         return cfg.instantiate, {}
     raise AttributeError("Config must provide _target_, be callable, or provide instantiate()")
+
+
+def _target_kwargs(node: Any) -> tuple[Any, dict[str, Any]]:
+    """``(target, kwargs)`` for a loader ``make_*`` resolver from a config node.
+
+    ``None`` → ``(None, {})``; a bare string (a ``make_*`` registry key or dotted path) → ``(node, {})``;
+    otherwise a ``_target_`` section resolved via :func:`_callable_and_kwargs`.
+    """
+    if node is None:
+        return None, {}
+    if isinstance(node, str):
+        return node, {}
+    return _callable_and_kwargs(node)
 
 
 def _model_name_from_cfg(cfg_model: Any) -> str | None:
@@ -157,6 +171,81 @@ class RecipeConfig:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def dataloader(self) -> "DataloaderConfig" | None:
+        from nemo_automodel.components.datasets.loader import (
+            build_dataloader_config,
+            make_collate_fn,
+            make_dataset_config,
+            make_packing_config,
+        )
+
+        node = self._raw.get("dataset", None)
+        if node is None:
+            return None
+        target, ds_kwargs = _callable_and_kwargs(node)
+        ds_kwargs.pop("tokenizer", None)  # tokenizer is a runtime build() arg, not a construct kwarg
+        # Resolve dataset._target_ to a typed <Name>Config (or a back-compat shim for a pre-Config target).
+        dataset_config = make_dataset_config(target, ds_kwargs)
+        dl = _as_dict(self._raw.get("dataloader", None))
+        # collate_fn resolves to a callable via a loader-side ``make_*`` registry resolver (registry key /
+        # dotted path / callable). Sampling is not configurable here — every dataset (Megatron included) uses
+        # the dataloader's default distributed / length-grouped sampler.
+        collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
+        ps = _as_dict(self._raw.get("packed_sequence", None))
+        packing = None
+        if ps.get("packed_sequence_size", 0) > 0:
+            packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
+        return build_dataloader_config(
+            dataset_config,
+            dataloader=dl,
+            packing=packing,
+            collate_fn=collate,
+            seed=self._raw.get("seed", 42),
+            local_batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
+        )
+
+    @cached_property
+    def validation_dataloaders(self) -> dict[str, "DataloaderConfig"]:
+        """One :class:`DataloaderConfig` per ``validation_dataset*`` block (mirrors :meth:`dataloader`)."""
+        from nemo_automodel.components.datasets.loader import (
+            build_dataloader_config,
+            make_collate_fn,
+            make_dataset_config,
+            make_packing_config,
+        )
+
+        def _name(key: str) -> str:
+            key = key.replace("validation_dataset", "")
+            if len(key) > 1 and key[0] in ("_", "-", "."):
+                key = key[1:]
+            return key or "default"
+
+        val_dl_node = self._raw.get("validation_dataloader", None)
+        ps = _as_dict(self._raw.get("packed_sequence", None))
+        packing = None
+        if ps.get("packed_sequence_size", 0) > 0:
+            packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
+        out: dict[str, Any] = {}
+        for key in filter(lambda k: k.startswith("validation_dataset"), self._raw.to_dict().keys()):
+            node = self._raw.get(key, None)
+            if node is None:
+                continue
+            target, ds_kwargs = _callable_and_kwargs(node)
+            ds_kwargs.pop("tokenizer", None)
+            dataset_config = make_dataset_config(target, ds_kwargs)
+            dl = _as_dict(val_dl_node)
+            collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
+            out[_name(key)] = build_dataloader_config(
+                dataset_config,
+                dataloader=dl,
+                packing=packing,
+                collate_fn=collate,
+                seed=self._raw.get("seed", 42),
+                local_batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
+            )
+        return out
 
     @cached_property
     def loss_fn(self) -> "LossConfig" | None:

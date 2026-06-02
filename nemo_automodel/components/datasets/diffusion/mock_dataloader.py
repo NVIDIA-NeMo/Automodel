@@ -19,10 +19,48 @@ tensors with the correct shapes for WAN 2.1 training, allowing functional
 tests to run without requiring real data.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+
+@dataclass
+class MockWanDatasetConfig:
+    """Construction-time configuration for :class:`MockWanDataset`."""
+
+    length: int = 1024
+    """Number of samples in the dataset."""
+    num_channels: int = 16
+    """Number of latent channels."""
+    num_frame_latents: int = 16
+    """Number of temporal latent frames."""
+    spatial_h: int = 30
+    """Height of spatial latents."""
+    spatial_w: int = 52
+    """Width of spatial latents."""
+    text_seq_len: int = 77
+    """Length of text sequence."""
+    text_embed_dim: int = 4096
+    """Dimension of text embeddings."""
+    device: str = "cpu"
+    """Device to place tensors on."""
+
+    def build(self) -> "MockWanDataset":
+        """Build a :class:`MockWanDataset` from this :class:`MockWanDatasetConfig`."""
+        return MockWanDataset(
+            length=self.length,
+            num_channels=self.num_channels,
+            num_frame_latents=self.num_frame_latents,
+            spatial_h=self.spatial_h,
+            spatial_w=self.spatial_w,
+            text_seq_len=self.text_seq_len,
+            text_embed_dim=self.text_embed_dim,
+            device=self.device,
+        )
 
 
 class MockWanDataset(Dataset):

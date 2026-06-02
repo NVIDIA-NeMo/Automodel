@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
 
 from datasets import load_dataset
 
@@ -134,3 +137,36 @@ def make_squad_dataset(
 
     # map the dataset
     return LazyMappedDataset(dataset, fmt_fn)
+
+
+@dataclass
+class SquadConfig:
+    """Construction-time configuration for the SQuAD dataset (tokenizer is a build arg)."""
+
+    seq_length: int | None = None
+    """If set, pad/truncate each example to this length."""
+    limit_dataset_samples: int | None = None
+    """If set, limit the number of examples loaded from the split."""
+    fp8: bool = False
+    """Flag reserved for future mixed-precision use (currently unused)."""
+    split: str = "train"
+    """Which split of the dataset to load (e.g. ``train``, ``validation``)."""
+    dataset_name: str = "squad"
+    """Identifier for the HuggingFace dataset to load."""
+    padding: bool | str = False
+    """Optional padding strategy."""
+    truncation: bool | str = False
+    """Optional truncation strategy."""
+
+    def build(self, *, tokenizer) -> LazyMappedDataset:
+        """Build the SQuAD :class:`LazyMappedDataset` from this :class:`SquadConfig` and a runtime tokenizer."""
+        return make_squad_dataset(
+            tokenizer=tokenizer,
+            seq_length=self.seq_length,
+            limit_dataset_samples=self.limit_dataset_samples,
+            fp8=self.fp8,
+            split=self.split,
+            dataset_name=self.dataset_name,
+            padding=self.padding,
+            truncation=self.truncation,
+        )
