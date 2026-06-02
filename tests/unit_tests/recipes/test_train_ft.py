@@ -31,7 +31,6 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
-from nemo_automodel.components.datasets.loader import Dataloader
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import _as_dict, _callable_and_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
@@ -64,7 +63,7 @@ def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft):
     return CheckpointingConfig(**{**derived, **kwargs})
 
 
-class DummyIterableDataset(IterableDataset, Dataloader):  # noqa: D401
+class DummyIterableDataset(IterableDataset):  # noqa: D401
     """Minimal iterable dataset with shard/shuffle hooks for testing build_dataloader."""
 
     def __init__(self, items=None, num_shards=1, tokenizer=None, **kwargs):
@@ -490,8 +489,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
     # Lightweight distributed/env/logging
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.apply_cache_compatibility_patches", lambda: None)
@@ -832,8 +831,8 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
 
     # Minimal stubs so we can create the recipe
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
 
@@ -1673,8 +1672,8 @@ class TestRunTrainOptimStepSetsMoEScale:
             }
         )
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.build_distributed",
-            lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+            "nemo_automodel.recipes.llm.train_ft.initialize_distributed",
+            lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)

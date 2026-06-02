@@ -2032,29 +2032,6 @@ class TestForwardBackwardStepPP:
 class TestFinetuneRecipeSetup:
     """Tests for FinetuneRecipeForVLM.setup() method components."""
 
-    def test_setup_initializes_dist_env(self, monkeypatch):
-        """Test that setup initializes distributed environment."""
-        from nemo_automodel.recipes.vlm.finetune import build_distributed
-
-        mock_dist_info = SimpleNamespace(
-            rank=0,
-            world_size=1,
-            local_rank=0,
-            is_main=True,
-            device=torch.device("cpu"),
-        )
-
-        monkeypatch.setattr(
-            "nemo_automodel.components.distributed.init_utils.initialize_distributed",
-            lambda backend, timeout_minutes: mock_dist_info,
-        )
-
-        dist_env = build_distributed({"backend": "gloo", "timeout_minutes": 5})
-
-        assert dist_env.rank == 0
-        assert dist_env.world_size == 1
-        assert dist_env.is_main is True
-
     def test_setup_pp_config_validation(self):
         """Test PP configuration validation in setup."""
         # Create minimal config that would fail PP validation
@@ -2499,8 +2476,8 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
 def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     """Patch heavy dependencies so FinetuneRecipeForVLM.setup() runs lightly."""
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.build_distributed",
-        lambda cfg: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
+        "nemo_automodel.recipes.vlm.finetune.initialize_distributed",
+        lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.apply_cache_compatibility_patches", lambda: None)
