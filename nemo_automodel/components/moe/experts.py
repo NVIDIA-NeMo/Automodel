@@ -496,16 +496,16 @@ class GroupedExperts(nn.Module):
                 # Apply bias manually after each grouped GEMM via _apply_bias.
                 # _select_grouped_mm routes through torchao MXFP8 (with the contiguous-
                 # operand relayout) when use_mxfp8, else plain torch._grouped_mm.
-                # MXFP8 path: bias-add + activation in fp32 (see _mxfp8_pre_bias) to avoid
-                # the bf16-bias + re-quantize blowup; bf16 path stays byte-identical.
+                # MXFP8: the grouped_mm wrapper clamps its quant input (see
+                # _select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+                # block scale -> nan. The bias-add stays a bf16 separate add (torchao
+                # v0.17.0 has no bias arg). bf16 path byte-identical.
                 grouped_mm = _select_grouped_mm(self.use_mxfp8, self.compile_experts)
                 output1 = grouped_mm(permuted_x, gate_and_up_projs, offs)
-                output1 = _apply_bias(_mxfp8_pre_bias(output1, self.use_mxfp8), gate_up_proj_bias, tokens_per_expert)
+                output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation_grouped(output1, permuted_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
-                output2 = _apply_bias(
-                    _mxfp8_pre_bias(output2, self.use_mxfp8), down_proj_bias, tokens_per_expert, permuted_probs
-                )
+                output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
             else:
                 output2 = _torch_mm_experts_fwd(
                     permuted_x,
@@ -783,21 +783,15 @@ class GroupedExpertsDeepEP(nn.Module):
                     grouped_mm = _select_grouped_mm(self.use_mxfp8, self.compile_experts)
                     output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
                     gate_up_proj_bias = self.gate_up_proj_bias.to_local()
-                    # MXFP8 path: add the bias and run the activation in FP32. torchao's
-                    # MXFP8 GEMM returns bf16; adding a bf16 bias and re-quantizing the
-                    # result to MXFP8 for the down GEMM is numerically fragile (the bias
-                    # can shift the per-block amax so the e8m0 scale overflows -> nan, seen
-                    # on gpt-oss). Doing the bias+activation in fp32 and casting back only
-                    # before the next quant keeps the values in range. bf16 path unchanged.
-                    output1 = _apply_bias(
-                        _mxfp8_pre_bias(output1, self.use_mxfp8), gate_up_proj_bias, tokens_per_expert
-                    )
+                    # MXFP8: the grouped_mm wrapper clamps its quant input (see
+                    # _select_grouped_mm) so a bias-shifted value can't overflow the e8m0
+                    # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
+                    # separate add (torchao v0.17.0 has no bias arg). bf16 path unchanged.
+                    output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                     output1 = self.expert_activation(output1, permuted_probs)
                     output2 = grouped_mm(output1, down_projs, offs)
                     down_bias = self.down_proj_bias.to_local()
-                    output2 = _apply_bias(
-                        _mxfp8_pre_bias(output2, self.use_mxfp8), down_bias, tokens_per_expert, permuted_probs
-                    )
+                    output2 = _apply_bias(output2, down_bias, tokens_per_expert, permuted_probs)
                 else:
                     output2 = _torch_mm_experts_fwd(
                         permuted_local_hidden_states,
@@ -966,16 +960,24 @@ def _mxfp8_weight_relayout(B):
     return B.transpose(-2, -1).contiguous().transpose(-2, -1)
 
 
-def _mxfp8_pre_bias(value, use_mxfp8):
-    """Upcast an MXFP8 grouped-GEMM output to fp32 before bias-add + activation.
+# Finite magnitude to clamp MXFP8 quant inputs to. torchao's to_mx derives a per-block
+# e8m0 scale from the block amax; a bias-shifted value with a huge amax overflows that
+# exponent and yields nan (observed on gpt-oss, expert_bias=True). Activations here are
+# O(1)–O(100) after the clamped swiglu, so ±1e4 is ample headroom that never distorts
+# normal training but caps pathological values below the overflow regime. Kept in the
+# input dtype (bf16) — no upcast — so it never trips bf16-only activation kernels.
+_MXFP8_QUANT_CLAMP = 1.0e4
 
-    Only on the mxfp8 path: the bias-add and activation then run in fp32, and the
-    result is cast back to bf16 only when it is re-quantized for the next GEMM. This
-    avoids the bf16-bias + re-quantize precision/scale blowup that nan'd gpt-oss
-    (expert_bias=True). On the bf16 path this is an identity (returns ``value``
-    unchanged), so that path stays byte-identical.
+
+def _mxfp8_clamp_quant_input(A):
+    """Sanitize an MXFP8 grouped-GEMM activation operand before to_mx quantization.
+
+    Replaces any nan/inf and clamps to ±_MXFP8_QUANT_CLAMP so a bias-shifted value can't
+    overflow the per-block e8m0 scale -> nan. Preserves dtype (no upcast). Only called on
+    the mxfp8 path; the bf16 fallback never sees it.
     """
-    return value.float() if use_mxfp8 else value
+    A = torch.nan_to_num(A, nan=0.0, posinf=_MXFP8_QUANT_CLAMP, neginf=-_MXFP8_QUANT_CLAMP)
+    return A.clamp(min=-_MXFP8_QUANT_CLAMP, max=_MXFP8_QUANT_CLAMP)
 
 
 def _select_grouped_mm(use_mxfp8, compile_experts=False):
@@ -1001,7 +1003,10 @@ def _select_grouped_mm(use_mxfp8, compile_experts=False):
     else:
 
         def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
-            return _fn(A.contiguous(), _mxfp8_weight_relayout(B), offs)
+            # Clamp the activation operand before to_mx so a bias-shifted value can't
+            # overflow the per-block e8m0 scale -> nan (gpt-oss bias path). Weights are
+            # bounded init values, so only A is sanitized.
+            return _fn(_mxfp8_clamp_quant_input(A).contiguous(), _mxfp8_weight_relayout(B), offs)
 
     if compile_experts:
         # Cache the compiled callable on the behavior key (mxfp8 active or not) — NOT on
