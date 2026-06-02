@@ -281,9 +281,7 @@ class ModelSupports:
         CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``)."""
         if self.cp_size <= 1:
             return self.supports_sequence_packing
-        return self.supports_sequence_packing and (
-            _uses_te_attention(self._model) or _uses_magi_attention(self._model)
-        )
+        return self.supports_sequence_packing and (_uses_te_attention(self._model) or _uses_magi_attention(self._model))
 
 
 def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
