@@ -1,6 +1,9 @@
 navigation:
   - section: "Get Started"
     contents:
+      # Slug-less first page → serves at the version root (see nightly.yml).
+      - page: "Home"
+        path: ./v0.4/pages/index.mdx
       - page: "About NeMo AutoModel"
         path: ./v0.4/pages/about/index.mdx
         slug: about

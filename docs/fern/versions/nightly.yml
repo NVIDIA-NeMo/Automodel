@@ -1,6 +1,11 @@
 navigation:
   - section: "Get Started"
     contents:
+      # Slug-less first page → serves at the version root (/nightly, /latest,
+      # /v0.4) and is the target of the docs.yml index.html/index redirects.
+      # Without it the version-root URL 404s. Mirrors the NeMo Gym pattern.
+      - page: "Home"
+        path: ../../index.mdx
       - page: "About NeMo AutoModel"
         path: ../../about/index.mdx
         slug: about
