@@ -336,6 +336,88 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
     return False
 
 
+def _detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
+    """Detect KV-sharing and disable ``use_cache`` for non-KV-shared models.
+
+    Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from earlier
+    layers to later layers through the ``DynamicCache``; disabling the cache
+    breaks that dependency, so ``use_cache`` is left untouched for them.
+
+    Returns:
+        bool: Whether the model uses KV-sharing.
+    """
+    text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
+    has_kv_sharing = getattr(text_cfg, "num_kv_shared_layers", 0) > 0
+    if not has_kv_sharing:
+        if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
+            try:
+                model.config.use_cache = False
+            except Exception:
+                pass
+    return has_kv_sharing
+
+
+def _apply_selective_checkpointing_to_layers(
+    model: nn.Module,
+    layers: List[nn.Module],
+    has_kv_sharing: bool,
+    *,
+    enable_compile: bool = False,
+) -> None:
+    """Wrap whole transformer blocks with the selective-AC policy.
+
+    KV-shared models cannot checkpoint attention through the ``DynamicCache``,
+    so they fall back to sub-module checkpointing. ``layers`` is mutated in
+    place so callers that retain the list (e.g. for subsequent FSDP sharding)
+    see the wrapped modules. Works without FSDP/distributed, so it is shared by
+    the FSDP2 strategy and the single-GPU path.
+    """
+    if has_kv_sharing:
+        logger.warning(
+            "Selective activation checkpointing is not supported for KV-shared models; "
+            "falling back to sub-module activation checkpointing."
+        )
+        _apply_submodule_checkpointing(layers, has_kv_sharing)
+        return
+
+    # With compile, the per-layer compile step compiles these wrappers OUTER so
+    # the SAC policy is traced and respected by the partitioner; disable dynamo's
+    # LRU cache to keep graph selection stable across pipeline microbatches.
+    if enable_compile:
+        _disable_dynamo_lru_cache()
+    context_fn = _make_selective_checkpoint_context_fn()
+    for i, layer in enumerate(layers):
+        wrapped_layer = checkpoint_wrapper(
+            layer,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=context_fn,
+            preserve_rng_state=True,
+        )
+        setattr(wrapped_layer, _SELECTIVE_AC_WRAPPER_FLAG, True)
+        if not _replace_child_module(model, layer, wrapped_layer):
+            logger.warning("Could not replace layer %d with selective activation checkpoint wrapper.", i)
+        layers[i] = wrapped_layer
+
+
+def apply_selective_activation_checkpointing(model: nn.Module, *, enable_compile: bool = False) -> None:
+    """Apply selective activation checkpointing to ``model`` end to end.
+
+    Standalone entry point (detects KV-sharing, disables ``use_cache``, and
+    wraps transformer blocks) for paths where the FSDP2 parallelize flow is
+    skipped -- notably single-GPU training.
+
+    Args:
+        model: The model to checkpoint.
+        enable_compile: Whether per-layer ``torch.compile`` will be applied.
+    """
+    layers = _extract_model_layers(model)
+    if not layers:
+        logger.warning("No transformer layers found; skipping selective activation checkpointing.")
+        return
+    has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
+    _apply_selective_checkpointing_to_layers(model, layers, has_kv_sharing, enable_compile=enable_compile)
+
+
 class ParallelizationStrategy(ABC):
     """Abstract base class for model parallelization strategies."""
 
@@ -444,45 +526,10 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
 
         # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
-            # Models with KV-shared layers (e.g. Gemma4 2B/4B) pass K/V from
-            # earlier layers to later layers through the DynamicCache.  Disabling
-            # the cache breaks this architectural dependency, so we must keep
-            # use_cache=True for those models.
-            _text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
-            _has_kv_sharing = getattr(_text_cfg, "num_kv_shared_layers", 0) > 0
+            _has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
-            if not _has_kv_sharing:
-                if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-                    try:
-                        model.config.use_cache = False
-                    except Exception:
-                        pass
-
-            if _is_selective_activation_checkpointing(activation_checkpointing) and not _has_kv_sharing:
-                # With compile, the per-layer compile step (run after sharding)
-                # compiles these wrappers OUTER so the SAC policy is traced and
-                # respected by the partitioner; disable dynamo's LRU cache to
-                # keep graph selection stable across pipeline microbatches.
-                if enable_compile:
-                    _disable_dynamo_lru_cache()
-                context_fn = _make_selective_checkpoint_context_fn()
-                for i, layer in enumerate(layers):
-                    wrapped_layer = checkpoint_wrapper(
-                        layer,
-                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                        context_fn=context_fn,
-                        preserve_rng_state=True,
-                    )
-                    setattr(wrapped_layer, _SELECTIVE_AC_WRAPPER_FLAG, True)
-                    if not _replace_child_module(model, layer, wrapped_layer):
-                        logger.warning("Could not replace layer %d with selective activation checkpoint wrapper.", i)
-                    layers[i] = wrapped_layer
-            elif _is_selective_activation_checkpointing(activation_checkpointing):
-                logger.warning(
-                    "Selective activation checkpointing is not supported for KV-shared models; "
-                    "falling back to the existing activation checkpointing behavior."
-                )
-                _apply_submodule_checkpointing(layers, _has_kv_sharing)
+            if _is_selective_activation_checkpointing(activation_checkpointing):
+                _apply_selective_checkpointing_to_layers(model, layers, _has_kv_sharing, enable_compile=enable_compile)
             elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA

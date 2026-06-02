@@ -31,7 +31,7 @@ distributed:
   activation_checkpointing: selective
 ```
 
-Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on non-EP FSDP2 configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
+Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on non-EP FSDP2 configs (including single-GPU runs). Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
 
 ### Configure Programmatically
 ```python

@@ -1703,6 +1703,55 @@ class TestSelectiveCheckpointCompile:
         parallelizer._disable_dynamo_lru_cache()  # should not raise
 
 
+class TestSingleGpuActivationCheckpointing:
+    """FSDP2Manager single-GPU (world_size==1) activation-checkpointing behavior."""
+
+    def _make_manager(self, monkeypatch, activation_checkpointing):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+        config = FSDP2Config(activation_checkpointing=activation_checkpointing)
+        return fsdp2_mod.FSDP2Manager(config, device_mesh=MagicMock())
+
+    def test_selective_wraps_layers_on_single_gpu(self, monkeypatch):
+        """Selective AC is honored on a single GPU (not silently full-checkpointed)."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        from nemo_automodel.components.distributed.parallelizer import _SELECTIVE_AC_WRAPPER_FLAG
+
+        manager = self._make_manager(monkeypatch, "selective")
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        manager.parallelize(model)
+
+        for layer in model.model.layers:
+            assert isinstance(layer, CheckpointWrapper)
+            assert getattr(layer, _SELECTIVE_AC_WRAPPER_FLAG, False) is True
+        assert model.config.use_cache is False
+
+    def test_selective_kv_sharing_falls_back_on_single_gpu(self, monkeypatch):
+        """KV-shared models fall back to sub-module checkpointing, not whole-block."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        manager = self._make_manager(monkeypatch, "selective")
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        manager.parallelize(model)
+
+        for layer in model.model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert isinstance(layer.mlp, CheckpointWrapper)
+            assert not isinstance(layer.self_attn, CheckpointWrapper)
+
+    def test_full_uses_hf_gradient_checkpointing_on_single_gpu(self, monkeypatch):
+        """Non-selective AC still uses HF gradient_checkpointing_enable on a single GPU."""
+        manager = self._make_manager(monkeypatch, True)
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.gradient_checkpointing_enable = MagicMock()
+        manager.parallelize(model)
+
+        model.gradient_checkpointing_enable.assert_called_once()
+
+
 class TestSelectiveCheckpointSaveOps:
     """Tests for the TorchTitan-style save-op set used by selective AC."""
 
