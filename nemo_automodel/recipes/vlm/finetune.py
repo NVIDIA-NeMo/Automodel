@@ -36,8 +36,6 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
-from megatron_fsdp import MegatronFSDP
-from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
@@ -96,6 +94,13 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
+
+try:
+    from megatron_fsdp import MegatronFSDP
+    from megatron_fsdp.fully_shard import fully_shard_optimizer
+except (ImportError, FileNotFoundError, OSError):
+    MegatronFSDP = None
+    fully_shard_optimizer = None
 
 # ---------------------------
 #  Stateless helper functions
