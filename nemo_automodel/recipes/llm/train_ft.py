@@ -1400,6 +1400,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if getattr(self, "magi_enabled", False):
             # MagiAttention does its own CP sharding (sequence dispatch) inside
             # magi_prepare_batch; skip the torch-native DTensor CP context here.
+            # With THD sequence packing, still run the THD conversion (cp=1, no
+            # sharding) so the batch carries cu_seqlens -> the magi attn_func builds
+            # the per-document block-diagonal mask instead of one full-causal block.
+            if _uses_thd_collater(self.cfg.dataloader):
+                _, batch = make_cp_batch_and_ctx(
+                    self.device_mesh,
+                    batch,
+                    use_te=True,
+                    padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+                    num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
+                )
             train_ctx = nullcontext
         else:
             train_ctx, batch = make_cp_batch_and_ctx(
