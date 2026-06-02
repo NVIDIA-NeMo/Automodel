@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Full-FT English ASR of Qwen/Qwen2.5-Omni-3B on the AMI meeting corpus.
+# Full-FT English ASR of Qwen/Qwen2.5-Omni-3B on a six-corpus English mix
+# (AMI + earnings22 + voxpopuli_en + gigaspeech + spgispeech + librispeech).
+#
+# NOTE: gigaspeech and spgispeech are gated on the Hugging Face Hub. Accept
+# their dataset terms (and allow trust_remote_code for gigaspeech) before
+# launching, or trim the mix by passing a `dataset.sources` subset.
 
 recipe: FinetuneRecipeForVLM
 
@@ -21,7 +26,7 @@ step_scheduler:
   local_batch_size: 8
   ckpt_every_steps: 200
   num_epochs: 1
-  max_steps: 2000             # safety cap; epoch typically exhausts first
+  max_steps: 8000             # safety cap (~1 epoch of the ~500k-sample mix at GBS 64)
 
 dist_env:
   backend: nccl
@@ -45,7 +50,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: result/checkpoints/qwen2_5_omni_asr_ami
+  checkpoint_dir: result/checkpoints/qwen2_5_omni_asr_multi_en
   model_save_format: safetensors
   save_consolidated: true
 
@@ -57,7 +62,7 @@ distributed:
   sequence_parallel: false
 
 # Full fine-tune: audio tower + language model trainable; vision tower frozen
-# (we never feed images on AMI).
+# (we never feed images on these English ASR corpora).
 freeze_config:
   freeze_embeddings: false
   freeze_vision_tower: true
@@ -70,18 +75,17 @@ loss_fn:
 # Conversation shape (per sample):
 #   user(  text=user_prompt + audio=<waveform>  )
 #   assistant(  text=<transcript>  )
+#
+# The builder owns the six-source list, the prototype-faithful transcript
+# normalization, and the torchcodec-free soundfile decode; it needs no
+# path_or_dataset / name here.
 dataset:
-  _target_: nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset
-  path_or_dataset: edinburghcstr/ami
-  name: ihm
-  split: train
-  audio_column: audio
-  text_column: text
+  _target_: nemo_automodel.components.datasets.audio.multi_en.make_multi_en_asr_dataset
   sampling_rate: 16000
   system_prompt: null
   user_prompt: >-
-    Transcribe the following English meeting audio verbatim. Output only the
-    raw transcript text with no leading or trailing commentary.
+    Transcribe the following English audio verbatim. Output only the raw
+    transcript text with no leading or trailing commentary.
   # Qwen-Omni's Whisper feature extractor has a known off-by-one between
   # ``input_features`` and ``feature_attention_mask`` on sub-second clips.
   # Filtering at 1.0 s costs only the header-only sf.info probe per sample.
@@ -101,8 +105,8 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
-  project: ${oc.env:WANDB_PROJECT,qwen2_5-omni-asr-ami}
-  name: ${oc.env:WANDB_NAME,qwen2_5_omni_3b_asr_ami_fullft}
+  project: ${oc.env:WANDB_PROJECT,qwen2_5-omni-asr-multi-en}
+  name: ${oc.env:WANDB_NAME,qwen2_5_omni_3b_asr_multi_en_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:

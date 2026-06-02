@@ -20,7 +20,7 @@ The workflow has two stages:
 
 ### Built-In Builder: `make_hf_audio_asr_dataset`
 
-`nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`
+`nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset`
 returns a Hugging Face `Dataset` whose `__getitem__` lazily produces a single
 `{"conversation": [...]}` dict suitable for `qwen3_omni_asr_collate_fn`. Key
 design points:
@@ -62,7 +62,7 @@ dataset = make_hf_audio_asr_dataset(
 
 ### Built-In Collate: `qwen3_omni_asr_collate_fn`
 
-`nemo_automodel.components.datasets.vlm.collate_fns.qwen3_omni_asr_collate_fn`
+`nemo_automodel.components.datasets.audio.collate_fns.qwen3_omni_asr_collate_fn`
 batches the lazy samples into model inputs without depending on
 `qwen_omni_utils`:
 
@@ -98,7 +98,7 @@ YAML override snippet for CommonVoice (note `text_column: sentence`):
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
+  _target_: nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset
   path_or_dataset: mozilla-foundation/common_voice_18_0
   name: en
   text_column: sentence

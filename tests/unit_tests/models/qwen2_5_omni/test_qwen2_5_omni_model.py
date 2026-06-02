@@ -97,10 +97,8 @@ def test_marker_processor_set_includes_qwen2_5_omni(processor_name):
 
 
 def test_collate_fn_dispatch_includes_qwen2_5_omni():
-    from nemo_automodel.components.datasets.vlm.collate_fns import (
-        COLLATE_FNS,
-        qwen2_5_omni_asr_collate_fn,
-    )
+    from nemo_automodel.components.datasets.audio.collate_fns import qwen2_5_omni_asr_collate_fn
+    from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 
     assert COLLATE_FNS.get("Qwen2_5OmniProcessor") is qwen2_5_omni_asr_collate_fn
 
@@ -109,7 +107,7 @@ def test_collate_fn_is_alias_of_qwen3_omni_asr():
     """``qwen2_5_omni_asr_collate_fn`` must delegate to ``qwen3_omni_asr_collate_fn`` for processor-agnostic logic."""
     from unittest.mock import MagicMock
 
-    from nemo_automodel.components.datasets.vlm import collate_fns as cf
+    from nemo_automodel.components.datasets.audio import collate_fns as cf
 
     sentinel = object()
     captured = {}

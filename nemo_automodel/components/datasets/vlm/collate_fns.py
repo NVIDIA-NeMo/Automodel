@@ -16,7 +16,6 @@ import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest.mock import MagicMock
 
-import numpy as np
 import torch
 from PIL import Image as PILImage
 
@@ -52,6 +51,29 @@ _DEFAULT_MERGE_KERNEL: Tuple[int, int] = (2, 2)
 # The helpers live in fake_image.py and are imported here for use in collate
 # functions that need to mask vision tokens for samples that were injected.
 # ---------------------------------------------------------------------------
+# ASR collates now live in the audio package. Reference them via the module
+# (not a bare ``from ... import``) so the registry resolves the moved functions
+# without re-exporting their names as ``vlm.collate_fns`` attributes — the move
+# is a clean break with no backward-compat shim.
+from nemo_automodel.components.datasets.audio import collate_fns as _audio_collate_fns
+
+# Shared label/marker machinery now lives in the modality-neutral label_utils
+# module. Re-import the full chain here so these names stay resolvable as
+# ``vlm.collate_fns`` attributes (preserves existing string-path monkeypatches
+# and ``from ...vlm.collate_fns import build_labels`` call sites).
+from nemo_automodel.components.datasets.label_utils import (  # noqa: F401
+    _IMSTART_TEMPLATE_PROCESSORS,
+    _build_labels_from_markers,
+    _decode_single_token,
+    _derive_turn_markers,
+    _extract_assistant_text,
+    _find_pattern_indices,
+    _get_assistant_marker,
+    _get_stop_token_id,
+    build_labels,
+    build_labels_from_template,
+    default_stop_tokens,
+)
 from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     _FAKE_IMAGE,
     _batch_has_media,
@@ -59,7 +81,6 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     mask_fake_vision_tokens_batch,
 )
 from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
-from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
 
 # ---------------------------------------------------------------------------
 # Patch BaseVideoProcessor.fetch_videos to use decord (decord2) instead of
@@ -96,369 +117,6 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
         raise RuntimeError(f"Collate failed after {max_retries} retries. Last error: {last_error}")
 
     return wrapper
-
-
-def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
-    template_len = len(template)
-    pattern_len = len(pattern)
-    for i in range(search_start_index, template_len - pattern_len + 1):
-        match = template[i : i + pattern_len] == pattern
-        if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
-            return i, i + pattern_len
-    return -1, -1
-
-
-def _extract_assistant_text(message: Dict[str, Any]) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                return item.get("text", "")
-    return ""
-
-
-def _decode_single_token(tokenizer, token_id: int) -> str:
-    """Decode a single token id across tokenizer implementations.
-
-    Some tokenizers accept an `int` token id, while others require a sequence of
-    ids (e.g., `List[int]`). We try the common forms in order.
-    """
-    try:
-        return tokenizer.decode(token_id)
-    except Exception:
-        try:
-            return tokenizer.decode([token_id])
-        except Exception:
-            try:
-                return tokenizer.decode(torch.tensor([token_id]))
-            except Exception:
-                # Best-effort fallback; stop-token detection will likely fail.
-                return str(token_id)
-
-
-def build_labels(
-    input_ids_batch: torch.Tensor,
-    conversations: Sequence[Sequence[Dict[str, Any]]],
-    processor,
-) -> torch.Tensor:
-    """Construct label and optional loss-mask tensors aligned to assistant responses."""
-    tokenizer = getattr(processor, "tokenizer", processor)
-
-    labels_list: List[torch.Tensor] = []
-
-    for encoded, conversation in zip(input_ids_batch, conversations):
-        labels = torch.full_like(encoded, -100)
-        search_start_index = 0
-
-        for message in conversation:
-            if message.get("role") != "assistant":
-                continue
-
-            assistant_text = _extract_assistant_text(message)
-            if not assistant_text:
-                continue
-
-            assistant_tokens = tokenizer(
-                assistant_text,
-                add_special_tokens=False,
-                return_tensors="pt",
-            )["input_ids"][0].to(encoded.device)
-
-            answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
-
-            # handle tokenizers that can produce different tokens for text with leading
-            # whitespace when tokenized standalone vs in-context
-            if answer_start < 0 and assistant_text != assistant_text.lstrip():
-                assistant_tokens = tokenizer(
-                    assistant_text.lstrip(),
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                )["input_ids"][0].to(encoded.device)
-                answer_start, answer_end = _find_pattern_indices(encoded, assistant_tokens, search_start_index)
-
-            if answer_end < len(encoded):
-                next_token_id = int(encoded[answer_end].item())
-                next_token_str = _decode_single_token(tokenizer, next_token_id)
-                if next_token_str.strip() in default_stop_tokens(processor):
-                    answer_end += 1
-
-            if answer_start >= 0:
-                labels[answer_start:answer_end] = encoded[answer_start:answer_end]
-                search_start_index = answer_end
-            else:
-                logger.warning(
-                    (
-                        "Unable to find answer segment in the tokenized conversation. "
-                        "Skipping labeling for this and subsequent answers. Details:"
-                        "\n- Processed Text: %s"
-                        "\n- Tokens: %s"
-                        "\n- Target Answer Tokens: %s"
-                        "\n- Search Start Index: %d"
-                    ),
-                    conversation,
-                    encoded,
-                    assistant_tokens,
-                    search_start_index,
-                )
-                break
-
-        labels_list.append(labels)
-
-    labels_tensor = torch.stack(labels_list)
-    return labels_tensor
-
-
-# ---------------------------------------------------------------------------
-# Template-based label builder  (robust replacement for pattern-matching)
-# ---------------------------------------------------------------------------
-# Chat templates delimit roles with special tokens whose IDs are fixed.
-# By scanning ``input_ids`` for the marker sequence
-#   <|im_start|>  +  assistant  +  \n
-# we can locate every assistant turn without re-tokenizing the text.
-# This avoids the BPE context-sensitivity bugs of the old approach.
-# ---------------------------------------------------------------------------
-
-
-def _get_assistant_marker(tokenizer) -> Optional[List[int]]:
-    """Return the token-id sequence that introduces an assistant turn.
-
-    For Qwen-family models the marker is ``[<|im_start|>, assistant, \\n]``.
-    Returns ``None`` when the tokenizer does not use this convention.
-    """
-    try:
-        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        if im_start is None or im_start == getattr(tokenizer, "unk_token_id", None):
-            return None
-        role_ids = tokenizer.encode("assistant\n", add_special_tokens=False)
-        if not role_ids:
-            return None
-        return [im_start] + role_ids
-    except Exception:
-        return None
-
-
-def _get_stop_token_id(tokenizer) -> Optional[int]:
-    """Return the token id of the turn-ending marker (``<|im_end|>``)."""
-    try:
-        tid = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        if tid is not None and tid != getattr(tokenizer, "unk_token_id", None):
-            return tid
-    except Exception:
-        pass
-    return None
-
-
-# Processor types whose chat template uses ``<|im_start|>``/``<|im_end|>``
-# markers.  For these we use the fast ``_get_assistant_marker`` /
-# ``_get_stop_token_id`` helpers (no dummy-conversation overhead).
-_IMSTART_TEMPLATE_PROCESSORS = frozenset(
-    {
-        "Qwen2VLProcessor",
-        "Qwen2_5_VLProcessor",
-        "Qwen2_5OmniProcessor",
-        "Qwen3VLProcessor",
-        "Qwen3VLMoeProcessor",
-        "Qwen3OmniMoeProcessor",
-    }
-)
-
-
-def _derive_turn_markers(tokenizer) -> Tuple[List[int], int]:
-    """Derive the assistant-turn start marker and end-of-turn token id from the
-    tokenizer's own chat template.
-
-    The function applies a minimal dummy conversation that contains a known
-    sentinel string as the assistant reply, then locates the sentinel in the
-    resulting token sequence.  Everything between the end of the user turn and
-    the start of the sentinel becomes the **assistant marker**; the first token
-    *after* the sentinel becomes the **end-of-turn id**.
-
-    This approach is robust to BPE context-sensitivity and works for any model
-    whose template wraps assistant turns with fixed token sequences — e.g.
-    Gemma4's ``<start_of_turn>model\\n`` … ``<end_of_turn>``.
-
-    .. note::
-        ``apply_chat_template`` may return a :class:`~transformers.BatchEncoding`
-        (a ``UserDict`` subclass, **not** a plain :class:`dict`), so
-        ``isinstance(result, dict)`` is ``False``.  We access ``result["input_ids"]``
-        directly, which works for both ``BatchEncoding`` and plain ``dict`` / ``list``.
-
-    Returns
-    -------
-    tuple[list[int], int]
-        ``(assistant_marker, end_of_turn_id)``
-
-    Raises
-    ------
-    ValueError
-        If the sentinel cannot be located in the template output or if the
-        resulting marker is empty.
-    """
-
-    def _extract_ids(result) -> List[int]:
-        try:
-            return list(result["input_ids"])
-        except (KeyError, TypeError):
-            return list(result)
-
-    sentinel = "XSENTINELMARKERX"
-    all_ids = _extract_ids(
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": "u"}, {"role": "assistant", "content": sentinel}],
-            tokenize=True,
-            add_generation_prompt=False,
-        )
-    )
-    user_ids = _extract_ids(
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": "u"}],
-            tokenize=True,
-            add_generation_prompt=False,
-        )
-    )
-    sentinel_ids = tokenizer.encode(sentinel, add_special_tokens=False)
-
-    for i in range(len(all_ids) - len(sentinel_ids) + 1):
-        if all_ids[i : i + len(sentinel_ids)] == sentinel_ids:
-            end_idx = i + len(sentinel_ids)
-            if end_idx >= len(all_ids):
-                raise ValueError(f"No token found after sentinel in template output {all_ids}.")
-            end_of_turn_id: int = all_ids[end_idx]
-            assistant_marker: List[int] = all_ids[len(user_ids) : i]
-            if not assistant_marker:
-                raise ValueError(
-                    f"Assistant marker is empty (user_len={len(user_ids)}, sentinel_pos={i}). Full sequence: {all_ids}"
-                )
-            return assistant_marker, end_of_turn_id
-
-    raise ValueError(f"Sentinel '{sentinel}' (ids={sentinel_ids}) not found in template output {all_ids}.")
-
-
-def _build_labels_from_markers(
-    input_ids_batch: torch.Tensor,
-    assistant_marker: List[int],
-    stop_id: int,
-) -> torch.Tensor:
-    """Scan ``input_ids`` for ``assistant_marker`` … ``stop_id`` and build labels.
-
-    For each sequence in the batch, every token between the end of an
-    assistant marker and the corresponding ``stop_id`` (inclusive) is copied
-    into the labels tensor; all other positions are set to ``-100``.
-
-    Parameters
-    ----------
-    input_ids_batch:
-        Shape ``(B, L)``.
-    assistant_marker:
-        Token-id sequence that opens an assistant turn (e.g.
-        ``[<|im_start|>, assistant_id, newline_id]`` for Qwen or
-        ``[<start_of_turn>, model_id, newline_id]`` for Gemma4).
-    stop_id:
-        Single token id that closes a turn (e.g. ``<|im_end|>`` or
-        ``<end_of_turn>``).
-    """
-    marker_len = len(assistant_marker)
-    marker_tensor = torch.tensor(assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device)
-
-    labels_list: List[torch.Tensor] = []
-
-    for encoded in input_ids_batch:
-        labels = torch.full_like(encoded, -100)
-        seq_len = len(encoded)
-        i = 0
-
-        while i <= seq_len - marker_len:
-            if torch.equal(encoded[i : i + marker_len], marker_tensor):
-                content_start = i + marker_len  # first token of assistant content
-
-                # Scan forward to find the closing stop token.
-                content_end = content_start
-                while content_end < seq_len and encoded[content_end].item() != stop_id:
-                    content_end += 1
-
-                # Include the stop token in labels so the model learns to emit it.
-                if content_end < seq_len:
-                    content_end += 1
-
-                labels[content_start:content_end] = encoded[content_start:content_end]
-                i = content_end
-            else:
-                i += 1
-
-        labels_list.append(labels)
-
-    return torch.stack(labels_list)
-
-
-def build_labels_from_template(
-    input_ids_batch: torch.Tensor,
-    conversations: Sequence[Sequence[Dict[str, Any]]],
-    processor,
-) -> torch.Tensor:
-    """Build training labels by scanning ``input_ids`` for chat-template role markers.
-
-    Instead of re-tokenizing assistant text and searching for it (fragile due
-    to BPE context sensitivity), this function locates the structural markers
-    that the chat template inserts around each assistant turn and sets labels
-    only for the content region.
-
-    Two strategies are attempted in order:
-
-    1. **Fast path** (``_IMSTART_TEMPLATE_PROCESSORS``): for Qwen-family models
-       whose tokenizers expose ``<|im_start|>`` / ``<|im_end|>`` via
-       :func:`convert_tokens_to_ids`, the marker ids are resolved directly
-       without applying any dummy conversation.
-
-    2. **General path** (``_derive_turn_markers``): for all other processors
-       (e.g. Gemma4), the assistant-turn markers are derived automatically by
-       applying a minimal dummy conversation that contains a sentinel string.
-       This handles models whose tokenizers do not reliably expose special-token
-       ids via ``convert_tokens_to_ids`` or ``encode``.
-
-    If both strategies fail, the function falls back to the legacy
-    :func:`build_labels` (BPE pattern-matching), which logs a warning because
-    it is sensitive to tokenisation context and may produce ``num_label_tokens=0``
-    / nan loss on some samples.
-    """
-    processor_type = type(processor).__name__
-    tokenizer = getattr(processor, "tokenizer", processor)
-
-    # ------------------------------------------------------------------
-    # Fast path: Qwen-family processors with <|im_start|>/<|im_end|>.
-    # ------------------------------------------------------------------
-    if processor_type in _IMSTART_TEMPLATE_PROCESSORS:
-        assistant_marker = _get_assistant_marker(tokenizer)
-        stop_id = _get_stop_token_id(tokenizer)
-        if assistant_marker is not None and stop_id is not None:
-            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
-        logger.warning(
-            "Processor %s is listed in _IMSTART_TEMPLATE_PROCESSORS but the tokenizer "
-            "does not expose <|im_start|>/<|im_end|>. Trying template-derived markers.",
-            processor_type,
-        )
-
-    # ------------------------------------------------------------------
-    # General path: derive markers from the chat template via sentinel.
-    # Handles Gemma4 and any future model automatically.
-    # ------------------------------------------------------------------
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            assistant_marker, stop_id = _derive_turn_markers(tokenizer)
-            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
-        except Exception as exc:
-            logger.warning(
-                "Processor %s: could not derive turn markers from chat template (%s). "
-                "Falling back to BPE pattern-match labels, which may produce nan loss.",
-                processor_type,
-                exc,
-            )
-
-    # ------------------------------------------------------------------
-    # Last-resort fallback: BPE pattern-matching (fragile).
-    # ------------------------------------------------------------------
-    return build_labels(input_ids_batch, conversations, processor)
 
 
 def phi4_mm_collate_fn(examples, processor):
@@ -699,190 +357,6 @@ def qwen3_omni_collate_fn(
         batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
     return batch
-
-
-def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) -> List[Any]:
-    """Walk a Qwen3-Omni-style conversation and collect audio payloads in order.
-
-    The returned list contains the raw audio objects (typically 1-D ``np.ndarray``
-    waveforms) attached to ``{"type": "audio", "audio": ...}`` items in any
-    message's content list. Used by :func:`qwen3_omni_asr_collate_fn` to feed the
-    processor's ``audio=`` kwarg without going through ``qwen_omni_utils``.
-    """
-    audios: List[Any] = []
-    for message in conversation:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "audio":
-                audios.append(item.get("audio"))
-    return audios
-
-
-def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> np.ndarray:
-    """Coerce an audio payload to a 1-D ``float32`` ``np.ndarray`` or raise.
-
-    The single rule:
-      - Convert any numeric ``np.ndarray`` / ``torch.Tensor`` to ``np.float32``.
-      - The result must be exactly 1-D after conversion (mono waveform).
-      - Anything else raises ``ValueError`` naming the sample index, observed
-        shape, and observed dtype so the caller can pinpoint the bad sample.
-
-    Args:
-        payload: Audio object pulled from a conversation content item.
-        sample_index: Index of the offending sample within the batch (for error
-            messages).
-
-    Returns:
-        A 1-D ``np.float32`` ``np.ndarray``.
-
-    Raises:
-        ValueError: When the payload is not a numeric array or is not 1-D.
-    """
-    if hasattr(payload, "detach") and hasattr(payload, "cpu") and hasattr(payload, "numpy"):
-        # torch.Tensor or similar; move to CPU before NumPy view.
-        payload = payload.detach().cpu().numpy()
-
-    if not isinstance(payload, np.ndarray):
-        raise ValueError(
-            f"sample[{sample_index}] audio payload must be an np.ndarray or torch.Tensor; "
-            f"got type={type(payload).__name__}"
-        )
-
-    if not np.issubdtype(payload.dtype, np.number):
-        raise ValueError(
-            f"sample[{sample_index}] audio payload must have a numeric dtype; "
-            f"got shape={payload.shape} dtype={payload.dtype}"
-        )
-
-    if payload.dtype != np.float32:
-        payload = payload.astype(np.float32, copy=False)
-
-    if payload.ndim != 1:
-        raise ValueError(
-            f"sample[{sample_index}] audio payload must be 1-D (mono waveform); "
-            f"got shape={payload.shape} dtype={payload.dtype}"
-        )
-
-    return payload
-
-
-def _conversation_ends_with_assistant_text(conversation: Sequence[Dict[str, Any]]) -> bool:
-    """Return True iff the last turn is an ``assistant`` turn with non-empty text content."""
-    if not conversation:
-        return False
-    last = conversation[-1]
-    if last.get("role") != "assistant":
-        return False
-    content = last.get("content")
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    return True
-    return False
-
-
-def qwen3_omni_asr_collate_fn(
-    examples: Sequence[Dict[str, Any]],
-    processor,
-) -> Dict[str, torch.Tensor]:
-    """Collate Qwen3-Omni ASR conversations into model inputs without ``qwen_omni_utils``.
-
-    Unlike :func:`qwen3_omni_collate_fn`, this collate is intended for environments
-    that lack ``qwen_omni_utils`` and ``torchcodec``. It assumes audio waveforms
-    are already attached to the conversation as 1-D ``np.ndarray`` items of the
-    form ``{"type": "audio", "audio": waveform}`` (see
-    :func:`nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset`)
-    and passes them directly to the processor's ``audio=`` kwarg, which routes to
-    the bundled ``WhisperFeatureExtractor``.
-
-    Label masking is delegated to :func:`build_labels_from_template`, which uses
-    the marker-based fast path that already supports ``Qwen3OmniMoeProcessor``
-    via ``_IMSTART_TEMPLATE_PROCESSORS``. The collate produces pre-shifted labels
-    (``labels[:, 1:]``) and slices same-shape tensors to ``[:, :-1]`` so the
-    downstream loss (``MaskedCrossEntropy``/``FusedLinearCrossEntropy``) consumes
-    them without a second internal shift.
-
-    Args:
-        examples: Iterable of dicts each containing a ``conversation`` key, where
-            the last turn MUST be an ``assistant`` turn with non-empty text.
-        processor: A ``Qwen3OmniMoeProcessor`` instance (or compatible mock).
-
-    Returns:
-        Dict with ``input_ids``, ``attention_mask``, ``input_features``,
-        ``feature_attention_mask``, and ``labels`` plus any other tensors the
-        processor returns, all aligned along the batch dimension.
-
-    Raises:
-        ValueError: If any conversation lacks a non-empty assistant turn at the
-            end (the marker-based labeler would otherwise produce all-``-100``
-            labels and a NaN loss).
-    """
-    conversations = [example["conversation"] for example in examples]
-
-    for idx, conv in enumerate(conversations):
-        if not _conversation_ends_with_assistant_text(conv):
-            raise ValueError(
-                f"example[{idx}].conversation must end with an assistant turn containing non-empty text; got: {conv!r}"
-            )
-
-    texts = [processor.apply_chat_template(conv, add_generation_prompt=False, tokenize=False) for conv in conversations]
-
-    all_audios: List[Any] = []
-    for idx, conv in enumerate(conversations):
-        sample_audios = _extract_audios_from_conversation(conv)
-        for payload in sample_audios:
-            all_audios.append(_validate_and_coerce_audio_payload(payload, sample_index=idx))
-
-    processor_kwargs = {
-        "text": texts,
-        "return_tensors": "pt",
-        "padding": True,
-        # Match qwen3_omni_collate_fn and the recipe's token-accounting helpers
-        # (count_tail_padding only strips right-tail padding); transformers 5.5.0
-        # defaults this processor's text padding to "left".
-        "padding_side": "right",
-    }
-    if all_audios:
-        processor_kwargs["audio"] = all_audios
-
-    batch = processor(**processor_kwargs)
-
-    labels = build_labels_from_template(
-        batch["input_ids"],
-        conversations,
-        processor,
-    )
-
-    batch["labels"] = labels[:, 1:]
-
-    input_shape = batch["input_ids"].shape
-    for key, value in list(batch.items()):
-        if isinstance(value, torch.Tensor) and value.shape == input_shape:
-            batch[key] = value[:, :-1]
-
-    return batch
-
-
-def qwen2_5_omni_asr_collate_fn(
-    examples: Sequence[Dict[str, Any]],
-    processor,
-) -> Dict[str, torch.Tensor]:
-    """Collate Qwen2.5-Omni ASR conversations.
-
-    Thin alias over :func:`qwen3_omni_asr_collate_fn`: the body is processor-
-    agnostic (it only depends on the processor exposing ``apply_chat_template``
-    and the ``audio=`` kwarg, both of which ``Qwen2_5OmniProcessor`` provides),
-    so the entire Qwen3-Omni-ASR path works unchanged here. We expose a
-    separate symbol so YAML configs can pick the right collate via
-    ``_target_`` without users having to know about the Qwen3-Omni name.
-    """
-    return qwen3_omni_asr_collate_fn(examples, processor)
 
 
 def kimi_vl_collate_fn(
@@ -2178,7 +1652,7 @@ def llava_onevision_collate_fn(
 # Mapping of processor types to their collate functions
 COLLATE_FNS = {
     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
-    "Qwen2_5OmniProcessor": qwen2_5_omni_asr_collate_fn,
+    "Qwen2_5OmniProcessor": _audio_collate_fns.qwen2_5_omni_asr_collate_fn,
     "Qwen3OmniMoeProcessor": qwen3_omni_collate_fn,
     "KimiVLProcessor": kimi_vl_collate_fn,
     "KimiK25Processor": kimi_k25_vl_collate_fn,
