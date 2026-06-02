@@ -101,18 +101,23 @@ class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
 
     When present (not None) in BackendConfig, FP8 is enabled.
-    The ``recipe`` field accepts either a string shorthand (``"current"`` or ``"block"``)
-    or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
+    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+
+    ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
+    scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
+    e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
+    ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
     """
 
-    recipe: Literal["current", "block"] | Any = "current"
+    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
 
         If ``recipe`` is already a TE recipe object (e.g. ``Float8CurrentScaling(...)``),
-        it is returned directly.  String values ``"current"`` and ``"block"`` are
-        mapped to the corresponding TE recipe class.
+        it is returned directly.  String values ``"current"``, ``"block"``, and
+        ``"mxfp8"`` are mapped to the corresponding TE recipe class.
         """
         if not HAVE_TE:
             return None
@@ -123,6 +128,16 @@ class TEFp8Config:
 
         from transformer_engine.common.recipe import Float8BlockScaling, Float8CurrentScaling
 
+        if self.recipe == "mxfp8":
+            try:
+                from transformer_engine.common.recipe import MXFP8BlockScaling
+            except ImportError as e:  # TE too old for MXFP8 (added ~v2.3)
+                raise ImportError(
+                    "te_fp8.recipe='mxfp8' requires transformer_engine.common.recipe.MXFP8BlockScaling "
+                    "(TE >= ~2.3). The installed TE does not provide it; rebuild on a newer TE image."
+                ) from e
+            logger.warning("te_fp8.recipe='mxfp8': using TE MXFP8BlockScaling (mature MXFP8 backward).")
+            return MXFP8BlockScaling()
         if self.recipe == "block":
             return Float8BlockScaling()
         return Float8CurrentScaling()
