@@ -283,11 +283,17 @@ def apply_fsdp(
         moe_module = _get_moe_module(block)
         if isinstance(moe_module, MoE) and ep_shard_enabled:
             # Apply FSDP on dim=1 for grouped experts since we may have more
-            # shards than experts (dim=0).
+            # shards than experts (dim=0). 1D params (e.g. the per-expert bias of
+            # the experts="te" GroupedLinear path, shape [out_features]) have no
+            # dim 1 -> shard them on dim 0 instead. FSDP all-gathers before use, so
+            # the shard dim is a storage detail and does not change compute.
+            def _moe_shard_placement(param):
+                return Shard(0) if param.ndim < 2 else Shard(1)
+
             fully_shard(
                 moe_module.experts,
                 mesh=ep_shard_mesh,
-                shard_placement_fn=lambda _: Shard(1),
+                shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=reshard_after_forward,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
