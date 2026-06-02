@@ -165,15 +165,34 @@ def _filter_nonempty_text(dataset: Dataset, text_column: str) -> Dataset:
     )
 
 
-def _filter_min_audio_duration(dataset: Dataset, audio_column: str, min_audio_duration_seconds: float) -> Dataset:
-    """Drop rows shorter than ``min_audio_duration_seconds`` via header-only ``sf.info``.
+def _filter_audio_duration(
+    dataset: Dataset,
+    audio_column: str,
+    *,
+    min_seconds: float | None = None,
+    max_seconds: float | None = None,
+) -> Dataset:
+    """Drop rows outside ``[min_seconds, max_seconds]`` via header-only ``sf.info``.
 
     Uses ``soundfile.info`` (header read, no PCM decode) on the ``Audio(decode=False)``
     cell. The bytes branch wraps the payload in ``BytesIO``; the path branch passes the
-    path directly. Cells that fail to probe are dropped.
-    """
+    path directly. Cells that fail to probe are dropped. Bounds are inclusive; pass
+    ``None`` to disable that side. The upper bound caps activation memory (long clips
+    inflate the Whisper feature extractor's ``input_features`` and can OOM a rank).
 
-    def _duration_at_least(batch):
+    Args:
+        dataset: Dataset whose ``audio_column`` is cast with ``Audio(decode=False)``.
+        audio_column: Name of the audio column.
+        min_seconds: Inclusive lower bound on duration, or ``None``.
+        max_seconds: Inclusive upper bound on duration, or ``None``.
+
+    Returns:
+        The filtered dataset (unchanged if both bounds are ``None``).
+    """
+    if min_seconds is None and max_seconds is None:
+        return dataset
+
+    def _within_duration(batch):
         keep = []
         for cell in batch[audio_column]:
             try:
@@ -181,12 +200,16 @@ def _filter_min_audio_duration(dataset: Dataset, audio_column: str, min_audio_du
                     info = sf.info(io.BytesIO(cell["bytes"]))
                 else:
                     info = sf.info(cell["path"])
-                keep.append((info.frames / info.samplerate) >= min_audio_duration_seconds)
+                duration = info.frames / info.samplerate
+                ok = (min_seconds is None or duration >= min_seconds) and (
+                    max_seconds is None or duration <= max_seconds
+                )
+                keep.append(ok)
             except Exception:
                 keep.append(False)
         return keep
 
-    return dataset.filter(_duration_at_least, batched=True)
+    return dataset.filter(_within_duration, batched=True)
 
 
 def _attach_asr_transform(
@@ -269,6 +292,7 @@ def make_hf_audio_asr_dataset(
     text_column: str = "text",
     drop_empty_text: bool = True,
     min_audio_duration_seconds: float | None = None,
+    max_audio_duration_seconds: float | None = None,
     **load_kwargs: Any,
 ) -> Dataset:
     """Lazy HuggingFace audio→text dataset builder for Qwen-Omni ASR fine-tuning.
@@ -321,6 +345,12 @@ def make_hf_audio_asr_dataset(
             sub-second clips (~0.27 s manifests as a 27-vs-26 frame
             mismatch); set this to ``1.0`` for AMI / CommonVoice-style
             corpora that contain very short utterances.
+        max_audio_duration_seconds: Optional maximum audio duration. Samples
+            longer than this threshold are dropped via the same header-only
+            ``soundfile.info`` probe (no decode). Use this to cap activation
+            memory: long clips inflate the Whisper feature extractor's
+            ``input_features`` (mel frames) and can OOM a rank at larger batch
+            sizes. ``None`` disables the cap.
         **load_kwargs: Forwarded to ``datasets.load_dataset`` (e.g.
             ``trust_remote_code=True``).
 
@@ -347,8 +377,12 @@ def make_hf_audio_asr_dataset(
         # Arrow-level filter on the text column only; no audio decode runs.
         dataset = _filter_nonempty_text(dataset, text_column)
 
-    if min_audio_duration_seconds is not None:
-        dataset = _filter_min_audio_duration(dataset, audio_column, min_audio_duration_seconds)
+    dataset = _filter_audio_duration(
+        dataset,
+        audio_column,
+        min_seconds=min_audio_duration_seconds,
+        max_seconds=max_audio_duration_seconds,
+    )
 
     return _attach_asr_transform(
         dataset,

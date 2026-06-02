@@ -169,6 +169,23 @@ def test_min_audio_duration_filters_short_clips(monkeypatch):
     assert mixed["text"] == ["LONG CLIP"]
 
 
+def test_max_audio_duration_filters_long_clips(monkeypatch):
+    """``max_audio_duration_seconds`` drops over-long clips (caps activation memory)."""
+    short = _make_wav_bytes(duration_seconds=2.0)
+    long = _make_wav_bytes(duration_seconds=40.0)
+    rows = [
+        {"audio": {"bytes": short, "path": None}, "text": "keep me"},
+        {"audio": {"bytes": long, "path": None}, "text": "too long"},
+    ]
+    sources = [Source("s", "repo/s", None, "train", "text")]
+    _install_fake_load_dataset(monkeypatch, {"repo/s": ("text", rows)})
+
+    mixed = me.build_multi_en_source_mix(
+        sources=sources, shuffle_seed=None, min_audio_duration_seconds=None, max_audio_duration_seconds=30.0
+    )
+    assert mixed["text"] == ["KEEP ME"]
+
+
 def test_make_multi_en_asr_dataset_is_lazy_and_torchcodec_free(monkeypatch):
     """Construction decodes no audio; access triggers the soundfile decode; no torchcodec."""
     wav = _make_wav_bytes()

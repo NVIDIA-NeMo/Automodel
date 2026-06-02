@@ -39,7 +39,7 @@ from datasets import Audio, Dataset, concatenate_datasets, load_dataset
 
 from nemo_automodel.components.datasets.audio.datasets import (
     _attach_asr_transform,
-    _filter_min_audio_duration,
+    _filter_audio_duration,
     _filter_nonempty_text,
 )
 
@@ -194,6 +194,7 @@ def build_multi_en_source_mix(
     text_column: str = "text",
     shuffle_seed: int | None = 42,
     min_audio_duration_seconds: float | None = 1.0,
+    max_audio_duration_seconds: float | None = 30.0,
 ) -> Dataset:
     """Build the concatenated ``{audio, text, source}`` mix (before the ASR transform).
 
@@ -211,6 +212,10 @@ def build_multi_en_source_mix(
             ``None`` disables shuffling (single-source blocks).
         min_audio_duration_seconds: Drop clips shorter than this via header-only
             ``soundfile.info`` (no PCM decode). ``None`` disables the filter.
+        max_audio_duration_seconds: Drop clips longer than this via the same
+            header-only probe. Defaults to ``30.0`` to cap activation memory —
+            long clips inflate the Whisper feature extractor and can OOM a rank.
+            ``None`` disables the cap.
 
     Returns:
         A map-style HuggingFace ``Dataset`` with columns
@@ -223,8 +228,12 @@ def build_multi_en_source_mix(
     if shuffle_seed is not None:
         mixed = mixed.shuffle(seed=shuffle_seed)
 
-    if min_audio_duration_seconds is not None:
-        mixed = _filter_min_audio_duration(mixed, audio_column, min_audio_duration_seconds)
+    mixed = _filter_audio_duration(
+        mixed,
+        audio_column,
+        min_seconds=min_audio_duration_seconds,
+        max_seconds=max_audio_duration_seconds,
+    )
 
     return mixed
 
@@ -235,6 +244,7 @@ def make_multi_en_asr_dataset(
     system_prompt: str | None = None,
     user_prompt: str | None = DEFAULT_USER_PROMPT,
     min_audio_duration_seconds: float | None = 1.0,
+    max_audio_duration_seconds: float | None = 30.0,
     shuffle_seed: int | None = 42,
     sources: list[Source | Mapping[str, Any]] | None = None,
     audio_column: str = "audio",
@@ -256,6 +266,9 @@ def make_multi_en_asr_dataset(
         min_audio_duration_seconds: Drop clips shorter than this (header-only
             probe). Defaults to ``1.0`` to dodge the Qwen-Omni Whisper
             feature-extractor sub-second off-by-one.
+        max_audio_duration_seconds: Drop clips longer than this (header-only
+            probe). Defaults to ``30.0`` to cap activation memory and avoid
+            per-rank OOM from long clips in the mix. ``None`` disables the cap.
         shuffle_seed: Global shuffle seed; ``None`` disables shuffling.
         sources: Optional subset of :data:`SOURCES` (e.g. to skip gated corpora
             for a local smoke run). Defaults to all six.
@@ -273,6 +286,7 @@ def make_multi_en_asr_dataset(
         text_column=text_column,
         shuffle_seed=shuffle_seed,
         min_audio_duration_seconds=min_audio_duration_seconds,
+        max_audio_duration_seconds=max_audio_duration_seconds,
     )
     return _attach_asr_transform(
         mixed,
