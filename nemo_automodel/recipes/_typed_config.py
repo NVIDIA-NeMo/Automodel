@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.loss.loss import LossConfig
+    from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
@@ -161,6 +162,16 @@ class RecipeConfig:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_loss_config(factory, **kwargs)
+
+    @cached_property
+    def mtp(self) -> "MTPLossConfig":
+        # MTP loss params are model-driven (scaling_factor comes from the model
+        # output / get_mtp_loss_scaling_factor; ignore_index is fixed) and are not
+        # exposed via YAML.  This typed accessor just lets recipes build MTP through
+        # the typed-config boundary like the other sections.
+        from nemo_automodel.components.loss.mtp import MTPLossConfig
+
+        return MTPLossConfig()
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":
