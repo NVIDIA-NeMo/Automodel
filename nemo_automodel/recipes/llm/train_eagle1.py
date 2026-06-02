@@ -573,6 +573,17 @@ class TrainEagle1Recipe(BaseRecipe):
             # ``pending_micro_batches / grad_accumulation_steps`` of a normal
             # step; rescale by the inverse so the trailing step's gradient is on
             # the same scale as every other step.
+            #
+            # Assumption: every data-parallel rank reaches this flush with the
+            # same ``pending_micro_batches``. That holds here because the loader
+            # uses ``DistributedSampler`` with ``drop_last=False`` (and the
+            # DataLoader likewise), which pads every rank to an equal sample
+            # count -> equal batches per epoch -> equal trailing windows. If a
+            # non-padding / variable-length sampler is ever introduced, revisit
+            # this: a divergent per-rank ``scale`` would desync parameters, and
+            # a rank that lands on ``pending_micro_batches == 0`` would skip the
+            # flush (and the ``clip_grad_norm_`` collective inside it) while its
+            # peers step, hanging on the mismatched collective.
             if pending_micro_batches > 0:
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
