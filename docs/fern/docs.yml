@@ -3,6 +3,16 @@ instances:
   custom-domain: docs.nvidia.com/nemo/automodel
 title: NVIDIA NeMo AutoModel
 
+# Designate the existing homepage (docs/index.mdx) as the site landing page so
+# the docs root resolves to it instead of 404ing. Uses Fern's top-level
+# `landing-page` field (an existing page, by path) rather than a synthetic
+# "Home" nav entry. Path is relative to this docs.yml (which lives in
+# docs/fern/), so ../ reaches the nightly tree's top-level homepage at
+# docs/index.mdx.
+landing-page:
+  page: NeMo AutoModel
+  path: ../index.mdx
+
 # Inherit NVIDIA branding (footer, colors, layout, fonts, NVIDIA logos+favicon,
 # OneTrust JS, theme CSS) from the central control repo at
 # https://github.com/NVIDIA/fern-components. At publish time Fern fetches the

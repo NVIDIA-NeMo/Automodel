@@ -1,8 +1,4 @@
 navigation:
-  # Top-level page with empty slug → serves at the version root (see nightly.yml).
-  - page: "Home"
-    path: ./v0.4/pages/index.mdx
-    slug: ""
   - section: "Get Started"
     contents:
       - page: "About NeMo AutoModel"

@@ -1,13 +1,4 @@
 navigation:
-  # Top-level page with an empty slug → serves at the version root
-  # (/nightly, /latest, /v0.4) and is the target of the docs.yml
-  # index.html/index redirects. A page nested inside a section only gets a
-  # within-section slug, leaving the version root unmapped (404), so Home
-  # must be a top-level nav entry with slug "". (`slug: ""` = parent path,
-  # no extra segment — same convention NeMo Curator uses.)
-  - page: "Home"
-    path: ../../index.mdx
-    slug: ""
   - section: "Get Started"
     contents:
       - page: "About NeMo AutoModel"
