@@ -960,24 +960,49 @@ def _mxfp8_weight_relayout(B):
     return B.transpose(-2, -1).contiguous().transpose(-2, -1)
 
 
-# Finite magnitude to clamp MXFP8 quant inputs to. torchao's to_mx derives a per-block
-# e8m0 scale from the block amax; a bias-shifted value with a huge amax overflows that
-# exponent and yields nan (observed on gpt-oss, expert_bias=True). Activations here are
-# O(1)–O(100) after the clamped swiglu, so ±1e4 is ample headroom that never distorts
-# normal training but caps pathological values below the overflow regime. Kept in the
-# input dtype (bf16) — no upcast — so it never trips bf16-only activation kernels.
-_MXFP8_QUANT_CLAMP = 1.0e4
+_MXFP8_GRAD_LOGGED = False  # one-time DEBUG_MXFP8_GRADCHECK report
 
 
-def _mxfp8_clamp_quant_input(A):
-    """Sanitize an MXFP8 grouped-GEMM activation operand before to_mx quantization.
+def _mxfp8_gradcheck_hooks(A, out):
+    """Attach one-time backward finiteness probes (DEBUG_MXFP8_GRADCHECK).
 
-    Replaces any nan/inf and clamps to ±_MXFP8_QUANT_CLAMP so a bias-shifted value can't
-    overflow the per-block e8m0 scale -> nan. Preserves dtype (no upcast). Only called on
-    the mxfp8 path; the bf16 fallback never sees it.
+    gpt-oss nans at iter 1 (iter-0 forward is sane), so the suspect is torchao's MXFP8
+    BACKWARD grad-quant overflowing the first large gradient. This logs, on rank0 the
+    first time, whether grad_output entering torchao's backward is finite and whether the
+    grad propagated back to the activation operand A (i.e. AFTER torchao's backward quant)
+    is finite. grad_output finite + A.grad non-finite => the backward mxfp8 quant is the
+    source. No-op unless the env flag is set.
     """
-    A = torch.nan_to_num(A, nan=0.0, posinf=_MXFP8_QUANT_CLAMP, neginf=-_MXFP8_QUANT_CLAMP)
-    return A.clamp(min=-_MXFP8_QUANT_CLAMP, max=_MXFP8_QUANT_CLAMP)
+    if os.environ.get("DEBUG_MXFP8_GRADCHECK") != "True":
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    def _out_hook(g):
+        global _MXFP8_GRAD_LOGGED
+        if not _MXFP8_GRAD_LOGGED:
+            warnings.warn(
+                f"[DEBUG_MXFP8_GRADCHECK] grad_output into torchao backward finite={torch.isfinite(g).all().item()}",
+                category=UserWarning,
+                stacklevel=2,
+            )
+        return g
+
+    def _a_hook(g):
+        global _MXFP8_GRAD_LOGGED
+        if not _MXFP8_GRAD_LOGGED:
+            _MXFP8_GRAD_LOGGED = True
+            warnings.warn(
+                f"[DEBUG_MXFP8_GRADCHECK] A.grad after torchao backward finite={torch.isfinite(g).all().item()}",
+                category=UserWarning,
+                stacklevel=2,
+            )
+        return g
+
+    if out.requires_grad:
+        out.register_hook(_out_hook)
+    if A.requires_grad:
+        A.register_hook(_a_hook)
 
 
 def _select_grouped_mm(use_mxfp8, compile_experts=False):
@@ -1003,10 +1028,10 @@ def _select_grouped_mm(use_mxfp8, compile_experts=False):
     else:
 
         def grouped_mm(A, B, offs, _fn=mxfp8_grouped_mm):
-            # Clamp the activation operand before to_mx so a bias-shifted value can't
-            # overflow the per-block e8m0 scale -> nan (gpt-oss bias path). Weights are
-            # bounded init values, so only A is sanitized.
-            return _fn(_mxfp8_clamp_quant_input(A).contiguous(), _mxfp8_weight_relayout(B), offs)
+            A = A.contiguous()
+            out = _fn(A, _mxfp8_weight_relayout(B), offs)
+            _mxfp8_gradcheck_hooks(A, out)
+            return out
 
     if compile_experts:
         # Cache the compiled callable on the behavior key (mxfp8 active or not) — NOT on
