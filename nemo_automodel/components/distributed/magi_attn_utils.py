@@ -283,7 +283,7 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):
     """
     from einops import rearrange
 
-    from magi_attention.api import calc_attn
+    from magi_attention.api import calc_attn, get_most_recent_key
 
     def magi_attn_func(q, k, v, **call_kwargs):
         cp_group = get_active_cp_group()
@@ -301,6 +301,16 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):
             qf, kf, vf = q, k, v
         dtype = qf.dtype
         qf, kf, vf = (e.to(torch.bfloat16).contiguous() for e in (qf, kf, vf))
+        # Context-parallel (cp>1): q/k/v here are the LOCAL sequence shard and the
+        # recipe has already built + dispatched the global dist key (the FFA kernel
+        # does the cross-rank KV exchange). Use that pre-built key directly rather
+        # than building one from the local shard.
+        if cp_group.size() > 1:
+            key = get_most_recent_key(cp_group)
+            o = calc_attn(qf, kf, vf, key, softmax_scale=softmax_scale)[0].to(dtype)
+            if bshd:
+                o = rearrange(o, "(b s) nh hd -> b s nh hd", b=b)
+            return o
         # Resolve the mask, preferring per-call args over module-global state:
         #   1. explicit ``magi_attn_spec`` (arbitrary AttnSlice mask, e.g. prefix tree)
         #   2. ``cu_seqlens`` -> varlen/block-diagonal (packed sequences)
@@ -520,6 +530,55 @@ def magi_prepare_batch(
     new_batch["position_ids"] = position_ids
     # Remove anything that no longer matches the dispatched layout.
     new_batch.pop("attention_mask", None)
+    return new_batch, key
+
+
+def magi_prepare_packed_cp(model, batch: dict, cp_group):
+    """Context-parallel prep for a packed (THD) batch on the custom-model path.
+
+    Takes a *global* THD batch (flat ``input_ids``/``labels``/``position_ids`` plus
+    ``cu_seqlens`` marking document boundaries), builds a per-document varlen dist
+    key over ``cp_group`` and dispatches the sequence with MagiAttention's own
+    load-balancing solver (not TE's THD sharding). Each rank then runs the model on
+    its local shard; the attn_func uses this pre-built key so the FFA kernel does
+    the cross-rank KV exchange. Logits are undispatched back to the global sequence
+    before the loss (see :func:`magi_undispatch_logits`), so ``labels`` stay global.
+
+    Returns:
+        (new_batch, key): ``new_batch`` has the local ``input_ids``/``position_ids``
+        and the global ``labels``; ``key`` is the dist-attn runtime key.
+    """
+    from magi_attention.api import dispatch, get_position_ids
+
+    cu = batch["cu_seqlens"]
+    seqlens = (cu[1:] - cu[:-1]).tolist()
+    spec = AttnMaskSpec.varlen(seqlens, causal=True)
+    num_heads_q, num_heads_kv, head_dim = _get_head_config(
+        model.module if hasattr(model, "module") else model
+    )
+    key = build_flex_key(
+        spec, num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
+        head_dim=head_dim, cp_group=cp_group,
+    )
+    input_ids = batch["input_ids"].reshape(-1)  # global flat [T]
+    local_input = dispatch(input_ids, key=key)
+    local_pos = get_position_ids(key).to(local_input.device)
+    # Shard labels the same way as the input (like TE-CP): each rank computes the
+    # loss on its own shard and the recipe's cross-CP reduction sums the shards
+    # into the global loss. (Undispatching logits to global instead would make
+    # every CP rank compute the full loss redundantly -> the reduction would
+    # double-count it by a factor of cp_size.)
+    local_labels = dispatch(batch["labels"].reshape(-1), key=key)
+    new_batch = {
+        "input_ids": local_input,
+        "position_ids": local_pos,
+        "labels": local_labels,
+        # THD layout: the model must use the thd RoPE path and our dispatched
+        # (permuted) positions. Requires non-fused RoPE (backend.rope_fusion=false),
+        # since the fused thd path rebuilds contiguous positions that ignore the
+        # magi dispatch permutation.
+        "qkv_format": "thd",
+    }
     return new_batch, key
 
 
